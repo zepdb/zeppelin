@@ -31,6 +31,9 @@ build/
 claude_files/
 CLAUDE.md
 
+# Task tracking (session state)
+tasks/
+
 # Test artifacts
 tests/fixtures/tmp/
 
