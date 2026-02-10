@@ -29,6 +29,7 @@ build/
 
 # Claude working files
 claude_files/
+CLAUDE.md
 
 # Test artifacts
 tests/fixtures/tmp/
