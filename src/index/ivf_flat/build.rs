@@ -21,7 +21,7 @@ use crate::index::distance;
 // ---------------------------------------------------------------------------
 
 /// S3 key for the centroids blob.
-pub(crate) fn centroids_key(namespace: &str, segment_id: &str) -> String {
+pub fn centroids_key(namespace: &str, segment_id: &str) -> String {
     format!("{namespace}/segments/{segment_id}/centroids.bin")
 }
 

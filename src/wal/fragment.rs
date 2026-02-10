@@ -34,8 +34,12 @@ impl WalFragment {
     }
 
     /// Compute the checksum for a set of vectors and deletes.
+    ///
+    /// Uses JSON serialization because `AttributeValue` uses `#[serde(untagged)]`
+    /// which is incompatible with bincode's non-self-describing format.
     fn compute_checksum(vectors: &[VectorEntry], deletes: &[VectorId]) -> u64 {
-        let payload = bincode::serialize(&(vectors, deletes)).expect("serialization should not fail");
+        let payload =
+            serde_json::to_vec(&(vectors, deletes)).expect("serialization should not fail");
         xxh3_64(&payload)
     }
 
@@ -51,15 +55,15 @@ impl WalFragment {
         Ok(())
     }
 
-    /// Serialize this fragment to bytes (bincode).
+    /// Serialize this fragment to JSON bytes.
     pub fn to_bytes(&self) -> Result<Bytes> {
-        let data = bincode::serialize(self)?;
+        let data = serde_json::to_vec(self)?;
         Ok(Bytes::from(data))
     }
 
-    /// Deserialize a fragment from bytes (bincode).
+    /// Deserialize a fragment from JSON bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let fragment: Self = bincode::deserialize(data)?;
+        let fragment: Self = serde_json::from_slice(data)?;
         fragment.validate_checksum()?;
         Ok(fragment)
     }
