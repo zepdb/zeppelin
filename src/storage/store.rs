@@ -1,0 +1,162 @@
+use bytes::Bytes;
+use object_store::aws::AmazonS3Builder;
+use object_store::path::Path;
+use object_store::{ObjectStore, PutPayload};
+use std::sync::Arc;
+
+use crate::config::StorageConfig;
+use crate::error::{Result, ZeppelinError};
+
+/// Wrapper around the `object_store` crate providing a unified interface
+/// for S3, GCS, Azure, and local storage backends.
+#[derive(Clone)]
+pub struct ZeppelinStore {
+    inner: Arc<dyn ObjectStore>,
+    bucket: String,
+}
+
+impl ZeppelinStore {
+    /// Create a new store from configuration.
+    pub fn from_config(config: &StorageConfig) -> Result<Self> {
+        let store: Arc<dyn ObjectStore> = match config.backend.as_str() {
+            "s3" => {
+                let mut builder = AmazonS3Builder::new()
+                    .with_bucket_name(&config.bucket);
+
+                if let Some(ref region) = config.s3_region {
+                    builder = builder.with_region(region);
+                }
+                if let Some(ref endpoint) = config.s3_endpoint {
+                    if !endpoint.is_empty() {
+                        builder = builder.with_endpoint(endpoint);
+                    }
+                }
+                if let Some(ref key_id) = config.s3_access_key_id {
+                    builder = builder.with_access_key_id(key_id);
+                }
+                if let Some(ref secret) = config.s3_secret_access_key {
+                    builder = builder.with_secret_access_key(secret);
+                }
+                if config.s3_allow_http {
+                    builder = builder.with_allow_http(true);
+                }
+
+                Arc::new(builder.build().map_err(|e| {
+                    ZeppelinError::Config(format!("failed to build S3 store: {e}"))
+                })?)
+            }
+            "local" => {
+                let path = std::path::Path::new(&config.bucket);
+                if !path.exists() {
+                    std::fs::create_dir_all(path)?;
+                }
+                Arc::new(
+                    object_store::local::LocalFileSystem::new_with_prefix(path)
+                        .map_err(|e| {
+                            ZeppelinError::Config(format!("failed to build local store: {e}"))
+                        })?,
+                )
+            }
+            backend => {
+                return Err(ZeppelinError::Config(format!(
+                    "unsupported storage backend: {backend}"
+                )));
+            }
+        };
+
+        Ok(Self {
+            inner: store,
+            bucket: config.bucket.clone(),
+        })
+    }
+
+    /// Create a store directly from an ObjectStore instance (for testing).
+    pub fn new(store: Arc<dyn ObjectStore>, bucket: String) -> Self {
+        Self {
+            inner: store,
+            bucket,
+        }
+    }
+
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    /// Put an object at the given key.
+    pub async fn put(&self, key: &str, data: Bytes) -> Result<()> {
+        let path = Path::parse(key)?;
+        self.inner.put(&path, PutPayload::from(data)).await?;
+        Ok(())
+    }
+
+    /// Get an object by key. Returns NotFound if it doesn't exist.
+    pub async fn get(&self, key: &str) -> Result<Bytes> {
+        let path = Path::parse(key)?;
+        let result = self.inner.get(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
+                key: path.to_string(),
+            },
+            other => ZeppelinError::Storage(other),
+        })?;
+        Ok(result.bytes().await?)
+    }
+
+    /// Get a byte range of an object.
+    pub async fn get_range(&self, key: &str, range: std::ops::Range<usize>) -> Result<Bytes> {
+        let path = Path::parse(key)?;
+        Ok(self.inner.get_range(&path, range).await?)
+    }
+
+    /// Delete an object by key.
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        let path = Path::parse(key)?;
+        self.inner.delete(&path).await?;
+        Ok(())
+    }
+
+    /// List objects under a prefix.
+    pub async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        use futures::TryStreamExt;
+        let path = Path::parse(prefix)?;
+        let stream = self.inner.list(Some(&path));
+        let objects: Vec<_> = stream.try_collect().await?;
+        Ok(objects.iter().map(|o| o.location.to_string()).collect())
+    }
+
+    /// Check if an object exists.
+    pub async fn exists(&self, key: &str) -> Result<bool> {
+        let path = Path::parse(key)?;
+        match self.inner.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(ZeppelinError::Storage(e)),
+        }
+    }
+
+    /// Head request - get metadata without downloading the object.
+    pub async fn head(&self, key: &str) -> Result<object_store::ObjectMeta> {
+        let path = Path::parse(key)?;
+        Ok(self.inner.head(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
+                key: path.to_string(),
+            },
+            other => ZeppelinError::Storage(other),
+        })?)
+    }
+
+    /// Delete all objects under a prefix (for cleanup).
+    pub async fn delete_prefix(&self, prefix: &str) -> Result<usize> {
+        let keys = self.list_prefix(prefix).await?;
+        let count = keys.len();
+        for key in &keys {
+            let path = Path::parse(key)?;
+            self.inner.delete(&path).await?;
+        }
+        Ok(count)
+    }
+
+    /// Get the underlying ObjectStore for advanced operations.
+    pub fn inner(&self) -> &Arc<dyn ObjectStore> {
+        &self.inner
+    }
+}

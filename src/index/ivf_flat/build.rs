@@ -1,0 +1,413 @@
+//! Build phase for IVF-Flat index.
+//!
+//! Pipeline: train centroids -> assign vectors to clusters -> serialize and
+//! write artifacts (centroids, cluster vectors, cluster attributes) to S3.
+
+use bytes::Bytes;
+use std::collections::HashMap;
+use tracing::{debug, info};
+
+use crate::config::IndexingConfig;
+use crate::error::{Result, ZeppelinError};
+use crate::storage::ZeppelinStore;
+use crate::types::{AttributeValue, VectorEntry};
+
+use super::kmeans::train_kmeans;
+use super::IvfFlatIndex;
+use crate::index::distance;
+
+// ---------------------------------------------------------------------------
+// Artifact paths
+// ---------------------------------------------------------------------------
+
+/// S3 key for the centroids blob.
+pub(crate) fn centroids_key(namespace: &str, segment_id: &str) -> String {
+    format!("{namespace}/segments/{segment_id}/centroids.bin")
+}
+
+/// S3 key for the vector data of cluster `i`.
+pub(crate) fn cluster_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> String {
+    format!("{namespace}/segments/{segment_id}/cluster_{cluster_idx}.bin")
+}
+
+/// S3 key for the attribute data of cluster `i`.
+pub(crate) fn attrs_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> String {
+    format!("{namespace}/segments/{segment_id}/attrs_{cluster_idx}.bin")
+}
+
+// ---------------------------------------------------------------------------
+// Serialization helpers
+// ---------------------------------------------------------------------------
+
+/// Header written before the centroid float array.
+///
+/// Layout: `[num_centroids: u32][dimension: u32][f32 * num_centroids * dimension]`
+pub(crate) fn serialize_centroids(centroids: &[Vec<f32>], dim: usize) -> Result<Bytes> {
+    let num_centroids = centroids.len() as u32;
+    let dimension = dim as u32;
+
+    // 8 bytes header + floats
+    let float_bytes = centroids.len() * dim * std::mem::size_of::<f32>();
+    let total = 8 + float_bytes;
+    let mut buf = Vec::with_capacity(total);
+
+    buf.extend_from_slice(&num_centroids.to_le_bytes());
+    buf.extend_from_slice(&dimension.to_le_bytes());
+
+    for centroid in centroids {
+        for &val in centroid {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+
+    debug_assert_eq!(buf.len(), total);
+    Ok(Bytes::from(buf))
+}
+
+/// Deserialize centroids from the binary format produced by `serialize_centroids`.
+pub(crate) fn deserialize_centroids(data: &[u8]) -> Result<(Vec<Vec<f32>>, usize)> {
+    if data.len() < 8 {
+        return Err(ZeppelinError::Index("centroids blob too small for header".into()));
+    }
+
+    let num_centroids = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let dim = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+
+    let expected = 8 + num_centroids * dim * 4;
+    if data.len() < expected {
+        return Err(ZeppelinError::Index(format!(
+            "centroids blob size mismatch: expected {expected}, got {}",
+            data.len()
+        )));
+    }
+
+    let mut centroids = Vec::with_capacity(num_centroids);
+    let mut offset = 8;
+    for _ in 0..num_centroids {
+        let mut c = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            c.push(val);
+            offset += 4;
+        }
+        centroids.push(c);
+    }
+
+    Ok((centroids, dim))
+}
+
+/// Cluster blob layout:
+/// `[num_vectors: u32][dimension: u32]`
+/// then for each vector: `[id_len: u32][id_bytes...][f32 * dim]`
+pub(crate) fn serialize_cluster(
+    ids: &[String],
+    vectors: &[Vec<f32>],
+    dim: usize,
+) -> Result<Bytes> {
+    let n = ids.len() as u32;
+    let dimension = dim as u32;
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&n.to_le_bytes());
+    buf.extend_from_slice(&dimension.to_le_bytes());
+
+    for (id, vec) in ids.iter().zip(vectors.iter()) {
+        let id_bytes = id.as_bytes();
+        let id_len = id_bytes.len() as u32;
+        buf.extend_from_slice(&id_len.to_le_bytes());
+        buf.extend_from_slice(id_bytes);
+        for &val in vec {
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+    }
+
+    Ok(Bytes::from(buf))
+}
+
+/// Cluster data for a single cluster.
+pub(crate) struct ClusterData {
+    pub ids: Vec<String>,
+    pub vectors: Vec<Vec<f32>>,
+}
+
+/// Deserialize a cluster blob.
+pub(crate) fn deserialize_cluster(data: &[u8]) -> Result<ClusterData> {
+    if data.len() < 8 {
+        return Err(ZeppelinError::Index("cluster blob too small for header".into()));
+    }
+
+    let n = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let dim = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+
+    let mut ids = Vec::with_capacity(n);
+    let mut vectors = Vec::with_capacity(n);
+    let mut offset = 8;
+
+    for _ in 0..n {
+        if offset + 4 > data.len() {
+            return Err(ZeppelinError::Index("cluster blob truncated at id_len".into()));
+        }
+        let id_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+
+        if offset + id_len > data.len() {
+            return Err(ZeppelinError::Index("cluster blob truncated at id".into()));
+        }
+        let id = String::from_utf8_lossy(&data[offset..offset + id_len]).into_owned();
+        offset += id_len;
+
+        let float_bytes = dim * 4;
+        if offset + float_bytes > data.len() {
+            return Err(ZeppelinError::Index("cluster blob truncated at vector data".into()));
+        }
+        let mut vec = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            vec.push(val);
+            offset += 4;
+        }
+
+        ids.push(id);
+        vectors.push(vec);
+    }
+
+    Ok(ClusterData { ids, vectors })
+}
+
+/// Attributes blob: JSON-serialized `Vec<Option<HashMap<String, AttributeValue>>>`.
+///
+/// We use JSON rather than bincode because `AttributeValue` uses
+/// `#[serde(untagged)]`, which requires `deserialize_any` -- a method
+/// that bincode does not support.
+pub(crate) fn serialize_attrs(
+    attrs: &[Option<HashMap<String, AttributeValue>>],
+) -> Result<Bytes> {
+    let encoded = serde_json::to_vec(attrs)?;
+    Ok(Bytes::from(encoded))
+}
+
+/// Deserialize attributes blob.
+pub(crate) fn deserialize_attrs(
+    data: &[u8],
+) -> Result<Vec<Option<HashMap<String, AttributeValue>>>> {
+    Ok(serde_json::from_slice(data)?)
+}
+
+// ---------------------------------------------------------------------------
+// Build pipeline
+// ---------------------------------------------------------------------------
+
+/// Build an IVF-Flat index from the given vectors.
+///
+/// 1. Train centroids via k-means++.
+/// 2. Assign every vector to its nearest centroid.
+/// 3. Serialize and write all artifacts to S3.
+/// 4. Return an `IvfFlatIndex` handle with the metadata needed for search.
+pub async fn build_ivf_flat(
+    vectors: &[VectorEntry],
+    config: &IndexingConfig,
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_id: &str,
+) -> Result<IvfFlatIndex> {
+    if vectors.is_empty() {
+        return Err(ZeppelinError::Index("cannot build index from empty vector set".into()));
+    }
+
+    let dim = vectors[0].values.len();
+    if dim == 0 {
+        return Err(ZeppelinError::Index("vector dimension must be > 0".into()));
+    }
+
+    // Validate all dimensions match.
+    for v in vectors.iter() {
+        if v.values.len() != dim {
+            return Err(ZeppelinError::DimensionMismatch {
+                expected: dim,
+                actual: v.values.len(),
+            });
+        }
+    }
+
+    let k = config.default_num_centroids.min(vectors.len());
+
+    info!(
+        n = vectors.len(),
+        dim = dim,
+        k = k,
+        namespace = namespace,
+        segment_id = segment_id,
+        "building IVF-Flat index"
+    );
+
+    // --- Step 1: Train centroids ---
+    let vec_refs: Vec<&[f32]> = vectors.iter().map(|v| v.values.as_slice()).collect();
+    let centroids = train_kmeans(
+        &vec_refs,
+        dim,
+        k,
+        config.kmeans_max_iterations,
+        config.kmeans_convergence_epsilon,
+    )?;
+
+    let num_clusters = centroids.len();
+    info!(num_clusters = num_clusters, "k-means training complete");
+
+    // --- Step 2: Assign vectors to clusters ---
+    let mut cluster_ids: Vec<Vec<String>> = vec![Vec::new(); num_clusters];
+    let mut cluster_vecs: Vec<Vec<Vec<f32>>> = vec![Vec::new(); num_clusters];
+    let mut cluster_attrs: Vec<Vec<Option<HashMap<String, AttributeValue>>>> =
+        vec![Vec::new(); num_clusters];
+
+    for entry in vectors {
+        let mut best_dist = f32::MAX;
+        let mut best_cluster = 0usize;
+        for (c, centroid) in centroids.iter().enumerate() {
+            let d = distance::euclidean_distance(&entry.values, centroid);
+            if d < best_dist {
+                best_dist = d;
+                best_cluster = c;
+            }
+        }
+        cluster_ids[best_cluster].push(entry.id.clone());
+        cluster_vecs[best_cluster].push(entry.values.clone());
+        cluster_attrs[best_cluster].push(entry.attributes.clone());
+    }
+
+    for (i, ids) in cluster_ids.iter().enumerate() {
+        debug!(cluster = i, count = ids.len(), "cluster assignment");
+    }
+
+    // --- Step 3: Write artifacts to S3 ---
+
+    // Write centroids.
+    let centroids_data = serialize_centroids(&centroids, dim)?;
+    let ckey = centroids_key(namespace, segment_id);
+    store.put(&ckey, centroids_data).await?;
+    debug!(key = %ckey, "wrote centroids");
+
+    // Write per-cluster data.
+    for i in 0..num_clusters {
+        let cvec_data = serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?;
+        let cvec_key = cluster_key(namespace, segment_id, i);
+        store.put(&cvec_key, cvec_data).await?;
+
+        let cattr_data = serialize_attrs(&cluster_attrs[i])?;
+        let cattr_key = attrs_key(namespace, segment_id, i);
+        store.put(&cattr_key, cattr_data).await?;
+
+        debug!(cluster = i, key = %cvec_key, "wrote cluster data");
+    }
+
+    info!(
+        namespace = namespace,
+        segment_id = segment_id,
+        num_vectors = vectors.len(),
+        num_clusters = num_clusters,
+        dim = dim,
+        "IVF-Flat index build complete"
+    );
+
+    Ok(IvfFlatIndex {
+        centroids,
+        num_vectors: vectors.len(),
+        dim,
+        namespace: namespace.to_string(),
+        segment_id: segment_id.to_string(),
+    })
+}
+
+/// Load an existing IVF-Flat index from S3 artifacts.
+///
+/// Only the centroids are loaded into memory; cluster data is fetched
+/// on demand during search.
+pub async fn load_ivf_flat(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_id: &str,
+) -> Result<IvfFlatIndex> {
+    let ckey = centroids_key(namespace, segment_id);
+    let data = store.get(&ckey).await?;
+    let (centroids, dim) = deserialize_centroids(&data)?;
+
+    // Count total vectors by summing cluster sizes.
+    let num_clusters = centroids.len();
+    let mut num_vectors = 0usize;
+    for i in 0..num_clusters {
+        let cvec_key = cluster_key(namespace, segment_id, i);
+        let cluster_data = store.get(&cvec_key).await?;
+        if cluster_data.len() >= 8 {
+            let n = u32::from_le_bytes(cluster_data[0..4].try_into().unwrap()) as usize;
+            num_vectors += n;
+        }
+    }
+
+    info!(
+        namespace = namespace,
+        segment_id = segment_id,
+        num_vectors = num_vectors,
+        num_clusters = num_clusters,
+        dim = dim,
+        "loaded IVF-Flat index"
+    );
+
+    Ok(IvfFlatIndex {
+        centroids,
+        num_vectors,
+        dim,
+        namespace: namespace.to_string(),
+        segment_id: segment_id.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serialize_deserialize_centroids() {
+        let centroids = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![4.0, 5.0, 6.0],
+        ];
+        let data = serialize_centroids(&centroids, 3).unwrap();
+        let (decoded, dim) = deserialize_centroids(&data).unwrap();
+        assert_eq!(dim, 3);
+        assert_eq!(decoded, centroids);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_cluster() {
+        let ids = vec!["vec_1".to_string(), "vec_2".to_string()];
+        let vecs = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let data = serialize_cluster(&ids, &vecs, 2).unwrap();
+        let cluster = deserialize_cluster(&data).unwrap();
+        assert_eq!(cluster.ids, ids);
+        assert_eq!(cluster.vectors, vecs);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_attrs() {
+        let mut attrs_map = HashMap::new();
+        attrs_map.insert("color".to_string(), AttributeValue::String("red".to_string()));
+        let attrs = vec![Some(attrs_map), None];
+
+        let data = serialize_attrs(&attrs).unwrap();
+        let decoded = deserialize_attrs(&data).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[0].is_some());
+        assert!(decoded[1].is_none());
+    }
+
+    #[test]
+    fn test_centroids_header_too_small() {
+        let data = vec![0u8; 4]; // less than 8 bytes
+        assert!(deserialize_centroids(&data).is_err());
+    }
+
+    #[test]
+    fn test_cluster_header_too_small() {
+        let data = vec![0u8; 4];
+        assert!(deserialize_cluster(&data).is_err());
+    }
+}

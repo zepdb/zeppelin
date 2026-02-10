@@ -1,0 +1,40 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Claude working files
+claude_files/
+
+# Test artifacts
+tests/fixtures/tmp/
+
+# Cache
+/cache/
+
+# Docker volumes
+minio_data/

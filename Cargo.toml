@@ -1,0 +1,77 @@
+[package]
+name = "zeppelin"
+version = "0.1.0"
+edition = "2021"
+description = "S3-native vector search engine"
+license = "MIT"
+rust-version = "1.75"
+
+[[bin]]
+name = "zeppelin"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors", "timeout"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Storage
+object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+toml = "0.8"
+
+# IDs
+ulid = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Concurrency
+dashmap = "6"
+
+# Error handling
+thiserror = "2"
+
+# Byte buffers
+bytes = "1"
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Metrics
+prometheus = "0.13"
+
+# Config
+dotenvy = "0.15"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# URL handling
+url = "2"
+
+# Async trait
+async-trait = "0.1"
+
+# Futures
+futures = "0.3"
+
+# Random (for k-means++)
+rand = "0.8"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+rand = "0.8"
+tempfile = "3"
+tokio-test = "0.4"
+assert_approx_eq = "1"
