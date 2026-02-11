@@ -40,6 +40,7 @@ tasks/
 
 # Test artifacts
 tests/fixtures/tmp/
+*.proptest-regressions
 
 # Cache
 /cache/
