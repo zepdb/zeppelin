@@ -56,7 +56,7 @@ s3://{bucket}/{namespace}/
 
 ```
 # Vectors
-PUT    /v1/namespaces/{ns}/vectors    # upsert
+POST   /v1/namespaces/{ns}/vectors    # upsert
 DELETE /v1/namespaces/{ns}/vectors    # delete by IDs
 
 # Search
@@ -77,7 +77,7 @@ GET    /metrics                        # prometheus format
 
 ### Prerequisites
 
-- Rust 1.75+
+- Rust 1.84+
 - An S3-compatible bucket (AWS S3, MinIO, R2, GCS)
 
 ### Docker quickstart
@@ -163,4 +163,4 @@ See `.env.example` for the full list.
 
 ## License
 
-MIT
+Apache-2.0

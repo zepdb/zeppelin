@@ -100,7 +100,7 @@ class ZeppelinClient:
         payload = [
             v.to_dict() if isinstance(v, Vector) else v for v in vectors
         ]
-        data = self._put(
+        data = self._post(
             f"/v1/namespaces/{namespace}/vectors",
             json={"vectors": payload},
         )
@@ -154,10 +154,6 @@ class ZeppelinClient:
 
     def _post(self, path: str, json: dict) -> Any:
         resp = self._client.post(path, json=json)
-        return self._handle_response(resp)
-
-    def _put(self, path: str, json: dict) -> Any:
-        resp = self._client.put(path, json=json)
         return self._handle_response(resp)
 
     def _delete(self, path: str) -> Any:

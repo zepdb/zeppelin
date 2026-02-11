@@ -1,9 +1,14 @@
 # syntax=docker/dockerfile:1
 
 # ---- Builder stage ----
-FROM rust:1.75-bookworm AS builder
+FROM rust:1.84-bookworm AS builder
 
 WORKDIR /app
+
+# Install OpenSSL dev headers for static linking
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy manifests first for dependency caching
 COPY Cargo.toml Cargo.lock ./
