@@ -11,6 +11,7 @@ use zeppelin::config::Config;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::server::routes::build_router;
 use zeppelin::server::AppState;
+use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::{WalReader, WalWriter};
 
 /// Start a test server on a random port, returning (base_url, harness).
@@ -42,6 +43,13 @@ async fn start_test_server() -> (String, TestHarness) {
 /// Uses dash separator instead of slash so it works in URL path segments.
 fn api_ns(harness: &TestHarness, suffix: &str) -> String {
     format!("{}-{suffix}", harness.prefix)
+}
+
+/// Clean up all S3 objects under a namespace prefix.
+/// Needed because api_ns() names live outside the harness prefix.
+async fn cleanup_ns(store: &ZeppelinStore, ns: &str) {
+    let prefix = format!("{ns}/");
+    let _ = store.delete_prefix(&prefix).await;
 }
 
 #[tokio::test]
@@ -117,6 +125,7 @@ async fn test_namespace_crud() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 
+    // DELETE handler already cleaned up S3 objects
     harness.cleanup().await;
 }
 
@@ -147,6 +156,7 @@ async fn test_duplicate_create_409() {
         .unwrap();
     assert_eq!(resp.status(), 409);
 
+    cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
 
@@ -180,6 +190,7 @@ async fn test_vector_upsert() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["upserted"], 5);
 
+    cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
 
@@ -210,6 +221,7 @@ async fn test_dimension_mismatch_400() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
+    cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
 
@@ -259,6 +271,7 @@ async fn test_query_basic_wal_scan() {
     assert_eq!(results[0]["id"], "vec_0");
     assert!(body["scanned_fragments"].as_u64().unwrap() > 0);
 
+    cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
 
@@ -315,6 +328,7 @@ async fn test_query_with_filter() {
     assert!(ids.contains(&"v1"));
     assert!(ids.contains(&"v3"));
 
+    cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
 
@@ -351,6 +365,7 @@ async fn test_query_empty_namespace() {
     let results = body["results"].as_array().unwrap();
     assert!(results.is_empty());
 
+    cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
 
@@ -383,5 +398,6 @@ async fn test_query_dimension_mismatch() {
         .unwrap();
     assert_eq!(resp.status(), 400);
 
+    cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
