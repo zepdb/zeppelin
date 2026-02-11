@@ -153,8 +153,13 @@ impl Compactor {
                 }
             }
 
+            let elapsed = start.elapsed();
+            crate::metrics::COMPACTION_DURATION
+                .with_label_values(&[namespace])
+                .observe(elapsed.as_secs_f64());
+
             info!(
-                elapsed_ms = start.elapsed().as_millis(),
+                elapsed_ms = elapsed.as_millis(),
                 "compaction complete (all vectors deleted)"
             );
             return Ok(CompactionResult {
@@ -208,11 +213,16 @@ impl Compactor {
             None
         };
 
+        let elapsed = start.elapsed();
+        crate::metrics::COMPACTION_DURATION
+            .with_label_values(&[namespace])
+            .observe(elapsed.as_secs_f64());
+
         info!(
             segment_id = %segment_id,
             vectors_compacted,
             fragments_removed,
-            elapsed_ms = start.elapsed().as_millis(),
+            elapsed_ms = elapsed.as_millis(),
             "compaction complete"
         );
 

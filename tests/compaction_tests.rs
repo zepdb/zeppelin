@@ -3,7 +3,7 @@ mod common;
 use common::harness::TestHarness;
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 
-use zeppelin::compaction::{CompactionResult, Compactor};
+use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::index::ivf_flat::build::build_ivf_flat;
 use zeppelin::query::execute_query;
@@ -240,7 +240,7 @@ async fn test_compact_updates_manifest() {
     manifest.write(store, &ns).await.unwrap();
 
     // Append 2 fragments
-    let f1 = writer
+    let _f1 = writer
         .append(&ns, random_vectors(20, 16), vec![])
         .await
         .unwrap();

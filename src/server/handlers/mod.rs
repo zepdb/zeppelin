@@ -22,14 +22,16 @@ impl From<ZeppelinError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.0.status_code();
+        let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if status_code.is_server_error() {
+            tracing::error!(error = %self.0, status, "server error");
+        } else if status_code.is_client_error() {
+            tracing::warn!(error = %self.0, status, "client error");
+        }
         let body = json!({
             "error": self.0.to_string(),
             "status": status,
         });
-        (
-            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            axum::Json(body),
-        )
-            .into_response()
+        (status_code, axum::Json(body)).into_response()
     }
 }
