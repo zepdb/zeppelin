@@ -213,5 +213,4 @@ impl ZeppelinStore {
             .observe(elapsed.as_secs_f64());
         Ok(count)
     }
-
 }
