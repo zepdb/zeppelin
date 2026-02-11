@@ -34,9 +34,6 @@ pub enum ZeppelinError {
     NamespaceAlreadyExists { namespace: String },
 
     // Index errors
-    #[error("index not built for namespace: {namespace}")]
-    IndexNotBuilt { namespace: String },
-
     #[error("index error: {0}")]
     Index(String),
 
@@ -54,25 +51,13 @@ pub enum ZeppelinError {
     #[error("config error: {0}")]
     Config(String),
 
-    // Query errors
-    #[error("query error: {0}")]
-    Query(String),
-
     // IO errors
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    // Compaction errors
-    #[error("compaction error: {0}")]
-    Compaction(String),
-
     // Cache errors
     #[error("cache error: {0}")]
     Cache(String),
-
-    // Internal
-    #[error("internal error: {0}")]
-    Internal(String),
 }
 
 impl From<Box<bincode::ErrorKind>> for ZeppelinError {
@@ -94,9 +79,109 @@ impl ZeppelinError {
 
             ZeppelinError::DimensionMismatch { .. } | ZeppelinError::Validation(_) => 400,
 
-            ZeppelinError::IndexNotBuilt { .. } => 503,
-
             _ => 500,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_not_found_status_code() {
+        let err = ZeppelinError::NotFound {
+            key: "some/key".into(),
+        };
+        assert_eq!(err.status_code(), 404);
+    }
+
+    #[test]
+    fn test_namespace_not_found_status_code() {
+        let err = ZeppelinError::NamespaceNotFound {
+            namespace: "ns".into(),
+        };
+        assert_eq!(err.status_code(), 404);
+    }
+
+    #[test]
+    fn test_manifest_not_found_status_code() {
+        let err = ZeppelinError::ManifestNotFound {
+            namespace: "ns".into(),
+        };
+        assert_eq!(err.status_code(), 404);
+    }
+
+    #[test]
+    fn test_namespace_already_exists_status_code() {
+        let err = ZeppelinError::NamespaceAlreadyExists {
+            namespace: "ns".into(),
+        };
+        assert_eq!(err.status_code(), 409);
+    }
+
+    #[test]
+    fn test_dimension_mismatch_status_code() {
+        let err = ZeppelinError::DimensionMismatch {
+            expected: 128,
+            actual: 256,
+        };
+        assert_eq!(err.status_code(), 400);
+    }
+
+    #[test]
+    fn test_validation_status_code() {
+        let err = ZeppelinError::Validation("bad input".into());
+        assert_eq!(err.status_code(), 400);
+    }
+
+    #[test]
+    fn test_default_status_code() {
+        let err = ZeppelinError::Bincode("bad data".into());
+        assert_eq!(err.status_code(), 500);
+
+        let err = ZeppelinError::Config("missing key".into());
+        assert_eq!(err.status_code(), 500);
+
+        let err = ZeppelinError::Cache("disk full".into());
+        assert_eq!(err.status_code(), 500);
+
+        let err = ZeppelinError::Index("corrupt".into());
+        assert_eq!(err.status_code(), 500);
+    }
+
+    #[test]
+    fn test_display_formatting() {
+        let err = ZeppelinError::NotFound {
+            key: "my/key".into(),
+        };
+        assert!(err.to_string().contains("my/key"));
+
+        let err = ZeppelinError::DimensionMismatch {
+            expected: 128,
+            actual: 256,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("128"));
+        assert!(msg.contains("256"));
+
+        let err = ZeppelinError::ChecksumMismatch {
+            expected: 111,
+            actual: 222,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("111"));
+        assert!(msg.contains("222"));
+    }
+
+    #[test]
+    fn test_from_bincode_error() {
+        let bincode_err: Box<bincode::ErrorKind> =
+            Box::new(bincode::ErrorKind::Custom("test error".into()));
+        let err: ZeppelinError = bincode_err.into();
+        match &err {
+            ZeppelinError::Bincode(msg) => assert!(msg.contains("test error")),
+            other => panic!("expected Bincode, got {:?}", other),
         }
     }
 }

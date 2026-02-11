@@ -225,7 +225,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let store = rt.block_on(async {
             let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
-            ZeppelinStore::new(mem, "test".to_string())
+            ZeppelinStore::new(mem)
         });
 
         let result = rt.block_on(search_ivf_flat(
@@ -257,7 +257,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let store = rt.block_on(async {
             let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
-            ZeppelinStore::new(mem, "test".to_string())
+            ZeppelinStore::new(mem)
         });
 
         let results = rt

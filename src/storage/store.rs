@@ -13,7 +13,6 @@ use crate::error::{Result, ZeppelinError};
 #[derive(Clone)]
 pub struct ZeppelinStore {
     inner: Arc<dyn ObjectStore>,
-    bucket: String,
 }
 
 impl ZeppelinStore {
@@ -64,22 +63,12 @@ impl ZeppelinStore {
                 }
             };
 
-        Ok(Self {
-            inner: store,
-            bucket: config.bucket.clone(),
-        })
+        Ok(Self { inner: store })
     }
 
     /// Create a store directly from an ObjectStore instance (for testing).
-    pub fn new(store: Arc<dyn ObjectStore>, bucket: String) -> Self {
-        Self {
-            inner: store,
-            bucket,
-        }
-    }
-
-    pub fn bucket(&self) -> &str {
-        &self.bucket
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self { inner: store }
     }
 
     /// Put an object at the given key.
@@ -121,24 +110,6 @@ impl ZeppelinStore {
         );
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["get"])
-            .observe(elapsed.as_secs_f64());
-        Ok(bytes)
-    }
-
-    /// Get a byte range of an object.
-    #[instrument(skip(self), fields(key = key))]
-    pub async fn get_range(&self, key: &str, range: std::ops::Range<usize>) -> Result<Bytes> {
-        let start = std::time::Instant::now();
-        let path = Path::parse(key)?;
-        let bytes = self.inner.get_range(&path, range).await?;
-        let elapsed = start.elapsed();
-        debug!(
-            elapsed_ms = elapsed.as_millis(),
-            size = bytes.len(),
-            "s3 get_range"
-        );
-        crate::metrics::S3_OPERATION_DURATION
-            .with_label_values(&["get_range"])
             .observe(elapsed.as_secs_f64());
         Ok(bytes)
     }
@@ -243,8 +214,4 @@ impl ZeppelinStore {
         Ok(count)
     }
 
-    /// Get the underlying ObjectStore for advanced operations.
-    pub fn inner(&self) -> &Arc<dyn ObjectStore> {
-        &self.inner
-    }
 }
