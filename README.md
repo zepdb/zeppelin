@@ -5,6 +5,8 @@
 <p align="center">
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.84+-DEA584?logo=rust&logoColor=white" alt="Rust: 1.84+"></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <a href="https://github.com/Ghatage/zeppelin/actions/workflows/ci.yml"><img src="https://github.com/Ghatage/zeppelin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/Ghatage/zeppelin"><img src="https://codecov.io/gh/Ghatage/zeppelin/branch/main/graph/badge.svg" alt="codecov"></a>
 </p>
 <p align="center">
   An S3-native vector search engine. Object storage is the source of truth. Nodes are stateless.
