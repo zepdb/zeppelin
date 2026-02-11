@@ -21,16 +21,39 @@ pub struct WalFragment {
 }
 
 impl WalFragment {
-    /// Create a new WAL fragment with vectors and deletes.
+    /// Create a new WAL fragment, panicking if any vector ID appears in both
+    /// upserts and deletes. Per project rule: no fallbacks, crash explicitly.
     pub fn new(vectors: Vec<VectorEntry>, deletes: Vec<VectorId>) -> Self {
+        Self::try_new(vectors, deletes)
+            .expect("WalFragment::new called with overlapping vector IDs in upserts and deletes")
+    }
+
+    /// Create a new WAL fragment, returning an error if any vector ID appears
+    /// in both the upsert list and the delete list.
+    pub fn try_new(
+        vectors: Vec<VectorEntry>,
+        deletes: Vec<VectorId>,
+    ) -> std::result::Result<Self, ZeppelinError> {
+        use std::collections::HashSet;
+
+        let delete_set: HashSet<&str> = deletes.iter().map(|id| id.as_str()).collect();
+        for vec in &vectors {
+            if delete_set.contains(vec.id.as_str()) {
+                return Err(ZeppelinError::Validation(format!(
+                    "vector ID '{}' appears in both upserts and deletes within the same fragment",
+                    vec.id
+                )));
+            }
+        }
+
         let id = Ulid::new();
         let checksum = Self::compute_checksum(&vectors, &deletes);
-        Self {
+        Ok(Self {
             id,
             vectors,
             deletes,
             checksum,
-        }
+        })
     }
 
     /// Compute the checksum for a set of vectors and deletes.

@@ -140,14 +140,14 @@ fn reference_evaluate(filter: &Filter, attrs: &HashMap<String, AttributeValue>) 
             gt,
             lt,
         } => {
-            let num = match attrs.get(field).and_then(|a| ref_to_f64(a)) {
+            let num = match attrs.get(field).and_then(ref_to_f64) {
                 Some(n) => n,
                 None => return false,
             };
-            let ok_gte = gte.map_or(true, |min| num >= min);
-            let ok_lte = lte.map_or(true, |max| num <= max);
-            let ok_gt = gt.map_or(true, |min| num > min);
-            let ok_lt = lt.map_or(true, |max| num < max);
+            let ok_gte = gte.is_none_or(|min| num >= min);
+            let ok_lte = lte.is_none_or(|max| num <= max);
+            let ok_gt = gt.is_none_or(|min| num > min);
+            let ok_lt = lt.is_none_or(|max| num < max);
             ok_gte && ok_lte && ok_gt && ok_lt
         }
         Filter::In { field, values } => match attrs.get(field) {
@@ -221,12 +221,10 @@ fn arb_filter_leaf() -> impl Strategy<Value = Filter> {
 
 fn arb_filter() -> impl Strategy<Value = Filter> {
     arb_filter_leaf().prop_recursive(
-        2,  // max depth
-        8,  // max nodes
-        3,  // items per collection
-        |inner| {
-            prop::collection::vec(inner, 1..=3).prop_map(|filters| Filter::And { filters })
-        },
+        2, // max depth
+        8, // max nodes
+        3, // items per collection
+        |inner| prop::collection::vec(inner, 1..=3).prop_map(|filters| Filter::And { filters }),
     )
 }
 

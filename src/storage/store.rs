@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
 use std::sync::Arc;
 use tracing::{debug, instrument};
 
@@ -112,6 +112,78 @@ impl ZeppelinStore {
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
         Ok(bytes)
+    }
+
+    /// Get an object by key, returning data along with the ETag for CAS operations.
+    #[instrument(skip(self), fields(key = key))]
+    pub async fn get_with_meta(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+        let start = std::time::Instant::now();
+        let path = Path::parse(key)?;
+        let result = self.inner.get(&path).await.map_err(|e| {
+            crate::metrics::S3_ERRORS_TOTAL
+                .with_label_values(&["get"])
+                .inc();
+            match e {
+                object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
+                    key: path.to_string(),
+                },
+                other => ZeppelinError::Storage(other),
+            }
+        })?;
+        let etag = result.meta.e_tag.clone();
+        let bytes = result.bytes().await?;
+        let elapsed = start.elapsed();
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            size = bytes.len(),
+            etag = ?etag,
+            "s3 get_with_meta"
+        );
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["get"])
+            .observe(elapsed.as_secs_f64());
+        Ok((bytes, etag))
+    }
+
+    /// Put an object only if the ETag matches (compare-and-swap).
+    /// Returns ManifestConflict if the ETag has changed (concurrent write).
+    #[instrument(skip(self, data), fields(key = key))]
+    pub async fn put_if_match(
+        &self,
+        key: &str,
+        data: Bytes,
+        etag: &str,
+        namespace: &str,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        let path = Path::parse(key)?;
+        let options = PutOptions {
+            mode: PutMode::Update(UpdateVersion {
+                e_tag: Some(etag.to_string()),
+                version: None,
+            }),
+            ..PutOptions::default()
+        };
+        self.inner
+            .put_opts(&path, PutPayload::from(data), options)
+            .await
+            .map_err(|e| match e {
+                object_store::Error::Precondition { .. } => ZeppelinError::ManifestConflict {
+                    namespace: namespace.to_string(),
+                },
+                other => {
+                    crate::metrics::S3_ERRORS_TOTAL
+                        .with_label_values(&["put"])
+                        .inc();
+                    ZeppelinError::Storage(other)
+                }
+            })?;
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), "s3 put_if_match");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["put"])
+            .observe(elapsed.as_secs_f64());
+        Ok(())
     }
 
     /// Delete an object by key.

@@ -155,6 +155,9 @@ impl NamespaceManager {
     }
 
     /// Delete a namespace and all its data.
+    ///
+    /// Deletes manifest first so concurrent queries see `None` manifest → empty
+    /// results, rather than a manifest referencing already-deleted fragments.
     #[instrument(skip(self), fields(namespace = name))]
     pub async fn delete(&self, name: &str) -> Result<()> {
         // Verify it exists
@@ -165,16 +168,28 @@ impl NamespaceManager {
             });
         }
 
-        // Delete all objects under the namespace prefix
+        // 1. Delete manifest first — queries will see None and return empty results
+        let manifest_key = crate::wal::Manifest::s3_key(name);
+        if let Err(e) = self.store.delete(&manifest_key).await {
+            // Manifest may not exist (e.g., never initialized), log and continue
+            tracing::warn!(key = %manifest_key, error = %e, "failed to delete manifest during namespace deletion");
+        }
+
+        // 2. Delete meta.json
+        if let Err(e) = self.store.delete(&key).await {
+            tracing::warn!(key = %key, error = %e, "failed to delete meta.json during namespace deletion");
+        }
+
+        // 3. Delete remaining keys (WAL fragments, segments, etc.)
         let prefix = format!("{name}/");
         let deleted = self.store.delete_prefix(&prefix).await?;
 
-        // Remove from registry
+        // 4. Remove from registry
         self.registry.remove(name);
 
         info!(
             namespace = name,
-            objects_deleted = deleted,
+            objects_deleted = deleted + 2, // +2 for manifest and meta
             "deleted namespace"
         );
         Ok(())

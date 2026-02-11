@@ -12,6 +12,10 @@ pub struct FragmentRef {
     pub id: Ulid,
     pub vector_count: usize,
     pub delete_count: usize,
+    /// Monotonic sequence number assigned at manifest write time.
+    /// Immune to clock skew — determines merge order instead of ULID.
+    #[serde(default)]
+    pub sequence_number: u64,
 }
 
 /// A reference to an IVF segment stored on S3.
@@ -37,6 +41,12 @@ pub struct Manifest {
     /// The currently active segment (latest).
     #[serde(default)]
     pub active_segment: Option<String>,
+    /// Monotonic counter for assigning sequence numbers to fragments.
+    #[serde(default)]
+    pub next_sequence: u64,
+    /// S3 keys awaiting deferred deletion from a previous compaction cycle.
+    #[serde(default)]
+    pub pending_deletes: Vec<String>,
     /// Last time the manifest was updated.
     pub updated_at: DateTime<Utc>,
 }
@@ -49,6 +59,8 @@ impl Manifest {
             segments: Vec::new(),
             compaction_watermark: None,
             active_segment: None,
+            next_sequence: 0,
+            pending_deletes: Vec::new(),
             updated_at: Utc::now(),
         }
     }
@@ -58,8 +70,10 @@ impl Manifest {
         format!("{namespace}/manifest.json")
     }
 
-    /// Add a fragment reference.
-    pub fn add_fragment(&mut self, fref: FragmentRef) {
+    /// Add a fragment reference, assigning the next monotonic sequence number.
+    pub fn add_fragment(&mut self, mut fref: FragmentRef) {
+        fref.sequence_number = self.next_sequence;
+        self.next_sequence += 1;
         self.fragments.push(fref);
         self.updated_at = Utc::now();
     }
@@ -115,7 +129,45 @@ impl Manifest {
         let data = self.to_bytes()?;
         store.put(&key, data).await
     }
+
+    /// Read manifest from S3, returning the manifest along with its ETag version.
+    /// Returns None if not found.
+    pub async fn read_versioned(
+        store: &ZeppelinStore,
+        namespace: &str,
+    ) -> Result<Option<(Self, ManifestVersion)>> {
+        let key = Self::s3_key(namespace);
+        match store.get_with_meta(&key).await {
+            Ok((data, etag)) => {
+                let manifest = Self::from_bytes(&data)?;
+                Ok(Some((manifest, ManifestVersion(etag))))
+            }
+            Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Write manifest to S3 using conditional PUT (CAS).
+    /// If version has an ETag, uses put_if_match for optimistic concurrency.
+    /// For first-writes (no ETag), falls back to unconditional put.
+    pub async fn write_conditional(
+        &self,
+        store: &ZeppelinStore,
+        namespace: &str,
+        version: &ManifestVersion,
+    ) -> Result<()> {
+        let key = Self::s3_key(namespace);
+        let data = self.to_bytes()?;
+        match &version.0 {
+            Some(etag) => store.put_if_match(&key, data, etag, namespace).await,
+            None => store.put(&key, data).await,
+        }
+    }
 }
+
+/// Wraps the ETag for optimistic concurrency control on manifest writes.
+#[derive(Debug, Clone)]
+pub struct ManifestVersion(pub Option<String>);
 
 impl Default for Manifest {
     fn default() -> Self {

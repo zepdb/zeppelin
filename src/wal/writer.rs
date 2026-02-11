@@ -1,14 +1,17 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
-use crate::error::Result;
+use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
 use crate::types::{VectorEntry, VectorId};
 
 use super::fragment::WalFragment;
-use super::manifest::{FragmentRef, Manifest};
+use super::manifest::{FragmentRef, Manifest, ManifestVersion};
+
+/// Maximum CAS retry attempts for manifest updates.
+const MAX_CAS_RETRIES: u32 = 5;
 
 /// WAL writer with per-namespace mutexes to ensure single-writer semantics.
 pub struct WalWriter {
@@ -36,6 +39,7 @@ impl WalWriter {
 
     /// Append vectors and deletes to the WAL for a namespace.
     /// Creates a new fragment, writes it to S3, and updates the manifest.
+    /// Uses CAS (compare-and-swap) for manifest updates to prevent concurrent overwrites.
     #[instrument(skip(self, vectors, deletes), fields(namespace = namespace))]
     pub async fn append(
         &self,
@@ -64,24 +68,45 @@ impl WalWriter {
             "wrote WAL fragment"
         );
 
-        // Update the manifest
-        let mut manifest = Manifest::read(&self.store, namespace)
-            .await?
-            .unwrap_or_default();
+        // CAS retry loop for manifest update
+        for attempt in 0..MAX_CAS_RETRIES {
+            let (mut manifest, version) =
+                match Manifest::read_versioned(&self.store, namespace).await? {
+                    Some(pair) => pair,
+                    None => (Manifest::default(), ManifestVersion(None)),
+                };
 
-        manifest.add_fragment(FragmentRef {
-            id: fragment.id,
-            vector_count: fragment.vectors.len(),
-            delete_count: fragment.deletes.len(),
-        });
+            manifest.add_fragment(FragmentRef {
+                id: fragment.id,
+                vector_count: fragment.vectors.len(),
+                delete_count: fragment.deletes.len(),
+                sequence_number: 0, // assigned by add_fragment
+            });
 
-        manifest.write(&self.store, namespace).await?;
+            match manifest
+                .write_conditional(&self.store, namespace, &version)
+                .await
+            {
+                Ok(()) => {
+                    debug!(
+                        fragment_count = manifest.fragments.len(),
+                        attempt, "updated manifest"
+                    );
+                    return Ok(fragment);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => {
+                    warn!(
+                        attempt,
+                        namespace, "manifest CAS conflict in writer, retrying"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
-        debug!(
-            fragment_count = manifest.fragments.len(),
-            "updated manifest"
-        );
-
-        Ok(fragment)
+        Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
+        })
     }
 }
