@@ -9,6 +9,7 @@ use tracing::{debug, info};
 
 use crate::config::IndexingConfig;
 use crate::error::{Result, ZeppelinError};
+use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, VectorEntry};
 
@@ -312,6 +313,7 @@ pub async fn build_ivf_flat(
     }
 
     // --- Step 3: Write artifacts to S3 ---
+    let quantization = config.quantization;
 
     // Write centroids.
     let centroids_data = serialize_centroids(&centroids, dim)?;
@@ -319,7 +321,7 @@ pub async fn build_ivf_flat(
     store.put(&ckey, centroids_data).await?;
     debug!(key = %ckey, "wrote centroids");
 
-    // Write per-cluster data.
+    // Write per-cluster data (always write full-precision as ground truth).
     for i in 0..num_clusters {
         let cvec_data = serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?;
         let cvec_key = cluster_key(namespace, segment_id, i);
@@ -332,12 +334,71 @@ pub async fn build_ivf_flat(
         debug!(cluster = i, key = %cvec_key, "wrote cluster data");
     }
 
+    // --- Step 4: Write quantized artifacts (if configured) ---
+    match quantization {
+        QuantizationType::Scalar => {
+            use crate::index::quantization::sq::{
+                serialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
+            };
+
+            // Calibrate SQ8 on all vectors.
+            let cal = SqCalibration::calibrate(&vec_refs, dim);
+            let cal_bytes = cal.to_bytes();
+            store
+                .put(&sq_calibration_key(namespace, segment_id), cal_bytes)
+                .await?;
+            debug!("wrote SQ8 calibration");
+
+            // Write quantized cluster data.
+            for i in 0..num_clusters {
+                let cluster_refs: Vec<&[f32]> =
+                    cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                let codes = cal.encode_batch(&cluster_refs);
+                let sq_data =
+                    serialize_sq_cluster(&cluster_ids[i], &codes, dim)?;
+                store
+                    .put(&sq_cluster_key(namespace, segment_id, i), sq_data)
+                    .await?;
+            }
+            info!("wrote SQ8 quantized clusters");
+        }
+        QuantizationType::Product => {
+            use crate::index::quantization::pq::{
+                pq_cluster_key, pq_codebook_key, serialize_pq_cluster, PqCodebook,
+            };
+
+            let pq_m = config.pq_m;
+            // Train PQ codebook on all vectors.
+            let codebook =
+                PqCodebook::train(&vec_refs, dim, pq_m, config.kmeans_max_iterations)?;
+            let cb_bytes = codebook.to_bytes();
+            store
+                .put(&pq_codebook_key(namespace, segment_id), cb_bytes)
+                .await?;
+            debug!(m = pq_m, "wrote PQ codebook");
+
+            // Write PQ-encoded cluster data.
+            for i in 0..num_clusters {
+                let cluster_refs: Vec<&[f32]> =
+                    cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                let codes = codebook.encode_batch(&cluster_refs);
+                let pq_data = serialize_pq_cluster(&cluster_ids[i], &codes, pq_m)?;
+                store
+                    .put(&pq_cluster_key(namespace, segment_id, i), pq_data)
+                    .await?;
+            }
+            info!(m = pq_m, "wrote PQ-encoded clusters");
+        }
+        QuantizationType::None => {}
+    }
+
     info!(
         namespace = namespace,
         segment_id = segment_id,
         num_vectors = vectors.len(),
         num_clusters = num_clusters,
         dim = dim,
+        quantization = ?quantization,
         "IVF-Flat index build complete"
     );
 
@@ -347,13 +408,15 @@ pub async fn build_ivf_flat(
         dim,
         namespace: namespace.to_string(),
         segment_id: segment_id.to_string(),
+        quantization,
     })
 }
 
 /// Load an existing IVF-Flat index from S3 artifacts.
 ///
 /// Only the centroids are loaded into memory; cluster data is fetched
-/// on demand during search.
+/// on demand during search. Detects available quantization by probing
+/// for calibration/codebook artifacts.
 pub async fn load_ivf_flat(
     store: &ZeppelinStore,
     namespace: &str,
@@ -379,12 +442,31 @@ pub async fn load_ivf_flat(
         }
     }
 
+    // Detect quantization: check for PQ codebook first, then SQ calibration.
+    let quantization = {
+        use crate::index::quantization::pq::pq_codebook_key;
+        use crate::index::quantization::sq::sq_calibration_key;
+
+        let pq_key = pq_codebook_key(namespace, segment_id);
+        if store.get(&pq_key).await.is_ok() {
+            QuantizationType::Product
+        } else {
+            let sq_key = sq_calibration_key(namespace, segment_id);
+            if store.get(&sq_key).await.is_ok() {
+                QuantizationType::Scalar
+            } else {
+                QuantizationType::None
+            }
+        }
+    };
+
     info!(
         namespace = namespace,
         segment_id = segment_id,
         num_vectors = num_vectors,
         num_clusters = num_clusters,
         dim = dim,
+        quantization = ?quantization,
         "loaded IVF-Flat index"
     );
 
@@ -394,6 +476,7 @@ pub async fn load_ivf_flat(
         dim,
         namespace: namespace.to_string(),
         segment_id: segment_id.to_string(),
+        quantization,
     })
 }
 

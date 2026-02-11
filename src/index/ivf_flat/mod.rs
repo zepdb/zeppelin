@@ -32,6 +32,8 @@ pub struct IvfFlatIndex {
     pub(crate) namespace: String,
     /// Segment identifier (for constructing S3 keys).
     pub(crate) segment_id: String,
+    /// Quantization type used by this index.
+    pub(crate) quantization: crate::index::quantization::QuantizationType,
 }
 
 impl IvfFlatIndex {

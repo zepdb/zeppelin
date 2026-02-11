@@ -98,6 +98,27 @@ pub struct IndexingConfig {
     pub kmeans_convergence_epsilon: f64,
     #[serde(default = "default_oversample_factor")]
     pub oversample_factor: usize,
+    /// Quantization type for vector compression.
+    #[serde(default)]
+    pub quantization: crate::index::quantization::QuantizationType,
+    /// Number of PQ subquantizers (only used when quantization = product).
+    /// Must divide vector dimension evenly. Default: 8.
+    #[serde(default = "default_pq_m")]
+    pub pq_m: usize,
+    /// Reranking factor: how many candidates to fetch with approximate
+    /// distances before reranking with full-precision vectors.
+    /// Only used when quantization is enabled. Default: 4.
+    #[serde(default = "default_rerank_factor")]
+    pub rerank_factor: usize,
+    /// Whether to use hierarchical (multi-level centroid tree) indexing.
+    /// When true, build produces a hierarchical index instead of flat IVF.
+    /// Default: false.
+    #[serde(default)]
+    pub hierarchical: bool,
+    /// Beam width for hierarchical search (candidates kept per level).
+    /// Higher = better recall but more S3 reads. Default: 10.
+    #[serde(default = "default_beam_width")]
+    pub beam_width: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +248,15 @@ fn default_kmeans_convergence_epsilon() -> f64 {
 fn default_oversample_factor() -> usize {
     3
 }
+fn default_pq_m() -> usize {
+    8
+}
+fn default_rerank_factor() -> usize {
+    4
+}
+fn default_beam_width() -> usize {
+    10
+}
 fn default_compaction_interval() -> u64 {
     std::env::var("ZEPPELIN_COMPACTION_INTERVAL_SECS")
         .ok()
@@ -311,6 +341,11 @@ impl Default for IndexingConfig {
             kmeans_max_iterations: default_kmeans_max_iterations(),
             kmeans_convergence_epsilon: default_kmeans_convergence_epsilon(),
             oversample_factor: default_oversample_factor(),
+            quantization: Default::default(),
+            pq_m: default_pq_m(),
+            rerank_factor: default_rerank_factor(),
+            hierarchical: false,
+            beam_width: default_beam_width(),
         }
     }
 }

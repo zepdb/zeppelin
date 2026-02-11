@@ -14,6 +14,7 @@ use crate::cache::DiskCache;
 use crate::error::{Result, ZeppelinError};
 use crate::index::distance::compute_distance;
 use crate::index::filter::{evaluate_filter, oversampled_k};
+use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, DistanceMetric, Filter, SearchResult};
 
@@ -110,51 +111,18 @@ pub async fn search_ivf_flat(
     };
 
     // --- Step 3: Scan selected clusters ---
-    let mut candidates: Vec<Candidate> = Vec::new();
-
-    for &cluster_idx in &probe_clusters {
-        // Fetch cluster vector data.
-        let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
-        let cluster_data = match fetch_with_cache(cache, store, &cvec_key).await {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(cluster = cluster_idx, error = %e, "failed to read cluster, skipping");
-                continue;
-            }
-        };
-        let cluster = deserialize_cluster(&cluster_data)?;
-
-        // Fetch attributes if we need them for filtering.
-        let attrs: Option<Vec<Option<HashMap<String, AttributeValue>>>> = if filter.is_some() {
-            let akey = attrs_key(&index.namespace, &index.segment_id, cluster_idx);
-            match fetch_with_cache(cache, store, &akey).await {
-                Ok(data) => Some(deserialize_attrs(&data)?),
-                Err(e) => {
-                    warn!(cluster = cluster_idx, error = %e, "failed to read attrs, skipping filter for cluster");
-                    None
-                }
-            }
-        } else {
-            // Even without a filter, load attrs so we can return them in results.
-            let akey = attrs_key(&index.namespace, &index.segment_id, cluster_idx);
-            match fetch_with_cache(cache, store, &akey).await {
-                Ok(data) => Some(deserialize_attrs(&data)?),
-                Err(_) => None,
-            }
-        };
-
-        // Score each vector in the cluster.
-        for (j, vec) in cluster.vectors.iter().enumerate() {
-            let score = compute_distance(query, vec, distance_metric);
-            let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
-
-            candidates.push(Candidate {
-                id: cluster.ids[j].clone(),
-                score,
-                attributes: vector_attrs,
-            });
+    // Use quantized search path if quantization is available.
+    let candidates = match index.quantization {
+        QuantizationType::Scalar => {
+            scan_clusters_sq(index, &probe_clusters, query, distance_metric, filter, fetch_k, store, cache).await?
         }
-    }
+        QuantizationType::Product => {
+            scan_clusters_pq(index, &probe_clusters, query, distance_metric, filter, fetch_k, store, cache).await?
+        }
+        QuantizationType::None => {
+            scan_clusters_flat(index, &probe_clusters, query, distance_metric, filter, store, cache).await?
+        }
+    };
 
     debug!(
         total_candidates = candidates.len(),
@@ -163,7 +131,8 @@ pub async fn search_ivf_flat(
     );
 
     // --- Step 4: Sort all candidates by distance ---
-    candidates.sort_by(|a, b| {
+    let mut sorted = candidates;
+    sorted.sort_by(|a, b| {
         a.score
             .partial_cmp(&b.score)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -171,7 +140,7 @@ pub async fn search_ivf_flat(
 
     // --- Step 5: Apply post-filter if present ---
     let results: Vec<SearchResult> = if let Some(f) = filter {
-        candidates
+        sorted
             .into_iter()
             .filter(|c| {
                 match &c.attributes {
@@ -187,7 +156,7 @@ pub async fn search_ivf_flat(
             })
             .collect()
     } else {
-        candidates
+        sorted
             .into_iter()
             .take(top_k)
             .map(|c| SearchResult {
@@ -203,6 +172,279 @@ pub async fn search_ivf_flat(
     Ok(results)
 }
 
+/// Scan clusters using full-precision vectors (no quantization).
+async fn scan_clusters_flat(
+    index: &IvfFlatIndex,
+    probe_clusters: &[usize],
+    query: &[f32],
+    distance_metric: DistanceMetric,
+    filter: Option<&Filter>,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Result<Vec<Candidate>> {
+    let mut candidates = Vec::new();
+
+    for &cluster_idx in probe_clusters {
+        let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+        let cluster_data = match fetch_with_cache(cache, store, &cvec_key).await {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(cluster = cluster_idx, error = %e, "failed to read cluster, skipping");
+                continue;
+            }
+        };
+        let cluster = deserialize_cluster(&cluster_data)?;
+
+        let attrs = load_attrs(index, cluster_idx, filter, store, cache).await;
+
+        for (j, vec) in cluster.vectors.iter().enumerate() {
+            let score = compute_distance(query, vec, distance_metric);
+            let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
+
+            candidates.push(Candidate {
+                id: cluster.ids[j].clone(),
+                score,
+                attributes: vector_attrs,
+            });
+        }
+    }
+
+    Ok(candidates)
+}
+
+/// Scan clusters using SQ8 quantized distances, then rerank top candidates
+/// with full-precision vectors.
+async fn scan_clusters_sq(
+    index: &IvfFlatIndex,
+    probe_clusters: &[usize],
+    query: &[f32],
+    distance_metric: DistanceMetric,
+    filter: Option<&Filter>,
+    fetch_k: usize,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Result<Vec<Candidate>> {
+    use crate::index::quantization::sq::{
+        deserialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
+    };
+
+    // Load SQ calibration.
+    let cal_key = sq_calibration_key(&index.namespace, &index.segment_id);
+    let cal_data = fetch_with_cache(cache, store, &cal_key).await?;
+    let calibration = SqCalibration::from_bytes(&cal_data)?;
+
+    // Phase 1: Coarse ranking with quantized distances.
+    let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new(); // (id, approx_score, cluster_idx)
+
+    for &cluster_idx in probe_clusters {
+        let sq_key = sq_cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+        let sq_data = match fetch_with_cache(cache, store, &sq_key).await {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(cluster = cluster_idx, error = %e, "failed to read SQ cluster, falling back to flat");
+                // Fallback: use full-precision for this cluster.
+                let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+                if let Ok(data) = fetch_with_cache(cache, store, &cvec_key).await {
+                    let cluster = deserialize_cluster(&data)?;
+                    for (j, vec) in cluster.vectors.iter().enumerate() {
+                        let score = compute_distance(query, vec, distance_metric);
+                        coarse_candidates.push((cluster.ids[j].clone(), score, cluster_idx));
+                    }
+                }
+                continue;
+            }
+        };
+        let sq_cluster = deserialize_sq_cluster(&sq_data)?;
+
+        for (j, codes) in sq_cluster.codes.iter().enumerate() {
+            let approx_score = calibration.asymmetric_distance(query, codes, distance_metric);
+            coarse_candidates.push((sq_cluster.ids[j].clone(), approx_score, cluster_idx));
+        }
+    }
+
+    // Sort by approximate distance and take top candidates for reranking.
+    coarse_candidates.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Rerank factor: take more candidates than needed for full-precision reranking.
+    let rerank_count = fetch_k * 4; // 4x reranking factor
+    coarse_candidates.truncate(rerank_count);
+
+    debug!(
+        coarse_candidates = coarse_candidates.len(),
+        rerank_count = rerank_count,
+        "SQ8 coarse ranking complete, starting rerank"
+    );
+
+    // Phase 2: Rerank with full-precision vectors.
+    // Group candidates by cluster for batch loading.
+    let mut cluster_candidates: HashMap<usize, Vec<String>> = HashMap::new();
+    for (id, _, cluster_idx) in &coarse_candidates {
+        cluster_candidates
+            .entry(*cluster_idx)
+            .or_default()
+            .push(id.clone());
+    }
+
+    let mut candidates = Vec::new();
+
+    for (cluster_idx, needed_ids) in &cluster_candidates {
+        let cvec_key = cluster_key(&index.namespace, &index.segment_id, *cluster_idx);
+        let cluster_data = match fetch_with_cache(cache, store, &cvec_key).await {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        let cluster = deserialize_cluster(&cluster_data)?;
+        let attrs = load_attrs(index, *cluster_idx, filter, store, cache).await;
+
+        let needed_set: std::collections::HashSet<&str> =
+            needed_ids.iter().map(|s| s.as_str()).collect();
+
+        for (j, id) in cluster.ids.iter().enumerate() {
+            if needed_set.contains(id.as_str()) {
+                let score = compute_distance(query, &cluster.vectors[j], distance_metric);
+                let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
+                candidates.push(Candidate {
+                    id: id.clone(),
+                    score,
+                    attributes: vector_attrs,
+                });
+            }
+        }
+    }
+
+    Ok(candidates)
+}
+
+/// Scan clusters using PQ-encoded distances with ADC lookup tables,
+/// then rerank top candidates with full-precision vectors.
+async fn scan_clusters_pq(
+    index: &IvfFlatIndex,
+    probe_clusters: &[usize],
+    query: &[f32],
+    distance_metric: DistanceMetric,
+    filter: Option<&Filter>,
+    fetch_k: usize,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Result<Vec<Candidate>> {
+    use crate::index::quantization::pq::{
+        deserialize_pq_cluster, pq_cluster_key, pq_codebook_key, PqCodebook,
+    };
+
+    // Load PQ codebook.
+    let cb_key = pq_codebook_key(&index.namespace, &index.segment_id);
+    let cb_data = fetch_with_cache(cache, store, &cb_key).await?;
+    let codebook = PqCodebook::from_bytes(&cb_data)?;
+
+    // Precompute ADC lookup table.
+    let adc_table = codebook.build_adc_table(query, distance_metric);
+
+    // Phase 1: Coarse ranking with PQ distances.
+    let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
+
+    for &cluster_idx in probe_clusters {
+        let pq_key = pq_cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+        let pq_data = match fetch_with_cache(cache, store, &pq_key).await {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(cluster = cluster_idx, error = %e, "failed to read PQ cluster, skipping");
+                continue;
+            }
+        };
+        let pq_cluster = deserialize_pq_cluster(&pq_data)?;
+
+        for (j, codes) in pq_cluster.codes.iter().enumerate() {
+            let approx_score = codebook.adc_distance(&adc_table, codes);
+            coarse_candidates.push((pq_cluster.ids[j].clone(), approx_score, cluster_idx));
+        }
+    }
+
+    // Sort and take top candidates for reranking.
+    coarse_candidates.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let rerank_count = fetch_k * 4;
+    coarse_candidates.truncate(rerank_count);
+
+    debug!(
+        coarse_candidates = coarse_candidates.len(),
+        "PQ coarse ranking complete, starting rerank"
+    );
+
+    // Phase 2: Rerank with full-precision vectors.
+    let mut cluster_candidates: HashMap<usize, Vec<String>> = HashMap::new();
+    for (id, _, cluster_idx) in &coarse_candidates {
+        cluster_candidates
+            .entry(*cluster_idx)
+            .or_default()
+            .push(id.clone());
+    }
+
+    let mut candidates = Vec::new();
+
+    for (cluster_idx, needed_ids) in &cluster_candidates {
+        let cvec_key = cluster_key(&index.namespace, &index.segment_id, *cluster_idx);
+        let cluster_data = match fetch_with_cache(cache, store, &cvec_key).await {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        let cluster = deserialize_cluster(&cluster_data)?;
+        let attrs = load_attrs(index, *cluster_idx, filter, store, cache).await;
+
+        let needed_set: std::collections::HashSet<&str> =
+            needed_ids.iter().map(|s| s.as_str()).collect();
+
+        for (j, id) in cluster.ids.iter().enumerate() {
+            if needed_set.contains(id.as_str()) {
+                let score = compute_distance(query, &cluster.vectors[j], distance_metric);
+                let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
+                candidates.push(Candidate {
+                    id: id.clone(),
+                    score,
+                    attributes: vector_attrs,
+                });
+            }
+        }
+    }
+
+    Ok(candidates)
+}
+
+/// Load attribute data for a cluster. Shared helper for all scan methods.
+async fn load_attrs(
+    index: &IvfFlatIndex,
+    cluster_idx: usize,
+    filter: Option<&Filter>,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Option<Vec<Option<HashMap<String, AttributeValue>>>> {
+    let akey = attrs_key(&index.namespace, &index.segment_id, cluster_idx);
+    if filter.is_some() {
+        match fetch_with_cache(cache, store, &akey).await {
+            Ok(data) => match deserialize_attrs(&data) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    warn!(cluster = cluster_idx, error = %e, "failed to parse attrs");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(cluster = cluster_idx, error = %e, "failed to read attrs");
+                None
+            }
+        }
+    } else {
+        // Load attrs for result enrichment even without filters.
+        match fetch_with_cache(cache, store, &akey).await {
+            Ok(data) => deserialize_attrs(&data).ok(),
+            Err(_) => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +456,7 @@ mod tests {
             dim: 2,
             namespace: "test_ns".to_string(),
             segment_id: "seg_001".to_string(),
+            quantization: QuantizationType::None,
         }
     }
 

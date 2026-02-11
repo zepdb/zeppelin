@@ -7,6 +7,7 @@ use crate::cache::DiskCache;
 use crate::error::Result;
 use crate::index::distance::compute_distance;
 use crate::index::filter::evaluate_filter;
+use crate::index::HierarchicalIndex;
 use crate::index::IvfFlatIndex;
 use crate::server::handlers::query::QueryResponse;
 use crate::storage::ZeppelinStore;
@@ -190,7 +191,10 @@ async fn wal_scan(
     Ok((results, frag_count))
 }
 
-/// Search a single segment via the IVF-Flat index.
+/// Search a single segment via IVF-Flat or Hierarchical index.
+///
+/// Detection: if a `tree_meta.json` exists for the segment, use hierarchical
+/// search; otherwise fall back to IVF-Flat.
 #[allow(clippy::too_many_arguments)]
 async fn segment_search(
     store: &ZeppelinStore,
@@ -204,8 +208,27 @@ async fn segment_search(
     oversample_factor: usize,
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<SearchResult>> {
-    let index = IvfFlatIndex::load(store, namespace, segment_id).await?;
+    // Detect hierarchical index by probing for tree_meta.json.
+    let tree_meta_key = crate::index::hierarchical::tree_meta_key(namespace, segment_id);
+    if store.get(&tree_meta_key).await.is_ok() {
+        let index = HierarchicalIndex::load(store, namespace, segment_id).await?;
+        use crate::index::hierarchical::search::search_hierarchical;
+        let results = search_hierarchical(
+            &index,
+            query,
+            top_k,
+            nprobe, // beam_width uses nprobe
+            filter,
+            distance_metric,
+            store,
+            oversample_factor,
+            cache,
+        )
+        .await?;
+        return Ok(results);
+    }
 
+    let index = IvfFlatIndex::load(store, namespace, segment_id).await?;
     use crate::index::ivf_flat::search::search_ivf_flat;
     let results = search_ivf_flat(
         &index,

@@ -24,6 +24,12 @@ pub struct SegmentRef {
     pub id: String,
     pub vector_count: usize,
     pub cluster_count: usize,
+    /// Quantization method used for this segment.
+    #[serde(default)]
+    pub quantization: crate::index::quantization::QuantizationType,
+    /// Whether this segment uses a hierarchical index.
+    #[serde(default)]
+    pub hierarchical: bool,
 }
 
 /// The manifest is the single source of truth for what data exists

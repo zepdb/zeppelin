@@ -32,6 +32,8 @@ pub enum AttributeValue {
     Float(f64),
     Bool(bool),
     StringList(Vec<String>),
+    IntegerList(Vec<i64>),
+    FloatList(Vec<f64>),
 }
 
 /// A vector entry with its ID, values, and optional attributes.
@@ -60,6 +62,11 @@ pub enum Filter {
         field: String,
         value: AttributeValue,
     },
+    #[serde(rename = "not_eq")]
+    NotEq {
+        field: String,
+        value: AttributeValue,
+    },
     Range {
         field: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,8 +82,23 @@ pub enum Filter {
         field: String,
         values: Vec<AttributeValue>,
     },
+    #[serde(rename = "not_in")]
+    NotIn {
+        field: String,
+        values: Vec<AttributeValue>,
+    },
     And {
         filters: Vec<Filter>,
+    },
+    Or {
+        filters: Vec<Filter>,
+    },
+    Not {
+        filter: Box<Filter>,
+    },
+    Contains {
+        field: String,
+        value: AttributeValue,
     },
 }
 
@@ -97,6 +119,12 @@ pub enum ConsistencyLevel {
 pub enum IndexType {
     #[default]
     IvfFlat,
+    /// IVF-Flat with Scalar Quantization (4x compression).
+    IvfSq,
+    /// IVF with Product Quantization (16-32x compression).
+    IvfPq,
+    /// Hierarchical ANN index (multi-level centroid tree).
+    Hierarchical,
 }
 
 #[cfg(test)]
@@ -290,5 +318,145 @@ mod tests {
         assert!(!json.contains("attributes"));
         let back: SearchResult = serde_json::from_str(&json).unwrap();
         assert!(back.attributes.is_none());
+    }
+
+    // --- New filter operator serde tests ---
+
+    #[test]
+    fn test_filter_not_eq_serde() {
+        let f = Filter::NotEq {
+            field: "status".into(),
+            value: AttributeValue::String("deleted".into()),
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"op\":\"not_eq\""));
+        let back: Filter = serde_json::from_str(&json).unwrap();
+        match back {
+            Filter::NotEq { field, value } => {
+                assert_eq!(field, "status");
+                assert_eq!(value, AttributeValue::String("deleted".into()));
+            }
+            _ => panic!("expected NotEq"),
+        }
+    }
+
+    #[test]
+    fn test_filter_not_in_serde() {
+        let f = Filter::NotIn {
+            field: "category".into(),
+            values: vec![
+                AttributeValue::String("spam".into()),
+                AttributeValue::String("junk".into()),
+            ],
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"op\":\"not_in\""));
+        let back: Filter = serde_json::from_str(&json).unwrap();
+        match back {
+            Filter::NotIn { field, values } => {
+                assert_eq!(field, "category");
+                assert_eq!(values.len(), 2);
+            }
+            _ => panic!("expected NotIn"),
+        }
+    }
+
+    #[test]
+    fn test_filter_or_serde() {
+        let f = Filter::Or {
+            filters: vec![
+                Filter::Eq {
+                    field: "a".into(),
+                    value: AttributeValue::Integer(1),
+                },
+                Filter::Eq {
+                    field: "b".into(),
+                    value: AttributeValue::Integer(2),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"op\":\"or\""));
+        let back: Filter = serde_json::from_str(&json).unwrap();
+        match back {
+            Filter::Or { filters } => assert_eq!(filters.len(), 2),
+            _ => panic!("expected Or"),
+        }
+    }
+
+    #[test]
+    fn test_filter_not_serde() {
+        let f = Filter::Not {
+            filter: Box::new(Filter::Eq {
+                field: "active".into(),
+                value: AttributeValue::Bool(false),
+            }),
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"op\":\"not\""));
+        let back: Filter = serde_json::from_str(&json).unwrap();
+        match back {
+            Filter::Not { filter } => match *filter {
+                Filter::Eq { field, value } => {
+                    assert_eq!(field, "active");
+                    assert_eq!(value, AttributeValue::Bool(false));
+                }
+                _ => panic!("expected inner Eq"),
+            },
+            _ => panic!("expected Not"),
+        }
+    }
+
+    #[test]
+    fn test_filter_contains_serde() {
+        let f = Filter::Contains {
+            field: "tags".into(),
+            value: AttributeValue::String("rust".into()),
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"op\":\"contains\""));
+        let back: Filter = serde_json::from_str(&json).unwrap();
+        match back {
+            Filter::Contains { field, value } => {
+                assert_eq!(field, "tags");
+                assert_eq!(value, AttributeValue::String("rust".into()));
+            }
+            _ => panic!("expected Contains"),
+        }
+    }
+
+    // --- New attribute type serde tests ---
+
+    #[test]
+    fn test_integer_list_serde() {
+        let val = AttributeValue::IntegerList(vec![1, 2, 3]);
+        let json = serde_json::to_string(&val).unwrap();
+        assert_eq!(json, "[1,2,3]");
+        let back: AttributeValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, val);
+    }
+
+    #[test]
+    fn test_float_list_serde() {
+        let val = AttributeValue::FloatList(vec![1.5, 2.5]);
+        let json = serde_json::to_string(&val).unwrap();
+        assert_eq!(json, "[1.5,2.5]");
+        let back: AttributeValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, val);
+    }
+
+    #[test]
+    fn test_index_type_serde_roundtrip() {
+        for (variant, expected) in [
+            (IndexType::IvfFlat, "\"ivf_flat\""),
+            (IndexType::IvfSq, "\"ivf_sq\""),
+            (IndexType::IvfPq, "\"ivf_pq\""),
+            (IndexType::Hierarchical, "\"hierarchical\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, expected);
+            let back: IndexType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
     }
 }

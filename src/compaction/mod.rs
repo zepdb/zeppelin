@@ -7,6 +7,7 @@ use ulid::Ulid;
 
 use crate::config::{CompactionConfig, IndexingConfig};
 use crate::error::{Result, ZeppelinError};
+use crate::index::hierarchical::build::build_hierarchical;
 use crate::index::ivf_flat::build::{
     attrs_key, build_ivf_flat, cluster_key, deserialize_attrs, deserialize_cluster,
 };
@@ -254,15 +255,29 @@ impl Compactor {
         // 7. Generate new segment ID
         let segment_id = format!("seg_{}", Ulid::new());
 
-        // 8. Build IVF-Flat index (expensive, done once — NOT retried)
-        let index = build_ivf_flat(
-            &vectors,
-            &self.indexing_config,
-            &self.store,
-            namespace,
-            &segment_id,
-        )
-        .await?;
+        // 8. Build index (expensive, done once — NOT retried)
+        // Choose hierarchical or flat based on config.
+        let (cluster_count, is_hierarchical) = if self.indexing_config.hierarchical {
+            let h_index = build_hierarchical(
+                &vectors,
+                &self.indexing_config,
+                &self.store,
+                namespace,
+                &segment_id,
+            )
+            .await?;
+            (h_index.num_leaf_clusters(), true)
+        } else {
+            let index = build_ivf_flat(
+                &vectors,
+                &self.indexing_config,
+                &self.store,
+                namespace,
+                &segment_id,
+            )
+            .await?;
+            (index.num_clusters(), false)
+        };
 
         // 9. CAS loop: re-read manifest, apply changes, write conditionally
         for attempt in 0..MAX_CAS_RETRIES {
@@ -287,7 +302,9 @@ impl Compactor {
             fresh_manifest.add_segment(SegmentRef {
                 id: segment_id.clone(),
                 vector_count: vectors_compacted,
-                cluster_count: index.num_clusters(),
+                cluster_count,
+                quantization: self.indexing_config.quantization,
+                hierarchical: is_hierarchical,
             });
             fresh_manifest.remove_compacted_fragments(last_fragment_id);
             fresh_manifest.pending_deletes = deferred_deletes.clone();

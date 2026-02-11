@@ -398,6 +398,8 @@ async fn test_compact_with_existing_segment() {
         id: old_seg_id.to_string(),
         vector_count: 50,
         cluster_count: 4,
+        quantization: Default::default(),
+        hierarchical: false,
     });
     manifest.write(store, &ns).await.unwrap();
 
