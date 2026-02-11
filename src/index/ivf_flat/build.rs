@@ -322,6 +322,7 @@ pub async fn build_ivf_flat(
     debug!(key = %ckey, "wrote centroids");
 
     // Write per-cluster data (always write full-precision as ground truth).
+    let mut bitmap_fields_set = std::collections::HashSet::new();
     for i in 0..num_clusters {
         let cvec_data = serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?;
         let cvec_key = cluster_key(namespace, segment_id, i);
@@ -331,8 +332,22 @@ pub async fn build_ivf_flat(
         let cattr_key = attrs_key(namespace, segment_id, i);
         store.put(&cattr_key, cattr_data).await?;
 
+        // Build and write bitmap index for this cluster.
+        if config.bitmap_index {
+            let attr_refs: Vec<Option<&HashMap<String, AttributeValue>>> =
+                cluster_attrs[i].iter().map(|a| a.as_ref()).collect();
+            let bitmap_index = crate::index::bitmap::build::build_cluster_bitmaps(&attr_refs);
+            for field_name in bitmap_index.fields.keys() {
+                bitmap_fields_set.insert(field_name.clone());
+            }
+            let bitmap_data = bitmap_index.to_bytes()?;
+            let bkey = crate::index::bitmap::bitmap_key(namespace, segment_id, i);
+            store.put(&bkey, bitmap_data).await?;
+        }
+
         debug!(cluster = i, key = %cvec_key, "wrote cluster data");
     }
+    let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
 
     // --- Step 4: Write quantized artifacts (if configured) ---
     match quantization {
@@ -409,6 +424,7 @@ pub async fn build_ivf_flat(
         namespace: namespace.to_string(),
         segment_id: segment_id.to_string(),
         quantization,
+        bitmap_fields,
     })
 }
 
@@ -477,6 +493,7 @@ pub async fn load_ivf_flat(
         namespace: namespace.to_string(),
         segment_id: segment_id.to_string(),
         quantization,
+        bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
     })
 }
 

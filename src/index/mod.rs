@@ -3,6 +3,7 @@
 //! Provides the `VectorIndex` trait, distance functions, post-filter
 //! evaluation, quantization schemes, and concrete index implementations.
 
+pub mod bitmap;
 pub mod distance;
 pub mod f16_storage;
 pub mod filter;

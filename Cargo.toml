@@ -73,6 +73,9 @@ rand = "0.8"
 # Half-precision floats (f16)
 half = { version = "2", features = ["std", "serde"] }
 
+# Bitmap indexes (pre-filter)
+roaring = { version = "0.10", features = ["serde"] }
+
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
 rand = "0.8"

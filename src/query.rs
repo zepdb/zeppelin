@@ -66,6 +66,13 @@ pub async fn execute_query(
     // Segment search
     let segment_start = std::time::Instant::now();
     let segment_results = if let Some(ref segment_id) = manifest.active_segment {
+        // Look up bitmap_fields from the manifest's SegmentRef.
+        let bitmap_fields = manifest
+            .segments
+            .iter()
+            .find(|s| s.id == *segment_id)
+            .map(|s| s.bitmap_fields.clone())
+            .unwrap_or_default();
         let results = segment_search(
             store,
             namespace,
@@ -77,6 +84,7 @@ pub async fn execute_query(
             distance_metric,
             oversample_factor,
             cache,
+            &bitmap_fields,
         )
         .await?;
         scanned_segments = 1;
@@ -207,11 +215,13 @@ async fn segment_search(
     distance_metric: DistanceMetric,
     oversample_factor: usize,
     cache: Option<&Arc<DiskCache>>,
+    bitmap_fields: &[String],
 ) -> Result<Vec<SearchResult>> {
     // Detect hierarchical index by probing for tree_meta.json.
     let tree_meta_key = crate::index::hierarchical::tree_meta_key(namespace, segment_id);
     if store.get(&tree_meta_key).await.is_ok() {
-        let index = HierarchicalIndex::load(store, namespace, segment_id).await?;
+        let mut index = HierarchicalIndex::load(store, namespace, segment_id).await?;
+        index.bitmap_fields = bitmap_fields.to_vec();
         use crate::index::hierarchical::search::search_hierarchical;
         let results = search_hierarchical(
             &index,
@@ -228,7 +238,8 @@ async fn segment_search(
         return Ok(results);
     }
 
-    let index = IvfFlatIndex::load(store, namespace, segment_id).await?;
+    let mut index = IvfFlatIndex::load(store, namespace, segment_id).await?;
+    index.bitmap_fields = bitmap_fields.to_vec();
     use crate::index::ivf_flat::search::search_ivf_flat;
     let results = search_ivf_flat(
         &index,

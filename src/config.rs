@@ -119,6 +119,16 @@ pub struct IndexingConfig {
     /// Higher = better recall but more S3 reads. Default: 10.
     #[serde(default = "default_beam_width")]
     pub beam_width: usize,
+    /// Maximum vectors per leaf cluster in hierarchical index.
+    /// When `None`, uses the default of 1000. Set to a small value
+    /// (e.g., 5–10) in tests to force multi-level trees with small datasets.
+    #[serde(default)]
+    pub leaf_size: Option<usize>,
+    /// Whether to build bitmap indexes for pre-filtering.
+    /// When true, each cluster gets a roaring bitmap index per attribute field,
+    /// enabling filter evaluation before distance computation.
+    #[serde(default = "default_bitmap_index")]
+    pub bitmap_index: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +267,9 @@ fn default_rerank_factor() -> usize {
 fn default_beam_width() -> usize {
     10
 }
+fn default_bitmap_index() -> bool {
+    true
+}
 fn default_compaction_interval() -> u64 {
     std::env::var("ZEPPELIN_COMPACTION_INTERVAL_SECS")
         .ok()
@@ -346,6 +359,8 @@ impl Default for IndexingConfig {
             rerank_factor: default_rerank_factor(),
             hierarchical: false,
             beam_width: default_beam_width(),
+            leaf_size: None,
+            bitmap_index: default_bitmap_index(),
         }
     }
 }

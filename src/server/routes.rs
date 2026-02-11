@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -33,6 +34,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/namespaces/:ns/query", post(query::query_namespace))
         .layer(axum::middleware::from_fn(middleware::http_metrics))
         .layer(TimeoutLayer::new(timeout))
+        .layer(DefaultBodyLimit::max(
+            state.config.server.max_request_body_mb * 1024 * 1024,
+        ))
         .layer(RequestBodyLimitLayer::new(
             state.config.server.max_request_body_mb * 1024 * 1024,
         ))

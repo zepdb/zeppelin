@@ -400,6 +400,7 @@ async fn test_compact_with_existing_segment() {
         cluster_count: 4,
         quantization: Default::default(),
         hierarchical: false,
+        bitmap_fields: Vec::new(),
     });
     manifest.write(store, &ns).await.unwrap();
 

@@ -70,7 +70,10 @@ pub async fn build_hierarchical(
     }
 
     let branching_factor = config.default_num_centroids.min(vectors.len());
-    let leaf_size = DEFAULT_LEAF_SIZE.max(branching_factor * 2);
+    let leaf_size = config
+        .leaf_size
+        .unwrap_or(DEFAULT_LEAF_SIZE)
+        .max(branching_factor * 2);
 
     info!(
         n = vectors.len(),
@@ -123,6 +126,8 @@ pub async fn build_hierarchical(
         }
     };
 
+    info!(num_leaf_clusters = next_cluster_idx, "hierarchical tree partitioning complete");
+
     // Write quantized artifacts if configured.
     write_quantized_artifacts(
         vectors,
@@ -159,13 +164,30 @@ pub async fn build_hierarchical(
         num_leaf_clusters = next_cluster_idx,
         total_vectors = vectors.len(),
         root_node_id = %root_node_id,
+        quantization = ?config.quantization,
         "hierarchical index build complete"
     );
+
+    // Collect bitmap field names from the built bitmaps.
+    let bitmap_fields = if config.bitmap_index && next_cluster_idx > 0 {
+        // Read back the first cluster's bitmap to get field names.
+        let bkey = crate::index::bitmap::bitmap_key(namespace, segment_id, 0);
+        match store.get(&bkey).await {
+            Ok(data) => match crate::index::bitmap::ClusterBitmapIndex::from_bytes(&data) {
+                Ok(idx) => idx.fields.keys().cloned().collect(),
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
 
     Ok(HierarchicalIndex {
         meta,
         namespace: namespace.to_string(),
         segment_id: segment_id.to_string(),
+        bitmap_fields,
     })
 }
 
@@ -192,7 +214,7 @@ async fn build_subtree(
             *max_depth = depth;
         }
 
-        write_leaf_cluster(vectors, dim, cluster_idx, store, namespace, segment_id).await?;
+        write_leaf_cluster(vectors, dim, cluster_idx, store, namespace, segment_id, config.bitmap_index).await?;
 
         debug!(
             cluster_idx,
@@ -228,6 +250,10 @@ async fn build_subtree(
             }
         }
         assignments[best_c].push(i);
+    }
+
+    for (i, a) in assignments.iter().enumerate() {
+        debug!(cluster = i, count = a.len(), depth, "cluster assignment");
     }
 
     // Build child subtrees.
@@ -306,6 +332,7 @@ async fn write_leaf_cluster(
     store: &ZeppelinStore,
     namespace: &str,
     segment_id: &str,
+    bitmap_index_enabled: bool,
 ) -> Result<()> {
     let ids: Vec<String> = vectors.iter().map(|v| v.id.clone()).collect();
     let vecs: Vec<Vec<f32>> = vectors.iter().map(|v| v.values.clone()).collect();
@@ -321,6 +348,16 @@ async fn write_leaf_cluster(
     store
         .put(&attrs_key(namespace, segment_id, cluster_idx), cattr_data)
         .await?;
+
+    // Build and write bitmap index for this leaf cluster.
+    if bitmap_index_enabled {
+        let attr_refs: Vec<Option<&HashMap<String, AttributeValue>>> =
+            attrs.iter().map(|a| a.as_ref()).collect();
+        let bitmap_idx = crate::index::bitmap::build::build_cluster_bitmaps(&attr_refs);
+        let bitmap_data = bitmap_idx.to_bytes()?;
+        let bkey = crate::index::bitmap::bitmap_key(namespace, segment_id, cluster_idx);
+        store.put(&bkey, bitmap_data).await?;
+    }
 
     Ok(())
 }
@@ -351,6 +388,7 @@ async fn write_quantized_artifacts(
                     cal.to_bytes(),
                 )
                 .await?;
+            debug!("wrote SQ8 calibration");
 
             // Re-read each leaf cluster and write quantized version.
             for i in 0..num_clusters {
@@ -381,6 +419,7 @@ async fn write_quantized_artifacts(
                     codebook.to_bytes(),
                 )
                 .await?;
+            debug!(m = config.pq_m, "wrote PQ codebook");
 
             for i in 0..num_clusters {
                 let cluster_data = store.get(&cluster_key(namespace, segment_id, i)).await?;
@@ -439,5 +478,6 @@ pub async fn load_hierarchical(
         meta,
         namespace: namespace.to_string(),
         segment_id: segment_id.to_string(),
+        bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
     })
 }

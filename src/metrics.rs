@@ -47,6 +47,39 @@ lazy_static::lazy_static! {
     pub static ref ACTIVE_QUERIES: IntGauge = register_int_gauge!(
         "zeppelin_active_queries", "Number of in-flight queries"
     ).unwrap();
+    pub static ref INDEX_BUILD_DURATION: HistogramVec = register_histogram_vec!(
+        "zeppelin_index_build_duration_seconds", "Index build duration",
+        &["namespace", "index_type"],
+        vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]
+    ).unwrap();
+
+    // Bitmap index metrics
+    pub static ref BITMAP_BUILD_DURATION: HistogramVec = register_histogram_vec!(
+        "zeppelin_bitmap_build_duration_seconds", "Bitmap index build duration",
+        &["namespace"],
+        vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0]
+    ).unwrap();
+    pub static ref BITMAP_EVAL_DURATION: HistogramVec = register_histogram_vec!(
+        "zeppelin_bitmap_eval_duration_seconds", "Bitmap filter evaluation duration",
+        &["namespace"],
+        vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]
+    ).unwrap();
+    pub static ref BITMAP_VECTORS_SKIPPED: IntCounterVec = register_int_counter_vec!(
+        "zeppelin_bitmap_vectors_skipped_total", "Vectors skipped by bitmap pre-filter",
+        &["namespace"]
+    ).unwrap();
+    pub static ref BITMAP_FIELDS_BUILT: IntCounterVec = register_int_counter_vec!(
+        "zeppelin_bitmap_fields_built_total", "Fields included in bitmap index",
+        &["namespace"]
+    ).unwrap();
+    pub static ref BITMAP_PREFILTER_USED: IntCounterVec = register_int_counter_vec!(
+        "zeppelin_bitmap_prefilter_used_total", "Times bitmap pre-filter was used",
+        &["namespace"]
+    ).unwrap();
+    pub static ref BITMAP_FALLBACK_POSTFILTER: IntCounterVec = register_int_counter_vec!(
+        "zeppelin_bitmap_fallback_postfilter_total", "Times bitmap fell back to post-filter",
+        &["namespace"]
+    ).unwrap();
 }
 
 /// RAII guard that decrements an IntGauge on drop.
@@ -71,4 +104,11 @@ pub fn init() {
     lazy_static::initialize(&CACHE_ENTRIES);
     lazy_static::initialize(&CACHE_EVICTIONS_TOTAL);
     lazy_static::initialize(&ACTIVE_QUERIES);
+    lazy_static::initialize(&INDEX_BUILD_DURATION);
+    lazy_static::initialize(&BITMAP_BUILD_DURATION);
+    lazy_static::initialize(&BITMAP_EVAL_DURATION);
+    lazy_static::initialize(&BITMAP_VECTORS_SKIPPED);
+    lazy_static::initialize(&BITMAP_FIELDS_BUILT);
+    lazy_static::initialize(&BITMAP_PREFILTER_USED);
+    lazy_static::initialize(&BITMAP_FALLBACK_POSTFILTER);
 }

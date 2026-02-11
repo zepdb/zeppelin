@@ -34,6 +34,8 @@ pub struct IvfFlatIndex {
     pub(crate) segment_id: String,
     /// Quantization type used by this index.
     pub(crate) quantization: crate::index::quantization::QuantizationType,
+    /// Fields that have bitmap indexes.
+    pub(crate) bitmap_fields: Vec<String>,
 }
 
 impl IvfFlatIndex {

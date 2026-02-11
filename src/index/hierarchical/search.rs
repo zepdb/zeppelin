@@ -22,6 +22,9 @@ use crate::types::{AttributeValue, DistanceMetric, Filter, SearchResult};
 
 use super::{deserialize_tree_node, tree_node_key, HierarchicalIndex};
 
+use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
+use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
+
 /// A candidate result during search, before final ranking.
 struct Candidate {
     id: String,
@@ -123,11 +126,10 @@ pub async fn search_hierarchical(
 
     // Descend through internal levels.
     let mut current_ids: Vec<String> = beam.into_iter().map(|(id, _)| id).collect();
+    let mut accumulated: Vec<SearchResult> = Vec::new();
 
     loop {
         let mut next_beam: Vec<(String, f32, bool)> = Vec::new(); // (child_id, dist, is_leaf)
-        let mut any_leaf = false;
-        let mut any_internal = false;
 
         for node_id in &current_ids {
             let nkey = tree_node_key(ns, seg, node_id);
@@ -140,15 +142,12 @@ pub async fn search_hierarchical(
             };
             let node = deserialize_tree_node(&node_data)?;
 
-            if node.is_leaf {
-                any_leaf = true;
-            } else {
-                any_internal = true;
-            }
-
             for (c, child_id) in node.children.iter().enumerate() {
                 let dist = compute_distance(query, &node.centroids[c], distance_metric);
-                next_beam.push((child_id.clone(), dist, node.is_leaf));
+                // Classify per-child: leaf cluster indices parse as usize,
+                // internal node IDs have format "n_{depth}_{ulid}" and never do.
+                let child_is_leaf = node.is_leaf || child_id.parse::<usize>().is_ok();
+                next_beam.push((child_id.clone(), dist, child_is_leaf));
             }
         }
 
@@ -156,49 +155,30 @@ pub async fn search_hierarchical(
         next_beam.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         next_beam.truncate(effective_beam);
 
+        let any_internal = next_beam.iter().any(|(_, _, is_leaf)| !*is_leaf);
+
         debug!(
             candidates = next_beam.len(),
-            any_leaf,
             any_internal,
             "beam search: descending level"
         );
 
-        // If we've reached leaf level, scan clusters.
-        if any_leaf && !any_internal {
-            let cluster_indices: Vec<usize> = next_beam
-                .iter()
-                .filter_map(|(id, _, _)| id.parse::<usize>().ok())
-                .collect();
-            return scan_leaf_clusters(
-                index,
-                &cluster_indices,
-                query,
-                top_k,
-                filter,
-                distance_metric,
-                store,
-                oversample_factor,
-                cache,
-            )
-            .await;
+        // Separate leaf cluster entries from internal node entries.
+        let mut leaf_clusters: Vec<usize> = Vec::new();
+        let mut internal_ids: Vec<String> = Vec::new();
+
+        for (id, _, is_leaf) in &next_beam {
+            if *is_leaf {
+                if let Ok(idx) = id.parse::<usize>() {
+                    leaf_clusters.push(idx);
+                }
+            } else {
+                internal_ids.push(id.clone());
+            }
         }
 
-        // Mixed level: separate leaf and internal children.
-        if any_leaf && any_internal {
-            let mut leaf_clusters: Vec<usize> = Vec::new();
-            let mut internal_ids: Vec<String> = Vec::new();
-
-            for (id, _, is_leaf) in &next_beam {
-                if *is_leaf {
-                    if let Ok(idx) = id.parse::<usize>() {
-                        leaf_clusters.push(idx);
-                    }
-                } else {
-                    internal_ids.push(id.clone());
-                }
-            }
-
-            // Scan leaf clusters.
+        // Scan any leaf clusters found at this level.
+        if !leaf_clusters.is_empty() {
             let leaf_results = scan_leaf_clusters(
                 index,
                 &leaf_clusters,
@@ -211,24 +191,21 @@ pub async fn search_hierarchical(
                 cache,
             )
             .await?;
-
-            // Continue descending internal nodes.
-            current_ids = internal_ids;
-            if current_ids.is_empty() {
-                return Ok(leaf_results);
-            }
-            // For simplicity in mixed case, just continue descent.
-            // The leaf results will be merged with internal results below.
-            // TODO: proper merge for mixed-depth trees.
-            continue;
+            accumulated.extend(leaf_results);
         }
 
-        // All internal — continue descent.
-        current_ids = next_beam.into_iter().map(|(id, _, _)| id).collect();
-
-        if current_ids.is_empty() {
-            return Ok(Vec::new());
+        if internal_ids.is_empty() {
+            // No more internal nodes to descend — return merged results.
+            accumulated.sort_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            accumulated.truncate(top_k);
+            return Ok(accumulated);
         }
+
+        current_ids = internal_ids;
     }
 }
 
@@ -252,20 +229,25 @@ async fn scan_leaf_clusters(
         top_k
     };
 
+    debug!(nprobe = cluster_indices.len(), clusters = ?cluster_indices, "probing leaf clusters");
+
     let ns = &index.namespace;
     let seg = &index.segment_id;
+    let has_bitmaps = !index.bitmap_fields.is_empty();
 
     let candidates = match index.meta.quantization {
         QuantizationType::Scalar => {
-            scan_clusters_sq(ns, seg, cluster_indices, query, distance_metric, filter, fetch_k, store, cache).await?
+            scan_clusters_sq(ns, seg, cluster_indices, query, distance_metric, filter, fetch_k, has_bitmaps, store, cache).await?
         }
         QuantizationType::Product => {
-            scan_clusters_pq(ns, seg, cluster_indices, query, distance_metric, filter, fetch_k, store, cache).await?
+            scan_clusters_pq(ns, seg, cluster_indices, query, distance_metric, filter, fetch_k, has_bitmaps, store, cache).await?
         }
         QuantizationType::None => {
-            scan_clusters_flat(ns, seg, cluster_indices, query, distance_metric, filter, store, cache).await?
+            scan_clusters_flat(ns, seg, cluster_indices, query, distance_metric, filter, has_bitmaps, store, cache).await?
         }
     };
+
+    debug!(total_candidates = candidates.len(), fetch_k, "scanned leaf clusters");
 
     // Sort and apply filter.
     let mut sorted = candidates;
@@ -314,6 +296,7 @@ async fn scan_clusters_flat(
     query: &[f32],
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
+    has_bitmaps: bool,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
@@ -329,9 +312,17 @@ async fn scan_clusters_flat(
             }
         };
         let cluster = deserialize_cluster(&cluster_data)?;
+
+        let prefilter = try_bitmap_prefilter(
+            namespace, segment_id, cluster_idx, filter, has_bitmaps, store, cache,
+        ).await;
+
         let attrs = load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await;
 
         for (j, vec) in cluster.vectors.iter().enumerate() {
+            if let Some(ref bm) = prefilter {
+                if !bm.contains(j as u32) { continue; }
+            }
             let score = compute_distance(query, vec, distance_metric);
             let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
             candidates.push(Candidate {
@@ -355,6 +346,7 @@ async fn scan_clusters_sq(
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
     fetch_k: usize,
+    has_bitmaps: bool,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
@@ -370,21 +362,31 @@ async fn scan_clusters_sq(
     let mut coarse: Vec<(String, f32, usize)> = Vec::new();
 
     for &cluster_idx in cluster_indices {
+        let prefilter = try_bitmap_prefilter(
+            namespace, segment_id, cluster_idx, filter, has_bitmaps, store, cache,
+        ).await;
+
         let sq_key = sq_cluster_key(namespace, segment_id, cluster_idx);
         match fetch_with_cache(cache, store, &sq_key).await {
             Ok(sq_data) => {
                 let sq_cluster = deserialize_sq_cluster(&sq_data)?;
                 for (j, codes) in sq_cluster.codes.iter().enumerate() {
+                    if let Some(ref bm) = prefilter {
+                        if !bm.contains(j as u32) { continue; }
+                    }
                     let approx = calibration.asymmetric_distance(query, codes, distance_metric);
                     coarse.push((sq_cluster.ids[j].clone(), approx, cluster_idx));
                 }
             }
-            Err(_) => {
-                // Fallback to flat.
+            Err(e) => {
+                warn!(cluster = cluster_idx, error = %e, "failed to read SQ cluster, falling back to flat");
                 let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
                 if let Ok(data) = fetch_with_cache(cache, store, &cvec_key).await {
                     let cluster = deserialize_cluster(&data)?;
                     for (j, vec) in cluster.vectors.iter().enumerate() {
+                        if let Some(ref bm) = prefilter {
+                            if !bm.contains(j as u32) { continue; }
+                        }
                         let score = compute_distance(query, vec, distance_metric);
                         coarse.push((cluster.ids[j].clone(), score, cluster_idx));
                     }
@@ -396,6 +398,8 @@ async fn scan_clusters_sq(
     coarse.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     let rerank_count = fetch_k * 4;
     coarse.truncate(rerank_count);
+
+    debug!(coarse_candidates = coarse.len(), rerank_count, "SQ8 coarse ranking complete, starting rerank");
 
     // Phase 2: rerank with full-precision.
     let mut by_cluster: HashMap<usize, Vec<String>> = HashMap::new();
@@ -441,6 +445,7 @@ async fn scan_clusters_pq(
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
     fetch_k: usize,
+    has_bitmaps: bool,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
@@ -457,22 +462,34 @@ async fn scan_clusters_pq(
     let mut coarse: Vec<(String, f32, usize)> = Vec::new();
 
     for &cluster_idx in cluster_indices {
+        let prefilter = try_bitmap_prefilter(
+            namespace, segment_id, cluster_idx, filter, has_bitmaps, store, cache,
+        ).await;
+
         let pq_key = pq_cluster_key(namespace, segment_id, cluster_idx);
         match fetch_with_cache(cache, store, &pq_key).await {
             Ok(pq_data) => {
                 let pq_cluster = deserialize_pq_cluster(&pq_data)?;
                 for (j, codes) in pq_cluster.codes.iter().enumerate() {
+                    if let Some(ref bm) = prefilter {
+                        if !bm.contains(j as u32) { continue; }
+                    }
                     let approx = codebook.adc_distance(&adc_table, codes);
                     coarse.push((pq_cluster.ids[j].clone(), approx, cluster_idx));
                 }
             }
-            Err(_) => continue,
+            Err(e) => {
+                warn!(cluster = cluster_idx, error = %e, "failed to read PQ cluster, skipping");
+                continue;
+            }
         }
     }
 
     coarse.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     let rerank_count = fetch_k * 4;
     coarse.truncate(rerank_count);
+
+    debug!(coarse_candidates = coarse.len(), "PQ coarse ranking complete, starting rerank");
 
     // Phase 2: rerank.
     let mut by_cluster: HashMap<usize, Vec<String>> = HashMap::new();
@@ -506,6 +523,37 @@ async fn scan_clusters_pq(
     }
 
     Ok(candidates)
+}
+
+/// Try to load a cluster's bitmap index and evaluate the filter against it.
+async fn try_bitmap_prefilter(
+    namespace: &str,
+    segment_id: &str,
+    cluster_idx: usize,
+    filter: Option<&Filter>,
+    has_bitmaps: bool,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Option<roaring::RoaringBitmap> {
+    let filter = filter?;
+    if !has_bitmaps {
+        return None;
+    }
+
+    let bkey = bitmap_key(namespace, segment_id, cluster_idx);
+    let data = match fetch_with_cache(cache, store, &bkey).await {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    let bitmap_index = match ClusterBitmapIndex::from_bytes(&data) {
+        Ok(idx) => idx,
+        Err(e) => {
+            tracing::debug!(cluster = cluster_idx, error = %e, "failed to load bitmap index");
+            return None;
+        }
+    };
+
+    evaluate_filter_bitmap(filter, &bitmap_index)
 }
 
 /// Load attribute data for a cluster.

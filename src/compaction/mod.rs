@@ -257,7 +257,8 @@ impl Compactor {
 
         // 8. Build index (expensive, done once — NOT retried)
         // Choose hierarchical or flat based on config.
-        let (cluster_count, is_hierarchical) = if self.indexing_config.hierarchical {
+        let build_start = std::time::Instant::now();
+        let (cluster_count, is_hierarchical, bitmap_fields) = if self.indexing_config.hierarchical {
             let h_index = build_hierarchical(
                 &vectors,
                 &self.indexing_config,
@@ -266,7 +267,8 @@ impl Compactor {
                 &segment_id,
             )
             .await?;
-            (h_index.num_leaf_clusters(), true)
+            let bf = h_index.bitmap_fields.clone();
+            (h_index.num_leaf_clusters(), true, bf)
         } else {
             let index = build_ivf_flat(
                 &vectors,
@@ -276,8 +278,19 @@ impl Compactor {
                 &segment_id,
             )
             .await?;
-            (index.num_clusters(), false)
+            let bf = index.bitmap_fields.clone();
+            (index.num_clusters(), false, bf)
         };
+        let build_elapsed = build_start.elapsed();
+        let index_type_label = if is_hierarchical { "hierarchical" } else { "ivf_flat" };
+        crate::metrics::INDEX_BUILD_DURATION
+            .with_label_values(&[namespace, index_type_label])
+            .observe(build_elapsed.as_secs_f64());
+        debug!(
+            index_type = index_type_label,
+            build_duration_ms = build_elapsed.as_millis() as u64,
+            "index build phase complete"
+        );
 
         // 9. CAS loop: re-read manifest, apply changes, write conditionally
         for attempt in 0..MAX_CAS_RETRIES {
@@ -305,6 +318,7 @@ impl Compactor {
                 cluster_count,
                 quantization: self.indexing_config.quantization,
                 hierarchical: is_hierarchical,
+                bitmap_fields: bitmap_fields.clone(),
             });
             fresh_manifest.remove_compacted_fragments(last_fragment_id);
             fresh_manifest.pending_deletes = deferred_deletes.clone();

@@ -67,6 +67,8 @@ pub struct HierarchicalIndex {
     pub(crate) namespace: String,
     /// Segment ID (for S3 key construction).
     pub(crate) segment_id: String,
+    /// Fields that have bitmap indexes.
+    pub(crate) bitmap_fields: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
