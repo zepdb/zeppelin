@@ -89,7 +89,11 @@ impl ZeppelinStore {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         self.inner.put(&path, PutPayload::from(data)).await?;
-        debug!(elapsed_ms = start.elapsed().as_millis(), "s3 put");
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), "s3 put");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["put"])
+            .observe(elapsed.as_secs_f64());
         Ok(())
     }
 
@@ -98,14 +102,23 @@ impl ZeppelinStore {
     pub async fn get(&self, key: &str) -> Result<Bytes> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
-        let result = self.inner.get(&path).await.map_err(|e| match e {
-            object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
-                key: path.to_string(),
-            },
-            other => ZeppelinError::Storage(other),
+        let result = self.inner.get(&path).await.map_err(|e| {
+            crate::metrics::S3_ERRORS_TOTAL
+                .with_label_values(&["get"])
+                .inc();
+            match e {
+                object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
+                    key: path.to_string(),
+                },
+                other => ZeppelinError::Storage(other),
+            }
         })?;
         let bytes = result.bytes().await?;
-        debug!(elapsed_ms = start.elapsed().as_millis(), size = bytes.len(), "s3 get");
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), size = bytes.len(), "s3 get");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["get"])
+            .observe(elapsed.as_secs_f64());
         Ok(bytes)
     }
 
@@ -115,7 +128,11 @@ impl ZeppelinStore {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let bytes = self.inner.get_range(&path, range).await?;
-        debug!(elapsed_ms = start.elapsed().as_millis(), size = bytes.len(), "s3 get_range");
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), size = bytes.len(), "s3 get_range");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["get_range"])
+            .observe(elapsed.as_secs_f64());
         Ok(bytes)
     }
 
@@ -125,7 +142,11 @@ impl ZeppelinStore {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         self.inner.delete(&path).await?;
-        debug!(elapsed_ms = start.elapsed().as_millis(), "s3 delete");
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), "s3 delete");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["delete"])
+            .observe(elapsed.as_secs_f64());
         Ok(())
     }
 
@@ -138,7 +159,11 @@ impl ZeppelinStore {
         let stream = self.inner.list(Some(&path));
         let objects: Vec<_> = stream.try_collect().await?;
         let keys: Vec<String> = objects.iter().map(|o| o.location.to_string()).collect();
-        debug!(elapsed_ms = start.elapsed().as_millis(), count = keys.len(), "s3 list_prefix");
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), count = keys.len(), "s3 list_prefix");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["list_prefix"])
+            .observe(elapsed.as_secs_f64());
         Ok(keys)
     }
 
@@ -150,9 +175,18 @@ impl ZeppelinStore {
         let result = match self.inner.head(&path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
-            Err(e) => Err(ZeppelinError::Storage(e)),
+            Err(e) => {
+                crate::metrics::S3_ERRORS_TOTAL
+                    .with_label_values(&["exists"])
+                    .inc();
+                Err(ZeppelinError::Storage(e))
+            }
         };
-        debug!(elapsed_ms = start.elapsed().as_millis(), "s3 exists");
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), "s3 exists");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["exists"])
+            .observe(elapsed.as_secs_f64());
         result
     }
 
@@ -161,13 +195,22 @@ impl ZeppelinStore {
     pub async fn head(&self, key: &str) -> Result<object_store::ObjectMeta> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
-        let meta = self.inner.head(&path).await.map_err(|e| match e {
-            object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
-                key: path.to_string(),
-            },
-            other => ZeppelinError::Storage(other),
+        let meta = self.inner.head(&path).await.map_err(|e| {
+            crate::metrics::S3_ERRORS_TOTAL
+                .with_label_values(&["head"])
+                .inc();
+            match e {
+                object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
+                    key: path.to_string(),
+                },
+                other => ZeppelinError::Storage(other),
+            }
         })?;
-        debug!(elapsed_ms = start.elapsed().as_millis(), "s3 head");
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), "s3 head");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["head"])
+            .observe(elapsed.as_secs_f64());
         Ok(meta)
     }
 
@@ -181,7 +224,11 @@ impl ZeppelinStore {
             let path = Path::parse(key)?;
             self.inner.delete(&path).await?;
         }
-        debug!(elapsed_ms = start.elapsed().as_millis(), count, "s3 delete_prefix");
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), count, "s3 delete_prefix");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["delete_prefix"])
+            .observe(elapsed.as_secs_f64());
         Ok(count)
     }
 

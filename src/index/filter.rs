@@ -115,7 +115,7 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("color".to_string(), AttributeValue::String("red".to_string()));
         m.insert("size".to_string(), AttributeValue::Integer(42));
-        m.insert("weight".to_string(), AttributeValue::Float(3.14));
+        m.insert("weight".to_string(), AttributeValue::Float(3.125));
         m.insert("active".to_string(), AttributeValue::Bool(true));
         m.insert(
             "tags".to_string(),

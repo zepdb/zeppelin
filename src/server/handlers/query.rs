@@ -41,6 +41,8 @@ pub async fn query_namespace(
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let start = std::time::Instant::now();
+    crate::metrics::ACTIVE_QUERIES.inc();
+    let _guard = crate::metrics::GaugeGuard(&crate::metrics::ACTIVE_QUERIES);
     crate::metrics::QUERIES_TOTAL.with_label_values(&[&ns]).inc();
 
     let meta = state

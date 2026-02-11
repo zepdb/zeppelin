@@ -36,6 +36,7 @@ pub async fn execute_query(
     let mut scanned_segments = 0;
 
     // WAL scan (always for Strong, never for Eventual)
+    let wal_start = std::time::Instant::now();
     let wal_results = match consistency {
         ConsistencyLevel::Strong => {
             let (results, frag_count) =
@@ -45,8 +46,15 @@ pub async fn execute_query(
         }
         ConsistencyLevel::Eventual => Vec::new(),
     };
+    let wal_duration = wal_start.elapsed();
+    debug!(
+        wal_duration_ms = wal_duration.as_millis() as u64,
+        fragments_scanned = scanned_fragments,
+        "query phase: WAL scan"
+    );
 
     // Segment search
+    let segment_start = std::time::Instant::now();
     let segment_results = if let Some(ref segment_id) = manifest.active_segment {
         let results = segment_search(
             store, namespace, segment_id, query, top_k, nprobe, filter, distance_metric,
@@ -57,15 +65,21 @@ pub async fn execute_query(
     } else {
         Vec::new()
     };
+    let segment_duration = segment_start.elapsed();
+    debug!(
+        segment_duration_ms = segment_duration.as_millis() as u64,
+        segments_scanned = scanned_segments,
+        "query phase: segment search"
+    );
 
     // Merge results
+    let merge_start = std::time::Instant::now();
     let results = merge_results(wal_results, segment_results, top_k, consistency);
-
+    let merge_duration = merge_start.elapsed();
     debug!(
-        result_count = results.len(),
-        scanned_fragments,
-        scanned_segments,
-        "query complete"
+        merge_duration_ms = merge_duration.as_millis() as u64,
+        final_results = results.len(),
+        "query phase: merge"
     );
 
     Ok(QueryResponse {

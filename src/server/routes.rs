@@ -8,6 +8,7 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use super::handlers::{health, metrics, namespace, query, vectors};
+use super::middleware;
 use super::AppState;
 
 pub fn build_router(state: AppState) -> Router {
@@ -33,6 +34,7 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/namespaces/:ns/query",
             post(query::query_namespace),
         )
+        .layer(axum::middleware::from_fn(middleware::http_metrics))
         .layer(TimeoutLayer::new(timeout))
         .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // 50 MB
         .layer(
@@ -40,5 +42,6 @@ pub fn build_router(state: AppState) -> Router {
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
+        .layer(axum::middleware::from_fn(middleware::request_id))
         .with_state(state)
 }

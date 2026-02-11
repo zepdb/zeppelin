@@ -147,6 +147,7 @@ impl DiskCache {
                 let mut entries = self.entries.write().await;
                 if let Some(entry) = entries.remove(key) {
                     self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
+                    crate::metrics::CACHE_ENTRIES.dec();
                 }
                 crate::metrics::CACHE_HITS_TOTAL.with_label_values(&["miss"]).inc();
                 debug!("cache miss (file missing)");
@@ -172,6 +173,7 @@ impl DiskCache {
             .map_err(|e| ZeppelinError::Cache(format!("failed to rename cache file: {e}")))?;
 
         // Update index
+        let is_new;
         {
             let mut entries = self.entries.write().await;
             if let Some(old) = entries.insert(
@@ -184,9 +186,15 @@ impl DiskCache {
             ) {
                 // Replacing existing entry: subtract old size
                 self.total_size.fetch_sub(old.size, Ordering::Relaxed);
+                is_new = false;
+            } else {
+                is_new = true;
             }
         }
         self.total_size.fetch_add(size, Ordering::Relaxed);
+        if is_new {
+            crate::metrics::CACHE_ENTRIES.inc();
+        }
 
         debug!("cache put");
 
@@ -231,6 +239,7 @@ impl DiskCache {
         let mut entries = self.entries.write().await;
         if let Some(entry) = entries.remove(key) {
             self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
+            crate::metrics::CACHE_ENTRIES.dec();
             let path = self.dir.join(&entry.filename);
             let _ = tokio::fs::remove_file(&path).await;
             debug!("invalidated cache key");
@@ -256,6 +265,7 @@ impl DiskCache {
         for key in &matching_keys {
             if let Some(entry) = entries.remove(key) {
                 self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
+                crate::metrics::CACHE_ENTRIES.dec();
                 let path = self.dir.join(&entry.filename);
                 let _ = tokio::fs::remove_file(&path).await;
             }
@@ -299,6 +309,8 @@ impl DiskCache {
                 Some(key) => {
                     if let Some(entry) = entries.remove(&key) {
                         self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
+                        crate::metrics::CACHE_ENTRIES.dec();
+                        crate::metrics::CACHE_EVICTIONS_TOTAL.inc();
                         let path = self.dir.join(&entry.filename);
                         let _ = tokio::fs::remove_file(&path).await;
                         debug!(key = %key, size = entry.size, "evicted cache entry");

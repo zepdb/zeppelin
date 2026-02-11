@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use uuid::Uuid;
 use zeppelin::config::StorageConfig;
 use zeppelin::storage::ZeppelinStore;

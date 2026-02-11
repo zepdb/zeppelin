@@ -42,6 +42,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("zeppelin starting");
 
+    tracing::info!(
+        host = %config.server.host,
+        port = config.server.port,
+        bucket = %config.storage.bucket,
+        backend = %config.storage.backend,
+        cache_dir = %config.cache.dir.display(),
+        cache_max_size_gb = config.cache.max_size_gb,
+        compaction_interval_secs = config.compaction.interval_secs,
+        max_wal_fragments = config.compaction.max_wal_fragments_before_compact,
+        "configuration loaded"
+    );
+
     // Initialize metrics
     zeppelin::metrics::init();
 

@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_train_single_point() {
-        let data = vec![vec![1.0, 2.0, 3.0]];
+        let data = [vec![1.0, 2.0, 3.0]];
         let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
         let centroids = train_kmeans(&refs, 3, 1, 10, 1e-4).unwrap();
         assert_eq!(centroids.len(), 1);
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_train_k_gt_n() {
-        let data = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let data = [vec![1.0, 0.0], vec![0.0, 1.0]];
         let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
         // k=5 but only 2 points -> should produce 2 centroids.
         let centroids = train_kmeans(&refs, 2, 5, 10, 1e-4).unwrap();
