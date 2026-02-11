@@ -26,6 +26,9 @@ pub enum ZeppelinError {
     #[error("manifest not found for namespace: {namespace}")]
     ManifestNotFound { namespace: String },
 
+    #[error("manifest conflict (concurrent write) for namespace: {namespace}")]
+    ManifestConflict { namespace: String },
+
     // Namespace errors
     #[error("namespace not found: {namespace}")]
     NamespaceNotFound { namespace: String },
@@ -75,7 +78,8 @@ impl ZeppelinError {
             | ZeppelinError::NamespaceNotFound { .. }
             | ZeppelinError::ManifestNotFound { .. } => 404,
 
-            ZeppelinError::NamespaceAlreadyExists { .. } => 409,
+            ZeppelinError::NamespaceAlreadyExists { .. }
+            | ZeppelinError::ManifestConflict { .. } => 409,
 
             ZeppelinError::DimensionMismatch { .. } | ZeppelinError::Validation(_) => 400,
 

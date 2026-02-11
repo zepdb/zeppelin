@@ -6,15 +6,18 @@ use tracing::{debug, info, instrument, warn};
 use ulid::Ulid;
 
 use crate::config::{CompactionConfig, IndexingConfig};
-use crate::error::Result;
+use crate::error::{Result, ZeppelinError};
 use crate::index::ivf_flat::build::{
     attrs_key, build_ivf_flat, cluster_key, deserialize_attrs, deserialize_cluster,
 };
 use crate::storage::ZeppelinStore;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
-use crate::wal::manifest::{Manifest, SegmentRef};
+use crate::wal::manifest::{Manifest, ManifestVersion, SegmentRef};
 use crate::wal::WalReader;
+
+/// Maximum CAS retry attempts for manifest updates.
+const MAX_CAS_RETRIES: u32 = 5;
 
 /// Result of a compaction run.
 #[derive(Debug)]
@@ -72,12 +75,34 @@ impl Compactor {
     }
 
     /// Compact all uncompacted WAL fragments into a new IVF-Flat segment.
+    ///
+    /// Uses CAS (compare-and-swap) for manifest updates to prevent concurrent overwrites.
+    /// Fragment deletion is deferred: keys are added to `pending_deletes` in the manifest
+    /// and cleaned up at the start of the next compaction cycle.
     #[instrument(skip(self), fields(namespace = namespace))]
     pub async fn compact(&self, namespace: &str) -> Result<CompactionResult> {
         let start = std::time::Instant::now();
 
-        // 1. Read manifest
-        let mut manifest = Manifest::read(&self.store, namespace)
+        // 0. GC: delete any pending_deletes from a previous compaction cycle
+        {
+            let manifest = Manifest::read(&self.store, namespace)
+                .await?
+                .unwrap_or_default();
+            if !manifest.pending_deletes.is_empty() {
+                debug!(
+                    pending_count = manifest.pending_deletes.len(),
+                    "cleaning up deferred deletes from previous compaction"
+                );
+                for key in &manifest.pending_deletes {
+                    if let Err(e) = self.store.delete(key).await {
+                        warn!(key = %key, error = %e, "failed to delete deferred key");
+                    }
+                }
+            }
+        }
+
+        // 1. Read manifest to get fragment list (snapshot for segment building)
+        let manifest = Manifest::read(&self.store, namespace)
             .await?
             .unwrap_or_default();
 
@@ -98,13 +123,13 @@ impl Compactor {
 
         info!(fragment_count = fragments_removed, "starting compaction");
 
-        // 3. Read all uncompacted fragments
+        // 3. Read fragments using snapshot refs (not re-reading manifest)
         let fragments = self
             .wal_reader
-            .read_uncompacted_fragments(namespace)
+            .read_fragments_from_refs(namespace, &fragment_refs)
             .await?;
 
-        // 4. Merge vectors: process in ULID order, latest wins, track deletes
+        // 4. Merge vectors: process in manifest order (sequence number), latest wins
         let mut latest_vectors: HashMap<String, VectorEntry> = HashMap::new();
         let mut deleted_ids: HashSet<String> = HashSet::new();
 
@@ -135,49 +160,71 @@ impl Compactor {
         let vectors: Vec<VectorEntry> = latest_vectors.into_values().collect();
         let vectors_compacted = vectors.len();
 
+        // Collect keys for deferred deletion
+        let mut deferred_deletes: Vec<String> = Vec::new();
+        for fref in &fragment_refs {
+            deferred_deletes.push(WalFragment::s3_key(namespace, &fref.id));
+        }
+        if let Some(ref seg_id) = old_segment_id {
+            let prefix = format!("{namespace}/segments/{seg_id}/");
+            if let Ok(keys) = self.store.list_prefix(&prefix).await {
+                deferred_deletes.extend(keys);
+            }
+        }
+
         if vectors.is_empty() {
             // Edge case: all vectors were deleted
-            // Still clean up fragments and old segment
-            manifest.remove_compacted_fragments(last_fragment_id);
-            manifest.write(&self.store, namespace).await?;
+            // CAS loop to update manifest
+            for attempt in 0..MAX_CAS_RETRIES {
+                let (mut fresh_manifest, version) =
+                    match Manifest::read_versioned(&self.store, namespace).await? {
+                        Some(pair) => pair,
+                        None => (Manifest::default(), ManifestVersion(None)),
+                    };
 
-            // Delete old fragment files
-            for fref in &fragment_refs {
-                let key = WalFragment::s3_key(namespace, &fref.id);
-                if let Err(e) = self.store.delete(&key).await {
-                    warn!(key = %key, error = %e, "failed to delete old WAL fragment");
+                fresh_manifest.remove_compacted_fragments(last_fragment_id);
+                fresh_manifest.pending_deletes = deferred_deletes.clone();
+
+                match fresh_manifest
+                    .write_conditional(&self.store, namespace, &version)
+                    .await
+                {
+                    Ok(()) => {
+                        let elapsed = start.elapsed();
+                        crate::metrics::COMPACTION_DURATION
+                            .with_label_values(&[namespace])
+                            .observe(elapsed.as_secs_f64());
+
+                        info!(
+                            elapsed_ms = elapsed.as_millis(),
+                            attempt, "compaction complete (all vectors deleted)"
+                        );
+                        return Ok(CompactionResult {
+                            segment_id: None,
+                            vectors_compacted: 0,
+                            fragments_removed,
+                            old_segment_removed: old_segment_id,
+                        });
+                    }
+                    Err(ZeppelinError::ManifestConflict { .. }) => {
+                        warn!(
+                            attempt,
+                            "manifest CAS conflict in compactor (empty), retrying"
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
-
-            // Delete old segment if existed
-            if let Some(ref seg_id) = old_segment_id {
-                let prefix = format!("{namespace}/segments/{seg_id}/");
-                if let Err(e) = self.store.delete_prefix(&prefix).await {
-                    warn!(prefix = %prefix, error = %e, "failed to delete old segment");
-                }
-            }
-
-            let elapsed = start.elapsed();
-            crate::metrics::COMPACTION_DURATION
-                .with_label_values(&[namespace])
-                .observe(elapsed.as_secs_f64());
-
-            info!(
-                elapsed_ms = elapsed.as_millis(),
-                "compaction complete (all vectors deleted)"
-            );
-            return Ok(CompactionResult {
-                segment_id: None,
-                vectors_compacted: 0,
-                fragments_removed,
-                old_segment_removed: old_segment_id,
+            return Err(ZeppelinError::ManifestConflict {
+                namespace: namespace.to_string(),
             });
         }
 
         // 7. Generate new segment ID
         let segment_id = format!("seg_{}", Ulid::new());
 
-        // 8. Build IVF-Flat index
+        // 8. Build IVF-Flat index (expensive, done once — NOT retried)
         let index = build_ivf_flat(
             &vectors,
             &self.indexing_config,
@@ -187,54 +234,58 @@ impl Compactor {
         )
         .await?;
 
-        // 9. Update manifest
-        manifest.add_segment(SegmentRef {
-            id: segment_id.clone(),
-            vector_count: vectors_compacted,
-            cluster_count: index.num_clusters(),
-        });
-        manifest.remove_compacted_fragments(last_fragment_id);
+        // 9. CAS loop: re-read manifest, apply changes, write conditionally
+        for attempt in 0..MAX_CAS_RETRIES {
+            let (mut fresh_manifest, version) =
+                match Manifest::read_versioned(&self.store, namespace).await? {
+                    Some(pair) => pair,
+                    None => (Manifest::default(), ManifestVersion(None)),
+                };
 
-        // 10. Write manifest
-        manifest.write(&self.store, namespace).await?;
+            fresh_manifest.add_segment(SegmentRef {
+                id: segment_id.clone(),
+                vector_count: vectors_compacted,
+                cluster_count: index.num_clusters(),
+            });
+            fresh_manifest.remove_compacted_fragments(last_fragment_id);
+            fresh_manifest.pending_deletes = deferred_deletes.clone();
 
-        // 11. Delete old WAL fragment files
-        for fref in &fragment_refs {
-            let key = WalFragment::s3_key(namespace, &fref.id);
-            if let Err(e) = self.store.delete(&key).await {
-                warn!(key = %key, error = %e, "failed to delete old WAL fragment");
+            match fresh_manifest
+                .write_conditional(&self.store, namespace, &version)
+                .await
+            {
+                Ok(()) => {
+                    let elapsed = start.elapsed();
+                    crate::metrics::COMPACTION_DURATION
+                        .with_label_values(&[namespace])
+                        .observe(elapsed.as_secs_f64());
+
+                    info!(
+                        segment_id = %segment_id,
+                        vectors_compacted,
+                        fragments_removed,
+                        elapsed_ms = elapsed.as_millis(),
+                        attempt,
+                        "compaction complete"
+                    );
+
+                    return Ok(CompactionResult {
+                        segment_id: Some(segment_id),
+                        vectors_compacted,
+                        fragments_removed,
+                        old_segment_removed: old_segment_id,
+                    });
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => {
+                    warn!(attempt, "manifest CAS conflict in compactor, retrying");
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
         }
 
-        // 12. Delete old segment files if existed
-        let old_segment_removed = if let Some(ref seg_id) = old_segment_id {
-            let prefix = format!("{namespace}/segments/{seg_id}/");
-            if let Err(e) = self.store.delete_prefix(&prefix).await {
-                warn!(prefix = %prefix, error = %e, "failed to delete old segment");
-            }
-            Some(seg_id.clone())
-        } else {
-            None
-        };
-
-        let elapsed = start.elapsed();
-        crate::metrics::COMPACTION_DURATION
-            .with_label_values(&[namespace])
-            .observe(elapsed.as_secs_f64());
-
-        info!(
-            segment_id = %segment_id,
-            vectors_compacted,
-            fragments_removed,
-            elapsed_ms = elapsed.as_millis(),
-            "compaction complete"
-        );
-
-        Ok(CompactionResult {
-            segment_id: Some(segment_id),
-            vectors_compacted,
-            fragments_removed,
-            old_segment_removed,
+        Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
         })
     }
 }

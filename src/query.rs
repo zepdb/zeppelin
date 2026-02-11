@@ -36,11 +36,20 @@ pub async fn execute_query(
     let mut scanned_segments = 0;
 
     // WAL scan (always for Strong, never for Eventual)
+    // Uses the manifest we already read for snapshot consistency — avoids re-reading
+    // a newer manifest whose fragments may have been deleted by compaction.
     let wal_start = std::time::Instant::now();
     let wal_results = match consistency {
         ConsistencyLevel::Strong => {
-            let (results, frag_count) =
-                wal_scan(store, wal_reader, namespace, query, filter, distance_metric).await?;
+            let (results, frag_count) = wal_scan(
+                wal_reader,
+                namespace,
+                &manifest,
+                query,
+                filter,
+                distance_metric,
+            )
+            .await?;
             scanned_fragments = frag_count;
             results
         }
@@ -99,15 +108,19 @@ pub async fn execute_query(
 }
 
 /// Scan all uncompacted WAL fragments, deduplicate, apply deletes, score, and filter.
+/// Reads fragments from the provided manifest snapshot (not re-reading manifest from S3).
 async fn wal_scan(
-    _store: &ZeppelinStore,
     wal_reader: &WalReader,
     namespace: &str,
+    manifest: &Manifest,
     query: &[f32],
     filter: Option<&Filter>,
     distance_metric: DistanceMetric,
 ) -> Result<(Vec<SearchResult>, usize)> {
-    let fragments = wal_reader.read_uncompacted_fragments(namespace).await?;
+    let refs = manifest.uncompacted_fragments().to_vec();
+    let fragments = wal_reader
+        .read_fragments_from_refs(namespace, &refs)
+        .await?;
     let frag_count = fragments.len();
 
     if fragments.is_empty() {

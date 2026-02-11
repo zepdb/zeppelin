@@ -15,6 +15,7 @@ use std::collections::HashSet;
 
 // ---- Distance Functions (mirrors src/index/distance.rs) ----
 
+#[allow(dead_code)]
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     let mut dot: f32 = 0.0;
     let mut norm_a: f32 = 0.0;
@@ -47,19 +48,12 @@ struct SimpleIvfFlat {
 
 impl SimpleIvfFlat {
     /// Build an IVF-Flat index from vectors using simple k-means.
-    fn build(
-        vectors: &[(String, Vec<f32>)],
-        num_clusters: usize,
-        max_iters: usize,
-    ) -> Self {
+    fn build(vectors: &[(String, Vec<f32>)], num_clusters: usize, max_iters: usize) -> Self {
         let dim = vectors[0].1.len();
         let k = num_clusters.min(vectors.len());
 
         // Initialize centroids from first k vectors
-        let mut centroids: Vec<Vec<f32>> = vectors[..k]
-            .iter()
-            .map(|(_, v)| v.clone())
-            .collect();
+        let mut centroids: Vec<Vec<f32>> = vectors[..k].iter().map(|(_, v)| v.clone()).collect();
 
         // Simple k-means
         for _ in 0..max_iters {
@@ -92,8 +86,8 @@ impl SimpleIvfFlat {
                     }
                 }
                 let count = assigned.len() as f32;
-                for d in 0..dim {
-                    new_centroid[d] /= count;
+                for val in &mut new_centroid {
+                    *val /= count;
                 }
                 centroids[c] = new_centroid;
             }
@@ -122,12 +116,7 @@ impl SimpleIvfFlat {
     }
 
     /// Search the index with nprobe probing.
-    fn search(
-        &self,
-        query: &[f32],
-        top_k: usize,
-        nprobe: usize,
-    ) -> Vec<(String, f32)> {
+    fn search(&self, query: &[f32], top_k: usize, nprobe: usize) -> Vec<(String, f32)> {
         // Find nearest nprobe centroids
         let mut centroid_dists: Vec<(usize, f32)> = self
             .centroids

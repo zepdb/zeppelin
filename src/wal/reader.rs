@@ -1,11 +1,11 @@
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
-use crate::error::Result;
+use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
 
 use super::fragment::WalFragment;
-use super::manifest::Manifest;
+use super::manifest::{FragmentRef, Manifest};
 
 /// WAL reader for listing and reading uncompacted fragments.
 pub struct WalReader {
@@ -33,7 +33,9 @@ impl WalReader {
         WalFragment::from_bytes(&data)
     }
 
-    /// Read all uncompacted fragments for a namespace, in ULID order.
+    /// Read all uncompacted fragments for a namespace, in manifest order.
+    /// Manifest order reflects sequence number assignment (monotonic), which is
+    /// immune to clock skew — unlike ULID ordering.
     #[instrument(skip(self), fields(namespace = namespace))]
     pub async fn read_uncompacted_fragments(&self, namespace: &str) -> Result<Vec<WalFragment>> {
         let manifest = Manifest::read(&self.store, namespace).await?;
@@ -42,20 +44,34 @@ impl WalReader {
             None => return Ok(Vec::new()),
         };
 
+        let refs = manifest.uncompacted_fragments().to_vec();
+        self.read_fragments_from_refs(namespace, &refs).await
+    }
+
+    /// Read specific fragments by their refs, preserving the caller's ordering.
+    /// Gracefully skips fragments that return NotFound (deferred deletion safety).
+    #[instrument(skip(self, refs), fields(namespace = namespace, ref_count = refs.len()))]
+    pub async fn read_fragments_from_refs(
+        &self,
+        namespace: &str,
+        refs: &[FragmentRef],
+    ) -> Result<Vec<WalFragment>> {
         let mut fragments = Vec::new();
-        for fref in manifest.uncompacted_fragments() {
-            let fragment = self.read_fragment(namespace, &fref.id).await?;
-            fragments.push(fragment);
+        for fref in refs {
+            match self.read_fragment(namespace, &fref.id).await {
+                Ok(fragment) => fragments.push(fragment),
+                Err(ZeppelinError::NotFound { key }) => {
+                    warn!(
+                        fragment_id = %fref.id,
+                        key = %key,
+                        "fragment not found (likely deferred deletion), skipping"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        // Fragments should already be in order since we append in order,
-        // but sort by ULID to be safe.
-        fragments.sort_by_key(|f| f.id);
-
-        debug!(
-            fragment_count = fragments.len(),
-            "read uncompacted fragments"
-        );
+        debug!(fragment_count = fragments.len(), "read fragments from refs");
 
         Ok(fragments)
     }

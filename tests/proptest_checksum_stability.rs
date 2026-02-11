@@ -59,20 +59,18 @@ impl TestFragment {
     fn compute_checksum(vectors: &[TestVectorEntry], deletes: &[String]) -> u64 {
         use std::collections::BTreeMap;
 
-        let canonical: Vec<(
-            &str,
-            &[f32],
-            Option<BTreeMap<&String, &TestAttributeValue>>,
-        )> = vectors
-            .iter()
-            .map(|v| {
-                let attrs = v
-                    .attributes
-                    .as_ref()
-                    .map(|a| a.iter().collect::<BTreeMap<_, _>>());
-                (v.id.as_str(), v.values.as_slice(), attrs)
-            })
-            .collect();
+        #[allow(clippy::type_complexity)]
+        let canonical: Vec<(&str, &[f32], Option<BTreeMap<&String, &TestAttributeValue>>)> =
+            vectors
+                .iter()
+                .map(|v| {
+                    let attrs = v
+                        .attributes
+                        .as_ref()
+                        .map(|a| a.iter().collect::<BTreeMap<_, _>>());
+                    (v.id.as_str(), v.values.as_slice(), attrs)
+                })
+                .collect();
         let payload =
             serde_json::to_vec(&(&canonical, deletes)).expect("serialization should not fail");
         xxhash_rust::xxh3::xxh3_64(&payload)

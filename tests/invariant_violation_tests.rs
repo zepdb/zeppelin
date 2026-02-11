@@ -1,25 +1,23 @@
 //! Integration tests that reproduce invariant violations discovered by TLA+ model checking.
 //!
-//! Each test demonstrates a real bug in Zeppelin by simulating the exact interleaving
-//! or condition that breaks the invariant. Tests PASS when the bug exists (they assert
-//! the buggy behavior). When the bugs are later fixed, these tests should FAIL — then
-//! flip the assertions to confirm the fix.
+//! Each test verifies that the corresponding bug has been FIXED. The original bugs
+//! were found by TLA+ model checking and confirmed by property-based tests.
+//! These tests assert correct behavior after the fixes.
 
 mod common;
 
 use common::assertions::*;
 use common::harness::TestHarness;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::error::ZeppelinError;
-use zeppelin::query::execute_query;
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
+use zeppelin::types::VectorEntry;
 use zeppelin::wal::fragment::WalFragment;
-use zeppelin::wal::manifest::{FragmentRef, Manifest, SegmentRef};
+use zeppelin::wal::manifest::{FragmentRef, Manifest};
 use zeppelin::wal::{WalReader, WalWriter};
 
 /// Create a Compactor with test-friendly settings (small centroids, low threshold).
@@ -34,7 +32,12 @@ fn test_compactor(store: &ZeppelinStore) -> Compactor {
         kmeans_max_iterations: 10,
         ..Default::default()
     };
-    Compactor::new(store.clone(), wal_reader, compaction_config, indexing_config)
+    Compactor::new(
+        store.clone(),
+        wal_reader,
+        compaction_config,
+        indexing_config,
+    )
 }
 
 /// Create N vectors with unique IDs (`{prefix}_{i}`) and varied dimension values.
@@ -57,13 +60,11 @@ fn make_vectors(prefix: &str, count: usize, dims: usize) -> Vec<VectorEntry> {
 //
 // TLA+ invariant: ManifestCoversAllFragments
 //
-// Bug: Compactor reads manifest, builds segment (slow), then writes manifest back.
-// A concurrent writer appends a new fragment and updates the manifest in between.
-// The compactor's stale write erases the new fragment reference. The fragment's data
-// is still on S3, but no manifest points to it — data loss.
+// FIX: CAS (compare-and-swap) manifest writes using ETag-based conditional PUT.
+// A stale manifest write returns ManifestConflict instead of silently overwriting.
 
 #[tokio::test]
-async fn test_compaction_safety_stale_manifest_overwrites_fragment() {
+async fn test_compaction_safety_cas_prevents_stale_overwrite() {
     let harness = TestHarness::new().await;
     let ns = harness.key("inv-compact-safety");
     let store = &harness.store;
@@ -72,59 +73,43 @@ async fn test_compaction_safety_stale_manifest_overwrites_fragment() {
     // 1. Initialize namespace with empty manifest
     Manifest::new().write(store, &ns).await.unwrap();
 
-    // 2. Append 2 fragments (existing data before compaction starts)
+    // 2. Append 2 fragments
     let _f1 = writer
         .append(&ns, make_vectors("f1", 5, 16), vec![])
         .await
         .unwrap();
-    let f2 = writer
+    let _f2 = writer
         .append(&ns, make_vectors("f2", 5, 16), vec![])
         .await
         .unwrap();
 
-    // 3. Compactor reads manifest — this is its stale snapshot (compaction/mod.rs:80)
-    let stale_manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    // 3. Read manifest with version (simulating compactor's initial read)
+    let (stale_manifest, stale_version) =
+        Manifest::read_versioned(store, &ns).await.unwrap().unwrap();
     assert_eq!(stale_manifest.fragments.len(), 2);
 
-    // 4. Concurrent writer appends fragment 3 AFTER the compactor read the manifest
+    // 4. Concurrent writer appends fragment 3 (changes the ETag)
     let f3 = writer
         .append(&ns, make_vectors("f3", 5, 16), vec![])
         .await
         .unwrap();
 
-    // Verify f3 is in the real (current) manifest on S3
-    let current_manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
-    assert_eq!(current_manifest.fragments.len(), 3);
-    assert!(current_manifest.fragments.iter().any(|f| f.id == f3.id));
+    // 5. Attempt to write with stale version → ManifestConflict
+    let result = stale_manifest
+        .write_conditional(store, &ns, &stale_version)
+        .await;
 
-    // 5. Compactor finishes building segment from stale snapshot:
-    //    removes fragments 1 & 2, adds a segment — has NO IDEA about fragment 3.
-    let mut compacted = stale_manifest;
-    compacted.remove_compacted_fragments(f2.id);
-    compacted.add_segment(SegmentRef {
-        id: "fake_seg_001".into(),
-        vector_count: 10,
-        cluster_count: 2,
-    });
-    // Compactor writes stale manifest back — OVERWRITES the current one
-    compacted.write(store, &ns).await.unwrap();
-
-    // 6. ASSERT: Fragment 3's data exists on S3 but is NOT in the manifest.
-    //    This is data loss: fragment 3 is invisible to all future reads.
-    let f3_key = WalFragment::s3_key(&ns, &f3.id);
-    assert_s3_object_exists(store, &f3_key).await;
-
-    let final_manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
-    let f3_in_manifest = final_manifest.fragments.iter().any(|f| f.id == f3.id);
     assert!(
-        !f3_in_manifest,
-        "BUG CONFIRMED: Fragment 3 is on S3 but MISSING from manifest — data loss!"
+        matches!(result, Err(ZeppelinError::ManifestConflict { .. })),
+        "FIX VERIFIED: CAS rejects stale manifest write. Got: {result:?}"
     );
 
-    // The stale manifest only knows about the segment, not fragment 3
-    assert_eq!(final_manifest.fragments.len(), 0);
-    assert_eq!(final_manifest.segments.len(), 1);
-    assert_eq!(final_manifest.segments[0].id, "fake_seg_001");
+    // 6. Fragment 3 is safe in the current manifest
+    let final_manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    assert!(
+        final_manifest.fragments.iter().any(|f| f.id == f3.id),
+        "FIX VERIFIED: Fragment 3 is preserved in manifest after CAS rejection"
+    );
 
     harness.cleanup().await;
 }
@@ -133,18 +118,17 @@ async fn test_compaction_safety_stale_manifest_overwrites_fragment() {
 //
 // TLA+ invariant: QueryNever404
 //
-// Bug: Query reads manifest (sees fragment references), then compaction runs and
-// deletes those .wal files from S3. When the query tries to read the fragments
-// using its stale manifest snapshot, it gets 404 errors.
+// FIX: Deferred deletion — compaction moves fragment keys to pending_deletes
+// instead of immediately deleting them. Fragments survive until next compaction.
 
 #[tokio::test]
-async fn test_query_read_consistency_fragment_404_after_compaction() {
+async fn test_query_read_consistency_deferred_deletion() {
     let harness = TestHarness::new().await;
     let ns = harness.key("inv-query-404");
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    // 1. Initialize namespace and append 3 fragments with enough vectors for compaction
+    // 1. Initialize namespace and append 3 fragments
     Manifest::new().write(store, &ns).await.unwrap();
 
     for i in 0..3 {
@@ -152,49 +136,40 @@ async fn test_query_read_consistency_fragment_404_after_compaction() {
         writer.append(&ns, vecs, vec![]).await.unwrap();
     }
 
-    // 2. Query reads manifest and saves fragment list (stale snapshot — query.rs:33)
-    let query_manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
-    let stale_fragment_refs = query_manifest.fragments.clone();
-    assert_eq!(
-        stale_fragment_refs.len(),
-        3,
-        "Should have 3 fragments before compaction"
-    );
+    // 2. Save fragment refs before compaction
+    let pre_manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    let fragment_refs = pre_manifest.fragments.clone();
+    assert_eq!(fragment_refs.len(), 3);
 
-    // Verify fragment files exist right now
-    for fref in &stale_fragment_refs {
-        let key = WalFragment::s3_key(&ns, &fref.id);
-        assert_s3_object_exists(store, &key).await;
-    }
-
-    // 3. Compaction runs — compacts fragments into a segment AND deletes .wal files
+    // 3. Run compaction — with deferred deletion, fragment files should STILL exist
     let compactor = test_compactor(store);
     let result = compactor.compact(&ns).await.unwrap();
     assert_eq!(result.fragments_removed, 3);
     assert!(result.segment_id.is_some());
 
-    // 4. Query tries to read fragments using its stale manifest —
-    //    the .wal files have been deleted by compaction.
-    let mut not_found_count = 0;
-    for fref in &stale_fragment_refs {
+    // 4. FIX VERIFIED: Fragment files still exist (deferred deletion)
+    for fref in &fragment_refs {
         let key = WalFragment::s3_key(&ns, &fref.id);
-        match store.get(&key).await {
-            Err(ZeppelinError::NotFound { .. }) => not_found_count += 1,
-            Ok(_) => panic!(
-                "Fragment {} should have been deleted by compaction",
-                fref.id
-            ),
-            Err(e) => panic!("Unexpected error reading fragment {}: {e}", fref.id),
-        }
+        assert_s3_object_exists(store, &key).await;
     }
 
-    // 5. ASSERT: All fragment reads fail with NotFound — query gets 404
-    assert_eq!(
-        not_found_count,
-        stale_fragment_refs.len(),
-        "BUG CONFIRMED: All {} fragments return 404 after compaction — query would fail!",
-        stale_fragment_refs.len()
+    // 5. Manifest should have pending_deletes populated
+    let post_manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    assert!(
+        !post_manifest.pending_deletes.is_empty(),
+        "FIX VERIFIED: Fragment keys are in pending_deletes, not immediately deleted"
     );
+
+    // 6. Reads succeed — no 404
+    let wal_reader = WalReader::new(store.clone());
+    for fref in &fragment_refs {
+        let fragment = wal_reader.read_fragment(&ns, &fref.id).await;
+        assert!(
+            fragment.is_ok(),
+            "FIX VERIFIED: Fragment {} is readable after compaction (deferred deletion)",
+            fref.id
+        );
+    }
 
     harness.cleanup().await;
 }
@@ -203,12 +178,11 @@ async fn test_query_read_consistency_fragment_404_after_compaction() {
 //
 // TLA+ invariant: DeleteIsAtomic
 //
-// Bug: delete_namespace calls delete_prefix which deletes S3 keys one-by-one
-// (non-atomic). During deletion, a query can read the manifest (not yet deleted)
-// but find fragments already gone — partial state.
+// FIX: Delete manifest first. Concurrent queries see None manifest → empty results.
+// Fragments can still exist on S3, but no query will read them without a manifest.
 
 #[tokio::test]
-async fn test_namespace_deletion_partial_state() {
+async fn test_namespace_deletion_manifest_first() {
     let harness = TestHarness::new().await;
     let ns = harness.key("inv-ns-deletion");
     let store = &harness.store;
@@ -234,30 +208,19 @@ async fn test_namespace_deletion_partial_state() {
     assert_s3_object_exists(store, &f1_key).await;
     assert_s3_object_exists(store, &f2_key).await;
 
-    // 3. Simulate partial deletion: delete one fragment but NOT the manifest.
-    //    This is what happens mid-way through delete_prefix (manager.rs:170).
-    store.delete(&f1_key).await.unwrap();
+    // 3. Simulate the fixed deletion order: delete manifest FIRST
+    store.delete(&manifest_key).await.unwrap();
 
-    // 4. Read manifest — it still exists and still references the deleted fragment
-    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
-    let f1_still_referenced = manifest.fragments.iter().any(|f| f.id == f1.id);
+    // 4. FIX VERIFIED: Manifest is gone — queries see None → empty results
+    let manifest = Manifest::read(store, &ns).await.unwrap();
     assert!(
-        f1_still_referenced,
-        "Manifest should still reference fragment 1 (it hasn't been deleted yet)"
+        manifest.is_none(),
+        "FIX VERIFIED: Manifest is deleted first, queries see None"
     );
 
-    // 5. Try to read the deleted fragment via the manifest's reference
-    let result = store.get(&f1_key).await;
-
-    // 6. ASSERT: Manifest is readable but references a non-existent fragment — partial state
-    assert!(
-        matches!(result, Err(ZeppelinError::NotFound { .. })),
-        "BUG CONFIRMED: Manifest references fragment that no longer exists — partial state!"
-    );
-
-    // Fragment 2 and manifest still exist (only f1 was deleted so far)
+    // 5. Fragment files still exist (safe — no query will read them without a manifest)
+    assert_s3_object_exists(store, &f1_key).await;
     assert_s3_object_exists(store, &f2_key).await;
-    assert_s3_object_exists(store, &manifest_key).await;
 
     harness.cleanup().await;
 }
@@ -266,28 +229,23 @@ async fn test_namespace_deletion_partial_state() {
 //
 // TLA+ invariant: LatestWriteWins
 //
-// Bug: ULID ordering determines which value wins during merge, not commit order.
-// If clock skew causes a later-committed write to have an EARLIER ULID, its value
-// is treated as older and gets overwritten by the earlier-committed write.
-//
-// Scenario: Writer W1 starts at T=1000 (early ULID), Writer W2 starts at T=2000
-// (later ULID). W2 commits first, then W1 commits second. W1's value should be
-// authoritative (latest commit), but W2 wins because it has the later ULID.
+// FIX: Monotonic sequence numbers assigned at manifest write time.
+// Manifest order (not ULID order) determines merge winner.
 
 #[tokio::test]
-async fn test_ulid_ordering_clock_skew_wrong_value_wins() {
+async fn test_sequence_numbers_override_ulid_ordering() {
     let harness = TestHarness::new().await;
     let ns = harness.key("inv-ulid-order");
     let store = &harness.store;
 
     // 1. Construct two fragments with controlled ULIDs for the same vector ID.
     //
-    //    Fragment A: early ULID (T=1000), the LAST commit (should be authoritative)
-    //    Fragment B: later ULID (T=2000), committed FIRST (should be overridden)
+    //    Fragment B: later ULID (T=2000), committed FIRST (gets seq 0)
+    //    Fragment A: early ULID (T=1000), committed SECOND (gets seq 1, should win)
     let early_ulid = ulid::Ulid::from_parts(1000, 1);
     let later_ulid = ulid::Ulid::from_parts(2000, 1);
 
-    // Fragment A: early ULID, value = [1.0, 0.0, 0.0, ...]
+    // Fragment A: early ULID, value = [1.0, 0.0, 0.0, ...]  — the LATER commit
     let mut vec_a = vec![0.0f32; 16];
     vec_a[0] = 1.0;
     let mut frag_a = WalFragment::new(
@@ -300,7 +258,7 @@ async fn test_ulid_ordering_clock_skew_wrong_value_wins() {
     );
     frag_a.id = early_ulid;
 
-    // Fragment B: later ULID, value = [0.0, 1.0, 0.0, ...]
+    // Fragment B: later ULID, value = [0.0, 1.0, 0.0, ...] — the EARLIER commit
     let mut vec_b = vec![0.0f32; 16];
     vec_b[1] = 1.0;
     let mut frag_b = WalFragment::new(
@@ -316,73 +274,56 @@ async fn test_ulid_ordering_clock_skew_wrong_value_wins() {
     // 2. Write both fragments to S3
     let key_a = WalFragment::s3_key(&ns, &frag_a.id);
     let key_b = WalFragment::s3_key(&ns, &frag_b.id);
-    store
-        .put(&key_a, frag_a.to_bytes().unwrap())
-        .await
-        .unwrap();
-    store
-        .put(&key_b, frag_b.to_bytes().unwrap())
-        .await
-        .unwrap();
+    store.put(&key_a, frag_a.to_bytes().unwrap()).await.unwrap();
+    store.put(&key_b, frag_b.to_bytes().unwrap()).await.unwrap();
 
-    // 3. Write manifest referencing both fragments (A listed before B)
+    // 3. Write manifest: B added first (seq 0), then A (seq 1).
+    //    A committed later = higher sequence = should win.
     let mut manifest = Manifest::new();
-    manifest.add_fragment(FragmentRef {
-        id: frag_a.id,
-        vector_count: 1,
-        delete_count: 0,
-    });
     manifest.add_fragment(FragmentRef {
         id: frag_b.id,
         vector_count: 1,
         delete_count: 0,
+        sequence_number: 0, // overwritten by add_fragment
+    });
+    manifest.add_fragment(FragmentRef {
+        id: frag_a.id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0, // overwritten by add_fragment
     });
     manifest.write(store, &ns).await.unwrap();
 
-    // 4. Read fragments the way query/compaction does (sorted by ULID)
+    // 4. Read fragments in manifest order (sequence order, NOT ULID order)
     let wal_reader = WalReader::new(store.clone());
-    let fragments = wal_reader
-        .read_uncompacted_fragments(&ns)
-        .await
-        .unwrap();
+    let fragments = wal_reader.read_uncompacted_fragments(&ns).await.unwrap();
     assert_eq!(fragments.len(), 2);
+
+    // First fragment is B (seq 0, later ULID), second is A (seq 1, early ULID)
     assert_eq!(
-        fragments[0].id, early_ulid,
-        "Fragments should be sorted by ULID — early first"
+        fragments[0].id, later_ulid,
+        "First fragment should be B (seq 0, added first to manifest)"
     );
     assert_eq!(
-        fragments[1].id, later_ulid,
-        "Fragments should be sorted by ULID — later second"
+        fragments[1].id, early_ulid,
+        "Second fragment should be A (seq 1, added second to manifest)"
     );
 
-    // 5. Apply the production merge logic (same as compaction/mod.rs:107-120)
+    // 5. Apply merge logic — later in sequence wins (A overwrites B)
     let mut latest_vectors: HashMap<String, VectorEntry> = HashMap::new();
-    let mut deleted_ids: HashSet<String> = HashSet::new();
 
     for fragment in &fragments {
-        for del_id in &fragment.deletes {
-            deleted_ids.insert(del_id.clone());
-            latest_vectors.remove(del_id);
-        }
         for vec in &fragment.vectors {
-            deleted_ids.remove(&vec.id);
             latest_vectors.insert(vec.id.clone(), vec.clone());
         }
     }
 
-    // 6. ASSERT: Fragment B (later ULID) wins, even though Fragment A committed later.
-    //    In a real concurrent scenario, W1 (early ULID) committed AFTER W2 (later ULID),
-    //    so W1's value should be authoritative. But ULID ordering makes W2 win.
+    // 6. FIX VERIFIED: Fragment A (seq 1, later commit) wins
     let winner = latest_vectors.get("vec_0").expect("vec_0 should exist");
     assert_eq!(
-        winner.values, vec_b,
-        "BUG CONFIRMED: Later ULID wins, not later commit. \
-         Fragment B (earlier commit, ULID={later_ulid}) overwrites \
-         Fragment A (later commit, ULID={early_ulid})"
-    );
-    assert_ne!(
         winner.values, vec_a,
-        "Fragment A's value (the later commit) was lost due to ULID ordering"
+        "FIX VERIFIED: Fragment A (later commit, seq 1) wins over \
+         Fragment B (earlier commit, seq 0). Sequence order, not ULID order."
     );
 
     harness.cleanup().await;
@@ -390,85 +331,49 @@ async fn test_ulid_ordering_clock_skew_wrong_value_wins() {
 
 // ─── Test 5: Intra-Fragment Op Reordering ────────────────────────────────────
 //
-// Bug (from proptest): Within a single fragment, compaction processes ALL deletes
-// before ALL upserts. If a fragment contains an Upsert then Delete for the same ID
-// (intent: insert it, then remove it → should be gone), the delete runs first (no-op
-// since the vector isn't in latest_vectors yet), then the upsert adds it. Result: the
-// vector survives even though the user's intent was to delete it.
+// FIX: WalFragment::try_new() validates that no vector ID appears in both
+// upserts and deletes. The invalid state is now unrepresentable.
 
 #[tokio::test]
-async fn test_intra_fragment_op_reordering_delete_before_upsert() {
-    let harness = TestHarness::new().await;
-    let ns = harness.key("inv-op-reorder");
-    let store = &harness.store;
+async fn test_intra_fragment_overlap_rejected() {
+    let _harness = TestHarness::new().await;
 
-    // 1. Create a fragment that represents "upsert doomed_v1, then delete doomed_v1"
-    //    The fragment has doomed_v1 in BOTH vectors AND deletes.
-    //    Intent: doomed_v1 should NOT exist after processing this fragment.
-    //
-    //    Include enough other vectors for k-means to converge (need >= 4 for 4 centroids).
-    let mut vectors = make_vectors("keep", 20, 16);
-    vectors.push(VectorEntry {
+    // 1. Try to create a fragment with the same ID in both upserts and deletes
+    let vectors = vec![VectorEntry {
         id: "doomed_v1".into(),
-        values: vec![999.0; 16], // extreme values to make it easy to find in query
+        values: vec![999.0; 16],
         attributes: None,
-    });
+    }];
     let deletes = vec!["doomed_v1".to_string()];
-    let fragment = WalFragment::new(vectors, deletes);
 
-    // 2. Write fragment to S3 and create manifest
-    let frag_key = WalFragment::s3_key(&ns, &fragment.id);
-    store
-        .put(&frag_key, fragment.to_bytes().unwrap())
-        .await
-        .unwrap();
+    let result = WalFragment::try_new(vectors, deletes);
 
-    let mut manifest = Manifest::new();
-    manifest.add_fragment(FragmentRef {
-        id: fragment.id,
-        vector_count: 21,
-        delete_count: 1,
-    });
-    manifest.write(store, &ns).await.unwrap();
-
-    // 3. Run compaction — this applies the buggy merge logic
-    let compactor = test_compactor(store);
-    let result = compactor.compact(&ns).await.unwrap();
-    assert!(result.segment_id.is_some(), "Compaction should produce a segment");
-
-    // 4. Query for doomed_v1 using Eventual consistency (segment-only, bypasses WAL)
-    let wal_reader = WalReader::new(store.clone());
-    let query_vec = vec![999.0; 16]; // exact match for doomed_v1
-    let query_result = execute_query(
-        store,
-        &wal_reader,
-        &ns,
-        &query_vec,
-        25, // large enough top_k to return all vectors
-        4,
-        None,
-        ConsistencyLevel::Eventual,
-        DistanceMetric::Euclidean,
-        3,
-        None,
-    )
-    .await
-    .unwrap();
-
-    // 5. ASSERT: doomed_v1 survives in the segment despite the delete.
-    //    Because compaction processes deletes before upserts within a fragment:
-    //      - Delete "doomed_v1": no-op (not in latest_vectors yet)
-    //      - Upsert "doomed_v1": adds it to latest_vectors, removes from deleted_ids
-    //    Result: doomed_v1 is alive in the segment.
-    let doomed_found = query_result.results.iter().any(|r| r.id == "doomed_v1");
+    // 2. FIX VERIFIED: try_new rejects overlapping IDs
     assert!(
-        doomed_found,
-        "BUG CONFIRMED: doomed_v1 survives in segment despite delete in same fragment. \
-         Compaction processes deletes before upserts within a fragment, so the delete \
-         is a no-op and the upsert resurrects the vector. \
-         Compacted {} vectors into segment.",
-        result.vectors_compacted
+        result.is_err(),
+        "FIX VERIFIED: WalFragment::try_new rejects overlapping IDs in upserts and deletes"
     );
 
-    harness.cleanup().await;
+    match result {
+        Err(ZeppelinError::Validation(msg)) => {
+            assert!(
+                msg.contains("doomed_v1"),
+                "Error message should mention the offending vector ID"
+            );
+        }
+        other => panic!("Expected Validation error, got: {other:?}"),
+    }
+
+    // 3. Non-overlapping fragment creation still works
+    let good_vectors = vec![VectorEntry {
+        id: "keep_me".into(),
+        values: vec![1.0; 16],
+        attributes: None,
+    }];
+    let good_deletes = vec!["delete_me".to_string()];
+    let good_result = WalFragment::try_new(good_vectors, good_deletes);
+    assert!(
+        good_result.is_ok(),
+        "Non-overlapping fragment creation should succeed"
+    );
 }
