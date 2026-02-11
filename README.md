@@ -80,19 +80,47 @@ GET    /metrics                        # prometheus format
 - Rust 1.75+
 - An S3-compatible bucket (AWS S3, MinIO, R2, GCS)
 
-### Run locally with MinIO
+### Docker quickstart
 
 ```bash
-docker-compose up -d    # starts zeppelin + MinIO
+# Start Zeppelin + MinIO (local dev)
+docker compose up -d
+
+# Verify it's running
+curl http://localhost:8080/healthz
+
+# For production S3 — override env vars, skip MinIO
+S3_ENDPOINT= AWS_ACCESS_KEY_ID=AKIA... AWS_SECRET_ACCESS_KEY=... S3_BUCKET=my-bucket \
+  docker compose up zeppelin
 ```
 
-### Run against real S3
+### Run from source
 
 ```bash
 cp .env.example .env
 # Fill in AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET
 cargo run
 ```
+
+### Python client
+
+```bash
+pip install ./python
+```
+
+```python
+from zeppelin import ZeppelinClient
+
+with ZeppelinClient() as client:
+    client.create_namespace("demo", dimensions=4)
+    client.upsert_vectors("demo", [{"id": "v1", "values": [1, 0, 0, 0]}])
+    result = client.query("demo", [1, 0, 0, 0], top_k=5)
+    for r in result.results:
+        print(f"{r.id}: {r.score:.4f}")
+    client.delete_namespace("demo")
+```
+
+See [`python/README.md`](python/README.md) for full API docs.
 
 ### Run tests
 

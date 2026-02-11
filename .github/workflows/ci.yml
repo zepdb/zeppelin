@@ -67,6 +67,14 @@ jobs:
           MINIO_SECRET_KEY: minioadmin
         run: cargo test --test storage_tests -- --nocapture
 
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t zeppelin:ci .
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

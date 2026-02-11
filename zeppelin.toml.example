@@ -1,0 +1,57 @@
+# Zeppelin configuration
+# Copy to zeppelin.toml and uncomment values to override defaults.
+# Environment variables (shown in comments) take precedence over file values.
+
+[server]
+# host = "0.0.0.0"                   # ZEPPELIN_HOST
+# port = 8080                        # ZEPPELIN_PORT
+# request_timeout_secs = 30
+# max_concurrent_queries = 64
+# max_batch_size = 10000
+# max_top_k = 10000
+# shutdown_timeout_secs = 30
+# max_dimensions = 65536
+# max_vector_id_length = 1024
+
+[storage]
+# backend = "s3"                     # STORAGE_BACKEND — "s3", "gcs", "azure"
+# bucket = "zeppelin"                # S3_BUCKET
+
+# S3 / MinIO / R2
+# s3_region = "us-east-1"            # AWS_REGION
+# s3_endpoint = ""                   # S3_ENDPOINT — set for MinIO/R2
+# s3_access_key_id = ""              # AWS_ACCESS_KEY_ID
+# s3_secret_access_key = ""          # AWS_SECRET_ACCESS_KEY
+# s3_allow_http = false              # S3_ALLOW_HTTP — "true" for local MinIO
+
+# GCS
+# gcs_service_account_path = ""      # GCS_SERVICE_ACCOUNT_PATH
+
+# Azure Blob Storage
+# azure_account = ""                 # AZURE_ACCOUNT
+# azure_access_key = ""              # AZURE_ACCESS_KEY
+
+[cache]
+# dir = "/var/cache/zeppelin"
+# max_size_gb = 50
+# eviction = "lru"
+
+[indexing]
+# default_num_centroids = 256
+# default_nprobe = 16
+# max_nprobe = 128
+# kmeans_max_iterations = 25
+# kmeans_convergence_epsilon = 0.0001
+# oversample_factor = 3
+
+[compaction]
+# interval_secs = 30
+# max_wal_fragments_before_compact = 1000
+# retrain_imbalance_threshold = 5.0
+
+[consistency]
+# default = "strong"                 # "strong" or "eventual"
+
+[logging]
+# level = "info"                     # RUST_LOG compatible
+# format = "json"                    # "json" or "pretty"
