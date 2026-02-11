@@ -81,30 +81,20 @@ pub enum Filter {
 }
 
 /// Consistency level for queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsistencyLevel {
     /// Read from index + scan all uncompacted WAL fragments
+    #[default]
     Strong,
     /// Read from index only (faster, may miss recent writes)
     Eventual,
 }
 
-impl Default for ConsistencyLevel {
-    fn default() -> Self {
-        ConsistencyLevel::Strong
-    }
-}
-
 /// Index type for a namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexType {
+    #[default]
     IvfFlat,
-}
-
-impl Default for IndexType {
-    fn default() -> Self {
-        IndexType::IvfFlat
-    }
 }

@@ -36,6 +36,19 @@ pub async fn upsert_vectors(
     Path(ns): Path<String>,
     Json(req): Json<UpsertVectorsRequest>,
 ) -> Result<(StatusCode, Json<UpsertVectorsResponse>), ApiError> {
+    if req.vectors.is_empty() {
+        return Err(ApiError(ZeppelinError::Validation(
+            "vectors array cannot be empty".into(),
+        )));
+    }
+    if req.vectors.len() > state.config.server.max_batch_size {
+        return Err(ApiError(ZeppelinError::Validation(format!(
+            "batch size {} exceeds maximum of {}",
+            req.vectors.len(),
+            state.config.server.max_batch_size
+        ))));
+    }
+
     info!(count = req.vectors.len(), "upserting vectors");
 
     // Validate namespace exists and check dimensions

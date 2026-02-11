@@ -45,6 +45,7 @@ impl WalFragment {
         use std::collections::BTreeMap;
         use crate::types::AttributeValue;
 
+        #[allow(clippy::type_complexity)]
         let canonical: Vec<(
             &str,
             &[f32],

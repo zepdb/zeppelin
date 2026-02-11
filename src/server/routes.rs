@@ -1,14 +1,22 @@
+use std::time::Duration;
+
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
-use super::handlers::{health, namespace, query, vectors};
+use super::handlers::{health, metrics, namespace, query, vectors};
 use super::AppState;
 
 pub fn build_router(state: AppState) -> Router {
+    let timeout = Duration::from_secs(state.config.server.request_timeout_secs);
+
     Router::new()
         .route("/healthz", get(health::health_check))
+        .route("/readyz", get(health::readiness_check))
+        .route("/metrics", get(metrics::metrics_handler))
         .route(
             "/v1/namespaces",
             post(namespace::create_namespace).get(namespace::list_namespaces),
@@ -25,6 +33,8 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/namespaces/:ns/query",
             post(query::query_namespace),
         )
+        .layer(TimeoutLayer::new(timeout))
+        .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // 50 MB
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))

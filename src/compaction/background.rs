@@ -44,6 +44,9 @@ pub async fn compaction_loop(
                     info!(namespace = %ns.name, "triggering compaction");
                     match compactor.compact(&ns.name).await {
                         Ok(result) => {
+                            crate::metrics::COMPACTIONS_TOTAL
+                                .with_label_values(&[&ns.name, "success"])
+                                .inc();
                             info!(
                                 namespace = %ns.name,
                                 vectors_compacted = result.vectors_compacted,
@@ -52,6 +55,9 @@ pub async fn compaction_loop(
                             );
                         }
                         Err(e) => {
+                            crate::metrics::COMPACTIONS_TOTAL
+                                .with_label_values(&[&ns.name, "failure"])
+                                .inc();
                             warn!(namespace = %ns.name, error = %e, "compaction failed");
                         }
                     }

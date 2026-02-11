@@ -1,8 +1,10 @@
 use bytes::Bytes;
 use std::path::Path;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 use zeppelin::cache::DiskCache;
+use zeppelin::error::ZeppelinError;
 
 /// Create a test cache with a given max size in bytes.
 fn test_cache(dir: &Path, max_bytes: u64) -> DiskCache {
@@ -218,4 +220,61 @@ async fn test_cache_persists_across_instances() {
         let result = cache.get("k1").await;
         assert_eq!(result, Some(Bytes::from("persistent_data")));
     }
+}
+
+#[tokio::test]
+async fn test_cache_get_or_fetch_error_propagates() {
+    let dir = TempDir::new().unwrap();
+    let cache = test_cache(dir.path(), 1024 * 1024);
+
+    let result = cache
+        .get_or_fetch("error_key", || async {
+            Err(ZeppelinError::Cache("simulated fetch error".into()))
+        })
+        .await;
+
+    assert!(result.is_err(), "error from fetch should propagate");
+    // Cache should not be populated
+    assert_eq!(cache.get("error_key").await, None);
+}
+
+#[tokio::test]
+async fn test_cache_concurrent_get_or_fetch() {
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(test_cache(dir.path(), 1024 * 1024));
+
+    let fetch_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let mut handles = vec![];
+    for _ in 0..10 {
+        let cache = cache.clone();
+        let fetch_count = fetch_count.clone();
+        handles.push(tokio::spawn(async move {
+            cache
+                .get_or_fetch("shared_key", || {
+                    let fc = fetch_count.clone();
+                    async move {
+                        fc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Small delay to simulate network fetch
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        Ok(Bytes::from("shared_value"))
+                    }
+                })
+                .await
+                .unwrap()
+        }));
+    }
+
+    let mut results = vec![];
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+
+    // All results should be the same value
+    for result in &results {
+        assert_eq!(result, &Bytes::from("shared_value"));
+    }
+
+    // The value should be in the cache
+    assert_eq!(cache.get("shared_key").await, Some(Bytes::from("shared_value")));
 }

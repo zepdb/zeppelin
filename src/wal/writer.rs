@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::sync::Arc;
+use dashmap::DashMap;
 use tokio::sync::Mutex;
 use tracing::{debug, instrument};
 
@@ -14,30 +14,24 @@ use super::manifest::{FragmentRef, Manifest};
 pub struct WalWriter {
     store: ZeppelinStore,
     /// Per-namespace locks to serialize writes within a namespace.
-    locks: Arc<HashMap<String, Mutex<()>>>,
-    /// Global lock for creating new namespace locks.
-    global_lock: Mutex<()>,
+    locks: DashMap<String, Arc<Mutex<()>>>,
 }
 
 impl WalWriter {
     pub fn new(store: ZeppelinStore) -> Self {
         Self {
             store,
-            locks: Arc::new(HashMap::new()),
-            global_lock: Mutex::new(()),
+            locks: DashMap::new(),
         }
     }
 
     /// Get or create the per-namespace lock.
-    async fn namespace_lock(&self, namespace: &str) -> Arc<Mutex<()>> {
-        // For simplicity, use a DashMap-like approach with the global lock
-        // In production, this would use DashMap, but for correctness we use a simple approach.
-        let _guard = self.global_lock.lock().await;
-
-        // Since HashMap isn't mutable here, we'll use a separate approach
-        // We return a new mutex each time — the actual serialization happens via
-        // the manifest read-modify-write on S3 being atomic enough for single-node.
-        Arc::new(Mutex::new(()))
+    fn namespace_lock(&self, namespace: &str) -> Arc<Mutex<()>> {
+        self.locks
+            .entry(namespace.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value()
+            .clone()
     }
 
     /// Append vectors and deletes to the WAL for a namespace.
@@ -49,6 +43,11 @@ impl WalWriter {
         vectors: Vec<VectorEntry>,
         deletes: Vec<VectorId>,
     ) -> Result<WalFragment> {
+        let lock = self.namespace_lock(namespace);
+        let _guard = lock.lock().await;
+
+        crate::metrics::WAL_APPENDS_TOTAL.with_label_values(&[namespace]).inc();
+
         let fragment = WalFragment::new(vectors, deletes);
 
         // Write the fragment to S3

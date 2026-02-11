@@ -1,4 +1,5 @@
 pub mod health;
+pub mod metrics;
 pub mod namespace;
 pub mod query;
 pub mod vectors;

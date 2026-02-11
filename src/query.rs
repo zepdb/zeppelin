@@ -15,6 +15,7 @@ use crate::wal::Manifest;
 use crate::wal::WalReader;
 
 /// Execute a query against a namespace, combining WAL scan and segment search.
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip(store, wal_reader, query, filter, cache), fields(namespace = namespace))]
 pub async fn execute_query(
     store: &ZeppelinStore,
@@ -48,18 +49,9 @@ pub async fn execute_query(
     // Segment search
     let segment_results = if let Some(ref segment_id) = manifest.active_segment {
         let results = segment_search(
-            store,
-            namespace,
-            segment_id,
-            query,
-            top_k,
-            nprobe,
-            filter,
-            distance_metric,
-            oversample_factor,
-            cache,
-        )
-        .await?;
+            store, namespace, segment_id, query, top_k, nprobe, filter, distance_metric,
+            oversample_factor, cache,
+        ).await?;
         scanned_segments = 1;
         results
     } else {
@@ -102,6 +94,7 @@ async fn wal_scan(
     // Collect all delete tombstones
     let mut deleted_ids: HashSet<String> = HashSet::new();
     // Latest vector state per ID (latest fragment wins)
+    #[allow(clippy::type_complexity)]
     let mut latest_vectors: HashMap<String, (Vec<f32>, Option<HashMap<String, crate::types::AttributeValue>>)> =
         HashMap::new();
 
@@ -153,6 +146,7 @@ async fn wal_scan(
 }
 
 /// Search a single segment via the IVF-Flat index.
+#[allow(clippy::too_many_arguments)]
 async fn segment_search(
     store: &ZeppelinStore,
     namespace: &str,
@@ -163,7 +157,7 @@ async fn segment_search(
     filter: Option<&Filter>,
     distance_metric: DistanceMetric,
     oversample_factor: usize,
-    _cache: Option<&Arc<DiskCache>>,
+    cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<SearchResult>> {
     let index = IvfFlatIndex::load(store, namespace, segment_id).await?;
 
@@ -177,6 +171,7 @@ async fn segment_search(
         distance_metric,
         store,
         oversample_factor,
+        cache,
     )
     .await?;
 

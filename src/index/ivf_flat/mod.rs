@@ -93,6 +93,7 @@ impl VectorIndex for IvfFlatIndex {
             distance_metric,
             store,
             oversample_factor,
+            None,
         )
         .await
     }

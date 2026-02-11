@@ -41,6 +41,7 @@ pub async fn query_namespace(
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let start = std::time::Instant::now();
+    crate::metrics::QUERIES_TOTAL.with_label_values(&[&ns]).inc();
 
     let meta = state
         .namespace_manager
@@ -53,6 +54,18 @@ pub async fn query_namespace(
             expected: meta.dimensions,
             actual: req.vector.len(),
         }));
+    }
+
+    if req.top_k == 0 {
+        return Err(ApiError(ZeppelinError::Validation(
+            "top_k must be > 0".into(),
+        )));
+    }
+    if req.top_k > state.config.server.max_top_k {
+        return Err(ApiError(ZeppelinError::Validation(format!(
+            "top_k {} exceeds maximum of {}",
+            req.top_k, state.config.server.max_top_k
+        ))));
     }
 
     let nprobe = req
@@ -76,11 +89,16 @@ pub async fn query_namespace(
     .await
     .map_err(ApiError::from)?;
 
+    let elapsed = start.elapsed();
+    crate::metrics::QUERY_DURATION
+        .with_label_values(&[&ns])
+        .observe(elapsed.as_secs_f64());
+
     info!(
         results = result.results.len(),
         scanned_fragments = result.scanned_fragments,
         scanned_segments = result.scanned_segments,
-        elapsed_ms = start.elapsed().as_millis(),
+        elapsed_ms = elapsed.as_millis(),
         "query complete"
     );
 

@@ -6,7 +6,7 @@ use tracing::{debug, info, instrument};
 use ulid::Ulid;
 
 use crate::config::{CompactionConfig, IndexingConfig};
-use crate::error::{Result, ZeppelinError};
+use crate::error::Result;
 use crate::index::ivf_flat::build::{
     attrs_key, build_ivf_flat, cluster_key, deserialize_attrs, deserialize_cluster,
 };

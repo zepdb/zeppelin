@@ -3,6 +3,8 @@ mod common;
 use common::harness::TestHarness;
 use common::vectors::random_vectors;
 
+use std::sync::Arc;
+
 use zeppelin::error::ZeppelinError;
 use zeppelin::wal::{Manifest, WalFragment, WalReader, WalWriter};
 
@@ -177,6 +179,85 @@ async fn test_wal_fragment_key_listing() {
     for key in &keys {
         assert!(key.ends_with(".wal"));
     }
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_wal_writer_concurrent_appends() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("wal-concurrent");
+
+    let manifest = Manifest::new();
+    manifest.write(&harness.store, &ns).await.unwrap();
+
+    let writer = Arc::new(WalWriter::new(harness.store.clone()));
+
+    let mut handles = vec![];
+    for i in 0..10 {
+        let writer = writer.clone();
+        let ns = ns.clone();
+        handles.push(tokio::spawn(async move {
+            let vectors = vec![zeppelin::types::VectorEntry {
+                id: format!("concurrent_{i}"),
+                values: vec![i as f32; 4],
+                attributes: None,
+            }];
+            writer.append(&ns, vectors, vec![]).await.unwrap();
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    let manifest = Manifest::read(&harness.store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.fragments.len(), 10, "all 10 concurrent appends should be in manifest");
+
+    // Verify all fragments are readable and have valid checksums
+    let reader = WalReader::new(harness.store.clone());
+    let fragments = reader.read_uncompacted_fragments(&ns).await.unwrap();
+    assert_eq!(fragments.len(), 10);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_wal_writer_sequential_consistency() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("wal-sequential");
+
+    let manifest = Manifest::new();
+    manifest.write(&harness.store, &ns).await.unwrap();
+
+    let writer = WalWriter::new(harness.store.clone());
+
+    // Append 1
+    writer
+        .append(&ns, random_vectors(2, 4), vec![])
+        .await
+        .unwrap();
+    let m = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(m.fragments.len(), 1);
+
+    // Append 2
+    writer
+        .append(&ns, random_vectors(3, 4), vec![])
+        .await
+        .unwrap();
+    let m = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(m.fragments.len(), 2);
+
+    // Append 3
+    writer
+        .append(&ns, random_vectors(1, 4), vec![])
+        .await
+        .unwrap();
+    let m = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(m.fragments.len(), 3);
 
     harness.cleanup().await;
 }

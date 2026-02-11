@@ -7,8 +7,10 @@
 //! 5. Return sorted top-k results.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
+use crate::cache::DiskCache;
 use crate::error::{Result, ZeppelinError};
 use crate::index::distance::compute_distance;
 use crate::index::filter::{evaluate_filter, oversampled_k};
@@ -25,6 +27,19 @@ struct Candidate {
     attributes: Option<HashMap<String, AttributeValue>>,
 }
 
+/// Fetch data from cache if available, otherwise from S3.
+async fn fetch_with_cache(
+    cache: Option<&Arc<DiskCache>>,
+    store: &ZeppelinStore,
+    key: &str,
+) -> Result<bytes::Bytes> {
+    if let Some(c) = cache {
+        c.get_or_fetch(key, || store.get(key)).await
+    } else {
+        store.get(key).await
+    }
+}
+
 /// Execute an IVF-Flat search against the stored index.
 ///
 /// # Arguments
@@ -36,6 +51,8 @@ struct Candidate {
 /// * `distance_metric` - Distance metric for ranking.
 /// * `store`    - S3 store for reading cluster data.
 /// * `oversample_factor` - Oversampling multiplier when filters are active.
+/// * `cache`    - Optional disk cache for cluster data.
+#[allow(clippy::too_many_arguments)]
 pub async fn search_ivf_flat(
     index: &IvfFlatIndex,
     query: &[f32],
@@ -45,6 +62,7 @@ pub async fn search_ivf_flat(
     distance_metric: DistanceMetric,
     store: &ZeppelinStore,
     oversample_factor: usize,
+    cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<SearchResult>> {
     // Validate query dimension.
     if query.len() != index.dim {
@@ -97,7 +115,7 @@ pub async fn search_ivf_flat(
     for &cluster_idx in &probe_clusters {
         // Fetch cluster vector data.
         let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
-        let cluster_data = match store.get(&cvec_key).await {
+        let cluster_data = match fetch_with_cache(cache, store, &cvec_key).await {
             Ok(data) => data,
             Err(e) => {
                 warn!(cluster = cluster_idx, error = %e, "failed to read cluster, skipping");
@@ -109,7 +127,7 @@ pub async fn search_ivf_flat(
         // Fetch attributes if we need them for filtering.
         let attrs: Option<Vec<Option<HashMap<String, AttributeValue>>>> = if filter.is_some() {
             let akey = attrs_key(&index.namespace, &index.segment_id, cluster_idx);
-            match store.get(&akey).await {
+            match fetch_with_cache(cache, store, &akey).await {
                 Ok(data) => Some(deserialize_attrs(&data)?),
                 Err(e) => {
                     warn!(cluster = cluster_idx, error = %e, "failed to read attrs, skipping filter for cluster");
@@ -119,7 +137,7 @@ pub async fn search_ivf_flat(
         } else {
             // Even without a filter, load attrs so we can return them in results.
             let akey = attrs_key(&index.namespace, &index.segment_id, cluster_idx);
-            match store.get(&akey).await {
+            match fetch_with_cache(cache, store, &akey).await {
                 Ok(data) => Some(deserialize_attrs(&data)?),
                 Err(_) => None,
             }
@@ -226,6 +244,7 @@ mod tests {
             DistanceMetric::Euclidean,
             &store,
             3,
+            None,
         ));
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -258,6 +277,7 @@ mod tests {
                 DistanceMetric::Euclidean,
                 &store,
                 3,
+                None,
             ))
             .unwrap();
         assert!(results.is_empty());

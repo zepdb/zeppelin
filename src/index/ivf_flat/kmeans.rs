@@ -75,10 +75,10 @@ pub fn train_kmeans(
         }
 
         // Zero the accumulators.
-        for c in 0..effective_k {
+        for (c, new_centroid) in new_centroids.iter_mut().enumerate().take(effective_k) {
             counts[c] = 0;
-            for d in 0..dim {
-                new_centroids[c][d] = 0.0;
+            for val in new_centroid.iter_mut() {
+                *val = 0.0;
             }
         }
 
@@ -93,19 +93,17 @@ pub fn train_kmeans(
 
         // Compute means and track maximum centroid shift.
         let mut max_shift: f64 = 0.0;
-        for c in 0..effective_k {
+        for (c, new_centroid) in new_centroids.iter_mut().enumerate().take(effective_k) {
             if counts[c] == 0 {
                 // Empty cluster: keep old centroid (degenerate but safe).
-                for d in 0..dim {
-                    new_centroids[c][d] = centroids[c][d];
-                }
+                new_centroid.copy_from_slice(&centroids[c]);
                 continue;
             }
             let inv = 1.0 / counts[c] as f32;
-            for d in 0..dim {
-                new_centroids[c][d] *= inv;
+            for val in new_centroid.iter_mut() {
+                *val *= inv;
             }
-            let shift = squared_l2(&centroids[c], &new_centroids[c]) as f64;
+            let shift = squared_l2(&centroids[c], new_centroid) as f64;
             if shift > max_shift {
                 max_shift = shift;
             }

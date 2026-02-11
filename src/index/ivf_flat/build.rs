@@ -70,8 +70,12 @@ pub(crate) fn deserialize_centroids(data: &[u8]) -> Result<(Vec<Vec<f32>>, usize
         return Err(ZeppelinError::Index("centroids blob too small for header".into()));
     }
 
-    let num_centroids = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    let dim = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let num_centroids = u32::from_le_bytes(
+        data[0..4].try_into().map_err(|_| ZeppelinError::Index("centroids header parse error".into()))?
+    ) as usize;
+    let dim = u32::from_le_bytes(
+        data[4..8].try_into().map_err(|_| ZeppelinError::Index("centroids header parse error".into()))?
+    ) as usize;
 
     let expected = 8 + num_centroids * dim * 4;
     if data.len() < expected {
@@ -86,7 +90,9 @@ pub(crate) fn deserialize_centroids(data: &[u8]) -> Result<(Vec<Vec<f32>>, usize
     for _ in 0..num_centroids {
         let mut c = Vec::with_capacity(dim);
         for _ in 0..dim {
-            let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            let val = f32::from_le_bytes(
+                data[offset..offset + 4].try_into().map_err(|_| ZeppelinError::Index("centroids float parse error".into()))?
+            );
             c.push(val);
             offset += 4;
         }
@@ -125,6 +131,7 @@ pub(crate) fn serialize_cluster(
 }
 
 /// Cluster data for a single cluster.
+#[derive(Debug)]
 pub(crate) struct ClusterData {
     pub ids: Vec<String>,
     pub vectors: Vec<Vec<f32>>,
@@ -136,8 +143,12 @@ pub(crate) fn deserialize_cluster(data: &[u8]) -> Result<ClusterData> {
         return Err(ZeppelinError::Index("cluster blob too small for header".into()));
     }
 
-    let n = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    let dim = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let n = u32::from_le_bytes(
+        data[0..4].try_into().map_err(|_| ZeppelinError::Index("cluster header parse error".into()))?
+    ) as usize;
+    let dim = u32::from_le_bytes(
+        data[4..8].try_into().map_err(|_| ZeppelinError::Index("cluster header parse error".into()))?
+    ) as usize;
 
     let mut ids = Vec::with_capacity(n);
     let mut vectors = Vec::with_capacity(n);
@@ -147,7 +158,9 @@ pub(crate) fn deserialize_cluster(data: &[u8]) -> Result<ClusterData> {
         if offset + 4 > data.len() {
             return Err(ZeppelinError::Index("cluster blob truncated at id_len".into()));
         }
-        let id_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let id_len = u32::from_le_bytes(
+            data[offset..offset + 4].try_into().map_err(|_| ZeppelinError::Index("cluster id_len parse error".into()))?
+        ) as usize;
         offset += 4;
 
         if offset + id_len > data.len() {
@@ -162,7 +175,9 @@ pub(crate) fn deserialize_cluster(data: &[u8]) -> Result<ClusterData> {
         }
         let mut vec = Vec::with_capacity(dim);
         for _ in 0..dim {
-            let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            let val = f32::from_le_bytes(
+                data[offset..offset + 4].try_into().map_err(|_| ZeppelinError::Index("cluster float parse error".into()))?
+            );
             vec.push(val);
             offset += 4;
         }
@@ -337,7 +352,9 @@ pub async fn load_ivf_flat(
         let cvec_key = cluster_key(namespace, segment_id, i);
         let cluster_data = store.get(&cvec_key).await?;
         if cluster_data.len() >= 8 {
-            let n = u32::from_le_bytes(cluster_data[0..4].try_into().unwrap()) as usize;
+            let n = u32::from_le_bytes(
+                cluster_data[0..4].try_into().map_err(|_| ZeppelinError::Index("cluster count parse error".into()))?
+            ) as usize;
             num_vectors += n;
         }
     }
@@ -409,5 +426,44 @@ mod tests {
     fn test_cluster_header_too_small() {
         let data = vec![0u8; 4];
         assert!(deserialize_cluster(&data).is_err());
+    }
+
+    #[test]
+    fn test_deserialize_centroids_truncated_floats() {
+        // Header says 2 centroids dim=3 but only provide 1 centroid of float data
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_le_bytes()); // num_centroids = 2
+        buf.extend_from_slice(&3u32.to_le_bytes()); // dim = 3
+        // Only provide 1 centroid worth of floats (3 floats = 12 bytes) instead of 2 (24 bytes)
+        for _ in 0..3 {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        let result = deserialize_centroids(&buf);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ZeppelinError::Index(msg) => assert!(msg.contains("mismatch"), "got: {msg}"),
+            other => panic!("expected Index error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_cluster_truncated_vector() {
+        // Header says 1 vector dim=4 but truncate after 2 floats
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // n = 1
+        buf.extend_from_slice(&4u32.to_le_bytes()); // dim = 4
+        // id
+        let id = b"vec_0";
+        buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
+        buf.extend_from_slice(id);
+        // Only 2 floats instead of 4
+        buf.extend_from_slice(&1.0f32.to_le_bytes());
+        buf.extend_from_slice(&2.0f32.to_le_bytes());
+        let result = deserialize_cluster(&buf);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ZeppelinError::Index(msg) => assert!(msg.contains("truncated"), "got: {msg}"),
+            other => panic!("expected Index error, got: {other}"),
+        }
     }
 }

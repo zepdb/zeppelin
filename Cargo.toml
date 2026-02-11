@@ -14,7 +14,7 @@ path = "src/main.rs"
 # HTTP server
 axum = { version = "0.7", features = ["macros"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors", "timeout"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "timeout", "limit"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -50,6 +50,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Metrics
 prometheus = "0.13"
+lazy_static = "1"
 
 # Config
 dotenvy = "0.15"

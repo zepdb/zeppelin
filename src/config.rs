@@ -2,7 +2,7 @@ use crate::error::{Result, ZeppelinError};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -30,6 +30,12 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
+    #[serde(default = "default_max_batch_size")]
+    pub max_batch_size: usize,
+    #[serde(default = "default_max_top_k")]
+    pub max_top_k: usize,
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +134,15 @@ fn default_request_timeout() -> u64 {
 fn default_max_concurrent_queries() -> usize {
     64
 }
+fn default_max_batch_size() -> usize {
+    10_000
+}
+fn default_max_top_k() -> usize {
+    10_000
+}
+fn default_shutdown_timeout_secs() -> u64 {
+    30
+}
 fn default_backend() -> String {
     std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "s3".to_string())
 }
@@ -180,20 +195,6 @@ fn default_log_format() -> String {
     "json".to_string()
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            storage: StorageConfig::default(),
-            cache: CacheConfig::default(),
-            indexing: IndexingConfig::default(),
-            compaction: CompactionConfig::default(),
-            consistency: ConsistencyConfig::default(),
-            logging: LoggingConfig::default(),
-        }
-    }
-}
-
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -201,6 +202,9 @@ impl Default for ServerConfig {
             port: default_port(),
             request_timeout_secs: default_request_timeout(),
             max_concurrent_queries: default_max_concurrent_queries(),
+            max_batch_size: default_max_batch_size(),
+            max_top_k: default_max_top_k(),
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
         }
     }
 }

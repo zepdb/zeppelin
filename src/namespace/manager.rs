@@ -2,7 +2,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, instrument};
+use tracing::{info, instrument};
 
 use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
