@@ -1,72 +1,7 @@
 mod common;
 
-use std::sync::Arc;
-
-use common::harness::TestHarness;
+use common::server::{api_ns, cleanup_ns, start_test_server};
 use common::vectors::random_vectors;
-
-use tokio::net::TcpListener;
-
-use zeppelin::cache::DiskCache;
-use zeppelin::compaction::Compactor;
-use zeppelin::config::Config;
-use zeppelin::namespace::NamespaceManager;
-use zeppelin::server::routes::build_router;
-use zeppelin::server::AppState;
-use zeppelin::storage::ZeppelinStore;
-use zeppelin::wal::{WalReader, WalWriter};
-
-/// Start a test server on a random port, returning (base_url, harness).
-async fn start_test_server() -> (String, TestHarness) {
-    let harness = TestHarness::new().await;
-    let config = Config::load(None).unwrap();
-
-    let cache_dir = tempfile::TempDir::new().unwrap();
-    let cache = Arc::new(
-        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
-    );
-
-    let compactor = Arc::new(Compactor::new(
-        harness.store.clone(),
-        WalReader::new(harness.store.clone()),
-        config.compaction.clone(),
-        config.indexing.clone(),
-    ));
-
-    let state = AppState {
-        store: harness.store.clone(),
-        namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
-        wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
-        wal_reader: Arc::new(WalReader::new(harness.store.clone())),
-        config: Arc::new(config),
-        compactor,
-        cache,
-    };
-
-    let app = build_router(state);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    (base_url, harness)
-}
-
-/// Create a URL-safe namespace name scoped to this test's prefix.
-/// Uses dash separator instead of slash so it works in URL path segments.
-fn api_ns(harness: &TestHarness, suffix: &str) -> String {
-    format!("{}-{suffix}", harness.prefix)
-}
-
-/// Clean up all S3 objects under a namespace prefix.
-/// Needed because api_ns() names live outside the harness prefix.
-async fn cleanup_ns(store: &ZeppelinStore, ns: &str) {
-    let prefix = format!("{ns}/");
-    let _ = store.delete_prefix(&prefix).await;
-}
 
 #[tokio::test]
 async fn test_health_check() {

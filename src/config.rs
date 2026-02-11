@@ -36,6 +36,10 @@ pub struct ServerConfig {
     pub max_top_k: usize,
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
+    #[serde(default = "default_max_dimensions")]
+    pub max_dimensions: usize,
+    #[serde(default = "default_max_vector_id_length")]
+    pub max_vector_id_length: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +147,12 @@ fn default_max_top_k() -> usize {
 fn default_shutdown_timeout_secs() -> u64 {
     30
 }
+fn default_max_dimensions() -> usize {
+    65_536
+}
+fn default_max_vector_id_length() -> usize {
+    1024
+}
 fn default_backend() -> String {
     std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "s3".to_string())
 }
@@ -205,6 +215,8 @@ impl Default for ServerConfig {
             max_batch_size: default_max_batch_size(),
             max_top_k: default_max_top_k(),
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            max_dimensions: default_max_dimensions(),
+            max_vector_id_length: default_max_vector_id_length(),
         }
     }
 }

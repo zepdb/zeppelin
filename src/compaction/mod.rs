@@ -2,7 +2,7 @@ pub mod background;
 
 use std::collections::{HashMap, HashSet};
 
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use ulid::Ulid;
 
 use crate::config::{CompactionConfig, IndexingConfig};
@@ -140,13 +140,17 @@ impl Compactor {
             // Delete old fragment files
             for fref in &fragment_refs {
                 let key = WalFragment::s3_key(namespace, &fref.id);
-                let _ = self.store.delete(&key).await;
+                if let Err(e) = self.store.delete(&key).await {
+                    warn!(key = %key, error = %e, "failed to delete old WAL fragment");
+                }
             }
 
             // Delete old segment if existed
             if let Some(ref seg_id) = old_segment_id {
                 let prefix = format!("{namespace}/segments/{seg_id}/");
-                let _ = self.store.delete_prefix(&prefix).await;
+                if let Err(e) = self.store.delete_prefix(&prefix).await {
+                    warn!(prefix = %prefix, error = %e, "failed to delete old segment");
+                }
             }
 
             info!(
@@ -188,13 +192,17 @@ impl Compactor {
         // 11. Delete old WAL fragment files
         for fref in &fragment_refs {
             let key = WalFragment::s3_key(namespace, &fref.id);
-            let _ = self.store.delete(&key).await;
+            if let Err(e) = self.store.delete(&key).await {
+                warn!(key = %key, error = %e, "failed to delete old WAL fragment");
+            }
         }
 
         // 12. Delete old segment files if existed
         let old_segment_removed = if let Some(ref seg_id) = old_segment_id {
             let prefix = format!("{namespace}/segments/{seg_id}/");
-            let _ = self.store.delete_prefix(&prefix).await;
+            if let Err(e) = self.store.delete_prefix(&prefix).await {
+                warn!(prefix = %prefix, error = %e, "failed to delete old segment");
+            }
             Some(seg_id.clone())
         } else {
             None
