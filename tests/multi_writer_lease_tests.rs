@@ -278,8 +278,14 @@ async fn test_sequential_writers_with_leases() {
     let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     assert_eq!(manifest.fragments.len(), 2);
     let frag_ids: Vec<_> = manifest.fragments.iter().map(|f| f.id).collect();
-    assert!(frag_ids.contains(&frag1.id), "Fragment 1 should be in manifest");
-    assert!(frag_ids.contains(&frag2.id), "Fragment 2 should be in manifest");
+    assert!(
+        frag_ids.contains(&frag1.id),
+        "Fragment 1 should be in manifest"
+    );
+    assert!(
+        frag_ids.contains(&frag2.id),
+        "Fragment 2 should be in manifest"
+    );
 
     harness.cleanup().await;
 }
@@ -415,10 +421,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
         .unwrap();
 
     // State 5: W1 reads manifest — snapshots with etag
-    let (w1_snap, w1_version) = Manifest::read_versioned(store, &ns)
-        .await
-        .unwrap()
-        .unwrap();
+    let (w1_snap, w1_version) = Manifest::read_versioned(store, &ns).await.unwrap().unwrap();
 
     // State 6: W1 passes CheckFencing (manifest.fencing_token=0 ≤ w1_token)
     assert!(
@@ -429,11 +432,8 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
     );
 
     // State 7: W2 acquires lease (takeover, token=2)
-    let w2_manager = LeaseManager::new(
-        store.clone(),
-        "w2-new".to_string(),
-        Duration::from_secs(30),
-    );
+    let w2_manager =
+        LeaseManager::new(store.clone(), "w2-new".to_string(), Duration::from_secs(30));
     let w2_lease = w2_manager.acquire(&ns).await.unwrap();
     let w2_token = w2_lease.fencing_token;
     assert!(w2_token > w1_token, "W2 token should be > W1 token");
@@ -450,10 +450,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
         .unwrap();
 
     // State 9-10: W2 reads manifest, passes fencing check
-    let (mut w2_snap, w2_version) = Manifest::read_versioned(store, &ns)
-        .await
-        .unwrap()
-        .unwrap();
+    let (mut w2_snap, w2_version) = Manifest::read_versioned(store, &ns).await.unwrap().unwrap();
     assert!(
         w2_snap.fencing_token <= w2_token,
         "W2 should pass fencing check"
@@ -482,9 +479,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
         sequence_number: 0,
     });
     w1_modified.fencing_token = w1_token;
-    let w1_cas_result = w1_modified
-        .write_conditional(store, &ns, &w1_version)
-        .await;
+    let w1_cas_result = w1_modified.write_conditional(store, &ns, &w1_version).await;
 
     assert!(
         matches!(w1_cas_result, Err(ZeppelinError::ManifestConflict { .. })),
@@ -552,22 +547,14 @@ async fn test_tla_graceful_release_after_lease_expiry() {
     manifest.write(store, &ns).await.unwrap();
 
     // State 2: W1 acquires lease (token=1, 1s duration)
-    let w1_manager = LeaseManager::new(
-        store.clone(),
-        "w1".to_string(),
-        Duration::from_secs(1),
-    );
+    let w1_manager = LeaseManager::new(store.clone(), "w1".to_string(), Duration::from_secs(1));
     let w1_lease = w1_manager.acquire(&ns).await.unwrap();
 
     // State 3: W1's lease expires
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // State 6: W2 acquires (takeover, token=2, also short lease)
-    let w2_manager = LeaseManager::new(
-        store.clone(),
-        "w2".to_string(),
-        Duration::from_secs(1),
-    );
+    let w2_manager = LeaseManager::new(store.clone(), "w2".to_string(), Duration::from_secs(1));
     let w2_lease = w2_manager.acquire(&ns).await.unwrap();
     assert!(w2_lease.fencing_token > w1_lease.fencing_token);
 
@@ -600,17 +587,13 @@ async fn test_tla_graceful_release_after_lease_expiry() {
         Ok(()) => {} // Best case: release silently succeeds (lease already gone)
         Err(e) => {
             // Acceptable: any non-panic error. The process can continue.
-            eprintln!(
-                "FIX VERIFIED: W1 release returned non-fatal error (expected): {e}"
-            );
+            eprintln!("FIX VERIFIED: W1 release returned non-fatal error (expected): {e}");
         }
     }
     match &w2_release_result {
         Ok(()) => {}
         Err(e) => {
-            eprintln!(
-                "FIX VERIFIED: W2 release returned non-fatal error (expected): {e}"
-            );
+            eprintln!("FIX VERIFIED: W2 release returned non-fatal error (expected): {e}");
         }
     }
 

@@ -120,9 +120,19 @@ async fn test_compact_multiple_fragments() {
     assert_eq!(result.vectors_compacted, 100);
     assert_eq!(result.fragments_removed, 3);
 
-    // All 3 fragment .wal files should be deleted from S3
+    // Deferred deletion: fragment keys should be in pending_deletes, not immediately removed
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
     for key in &frag_keys {
-        assert_s3_object_not_exists(store, key).await;
+        assert!(
+            manifest.pending_deletes.contains(key),
+            "Fragment key {} should be in pending_deletes",
+            key
+        );
+    }
+
+    // Fragment files still exist on S3 until next compaction cycle
+    for key in &frag_keys {
+        assert_s3_object_exists(store, key).await;
     }
 
     harness.cleanup().await;
@@ -307,9 +317,19 @@ async fn test_compact_cleans_up_fragments() {
     let compactor = test_compactor(store);
     compactor.compact(&ns).await.unwrap();
 
-    // Each fragment key should be deleted
+    // Deferred deletion: fragment keys should be in pending_deletes, not immediately removed
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
     for key in &keys {
-        assert_s3_object_not_exists(store, key).await;
+        assert!(
+            manifest.pending_deletes.contains(key),
+            "Fragment key {} should be in pending_deletes",
+            key
+        );
+    }
+
+    // Fragment files still exist on S3 until next compaction cycle
+    for key in &keys {
+        assert_s3_object_exists(store, key).await;
     }
 
     harness.cleanup().await;
@@ -398,12 +418,20 @@ async fn test_compact_with_existing_segment() {
     // New segment should have 70 vectors (50 old + 20 new)
     assert_eq!(result.vectors_compacted, 70);
 
-    // Old segment files should be cleaned up
+    // Deferred deletion: old segment keys should be in pending_deletes
     let old_centroids_key = format!("{ns}/segments/{old_seg_id}/centroids.bin");
-    assert_s3_object_not_exists(store, &old_centroids_key).await;
-
-    // New segment should exist
     let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    assert!(
+        manifest
+            .pending_deletes
+            .iter()
+            .any(|k| k.contains(old_seg_id)),
+        "Old segment keys should be in pending_deletes"
+    );
+    // Old segment still exists on S3 until next compaction cycle
+    assert_s3_object_exists(store, &old_centroids_key).await;
+
+    // New segment should exist (reuse manifest from above)
     assert!(manifest.active_segment.is_some());
     let new_seg_id = manifest.active_segment.as_ref().unwrap();
     assert_ne!(new_seg_id, old_seg_id);

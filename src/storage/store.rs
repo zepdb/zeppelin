@@ -43,8 +43,7 @@ impl ZeppelinStore {
 
                     // Enable conditional PUT (ETag-based CAS) — required for
                     // manifest conflict detection and lease CAS operations.
-                    builder =
-                        builder.with_conditional_put(S3ConditionalPut::ETagMatch);
+                    builder = builder.with_conditional_put(S3ConditionalPut::ETagMatch);
 
                     Arc::new(builder.build().map_err(|e| {
                         ZeppelinError::Config(format!("failed to build S3 store: {e}"))

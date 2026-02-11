@@ -198,8 +198,9 @@ impl LeaseManager {
     /// Build a new Lease with the given token and current timestamps.
     fn build_lease(&self, fencing_token: u64) -> Lease {
         let now = Utc::now();
-        let expires_at = now + chrono::Duration::from_std(self.lease_duration)
-            .expect("lease_duration out of range for chrono");
+        let expires_at = now
+            + chrono::Duration::from_std(self.lease_duration)
+                .expect("lease_duration out of range for chrono");
         Lease {
             holder_id: self.holder_id.clone(),
             fencing_token,

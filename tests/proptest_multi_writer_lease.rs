@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime};
 struct TestLease {
     holder_id: String,
     fencing_token: u64,
+    #[allow(dead_code)]
     acquired_at: SystemTime,
     expires_at: SystemTime,
 }
@@ -111,11 +112,7 @@ impl TestLeaseStore {
         now: SystemTime,
     ) -> (Result<TestLease, String>, Result<TestLease, String>) {
         // Both read the current state (simulate reading same ETag)
-        let current_version = self
-            .leases
-            .get(namespace)
-            .map(|(_, v)| *v)
-            .unwrap_or(0);
+        let current_version = self.leases.get(namespace).map(|(_, v)| *v).unwrap_or(0);
         let is_expired = self
             .leases
             .get(namespace)
@@ -147,7 +144,7 @@ impl TestLeaseStore {
 
         // Holder B tries to CAS — version mismatch (current_version != version_a)
         let _ = current_version; // B's stale version
-        // B fails because the ETag changed
+                                 // B fails because the ETag changed
         let result_b = Err(format!(
             "CAS conflict: holder {} lost race to {}",
             holder_b, holder_a
@@ -181,12 +178,7 @@ impl TestManifest {
 
     /// CAS write: add fragment and update fencing token.
     /// Returns true if CAS succeeded (etag matched).
-    fn cas_write(
-        &mut self,
-        fragment_id: u64,
-        writer_token: u64,
-        expected_etag: u64,
-    ) -> bool {
+    fn cas_write(&mut self, fragment_id: u64, writer_token: u64, expected_etag: u64) -> bool {
         if self.etag != expected_etag {
             return false; // CAS failed
         }
@@ -209,6 +201,7 @@ fn arb_duration_secs() -> impl Strategy<Value = u64> {
     1u64..=60
 }
 
+#[allow(dead_code)]
 fn arb_token_sequence() -> impl Strategy<Value = Vec<u64>> {
     prop::collection::vec(1u64..=100, 2..=10)
 }
