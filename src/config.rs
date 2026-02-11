@@ -40,6 +40,8 @@ pub struct ServerConfig {
     pub max_dimensions: usize,
     #[serde(default = "default_max_vector_id_length")]
     pub max_vector_id_length: usize,
+    #[serde(default = "default_max_request_body_mb")]
+    pub max_request_body_mb: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,25 +135,52 @@ fn default_port() -> u16 {
         .unwrap_or(8080)
 }
 fn default_request_timeout() -> u64 {
-    30
+    std::env::var("ZEPPELIN_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
 }
 fn default_max_concurrent_queries() -> usize {
-    64
+    std::env::var("ZEPPELIN_MAX_CONCURRENT_QUERIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
 }
 fn default_max_batch_size() -> usize {
-    10_000
+    std::env::var("ZEPPELIN_MAX_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
 }
 fn default_max_top_k() -> usize {
-    10_000
+    std::env::var("ZEPPELIN_MAX_TOP_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
 }
 fn default_shutdown_timeout_secs() -> u64 {
-    30
+    std::env::var("ZEPPELIN_SHUTDOWN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
 }
 fn default_max_dimensions() -> usize {
-    65_536
+    std::env::var("ZEPPELIN_MAX_DIMENSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65_536)
 }
 fn default_max_vector_id_length() -> usize {
-    1024
+    std::env::var("ZEPPELIN_MAX_VECTOR_ID_LENGTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024)
+}
+fn default_max_request_body_mb() -> usize {
+    std::env::var("ZEPPELIN_MAX_REQUEST_BODY_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
 }
 fn default_backend() -> String {
     std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "s3".to_string())
@@ -160,19 +189,31 @@ fn default_bucket() -> String {
     std::env::var("S3_BUCKET").unwrap_or_else(|_| "zeppelin".to_string())
 }
 fn default_cache_dir() -> PathBuf {
-    PathBuf::from("/var/cache/zeppelin")
+    std::env::var("ZEPPELIN_CACHE_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/cache/zeppelin"))
 }
 fn default_max_size_gb() -> u64 {
-    50
+    std::env::var("ZEPPELIN_CACHE_MAX_SIZE_GB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
 }
 fn default_eviction() -> String {
     "lru".to_string()
 }
 fn default_num_centroids() -> usize {
-    256
+    std::env::var("ZEPPELIN_DEFAULT_NUM_CENTROIDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256)
 }
 fn default_nprobe() -> usize {
-    16
+    std::env::var("ZEPPELIN_DEFAULT_NPROBE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16)
 }
 fn default_max_nprobe() -> usize {
     128
@@ -187,7 +228,10 @@ fn default_oversample_factor() -> usize {
     3
 }
 fn default_compaction_interval() -> u64 {
-    30
+    std::env::var("ZEPPELIN_COMPACTION_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
 }
 fn default_max_wal_fragments() -> usize {
     1000
@@ -202,7 +246,7 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 fn default_log_format() -> String {
-    "json".to_string()
+    std::env::var("ZEPPELIN_LOG_FORMAT").unwrap_or_else(|_| "json".to_string())
 }
 
 impl Default for ServerConfig {
@@ -217,6 +261,7 @@ impl Default for ServerConfig {
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
             max_dimensions: default_max_dimensions(),
             max_vector_id_length: default_max_vector_id_length(),
+            max_request_body_mb: default_max_request_body_mb(),
         }
     }
 }
@@ -297,16 +342,162 @@ impl Default for LoggingConfig {
 
 impl Config {
     /// Load config from a TOML file, falling back to defaults.
+    /// After loading, env var overrides are applied so that:
+    /// env var > TOML file > defaults.
     pub fn load(path: Option<&str>) -> Result<Self> {
-        match path {
+        let mut config = match path {
             Some(p) => {
                 let content = std::fs::read_to_string(p).map_err(|e| {
                     ZeppelinError::Config(format!("failed to read config file {p}: {e}"))
                 })?;
                 toml::from_str(&content)
-                    .map_err(|e| ZeppelinError::Config(format!("failed to parse config: {e}")))
+                    .map_err(|e| ZeppelinError::Config(format!("failed to parse config: {e}")))?
             }
-            None => Ok(Config::default()),
+            None => Config::default(),
+        };
+        config.apply_env_overrides();
+        Ok(config)
+    }
+
+    /// Apply environment variable overrides on top of file/default values.
+    /// This ensures env vars always take priority over TOML settings.
+    fn apply_env_overrides(&mut self) {
+        // Server
+        if let Ok(v) = std::env::var("ZEPPELIN_HOST") {
+            self.server.host = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.port = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.request_timeout_secs = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_CONCURRENT_QUERIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.max_concurrent_queries = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.max_batch_size = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_TOP_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.max_top_k = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_SHUTDOWN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.shutdown_timeout_secs = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_DIMENSIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.max_dimensions = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_VECTOR_ID_LENGTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.max_vector_id_length = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_REQUEST_BODY_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.max_request_body_mb = v;
+        }
+
+        // Storage
+        if let Ok(v) = std::env::var("STORAGE_BACKEND") {
+            self.storage.backend = v;
+        }
+        if let Ok(v) = std::env::var("S3_BUCKET") {
+            self.storage.bucket = v;
+        }
+        if let Ok(v) = std::env::var("AWS_REGION") {
+            self.storage.s3_region = Some(v);
+        }
+        if let Some(v) = std::env::var("S3_ENDPOINT").ok().filter(|s| !s.is_empty()) {
+            self.storage.s3_endpoint = Some(v);
+        }
+        if let Ok(v) = std::env::var("AWS_ACCESS_KEY_ID") {
+            self.storage.s3_access_key_id = Some(v);
+        }
+        if let Ok(v) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+            self.storage.s3_secret_access_key = Some(v);
+        }
+        if let Ok(v) = std::env::var("S3_ALLOW_HTTP") {
+            self.storage.s3_allow_http = v == "true";
+        }
+        if let Some(v) = std::env::var("GCS_SERVICE_ACCOUNT_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            self.storage.gcs_service_account_path = Some(v);
+        }
+        if let Some(v) = std::env::var("AZURE_ACCOUNT")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            self.storage.azure_account = Some(v);
+        }
+        if let Some(v) = std::env::var("AZURE_ACCESS_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            self.storage.azure_access_key = Some(v);
+        }
+
+        // Cache
+        if let Ok(v) = std::env::var("ZEPPELIN_CACHE_DIR") {
+            self.cache.dir = PathBuf::from(v);
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_CACHE_MAX_SIZE_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.cache.max_size_gb = v;
+        }
+
+        // Indexing
+        if let Some(v) = std::env::var("ZEPPELIN_DEFAULT_NUM_CENTROIDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.indexing.default_num_centroids = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_DEFAULT_NPROBE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.indexing.default_nprobe = v;
+        }
+
+        // Compaction
+        if let Some(v) = std::env::var("ZEPPELIN_COMPACTION_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.compaction.interval_secs = v;
+        }
+
+        // Logging
+        if let Ok(v) = std::env::var("ZEPPELIN_LOG_FORMAT") {
+            self.logging.format = v;
         }
     }
 }
