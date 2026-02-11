@@ -164,10 +164,7 @@ mod tests {
             back_attrs.get("color"),
             Some(&AttributeValue::String("red".into()))
         );
-        assert_eq!(
-            back_attrs.get("count"),
-            Some(&AttributeValue::Integer(5))
-        );
+        assert_eq!(back_attrs.get("count"), Some(&AttributeValue::Integer(5)));
     }
 
     #[test]

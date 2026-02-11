@@ -1,175 +1,152 @@
-# Zeppelin
+<p align="center">
+  <img src="assets/icon.svg" alt="Zeppelin" width="128" height="128">
+</p>
+<h1 align="center">Zeppelin</h1>
+<p align="center">
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.84+-DEA584?logo=rust&logoColor=white" alt="Rust: 1.84+"></a>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+</p>
+<p align="center">
+  An S3-native vector search engine. Object storage is the source of truth. Nodes are stateless.
+</p>
 
-[![CI](https://github.com/Ghatage/zeppelin/actions/workflows/ci.yml/badge.svg)](https://github.com/Ghatage/zeppelin/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/Ghatage/zeppelin/branch/main/graph/badge.svg)](https://codecov.io/gh/Ghatage/zeppelin)
+---
 
-S3-native vector search engine. A self-hostable alternative to [turbopuffer](https://turbopuffer.com).
+## Features
 
-Object storage is the source of truth. Nodes are stateless — kill one, the only cost is cache re-warming. IVF-Flat indexing gives exactly **2 sequential S3 roundtrips per query**.
+- **S3-native** -- Object storage is the single source of truth
+- **Stateless nodes** -- Any node can serve any query
+- **IVF-Flat indexing** -- 2 sequential S3 roundtrips per query
+- **Write-ahead log** -- Durable writes with compaction into indexed segments
+- **Strong & eventual consistency** -- Choose per-query
+- **Multi-cloud** -- Works with S3, GCS, and Azure Blob Storage
 
-## Why?
+## Quick Start
 
-Every existing open-source vector DB (Qdrant, Milvus, Weaviate) treats object storage as a backup tier. Their indexes (HNSW graphs) require low-latency random reads that object storage can't provide.
+Spin up Zeppelin with MinIO locally using Docker Compose:
 
-Zeppelin uses **IVF-Flat indexing** — probe centroids, then sequentially scan the top clusters — making S3 a first-class storage engine rather than an afterthought.
+```bash
+docker compose up
+```
+
+This starts Zeppelin on port `8080` and MinIO on port `9000` with a pre-created `zeppelin` bucket.
+
+### Create a namespace
+
+```bash
+curl -s http://localhost:8080/v1/namespaces \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-vectors", "dimensions": 384}' | jq
+```
+
+### Upsert vectors
+
+```bash
+curl -s http://localhost:8080/v1/namespaces/my-vectors/vectors \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vectors": [
+      {"id": "vec-1", "values": [0.1, 0.2, 0.3, "...384 dims..."]},
+      {"id": "vec-2", "values": [0.4, 0.5, 0.6, "...384 dims..."]}
+    ]
+  }' | jq
+```
+
+### Query
+
+```bash
+curl -s http://localhost:8080/v1/namespaces/my-vectors/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vector": [0.1, 0.2, 0.3, "...384 dims..."],
+    "top_k": 10
+  }' | jq
+```
+
+### Delete vectors
+
+```bash
+curl -s -X DELETE http://localhost:8080/v1/namespaces/my-vectors/vectors \
+  -H "Content-Type: application/json" \
+  -d '{"ids": ["vec-1"]}' | jq
+```
+
+## API Reference
+
+| Method   | Path                              | Description            |
+|----------|-----------------------------------|------------------------|
+| `GET`    | `/healthz`                        | Liveness probe         |
+| `GET`    | `/readyz`                         | Readiness probe        |
+| `GET`    | `/metrics`                        | Prometheus metrics     |
+| `POST`   | `/v1/namespaces`                  | Create a namespace     |
+| `GET`    | `/v1/namespaces`                  | List namespaces        |
+| `GET`    | `/v1/namespaces/:ns`              | Get namespace metadata |
+| `DELETE` | `/v1/namespaces/:ns`              | Delete a namespace     |
+| `POST`   | `/v1/namespaces/:ns/vectors`      | Upsert vectors         |
+| `DELETE` | `/v1/namespaces/:ns/vectors`      | Delete vectors         |
+| `POST`   | `/v1/namespaces/:ns/query`        | Query nearest neighbors|
+
+## Development
+
+### Prerequisites
+
+- [Rust 1.84+](https://www.rust-lang.org/tools/install)
+- [Docker](https://docs.docker.com/get-docker/) (for MinIO in tests)
+
+### Build
+
+```bash
+cargo build
+```
+
+### Run tests
+
+Start MinIO for the test suite, then run tests:
+
+```bash
+docker compose -f docker-compose.test.yml up -d
+TEST_BACKEND=minio cargo test
+```
+
+### Run locally (without Docker)
+
+```bash
+# Start MinIO
+docker compose -f docker-compose.test.yml up -d
+
+# Run Zeppelin against local MinIO
+STORAGE_BACKEND=s3 \
+S3_BUCKET=zeppelin \
+S3_ENDPOINT=http://localhost:9000 \
+AWS_ACCESS_KEY_ID=minioadmin \
+AWS_SECRET_ACCESS_KEY=minioadmin \
+AWS_REGION=us-east-1 \
+S3_ALLOW_HTTP=true \
+cargo run
+```
+
+### Lint and format
+
+```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+```
 
 ## Architecture
 
 ```
-HTTP API (axum)
-  │
-  ├── WAL Writer ──── append-only fragments (bincode + xxHash)
-  ├── Query Engine ── IVF centroid probe → cluster scan
-  └── Namespace Mgr ─ CRUD, metadata
-          │
-      Cache Manager ── LRU, pinned centroids
-          │
-      Storage Layer ── object_store crate
-          │
-    ┌─────┼─────┐
-    S3   GCS  Azure
-   MinIO       Blob
-    R2
+src/
+  storage/     Object store abstraction (S3, GCS, Azure)
+  wal/         Write-ahead log: fragments, manifest, reader/writer
+  namespace/   Namespace CRUD and metadata
+  index/       Vector indexing (IVF-Flat with k-means)
+  cache/       Local disk cache with LRU eviction
+  compaction/  Background WAL-to-segment compaction
+  server/      Axum HTTP handlers, routes, middleware
 ```
 
-**Key invariants:**
-- WAL fragments and segments are immutable once written
-- Manifest on S3 is the single source of truth
-- Local cache is disposable — safe to blow away at any time
-- Single writer per namespace, no distributed coordination needed
-
-## S3 Layout
-
-```
-s3://{bucket}/{namespace}/
-  meta.json              # dimensions, distance metric, vector count
-  manifest.json          # fragment refs, segment refs, compaction watermark
-  wal/
-    {ulid}.wal           # bincode-serialized vectors + deletes
-  segments/
-    {segment_id}/
-      centroids.bin      # IVF centroids
-      cluster_{i}.bin    # vectors assigned to cluster i
-      attrs_{i}.bin      # attributes for filtering
-```
-
-## API
-
-```
-# Vectors
-POST   /v1/namespaces/{ns}/vectors    # upsert
-DELETE /v1/namespaces/{ns}/vectors    # delete by IDs
-
-# Search
-POST   /v1/namespaces/{ns}/query      # vector search with filters
-
-# Namespaces
-GET    /v1/namespaces                  # list (supports ?prefix=)
-GET    /v1/namespaces/{ns}             # get metadata
-DELETE /v1/namespaces/{ns}             # delete namespace + all data
-POST   /v1/namespaces/{ns}/warm        # async cache warming
-
-# Operations
-GET    /healthz                        # health check
-GET    /metrics                        # prometheus format
-```
-
-## Quickstart
-
-### Prerequisites
-
-- Rust 1.84+
-- An S3-compatible bucket (AWS S3, MinIO, R2, GCS)
-
-### Docker quickstart
-
-```bash
-# Start Zeppelin + MinIO (local dev)
-docker compose up -d
-
-# Verify it's running
-curl http://localhost:8080/healthz
-
-# For production S3 — override env vars, skip MinIO
-S3_ENDPOINT= AWS_ACCESS_KEY_ID=AKIA... AWS_SECRET_ACCESS_KEY=... S3_BUCKET=my-bucket \
-  docker compose up zeppelin
-```
-
-### Run from source
-
-```bash
-cp .env.example .env
-# Fill in AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET
-cargo run
-```
-
-### Python client
-
-```bash
-pip install ./python
-```
-
-```python
-from zeppelin import ZeppelinClient
-
-with ZeppelinClient() as client:
-    client.create_namespace("demo", dimensions=4)
-    client.upsert_vectors("demo", [{"id": "v1", "values": [1, 0, 0, 0]}])
-    result = client.query("demo", [1, 0, 0, 0], top_k=5)
-    for r in result.results:
-        print(f"{r.id}: {r.score:.4f}")
-    client.delete_namespace("demo")
-```
-
-See [`python/README.md`](python/README.md) for full API docs.
-
-### Run tests
-
-```bash
-# Against real S3 (default)
-cargo test
-
-# Against MinIO
-TEST_BACKEND=minio cargo test
-```
-
-### View code coverage
-
-```bash
-cargo install cargo-llvm-cov
-cargo llvm-cov --html --lib --tests
-open target/llvm-cov/html/index.html
-```
-
-## Configuration
-
-Zeppelin reads from `zeppelin.toml` with environment variable overrides:
-
-| Setting | Env Var | Default | Description |
-|---------|---------|---------|-------------|
-| `storage.backend` | `STORAGE_BACKEND` | `s3` | `s3`, `gcs`, `azure`, `local` |
-| `storage.bucket` | `S3_BUCKET` | `zeppelin` | Bucket name |
-| `storage.s3_region` | `AWS_REGION` | `us-east-1` | AWS region |
-| `storage.s3_endpoint` | `S3_ENDPOINT` | *(auto)* | Custom endpoint for MinIO/R2 |
-| `cache.dir` | — | `/var/cache/zeppelin` | Local cache directory |
-| `cache.max_size_gb` | — | `50` | Max cache size |
-| `indexing.default_nprobe` | — | `16` | Clusters to probe per query |
-| `compaction.interval_secs` | — | `30` | Compaction check interval |
-
-See `.env.example` for the full list.
-
-## Design Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Storage abstraction | `object_store` crate | Multi-cloud from day 1. Battle-tested (Apache Arrow ecosystem). |
-| Index | IVF-Flat | S3-friendly: 2 sequential roundtrips. Pluggable trait for future IVF-PQ, ScaNN. |
-| WAL | ULID fragments + JSON manifest | Simple single-writer. No conditional writes needed. |
-| Filtering | Post-filter + oversampling | Correct for v1. Filter-aware routing deferred. |
-| Cache | LRU + pinned centroids | Simple, correct. Per-namespace budgets deferred. |
-| Coordination | None — S3 consistency | No ZooKeeper/etcd. S3 read-after-write handles it. |
-| Serialization | bincode (WAL) + JSON (manifests) | bincode for speed on hot path, JSON for debuggability. |
+Writes land in the WAL as immutable fragments. Background compaction merges fragments into IVF-Flat indexed segments. Queries probe the closest centroids (2 S3 reads) and merge results from any un-compacted WAL fragments.
 
 ## License
 
-Apache-2.0
+[Apache-2.0](https://opensource.org/licenses/Apache-2.0)
