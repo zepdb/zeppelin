@@ -1,6 +1,6 @@
 # Failing Tests & Root Causes
 
-Last run: 2026-02-10 | 3 failures across 2 test suites
+Last run: 2026-02-10 | 3 proptest failures + 4 TLA+ invariant violations
 
 ---
 
@@ -57,10 +57,95 @@ The test inserts `(k1, v1)` then `(k2, v2)` into one HashMap, and `(k2, v2)` the
 
 ---
 
-## Passing Suites
+## Passing Proptest Suites
 
 | Suite | Tests | Notes |
 |---|---|---|
 | `proptest_filter_eval` | 4/4 | Filter evaluation logic is correct |
 | `proptest_ivf_recall` | 3/3 | IVF-Flat recall properties hold |
 | `proptest_namespace_validation` | 10/10 | All boundary cases handled |
+
+---
+
+## TLA+ Invariant Violations (all 4 expected)
+
+Run with: OpenJDK 21.0.10, TLC 2.19
+
+### 4. `CompactionSafety` — `NoSilentDataLoss` VIOLATED
+
+**Counterexample** (8 states):
+```
+State 1: Init — manifest has fragments {1, 2}, both committed
+State 2: W1 acquires mutex
+State 3: W1 writes fragment 3 to S3
+State 4: W1 reads manifest (sees {1, 2})
+State 5: Compactor reads manifest (sees {1, 2}) — snapshots stale view
+State 6: W1 writes manifest {1, 2, 3} and releases mutex — fragment 3 committed
+State 7: Compactor builds segment from its snapshot {1, 2}
+State 8: Compactor writes manifest: frags={}, seg={1, 2}
+         *** Fragment 3 is in committed but NOT in manifest_frags or manifest_seg ***
+```
+
+**Bug**: The compactor reads the manifest, does expensive work (segment building), then overwrites the manifest without checking if it changed. A concurrent writer's committed fragment is silently lost.
+
+**Fix**: CAS (compare-and-swap) on manifest writes — abort compaction if manifest changed since snapshot.
+
+---
+
+### 5. `QueryReadConsistency` — `QueryNeverHitsOrphan` VIOLATED
+
+**Counterexample** (7 states):
+```
+State 1: Init — manifest has fragments {1, 2, 3}
+State 2: Compactor reads manifest (snapshots {1, 2, 3})
+State 3: Compactor builds segment from {1, 2, 3}
+State 4: Query reads manifest (sees fragments {1, 2, 3})
+State 5: Compactor writes new manifest: frags={}, seg={1,2,3}
+State 6: Compactor deletes old fragment files from S3 — s3_frag_data={}
+State 7: Query tries to read fragments {1, 2, 3} from S3 — q_frag_read_ok=FALSE (404!)
+```
+
+**Bug**: Query snapshots the manifest listing fragments, then compaction deletes those fragment files before the query reads them. The query gets S3 404 errors.
+
+**Fix**: Deferred fragment deletion — don't delete .wal files immediately. Use a grace period or reference counting so in-flight queries can complete.
+
+---
+
+### 6. `NamespaceDeletion` — `QueryNeverSeesPartialState` VIOLATED
+
+**Counterexample** (7 states):
+```
+State 1: Init — namespace has manifest, frag1, frag2, meta all present
+State 2: Deleter checks namespace exists
+State 3: Deleter lists keys to delete: {meta, manifest, frag1, frag2}
+State 4: Deleter deletes frag1 (s3_frag1=FALSE, others still exist)
+State 5: Query reads manifest (still exists) — expects frag1 + frag2
+State 6: Query reads frag1 — MISSING (already deleted)
+State 7: Query reads frag2 — exists. q_partial=TRUE
+         *** Query saw manifest but only got frag2, not frag1 — partial results ***
+```
+
+**Bug**: `delete_namespace` deletes S3 keys one-by-one (non-atomic). A concurrent query can read the manifest (not yet deleted) but then find some fragments already deleted, returning partial/corrupt results.
+
+**Fix**: Tombstone-based deletion — write a "deleting" tombstone first, then queries check for it and abort. Or delete the manifest first so queries fail cleanly with "namespace not found."
+
+---
+
+### 7. `ULIDOrdering` — `LastCommitterWins` VIOLATED
+
+**Counterexample** (7 states):
+```
+State 1: Init — clock_skew=TRUE, both writers at clock=10
+State 2: W1 acquires mutex, gets ULID with timestamp 10
+State 3: W1 writes fragment [ulid=10, value=1], commits, releases mutex. Clock advances to 11.
+State 4: W2 acquires mutex, but clock_skew is active — W2's clock stays at 10, gets ULID=10
+State 5: W2 writes fragment [ulid=10, value=2], commits. commit_order=<<"w1","w2">>
+State 6: Query starts
+State 7: Query merges by ULID order — both ULIDs are 10, W1's fragment appears first
+         in manifest_frags, so W1's value (1) wins. q_result=1
+         *** W2 committed last but W1's value is returned ***
+```
+
+**Bug**: Under clock skew, W2 (the later writer) can get a ULID that equals or is less than W1's ULID. The "latest ULID wins" merge logic then picks the wrong value. The client expects the last-committed write to win.
+
+**Fix**: Use monotonic ULID generation (track the last issued ULID and always increment), or add a sequence number to the manifest that doesn't depend on wall-clock time.
