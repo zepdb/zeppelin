@@ -47,6 +47,27 @@ impl WalWriter {
         vectors: Vec<VectorEntry>,
         deletes: Vec<VectorId>,
     ) -> Result<WalFragment> {
+        self.append_with_lease(namespace, vectors, deletes, None)
+            .await
+    }
+
+    /// Append with an optional fencing token from a lease.
+    ///
+    /// When `fencing_token` is `Some(token)`:
+    /// - **Layer 1 (CheckFencing)**: Before CAS write, checks
+    ///   `manifest.fencing_token <= token`. If false → `FencingTokenStale`.
+    /// - **Layer 2 (CAS)**: If the ETag changed (concurrent write), retries
+    ///   from read, re-checking fencing. A zombie is caught on retry.
+    ///
+    /// When `fencing_token` is `None`: behaves identically to `append()`.
+    #[instrument(skip(self, vectors, deletes), fields(namespace = namespace))]
+    pub async fn append_with_lease(
+        &self,
+        namespace: &str,
+        vectors: Vec<VectorEntry>,
+        deletes: Vec<VectorId>,
+        fencing_token: Option<u64>,
+    ) -> Result<WalFragment> {
         let lock = self.namespace_lock(namespace);
         let _guard = lock.lock().await;
 
@@ -76,6 +97,18 @@ impl WalWriter {
                     None => (Manifest::default(), ManifestVersion(None)),
                 };
 
+            // Layer 1: Fencing check — reject zombie writers.
+            if let Some(token) = fencing_token {
+                if manifest.fencing_token > token {
+                    return Err(ZeppelinError::FencingTokenStale {
+                        namespace: namespace.to_string(),
+                        our_token: token,
+                        manifest_token: manifest.fencing_token,
+                    });
+                }
+                manifest.fencing_token = token;
+            }
+
             manifest.add_fragment(FragmentRef {
                 id: fragment.id,
                 vector_count: fragment.vectors.len(),
@@ -83,6 +116,7 @@ impl WalWriter {
                 sequence_number: 0, // assigned by add_fragment
             });
 
+            // Layer 2: CAS — catches TOCTOU gap between fencing check and write.
             match manifest
                 .write_conditional(&self.store, namespace, &version)
                 .await

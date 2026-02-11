@@ -29,6 +29,20 @@ pub enum ZeppelinError {
     #[error("manifest conflict (concurrent write) for namespace: {namespace}")]
     ManifestConflict { namespace: String },
 
+    // Lease errors
+    #[error("lease held on namespace {namespace} by {holder}")]
+    LeaseHeld { namespace: String, holder: String },
+
+    #[error("lease expired for namespace {namespace}")]
+    LeaseExpired { namespace: String },
+
+    #[error("fencing token stale for namespace {namespace}: ours={our_token}, manifest={manifest_token}")]
+    FencingTokenStale {
+        namespace: String,
+        our_token: u64,
+        manifest_token: u64,
+    },
+
     // Namespace errors
     #[error("namespace not found: {namespace}")]
     NamespaceNotFound { namespace: String },
@@ -79,7 +93,10 @@ impl ZeppelinError {
             | ZeppelinError::ManifestNotFound { .. } => 404,
 
             ZeppelinError::NamespaceAlreadyExists { .. }
-            | ZeppelinError::ManifestConflict { .. } => 409,
+            | ZeppelinError::ManifestConflict { .. }
+            | ZeppelinError::LeaseHeld { .. }
+            | ZeppelinError::LeaseExpired { .. }
+            | ZeppelinError::FencingTokenStale { .. } => 409,
 
             ZeppelinError::DimensionMismatch { .. } | ZeppelinError::Validation(_) => 400,
 

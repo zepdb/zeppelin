@@ -81,6 +81,23 @@ impl Compactor {
     /// and cleaned up at the start of the next compaction cycle.
     #[instrument(skip(self), fields(namespace = namespace))]
     pub async fn compact(&self, namespace: &str) -> Result<CompactionResult> {
+        self.compact_with_lease(namespace, None).await
+    }
+
+    /// Compact with an optional fencing token from a lease.
+    ///
+    /// When `fencing_token` is `Some(token)`:
+    /// - **Layer 1 (CheckFencing)**: Before each CAS write, checks
+    ///   `manifest.fencing_token <= token`. If false → `FencingTokenStale`.
+    /// - **Layer 2 (CAS)**: If the ETag changed, retries with re-check.
+    ///
+    /// When `fencing_token` is `None`: behaves identically to `compact()`.
+    #[instrument(skip(self), fields(namespace = namespace))]
+    pub async fn compact_with_lease(
+        &self,
+        namespace: &str,
+        fencing_token: Option<u64>,
+    ) -> Result<CompactionResult> {
         let start = std::time::Instant::now();
 
         // 0. GC: delete any pending_deletes from a previous compaction cycle
@@ -182,9 +199,22 @@ impl Compactor {
                         None => (Manifest::default(), ManifestVersion(None)),
                     };
 
+                // Layer 1: Fencing check.
+                if let Some(token) = fencing_token {
+                    if fresh_manifest.fencing_token > token {
+                        return Err(ZeppelinError::FencingTokenStale {
+                            namespace: namespace.to_string(),
+                            our_token: token,
+                            manifest_token: fresh_manifest.fencing_token,
+                        });
+                    }
+                    fresh_manifest.fencing_token = token;
+                }
+
                 fresh_manifest.remove_compacted_fragments(last_fragment_id);
                 fresh_manifest.pending_deletes = deferred_deletes.clone();
 
+                // Layer 2: CAS.
                 match fresh_manifest
                     .write_conditional(&self.store, namespace, &version)
                     .await
@@ -242,6 +272,18 @@ impl Compactor {
                     None => (Manifest::default(), ManifestVersion(None)),
                 };
 
+            // Layer 1: Fencing check.
+            if let Some(token) = fencing_token {
+                if fresh_manifest.fencing_token > token {
+                    return Err(ZeppelinError::FencingTokenStale {
+                        namespace: namespace.to_string(),
+                        our_token: token,
+                        manifest_token: fresh_manifest.fencing_token,
+                    });
+                }
+                fresh_manifest.fencing_token = token;
+            }
+
             fresh_manifest.add_segment(SegmentRef {
                 id: segment_id.clone(),
                 vector_count: vectors_compacted,
@@ -250,6 +292,7 @@ impl Compactor {
             fresh_manifest.remove_compacted_fragments(last_fragment_id);
             fresh_manifest.pending_deletes = deferred_deletes.clone();
 
+            // Layer 2: CAS.
             match fresh_manifest
                 .write_conditional(&self.store, namespace, &version)
                 .await

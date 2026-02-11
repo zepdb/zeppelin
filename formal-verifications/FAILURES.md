@@ -149,3 +149,87 @@ State 7: Query merges by ULID order — both ULIDs are 10, W1's fragment appears
 **Bug**: Under clock skew, W2 (the later writer) can get a ULID that equals or is less than W1's ULID. The "latest ULID wins" merge logic then picks the wrong value. The client expects the last-committed write to win.
 
 **Fix**: Use monotonic ULID generation (track the last issued ULID and always increment), or add a sequence number to the manifest that doesn't depend on wall-clock time.
+
+---
+
+## MultiWriterLease Protocol Verification
+
+Run with: OpenJDK 21.0.10, TLC 2.19 | Spec: `MultiWriterLease.tla`
+
+Unlike the above specs (which model known bugs), this spec models the **proposed fix** — an S3-based lease with fencing tokens. TLC checks that the protocol is correct. Two protocol flaws were discovered and fixed before writing any implementation code.
+
+### 8. `MultiWriterLease` — `FencingPreventsZombie` VIOLATED (initial formulation)
+
+**Counterexample** (11 states):
+```
+State 1:  Init — manifest_fencing=0, both writers idle
+State 2:  W1 acquires lease (token=1)
+State 3:  Clock expires W1's lease
+State 4:  W1 writes fragment 3 to S3 (doesn't know lease expired)
+State 5:  W1 reads manifest — snapshots {1,2}, etag=1
+State 6:  W1 passes CheckFencing — manifest_fencing=0 ≤ token=1 ✓
+State 7:  W2 acquires lease (token=2, takeover of expired W1 lease)
+State 8:  W2 writes fragment 4 to S3
+State 9:  W2 reads manifest — snapshots {1,2}, etag=1
+State 10: W2 passes CheckFencing — manifest_fencing=0 ≤ token=2 ✓
+State 11: W2 commits — manifest_frags={1,2,4}, manifest_fencing=2, etag=2
+          *** W1 is at "fencing_ok" but manifest_fencing=2 > W1's token=1 ***
+```
+
+**Bug**: TOCTOU (time-of-check-to-time-of-use) gap between `CheckFencing` and `WriteManifest`. Between these two steps, another writer can commit and bump `manifest_fencing` above the zombie's token. The zombie passes the fencing check but the invariant is violated.
+
+**Why it's actually safe**: The CAS catches this — W1's CAS fails (etag changed from 1 to 2). On retry, W1 re-reads the manifest, re-checks fencing (manifest_fencing=2 > token=1), and aborts. The **two-layer defense** (CheckFencing + CAS) prevents the zombie from committing.
+
+**Fix (invariant)**: The invariant was too strict — it checked at the "fencing_ok" state. The correct invariant checks at "committed": `(w1_pc = "committed" => manifest_fencing >= w1_local_token)`.
+
+**Fix (protocol insight)**: Neither CheckFencing nor CAS alone is sufficient. Both layers are needed for safety:
+- Layer 1 (CheckFencing): Catches zombies when another writer has already committed
+- Layer 2 (CAS): Catches the TOCTOU gap when another writer commits between check and write
+
+**Test**: `tests/multi_writer_lease_tests.rs::test_tla_toctou_fencing_gap_cas_catches_zombie`
+
+---
+
+### 9. `MultiWriterLease` — Deadlock in `ReleaseLease` after lease expiry
+
+**Counterexample** (17 states, abbreviated):
+```
+State 2:  W1 acquires lease (token=1)
+State 3:  Clock expires W1's lease
+State 6:  W2 acquires lease (token=2, takeover)
+State 7:  Clock expires W2's lease
+State 8:  C (compactor) acquires lease (token=3, takeover)
+State 14: C commits, writes manifest, releases lease — lease_holder="none"
+State 15: W1 at "aborted" — tries ReleaseLease, but lease_holder="none" (not "w1")
+State 16: W2 at "aborted" — tries ReleaseLease, but lease_holder="none" (not "w2")
+          *** DEADLOCK — W1 and W2 can never transition to "done" ***
+```
+
+**Bug**: When a process is aborted (fencing check failed or CAS exhausted retries) and its lease was taken over by another process (due to expiry), the `ReleaseLease` step's guard `lease_holder = "w1"` is never satisfied. The process is stuck forever — it can't release a lease it doesn't hold.
+
+**Fix**: Made `ReleaseLease` conditional — if the process still holds the lease, release it; if the lease was taken over, skip the release and move directly to "done":
+```tla
+W1_ReleaseLease ==
+    /\ w1_pc \in {"committed", "aborted"}
+    /\ IF lease_holder = "w1"
+       THEN /\ lease_holder' = "none" /\ lease_expired' = FALSE /\ lease_etag' = lease_etag + 1
+       ELSE /\ UNCHANGED <<lease_holder, lease_expired, lease_etag>>
+    /\ w1_pc' = "done"
+```
+
+**Implementation requirement**: `LeaseManager::release()` must be best-effort. When the lease was already taken over, it should return `Ok(())` or a non-fatal warning — not a hard error that blocks the caller.
+
+**Test**: `tests/multi_writer_lease_tests.rs::test_tla_graceful_release_after_lease_expiry`
+
+---
+
+### Final TLC Result (after fixes)
+
+```
+Model checking completed. No error has been found.
+24965 states generated, 9532 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 21.
+Finished in 00s.
+```
+
+All 4 invariants hold: `NoSilentDataLoss`, `LeaseExclusivity`, `FencingPreventsZombie`, `TypeOK`.
