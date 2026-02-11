@@ -36,7 +36,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(axum::middleware::from_fn(middleware::http_metrics))
         .layer(TimeoutLayer::new(timeout))
-        .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // 50 MB
+        .layer(RequestBodyLimitLayer::new(
+            state.config.server.max_request_body_mb * 1024 * 1024,
+        ))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))

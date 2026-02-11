@@ -20,7 +20,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = dotenvy::dotenv();
 
     // Load config first (needed for logging setup)
-    let config = Config::load(None)?;
+    // Priority: ZEPPELIN_CONFIG env var > ./zeppelin.toml if exists > defaults
+    let config_path = std::env::var("ZEPPELIN_CONFIG").ok().or_else(|| {
+        let default = "zeppelin.toml";
+        std::path::Path::new(default)
+            .exists()
+            .then(|| default.to_string())
+    });
+    let config = Config::load(config_path.as_deref())?;
 
     // Initialize tracing from LoggingConfig
     let filter = EnvFilter::try_from_default_env()

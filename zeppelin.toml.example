@@ -1,17 +1,19 @@
 # Zeppelin configuration
 # Copy to zeppelin.toml and uncomment values to override defaults.
 # Environment variables (shown in comments) take precedence over file values.
+# Set ZEPPELIN_CONFIG to point to a custom config file path.
 
 [server]
 # host = "0.0.0.0"                   # ZEPPELIN_HOST
 # port = 8080                        # ZEPPELIN_PORT
-# request_timeout_secs = 30
-# max_concurrent_queries = 64
-# max_batch_size = 10000
-# max_top_k = 10000
-# shutdown_timeout_secs = 30
-# max_dimensions = 65536
-# max_vector_id_length = 1024
+# request_timeout_secs = 30          # ZEPPELIN_REQUEST_TIMEOUT_SECS
+# max_concurrent_queries = 64        # ZEPPELIN_MAX_CONCURRENT_QUERIES
+# max_batch_size = 10000             # ZEPPELIN_MAX_BATCH_SIZE
+# max_top_k = 10000                  # ZEPPELIN_MAX_TOP_K
+# shutdown_timeout_secs = 30         # ZEPPELIN_SHUTDOWN_TIMEOUT_SECS
+# max_dimensions = 65536             # ZEPPELIN_MAX_DIMENSIONS
+# max_vector_id_length = 1024        # ZEPPELIN_MAX_VECTOR_ID_LENGTH
+# max_request_body_mb = 50           # ZEPPELIN_MAX_REQUEST_BODY_MB
 
 [storage]
 # backend = "s3"                     # STORAGE_BACKEND — "s3", "gcs", "azure"
@@ -32,20 +34,20 @@
 # azure_access_key = ""              # AZURE_ACCESS_KEY
 
 [cache]
-# dir = "/var/cache/zeppelin"
-# max_size_gb = 50
+# dir = "/var/cache/zeppelin"        # ZEPPELIN_CACHE_DIR
+# max_size_gb = 50                   # ZEPPELIN_CACHE_MAX_SIZE_GB
 # eviction = "lru"
 
 [indexing]
-# default_num_centroids = 256
-# default_nprobe = 16
+# default_num_centroids = 256        # ZEPPELIN_DEFAULT_NUM_CENTROIDS
+# default_nprobe = 16                # ZEPPELIN_DEFAULT_NPROBE
 # max_nprobe = 128
 # kmeans_max_iterations = 25
 # kmeans_convergence_epsilon = 0.0001
 # oversample_factor = 3
 
 [compaction]
-# interval_secs = 30
+# interval_secs = 30                 # ZEPPELIN_COMPACTION_INTERVAL_SECS
 # max_wal_fragments_before_compact = 1000
 # retrain_imbalance_threshold = 5.0
 
@@ -54,4 +56,4 @@
 
 [logging]
 # level = "info"                     # RUST_LOG compatible
-# format = "json"                    # "json" or "pretty"
+# format = "json"                    # ZEPPELIN_LOG_FORMAT — "json" or "pretty"
