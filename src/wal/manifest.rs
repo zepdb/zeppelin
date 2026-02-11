@@ -30,6 +30,10 @@ pub struct SegmentRef {
     /// Whether this segment uses a hierarchical index.
     #[serde(default)]
     pub hierarchical: bool,
+    /// Fields that have bitmap indexes in this segment.
+    /// Empty if bitmap indexing was not enabled when the segment was built.
+    #[serde(default)]
+    pub bitmap_fields: Vec<String>,
 }
 
 /// The manifest is the single source of truth for what data exists

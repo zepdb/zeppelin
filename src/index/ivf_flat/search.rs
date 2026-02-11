@@ -21,6 +21,9 @@ use crate::types::{AttributeValue, DistanceMetric, Filter, SearchResult};
 use super::build::{attrs_key, cluster_key, deserialize_attrs, deserialize_cluster};
 use super::IvfFlatIndex;
 
+use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
+use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
+
 /// A candidate result during search, before final ranking.
 struct Candidate {
     id: String,
@@ -183,6 +186,7 @@ async fn scan_clusters_flat(
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
     let mut candidates = Vec::new();
+    let has_bitmaps = !index.bitmap_fields.is_empty();
 
     for &cluster_idx in probe_clusters {
         let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
@@ -195,9 +199,22 @@ async fn scan_clusters_flat(
         };
         let cluster = deserialize_cluster(&cluster_data)?;
 
+        // Try bitmap pre-filter: skip distance computation for non-matching vectors.
+        let prefilter = try_bitmap_prefilter(
+            &index.namespace, &index.segment_id, cluster_idx,
+            filter, has_bitmaps, store, cache,
+        ).await;
+
         let attrs = load_attrs(index, cluster_idx, filter, store, cache).await;
 
         for (j, vec) in cluster.vectors.iter().enumerate() {
+            // If bitmap pre-filter is active, skip vectors not in the bitmap.
+            if let Some(ref bm) = prefilter {
+                if !bm.contains(j as u32) {
+                    continue;
+                }
+            }
+
             let score = compute_distance(query, vec, distance_metric);
             let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
 
@@ -214,6 +231,7 @@ async fn scan_clusters_flat(
 
 /// Scan clusters using SQ8 quantized distances, then rerank top candidates
 /// with full-precision vectors.
+#[allow(clippy::too_many_arguments)]
 async fn scan_clusters_sq(
     index: &IvfFlatIndex,
     probe_clusters: &[usize],
@@ -235,8 +253,15 @@ async fn scan_clusters_sq(
 
     // Phase 1: Coarse ranking with quantized distances.
     let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new(); // (id, approx_score, cluster_idx)
+    let has_bitmaps = !index.bitmap_fields.is_empty();
 
     for &cluster_idx in probe_clusters {
+        // Try bitmap pre-filter for this cluster.
+        let prefilter = try_bitmap_prefilter(
+            &index.namespace, &index.segment_id, cluster_idx,
+            filter, has_bitmaps, store, cache,
+        ).await;
+
         let sq_key = sq_cluster_key(&index.namespace, &index.segment_id, cluster_idx);
         let sq_data = match fetch_with_cache(cache, store, &sq_key).await {
             Ok(data) => data,
@@ -247,6 +272,9 @@ async fn scan_clusters_sq(
                 if let Ok(data) = fetch_with_cache(cache, store, &cvec_key).await {
                     let cluster = deserialize_cluster(&data)?;
                     for (j, vec) in cluster.vectors.iter().enumerate() {
+                        if let Some(ref bm) = prefilter {
+                            if !bm.contains(j as u32) { continue; }
+                        }
                         let score = compute_distance(query, vec, distance_metric);
                         coarse_candidates.push((cluster.ids[j].clone(), score, cluster_idx));
                     }
@@ -257,6 +285,9 @@ async fn scan_clusters_sq(
         let sq_cluster = deserialize_sq_cluster(&sq_data)?;
 
         for (j, codes) in sq_cluster.codes.iter().enumerate() {
+            if let Some(ref bm) = prefilter {
+                if !bm.contains(j as u32) { continue; }
+            }
             let approx_score = calibration.asymmetric_distance(query, codes, distance_metric);
             coarse_candidates.push((sq_cluster.ids[j].clone(), approx_score, cluster_idx));
         }
@@ -319,6 +350,7 @@ async fn scan_clusters_sq(
 
 /// Scan clusters using PQ-encoded distances with ADC lookup tables,
 /// then rerank top candidates with full-precision vectors.
+#[allow(clippy::too_many_arguments)]
 async fn scan_clusters_pq(
     index: &IvfFlatIndex,
     probe_clusters: &[usize],
@@ -343,8 +375,15 @@ async fn scan_clusters_pq(
 
     // Phase 1: Coarse ranking with PQ distances.
     let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
+    let has_bitmaps = !index.bitmap_fields.is_empty();
 
     for &cluster_idx in probe_clusters {
+        // Try bitmap pre-filter for this cluster.
+        let prefilter = try_bitmap_prefilter(
+            &index.namespace, &index.segment_id, cluster_idx,
+            filter, has_bitmaps, store, cache,
+        ).await;
+
         let pq_key = pq_cluster_key(&index.namespace, &index.segment_id, cluster_idx);
         let pq_data = match fetch_with_cache(cache, store, &pq_key).await {
             Ok(data) => data,
@@ -356,6 +395,9 @@ async fn scan_clusters_pq(
         let pq_cluster = deserialize_pq_cluster(&pq_data)?;
 
         for (j, codes) in pq_cluster.codes.iter().enumerate() {
+            if let Some(ref bm) = prefilter {
+                if !bm.contains(j as u32) { continue; }
+            }
             let approx_score = codebook.adc_distance(&adc_table, codes);
             coarse_candidates.push((pq_cluster.ids[j].clone(), approx_score, cluster_idx));
         }
@@ -413,6 +455,39 @@ async fn scan_clusters_pq(
     Ok(candidates)
 }
 
+/// Try to load a cluster's bitmap index and evaluate the filter against it.
+/// Returns `Some(bitmap)` if pre-filtering succeeded (positions to include),
+/// or `None` if bitmaps are unavailable or the filter can't be resolved.
+async fn try_bitmap_prefilter(
+    namespace: &str,
+    segment_id: &str,
+    cluster_idx: usize,
+    filter: Option<&Filter>,
+    has_bitmaps: bool,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Option<roaring::RoaringBitmap> {
+    let filter = filter?;
+    if !has_bitmaps {
+        return None;
+    }
+
+    let bkey = bitmap_key(namespace, segment_id, cluster_idx);
+    let data = match fetch_with_cache(cache, store, &bkey).await {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    let bitmap_index = match ClusterBitmapIndex::from_bytes(&data) {
+        Ok(idx) => idx,
+        Err(e) => {
+            tracing::debug!(cluster = cluster_idx, error = %e, "failed to load bitmap index");
+            return None;
+        }
+    };
+
+    evaluate_filter_bitmap(filter, &bitmap_index)
+}
+
 /// Load attribute data for a cluster. Shared helper for all scan methods.
 async fn load_attrs(
     index: &IvfFlatIndex,
@@ -457,6 +532,7 @@ mod tests {
             namespace: "test_ns".to_string(),
             segment_id: "seg_001".to_string(),
             quantization: QuantizationType::None,
+            bitmap_fields: Vec::new(),
         }
     }
 
