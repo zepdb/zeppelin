@@ -1,6 +1,7 @@
 # Zeppelin
 
-[![CI](https://github.com/Ghatage/stormcrow/actions/workflows/ci.yml/badge.svg)](https://github.com/Ghatage/stormcrow/actions/workflows/ci.yml)
+[![CI](https://github.com/Ghatage/zeppelin/actions/workflows/ci.yml/badge.svg)](https://github.com/Ghatage/zeppelin/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Ghatage/zeppelin/branch/main/graph/badge.svg)](https://codecov.io/gh/Ghatage/zeppelin)
 
 S3-native vector search engine. A self-hostable alternative to [turbopuffer](https://turbopuffer.com).
 
@@ -130,6 +131,14 @@ cargo test
 
 # Against MinIO
 TEST_BACKEND=minio cargo test
+```
+
+### View code coverage
+
+```bash
+cargo install cargo-llvm-cov
+cargo llvm-cov --html --lib --tests
+open target/llvm-cov/html/index.html
 ```
 
 ## Configuration

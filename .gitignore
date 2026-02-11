@@ -2,6 +2,11 @@
 /target
 **/*.rs.bk
 
+# Coverage
+lcov.info
+*.profraw
+*.profdata
+
 # Environment
 .env
 .env.*
