@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tracing::{info, instrument};
 
 use crate::error::ZeppelinError;
 use crate::server::AppState;
@@ -29,11 +30,14 @@ pub struct DeleteVectorsResponse {
     pub deleted: usize,
 }
 
+#[instrument(skip(state, req), fields(namespace = %ns, vector_count = req.vectors.len()))]
 pub async fn upsert_vectors(
     State(state): State<AppState>,
     Path(ns): Path<String>,
     Json(req): Json<UpsertVectorsRequest>,
 ) -> Result<(StatusCode, Json<UpsertVectorsResponse>), ApiError> {
+    info!(count = req.vectors.len(), "upserting vectors");
+
     // Validate namespace exists and check dimensions
     let meta = state
         .namespace_manager
@@ -57,17 +61,21 @@ pub async fn upsert_vectors(
         .await
         .map_err(ApiError::from)?;
 
+    info!(upserted = count, "vectors upserted");
     Ok((
         StatusCode::OK,
         Json(UpsertVectorsResponse { upserted: count }),
     ))
 }
 
+#[instrument(skip(state, req), fields(namespace = %ns, delete_count = req.ids.len()))]
 pub async fn delete_vectors(
     State(state): State<AppState>,
     Path(ns): Path<String>,
     Json(req): Json<DeleteVectorsRequest>,
 ) -> Result<Json<DeleteVectorsResponse>, ApiError> {
+    info!(count = req.ids.len(), "deleting vectors");
+
     // Validate namespace exists
     state
         .namespace_manager
@@ -82,5 +90,6 @@ pub async fn delete_vectors(
         .await
         .map_err(ApiError::from)?;
 
+    info!(deleted = count, "vectors deleted");
     Ok(Json(DeleteVectorsResponse { deleted: count }))
 }

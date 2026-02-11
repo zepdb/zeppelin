@@ -7,6 +7,8 @@ use common::vectors::random_vectors;
 
 use tokio::net::TcpListener;
 
+use zeppelin::cache::DiskCache;
+use zeppelin::compaction::Compactor;
 use zeppelin::config::Config;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::server::routes::build_router;
@@ -19,12 +21,26 @@ async fn start_test_server() -> (String, TestHarness) {
     let harness = TestHarness::new().await;
     let config = Config::load(None).unwrap();
 
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+
+    let compactor = Arc::new(Compactor::new(
+        harness.store.clone(),
+        WalReader::new(harness.store.clone()),
+        config.compaction.clone(),
+        config.indexing.clone(),
+    ));
+
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         config: Arc::new(config),
+        compactor,
+        cache,
     };
 
     let app = build_router(state);

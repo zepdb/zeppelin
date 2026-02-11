@@ -1,6 +1,7 @@
 use axum::routing::{get, post};
 use axum::Router;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 use super::handlers::{health, namespace, query, vectors};
 use super::AppState;
@@ -24,6 +25,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/namespaces/:ns/query",
             post(query::query_namespace),
         )
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
         .with_state(state)
 }

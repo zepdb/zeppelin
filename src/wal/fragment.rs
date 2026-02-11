@@ -37,9 +37,30 @@ impl WalFragment {
     ///
     /// Uses JSON serialization because `AttributeValue` uses `#[serde(untagged)]`
     /// which is incompatible with bincode's non-self-describing format.
+    ///
+    /// Attributes are canonicalized via BTreeMap to ensure deterministic key
+    /// ordering across serialization round-trips (HashMap iteration order is
+    /// not guaranteed to be stable after deserialize → re-serialize).
     fn compute_checksum(vectors: &[VectorEntry], deletes: &[VectorId]) -> u64 {
+        use std::collections::BTreeMap;
+        use crate::types::AttributeValue;
+
+        let canonical: Vec<(
+            &str,
+            &[f32],
+            Option<BTreeMap<&String, &AttributeValue>>,
+        )> = vectors
+            .iter()
+            .map(|v| {
+                let attrs = v
+                    .attributes
+                    .as_ref()
+                    .map(|a| a.iter().collect::<BTreeMap<_, _>>());
+                (v.id.as_str(), v.values.as_slice(), attrs)
+            })
+            .collect();
         let payload =
-            serde_json::to_vec(&(vectors, deletes)).expect("serialization should not fail");
+            serde_json::to_vec(&(&canonical, deletes)).expect("serialization should not fail");
         xxh3_64(&payload)
     }
 

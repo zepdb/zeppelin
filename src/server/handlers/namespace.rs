@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tracing::{info, instrument};
 
 use crate::namespace::manager::NamespaceMetadata;
 use crate::server::AppState;
@@ -44,19 +45,23 @@ impl From<NamespaceMetadata> for NamespaceResponse {
     }
 }
 
+#[instrument(skip(state), fields(namespace = %req.name, dimensions = req.dimensions))]
 pub async fn create_namespace(
     State(state): State<AppState>,
     Json(req): Json<CreateNamespaceRequest>,
 ) -> Result<(StatusCode, Json<NamespaceResponse>), ApiError> {
+    info!(namespace = %req.name, dimensions = req.dimensions, "creating namespace");
     let meta = state
         .namespace_manager
         .create(&req.name, req.dimensions, req.distance_metric)
         .await
         .map_err(ApiError::from)?;
 
+    info!(namespace = %req.name, "namespace created");
     Ok((StatusCode::CREATED, Json(NamespaceResponse::from(meta))))
 }
 
+#[instrument(skip(state))]
 pub async fn list_namespaces(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<NamespaceResponse>>, ApiError> {
@@ -66,10 +71,12 @@ pub async fn list_namespaces(
         .await
         .map_err(ApiError::from)?;
 
+    info!(count = namespaces.len(), "listed namespaces");
     let responses: Vec<NamespaceResponse> = namespaces.into_iter().map(Into::into).collect();
     Ok(Json(responses))
 }
 
+#[instrument(skip(state), fields(namespace = %ns))]
 pub async fn get_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
@@ -83,15 +90,18 @@ pub async fn get_namespace(
     Ok(Json(NamespaceResponse::from(meta)))
 }
 
+#[instrument(skip(state), fields(namespace = %ns))]
 pub async fn delete_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    info!(namespace = %ns, "deleting namespace");
     state
         .namespace_manager
         .delete(&ns)
         .await
         .map_err(ApiError::from)?;
 
+    info!(namespace = %ns, "namespace deleted");
     Ok(StatusCode::NO_CONTENT)
 }

@@ -62,6 +62,14 @@ pub enum ZeppelinError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    // Compaction errors
+    #[error("compaction error: {0}")]
+    Compaction(String),
+
+    // Cache errors
+    #[error("cache error: {0}")]
+    Cache(String),
+
     // Internal
     #[error("internal error: {0}")]
     Internal(String),

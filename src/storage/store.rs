@@ -3,6 +3,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{ObjectStore, PutPayload};
 use std::sync::Arc;
+use tracing::{debug, instrument};
 
 use crate::config::StorageConfig;
 use crate::error::{Result, ZeppelinError};
@@ -83,14 +84,19 @@ impl ZeppelinStore {
     }
 
     /// Put an object at the given key.
+    #[instrument(skip(self, data), fields(key = key, size = data.len()))]
     pub async fn put(&self, key: &str, data: Bytes) -> Result<()> {
+        let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         self.inner.put(&path, PutPayload::from(data)).await?;
+        debug!(elapsed_ms = start.elapsed().as_millis(), "s3 put");
         Ok(())
     }
 
     /// Get an object by key. Returns NotFound if it doesn't exist.
+    #[instrument(skip(self), fields(key = key))]
     pub async fn get(&self, key: &str) -> Result<Bytes> {
+        let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let result = self.inner.get(&path).await.map_err(|e| match e {
             object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
@@ -98,60 +104,84 @@ impl ZeppelinStore {
             },
             other => ZeppelinError::Storage(other),
         })?;
-        Ok(result.bytes().await?)
+        let bytes = result.bytes().await?;
+        debug!(elapsed_ms = start.elapsed().as_millis(), size = bytes.len(), "s3 get");
+        Ok(bytes)
     }
 
     /// Get a byte range of an object.
+    #[instrument(skip(self), fields(key = key))]
     pub async fn get_range(&self, key: &str, range: std::ops::Range<usize>) -> Result<Bytes> {
+        let start = std::time::Instant::now();
         let path = Path::parse(key)?;
-        Ok(self.inner.get_range(&path, range).await?)
+        let bytes = self.inner.get_range(&path, range).await?;
+        debug!(elapsed_ms = start.elapsed().as_millis(), size = bytes.len(), "s3 get_range");
+        Ok(bytes)
     }
 
     /// Delete an object by key.
+    #[instrument(skip(self), fields(key = key))]
     pub async fn delete(&self, key: &str) -> Result<()> {
+        let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         self.inner.delete(&path).await?;
+        debug!(elapsed_ms = start.elapsed().as_millis(), "s3 delete");
         Ok(())
     }
 
     /// List objects under a prefix.
+    #[instrument(skip(self), fields(prefix = prefix))]
     pub async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let start = std::time::Instant::now();
         use futures::TryStreamExt;
         let path = Path::parse(prefix)?;
         let stream = self.inner.list(Some(&path));
         let objects: Vec<_> = stream.try_collect().await?;
-        Ok(objects.iter().map(|o| o.location.to_string()).collect())
+        let keys: Vec<String> = objects.iter().map(|o| o.location.to_string()).collect();
+        debug!(elapsed_ms = start.elapsed().as_millis(), count = keys.len(), "s3 list_prefix");
+        Ok(keys)
     }
 
     /// Check if an object exists.
+    #[instrument(skip(self), fields(key = key))]
     pub async fn exists(&self, key: &str) -> Result<bool> {
+        let start = std::time::Instant::now();
         let path = Path::parse(key)?;
-        match self.inner.head(&path).await {
+        let result = match self.inner.head(&path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(ZeppelinError::Storage(e)),
-        }
+        };
+        debug!(elapsed_ms = start.elapsed().as_millis(), "s3 exists");
+        result
     }
 
     /// Head request - get metadata without downloading the object.
+    #[instrument(skip(self), fields(key = key))]
     pub async fn head(&self, key: &str) -> Result<object_store::ObjectMeta> {
+        let start = std::time::Instant::now();
         let path = Path::parse(key)?;
-        Ok(self.inner.head(&path).await.map_err(|e| match e {
+        let meta = self.inner.head(&path).await.map_err(|e| match e {
             object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
                 key: path.to_string(),
             },
             other => ZeppelinError::Storage(other),
-        })?)
+        })?;
+        debug!(elapsed_ms = start.elapsed().as_millis(), "s3 head");
+        Ok(meta)
     }
 
     /// Delete all objects under a prefix (for cleanup).
+    #[instrument(skip(self), fields(prefix = prefix))]
     pub async fn delete_prefix(&self, prefix: &str) -> Result<usize> {
+        let start = std::time::Instant::now();
         let keys = self.list_prefix(prefix).await?;
         let count = keys.len();
         for key in &keys {
             let path = Path::parse(key)?;
             self.inner.delete(&path).await?;
         }
+        debug!(elapsed_ms = start.elapsed().as_millis(), count, "s3 delete_prefix");
         Ok(count)
     }
 

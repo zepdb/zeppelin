@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use tracing::{debug, instrument};
 
+use crate::cache::DiskCache;
 use crate::error::Result;
 use crate::index::distance::compute_distance;
 use crate::index::filter::evaluate_filter;
@@ -13,7 +15,7 @@ use crate::wal::Manifest;
 use crate::wal::WalReader;
 
 /// Execute a query against a namespace, combining WAL scan and segment search.
-#[instrument(skip(store, wal_reader, query, filter), fields(namespace = namespace))]
+#[instrument(skip(store, wal_reader, query, filter, cache), fields(namespace = namespace))]
 pub async fn execute_query(
     store: &ZeppelinStore,
     wal_reader: &WalReader,
@@ -25,6 +27,7 @@ pub async fn execute_query(
     consistency: ConsistencyLevel,
     distance_metric: DistanceMetric,
     oversample_factor: usize,
+    cache: Option<&Arc<DiskCache>>,
 ) -> Result<QueryResponse> {
     let manifest = Manifest::read(store, namespace).await?.unwrap_or_default();
 
@@ -54,6 +57,7 @@ pub async fn execute_query(
             filter,
             distance_metric,
             oversample_factor,
+            cache,
         )
         .await?;
         scanned_segments = 1;
@@ -159,6 +163,7 @@ async fn segment_search(
     filter: Option<&Filter>,
     distance_metric: DistanceMetric,
     oversample_factor: usize,
+    _cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<SearchResult>> {
     let index = IvfFlatIndex::load(store, namespace, segment_id).await?;
 

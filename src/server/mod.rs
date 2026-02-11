@@ -3,6 +3,8 @@ pub mod routes;
 
 use std::sync::Arc;
 
+use crate::cache::DiskCache;
+use crate::compaction::Compactor;
 use crate::config::Config;
 use crate::namespace::NamespaceManager;
 use crate::storage::ZeppelinStore;
@@ -16,4 +18,6 @@ pub struct AppState {
     pub wal_writer: Arc<WalWriter>,
     pub wal_reader: Arc<WalReader>,
     pub config: Arc<Config>,
+    pub compactor: Arc<Compactor>,
+    pub cache: Arc<DiskCache>,
 }

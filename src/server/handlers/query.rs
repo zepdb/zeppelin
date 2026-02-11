@@ -1,6 +1,7 @@
 use axum::extract::{Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tracing::{info, instrument};
 
 use crate::error::ZeppelinError;
 use crate::query;
@@ -33,11 +34,14 @@ pub struct QueryResponse {
     pub scanned_segments: usize,
 }
 
+#[instrument(skip(state, req), fields(namespace = %ns, top_k = req.top_k))]
 pub async fn query_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
+    let start = std::time::Instant::now();
+
     let meta = state
         .namespace_manager
         .get(&ns)
@@ -67,9 +71,18 @@ pub async fn query_namespace(
         req.consistency,
         meta.distance_metric,
         state.config.indexing.oversample_factor,
+        Some(&state.cache),
     )
     .await
     .map_err(ApiError::from)?;
+
+    info!(
+        results = result.results.len(),
+        scanned_fragments = result.scanned_fragments,
+        scanned_segments = result.scanned_segments,
+        elapsed_ms = start.elapsed().as_millis(),
+        "query complete"
+    );
 
     Ok(Json(result))
 }

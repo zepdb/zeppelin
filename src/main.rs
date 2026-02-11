@@ -3,6 +3,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
+use zeppelin::cache::DiskCache;
+use zeppelin::compaction::background::compaction_loop;
+use zeppelin::compaction::Compactor;
 use zeppelin::config::Config;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::server::routes::build_router;
@@ -15,15 +18,28 @@ async fn main() {
     // Load .env
     let _ = dotenvy::dotenv();
 
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    // Load config first (needed for logging setup)
+    let config = Config::load(None).expect("failed to load config");
+
+    // Initialize tracing from LoggingConfig
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
+
+    match config.logging.format.as_str() {
+        "json" => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .init();
+        }
+        _ => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .init();
+        }
+    }
 
     tracing::info!("zeppelin starting");
-
-    // Load config
-    let config = Config::load(None).expect("failed to load config");
 
     // Initialize storage
     let store =
@@ -40,6 +56,29 @@ async fn main() {
     let wal_writer = Arc::new(WalWriter::new(store.clone()));
     let wal_reader = Arc::new(WalReader::new(store.clone()));
 
+    // Initialize disk cache
+    let cache = Arc::new(
+        DiskCache::new(&config.cache).expect("failed to initialize disk cache"),
+    );
+
+    // Initialize compactor
+    let compactor = Arc::new(Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        config.compaction.clone(),
+        config.indexing.clone(),
+    ));
+
+    // Spawn background compaction loop
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    {
+        let compactor = compactor.clone();
+        let namespace_manager = namespace_manager.clone();
+        tokio::spawn(async move {
+            compaction_loop(compactor, namespace_manager, shutdown_rx).await;
+        });
+    }
+
     // Build application state
     let state = AppState {
         store,
@@ -47,6 +86,8 @@ async fn main() {
         wal_writer,
         wal_reader,
         config: Arc::new(config.clone()),
+        compactor,
+        cache,
     };
 
     // Build router
@@ -63,4 +104,7 @@ async fn main() {
     axum::serve(listener, app)
         .await
         .expect("server error");
+
+    // Signal shutdown to background tasks
+    let _ = shutdown_tx.send(true);
 }

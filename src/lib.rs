@@ -1,5 +1,7 @@
 //! Zeppelin: S3-native vector search engine.
 
+pub mod cache;
+pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod index;
