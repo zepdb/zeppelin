@@ -49,6 +49,21 @@ pub async fn upsert_vectors(
         ))));
     }
 
+    for vec in &req.vectors {
+        if vec.id.is_empty() {
+            return Err(ApiError(ZeppelinError::Validation(
+                "vector id cannot be empty".into(),
+            )));
+        }
+        if vec.id.len() > state.config.server.max_vector_id_length {
+            return Err(ApiError(ZeppelinError::Validation(format!(
+                "vector id length {} exceeds maximum of {}",
+                vec.id.len(),
+                state.config.server.max_vector_id_length
+            ))));
+        }
+    }
+
     info!(count = req.vectors.len(), "upserting vectors");
 
     // Validate namespace exists and check dimensions

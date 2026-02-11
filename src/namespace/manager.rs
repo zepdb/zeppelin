@@ -58,11 +58,13 @@ impl NamespaceManager {
         dimensions: usize,
         distance_metric: DistanceMetric,
     ) -> Result<NamespaceMetadata> {
-        // Validate
-        if name.is_empty() {
-            return Err(ZeppelinError::Validation(
-                "namespace name cannot be empty".to_string(),
-            ));
+        // Validate namespace name
+        if !is_valid_namespace_name(name) {
+            return Err(ZeppelinError::Validation(format!(
+                "invalid namespace name '{}': must be 1-255 chars, start with alphanumeric, \
+                 and contain only alphanumeric, dash, underscore, or dot characters",
+                name,
+            )));
         }
         if dimensions == 0 {
             return Err(ZeppelinError::Validation(
@@ -216,4 +218,19 @@ impl NamespaceManager {
     pub fn exists_in_registry(&self, name: &str) -> bool {
         self.registry.contains_key(name)
     }
+}
+
+/// Validate a namespace name: 1-255 chars, starts with alphanumeric,
+/// only contains `[a-zA-Z0-9._-]`.
+fn is_valid_namespace_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 {
+        return false;
+    }
+    let bytes = name.as_bytes();
+    if !bytes[0].is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }

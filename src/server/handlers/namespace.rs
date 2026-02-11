@@ -4,6 +4,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
+use crate::error::ZeppelinError;
 use crate::namespace::manager::NamespaceMetadata;
 use crate::server::AppState;
 use crate::types::DistanceMetric;
@@ -50,6 +51,13 @@ pub async fn create_namespace(
     State(state): State<AppState>,
     Json(req): Json<CreateNamespaceRequest>,
 ) -> Result<(StatusCode, Json<NamespaceResponse>), ApiError> {
+    if req.dimensions == 0 || req.dimensions > state.config.server.max_dimensions {
+        return Err(ApiError(ZeppelinError::Validation(format!(
+            "dimensions {} must be between 1 and {}",
+            req.dimensions, state.config.server.max_dimensions
+        ))));
+    }
+
     info!(namespace = %req.name, dimensions = req.dimensions, "creating namespace");
     let meta = state
         .namespace_manager
