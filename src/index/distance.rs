@@ -216,8 +216,8 @@ fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
             let d = a[base + j] - b[base + j];
             tmp[j] = d * d;
         }
-        for j in 0..8 {
-            sum += tmp[j];
+        for val in tmp {
+            sum += val;
         }
     }
 
@@ -304,8 +304,8 @@ fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
         for j in 0..8 {
             tmp[j] = a[base + j] * b[base + j];
         }
-        for j in 0..8 {
-            sum += tmp[j];
+        for val in tmp {
+            sum += val;
         }
     }
 
