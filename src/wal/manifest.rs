@@ -47,6 +47,11 @@ pub struct Manifest {
     /// S3 keys awaiting deferred deletion from a previous compaction cycle.
     #[serde(default)]
     pub pending_deletes: Vec<String>,
+    /// Fencing token set by the lease holder during manifest writes.
+    /// Prevents zombie writers (expired lease holders) from overwriting
+    /// a manifest that a newer lease holder has already written.
+    #[serde(default)]
+    pub fencing_token: u64,
     /// Last time the manifest was updated.
     pub updated_at: DateTime<Utc>,
 }
@@ -61,6 +66,7 @@ impl Manifest {
             active_segment: None,
             next_sequence: 0,
             pending_deletes: Vec::new(),
+            fencing_token: 0,
             updated_at: Utc::now(),
         }
     }

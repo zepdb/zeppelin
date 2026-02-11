@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
 use std::sync::Arc;
@@ -40,6 +40,11 @@ impl ZeppelinStore {
                     if config.s3_allow_http {
                         builder = builder.with_allow_http(true);
                     }
+
+                    // Enable conditional PUT (ETag-based CAS) — required for
+                    // manifest conflict detection and lease CAS operations.
+                    builder =
+                        builder.with_conditional_put(S3ConditionalPut::ETagMatch);
 
                     Arc::new(builder.build().map_err(|e| {
                         ZeppelinError::Config(format!("failed to build S3 store: {e}"))
