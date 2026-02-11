@@ -26,7 +26,10 @@ async fn test_create_namespace() {
     let name = ns(&harness, "ns-create");
 
     let manager = NamespaceManager::new(harness.store.clone());
-    let meta = manager.create(&name, 128, DistanceMetric::Cosine).await.unwrap();
+    let meta = manager
+        .create(&name, 128, DistanceMetric::Cosine)
+        .await
+        .unwrap();
 
     assert_eq!(meta.name, name);
     assert_eq!(meta.dimensions, 128);
@@ -51,7 +54,10 @@ async fn test_get_namespace_from_registry() {
     let name = ns(&harness, "ns-get-reg");
 
     let manager = NamespaceManager::new(harness.store.clone());
-    manager.create(&name, 64, DistanceMetric::Euclidean).await.unwrap();
+    manager
+        .create(&name, 64, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
 
     // Get should hit registry
     let meta = manager.get(&name).await.unwrap();
@@ -69,7 +75,10 @@ async fn test_get_namespace_s3_fallback() {
 
     // Create with one manager
     let manager1 = NamespaceManager::new(harness.store.clone());
-    manager1.create(&name, 32, DistanceMetric::DotProduct).await.unwrap();
+    manager1
+        .create(&name, 32, DistanceMetric::DotProduct)
+        .await
+        .unwrap();
 
     // Get with a fresh manager (empty registry → falls back to S3)
     let manager2 = NamespaceManager::new(harness.store.clone());
@@ -89,8 +98,14 @@ async fn test_list_namespaces() {
     let ns2 = ns(&harness, "ns-list-b");
 
     let manager = NamespaceManager::new(harness.store.clone());
-    manager.create(&ns1, 16, DistanceMetric::Cosine).await.unwrap();
-    manager.create(&ns2, 32, DistanceMetric::Euclidean).await.unwrap();
+    manager
+        .create(&ns1, 16, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+    manager
+        .create(&ns2, 32, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
 
     // List all namespaces and filter by our test prefix
     let namespaces = manager.list(None).await.unwrap();
@@ -109,7 +124,10 @@ async fn test_delete_namespace() {
     let name = ns(&harness, "ns-delete");
 
     let manager = NamespaceManager::new(harness.store.clone());
-    manager.create(&name, 64, DistanceMetric::Cosine).await.unwrap();
+    manager
+        .create(&name, 64, DistanceMetric::Cosine)
+        .await
+        .unwrap();
 
     // Delete
     manager.delete(&name).await.unwrap();
@@ -120,7 +138,10 @@ async fn test_delete_namespace() {
 
     // Verify get fails
     let result = manager.get(&name).await;
-    assert!(matches!(result, Err(ZeppelinError::NamespaceNotFound { .. })));
+    assert!(matches!(
+        result,
+        Err(ZeppelinError::NamespaceNotFound { .. })
+    ));
 
     harness.cleanup().await;
 }
@@ -131,7 +152,10 @@ async fn test_duplicate_create() {
     let name = ns(&harness, "ns-dup");
 
     let manager = NamespaceManager::new(harness.store.clone());
-    manager.create(&name, 64, DistanceMetric::Cosine).await.unwrap();
+    manager
+        .create(&name, 64, DistanceMetric::Cosine)
+        .await
+        .unwrap();
 
     let result = manager.create(&name, 64, DistanceMetric::Cosine).await;
     assert!(matches!(
@@ -166,8 +190,14 @@ async fn test_scan_and_register() {
 
     // Create namespaces with one manager
     let manager1 = NamespaceManager::new(harness.store.clone());
-    manager1.create(&ns1, 16, DistanceMetric::Cosine).await.unwrap();
-    manager1.create(&ns2, 32, DistanceMetric::Euclidean).await.unwrap();
+    manager1
+        .create(&ns1, 16, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+    manager1
+        .create(&ns2, 32, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
 
     // Fresh manager with scan_and_register
     let manager2 = NamespaceManager::new(harness.store.clone());
@@ -188,7 +218,9 @@ async fn test_create_namespace_invalid_name_regex() {
     let harness = TestHarness::new().await;
 
     let manager = NamespaceManager::new(harness.store.clone());
-    let result = manager.create("bad/name", 128, DistanceMetric::Cosine).await;
+    let result = manager
+        .create("bad/name", 128, DistanceMetric::Cosine)
+        .await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     let msg = err.to_string().to_lowercase();
@@ -215,7 +247,10 @@ async fn test_create_namespace_valid_name_formats() {
 
     for name in &valid_names {
         let result = manager.create(name, 16, DistanceMetric::Cosine).await;
-        assert!(result.is_ok(), "expected success for name '{name}', got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected success for name '{name}', got: {result:?}"
+        );
         cleanup_ns(&harness.store, name).await;
     }
 

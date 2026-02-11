@@ -417,7 +417,10 @@ mod tests {
     fn test_cosine_identical() {
         let a = vec![1.0, 2.0, 3.0];
         let d = cosine_distance(&a, &a);
-        assert!((d - 0.0).abs() < 1e-6, "identical vectors should have distance ~0, got {d}");
+        assert!(
+            (d - 0.0).abs() < 1e-6,
+            "identical vectors should have distance ~0, got {d}"
+        );
     }
 
     #[test]
@@ -425,7 +428,10 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![-1.0, 0.0, 0.0];
         let d = cosine_distance(&a, &b);
-        assert!((d - 2.0).abs() < 1e-6, "opposite vectors should have distance ~2, got {d}");
+        assert!(
+            (d - 2.0).abs() < 1e-6,
+            "opposite vectors should have distance ~2, got {d}"
+        );
     }
 
     #[test]

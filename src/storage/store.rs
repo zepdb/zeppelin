@@ -19,51 +19,50 @@ pub struct ZeppelinStore {
 impl ZeppelinStore {
     /// Create a new store from configuration.
     pub fn from_config(config: &StorageConfig) -> Result<Self> {
-        let store: Arc<dyn ObjectStore> = match config.backend.as_str() {
-            "s3" => {
-                let mut builder = AmazonS3Builder::new()
-                    .with_bucket_name(&config.bucket);
+        let store: Arc<dyn ObjectStore> =
+            match config.backend.as_str() {
+                "s3" => {
+                    let mut builder = AmazonS3Builder::new().with_bucket_name(&config.bucket);
 
-                if let Some(ref region) = config.s3_region {
-                    builder = builder.with_region(region);
-                }
-                if let Some(ref endpoint) = config.s3_endpoint {
-                    if !endpoint.is_empty() {
-                        builder = builder.with_endpoint(endpoint);
+                    if let Some(ref region) = config.s3_region {
+                        builder = builder.with_region(region);
                     }
-                }
-                if let Some(ref key_id) = config.s3_access_key_id {
-                    builder = builder.with_access_key_id(key_id);
-                }
-                if let Some(ref secret) = config.s3_secret_access_key {
-                    builder = builder.with_secret_access_key(secret);
-                }
-                if config.s3_allow_http {
-                    builder = builder.with_allow_http(true);
-                }
+                    if let Some(ref endpoint) = config.s3_endpoint {
+                        if !endpoint.is_empty() {
+                            builder = builder.with_endpoint(endpoint);
+                        }
+                    }
+                    if let Some(ref key_id) = config.s3_access_key_id {
+                        builder = builder.with_access_key_id(key_id);
+                    }
+                    if let Some(ref secret) = config.s3_secret_access_key {
+                        builder = builder.with_secret_access_key(secret);
+                    }
+                    if config.s3_allow_http {
+                        builder = builder.with_allow_http(true);
+                    }
 
-                Arc::new(builder.build().map_err(|e| {
-                    ZeppelinError::Config(format!("failed to build S3 store: {e}"))
-                })?)
-            }
-            "local" => {
-                let path = std::path::Path::new(&config.bucket);
-                if !path.exists() {
-                    std::fs::create_dir_all(path)?;
+                    Arc::new(builder.build().map_err(|e| {
+                        ZeppelinError::Config(format!("failed to build S3 store: {e}"))
+                    })?)
                 }
-                Arc::new(
-                    object_store::local::LocalFileSystem::new_with_prefix(path)
-                        .map_err(|e| {
-                            ZeppelinError::Config(format!("failed to build local store: {e}"))
-                        })?,
-                )
-            }
-            backend => {
-                return Err(ZeppelinError::Config(format!(
-                    "unsupported storage backend: {backend}"
-                )));
-            }
-        };
+                "local" => {
+                    let path = std::path::Path::new(&config.bucket);
+                    if !path.exists() {
+                        std::fs::create_dir_all(path)?;
+                    }
+                    Arc::new(
+                        object_store::local::LocalFileSystem::new_with_prefix(path).map_err(
+                            |e| ZeppelinError::Config(format!("failed to build local store: {e}")),
+                        )?,
+                    )
+                }
+                backend => {
+                    return Err(ZeppelinError::Config(format!(
+                        "unsupported storage backend: {backend}"
+                    )));
+                }
+            };
 
         Ok(Self {
             inner: store,
@@ -115,7 +114,11 @@ impl ZeppelinStore {
         })?;
         let bytes = result.bytes().await?;
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), size = bytes.len(), "s3 get");
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            size = bytes.len(),
+            "s3 get"
+        );
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
@@ -129,7 +132,11 @@ impl ZeppelinStore {
         let path = Path::parse(key)?;
         let bytes = self.inner.get_range(&path, range).await?;
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), size = bytes.len(), "s3 get_range");
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            size = bytes.len(),
+            "s3 get_range"
+        );
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["get_range"])
             .observe(elapsed.as_secs_f64());
@@ -160,7 +167,11 @@ impl ZeppelinStore {
         let objects: Vec<_> = stream.try_collect().await?;
         let keys: Vec<String> = objects.iter().map(|o| o.location.to_string()).collect();
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), count = keys.len(), "s3 list_prefix");
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            count = keys.len(),
+            "s3 list_prefix"
+        );
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["list_prefix"])
             .observe(elapsed.as_secs_f64());

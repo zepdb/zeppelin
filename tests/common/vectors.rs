@@ -76,10 +76,7 @@ pub fn simple_attributes(index: usize) -> HashMap<String, AttributeValue> {
         "category".to_string(),
         AttributeValue::String(categories[index % 3].to_string()),
     );
-    attrs.insert(
-        "score".to_string(),
-        AttributeValue::Integer(index as i64),
-    );
+    attrs.insert("score".to_string(), AttributeValue::Integer(index as i64));
     attrs
 }
 

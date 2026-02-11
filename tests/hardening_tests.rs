@@ -161,9 +161,7 @@ async fn test_top_k_zero_400() {
 async fn test_readyz_endpoint() {
     let (base_url, harness) = start_test_server().await;
 
-    let resp = reqwest::get(format!("{base_url}/readyz"))
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!("{base_url}/readyz")).await.unwrap();
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.unwrap();
@@ -178,9 +176,7 @@ async fn test_readyz_endpoint() {
 async fn test_healthz_still_works() {
     let (base_url, harness) = start_test_server().await;
 
-    let resp = reqwest::get(format!("{base_url}/healthz"))
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!("{base_url}/healthz")).await.unwrap();
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.unwrap();
@@ -200,16 +196,27 @@ async fn test_metrics_endpoint() {
         .with_label_values(&["__test__"])
         .inc();
 
-    let resp = reqwest::get(format!("{base_url}/metrics"))
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!("{base_url}/metrics")).await.unwrap();
     assert_eq!(resp.status(), 200);
 
-    let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap().to_string();
-    assert!(content_type.contains("text/plain"), "expected prometheus text format, got: {content_type}");
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.contains("text/plain"),
+        "expected prometheus text format, got: {content_type}"
+    );
 
     let body = resp.text().await.unwrap();
-    assert!(body.contains("zeppelin_"), "metrics should contain zeppelin_ prefix, got: {}", &body[..200.min(body.len())]);
+    assert!(
+        body.contains("zeppelin_"),
+        "metrics should contain zeppelin_ prefix, got: {}",
+        &body[..200.min(body.len())]
+    );
 
     harness.cleanup().await;
 }
@@ -233,9 +240,7 @@ async fn test_metrics_increment_after_query() {
         .await
         .unwrap();
 
-    let vectors = vec![
-        serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]}),
-    ];
+    let vectors = vec![serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]})];
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({ "vectors": vectors }))
@@ -255,11 +260,13 @@ async fn test_metrics_increment_after_query() {
         .unwrap();
 
     // Check metrics
-    let resp = reqwest::get(format!("{base_url}/metrics"))
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!("{base_url}/metrics")).await.unwrap();
     let body = resp.text().await.unwrap();
-    assert!(body.contains("zeppelin_queries_total"), "should have queries counter, got: {}", &body[..300.min(body.len())]);
+    assert!(
+        body.contains("zeppelin_queries_total"),
+        "should have queries counter, got: {}",
+        &body[..300.min(body.len())]
+    );
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
@@ -288,9 +295,7 @@ async fn test_request_timeout_applied() {
         .unwrap();
 
     // Normal query should complete successfully (validates middleware is wired)
-    let vectors = vec![
-        serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]}),
-    ];
+    let vectors = vec![serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]})];
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({ "vectors": vectors }))
@@ -352,7 +357,10 @@ async fn test_cache_populated_after_segment_query() {
 
     if let Ok(result) = compact_result {
         // Compaction succeeded — query with eventual consistency to hit the segment
-        assert!(result.vectors_compacted > 0, "expected vectors to be compacted");
+        assert!(
+            result.vectors_compacted > 0,
+            "expected vectors to be compacted"
+        );
 
         let query_vec: Vec<f32> = vec![0.5; 8];
         let resp = client
@@ -370,10 +378,16 @@ async fn test_cache_populated_after_segment_query() {
         let body: serde_json::Value = resp.json().await.unwrap();
         let scanned = body["scanned_segments"].as_u64().unwrap_or(0);
         assert!(scanned > 0, "expected segment scan after compaction");
-        assert!(cache.total_size() > 0, "cache should have data after segment query");
+        assert!(
+            cache.total_size() > 0,
+            "cache should have data after segment query"
+        );
     } else {
         // Compaction may fail if the namespace setup wasn't complete — skip gracefully
-        eprintln!("[test] compaction failed (expected in some environments): {:?}", compact_result.err());
+        eprintln!(
+            "[test] compaction failed (expected in some environments): {:?}",
+            compact_result.err()
+        );
     }
 
     cleanup_ns(&harness.store, &ns).await;

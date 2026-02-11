@@ -30,8 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(config_path.as_deref())?;
 
     // Initialize tracing from LoggingConfig
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
 
     match config.logging.format.as_str() {
         "json" => {
@@ -41,9 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .init();
         }
         _ => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(filter).init();
         }
     }
 

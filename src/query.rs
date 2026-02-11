@@ -57,9 +57,18 @@ pub async fn execute_query(
     let segment_start = std::time::Instant::now();
     let segment_results = if let Some(ref segment_id) = manifest.active_segment {
         let results = segment_search(
-            store, namespace, segment_id, query, top_k, nprobe, filter, distance_metric,
-            oversample_factor, cache,
-        ).await?;
+            store,
+            namespace,
+            segment_id,
+            query,
+            top_k,
+            nprobe,
+            filter,
+            distance_metric,
+            oversample_factor,
+            cache,
+        )
+        .await?;
         scanned_segments = 1;
         results
     } else {
@@ -109,8 +118,13 @@ async fn wal_scan(
     let mut deleted_ids: HashSet<String> = HashSet::new();
     // Latest vector state per ID (latest fragment wins)
     #[allow(clippy::type_complexity)]
-    let mut latest_vectors: HashMap<String, (Vec<f32>, Option<HashMap<String, crate::types::AttributeValue>>)> =
-        HashMap::new();
+    let mut latest_vectors: HashMap<
+        String,
+        (
+            Vec<f32>,
+            Option<HashMap<String, crate::types::AttributeValue>>,
+        ),
+    > = HashMap::new();
 
     // Process fragments in ULID order (oldest first, so later overwrites earlier)
     for fragment in &fragments {
@@ -148,7 +162,11 @@ async fn wal_scan(
         })
         .collect();
 
-    results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     debug!(
         surviving_vectors = results.len(),
@@ -206,8 +224,7 @@ fn merge_results(
         ConsistencyLevel::Strong => {
             // WAL results already have the latest state.
             // Remove segment results whose IDs appear in WAL results (WAL is authoritative).
-            let wal_ids: HashSet<String> =
-                wal_results.iter().map(|r| r.id.clone()).collect();
+            let wal_ids: HashSet<String> = wal_results.iter().map(|r| r.id.clone()).collect();
             let mut merged: Vec<SearchResult> = wal_results;
 
             for sr in segment_results {

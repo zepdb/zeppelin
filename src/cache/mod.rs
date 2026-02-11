@@ -138,7 +138,9 @@ impl DiskCache {
         let path = self.file_path(key);
         match tokio::fs::read(&path).await {
             Ok(data) => {
-                crate::metrics::CACHE_HITS_TOTAL.with_label_values(&["hit"]).inc();
+                crate::metrics::CACHE_HITS_TOTAL
+                    .with_label_values(&["hit"])
+                    .inc();
                 debug!("cache hit");
                 Some(Bytes::from(data))
             }
@@ -149,7 +151,9 @@ impl DiskCache {
                     self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
                     crate::metrics::CACHE_ENTRIES.dec();
                 }
-                crate::metrics::CACHE_HITS_TOTAL.with_label_values(&["miss"]).inc();
+                crate::metrics::CACHE_HITS_TOTAL
+                    .with_label_values(&["miss"])
+                    .inc();
                 debug!("cache miss (file missing)");
                 None
             }
@@ -161,7 +165,11 @@ impl DiskCache {
     pub async fn put(&self, key: &str, data: &Bytes) -> Result<()> {
         let size = data.len() as u64;
         let path = self.file_path(key);
-        let tmp_name = format!("{}.{}.tmp", Self::key_to_filename(key), uuid::Uuid::new_v4());
+        let tmp_name = format!(
+            "{}.{}.tmp",
+            Self::key_to_filename(key),
+            uuid::Uuid::new_v4()
+        );
         let tmp_path = self.dir.join(tmp_name);
 
         // Atomic write: write to .tmp then rename
@@ -214,7 +222,9 @@ impl DiskCache {
             return Ok(data);
         }
 
-        crate::metrics::CACHE_HITS_TOTAL.with_label_values(&["miss"]).inc();
+        crate::metrics::CACHE_HITS_TOTAL
+            .with_label_values(&["miss"])
+            .inc();
         let data = fetch().await?;
         self.put(key, &data).await?;
         Ok(data)

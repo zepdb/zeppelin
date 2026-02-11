@@ -99,8 +99,7 @@ pub fn recall_at_k(results: &[SearchResult], ground_truth: &[&str], k: usize) ->
         return 1.0;
     }
 
-    let truth_set: std::collections::HashSet<&str> =
-        ground_truth.iter().take(k).copied().collect();
+    let truth_set: std::collections::HashSet<&str> = ground_truth.iter().take(k).copied().collect();
     let result_set: std::collections::HashSet<&str> =
         results.iter().take(k).map(|r| r.id.as_str()).collect();
 

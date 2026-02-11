@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use dashmap::DashMap;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, instrument};
 
@@ -46,7 +46,9 @@ impl WalWriter {
         let lock = self.namespace_lock(namespace);
         let _guard = lock.lock().await;
 
-        crate::metrics::WAL_APPENDS_TOTAL.with_label_values(&[namespace]).inc();
+        crate::metrics::WAL_APPENDS_TOTAL
+            .with_label_values(&[namespace])
+            .inc();
 
         let fragment = WalFragment::new(vectors, deletes);
 

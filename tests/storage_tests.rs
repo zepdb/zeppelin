@@ -18,11 +18,7 @@ async fn test_s3_put_get_delete() {
         .expect("put should succeed");
 
     // GET
-    let result = harness
-        .store
-        .get(&key)
-        .await
-        .expect("get should succeed");
+    let result = harness.store.get(&key).await.expect("get should succeed");
     assert_eq!(result, data, "data read back should match what was written");
 
     // EXISTS
@@ -34,11 +30,7 @@ async fn test_s3_put_get_delete() {
     assert!(exists, "object should exist after put");
 
     // HEAD
-    let meta = harness
-        .store
-        .head(&key)
-        .await
-        .expect("head should succeed");
+    let meta = harness.store.head(&key).await.expect("head should succeed");
     assert_eq!(meta.size, data.len(), "head size should match data length");
 
     // DELETE
@@ -132,12 +124,12 @@ async fn test_s3_overwrite() {
         .expect("put v2 should succeed");
 
     // Read back — should get v2
-    let result = harness
-        .store
-        .get(&key)
-        .await
-        .expect("get should succeed");
-    assert_eq!(result, Bytes::from("version 2"), "should read overwritten value");
+    let result = harness.store.get(&key).await.expect("get should succeed");
+    assert_eq!(
+        result,
+        Bytes::from("version 2"),
+        "should read overwritten value"
+    );
 
     harness.cleanup().await;
 }
@@ -176,7 +168,11 @@ async fn test_s3_delete_prefix() {
 
     // Verify they exist
     let prefix = harness.key(&format!("{sub}/"));
-    let keys = harness.store.list_prefix(&prefix).await.expect("list should work");
+    let keys = harness
+        .store
+        .list_prefix(&prefix)
+        .await
+        .expect("list should work");
     assert_eq!(keys.len(), 5);
 
     // Delete prefix
@@ -188,7 +184,11 @@ async fn test_s3_delete_prefix() {
     assert_eq!(deleted, 5, "should delete 5 objects");
 
     // Verify empty
-    let keys_after = harness.store.list_prefix(&prefix).await.expect("list should work");
+    let keys_after = harness
+        .store
+        .list_prefix(&prefix)
+        .await
+        .expect("list should work");
     assert!(keys_after.is_empty(), "prefix should be empty after delete");
 
     harness.cleanup().await;

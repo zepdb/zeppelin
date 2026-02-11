@@ -42,15 +42,11 @@ impl WalFragment {
     /// ordering across serialization round-trips (HashMap iteration order is
     /// not guaranteed to be stable after deserialize → re-serialize).
     fn compute_checksum(vectors: &[VectorEntry], deletes: &[VectorId]) -> u64 {
-        use std::collections::BTreeMap;
         use crate::types::AttributeValue;
+        use std::collections::BTreeMap;
 
         #[allow(clippy::type_complexity)]
-        let canonical: Vec<(
-            &str,
-            &[f32],
-            Option<BTreeMap<&String, &AttributeValue>>,
-        )> = vectors
+        let canonical: Vec<(&str, &[f32], Option<BTreeMap<&String, &AttributeValue>>)> = vectors
             .iter()
             .map(|v| {
                 let attrs = v

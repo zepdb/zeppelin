@@ -31,7 +31,9 @@ pub fn train_kmeans(
     let n = vectors.len();
 
     if n == 0 {
-        return Err(ZeppelinError::Index("cannot train k-means on empty dataset".into()));
+        return Err(ZeppelinError::Index(
+            "cannot train k-means on empty dataset".into(),
+        ));
     }
     if k == 0 {
         return Err(ZeppelinError::Index("k must be > 0".into()));
@@ -48,7 +50,12 @@ pub fn train_kmeans(
         );
     }
 
-    info!(n = n, k = effective_k, dim = dim, "starting k-means++ initialization");
+    info!(
+        n = n,
+        k = effective_k,
+        dim = dim,
+        "starting k-means++ initialization"
+    );
 
     // --- k-means++ initialization ---
     let mut centroids = kmeans_pp_init(vectors, dim, effective_k)?;
@@ -141,11 +148,7 @@ pub fn train_kmeans(
 
 /// k-means++ seeding: pick initial centroids with probability proportional
 /// to squared distance from the nearest already-chosen centroid.
-fn kmeans_pp_init(
-    vectors: &[&[f32]],
-    dim: usize,
-    k: usize,
-) -> Result<Vec<Vec<f32>>> {
+fn kmeans_pp_init(vectors: &[&[f32]], dim: usize, k: usize) -> Result<Vec<Vec<f32>>> {
     let n = vectors.len();
     let mut rng = rand::thread_rng();
 
@@ -197,7 +200,11 @@ fn kmeans_pp_init(
         }
 
         centroids.push(vectors[chosen].to_vec());
-        debug!(centroid = c, chosen_idx = chosen, "k-means++ selected centroid");
+        debug!(
+            centroid = c,
+            chosen_idx = chosen,
+            "k-means++ selected centroid"
+        );
     }
 
     debug_assert_eq!(centroids.len(), k);

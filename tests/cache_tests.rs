@@ -16,10 +16,7 @@ async fn test_cache_put_and_get() {
     let dir = TempDir::new().unwrap();
     let cache = test_cache(dir.path(), 1024 * 1024);
 
-    cache
-        .put("k1", &Bytes::from("hello"))
-        .await
-        .unwrap();
+    cache.put("k1", &Bytes::from("hello")).await.unwrap();
 
     let result = cache.get("k1").await;
     assert_eq!(result, Some(Bytes::from("hello")));
@@ -58,22 +55,13 @@ async fn test_cache_eviction_lru() {
     let cache = test_cache(dir.path(), 100);
 
     // Put k1 (50 bytes)
-    cache
-        .put("k1", &Bytes::from(vec![b'a'; 50]))
-        .await
-        .unwrap();
+    cache.put("k1", &Bytes::from(vec![b'a'; 50])).await.unwrap();
 
     // Put k2 (50 bytes) — total now 100, at limit
-    cache
-        .put("k2", &Bytes::from(vec![b'b'; 50]))
-        .await
-        .unwrap();
+    cache.put("k2", &Bytes::from(vec![b'b'; 50])).await.unwrap();
 
     // Put k3 (50 bytes) — total would be 150, so evict oldest (k1)
-    cache
-        .put("k3", &Bytes::from(vec![b'c'; 50]))
-        .await
-        .unwrap();
+    cache.put("k3", &Bytes::from(vec![b'c'; 50])).await.unwrap();
 
     // k1 should be evicted
     assert_eq!(cache.get("k1").await, None);
@@ -276,5 +264,8 @@ async fn test_cache_concurrent_get_or_fetch() {
     }
 
     // The value should be in the cache
-    assert_eq!(cache.get("shared_key").await, Some(Bytes::from("shared_value")));
+    assert_eq!(
+        cache.get("shared_key").await,
+        Some(Bytes::from("shared_value"))
+    );
 }

@@ -7,9 +7,7 @@ use common::vectors::random_vectors;
 async fn test_health_check() {
     let (base_url, harness) = start_test_server().await;
 
-    let resp = reqwest::get(format!("{base_url}/healthz"))
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!("{base_url}/healthz")).await.unwrap();
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.unwrap();

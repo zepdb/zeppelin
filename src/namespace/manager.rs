@@ -172,7 +172,11 @@ impl NamespaceManager {
         // Remove from registry
         self.registry.remove(name);
 
-        info!(namespace = name, objects_deleted = deleted, "deleted namespace");
+        info!(
+            namespace = name,
+            objects_deleted = deleted,
+            "deleted namespace"
+        );
         Ok(())
     }
 

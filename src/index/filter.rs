@@ -11,17 +11,12 @@ use crate::types::{AttributeValue, Filter};
 /// Evaluate a filter predicate against a set of attributes.
 ///
 /// Returns `true` if the attributes satisfy the filter.
-pub fn evaluate_filter(
-    filter: &Filter,
-    attributes: &HashMap<String, AttributeValue>,
-) -> bool {
+pub fn evaluate_filter(filter: &Filter, attributes: &HashMap<String, AttributeValue>) -> bool {
     match filter {
-        Filter::Eq { field, value } => {
-            attributes
-                .get(field)
-                .map(|attr| attr_eq(attr, value))
-                .unwrap_or(false)
-        }
+        Filter::Eq { field, value } => attributes
+            .get(field)
+            .map(|attr| attr_eq(attr, value))
+            .unwrap_or(false),
 
         Filter::Range {
             field,
@@ -113,7 +108,10 @@ mod tests {
 
     fn make_attrs() -> HashMap<String, AttributeValue> {
         let mut m = HashMap::new();
-        m.insert("color".to_string(), AttributeValue::String("red".to_string()));
+        m.insert(
+            "color".to_string(),
+            AttributeValue::String("red".to_string()),
+        );
         m.insert("size".to_string(), AttributeValue::Integer(42));
         m.insert("weight".to_string(), AttributeValue::Float(3.125));
         m.insert("active".to_string(), AttributeValue::Bool(true));

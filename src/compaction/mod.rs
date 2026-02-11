@@ -63,7 +63,11 @@ impl Compactor {
             .await?
             .unwrap_or_default();
         let count = manifest.uncompacted_fragments().len();
-        debug!(fragment_count = count, threshold = self.config.max_wal_fragments_before_compact, "checking compaction trigger");
+        debug!(
+            fragment_count = count,
+            threshold = self.config.max_wal_fragments_before_compact,
+            "checking compaction trigger"
+        );
         Ok(count >= self.config.max_wal_fragments_before_compact)
     }
 

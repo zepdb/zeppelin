@@ -30,10 +30,7 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/namespaces/:ns/vectors",
             post(vectors::upsert_vectors).delete(vectors::delete_vectors),
         )
-        .route(
-            "/v1/namespaces/:ns/query",
-            post(query::query_namespace),
-        )
+        .route("/v1/namespaces/:ns/query", post(query::query_namespace))
         .layer(axum::middleware::from_fn(middleware::http_metrics))
         .layer(TimeoutLayer::new(timeout))
         .layer(RequestBodyLimitLayer::new(

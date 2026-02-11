@@ -51,11 +51,7 @@ impl IvfFlatIndex {
     }
 
     /// Load an existing IVF-Flat index from S3 artifacts.
-    pub async fn load(
-        store: &ZeppelinStore,
-        namespace: &str,
-        segment_id: &str,
-    ) -> Result<Self> {
+    pub async fn load(store: &ZeppelinStore, namespace: &str, segment_id: &str) -> Result<Self> {
         build::load_ivf_flat(store, namespace, segment_id).await
     }
 }

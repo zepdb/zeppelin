@@ -62,10 +62,7 @@ async fn test_wal_writer_append_single_fragment() {
     assert!(harness.store.exists(&frag_key).await.unwrap());
 
     // Verify manifest has the fragment
-    let manifest = Manifest::read(&harness.store, &ns)
-        .await
-        .unwrap()
-        .unwrap();
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     assert_eq!(manifest.fragments.len(), 1);
     assert_eq!(manifest.fragments[0].id, fragment.id);
     assert_eq!(manifest.fragments[0].vector_count, 3);
@@ -97,10 +94,7 @@ async fn test_wal_writer_append_multiple_fragments() {
         .await
         .unwrap();
 
-    let manifest = Manifest::read(&harness.store, &ns)
-        .await
-        .unwrap()
-        .unwrap();
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     assert_eq!(manifest.fragments.len(), 3);
     assert_eq!(manifest.fragments[0].id, f1.id);
     assert_eq!(manifest.fragments[1].id, f2.id);
@@ -211,11 +205,12 @@ async fn test_wal_writer_concurrent_appends() {
         handle.await.unwrap();
     }
 
-    let manifest = Manifest::read(&harness.store, &ns)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(manifest.fragments.len(), 10, "all 10 concurrent appends should be in manifest");
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(
+        manifest.fragments.len(),
+        10,
+        "all 10 concurrent appends should be in manifest"
+    );
 
     // Verify all fragments are readable and have valid checksums
     let reader = WalReader::new(harness.store.clone());

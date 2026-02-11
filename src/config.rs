@@ -282,7 +282,9 @@ impl Default for StorageConfig {
             gcs_service_account_path: std::env::var("GCS_SERVICE_ACCOUNT_PATH")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            azure_account: std::env::var("AZURE_ACCOUNT").ok().filter(|s| !s.is_empty()),
+            azure_account: std::env::var("AZURE_ACCOUNT")
+                .ok()
+                .filter(|s| !s.is_empty()),
             azure_access_key: std::env::var("AZURE_ACCESS_KEY")
                 .ok()
                 .filter(|s| !s.is_empty()),

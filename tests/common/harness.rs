@@ -18,8 +18,8 @@ impl TestHarness {
         let _ = dotenvy::dotenv();
 
         let backend = std::env::var("TEST_BACKEND").unwrap_or_else(|_| "s3".to_string());
-        let bucket = std::env::var("TEST_S3_BUCKET")
-            .unwrap_or_else(|_| "stormcrow-test".to_string());
+        let bucket =
+            std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "stormcrow-test".to_string());
 
         let config = match backend.as_str() {
             "s3" => StorageConfig {
@@ -46,12 +46,10 @@ impl TestHarness {
                         .unwrap_or_else(|_| "http://localhost:9000".to_string()),
                 ),
                 s3_access_key_id: Some(
-                    std::env::var("MINIO_ACCESS_KEY")
-                        .unwrap_or_else(|_| "minioadmin".to_string()),
+                    std::env::var("MINIO_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string()),
                 ),
                 s3_secret_access_key: Some(
-                    std::env::var("MINIO_SECRET_KEY")
-                        .unwrap_or_else(|_| "minioadmin".to_string()),
+                    std::env::var("MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string()),
                 ),
                 s3_allow_http: true,
                 gcs_service_account_path: None,
@@ -61,8 +59,8 @@ impl TestHarness {
             other => panic!("unsupported TEST_BACKEND: {other}"),
         };
 
-        let store = ZeppelinStore::from_config(&config)
-            .expect("failed to create store from config");
+        let store =
+            ZeppelinStore::from_config(&config).expect("failed to create store from config");
 
         let prefix = format!("test-{}", Uuid::new_v4());
 

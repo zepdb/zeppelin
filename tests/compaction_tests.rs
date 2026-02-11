@@ -8,8 +8,8 @@ use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::index::ivf_flat::build::build_ivf_flat;
 use zeppelin::query::execute_query;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
-use zeppelin::wal::manifest::{Manifest, SegmentRef};
 use zeppelin::wal::fragment::WalFragment;
+use zeppelin::wal::manifest::{Manifest, SegmentRef};
 use zeppelin::wal::{WalReader, WalWriter};
 
 use common::assertions::*;
@@ -26,7 +26,12 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
         kmeans_max_iterations: 10,
         ..Default::default()
     };
-    Compactor::new(store.clone(), wal_reader, compaction_config, indexing_config)
+    Compactor::new(
+        store.clone(),
+        wal_reader,
+        compaction_config,
+        indexing_config,
+    )
 }
 
 #[tokio::test]
@@ -483,8 +488,7 @@ async fn test_query_after_compaction() {
     .unwrap();
 
     // Both should return results matching pre-compaction top results
-    let post_strong_ids: Vec<String> =
-        post_strong.results.iter().map(|r| r.id.clone()).collect();
+    let post_strong_ids: Vec<String> = post_strong.results.iter().map(|r| r.id.clone()).collect();
     let post_eventual_ids: Vec<String> =
         post_eventual.results.iter().map(|r| r.id.clone()).collect();
 

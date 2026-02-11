@@ -55,9 +55,7 @@ async fn test_s3_metrics_after_operations() {
         .unwrap();
 
     // Upsert vectors (triggers more S3 operations)
-    let vectors = vec![
-        serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]}),
-    ];
+    let vectors = vec![serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]})];
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({ "vectors": vectors }))
@@ -112,9 +110,7 @@ async fn test_active_queries_returns_to_zero() {
         .unwrap();
 
     // Upsert a vector
-    let vectors = vec![
-        serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]}),
-    ];
+    let vectors = vec![serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]})];
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({ "vectors": vectors }))
@@ -282,15 +278,23 @@ async fn test_all_metrics_registered() {
 
     // Touch all Vec metrics so they appear in gather() output
     // (prometheus-rs omits Vec families with zero observations)
-    HTTP_REQUESTS_TOTAL.with_label_values(&["GET", "/test", "200"]).inc();
+    HTTP_REQUESTS_TOTAL
+        .with_label_values(&["GET", "/test", "200"])
+        .inc();
     QUERY_DURATION.with_label_values(&["__test__"]).observe(0.0);
     QUERIES_TOTAL.with_label_values(&["__test__"]).inc();
     WAL_APPENDS_TOTAL.with_label_values(&["__test__"]).inc();
     CACHE_HITS_TOTAL.with_label_values(&["hit"]).inc();
-    COMPACTIONS_TOTAL.with_label_values(&["__test__", "success"]).inc();
-    S3_OPERATION_DURATION.with_label_values(&["get"]).observe(0.0);
+    COMPACTIONS_TOTAL
+        .with_label_values(&["__test__", "success"])
+        .inc();
+    S3_OPERATION_DURATION
+        .with_label_values(&["get"])
+        .observe(0.0);
     S3_ERRORS_TOTAL.with_label_values(&["get"]).inc();
-    COMPACTION_DURATION.with_label_values(&["__test__"]).observe(0.0);
+    COMPACTION_DURATION
+        .with_label_values(&["__test__"])
+        .observe(0.0);
 
     let families = prometheus::gather();
     let names: Vec<String> = families.iter().map(|f| f.get_name().to_string()).collect();

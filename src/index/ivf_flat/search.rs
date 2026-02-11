@@ -146,11 +146,7 @@ pub async fn search_ivf_flat(
         // Score each vector in the cluster.
         for (j, vec) in cluster.vectors.iter().enumerate() {
             let score = compute_distance(query, vec, distance_metric);
-            let vector_attrs = attrs
-                .as_ref()
-                .and_then(|a| a.get(j))
-                .cloned()
-                .flatten();
+            let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
 
             candidates.push(Candidate {
                 id: cluster.ids[j].clone(),
@@ -167,7 +163,11 @@ pub async fn search_ivf_flat(
     );
 
     // --- Step 4: Sort all candidates by distance ---
-    candidates.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // --- Step 5: Apply post-filter if present ---
     let results: Vec<SearchResult> = if let Some(f) = filter {
@@ -198,11 +198,7 @@ pub async fn search_ivf_flat(
             .collect()
     };
 
-    debug!(
-        returned = results.len(),
-        top_k = top_k,
-        "search complete"
-    );
+    debug!(returned = results.len(), top_k = top_k, "search complete");
 
     Ok(results)
 }
@@ -213,10 +209,7 @@ mod tests {
 
     fn make_index() -> IvfFlatIndex {
         IvfFlatIndex {
-            centroids: vec![
-                vec![0.0, 0.0],
-                vec![10.0, 10.0],
-            ],
+            centroids: vec![vec![0.0, 0.0], vec![10.0, 10.0]],
             num_vectors: 4,
             dim: 2,
             namespace: "test_ns".to_string(),

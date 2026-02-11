@@ -27,11 +27,7 @@ impl WalReader {
 
     /// Read a specific WAL fragment by its ULID.
     #[instrument(skip(self), fields(namespace = namespace, fragment_id = %fragment_id))]
-    pub async fn read_fragment(
-        &self,
-        namespace: &str,
-        fragment_id: &Ulid,
-    ) -> Result<WalFragment> {
+    pub async fn read_fragment(&self, namespace: &str, fragment_id: &Ulid) -> Result<WalFragment> {
         let key = WalFragment::s3_key(namespace, fragment_id);
         let data = self.store.get(&key).await?;
         WalFragment::from_bytes(&data)
@@ -39,10 +35,7 @@ impl WalReader {
 
     /// Read all uncompacted fragments for a namespace, in ULID order.
     #[instrument(skip(self), fields(namespace = namespace))]
-    pub async fn read_uncompacted_fragments(
-        &self,
-        namespace: &str,
-    ) -> Result<Vec<WalFragment>> {
+    pub async fn read_uncompacted_fragments(&self, namespace: &str) -> Result<Vec<WalFragment>> {
         let manifest = Manifest::read(&self.store, namespace).await?;
         let manifest = match manifest {
             Some(m) => m,
