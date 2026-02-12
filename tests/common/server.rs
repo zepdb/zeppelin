@@ -10,6 +10,7 @@ use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::compaction_loop;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::Config;
+use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::server::routes::build_router;
 use zeppelin::server::AppState;
@@ -51,6 +52,7 @@ pub async fn start_test_server_with_config(
         compactor,
         cache: cache.clone(),
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
+        fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         batch_wal_writer: None,
     };
@@ -107,6 +109,7 @@ pub async fn start_test_server_with_compactor(
         compactor: compactor.clone(),
         cache: cache.clone(),
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
+        fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         batch_wal_writer: None,
     };
@@ -178,6 +181,7 @@ pub async fn start_test_server_with_compaction(
         compactor,
         cache: cache.clone(),
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
+        fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         batch_wal_writer: None,
     };

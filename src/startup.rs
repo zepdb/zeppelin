@@ -16,6 +16,7 @@ use crate::cache::DiskCache;
 use crate::compaction::background::start_compaction_thread;
 use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget};
+use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::NamespaceManager;
 use crate::server::routes::build_router;
 use crate::server::AppState;
@@ -154,6 +155,9 @@ pub async fn build_app(
         None
     };
 
+    // Initialize WAL FTS cache (pre-tokenized BM25 data)
+    let fts_cache = Arc::new(WalFtsCache::new());
+
     // Build application state
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.server.max_concurrent_queries,
@@ -167,6 +171,7 @@ pub async fn build_app(
         compactor,
         cache,
         manifest_cache,
+        fts_cache,
         query_semaphore,
         batch_wal_writer,
     };
