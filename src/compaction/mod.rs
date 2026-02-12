@@ -125,8 +125,14 @@ impl Compactor {
                     pending_count = manifest.pending_deletes.len(),
                     "cleaning up deferred deletes from previous compaction"
                 );
-                for key in &manifest.pending_deletes {
-                    if let Err(e) = self.store.delete(key).await {
+                let delete_futs: Vec<_> = manifest
+                    .pending_deletes
+                    .iter()
+                    .map(|key| self.store.delete(key))
+                    .collect();
+                let delete_results = futures::future::join_all(delete_futs).await;
+                for (key, result) in manifest.pending_deletes.iter().zip(delete_results) {
+                    if let Err(e) = result {
                         warn!(key = %key, error = %e, "failed to delete deferred key");
                     }
                 }
@@ -315,10 +321,17 @@ impl Compactor {
             let fts_start = std::time::Instant::now();
             let mut fts_field_names = Vec::new();
 
-            // Build inverted index per cluster
-            for cluster_idx in 0..cluster_count {
-                let akey = attrs_key(namespace, &segment_id, cluster_idx);
-                let cluster_attrs = match self.store.get(&akey).await {
+            // Phase 1: Parallel reads of cluster attributes.
+            let attr_keys: Vec<String> = (0..cluster_count)
+                .map(|i| attrs_key(namespace, &segment_id, i))
+                .collect();
+            let read_futs: Vec<_> = attr_keys.iter().map(|k| self.store.get(k)).collect();
+            let read_results = futures::future::join_all(read_futs).await;
+
+            // Phase 2: CPU — build inverted indexes.
+            let mut write_payloads = Vec::new();
+            for (cluster_idx, result) in read_results.into_iter().enumerate() {
+                let cluster_attrs = match result {
                     Ok(data) => deserialize_attrs(&data)?,
                     Err(_) => continue,
                 };
@@ -337,7 +350,17 @@ impl Compactor {
 
                 let fts_data = inv_index.to_bytes()?;
                 let fts_key = fts_index_key(namespace, &segment_id, cluster_idx);
-                self.store.put(&fts_key, fts_data).await?;
+                write_payloads.push((fts_key, fts_data));
+            }
+
+            // Phase 3: Parallel writes of FTS indexes.
+            let write_futs: Vec<_> = write_payloads
+                .iter()
+                .map(|(key, data)| self.store.put(key, data.clone()))
+                .collect();
+            let write_results = futures::future::join_all(write_futs).await;
+            for result in write_results {
+                result?;
             }
 
             let fts_elapsed = fts_start.elapsed();
