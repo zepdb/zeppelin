@@ -52,3 +52,10 @@ clients/typescript/dist/
 
 # Docker volumes
 minio_data/
+
+# Deployment state
+deploy/.state/
+
+# Benchmark results and build artifacts
+benchmarks/results/
+benchmarks/target/

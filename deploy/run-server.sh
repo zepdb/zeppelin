@@ -1,0 +1,44 @@
+#!/bin/bash
+# Runs Zeppelin container on EC2 with S3 backend
+set -euo pipefail
+
+# Source env vars if .env exists
+if [ -f /home/ec2-user/.env ]; then
+    set -a
+    source /home/ec2-user/.env
+    set +a
+fi
+
+# Required env vars
+: "${S3_BUCKET:?S3_BUCKET is required}"
+: "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required}"
+: "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}"
+: "${AWS_REGION:=us-east-1}"
+
+# Stop existing container if running
+docker rm -f zeppelin 2>/dev/null || true
+
+docker run -d --name zeppelin \
+    --restart unless-stopped \
+    -p 8080:8080 \
+    -e STORAGE_BACKEND=s3 \
+    -e S3_BUCKET="$S3_BUCKET" \
+    -e AWS_REGION="$AWS_REGION" \
+    -e AWS_DEFAULT_REGION="$AWS_REGION" \
+    -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+    -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+    -e RUST_LOG=info \
+    zeppelin:latest
+
+echo "Zeppelin started. Waiting for health check..."
+for i in $(seq 1 30); do
+    if curl -sf http://localhost:8080/healthz > /dev/null 2>&1; then
+        echo "Zeppelin is healthy!"
+        exit 0
+    fi
+    sleep 2
+done
+
+echo "WARNING: Health check did not pass within 60s"
+docker logs zeppelin
+exit 1

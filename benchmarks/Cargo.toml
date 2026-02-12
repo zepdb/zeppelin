@@ -1,0 +1,17 @@
+[package]
+name = "zeppelin-bench"
+version = "0.1.0"
+edition = "2021"
+description = "System benchmarks for Zeppelin vector search engine"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+hdrhistogram = "7"
+chrono = "0.4"
+async-trait = "0.1"
+anyhow = "1"
