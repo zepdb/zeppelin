@@ -63,8 +63,13 @@ impl NamespaceManager {
         dimensions: usize,
         distance_metric: DistanceMetric,
     ) -> Result<NamespaceMetadata> {
-        self.create_with_fts(name, dimensions, distance_metric, std::collections::HashMap::new())
-            .await
+        self.create_with_fts(
+            name,
+            dimensions,
+            distance_metric,
+            std::collections::HashMap::new(),
+        )
+        .await
     }
 
     /// Create a new namespace with optional FTS field configuration.

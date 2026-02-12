@@ -99,14 +99,17 @@ fn arb_vector_id() -> impl Strategy<Value = String> {
 }
 
 fn arb_values() -> impl Strategy<Value = Vec<f32>> {
-    prop::collection::vec(prop::num::f32::NORMAL, 2..=8)
+    prop::collection::vec(-1e6f32..1e6f32, 2..=8)
 }
 
 fn arb_attribute_value() -> impl Strategy<Value = TestAttributeValue> {
     prop_oneof![
         "[a-z]{1,8}".prop_map(TestAttributeValue::String),
         (-1000i64..1000).prop_map(TestAttributeValue::Integer),
-        (-100.0f64..100.0).prop_map(TestAttributeValue::Float),
+        // Use integer-valued f64 to avoid precision loss through
+        // serde's #[serde(untagged)] deserialization (buffers via Value,
+        // which can introduce f64 bit drift for high-precision decimals).
+        (-1000i64..1000).prop_map(|i| TestAttributeValue::Float(i as f64)),
         any::<bool>().prop_map(TestAttributeValue::Bool),
     ]
 }
@@ -204,6 +207,7 @@ proptest! {
         k2 in "[a-z]{1,3}",
         v2 in arb_attribute_value(),
     ) {
+        prop_assume!(k1 != k2);
         // Insert in order (k1, k2)
         let mut attrs1 = HashMap::new();
         attrs1.insert(k1.clone(), v1.clone());

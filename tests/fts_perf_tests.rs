@@ -32,14 +32,55 @@ fn default_fts_config() -> HashMap<String, FtsFieldConfig> {
 
 fn random_text(rng: &mut StdRng, word_count: usize) -> String {
     let vocab = [
-        "vector", "search", "engine", "index", "query", "database", "rust",
-        "programming", "system", "memory", "safe", "fast", "concurrent",
-        "storage", "object", "bucket", "cluster", "centroid", "quantization",
-        "inverted", "token", "score", "relevance", "document", "namespace",
-        "compaction", "segment", "fragment", "manifest", "cache", "performance",
-        "algorithm", "approximate", "neighbor", "distance", "cosine", "euclidean",
-        "bitmap", "filter", "attribute", "hierarchical", "beam", "tree",
-        "machine", "learning", "neural", "network", "embedding", "transformer",
+        "vector",
+        "search",
+        "engine",
+        "index",
+        "query",
+        "database",
+        "rust",
+        "programming",
+        "system",
+        "memory",
+        "safe",
+        "fast",
+        "concurrent",
+        "storage",
+        "object",
+        "bucket",
+        "cluster",
+        "centroid",
+        "quantization",
+        "inverted",
+        "token",
+        "score",
+        "relevance",
+        "document",
+        "namespace",
+        "compaction",
+        "segment",
+        "fragment",
+        "manifest",
+        "cache",
+        "performance",
+        "algorithm",
+        "approximate",
+        "neighbor",
+        "distance",
+        "cosine",
+        "euclidean",
+        "bitmap",
+        "filter",
+        "attribute",
+        "hierarchical",
+        "beam",
+        "tree",
+        "machine",
+        "learning",
+        "neural",
+        "network",
+        "embedding",
+        "transformer",
     ];
     (0..word_count)
         .map(|_| vocab[rng.gen_range(0..vocab.len())])
@@ -173,9 +214,16 @@ async fn test_fts_perf_query_latency() {
 
     // Measure 50 queries (eventual consistency — segment-only)
     let queries = [
-        "vector search", "database index", "rust programming", "memory safe",
-        "machine learning", "neural network", "approximate neighbor", "cosine distance",
-        "bitmap filter", "compaction segment",
+        "vector search",
+        "database index",
+        "rust programming",
+        "memory safe",
+        "machine learning",
+        "neural network",
+        "approximate neighbor",
+        "cosine distance",
+        "bitmap filter",
+        "compaction segment",
     ];
 
     let mut latencies = Vec::new();
@@ -208,10 +256,7 @@ async fn test_fts_perf_query_latency() {
     );
 
     // Sanity: p99 should be under 5s for 500 docs
-    assert!(
-        p99 < 5000.0,
-        "p99 latency too high: {p99:.1}ms"
-    );
+    assert!(p99 < 5000.0, "p99 latency too high: {p99:.1}ms");
 }
 
 // ---------------------------------------------------------------------------

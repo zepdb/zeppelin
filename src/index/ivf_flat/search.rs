@@ -21,8 +21,8 @@ use crate::types::{AttributeValue, DistanceMetric, Filter, SearchResult};
 use super::build::{attrs_key, cluster_key, deserialize_attrs, deserialize_cluster};
 use super::IvfFlatIndex;
 
-use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
+use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 
 /// A candidate result during search, before final ranking.
 struct Candidate {
@@ -117,13 +117,42 @@ pub async fn search_ivf_flat(
     // Use quantized search path if quantization is available.
     let candidates = match index.quantization {
         QuantizationType::Scalar => {
-            scan_clusters_sq(index, &probe_clusters, query, distance_metric, filter, fetch_k, store, cache).await?
+            scan_clusters_sq(
+                index,
+                &probe_clusters,
+                query,
+                distance_metric,
+                filter,
+                fetch_k,
+                store,
+                cache,
+            )
+            .await?
         }
         QuantizationType::Product => {
-            scan_clusters_pq(index, &probe_clusters, query, distance_metric, filter, fetch_k, store, cache).await?
+            scan_clusters_pq(
+                index,
+                &probe_clusters,
+                query,
+                distance_metric,
+                filter,
+                fetch_k,
+                store,
+                cache,
+            )
+            .await?
         }
         QuantizationType::None => {
-            scan_clusters_flat(index, &probe_clusters, query, distance_metric, filter, store, cache).await?
+            scan_clusters_flat(
+                index,
+                &probe_clusters,
+                query,
+                distance_metric,
+                filter,
+                store,
+                cache,
+            )
+            .await?
         }
     };
 
@@ -201,9 +230,15 @@ async fn scan_clusters_flat(
 
         // Try bitmap pre-filter: skip distance computation for non-matching vectors.
         let prefilter = try_bitmap_prefilter(
-            &index.namespace, &index.segment_id, cluster_idx,
-            filter, has_bitmaps, store, cache,
-        ).await;
+            &index.namespace,
+            &index.segment_id,
+            cluster_idx,
+            filter,
+            has_bitmaps,
+            store,
+            cache,
+        )
+        .await;
 
         let attrs = load_attrs(index, cluster_idx, filter, store, cache).await;
 
@@ -258,9 +293,15 @@ async fn scan_clusters_sq(
     for &cluster_idx in probe_clusters {
         // Try bitmap pre-filter for this cluster.
         let prefilter = try_bitmap_prefilter(
-            &index.namespace, &index.segment_id, cluster_idx,
-            filter, has_bitmaps, store, cache,
-        ).await;
+            &index.namespace,
+            &index.segment_id,
+            cluster_idx,
+            filter,
+            has_bitmaps,
+            store,
+            cache,
+        )
+        .await;
 
         let sq_key = sq_cluster_key(&index.namespace, &index.segment_id, cluster_idx);
         let sq_data = match fetch_with_cache(cache, store, &sq_key).await {
@@ -273,7 +314,9 @@ async fn scan_clusters_sq(
                     let cluster = deserialize_cluster(&data)?;
                     for (j, vec) in cluster.vectors.iter().enumerate() {
                         if let Some(ref bm) = prefilter {
-                            if !bm.contains(j as u32) { continue; }
+                            if !bm.contains(j as u32) {
+                                continue;
+                            }
                         }
                         let score = compute_distance(query, vec, distance_metric);
                         coarse_candidates.push((cluster.ids[j].clone(), score, cluster_idx));
@@ -286,7 +329,9 @@ async fn scan_clusters_sq(
 
         for (j, codes) in sq_cluster.codes.iter().enumerate() {
             if let Some(ref bm) = prefilter {
-                if !bm.contains(j as u32) { continue; }
+                if !bm.contains(j as u32) {
+                    continue;
+                }
             }
             let approx_score = calibration.asymmetric_distance(query, codes, distance_metric);
             coarse_candidates.push((sq_cluster.ids[j].clone(), approx_score, cluster_idx));
@@ -294,9 +339,7 @@ async fn scan_clusters_sq(
     }
 
     // Sort by approximate distance and take top candidates for reranking.
-    coarse_candidates.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    coarse_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Rerank factor: take more candidates than needed for full-precision reranking.
     let rerank_count = fetch_k * 4; // 4x reranking factor
@@ -380,9 +423,15 @@ async fn scan_clusters_pq(
     for &cluster_idx in probe_clusters {
         // Try bitmap pre-filter for this cluster.
         let prefilter = try_bitmap_prefilter(
-            &index.namespace, &index.segment_id, cluster_idx,
-            filter, has_bitmaps, store, cache,
-        ).await;
+            &index.namespace,
+            &index.segment_id,
+            cluster_idx,
+            filter,
+            has_bitmaps,
+            store,
+            cache,
+        )
+        .await;
 
         let pq_key = pq_cluster_key(&index.namespace, &index.segment_id, cluster_idx);
         let pq_data = match fetch_with_cache(cache, store, &pq_key).await {
@@ -396,7 +445,9 @@ async fn scan_clusters_pq(
 
         for (j, codes) in pq_cluster.codes.iter().enumerate() {
             if let Some(ref bm) = prefilter {
-                if !bm.contains(j as u32) { continue; }
+                if !bm.contains(j as u32) {
+                    continue;
+                }
             }
             let approx_score = codebook.adc_distance(&adc_table, codes);
             coarse_candidates.push((pq_cluster.ids[j].clone(), approx_score, cluster_idx));
@@ -404,9 +455,7 @@ async fn scan_clusters_pq(
     }
 
     // Sort and take top candidates for reranking.
-    coarse_candidates.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    coarse_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let rerank_count = fetch_k * 4;
     coarse_candidates.truncate(rerank_count);

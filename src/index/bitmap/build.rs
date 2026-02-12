@@ -206,10 +206,7 @@ mod tests {
     use super::*;
 
     fn make_attrs(pairs: Vec<(&str, AttributeValue)>) -> HashMap<String, AttributeValue> {
-        pairs
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect()
+        pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
     }
 
     #[test]
@@ -300,10 +297,7 @@ mod tests {
             "tags",
             AttributeValue::StringList(vec!["a".into(), "b".into()]),
         )]);
-        let a1 = make_attrs(vec![(
-            "tags",
-            AttributeValue::StringList(vec!["a".into()]),
-        )]);
+        let a1 = make_attrs(vec![("tags", AttributeValue::StringList(vec!["a".into()]))]);
         let a2 = make_attrs(vec![(
             "tags",
             AttributeValue::StringList(vec!["b".into(), "c".into()]),
@@ -334,17 +328,10 @@ mod tests {
 
     #[test]
     fn test_build_integer_list_inverted() {
-        let a0 = make_attrs(vec![(
-            "scores",
-            AttributeValue::IntegerList(vec![10, 20]),
-        )]);
-        let a1 = make_attrs(vec![(
-            "scores",
-            AttributeValue::IntegerList(vec![20, 30]),
-        )]);
+        let a0 = make_attrs(vec![("scores", AttributeValue::IntegerList(vec![10, 20]))]);
+        let a1 = make_attrs(vec![("scores", AttributeValue::IntegerList(vec![20, 30]))]);
 
-        let attrs: Vec<Option<&HashMap<String, AttributeValue>>> =
-            vec![Some(&a0), Some(&a1)];
+        let attrs: Vec<Option<&HashMap<String, AttributeValue>>> = vec![Some(&a0), Some(&a1)];
         let index = build_cluster_bitmaps(&attrs);
 
         let scores = index.fields.get("scores").unwrap();
@@ -361,17 +348,10 @@ mod tests {
 
     #[test]
     fn test_build_float_list_inverted() {
-        let a0 = make_attrs(vec![(
-            "ratios",
-            AttributeValue::FloatList(vec![1.5, 2.5]),
-        )]);
-        let a1 = make_attrs(vec![(
-            "ratios",
-            AttributeValue::FloatList(vec![2.5, 3.5]),
-        )]);
+        let a0 = make_attrs(vec![("ratios", AttributeValue::FloatList(vec![1.5, 2.5]))]);
+        let a1 = make_attrs(vec![("ratios", AttributeValue::FloatList(vec![2.5, 3.5]))]);
 
-        let attrs: Vec<Option<&HashMap<String, AttributeValue>>> =
-            vec![Some(&a0), Some(&a1)];
+        let attrs: Vec<Option<&HashMap<String, AttributeValue>>> = vec![Some(&a0), Some(&a1)];
         let index = build_cluster_bitmaps(&attrs);
 
         let ratios = index.fields.get("ratios").unwrap();
@@ -390,10 +370,7 @@ mod tests {
 
     #[test]
     fn test_build_empty_list() {
-        let a0 = make_attrs(vec![(
-            "tags",
-            AttributeValue::StringList(vec![]),
-        )]);
+        let a0 = make_attrs(vec![("tags", AttributeValue::StringList(vec![]))]);
 
         let attrs: Vec<Option<&HashMap<String, AttributeValue>>> = vec![Some(&a0)];
         let index = build_cluster_bitmaps(&attrs);
@@ -452,8 +429,7 @@ mod tests {
         // Some vectors have None attributes (no attributes at all)
         let a0 = make_attrs(vec![("color", AttributeValue::String("red".into()))]);
 
-        let attrs: Vec<Option<&HashMap<String, AttributeValue>>> =
-            vec![Some(&a0), None, None];
+        let attrs: Vec<Option<&HashMap<String, AttributeValue>>> = vec![Some(&a0), None, None];
         let index = build_cluster_bitmaps(&attrs);
 
         assert_eq!(index.vector_count, 3);

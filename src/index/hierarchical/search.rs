@@ -22,8 +22,8 @@ use crate::types::{AttributeValue, DistanceMetric, Filter, SearchResult};
 
 use super::{deserialize_tree_node, tree_node_key, HierarchicalIndex};
 
-use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
+use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 
 /// A candidate result during search, before final ranking.
 struct Candidate {
@@ -159,8 +159,7 @@ pub async fn search_hierarchical(
 
         debug!(
             candidates = next_beam.len(),
-            any_internal,
-            "beam search: descending level"
+            any_internal, "beam search: descending level"
         );
 
         // Separate leaf cluster entries from internal node entries.
@@ -237,17 +236,55 @@ async fn scan_leaf_clusters(
 
     let candidates = match index.meta.quantization {
         QuantizationType::Scalar => {
-            scan_clusters_sq(ns, seg, cluster_indices, query, distance_metric, filter, fetch_k, has_bitmaps, store, cache).await?
+            scan_clusters_sq(
+                ns,
+                seg,
+                cluster_indices,
+                query,
+                distance_metric,
+                filter,
+                fetch_k,
+                has_bitmaps,
+                store,
+                cache,
+            )
+            .await?
         }
         QuantizationType::Product => {
-            scan_clusters_pq(ns, seg, cluster_indices, query, distance_metric, filter, fetch_k, has_bitmaps, store, cache).await?
+            scan_clusters_pq(
+                ns,
+                seg,
+                cluster_indices,
+                query,
+                distance_metric,
+                filter,
+                fetch_k,
+                has_bitmaps,
+                store,
+                cache,
+            )
+            .await?
         }
         QuantizationType::None => {
-            scan_clusters_flat(ns, seg, cluster_indices, query, distance_metric, filter, has_bitmaps, store, cache).await?
+            scan_clusters_flat(
+                ns,
+                seg,
+                cluster_indices,
+                query,
+                distance_metric,
+                filter,
+                has_bitmaps,
+                store,
+                cache,
+            )
+            .await?
         }
     };
 
-    debug!(total_candidates = candidates.len(), fetch_k, "scanned leaf clusters");
+    debug!(
+        total_candidates = candidates.len(),
+        fetch_k, "scanned leaf clusters"
+    );
 
     // Sort and apply filter.
     let mut sorted = candidates;
@@ -283,7 +320,10 @@ async fn scan_leaf_clusters(
             .collect()
     };
 
-    debug!(returned = results.len(), top_k, "hierarchical search complete");
+    debug!(
+        returned = results.len(),
+        top_k, "hierarchical search complete"
+    );
     Ok(results)
 }
 
@@ -314,14 +354,23 @@ async fn scan_clusters_flat(
         let cluster = deserialize_cluster(&cluster_data)?;
 
         let prefilter = try_bitmap_prefilter(
-            namespace, segment_id, cluster_idx, filter, has_bitmaps, store, cache,
-        ).await;
+            namespace,
+            segment_id,
+            cluster_idx,
+            filter,
+            has_bitmaps,
+            store,
+            cache,
+        )
+        .await;
 
         let attrs = load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await;
 
         for (j, vec) in cluster.vectors.iter().enumerate() {
             if let Some(ref bm) = prefilter {
-                if !bm.contains(j as u32) { continue; }
+                if !bm.contains(j as u32) {
+                    continue;
+                }
             }
             let score = compute_distance(query, vec, distance_metric);
             let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
@@ -363,8 +412,15 @@ async fn scan_clusters_sq(
 
     for &cluster_idx in cluster_indices {
         let prefilter = try_bitmap_prefilter(
-            namespace, segment_id, cluster_idx, filter, has_bitmaps, store, cache,
-        ).await;
+            namespace,
+            segment_id,
+            cluster_idx,
+            filter,
+            has_bitmaps,
+            store,
+            cache,
+        )
+        .await;
 
         let sq_key = sq_cluster_key(namespace, segment_id, cluster_idx);
         match fetch_with_cache(cache, store, &sq_key).await {
@@ -372,7 +428,9 @@ async fn scan_clusters_sq(
                 let sq_cluster = deserialize_sq_cluster(&sq_data)?;
                 for (j, codes) in sq_cluster.codes.iter().enumerate() {
                     if let Some(ref bm) = prefilter {
-                        if !bm.contains(j as u32) { continue; }
+                        if !bm.contains(j as u32) {
+                            continue;
+                        }
                     }
                     let approx = calibration.asymmetric_distance(query, codes, distance_metric);
                     coarse.push((sq_cluster.ids[j].clone(), approx, cluster_idx));
@@ -385,7 +443,9 @@ async fn scan_clusters_sq(
                     let cluster = deserialize_cluster(&data)?;
                     for (j, vec) in cluster.vectors.iter().enumerate() {
                         if let Some(ref bm) = prefilter {
-                            if !bm.contains(j as u32) { continue; }
+                            if !bm.contains(j as u32) {
+                                continue;
+                            }
                         }
                         let score = compute_distance(query, vec, distance_metric);
                         coarse.push((cluster.ids[j].clone(), score, cluster_idx));
@@ -399,7 +459,10 @@ async fn scan_clusters_sq(
     let rerank_count = fetch_k * 4;
     coarse.truncate(rerank_count);
 
-    debug!(coarse_candidates = coarse.len(), rerank_count, "SQ8 coarse ranking complete, starting rerank");
+    debug!(
+        coarse_candidates = coarse.len(),
+        rerank_count, "SQ8 coarse ranking complete, starting rerank"
+    );
 
     // Phase 2: rerank with full-precision.
     let mut by_cluster: HashMap<usize, Vec<String>> = HashMap::new();
@@ -463,8 +526,15 @@ async fn scan_clusters_pq(
 
     for &cluster_idx in cluster_indices {
         let prefilter = try_bitmap_prefilter(
-            namespace, segment_id, cluster_idx, filter, has_bitmaps, store, cache,
-        ).await;
+            namespace,
+            segment_id,
+            cluster_idx,
+            filter,
+            has_bitmaps,
+            store,
+            cache,
+        )
+        .await;
 
         let pq_key = pq_cluster_key(namespace, segment_id, cluster_idx);
         match fetch_with_cache(cache, store, &pq_key).await {
@@ -472,7 +542,9 @@ async fn scan_clusters_pq(
                 let pq_cluster = deserialize_pq_cluster(&pq_data)?;
                 for (j, codes) in pq_cluster.codes.iter().enumerate() {
                     if let Some(ref bm) = prefilter {
-                        if !bm.contains(j as u32) { continue; }
+                        if !bm.contains(j as u32) {
+                            continue;
+                        }
                     }
                     let approx = codebook.adc_distance(&adc_table, codes);
                     coarse.push((pq_cluster.ids[j].clone(), approx, cluster_idx));
@@ -489,7 +561,10 @@ async fn scan_clusters_pq(
     let rerank_count = fetch_k * 4;
     coarse.truncate(rerank_count);
 
-    debug!(coarse_candidates = coarse.len(), "PQ coarse ranking complete, starting rerank");
+    debug!(
+        coarse_candidates = coarse.len(),
+        "PQ coarse ranking complete, starting rerank"
+    );
 
     // Phase 2: rerank.
     let mut by_cluster: HashMap<usize, Vec<String>> = HashMap::new();

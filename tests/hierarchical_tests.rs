@@ -106,7 +106,10 @@ async fn test_build_hierarchical_single_leaf() {
     let tree_meta: serde_json::Value = serde_json::from_slice(&meta_data).unwrap();
     // Single leaf: num_levels should be 1.
     let num_levels = tree_meta["num_levels"].as_u64().unwrap();
-    assert_eq!(num_levels, 1, "expected single-level tree for small dataset");
+    assert_eq!(
+        num_levels, 1,
+        "expected single-level tree for small dataset"
+    );
 
     harness.cleanup().await;
 }
@@ -120,8 +123,7 @@ async fn test_build_hierarchical_errors() {
     let config = hierarchical_test_config();
 
     // Empty vectors → error.
-    let result =
-        build_hierarchical(&[], &config, &harness.store, &ns, "seg_err1").await;
+    let result = build_hierarchical(&[], &config, &harness.store, &ns, "seg_err1").await;
     assert!(result.is_err());
     match result.unwrap_err() {
         ZeppelinError::Index(msg) => {
@@ -136,8 +138,7 @@ async fn test_build_hierarchical_errors() {
         values: vec![],
         attributes: None,
     }];
-    let result =
-        build_hierarchical(&zero_dim_vecs, &config, &harness.store, &ns, "seg_err2").await;
+    let result = build_hierarchical(&zero_dim_vecs, &config, &harness.store, &ns, "seg_err2").await;
     assert!(result.is_err());
     match result.unwrap_err() {
         ZeppelinError::Index(msg) => {
@@ -263,7 +264,10 @@ async fn test_search_hierarchical_with_filter() {
 
     // Verify all results satisfy filter.
     for r in &results {
-        let attrs = r.attributes.as_ref().expect("result should have attributes");
+        let attrs = r
+            .attributes
+            .as_ref()
+            .expect("result should have attributes");
         let cat = attrs.get("category").expect("result should have category");
         assert_eq!(
             cat,
@@ -313,10 +317,7 @@ async fn test_search_hierarchical_sq8() {
         .await
         .unwrap();
 
-    assert!(
-        !results.is_empty(),
-        "expected SQ8 search results, got none"
-    );
+    assert!(!results.is_empty(), "expected SQ8 search results, got none");
 
     // SQ8 should return reasonable results (at least some overlap with true neighbors).
     let mut distances: Vec<(&str, f32)> = vectors
@@ -379,10 +380,7 @@ async fn test_search_hierarchical_pq() {
         .await
         .unwrap();
 
-    assert!(
-        !results.is_empty(),
-        "expected PQ search results, got none"
-    );
+    assert!(!results.is_empty(), "expected PQ search results, got none");
 
     // Verify PQ produces at least some correct results.
     let mut distances: Vec<(&str, f32)> = vectors

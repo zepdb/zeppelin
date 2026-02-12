@@ -51,10 +51,8 @@ pub fn wal_bm25_scan(
 
     // 1. Dedup: latest fragment wins, apply deletes
     let mut deleted_ids: HashSet<String> = HashSet::new();
-    let mut latest_vectors: HashMap<
-        String,
-        Option<HashMap<String, AttributeValue>>,
-    > = HashMap::new();
+    let mut latest_vectors: HashMap<String, Option<HashMap<String, AttributeValue>>> =
+        HashMap::new();
 
     for fragment in fragments {
         for del_id in &fragment.deletes {
@@ -126,7 +124,10 @@ pub fn wal_bm25_scan(
     let mut doc_field_data: DocFieldData = HashMap::new();
 
     // Gather all unique fields we need to index
-    let fields_needed: HashSet<&str> = field_query_states.iter().map(|s| s.field.as_str()).collect();
+    let fields_needed: HashSet<&str> = field_query_states
+        .iter()
+        .map(|s| s.field.as_str())
+        .collect();
 
     for (doc_id, attrs_opt) in &latest_vectors {
         let attrs = match attrs_opt {
@@ -223,9 +224,8 @@ pub fn wal_bm25_scan(
                         for (doc_term, &freq) in tf_map.iter() {
                             if doc_term.starts_with(token.as_str()) {
                                 total_tf += freq;
-                                total_df = total_df.max(
-                                    corpus.term_doc_freqs.get(doc_term).copied().unwrap_or(0),
-                                );
+                                total_df = total_df
+                                    .max(corpus.term_doc_freqs.get(doc_term).copied().unwrap_or(0));
                             }
                         }
                         let term_idf = bm25::idf(corpus.doc_count, total_df);
@@ -381,10 +381,7 @@ mod tests {
 
     #[test]
     fn test_wal_scan_empty_query() {
-        let fragments = vec![make_fragment(
-            vec![make_vec_entry("v1", "cat dog")],
-            vec![],
-        )];
+        let fragments = vec![make_fragment(vec![make_vec_entry("v1", "cat dog")], vec![])];
 
         let rank_by = RankBy::Bm25 {
             field: "content".to_string(),

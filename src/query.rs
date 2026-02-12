@@ -5,9 +5,9 @@ use tracing::{debug, instrument};
 
 use crate::cache::DiskCache;
 use crate::error::Result;
+use crate::fts::bm25::Bm25Params;
 use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
 use crate::fts::rank_by::{evaluate_rank_by, RankBy};
-use crate::fts::bm25::Bm25Params;
 use crate::fts::tokenizer::tokenize_text;
 use crate::fts::types::FtsFieldConfig;
 use crate::fts::wal_scan::wal_bm25_scan;
@@ -299,11 +299,9 @@ pub async fn execute_bm25_query(
             // Apply post-filter to WAL results
             let mut results = scan_result.results;
             if let Some(f) = filter {
-                results.retain(|r| {
-                    match &r.attributes {
-                        Some(attrs) => crate::index::filter::evaluate_filter(f, attrs),
-                        None => false,
-                    }
+                results.retain(|r| match &r.attributes {
+                    Some(attrs) => crate::index::filter::evaluate_filter(f, attrs),
+                    None => false,
                 });
             }
             results
@@ -356,7 +354,13 @@ pub async fn execute_bm25_query(
 
     // Merge results — BM25 is higher-is-better
     // Pass deleted IDs so segment results for deleted docs are excluded
-    let results = merge_bm25_results(wal_results, segment_results, top_k, consistency, &wal_deleted_ids);
+    let results = merge_bm25_results(
+        wal_results,
+        segment_results,
+        top_k,
+        consistency,
+        &wal_deleted_ids,
+    );
 
     Ok(QueryResponse {
         results,
@@ -384,8 +388,10 @@ async fn segment_bm25_search(
     let num_clusters = index.num_clusters();
 
     let field_queries = rank_by.extract_field_queries();
-    let mut all_results: HashMap<String, (f32, Option<HashMap<String, crate::types::AttributeValue>>)> =
-        HashMap::new();
+    let mut all_results: HashMap<
+        String,
+        (f32, Option<HashMap<String, crate::types::AttributeValue>>),
+    > = HashMap::new();
 
     // Search each cluster's inverted index
     for cluster_idx in 0..num_clusters {
@@ -470,9 +476,7 @@ async fn segment_bm25_search(
             }
 
             // Accumulate: same ID might appear in multiple clusters (shouldn't, but be safe)
-            let entry = all_results
-                .entry(id.clone())
-                .or_insert((0.0, attrs));
+            let entry = all_results.entry(id.clone()).or_insert((0.0, attrs));
             if final_score > entry.0 {
                 entry.0 = final_score;
             }

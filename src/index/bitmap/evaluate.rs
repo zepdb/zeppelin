@@ -30,23 +30,13 @@ pub fn evaluate_filter_bitmap(
         Filter::Eq { field, value } => {
             let field_bitmaps = index.fields.get(field)?;
             let key = value_to_key(value);
-            Some(
-                field_bitmaps
-                    .values
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_default(),
-            )
+            Some(field_bitmaps.values.get(&key).cloned().unwrap_or_default())
         }
 
         Filter::NotEq { field, value } => {
             let field_bitmaps = index.fields.get(field)?;
             let key = value_to_key(value);
-            let eq_bitmap = field_bitmaps
-                .values
-                .get(&key)
-                .cloned()
-                .unwrap_or_default();
+            let eq_bitmap = field_bitmaps.values.get(&key).cloned().unwrap_or_default();
             // NotEq: universe minus matching (includes nulls, per evaluate_filter semantics)
             Some(&universe - &eq_bitmap)
         }
@@ -150,13 +140,7 @@ pub fn evaluate_filter_bitmap(
             // Contains on list fields: look up the element in the inverted index
             if field_bitmaps.is_list {
                 let key = value_to_key(value);
-                Some(
-                    field_bitmaps
-                        .values
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_default(),
-                )
+                Some(field_bitmaps.values.get(&key).cloned().unwrap_or_default())
             } else {
                 // Contains on string field (substring match) — can't do via bitmap
                 None
@@ -221,10 +205,7 @@ mod tests {
         let a2 = [
             ("color".to_string(), AttributeValue::String("red".into())),
             ("size".to_string(), AttributeValue::Integer(3)),
-            (
-                "tags".to_string(),
-                AttributeValue::StringList(vec![]),
-            ),
+            ("tags".to_string(), AttributeValue::StringList(vec![])),
         ]
         .into_iter()
         .collect::<HashMap<_, _>>();
@@ -453,9 +434,12 @@ mod tests {
     #[test]
     fn test_eval_contains_string_returns_none() {
         // Build index with a non-list string field
-        let a0 = [("desc".to_string(), AttributeValue::String("hello world".into()))]
-            .into_iter()
-            .collect::<HashMap<_, _>>();
+        let a0 = [(
+            "desc".to_string(),
+            AttributeValue::String("hello world".into()),
+        )]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
         let attrs: Vec<Option<&HashMap<String, AttributeValue>>> = vec![Some(&a0)];
         let index = build_cluster_bitmaps(&attrs);
 
@@ -601,10 +585,7 @@ mod tests {
         let a2: HashMap<String, AttributeValue> = [
             ("color".to_string(), AttributeValue::String("red".into())),
             ("size".to_string(), AttributeValue::Integer(3)),
-            (
-                "tags".to_string(),
-                AttributeValue::StringList(vec![]),
-            ),
+            ("tags".to_string(), AttributeValue::StringList(vec![])),
         ]
         .into_iter()
         .collect();

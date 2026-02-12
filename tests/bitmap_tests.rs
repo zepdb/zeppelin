@@ -57,10 +57,7 @@ fn status_vectors(prefix: &str, n: usize, dims: usize) -> Vec<VectorEntry> {
                         "inactive".to_string()
                     }),
                 );
-                attrs.insert(
-                    "priority".to_string(),
-                    AttributeValue::Integer(i as i64),
-                );
+                attrs.insert("priority".to_string(), AttributeValue::Integer(i as i64));
                 attrs
             }),
         })
@@ -86,14 +83,8 @@ fn tagged_vectors(prefix: &str, n: usize, dims: usize) -> Vec<VectorEntry> {
                     1 => vec!["beta".to_string(), "common".to_string()],
                     _ => vec!["gamma".to_string()],
                 };
-                attrs.insert(
-                    "tags".to_string(),
-                    AttributeValue::StringList(tags),
-                );
-                attrs.insert(
-                    "priority".to_string(),
-                    AttributeValue::Integer(i as i64),
-                );
+                attrs.insert("tags".to_string(), AttributeValue::StringList(tags));
+                attrs.insert("priority".to_string(), AttributeValue::Integer(i as i64));
                 attrs
             }),
         })
@@ -156,7 +147,11 @@ async fn test_bitmap_ivf_flat_eq_filter() {
 
     // Verify SegmentRef has bitmap_fields
     let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
-    let seg_ref = manifest.segments.iter().find(|s| s.id == segment_id).unwrap();
+    let seg_ref = manifest
+        .segments
+        .iter()
+        .find(|s| s.id == segment_id)
+        .unwrap();
     assert!(
         !seg_ref.bitmap_fields.is_empty(),
         "SegmentRef should have bitmap_fields"
@@ -186,7 +181,10 @@ async fn test_bitmap_ivf_flat_eq_filter() {
     // All returned results should have status=active
     for r in results {
         let status = r["attributes"]["status"].as_str().unwrap();
-        assert_eq!(status, "active", "filtered result should have status=active");
+        assert_eq!(
+            status, "active",
+            "filtered result should have status=active"
+        );
     }
 
     cleanup_ns(&harness.store, &ns).await;
@@ -307,7 +305,11 @@ async fn test_bitmap_backward_compat() {
 
     // SegmentRef should have empty bitmap_fields
     let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
-    let seg_ref = manifest.segments.iter().find(|s| s.id == segment_id).unwrap();
+    let seg_ref = manifest
+        .segments
+        .iter()
+        .find(|s| s.id == segment_id)
+        .unwrap();
     assert!(
         seg_ref.bitmap_fields.is_empty(),
         "SegmentRef should have no bitmap_fields when disabled"
@@ -332,7 +334,10 @@ async fn test_bitmap_backward_compat() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
-    assert!(!results.is_empty(), "post-filter should still return results");
+    assert!(
+        !results.is_empty(),
+        "post-filter should still return results"
+    );
 
     for r in results {
         let status = r["attributes"]["status"].as_str().unwrap();
@@ -399,7 +404,11 @@ async fn test_bitmap_low_selectivity() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
-    assert_eq!(results.len(), 1, "should return exactly 1 result for priority=42");
+    assert_eq!(
+        results.len(),
+        1,
+        "should return exactly 1 result for priority=42"
+    );
     assert_eq!(results[0]["attributes"]["priority"].as_i64().unwrap(), 42);
 
     cleanup_ns(&harness.store, &ns).await;
@@ -623,10 +632,7 @@ async fn test_bitmap_list_contains() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
-    assert!(
-        !results.is_empty(),
-        "Contains filter should return results"
-    );
+    assert!(!results.is_empty(), "Contains filter should return results");
 
     for r in results {
         let tags = r["attributes"]["tags"].as_array().unwrap();

@@ -67,7 +67,12 @@ pub async fn create_namespace(
     info!(namespace = %req.name, dimensions = req.dimensions, "creating namespace");
     let meta = state
         .namespace_manager
-        .create_with_fts(&req.name, req.dimensions, req.distance_metric, req.full_text_search)
+        .create_with_fts(
+            &req.name,
+            req.dimensions,
+            req.distance_metric,
+            req.full_text_search,
+        )
         .await
         .map_err(ApiError::from)?;
 

@@ -13,7 +13,7 @@
 //! 1. For each subquantizer m, precompute distance from query subvector
 //!    to all K centroids → lookup table of M × K entries.
 //! 2. For each encoded vector, sum M table lookups → approximate distance.
-//! This makes per-vector distance computation O(M) regardless of D.
+//!    This makes per-vector distance computation O(M) regardless of D.
 //!
 //! ## Binary format
 //!
@@ -61,12 +61,7 @@ impl PqCodebook {
     /// * `dim` — Vector dimensionality.
     /// * `m` — Number of subquantizers. Must divide `dim` evenly.
     /// * `kmeans_iters` — Max k-means iterations per subquantizer.
-    pub fn train(
-        vectors: &[&[f32]],
-        dim: usize,
-        m: usize,
-        kmeans_iters: usize,
-    ) -> Result<Self> {
+    pub fn train(vectors: &[&[f32]], dim: usize, m: usize, kmeans_iters: usize) -> Result<Self> {
         if dim == 0 || m == 0 {
             return Err(ZeppelinError::Index("PQ: dim and m must be > 0".into()));
         }

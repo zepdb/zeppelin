@@ -369,8 +369,7 @@ pub async fn build_ivf_flat(
                 let cluster_refs: Vec<&[f32]> =
                     cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
                 let codes = cal.encode_batch(&cluster_refs);
-                let sq_data =
-                    serialize_sq_cluster(&cluster_ids[i], &codes, dim)?;
+                let sq_data = serialize_sq_cluster(&cluster_ids[i], &codes, dim)?;
                 store
                     .put(&sq_cluster_key(namespace, segment_id, i), sq_data)
                     .await?;
@@ -384,8 +383,7 @@ pub async fn build_ivf_flat(
 
             let pq_m = config.pq_m;
             // Train PQ codebook on all vectors.
-            let codebook =
-                PqCodebook::train(&vec_refs, dim, pq_m, config.kmeans_max_iterations)?;
+            let codebook = PqCodebook::train(&vec_refs, dim, pq_m, config.kmeans_max_iterations)?;
             let cb_bytes = codebook.to_bytes();
             store
                 .put(&pq_codebook_key(namespace, segment_id), cb_bytes)
