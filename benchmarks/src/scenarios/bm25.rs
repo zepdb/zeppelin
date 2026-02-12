@@ -32,7 +32,7 @@ pub async fn run(args: &Args, client: &dyn BenchClient) -> Result<serde_json::Va
 
     // Ingest documents
     let n_docs = args.vectors.min(50_000); // Cap BM25 bench at 50K docs
-    let documents = datasets::random_documents(n_docs);
+    let documents = datasets::random_documents(n_docs, args.dimensions);
     eprintln!("  Ingesting {n_docs} documents...");
     for batch in documents.chunks(args.batch_size) {
         client

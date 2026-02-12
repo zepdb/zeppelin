@@ -55,7 +55,10 @@ pub fn random_query(dim: usize) -> Vec<f32> {
 }
 
 /// Generate text documents for BM25 benchmarks.
-pub fn random_documents(n: usize) -> Vec<Vector> {
+///
+/// Documents include random vectors (required by dimension validation) alongside
+/// text content for FTS indexing.
+pub fn random_documents(n: usize, dim: usize) -> Vec<Vector> {
     let mut rng = rand::thread_rng();
 
     let words = [
@@ -79,9 +82,11 @@ pub fn random_documents(n: usize) -> Vec<Vector> {
             let mut attrs = HashMap::new();
             attrs.insert("content".to_string(), serde_json::Value::String(text));
 
+            let values: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
+
             Vector {
                 id: format!("doc-{i}"),
-                values: vec![],  // BM25 doesn't need vectors
+                values,
                 attributes: Some(attrs),
             }
         })
