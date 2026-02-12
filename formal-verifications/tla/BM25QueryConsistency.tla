@@ -15,6 +15,11 @@
 \*   A strong query reads the manifest, then scans both segment and WAL,
 \*   computing BM25 scores. The query must see the correct, consistent view.
 \*
+\*   KEY MODELING INSIGHT: BM25 scores are a property of document CONTENT,
+\*   not storage location. A document has the same score whether it lives
+\*   in WAL or segment. After compaction, WAL docs move to segment but
+\*   their content (and scores) are preserved.
+\*
 \* Code references:
 \*   - src/query.rs: execute_query() reads manifest, scans WAL + segment
 \*   - src/wal/writer.rs: append() adds fragments to WAL
@@ -38,22 +43,16 @@ D4 == 4    \* Update of D2 in WAL (same logical doc, new content)
 AllDocs == {D1, D2, D3, D4}
 InitSegDocs == {D1, D2}        \* Documents in the initial segment
 
-\* BM25-like scores (arbitrary but deterministic)
-\* Segment version scores
-SegScore(d) ==
-    CASE d = D1 -> 10
-      [] d = D2 -> 15
-      [] d = D3 -> 0     \* not in segment
-      [] d = D4 -> 0     \* not in segment
+\* BM25-like scores: canonical score per document content.
+\* These represent the BM25 relevance of each document's content to the
+\* query terms. The score is intrinsic to the content, not the storage layer.
+DocScore(d) ==
+    CASE d = D1 -> 10     \* D1 has some relevance
+      [] d = D2 -> 15     \* D2 original content
+      [] d = D3 -> 20     \* D3 new doc content
+      [] d = D4 -> 18     \* D4 is updated D2 content (different score)
 
-\* WAL version scores (D4 is the updated version of D2)
-WalScore(d) ==
-    CASE d = D1 -> 0      \* D1 tombstone in WAL (deleted)
-      [] d = D2 -> 0      \* D2 not directly in WAL (D4 replaces it)
-      [] d = D3 -> 20     \* new doc in WAL
-      [] d = D4 -> 18     \* updated D2 content in WAL
-
-\* D4 is an update of D2: same logical document
+\* D4 is an update of D2: same logical document, newer version
 UpdatedBy(d) ==
     CASE d = D2 -> D4     \* D2 is superseded by D4
       [] OTHER  -> 0      \* no update relationship
@@ -198,9 +197,12 @@ C_BuildAndWrite ==
 \* Strong Query Protocol
 \*
 \* Step 1: Read manifest (snapshot seg + WAL + deletes)
-\* Step 2: Score segment documents
-\* Step 3: Score WAL documents, merge (WAL overrides segment)
-\* Step 4: Apply deletes, return results
+\* Step 2: Compute scores, merge WAL over segment, apply deletes
+\*
+\* The score of a document is determined by its content (DocScore),
+\* regardless of whether it resides in segment or WAL. When a WAL doc
+\* supersedes a segment doc (D4 updates D2), the superseded doc is
+\* excluded and the new version's score is used.
 \* ==========================================================================
 
 Q_ReadManifest ==
@@ -219,19 +221,20 @@ Q_ReadManifest ==
 Q_ScoreAndMerge ==
     /\ q_pc = "scoring"
     /\ LET
-        \* Start with segment docs and their scores
-        seg_scored == {<<d, SegScore(d)>> : d \in q_snap_seg}
-        \* WAL docs with their scores
-        wal_scored == {<<d, WalScore(d)>> : d \in q_snap_wal}
-        \* For docs in both WAL and segment, WAL version wins
-        \* D4 in WAL supersedes D2 in segment (HasUpdate relationship)
-        \* Effective segment results: remove docs that have WAL updates
-        effective_seg == {<<d, SegScore(d)>> : d \in q_snap_seg
-                          \ (q_snap_del \union {d2 \in q_snap_seg : HasUpdate(d2) /\ UpdatedBy(d2) \in q_snap_wal})}
-        \* Merge: effective_seg UNION wal_scored
-        merged == effective_seg \union wal_scored
-        \* Remove deleted docs
-        final == {pair \in merged : pair[1] \notin q_snap_del /\ pair[2] > 0}
+        \* Segment docs that are NOT deleted and NOT superseded by a WAL update
+        effective_seg_ids == {d \in q_snap_seg :
+                              /\ d \notin q_snap_del
+                              /\ ~(HasUpdate(d) /\ UpdatedBy(d) \in q_snap_wal)}
+        \* Score effective segment docs
+        seg_scored == {<<d, DocScore(d)>> : d \in effective_seg_ids}
+        \* WAL docs that are NOT deleted
+        effective_wal_ids == {d \in q_snap_wal : d \notin q_snap_del}
+        \* Score WAL docs
+        wal_scored == {<<d, DocScore(d)>> : d \in effective_wal_ids}
+        \* Merge: segment + WAL (no overlap due to effective_seg filtering)
+        merged == seg_scored \union wal_scored
+        \* Remove zero-score entries (irrelevant docs)
+        final == {pair \in merged : pair[2] > 0}
        IN
         q_results' = final
     /\ q_pc' = "done"
@@ -274,8 +277,8 @@ LiveDocsInSnapshot ==
         seg_live == {d \in q_snap_seg :
                       /\ d \notin q_snap_del
                       /\ ~(HasUpdate(d) /\ UpdatedBy(d) \in q_snap_wal)}
-        \* WAL docs minus those deleted and with positive score
-        wal_live == {d \in q_snap_wal : d \notin q_snap_del /\ WalScore(d) > 0}
+        \* WAL docs minus those deleted
+        wal_live == {d \in q_snap_wal : d \notin q_snap_del}
     IN seg_live \union wal_live
 
 \* Doc IDs that appear in the query result set
@@ -297,17 +300,16 @@ TypeOK ==
     /\ q_pc \in {"idle", "scoring", "done"}
 
 \* INVARIANT 2: A document committed before the query's manifest read
-\* must appear in the query results (if not deleted).
-\* Specifically: if doc d was committed AND present in the manifest
-\* the query read, AND not deleted, it must be in results.
+\* must appear in the query results (if not deleted and has positive score).
+\* Specifically: every live doc in the snapshot must appear in results.
 QueryNeverMissesCommittedDoc ==
     q_pc = "done" =>
         \A d \in LiveDocsInSnapshot :
-            d \in ResultDocIds
+            DocScore(d) > 0 => d \in ResultDocIds
 
 \* INVARIANT 3: WAL overrides segment on merge.
 \* If D2 is in segment and D4 (its WAL update) is in WAL snapshot,
-\* then D2's segment score must NOT appear in results.
+\* then D2's segment score must NOT appear in results — D4 replaces it.
 WalSegmentMergeCorrectness ==
     (q_pc = "done" /\ D2 \in q_snap_seg /\ D4 \in q_snap_wal) =>
         ~(\E pair \in q_results : pair[1] = D2)
