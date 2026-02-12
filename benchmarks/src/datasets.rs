@@ -91,6 +91,7 @@ pub fn random_documents(n: usize) -> Vec<Vector> {
 /// Load SIFT1M dataset from fvecs format.
 ///
 /// File format: for each vector, [dim: u32][f32 * dim].
+#[allow(dead_code)]
 pub fn load_fvecs(path: &str, max_vectors: usize) -> Result<Vec<Vec<f32>>, String> {
     use std::io::Read;
 

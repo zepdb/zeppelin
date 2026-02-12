@@ -28,6 +28,7 @@ pub struct QueryRequest {
 
 /// Search result entry.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SearchResult {
     pub id: String,
     pub score: f32,
@@ -35,6 +36,7 @@ pub struct SearchResult {
 
 /// Query response.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct QueryResponse {
     pub results: Vec<SearchResult>,
 }
@@ -59,6 +61,7 @@ pub trait BenchClient: Send + Sync {
 
     async fn delete_namespace(&self, name: &str) -> Result<(), String>;
 
+    #[allow(dead_code)]
     fn name(&self) -> &str;
 }
 

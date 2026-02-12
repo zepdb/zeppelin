@@ -65,7 +65,7 @@ pub async fn run(args: &Args, client: &dyn BenchClient) -> Result<serde_json::Va
             }
         }
 
-        let qps = n_queries as f64 / hist.mean() * 1_000_000.0 / n_queries as f64;
+        let _qps = n_queries as f64 / hist.mean() * 1_000_000.0 / n_queries as f64;
 
         eprintln!(
             "    scale={scale}: ingest={ingest_vps:.0} vps, query p50={:.1}ms p99={:.1}ms",
