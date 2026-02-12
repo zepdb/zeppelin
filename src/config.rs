@@ -561,6 +561,22 @@ impl Config {
         if let Ok(v) = std::env::var("ZEPPELIN_FTS_INDEX") {
             self.indexing.fts_index = v == "true";
         }
+        // Hierarchical indexing
+        if let Ok(v) = std::env::var("ZEPPELIN_HIERARCHICAL") {
+            self.indexing.hierarchical = v == "true";
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_BEAM_WIDTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.indexing.beam_width = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_LEAF_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.indexing.leaf_size = Some(v);
+        }
 
         // Compaction
         if let Some(v) = std::env::var("ZEPPELIN_COMPACTION_INTERVAL_SECS")
