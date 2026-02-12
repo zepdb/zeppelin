@@ -85,23 +85,25 @@ impl SqCalibration {
     #[inline]
     pub fn encode(&self, vector: &[f32]) -> Vec<u8> {
         debug_assert_eq!(vector.len(), self.dim);
-        let mut codes = Vec::with_capacity(self.dim);
-        for d in 0..self.dim {
-            let val = (vector[d] - self.mins[d]) * self.inv_scales[d];
-            codes.push(val.clamp(0.0, 255.0) as u8);
-        }
-        codes
+        vector
+            .iter()
+            .enumerate()
+            .map(|(d, &v)| {
+                let val = (v - self.mins[d]) * self.inv_scales[d];
+                val.clamp(0.0, 255.0) as u8
+            })
+            .collect()
     }
 
     /// Decode u8 codes back to approximate f32 vector.
     #[inline]
     pub fn decode(&self, codes: &[u8]) -> Vec<f32> {
         debug_assert_eq!(codes.len(), self.dim);
-        let mut vector = Vec::with_capacity(self.dim);
-        for d in 0..self.dim {
-            vector.push(self.mins[d] + codes[d] as f32 * self.scales[d]);
-        }
-        vector
+        codes
+            .iter()
+            .enumerate()
+            .map(|(d, &c)| self.mins[d] + c as f32 * self.scales[d])
+            .collect()
     }
 
     /// Encode a batch of vectors.
@@ -118,13 +120,16 @@ impl SqCalibration {
     pub fn asymmetric_l2_squared(&self, query: &[f32], codes: &[u8]) -> f32 {
         debug_assert_eq!(query.len(), self.dim);
         debug_assert_eq!(codes.len(), self.dim);
-        let mut sum = 0.0f32;
-        for d in 0..self.dim {
-            let reconstructed = self.mins[d] + codes[d] as f32 * self.scales[d];
-            let diff = query[d] - reconstructed;
-            sum += diff * diff;
-        }
-        sum
+        query
+            .iter()
+            .zip(codes.iter())
+            .enumerate()
+            .map(|(d, (&q, &c))| {
+                let reconstructed = self.mins[d] + c as f32 * self.scales[d];
+                let diff = q - reconstructed;
+                diff * diff
+            })
+            .sum()
     }
 
     /// Compute approximate dot product distance between a query (f32) and
@@ -135,11 +140,15 @@ impl SqCalibration {
     pub fn asymmetric_dot_product(&self, query: &[f32], codes: &[u8]) -> f32 {
         debug_assert_eq!(query.len(), self.dim);
         debug_assert_eq!(codes.len(), self.dim);
-        let mut dot = 0.0f32;
-        for d in 0..self.dim {
-            let reconstructed = self.mins[d] + codes[d] as f32 * self.scales[d];
-            dot += query[d] * reconstructed;
-        }
+        let dot: f32 = query
+            .iter()
+            .zip(codes.iter())
+            .enumerate()
+            .map(|(d, (&q, &c))| {
+                let reconstructed = self.mins[d] + c as f32 * self.scales[d];
+                q * reconstructed
+            })
+            .sum();
         -dot
     }
 
@@ -149,15 +158,17 @@ impl SqCalibration {
     pub fn asymmetric_cosine(&self, query: &[f32], codes: &[u8]) -> f32 {
         debug_assert_eq!(query.len(), self.dim);
         debug_assert_eq!(codes.len(), self.dim);
-        let mut dot = 0.0f32;
-        let mut norm_q = 0.0f32;
-        let mut norm_c = 0.0f32;
-        for d in 0..self.dim {
-            let reconstructed = self.mins[d] + codes[d] as f32 * self.scales[d];
-            dot += query[d] * reconstructed;
-            norm_q += query[d] * query[d];
-            norm_c += reconstructed * reconstructed;
-        }
+        let (dot, norm_q, norm_c) = query.iter().zip(codes.iter()).enumerate().fold(
+            (0.0f32, 0.0f32, 0.0f32),
+            |(dot, nq, nc), (d, (&q, &c))| {
+                let reconstructed = self.mins[d] + c as f32 * self.scales[d];
+                (
+                    dot + q * reconstructed,
+                    nq + q * q,
+                    nc + reconstructed * reconstructed,
+                )
+            },
+        );
         let denom = (norm_q * norm_c).sqrt();
         if denom < f32::EPSILON {
             return 1.0;
@@ -196,9 +207,7 @@ impl SqCalibration {
     /// Deserialize calibration parameters from binary format.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < 4 {
-            return Err(ZeppelinError::Index(
-                "SQ calibration blob too small".into(),
-            ));
+            return Err(ZeppelinError::Index("SQ calibration blob too small".into()));
         }
         let dim = u32::from_le_bytes(
             data[0..4]
@@ -394,7 +403,10 @@ mod tests {
             // Should be close to original (within quantization error).
             for (orig, dec) in vec.iter().zip(decoded.iter()) {
                 let error = (orig - dec).abs();
-                let range = cal.maxs[0].max(cal.maxs[1]).max(cal.maxs[2]).max(cal.maxs[3]);
+                let range = cal.maxs[0]
+                    .max(cal.maxs[1])
+                    .max(cal.maxs[2])
+                    .max(cal.maxs[3]);
                 // Max quantization error is range / 255 per dimension.
                 assert!(
                     error < range / 255.0 + 0.01,
@@ -491,7 +503,7 @@ mod tests {
     fn test_calibration_from_bytes_truncated() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&4u32.to_le_bytes()); // dim = 4
-        // Only provide 2 min/max pairs instead of 4.
+                                                    // Only provide 2 min/max pairs instead of 4.
         for _ in 0..2 {
             buf.extend_from_slice(&0.0f32.to_le_bytes());
             buf.extend_from_slice(&1.0f32.to_le_bytes());

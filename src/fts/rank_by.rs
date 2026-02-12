@@ -18,19 +18,13 @@ use crate::error::{Result, ZeppelinError};
 #[derive(Debug, Clone, PartialEq)]
 pub enum RankBy {
     /// Single-field BM25: `["field", "BM25", "query"]`
-    Bm25 {
-        field: String,
-        query: String,
-    },
+    Bm25 { field: String, query: String },
     /// Sum of multiple expressions: `["Sum", [...exprs]]`
     Sum(Vec<RankBy>),
     /// Max of multiple expressions: `["Max", [...exprs]]`
     Max(Vec<RankBy>),
     /// Weighted expression: `["Product", weight, expr]`
-    Product {
-        weight: f32,
-        expr: Box<RankBy>,
-    },
+    Product { weight: f32, expr: Box<RankBy> },
 }
 
 impl RankBy {
@@ -60,8 +54,7 @@ impl RankBy {
                 let exprs = arr[1].as_array().ok_or_else(|| {
                     ZeppelinError::Validation("Sum argument must be an array".into())
                 })?;
-                let parsed: Result<Vec<RankBy>> =
-                    exprs.iter().map(RankBy::from_value).collect();
+                let parsed: Result<Vec<RankBy>> = exprs.iter().map(RankBy::from_value).collect();
                 Ok(RankBy::Sum(parsed?))
             }
             "Max" | "max" => {
@@ -73,8 +66,7 @@ impl RankBy {
                 let exprs = arr[1].as_array().ok_or_else(|| {
                     ZeppelinError::Validation("Max argument must be an array".into())
                 })?;
-                let parsed: Result<Vec<RankBy>> =
-                    exprs.iter().map(RankBy::from_value).collect();
+                let parsed: Result<Vec<RankBy>> = exprs.iter().map(RankBy::from_value).collect();
                 Ok(RankBy::Max(parsed?))
             }
             "Product" | "product" => {
@@ -83,12 +75,9 @@ impl RankBy {
                         "Product requires exactly two arguments (weight, expression)".into(),
                     ));
                 }
-                let weight = arr[1]
-                    .as_f64()
-                    .ok_or_else(|| {
-                        ZeppelinError::Validation("Product weight must be a number".into())
-                    })?
-                    as f32;
+                let weight = arr[1].as_f64().ok_or_else(|| {
+                    ZeppelinError::Validation("Product weight must be a number".into())
+                })? as f32;
                 let expr = RankBy::from_value(&arr[2])?;
                 Ok(RankBy::Product {
                     weight,
@@ -230,8 +219,7 @@ mod tests {
 
     #[test]
     fn test_parse_sum_multi_field() {
-        let json =
-            serde_json::json!(["Sum", [["title", "BM25", "q"], ["content", "BM25", "q"]]]);
+        let json = serde_json::json!(["Sum", [["title", "BM25", "q"], ["content", "BM25", "q"]]]);
         let rank_by = RankBy::from_value(&json).unwrap();
         match rank_by {
             RankBy::Sum(exprs) => {
@@ -262,12 +250,13 @@ mod tests {
 
     #[test]
     fn test_parse_nested() {
-        let json = serde_json::json!(
-            ["Sum", [
+        let json = serde_json::json!([
+            "Sum",
+            [
                 ["Product", 2.0, ["title", "BM25", "q"]],
                 ["content", "BM25", "q"]
-            ]]
-        );
+            ]
+        ]);
         let rank_by = RankBy::from_value(&json).unwrap();
         match rank_by {
             RankBy::Sum(exprs) => {

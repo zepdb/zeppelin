@@ -296,7 +296,11 @@ impl Compactor {
             (index.num_clusters(), false, bf)
         };
         let build_elapsed = build_start.elapsed();
-        let index_type_label = if is_hierarchical { "hierarchical" } else { "ivf_flat" };
+        let index_type_label = if is_hierarchical {
+            "hierarchical"
+        } else {
+            "ivf_flat"
+        };
         crate::metrics::INDEX_BUILD_DURATION
             .with_label_values(&[namespace, index_type_label])
             .observe(build_elapsed.as_secs_f64());

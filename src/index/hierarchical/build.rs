@@ -13,9 +13,7 @@ use ulid::Ulid;
 use crate::config::IndexingConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::index::distance;
-use crate::index::ivf_flat::build::{
-    attrs_key, cluster_key, serialize_attrs, serialize_cluster,
-};
+use crate::index::ivf_flat::build::{attrs_key, cluster_key, serialize_attrs, serialize_cluster};
 use crate::index::ivf_flat::kmeans::train_kmeans;
 use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
@@ -77,12 +75,7 @@ pub async fn build_hierarchical(
 
     info!(
         n = vectors.len(),
-        dim,
-        branching_factor,
-        leaf_size,
-        namespace,
-        segment_id,
-        "building hierarchical ANN index"
+        dim, branching_factor, leaf_size, namespace, segment_id, "building hierarchical ANN index"
     );
 
     // Mutable counter for assigning global leaf cluster indexes.
@@ -126,7 +119,10 @@ pub async fn build_hierarchical(
         }
     };
 
-    info!(num_leaf_clusters = next_cluster_idx, "hierarchical tree partitioning complete");
+    info!(
+        num_leaf_clusters = next_cluster_idx,
+        "hierarchical tree partitioning complete"
+    );
 
     // Write quantized artifacts if configured.
     write_quantized_artifacts(
@@ -214,7 +210,16 @@ async fn build_subtree(
             *max_depth = depth;
         }
 
-        write_leaf_cluster(vectors, dim, cluster_idx, store, namespace, segment_id, config.bitmap_index).await?;
+        write_leaf_cluster(
+            vectors,
+            dim,
+            cluster_idx,
+            store,
+            namespace,
+            segment_id,
+            config.bitmap_index,
+        )
+        .await?;
 
         debug!(
             cluster_idx,
@@ -383,18 +388,14 @@ async fn write_quantized_artifacts(
             let vec_refs: Vec<&[f32]> = vectors.iter().map(|v| v.values.as_slice()).collect();
             let cal = SqCalibration::calibrate(&vec_refs, dim);
             store
-                .put(
-                    &sq_calibration_key(namespace, segment_id),
-                    cal.to_bytes(),
-                )
+                .put(&sq_calibration_key(namespace, segment_id), cal.to_bytes())
                 .await?;
             debug!("wrote SQ8 calibration");
 
             // Re-read each leaf cluster and write quantized version.
             for i in 0..num_clusters {
                 let cluster_data = store.get(&cluster_key(namespace, segment_id, i)).await?;
-                let cluster =
-                    crate::index::ivf_flat::build::deserialize_cluster(&cluster_data)?;
+                let cluster = crate::index::ivf_flat::build::deserialize_cluster(&cluster_data)?;
                 let cluster_refs: Vec<&[f32]> =
                     cluster.vectors.iter().map(|v| v.as_slice()).collect();
                 let codes = cal.encode_batch(&cluster_refs);
@@ -414,17 +415,13 @@ async fn write_quantized_artifacts(
             let codebook =
                 PqCodebook::train(&vec_refs, dim, config.pq_m, config.kmeans_max_iterations)?;
             store
-                .put(
-                    &pq_codebook_key(namespace, segment_id),
-                    codebook.to_bytes(),
-                )
+                .put(&pq_codebook_key(namespace, segment_id), codebook.to_bytes())
                 .await?;
             debug!(m = config.pq_m, "wrote PQ codebook");
 
             for i in 0..num_clusters {
                 let cluster_data = store.get(&cluster_key(namespace, segment_id, i)).await?;
-                let cluster =
-                    crate::index::ivf_flat::build::deserialize_cluster(&cluster_data)?;
+                let cluster = crate::index::ivf_flat::build::deserialize_cluster(&cluster_data)?;
                 let cluster_refs: Vec<&[f32]> =
                     cluster.vectors.iter().map(|v| v.as_slice()).collect();
                 let codes = codebook.encode_batch(&cluster_refs);
@@ -433,7 +430,10 @@ async fn write_quantized_artifacts(
                     .put(&pq_cluster_key(namespace, segment_id, i), pq_data)
                     .await?;
             }
-            info!(m = config.pq_m, "wrote PQ-encoded clusters for hierarchical index");
+            info!(
+                m = config.pq_m,
+                "wrote PQ-encoded clusters for hierarchical index"
+            );
         }
         QuantizationType::None => {}
     }

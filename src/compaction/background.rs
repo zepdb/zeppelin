@@ -42,7 +42,10 @@ pub async fn compaction_loop(
             match compactor.should_compact(&ns.name).await {
                 Ok(true) => {
                     info!(namespace = %ns.name, "triggering compaction");
-                    match compactor.compact_with_fts(&ns.name, None, &ns.full_text_search).await {
+                    match compactor
+                        .compact_with_fts(&ns.name, None, &ns.full_text_search)
+                        .await
+                    {
                         Ok(result) => {
                             crate::metrics::COMPACTIONS_TOTAL
                                 .with_label_values(&[&ns.name, "success"])

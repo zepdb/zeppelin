@@ -98,10 +98,7 @@ async fn test_stress_concurrent_writers_same_namespace() {
         })
         .collect();
 
-    join_all(handles)
-        .await
-        .into_iter()
-        .for_each(|r| r.unwrap());
+    join_all(handles).await.into_iter().for_each(|r| r.unwrap());
 
     // Query to verify vectors are queryable
     let query_vec: Vec<f32> = (0..16).map(|_| 0.5).collect();
@@ -648,9 +645,7 @@ async fn test_stress_concurrent_upsert_and_delete() {
     }
 
     // Verify some new vectors are present
-    let new_ids_present = result_ids
-        .iter()
-        .any(|id| id.starts_with("new_"));
+    let new_ids_present = result_ids.iter().any(|id| id.starts_with("new_"));
     assert!(new_ids_present, "expected some new vectors in results");
 
     let elapsed = start.elapsed();

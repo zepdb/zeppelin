@@ -78,10 +78,9 @@ fn create_stemmer(language: FtsLanguage) -> Stemmer {
 /// Only true function words: articles, prepositions, conjunctions,
 /// pronouns, auxiliaries. No content words that users would search for.
 static ENGLISH_STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in",
-    "into", "is", "it", "no", "not", "of", "on", "or", "such", "that", "the",
-    "their", "then", "there", "these", "they", "this", "to", "was", "will",
-    "with",
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
+    "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
+    "they", "this", "to", "was", "will", "with",
 ];
 
 lazy_static::lazy_static! {
@@ -184,7 +183,9 @@ mod tests {
         let mut config = default_config();
         config.case_sensitive = true;
         let tokens = tokenize_text("Hello WORLD", &config, false);
-        assert!(tokens.iter().any(|t| t.starts_with('H') || t.starts_with('W')));
+        assert!(tokens
+            .iter()
+            .any(|t| t.starts_with('H') || t.starts_with('W')));
     }
 
     #[test]
@@ -199,7 +200,9 @@ mod tests {
     fn test_stopwords_are_sane() {
         // Content words should NOT be removed as stopwords
         let config = default_config();
-        for word in &["hello", "world", "computer", "system", "help", "run", "work", "quick"] {
+        for word in &[
+            "hello", "world", "computer", "system", "help", "run", "work", "quick",
+        ] {
             let tokens = tokenize_text(word, &config, false);
             assert!(
                 !tokens.is_empty(),

@@ -195,9 +195,7 @@ impl InvertedIndex {
     /// Deserialize from bytes, validating magic header.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < 5 {
-            return Err(ZeppelinError::Index(
-                "FTS index data too short".to_string(),
-            ));
+            return Err(ZeppelinError::Index("FTS index data too short".to_string()));
         }
         if &data[0..4] != ZFTS_MAGIC {
             return Err(ZeppelinError::Index(format!(
@@ -466,11 +464,14 @@ mod tests {
 
     fn make_config() -> HashMap<String, FtsFieldConfig> {
         let mut configs = HashMap::new();
-        configs.insert("content".to_string(), FtsFieldConfig {
-            stemming: false,
-            remove_stopwords: false,
-            ..Default::default()
-        });
+        configs.insert(
+            "content".to_string(),
+            FtsFieldConfig {
+                stemming: false,
+                remove_stopwords: false,
+                ..Default::default()
+            },
+        );
         configs
     }
 
@@ -479,10 +480,7 @@ mod tests {
             .iter()
             .map(|t| {
                 let mut m = HashMap::new();
-                m.insert(
-                    "content".to_string(),
-                    AttributeValue::String(t.to_string()),
-                );
+                m.insert("content".to_string(), AttributeValue::String(t.to_string()));
                 Some(m)
             })
             .collect()
@@ -513,21 +511,33 @@ mod tests {
     #[test]
     fn test_build_multiple_fields() {
         let mut configs = HashMap::new();
-        configs.insert("title".to_string(), FtsFieldConfig {
-            stemming: false,
-            remove_stopwords: false,
-            ..Default::default()
-        });
-        configs.insert("body".to_string(), FtsFieldConfig {
-            stemming: false,
-            remove_stopwords: false,
-            ..Default::default()
-        });
+        configs.insert(
+            "title".to_string(),
+            FtsFieldConfig {
+                stemming: false,
+                remove_stopwords: false,
+                ..Default::default()
+            },
+        );
+        configs.insert(
+            "body".to_string(),
+            FtsFieldConfig {
+                stemming: false,
+                remove_stopwords: false,
+                ..Default::default()
+            },
+        );
 
         let attrs: Vec<Option<HashMap<String, AttributeValue>>> = vec![{
             let mut m = HashMap::new();
-            m.insert("title".to_string(), AttributeValue::String("hello".to_string()));
-            m.insert("body".to_string(), AttributeValue::String("world of code".to_string()));
+            m.insert(
+                "title".to_string(),
+                AttributeValue::String("hello".to_string()),
+            );
+            m.insert(
+                "body".to_string(),
+                AttributeValue::String("world of code".to_string()),
+            );
             Some(m)
         }];
         let attr_refs: Vec<Option<&HashMap<String, AttributeValue>>> =

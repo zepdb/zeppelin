@@ -100,12 +100,7 @@ async fn create_fts_namespace(
 }
 
 /// Upsert vectors via the HTTP API.
-async fn upsert_docs(
-    client: &reqwest::Client,
-    base_url: &str,
-    ns: &str,
-    vectors: &[VectorEntry],
-) {
+async fn upsert_docs(client: &reqwest::Client, base_url: &str, ns: &str, vectors: &[VectorEntry]) {
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({ "vectors": vectors }))
@@ -215,11 +210,20 @@ async fn test_fts_wal_scan_basic() {
 
     let ids = result_ids(&body);
     // "rust" appears in doc1 and doc4; "programming" appears in doc1, doc2, doc4
-    assert!(!ids.is_empty(), "should return results for 'rust programming'");
+    assert!(
+        !ids.is_empty(),
+        "should return results for 'rust programming'"
+    );
     assert!(ids.contains(&"doc1".to_string()), "doc1 should match");
     assert!(ids.contains(&"doc4".to_string()), "doc4 should match");
-    assert!(!ids.contains(&"doc3".to_string()), "doc3 (cooking) should not match");
-    assert!(!ids.contains(&"doc5".to_string()), "doc5 (weather) should not match");
+    assert!(
+        !ids.contains(&"doc3".to_string()),
+        "doc3 (cooking) should not match"
+    );
+    assert!(
+        !ids.contains(&"doc5".to_string()),
+        "doc5 (weather) should not match"
+    );
 
     // Verify scores are positive and ordered descending
     let results = body["results"].as_array().unwrap();
@@ -321,13 +325,28 @@ async fn test_fts_segment_search_after_compaction() {
 
     let docs = vec![
         content_doc("doc1", "Rust programming language is fast and memory safe"),
-        content_doc("doc2", "Python programming language is interpreted and dynamic"),
+        content_doc(
+            "doc2",
+            "Python programming language is interpreted and dynamic",
+        ),
         content_doc("doc3", "Java programming language runs on the JVM"),
-        content_doc("doc4", "Cooking delicious Italian pasta requires fresh ingredients"),
-        content_doc("doc5", "Rust compiler ensures memory safety without garbage collection"),
-        content_doc("doc6", "Go programming language is designed for concurrency"),
+        content_doc(
+            "doc4",
+            "Cooking delicious Italian pasta requires fresh ingredients",
+        ),
+        content_doc(
+            "doc5",
+            "Rust compiler ensures memory safety without garbage collection",
+        ),
+        content_doc(
+            "doc6",
+            "Go programming language is designed for concurrency",
+        ),
         content_doc("doc7", "JavaScript runs in web browsers and Node"),
-        content_doc("doc8", "Rust ownership model prevents data races at compile time"),
+        content_doc(
+            "doc8",
+            "Rust ownership model prevents data races at compile time",
+        ),
     ];
     upsert_docs(&client, &base_url, &ns, &docs).await;
 
@@ -464,8 +483,14 @@ async fn test_fts_strong_consistency_wal_plus_segment() {
         "strong query should find segment docs about Rust"
     );
     // Non-matching docs should be absent
-    assert!(!ids.contains(&"seg3".to_string()), "cooking doc should not match");
-    assert!(!ids.contains(&"wal2".to_string()), "baking doc should not match");
+    assert!(
+        !ids.contains(&"seg3".to_string()),
+        "cooking doc should not match"
+    );
+    assert!(
+        !ids.contains(&"wal2".to_string()),
+        "baking doc should not match"
+    );
 
     // Both WAL and segment should have been scanned
     assert!(
@@ -586,9 +611,21 @@ async fn test_fts_multi_field_sum() {
     // docD: no "rust" at all
     let docs = vec![
         title_content_doc("docA", "Rust Language", "Rust is fast and safe programming"),
-        title_content_doc("docB", "Systems Overview", "Rust gives memory safety guarantees"),
-        title_content_doc("docC", "Rust Guide", "A comprehensive guide to systems programming"),
-        title_content_doc("docD", "Cooking Tips", "How to make delicious Italian pasta"),
+        title_content_doc(
+            "docB",
+            "Systems Overview",
+            "Rust gives memory safety guarantees",
+        ),
+        title_content_doc(
+            "docC",
+            "Rust Guide",
+            "A comprehensive guide to systems programming",
+        ),
+        title_content_doc(
+            "docD",
+            "Cooking Tips",
+            "How to make delicious Italian pasta",
+        ),
     ];
     upsert_docs(&client, &base_url, &ns, &docs).await;
 
@@ -612,7 +649,10 @@ async fn test_fts_multi_field_sum() {
     assert!(!ids.is_empty(), "Sum query should return results");
 
     // docA has "rust" in both fields — should rank first
-    assert_eq!(ids[0], "docA", "docA should rank first with 'rust' in both fields");
+    assert_eq!(
+        ids[0], "docA",
+        "docA should rank first with 'rust' in both fields"
+    );
 
     // docD (no rust) should not appear
     assert!(
@@ -621,8 +661,14 @@ async fn test_fts_multi_field_sum() {
     );
 
     // docB and docC should appear (rust in one field each)
-    assert!(ids.contains(&"docB".to_string()), "docB should match (rust in content)");
-    assert!(ids.contains(&"docC".to_string()), "docC should match (rust in title)");
+    assert!(
+        ids.contains(&"docB".to_string()),
+        "docB should match (rust in content)"
+    );
+    assert!(
+        ids.contains(&"docC".to_string()),
+        "docC should match (rust in title)"
+    );
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;

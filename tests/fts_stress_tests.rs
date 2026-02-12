@@ -163,7 +163,9 @@ async fn test_fts_stress_large_batch() {
         .unwrap();
 
     // Build 500 vectors with varied text content
-    let words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"];
+    let words = [
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+    ];
     let vectors: Vec<serde_json::Value> = (0..500)
         .map(|i| {
             let content = format!(
@@ -215,7 +217,11 @@ async fn test_fts_stress_large_batch() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
     // alpha appears at indices 0, 8, 16, ... = 63 docs
-    assert!(results.len() >= 50, "expected ~63 results, got {}", results.len());
+    assert!(
+        results.len() >= 50,
+        "expected ~63 results, got {}",
+        results.len()
+    );
 
     cleanup_ns(&harness.store, &ns).await;
 }

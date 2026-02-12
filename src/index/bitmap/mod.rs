@@ -122,20 +122,16 @@ impl ClusterBitmapIndex {
             ));
         }
         if &data[0..4] != BITMAP_MAGIC {
-            return Err(crate::error::ZeppelinError::Index(
-                format!(
-                    "invalid bitmap magic: expected ZBMP, got {:?}",
-                    &data[0..4]
-                ),
-            ));
+            return Err(crate::error::ZeppelinError::Index(format!(
+                "invalid bitmap magic: expected ZBMP, got {:?}",
+                &data[0..4]
+            )));
         }
         if data[4] != BITMAP_VERSION {
-            return Err(crate::error::ZeppelinError::Index(
-                format!(
-                    "unsupported bitmap version: expected {}, got {}",
-                    BITMAP_VERSION, data[4]
-                ),
-            ));
+            return Err(crate::error::ZeppelinError::Index(format!(
+                "unsupported bitmap version: expected {}, got {}",
+                BITMAP_VERSION, data[4]
+            )));
         }
         let index: Self = serde_json::from_slice(&data[5..])?;
         tracing::debug!(
@@ -187,8 +183,16 @@ mod tests {
         assert_eq!(recovered.fields.len(), 1);
         let color = recovered.fields.get("color").unwrap();
         assert_eq!(color.present.len(), 3);
-        assert!(color.values.get(&BitmapKey("s:red".to_string())).unwrap().contains(0));
-        assert!(color.values.get(&BitmapKey("s:red".to_string())).unwrap().contains(2));
+        assert!(color
+            .values
+            .get(&BitmapKey("s:red".to_string()))
+            .unwrap()
+            .contains(0));
+        assert!(color
+            .values
+            .get(&BitmapKey("s:red".to_string()))
+            .unwrap()
+            .contains(2));
     }
 
     #[test]

@@ -141,11 +141,11 @@ async fn test_e2e_write_compact_query_lifecycle() {
     let total_elapsed = total_start.elapsed();
     eprintln!("[PERF] write_compact_query_lifecycle:");
     eprintln!("  write (500 vecs):   {:.3}s", write_elapsed.as_secs_f64());
-    eprintln!("  compact:            {:.3}s", compact_elapsed.as_secs_f64());
     eprintln!(
-        "  strong query:       {:.3}s",
-        strong_elapsed.as_secs_f64()
+        "  compact:            {:.3}s",
+        compact_elapsed.as_secs_f64()
     );
+    eprintln!("  strong query:       {:.3}s", strong_elapsed.as_secs_f64());
     eprintln!(
         "  eventual query:     {:.3}s",
         eventual_elapsed.as_secs_f64()
@@ -247,10 +247,7 @@ async fn test_e2e_background_compaction_triggers() {
 
     let total_elapsed = total_start.elapsed();
     eprintln!("[PERF] background_compaction_triggers:");
-    eprintln!(
-        "  time-to-compaction: {:.3}s",
-        poll_elapsed.as_secs_f64()
-    );
+    eprintln!("  time-to-compaction: {:.3}s", poll_elapsed.as_secs_f64());
     eprintln!("  total:              {:.3}s", total_elapsed.as_secs_f64());
 
     // Shutdown background loop
@@ -351,10 +348,7 @@ async fn test_e2e_incremental_compaction() {
     assert_eq!(body["results"][0]["id"], "batch2_vec_0");
 
     // Verify manifest: 1 active segment, no stale fragments
-    let manifest = Manifest::read(&harness.store, &ns)
-        .await
-        .unwrap()
-        .unwrap();
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     assert!(manifest.active_segment.is_some());
     assert!(
         manifest.uncompacted_fragments().is_empty(),

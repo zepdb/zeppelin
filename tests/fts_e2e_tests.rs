@@ -480,7 +480,11 @@ async fn test_fts_e2e_stemming() {
         .unwrap();
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
-    assert_eq!(results.len(), 2, "stemming: 'running' matches 'running' and 'runs' (both stem to 'run')");
+    assert_eq!(
+        results.len(),
+        2,
+        "stemming: 'running' matches 'running' and 'runs' (both stem to 'run')"
+    );
 
     cleanup_ns(&harness.store, &ns).await;
 }

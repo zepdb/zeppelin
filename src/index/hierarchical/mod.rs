@@ -200,11 +200,7 @@ impl HierarchicalIndex {
     }
 
     /// Load an existing hierarchical index from S3 (metadata only).
-    pub async fn load(
-        store: &ZeppelinStore,
-        namespace: &str,
-        segment_id: &str,
-    ) -> Result<Self> {
+    pub async fn load(store: &ZeppelinStore, namespace: &str, segment_id: &str) -> Result<Self> {
         build::load_hierarchical(store, namespace, segment_id).await
     }
 }

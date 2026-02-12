@@ -227,9 +227,6 @@ mod tests {
             }
         }
         // f16 has ~3 decimal digits of precision for numbers in [-1, 1].
-        assert!(
-            max_error < 0.001,
-            "max f16 roundtrip error: {max_error}"
-        );
+        assert!(max_error < 0.001, "max f16 roundtrip error: {max_error}");
     }
 }
