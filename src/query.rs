@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tracing::{debug, instrument};
 
+use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
 use crate::error::Result;
 use crate::fts::bm25::Bm25Params;
@@ -35,6 +36,7 @@ pub struct QueryParams<'a> {
     pub distance_metric: DistanceMetric,
     pub oversample_factor: usize,
     pub cache: Option<&'a Arc<DiskCache>>,
+    pub manifest_cache: Option<&'a Arc<ManifestCache>>,
 }
 
 /// Execute a query against a namespace, combining WAL scan and segment search.
@@ -52,8 +54,12 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         distance_metric,
         oversample_factor,
         cache,
+        manifest_cache,
     } = params;
-    let manifest = Manifest::read(store, namespace).await?.unwrap_or_default();
+    let manifest = match manifest_cache {
+        Some(mc) => mc.get(store, namespace).await?,
+        None => Manifest::read(store, namespace).await?.unwrap_or_default(),
+    };
 
     let mut scanned_fragments = 0;
     let mut scanned_segments = 0;
@@ -295,7 +301,7 @@ async fn segment_search(
 ///
 /// Combines WAL brute-force scan with segment inverted index search.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(store, wal_reader, rank_by, fts_configs, filter), fields(namespace = namespace))]
+#[instrument(skip(store, wal_reader, rank_by, fts_configs, filter, manifest_cache), fields(namespace = namespace))]
 pub async fn execute_bm25_query(
     store: &ZeppelinStore,
     wal_reader: &WalReader,
@@ -306,8 +312,12 @@ pub async fn execute_bm25_query(
     filter: Option<&Filter>,
     consistency: ConsistencyLevel,
     last_as_prefix: bool,
+    manifest_cache: Option<&Arc<ManifestCache>>,
 ) -> Result<QueryResponse> {
-    let manifest = Manifest::read(store, namespace).await?.unwrap_or_default();
+    let manifest = match manifest_cache {
+        Some(mc) => mc.get(store, namespace).await?,
+        None => Manifest::read(store, namespace).await?.unwrap_or_default(),
+    };
 
     let mut scanned_fragments = 0;
     let mut scanned_segments = 0;

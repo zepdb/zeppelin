@@ -114,6 +114,7 @@ pub async fn query_namespace(
             req.filter.as_ref(),
             req.consistency,
             req.last_as_prefix,
+            Some(&state.manifest_cache),
         )
         .await
         .map_err(ApiError::from)?
@@ -147,6 +148,7 @@ pub async fn query_namespace(
             distance_metric: meta.distance_metric,
             oversample_factor: state.config.indexing.oversample_factor,
             cache: Some(&state.cache),
+            manifest_cache: Some(&state.manifest_cache),
         })
         .await
         .map_err(ApiError::from)?

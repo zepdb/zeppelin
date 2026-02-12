@@ -533,6 +533,7 @@ async fn test_query_hierarchical_detection() {
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 3,
         cache: None,
+        manifest_cache: None,
     })
     .await
     .unwrap();

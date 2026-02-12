@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+pub mod manifest_cache;
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
@@ -6,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use tokio::sync::RwLock;
 use tracing::{debug, instrument};
 
@@ -27,10 +29,15 @@ struct CacheEntry {
 /// Files are stored at `{dir}/{filename}` where filename is the key with
 /// `/` replaced by `__`. On startup, the directory is scanned to rebuild
 /// the in-memory index.
+///
+/// Uses `DashMap` for the entry index to allow concurrent reads without
+/// write-lock contention. The previous `RwLock<HashMap>` took a write lock
+/// on every cache hit (to update `last_accessed`), causing p99 regressions
+/// at c=4+ concurrency.
 pub struct DiskCache {
     dir: PathBuf,
     max_size_bytes: u64,
-    entries: RwLock<HashMap<String, CacheEntry>>,
+    entries: DashMap<String, CacheEntry>,
     pinned: RwLock<HashSet<String>>,
     total_size: AtomicU64,
 }
@@ -52,7 +59,7 @@ impl DiskCache {
         let cache = Self {
             dir,
             max_size_bytes,
-            entries: RwLock::new(HashMap::new()),
+            entries: DashMap::new(),
             pinned: RwLock::new(HashSet::new()),
             total_size: AtomicU64::new(0),
         };
@@ -70,7 +77,6 @@ impl DiskCache {
             Err(_) => return,
         };
 
-        let mut entries = HashMap::new();
         let mut total = 0u64;
 
         for entry in entries_dir.flatten() {
@@ -98,7 +104,7 @@ impl DiskCache {
             let key = filename.replace("__", "/");
             total += size;
 
-            entries.insert(
+            self.entries.insert(
                 key,
                 CacheEntry {
                     filename,
@@ -109,11 +115,6 @@ impl DiskCache {
         }
 
         self.total_size.store(total, Ordering::Relaxed);
-        // We can't await the lock in a sync method, so use try_write
-        // This is only called during construction so no contention.
-        if let Ok(mut guard) = self.entries.try_write() {
-            *guard = entries;
-        }
     }
 
     fn key_to_filename(key: &str) -> String {
@@ -127,10 +128,9 @@ impl DiskCache {
     /// Get a cached value by key.
     #[instrument(skip(self), fields(key = key))]
     pub async fn get(&self, key: &str) -> Option<Bytes> {
-        // Check in-memory index first
+        // Check in-memory index and update last_accessed — no global write lock needed.
         {
-            let mut entries = self.entries.write().await;
-            let entry = entries.get_mut(key)?;
+            let mut entry = self.entries.get_mut(key)?;
             entry.last_accessed = Instant::now();
         }
 
@@ -146,8 +146,7 @@ impl DiskCache {
             }
             Err(_) => {
                 // File disappeared — remove from index
-                let mut entries = self.entries.write().await;
-                if let Some(entry) = entries.remove(key) {
+                if let Some((_, entry)) = self.entries.remove(key) {
                     self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
                     crate::metrics::CACHE_ENTRIES.dec();
                 }
@@ -181,24 +180,21 @@ impl DiskCache {
             .map_err(|e| ZeppelinError::Cache(format!("failed to rename cache file: {e}")))?;
 
         // Update index
-        let is_new;
-        {
-            let mut entries = self.entries.write().await;
-            if let Some(old) = entries.insert(
-                key.to_string(),
-                CacheEntry {
-                    filename: Self::key_to_filename(key),
-                    size,
-                    last_accessed: Instant::now(),
-                },
-            ) {
-                // Replacing existing entry: subtract old size
-                self.total_size.fetch_sub(old.size, Ordering::Relaxed);
-                is_new = false;
-            } else {
-                is_new = true;
-            }
-        }
+        let old = self.entries.insert(
+            key.to_string(),
+            CacheEntry {
+                filename: Self::key_to_filename(key),
+                size,
+                last_accessed: Instant::now(),
+            },
+        );
+        let is_new = if let Some(old_entry) = old {
+            // Replacing existing entry: subtract old size
+            self.total_size.fetch_sub(old_entry.size, Ordering::Relaxed);
+            false
+        } else {
+            true
+        };
         self.total_size.fetch_add(size, Ordering::Relaxed);
         if is_new {
             crate::metrics::CACHE_ENTRIES.inc();
@@ -246,8 +242,7 @@ impl DiskCache {
     /// Invalidate (remove) a single key from the cache.
     #[instrument(skip(self), fields(key = key))]
     pub async fn invalidate(&self, key: &str) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        if let Some(entry) = entries.remove(key) {
+        if let Some((_, entry)) = self.entries.remove(key) {
             self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
             crate::metrics::CACHE_ENTRIES.dec();
             let path = self.dir.join(&entry.filename);
@@ -265,28 +260,32 @@ impl DiskCache {
     /// Invalidate all keys that start with the given prefix.
     #[instrument(skip(self), fields(prefix = prefix))]
     pub async fn invalidate_prefix(&self, prefix: &str) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        let matching_keys: Vec<String> = entries
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
+        // Collect matching keys first to avoid holding DashMap shards during I/O.
+        let matching: Vec<(String, CacheEntry)> = self
+            .entries
+            .iter()
+            .filter(|r| r.key().starts_with(prefix))
+            .map(|r| (r.key().clone(), CacheEntry {
+                filename: r.value().filename.clone(),
+                size: r.value().size,
+                last_accessed: r.value().last_accessed,
+            }))
             .collect();
 
-        for key in &matching_keys {
-            if let Some(entry) = entries.remove(key) {
-                self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
-                crate::metrics::CACHE_ENTRIES.dec();
-                let path = self.dir.join(&entry.filename);
-                let _ = tokio::fs::remove_file(&path).await;
-            }
+        for (key, entry) in &matching {
+            self.entries.remove(key);
+            self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
+            crate::metrics::CACHE_ENTRIES.dec();
+            let path = self.dir.join(&entry.filename);
+            let _ = tokio::fs::remove_file(&path).await;
         }
 
         let mut pinned = self.pinned.write().await;
-        for key in &matching_keys {
+        for (key, _) in &matching {
             pinned.remove(key);
         }
 
-        debug!(removed = matching_keys.len(), "invalidated prefix");
+        debug!(removed = matching.len(), "invalidated prefix");
         Ok(())
     }
 
@@ -304,20 +303,20 @@ impl DiskCache {
             }
 
             let pinned = self.pinned.read().await;
-            let mut entries = self.entries.write().await;
 
-            // Find the oldest unpinned entry
-            let victim = entries
+            // Find the oldest unpinned entry by iterating the DashMap.
+            let victim = self
+                .entries
                 .iter()
-                .filter(|(k, _)| !pinned.contains(*k))
-                .min_by_key(|(_, e)| e.last_accessed)
-                .map(|(k, _)| k.clone());
+                .filter(|r| !pinned.contains(r.key()))
+                .min_by_key(|r| r.value().last_accessed)
+                .map(|r| r.key().clone());
 
             drop(pinned);
 
             match victim {
                 Some(key) => {
-                    if let Some(entry) = entries.remove(&key) {
+                    if let Some((_, entry)) = self.entries.remove(&key) {
                         self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
                         crate::metrics::CACHE_ENTRIES.dec();
                         crate::metrics::CACHE_EVICTIONS_TOTAL.inc();

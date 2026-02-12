@@ -364,6 +364,56 @@ impl Default for LoggingConfig {
     }
 }
 
+/// CPU budget for distributing workers across runtimes.
+///
+/// Detected at startup via `available_parallelism()`, then allocated:
+/// - **Query workers**: 2× CPUs (overcommit OK — 80%+ I/O-blocked on S3 GETs)
+/// - **Compaction workers**: CPUs - 1 (CPU-bound k-means/FTS, reserve 1 for queries)
+/// - **Rayon threads**: match physical cores (work-stealing at core count)
+#[derive(Debug, Clone)]
+pub struct CpuBudget {
+    pub query_workers: usize,
+    pub compaction_workers: usize,
+    pub rayon_threads: usize,
+}
+
+impl CpuBudget {
+    /// Auto-detect CPU count and allocate budgets.
+    pub fn auto() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        let mut budget = Self {
+            query_workers: (cpus * 2).max(4),
+            compaction_workers: cpus.saturating_sub(1).max(1),
+            rayon_threads: cpus,
+        };
+
+        // Allow env var overrides
+        if let Some(v) = std::env::var("ZEPPELIN_QUERY_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            budget.query_workers = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_COMPACTION_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            budget.compaction_workers = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_RAYON_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            budget.rayon_threads = v;
+        }
+
+        budget
+    }
+}
+
 impl Config {
     /// Load config from a TOML file, falling back to defaults.
     /// After loading, env var overrides are applied so that:

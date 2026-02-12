@@ -5,15 +5,17 @@
 //! tested with `StorageBackend::Local` without needing S3 or MinIO.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
+use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
 use crate::compaction::background::start_compaction_thread;
 use crate::compaction::Compactor;
-use crate::config::Config;
+use crate::config::{Config, CpuBudget};
 use crate::namespace::NamespaceManager;
 use crate::server::routes::build_router;
 use crate::server::AppState;
@@ -73,6 +75,15 @@ pub async fn build_app(
 ) -> Result<(Router, watch::Sender<bool>), Box<dyn std::error::Error>> {
     tracing::info!("zeppelin starting");
 
+    // Detect CPU budget and log allocation
+    let cpu_budget = CpuBudget::auto();
+    tracing::info!(
+        query_workers = cpu_budget.query_workers,
+        compaction_workers = cpu_budget.compaction_workers,
+        rayon_threads = cpu_budget.rayon_threads,
+        "CPU budget allocated"
+    );
+
     tracing::info!(
         host = %config.server.host,
         port = config.server.port,
@@ -105,6 +116,9 @@ pub async fn build_app(
     // Initialize disk cache
     let cache = Arc::new(DiskCache::new(&config.cache)?);
 
+    // Initialize manifest cache (500ms TTL — drops ~27ms S3 GET per query)
+    let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(500)));
+
     // Initialize compactor
     let compactor = Arc::new(Compactor::new(
         store.clone(),
@@ -119,6 +133,7 @@ pub async fn build_app(
         compactor.clone(),
         namespace_manager.clone(),
         shutdown_rx,
+        cpu_budget.compaction_workers,
     );
 
     // Build application state
@@ -133,6 +148,7 @@ pub async fn build_app(
         config: Arc::new(config),
         compactor,
         cache,
+        manifest_cache,
         query_semaphore,
     };
 

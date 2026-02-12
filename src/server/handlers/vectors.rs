@@ -91,6 +91,9 @@ pub async fn upsert_vectors(
         .await
         .map_err(ApiError::from)?;
 
+    // Invalidate cached manifest so next query sees the new fragment.
+    state.manifest_cache.invalidate(&ns);
+
     info!(upserted = count, "vectors upserted");
     Ok((
         StatusCode::OK,
@@ -125,6 +128,9 @@ pub async fn delete_vectors(
         .append(&ns, vec![], req.ids)
         .await
         .map_err(ApiError::from)?;
+
+    // Invalidate cached manifest so next query sees the delete.
+    state.manifest_cache.invalidate(&ns);
 
     info!(deleted = count, "vectors deleted");
     Ok(StatusCode::NO_CONTENT)

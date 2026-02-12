@@ -232,6 +232,7 @@ async fn test_compact_deduplication() {
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 3,
         cache: None,
+        manifest_cache: None,
     })
     .await
     .unwrap();
@@ -474,6 +475,7 @@ async fn test_query_after_compaction() {
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
         cache: None,
+        manifest_cache: None,
     })
     .await
     .unwrap();
@@ -498,6 +500,7 @@ async fn test_query_after_compaction() {
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
         cache: None,
+        manifest_cache: None,
     })
     .await
     .unwrap();
@@ -515,6 +518,7 @@ async fn test_query_after_compaction() {
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
         cache: None,
+        manifest_cache: None,
     })
     .await
     .unwrap();
@@ -629,6 +633,7 @@ async fn test_compact_attributes_preserved() {
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
         cache: None,
+        manifest_cache: None,
     })
     .await
     .unwrap();
