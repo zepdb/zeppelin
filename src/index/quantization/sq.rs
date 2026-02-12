@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn test_constant_dimension() {
         // When all values in a dimension are the same, encoding should still work.
-        let vecs = vec![vec![1.0, 5.0], vec![1.0, 3.0], vec![1.0, 7.0]];
+        let vecs = [vec![1.0, 5.0], vec![1.0, 3.0], vec![1.0, 7.0]];
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
         let cal = SqCalibration::calibrate(&refs, 2);
 
