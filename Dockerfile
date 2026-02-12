@@ -14,14 +14,16 @@ RUN apt-get update && \
 COPY Cargo.toml Cargo.lock ./
 
 # Create dummy sources to build dependencies as a cached layer
-RUN mkdir src && \
+RUN mkdir -p src benches && \
     echo "fn main() {}" > src/main.rs && \
     echo "" > src/lib.rs && \
+    echo "fn main() {}" > benches/core_benchmarks.rs && \
     cargo build --release && \
-    rm -rf src
+    rm -rf src benches
 
 # Copy real source code
 COPY src/ src/
+COPY benches/ benches/
 
 # Touch files so cargo detects changes from the dummy build
 RUN touch src/main.rs src/lib.rs && \
