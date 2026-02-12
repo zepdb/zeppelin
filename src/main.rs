@@ -1,119 +1,23 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tracing_subscriber::EnvFilter;
 
-use zeppelin::cache::DiskCache;
-use zeppelin::compaction::background::compaction_loop;
-use zeppelin::compaction::Compactor;
 use zeppelin::config::Config;
-use zeppelin::namespace::NamespaceManager;
-use zeppelin::server::routes::build_router;
-use zeppelin::server::AppState;
-use zeppelin::storage::ZeppelinStore;
-use zeppelin::wal::{WalReader, WalWriter};
+use zeppelin::startup::{build_app, init_logging, resolve_config_path};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env
     let _ = dotenvy::dotenv();
 
-    // Load config first (needed for logging setup)
-    // Priority: ZEPPELIN_CONFIG env var > ./zeppelin.toml if exists > defaults
-    let config_path = std::env::var("ZEPPELIN_CONFIG").ok().or_else(|| {
-        let default = "zeppelin.toml";
-        std::path::Path::new(default)
-            .exists()
-            .then(|| default.to_string())
-    });
-    let config = Config::load(config_path.as_deref())?;
+    // Load config (priority: ZEPPELIN_CONFIG env var > ./zeppelin.toml > defaults)
+    let config = Config::load(resolve_config_path().as_deref())?;
 
-    // Initialize tracing from LoggingConfig
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
+    // Initialize logging
+    init_logging(&config);
 
-    match config.logging.format.as_str() {
-        "json" => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(filter)
-                .init();
-        }
-        _ => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
-        }
-    }
-
-    tracing::info!("zeppelin starting");
-
-    tracing::info!(
-        host = %config.server.host,
-        port = config.server.port,
-        bucket = %config.storage.bucket,
-        backend = %config.storage.backend,
-        cache_dir = %config.cache.dir.display(),
-        cache_max_size_gb = config.cache.max_size_gb,
-        compaction_interval_secs = config.compaction.interval_secs,
-        max_wal_fragments = config.compaction.max_wal_fragments_before_compact,
-        "configuration loaded"
-    );
-
-    // Initialize metrics
-    zeppelin::metrics::init();
-
-    // Initialize storage
-    let store = ZeppelinStore::from_config(&config.storage)?;
-
-    // Initialize namespace manager and scan existing namespaces
-    let namespace_manager = Arc::new(NamespaceManager::new(store.clone()));
-    match namespace_manager.scan_and_register().await {
-        Ok(count) => tracing::info!(count, "registered existing namespaces"),
-        Err(e) => tracing::warn!(error = %e, "failed to scan namespaces on startup"),
-    }
-
-    // Initialize WAL writer and reader
-    let wal_writer = Arc::new(WalWriter::new(store.clone()));
-    let wal_reader = Arc::new(WalReader::new(store.clone()));
-
-    // Initialize disk cache
-    let cache = Arc::new(DiskCache::new(&config.cache)?);
-
-    // Initialize compactor
-    let compactor = Arc::new(Compactor::new(
-        store.clone(),
-        WalReader::new(store.clone()),
-        config.compaction.clone(),
-        config.indexing.clone(),
-    ));
-
-    // Spawn background compaction loop
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    {
-        let compactor = compactor.clone();
-        let namespace_manager = namespace_manager.clone();
-        tokio::spawn(async move {
-            compaction_loop(compactor, namespace_manager, shutdown_rx).await;
-        });
-    }
-
-    // Build application state
-    let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
-        config.server.max_concurrent_queries,
-    ));
-    let state = AppState {
-        store,
-        namespace_manager,
-        wal_writer,
-        wal_reader,
-        config: Arc::new(config.clone()),
-        compactor,
-        cache,
-        query_semaphore,
-    };
-
-    // Build router
-    let app = build_router(state);
+    // Build application (router + background tasks)
+    let (app, shutdown_tx) = build_app(config.clone()).await?;
 
     // Bind and serve
     let addr = format!("{}:{}", config.server.host, config.server.port);
