@@ -353,7 +353,13 @@ async fn scan_clusters_flat(
             let (cluster_res, prefilter, attrs) = tokio::join!(
                 fetch_with_cache(cache, store, &cvec_key),
                 try_bitmap_prefilter(
-                    namespace, segment_id, cluster_idx, filter, has_bitmaps, store, cache,
+                    namespace,
+                    segment_id,
+                    cluster_idx,
+                    filter,
+                    has_bitmaps,
+                    store,
+                    cache,
                 ),
                 load_attrs(namespace, segment_id, cluster_idx, filter, store, cache),
             );
@@ -421,7 +427,13 @@ async fn scan_clusters_sq(
         async move {
             let (prefilter, sq_res) = tokio::join!(
                 try_bitmap_prefilter(
-                    namespace, segment_id, cluster_idx, filter, has_bitmaps, store, cache,
+                    namespace,
+                    segment_id,
+                    cluster_idx,
+                    filter,
+                    has_bitmaps,
+                    store,
+                    cache,
                 ),
                 fetch_with_cache(cache, store, &sq_key),
             );
@@ -548,7 +560,13 @@ async fn scan_clusters_pq(
         async move {
             let (prefilter, pq_res) = tokio::join!(
                 try_bitmap_prefilter(
-                    namespace, segment_id, cluster_idx, filter, has_bitmaps, store, cache,
+                    namespace,
+                    segment_id,
+                    cluster_idx,
+                    filter,
+                    has_bitmaps,
+                    store,
+                    cache,
                 ),
                 fetch_with_cache(cache, store, &pq_key),
             );

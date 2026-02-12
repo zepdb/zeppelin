@@ -13,6 +13,9 @@ use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, VectorEntry};
 
+/// Pre-serialized cluster payload: (vec_key, vec_data, attr_key, attr_data, optional bitmap).
+type ClusterPayload = (String, Bytes, String, Bytes, Option<(String, Bytes)>);
+
 use super::kmeans::train_kmeans;
 use super::IvfFlatIndex;
 use crate::index::distance;
@@ -323,8 +326,7 @@ pub async fn build_ivf_flat(
 
     // CPU phase: pre-serialize all cluster payloads.
     let mut bitmap_fields_set = std::collections::HashSet::new();
-    let mut cluster_payloads: Vec<(String, Bytes, String, Bytes, Option<(String, Bytes)>)> =
-        Vec::with_capacity(num_clusters);
+    let mut cluster_payloads: Vec<ClusterPayload> = Vec::with_capacity(num_clusters);
     for i in 0..num_clusters {
         let cvec_data = serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?;
         let cvec_key = cluster_key(namespace, segment_id, i);
