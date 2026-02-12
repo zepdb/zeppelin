@@ -3,16 +3,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Supported languages for full-text search tokenization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FtsLanguage {
+    #[default]
     English,
-}
-
-impl Default for FtsLanguage {
-    fn default() -> Self {
-        Self::English
-    }
 }
 
 /// Per-field configuration for full-text search.

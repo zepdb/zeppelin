@@ -14,6 +14,9 @@ use crate::fts::types::FtsFieldConfig;
 use crate::types::{AttributeValue, SearchResult};
 use crate::wal::fragment::WalFragment;
 
+/// Per-doc, per-field data: (doc_length, term→term_frequency).
+type DocFieldData = HashMap<String, HashMap<String, (u32, HashMap<String, u32>)>>;
+
 /// Result of a WAL BM25 scan.
 pub struct WalBm25ScanResult {
     pub results: Vec<SearchResult>,
@@ -114,10 +117,7 @@ pub fn wal_bm25_scan(
 
     let mut field_corpus_stats: HashMap<String, CorpusStats> = HashMap::new();
     // Per-doc, per-field: (doc_length, term→tf)
-    let mut doc_field_data: HashMap<
-        String,
-        HashMap<String, (u32, HashMap<String, u32>)>,
-    > = HashMap::new();
+    let mut doc_field_data: DocFieldData = HashMap::new();
 
     // Gather all unique fields we need to index
     let fields_needed: HashSet<&str> = field_query_states.iter().map(|s| s.field.as_str()).collect();
