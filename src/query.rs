@@ -22,22 +22,37 @@ use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 use crate::wal::WalReader;
 
+/// Parameters for a vector query, grouped to avoid excessive function arguments.
+pub struct QueryParams<'a> {
+    pub store: &'a ZeppelinStore,
+    pub wal_reader: &'a WalReader,
+    pub namespace: &'a str,
+    pub query: &'a [f32],
+    pub top_k: usize,
+    pub nprobe: usize,
+    pub filter: Option<&'a Filter>,
+    pub consistency: ConsistencyLevel,
+    pub distance_metric: DistanceMetric,
+    pub oversample_factor: usize,
+    pub cache: Option<&'a Arc<DiskCache>>,
+}
+
 /// Execute a query against a namespace, combining WAL scan and segment search.
-#[allow(clippy::too_many_arguments)]
-#[instrument(skip(store, wal_reader, query, filter, cache), fields(namespace = namespace))]
-pub async fn execute_query(
-    store: &ZeppelinStore,
-    wal_reader: &WalReader,
-    namespace: &str,
-    query: &[f32],
-    top_k: usize,
-    nprobe: usize,
-    filter: Option<&Filter>,
-    consistency: ConsistencyLevel,
-    distance_metric: DistanceMetric,
-    oversample_factor: usize,
-    cache: Option<&Arc<DiskCache>>,
-) -> Result<QueryResponse> {
+#[instrument(skip(params), fields(namespace = params.namespace))]
+pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
+    let QueryParams {
+        store,
+        wal_reader,
+        namespace,
+        query,
+        top_k,
+        nprobe,
+        filter,
+        consistency,
+        distance_metric,
+        oversample_factor,
+        cache,
+    } = params;
     let manifest = Manifest::read(store, namespace).await?.unwrap_or_default();
 
     let mut scanned_fragments = 0;

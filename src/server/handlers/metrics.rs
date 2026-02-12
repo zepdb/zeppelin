@@ -6,13 +6,22 @@ pub async fn metrics_handler() -> impl IntoResponse {
     let encoder = TextEncoder::new();
     let families = prometheus::gather();
     let mut buf = Vec::new();
-    encoder.encode(&families, &mut buf).unwrap();
-    (
-        StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.04; charset=utf-8",
-        )],
-        buf,
-    )
+    match encoder.encode(&families, &mut buf) {
+        Ok(()) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.04; charset=utf-8",
+            )],
+            buf,
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to encode prometheus metrics");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("metrics encoding failed: {e}").into_bytes(),
+            )
+        }
+    }
 }

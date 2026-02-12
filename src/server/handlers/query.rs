@@ -22,18 +22,14 @@ pub struct QueryRequest {
     /// Whether the last token of each BM25 query should be treated as a prefix.
     #[serde(default)]
     pub last_as_prefix: bool,
-    #[serde(default = "default_top_k")]
-    pub top_k: usize,
+    #[serde(default)]
+    pub top_k: Option<usize>,
     #[serde(default)]
     pub filter: Option<Filter>,
     #[serde(default)]
     pub consistency: ConsistencyLevel,
     #[serde(default)]
     pub nprobe: Option<usize>,
-}
-
-fn default_top_k() -> usize {
-    10
 }
 
 #[derive(Debug, Serialize)]
@@ -43,13 +39,19 @@ pub struct QueryResponse {
     pub scanned_segments: usize,
 }
 
-#[instrument(skip(state, req), fields(namespace = %ns, top_k = req.top_k))]
+#[instrument(skip(state, req), fields(namespace = %ns))]
 pub async fn query_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let start = std::time::Instant::now();
+    let ns_for_metrics = ns.clone();
+    let _duration_guard = DurationGuard {
+        start,
+        namespace: ns_for_metrics,
+    };
+    let top_k = req.top_k.unwrap_or(state.config.server.default_top_k);
     crate::metrics::ACTIVE_QUERIES.inc();
     let _guard = crate::metrics::GaugeGuard(&crate::metrics::ACTIVE_QUERIES);
     crate::metrics::QUERIES_TOTAL
@@ -74,15 +76,15 @@ pub async fn query_namespace(
         .await
         .map_err(ApiError::from)?;
 
-    if req.top_k == 0 {
+    if top_k == 0 {
         return Err(ApiError(ZeppelinError::Validation(
             "top_k must be > 0".into(),
         )));
     }
-    if req.top_k > state.config.server.max_top_k {
+    if top_k > state.config.server.max_top_k {
         return Err(ApiError(ZeppelinError::Validation(format!(
             "top_k {} exceeds maximum of {}",
-            req.top_k, state.config.server.max_top_k
+            top_k, state.config.server.max_top_k
         ))));
     }
 
@@ -108,7 +110,7 @@ pub async fn query_namespace(
             &ns,
             rank_by,
             &meta.full_text_search,
-            req.top_k,
+            top_k,
             req.filter.as_ref(),
             req.consistency,
             req.last_as_prefix,
@@ -127,38 +129,52 @@ pub async fn query_namespace(
 
         let nprobe = req
             .nprobe
-            .unwrap_or(state.config.indexing.default_nprobe)
-            .min(state.config.indexing.max_nprobe);
+            .unwrap_or(state.config.indexing.default_nprobe);
+        if nprobe > state.config.indexing.max_nprobe {
+            return Err(ApiError(ZeppelinError::Validation(format!(
+                "nprobe {} exceeds maximum of {}",
+                nprobe, state.config.indexing.max_nprobe
+            ))));
+        }
 
-        query::execute_query(
-            &state.store,
-            &state.wal_reader,
-            &ns,
-            vector,
-            req.top_k,
+        query::execute_query(query::QueryParams {
+            store: &state.store,
+            wal_reader: &state.wal_reader,
+            namespace: &ns,
+            query: vector,
+            top_k,
             nprobe,
-            req.filter.as_ref(),
-            req.consistency,
-            meta.distance_metric,
-            state.config.indexing.oversample_factor,
-            Some(&state.cache),
-        )
+            filter: req.filter.as_ref(),
+            consistency: req.consistency,
+            distance_metric: meta.distance_metric,
+            oversample_factor: state.config.indexing.oversample_factor,
+            cache: Some(&state.cache),
+        })
         .await
         .map_err(ApiError::from)?
     };
-
-    let elapsed = start.elapsed();
-    crate::metrics::QUERY_DURATION
-        .with_label_values(&[&ns])
-        .observe(elapsed.as_secs_f64());
 
     info!(
         results = result.results.len(),
         scanned_fragments = result.scanned_fragments,
         scanned_segments = result.scanned_segments,
-        elapsed_ms = elapsed.as_millis(),
         "query complete"
     );
 
     Ok(Json(result))
+}
+
+/// RAII guard that records query duration on drop (including error paths).
+struct DurationGuard {
+    start: std::time::Instant,
+    namespace: String,
+}
+
+impl Drop for DurationGuard {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        crate::metrics::QUERY_DURATION
+            .with_label_values(&[&self.namespace])
+            .observe(elapsed.as_secs_f64());
+    }
 }

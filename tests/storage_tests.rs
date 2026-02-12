@@ -2,7 +2,7 @@ mod common;
 
 use bytes::Bytes;
 use common::harness::TestHarness;
-use zeppelin::config::StorageConfig;
+use zeppelin::config::{StorageBackend, StorageConfig};
 use zeppelin::storage::ZeppelinStore;
 
 /// Smoke test: connect to S3, write an object, read it back, verify content, delete it.
@@ -203,7 +203,7 @@ async fn test_s3_delete_prefix() {
 async fn test_local_backend_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let config = StorageConfig {
-        backend: "local".to_string(),
+        backend: StorageBackend::Local,
         bucket: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -230,7 +230,7 @@ async fn test_local_backend_creates_dir() {
     let base = tempfile::tempdir().unwrap();
     let nested = base.path().join("deeply/nested/dir");
     let config = StorageConfig {
-        backend: "local".to_string(),
+        backend: StorageBackend::Local,
         bucket: nested.to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -243,7 +243,7 @@ async fn test_local_backend_creates_dir() {
 #[test]
 fn test_unsupported_backend_error() {
     let config = StorageConfig {
-        backend: "gcs".to_string(),
+        backend: StorageBackend::Gcs,
         bucket: "irrelevant".to_string(),
         ..Default::default()
     };
@@ -284,7 +284,7 @@ async fn test_head_not_found() {
 async fn test_put_if_match_storage_error() {
     let dir = tempfile::tempdir().unwrap();
     let config = StorageConfig {
-        backend: "local".to_string(),
+        backend: StorageBackend::Local,
         bucket: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -306,7 +306,7 @@ async fn test_put_if_match_storage_error() {
 async fn test_head_storage_error() {
     let dir = tempfile::tempdir().unwrap();
     let config = StorageConfig {
-        backend: "local".to_string(),
+        backend: StorageBackend::Local,
         bucket: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -332,7 +332,7 @@ async fn test_head_storage_error() {
 #[test]
 fn test_s3_build_error() {
     let config = StorageConfig {
-        backend: "s3".to_string(),
+        backend: StorageBackend::S3,
         bucket: "".to_string(),
         ..Default::default()
     };

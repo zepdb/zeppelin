@@ -19,8 +19,8 @@ impl ZeppelinStore {
     /// Create a new store from configuration.
     pub fn from_config(config: &StorageConfig) -> Result<Self> {
         let store: Arc<dyn ObjectStore> =
-            match config.backend.as_str() {
-                "s3" => {
+            match config.backend {
+                crate::config::StorageBackend::S3 => {
                     let mut builder = AmazonS3Builder::new().with_bucket_name(&config.bucket);
 
                     if let Some(ref region) = config.s3_region {
@@ -49,7 +49,7 @@ impl ZeppelinStore {
                         ZeppelinError::Config(format!("failed to build S3 store: {e}"))
                     })?)
                 }
-                "local" => {
+                crate::config::StorageBackend::Local => {
                     let path = std::path::Path::new(&config.bucket);
                     if !path.exists() {
                         std::fs::create_dir_all(path)?;
@@ -62,7 +62,7 @@ impl ZeppelinStore {
                 }
                 backend => {
                     return Err(ZeppelinError::Config(format!(
-                        "unsupported storage backend: {backend}"
+                        "unsupported storage backend: {backend} (gcs/azure not yet implemented)"
                     )));
                 }
             };

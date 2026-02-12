@@ -82,6 +82,9 @@ pub enum ZeppelinError {
 
     #[error("FTS field not configured on namespace {namespace}: {field}")]
     FtsFieldNotConfigured { namespace: String, field: String },
+
+    #[error("query concurrency limit reached, try again later")]
+    QueryConcurrencyExhausted,
 }
 
 impl From<Box<bincode::ErrorKind>> for ZeppelinError {
@@ -108,6 +111,8 @@ impl ZeppelinError {
             ZeppelinError::DimensionMismatch { .. }
             | ZeppelinError::Validation(_)
             | ZeppelinError::FtsFieldNotConfigured { .. } => 400,
+
+            ZeppelinError::QueryConcurrencyExhausted => 503,
 
             _ => 500,
         }

@@ -42,12 +42,39 @@ pub struct ServerConfig {
     pub max_vector_id_length: usize,
     #[serde(default = "default_max_request_body_mb")]
     pub max_request_body_mb: usize,
+    #[serde(default = "default_top_k")]
+    pub default_top_k: usize,
+}
+
+fn default_top_k() -> usize {
+    10
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    #[default]
+    S3,
+    Gcs,
+    Azure,
+    Local,
+}
+
+impl std::fmt::Display for StorageBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageBackend::S3 => write!(f, "s3"),
+            StorageBackend::Gcs => write!(f, "gcs"),
+            StorageBackend::Azure => write!(f, "azure"),
+            StorageBackend::Local => write!(f, "local"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    #[serde(default = "default_backend")]
-    pub backend: String,
+    #[serde(default)]
+    pub backend: StorageBackend,
     #[serde(default = "default_bucket")]
     pub bucket: String,
 
@@ -74,14 +101,21 @@ pub struct StorageConfig {
     pub azure_access_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictionPolicy {
+    #[default]
+    Lru,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
     #[serde(default = "default_cache_dir")]
     pub dir: PathBuf,
     #[serde(default = "default_max_size_gb")]
     pub max_size_gb: u64,
-    #[serde(default = "default_eviction")]
-    pub eviction: String,
+    #[serde(default)]
+    pub eviction: EvictionPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,10 +178,10 @@ pub struct CompactionConfig {
     pub retrain_imbalance_threshold: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConsistencyConfig {
-    #[serde(default = "default_consistency")]
-    pub default: String,
+    #[serde(default)]
+    pub default: crate::types::ConsistencyLevel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,96 +192,52 @@ pub struct LoggingConfig {
     pub format: String,
 }
 
-// Default value functions
+// Default value functions — hardcoded defaults only.
+// Env var overrides are applied in `apply_env_overrides()`.
 fn default_host() -> String {
-    std::env::var("ZEPPELIN_HOST").unwrap_or_else(|_| "0.0.0.0".to_string())
+    "0.0.0.0".to_string()
 }
 fn default_port() -> u16 {
-    std::env::var("ZEPPELIN_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8080)
+    8080
 }
 fn default_request_timeout() -> u64 {
-    std::env::var("ZEPPELIN_REQUEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30)
+    30
 }
 fn default_max_concurrent_queries() -> usize {
-    std::env::var("ZEPPELIN_MAX_CONCURRENT_QUERIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(64)
+    64
 }
 fn default_max_batch_size() -> usize {
-    std::env::var("ZEPPELIN_MAX_BATCH_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000)
+    10_000
 }
 fn default_max_top_k() -> usize {
-    std::env::var("ZEPPELIN_MAX_TOP_K")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000)
+    10_000
 }
 fn default_shutdown_timeout_secs() -> u64 {
-    std::env::var("ZEPPELIN_SHUTDOWN_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30)
+    30
 }
 fn default_max_dimensions() -> usize {
-    std::env::var("ZEPPELIN_MAX_DIMENSIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(65_536)
+    65_536
 }
 fn default_max_vector_id_length() -> usize {
-    std::env::var("ZEPPELIN_MAX_VECTOR_ID_LENGTH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1024)
+    1024
 }
 fn default_max_request_body_mb() -> usize {
-    std::env::var("ZEPPELIN_MAX_REQUEST_BODY_MB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50)
-}
-fn default_backend() -> String {
-    std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "s3".to_string())
+    50
 }
 fn default_bucket() -> String {
-    std::env::var("S3_BUCKET").unwrap_or_else(|_| "zeppelin".to_string())
+    "zeppelin".to_string()
 }
 fn default_cache_dir() -> PathBuf {
-    std::env::var("ZEPPELIN_CACHE_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/cache/zeppelin"))
+    PathBuf::from("/var/cache/zeppelin")
 }
 fn default_max_size_gb() -> u64 {
-    std::env::var("ZEPPELIN_CACHE_MAX_SIZE_GB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50)
-}
-fn default_eviction() -> String {
-    "lru".to_string()
+    50
 }
 fn default_num_centroids() -> usize {
-    std::env::var("ZEPPELIN_DEFAULT_NUM_CENTROIDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(256)
+    256
 }
 fn default_nprobe() -> usize {
-    std::env::var("ZEPPELIN_DEFAULT_NPROBE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(16)
+    16
 }
 fn default_max_nprobe() -> usize {
     128
@@ -274,28 +264,19 @@ fn default_bitmap_index() -> bool {
     true
 }
 fn default_compaction_interval() -> u64 {
-    std::env::var("ZEPPELIN_COMPACTION_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30)
+    30
 }
 fn default_max_wal_fragments() -> usize {
-    std::env::var("ZEPPELIN_MAX_WAL_FRAGMENTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1000)
+    1000
 }
 fn default_retrain_threshold() -> f64 {
     5.0
-}
-fn default_consistency() -> String {
-    "strong".to_string()
 }
 fn default_log_level() -> String {
     "info".to_string()
 }
 fn default_log_format() -> String {
-    std::env::var("ZEPPELIN_LOG_FORMAT").unwrap_or_else(|_| "json".to_string())
+    "json".to_string()
 }
 
 impl Default for ServerConfig {
@@ -311,6 +292,7 @@ impl Default for ServerConfig {
             max_dimensions: default_max_dimensions(),
             max_vector_id_length: default_max_vector_id_length(),
             max_request_body_mb: default_max_request_body_mb(),
+            default_top_k: default_top_k(),
         }
     }
 }
@@ -318,25 +300,16 @@ impl Default for ServerConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
-            backend: default_backend(),
+            backend: StorageBackend::default(),
             bucket: default_bucket(),
-            s3_region: std::env::var("AWS_REGION").ok(),
-            s3_endpoint: std::env::var("S3_ENDPOINT").ok().filter(|s| !s.is_empty()),
-            s3_access_key_id: std::env::var("AWS_ACCESS_KEY_ID").ok(),
-            s3_secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
-            s3_allow_http: std::env::var("S3_ALLOW_HTTP")
-                .ok()
-                .map(|v| v == "true")
-                .unwrap_or(false),
-            gcs_service_account_path: std::env::var("GCS_SERVICE_ACCOUNT_PATH")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            azure_account: std::env::var("AZURE_ACCOUNT")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            azure_access_key: std::env::var("AZURE_ACCESS_KEY")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            s3_region: None,
+            s3_endpoint: None,
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_allow_http: false,
+            gcs_service_account_path: None,
+            azure_account: None,
+            azure_access_key: None,
         }
     }
 }
@@ -346,7 +319,7 @@ impl Default for CacheConfig {
         Self {
             dir: default_cache_dir(),
             max_size_gb: default_max_size_gb(),
-            eviction: default_eviction(),
+            eviction: EvictionPolicy::default(),
         }
     }
 }
@@ -382,13 +355,6 @@ impl Default for CompactionConfig {
     }
 }
 
-impl Default for ConsistencyConfig {
-    fn default() -> Self {
-        Self {
-            default: default_consistency(),
-        }
-    }
-}
 
 impl Default for LoggingConfig {
     fn default() -> Self {
@@ -479,10 +445,22 @@ impl Config {
         {
             self.server.max_request_body_mb = v;
         }
+        if let Some(v) = std::env::var("ZEPPELIN_DEFAULT_TOP_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.default_top_k = v;
+        }
 
         // Storage
         if let Ok(v) = std::env::var("STORAGE_BACKEND") {
-            self.storage.backend = v;
+            match v.to_lowercase().as_str() {
+                "s3" => self.storage.backend = StorageBackend::S3,
+                "gcs" => self.storage.backend = StorageBackend::Gcs,
+                "azure" => self.storage.backend = StorageBackend::Azure,
+                "local" => self.storage.backend = StorageBackend::Local,
+                _ => tracing::warn!("Unknown STORAGE_BACKEND value: {v}"),
+            }
         }
         if let Ok(v) = std::env::var("S3_BUCKET") {
             self.storage.bucket = v;

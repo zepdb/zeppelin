@@ -25,11 +25,6 @@ pub struct DeleteVectorsRequest {
     pub ids: Vec<VectorId>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct DeleteVectorsResponse {
-    pub deleted: usize,
-}
-
 #[instrument(skip(state, req), fields(namespace = %ns, vector_count = req.vectors.len()))]
 pub async fn upsert_vectors(
     State(state): State<AppState>,
@@ -60,6 +55,13 @@ pub async fn upsert_vectors(
                 "vector id length {} exceeds maximum of {}",
                 vec.id.len(),
                 state.config.server.max_vector_id_length
+            ))));
+        }
+        if !is_valid_vector_id(&vec.id) {
+            return Err(ApiError(ZeppelinError::Validation(format!(
+                "vector id '{}' contains invalid characters; \
+                 only alphanumeric, dash, underscore, and dot are allowed",
+                vec.id
             ))));
         }
     }
@@ -101,7 +103,13 @@ pub async fn delete_vectors(
     State(state): State<AppState>,
     Path(ns): Path<String>,
     Json(req): Json<DeleteVectorsRequest>,
-) -> Result<Json<DeleteVectorsResponse>, ApiError> {
+) -> Result<StatusCode, ApiError> {
+    if req.ids.is_empty() {
+        return Err(ApiError(ZeppelinError::Validation(
+            "ids array cannot be empty".into(),
+        )));
+    }
+
     info!(count = req.ids.len(), "deleting vectors");
 
     // Validate namespace exists
@@ -119,5 +127,11 @@ pub async fn delete_vectors(
         .map_err(ApiError::from)?;
 
     info!(deleted = count, "vectors deleted");
-    Ok(Json(DeleteVectorsResponse { deleted: count }))
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Validate a vector ID: only alphanumeric, dash, underscore, and dot allowed.
+fn is_valid_vector_id(id: &str) -> bool {
+    id.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }

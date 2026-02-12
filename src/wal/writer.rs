@@ -75,7 +75,7 @@ impl WalWriter {
             .with_label_values(&[namespace])
             .inc();
 
-        let fragment = WalFragment::new(vectors, deletes);
+        let fragment = WalFragment::try_new(vectors, deletes)?;
 
         // Write the fragment to S3
         let key = WalFragment::s3_key(namespace, &fragment.id);

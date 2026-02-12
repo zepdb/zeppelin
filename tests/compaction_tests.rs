@@ -6,7 +6,7 @@ use common::vectors::{random_vectors, simple_attributes, with_attributes};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::index::ivf_flat::build::build_ivf_flat;
-use zeppelin::query::execute_query;
+use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::{Manifest, SegmentRef};
@@ -220,19 +220,19 @@ async fn test_compact_deduplication() {
 
     // Query with v2 should find "dup" at distance ~0
     let wal_reader = WalReader::new(store.clone());
-    let query_result = execute_query(
+    let query_result = execute_query(QueryParams {
         store,
-        &wal_reader,
-        &ns,
-        &v2,
-        1,
-        4,
-        None,
-        ConsistencyLevel::Eventual,
-        DistanceMetric::Euclidean,
-        3,
-        None,
-    )
+        wal_reader: &wal_reader,
+        namespace: &ns,
+        query: &v2,
+        top_k: 1,
+        nprobe: 4,
+        filter: None,
+        consistency: ConsistencyLevel::Eventual,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 3,
+        cache: None,
+    })
     .await
     .unwrap();
 
@@ -462,19 +462,19 @@ async fn test_query_after_compaction() {
     writer.append(&ns, vecs, vec![]).await.unwrap();
 
     // Query before compaction (Strong)
-    let pre_result = execute_query(
+    let pre_result = execute_query(QueryParams {
         store,
-        &wal_reader,
-        &ns,
-        &query_vec,
-        5,
-        4,
-        None,
-        ConsistencyLevel::Strong,
-        DistanceMetric::Cosine,
-        3,
-        None,
-    )
+        wal_reader: &wal_reader,
+        namespace: &ns,
+        query: &query_vec,
+        top_k: 5,
+        nprobe: 4,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Cosine,
+        oversample_factor: 3,
+        cache: None,
+    })
     .await
     .unwrap();
 
@@ -486,36 +486,36 @@ async fn test_query_after_compaction() {
     compactor.compact(&ns).await.unwrap();
 
     // Query after compaction (Strong)
-    let post_strong = execute_query(
+    let post_strong = execute_query(QueryParams {
         store,
-        &wal_reader,
-        &ns,
-        &query_vec,
-        5,
-        4,
-        None,
-        ConsistencyLevel::Strong,
-        DistanceMetric::Cosine,
-        3,
-        None,
-    )
+        wal_reader: &wal_reader,
+        namespace: &ns,
+        query: &query_vec,
+        top_k: 5,
+        nprobe: 4,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Cosine,
+        oversample_factor: 3,
+        cache: None,
+    })
     .await
     .unwrap();
 
     // Query after compaction (Eventual)
-    let post_eventual = execute_query(
+    let post_eventual = execute_query(QueryParams {
         store,
-        &wal_reader,
-        &ns,
-        &query_vec,
-        5,
-        4,
-        None,
-        ConsistencyLevel::Eventual,
-        DistanceMetric::Cosine,
-        3,
-        None,
-    )
+        wal_reader: &wal_reader,
+        namespace: &ns,
+        query: &query_vec,
+        top_k: 5,
+        nprobe: 4,
+        filter: None,
+        consistency: ConsistencyLevel::Eventual,
+        distance_metric: DistanceMetric::Cosine,
+        oversample_factor: 3,
+        cache: None,
+    })
     .await
     .unwrap();
 
@@ -617,19 +617,19 @@ async fn test_compact_attributes_preserved() {
         field: "category".to_string(),
         value: AttributeValue::String("a".to_string()),
     };
-    let result = execute_query(
+    let result = execute_query(QueryParams {
         store,
-        &wal_reader,
-        &ns,
-        &query_vec,
-        30,
-        4,
-        Some(&filter),
-        ConsistencyLevel::Eventual,
-        DistanceMetric::Cosine,
-        3,
-        None,
-    )
+        wal_reader: &wal_reader,
+        namespace: &ns,
+        query: &query_vec,
+        top_k: 30,
+        nprobe: 4,
+        filter: Some(&filter),
+        consistency: ConsistencyLevel::Eventual,
+        distance_metric: DistanceMetric::Cosine,
+        oversample_factor: 3,
+        cache: None,
+    })
     .await
     .unwrap();
 

@@ -98,6 +98,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Build application state
+    let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        config.server.max_concurrent_queries,
+    ));
     let state = AppState {
         store,
         namespace_manager,
@@ -106,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: Arc::new(config.clone()),
         compactor,
         cache,
+        query_semaphore,
     };
 
     // Build router

@@ -563,7 +563,7 @@ async fn test_e2e_delete_compact_verify_gone() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 204);
 
     // Pre-compaction strong query: deleted IDs absent
     let resp = client

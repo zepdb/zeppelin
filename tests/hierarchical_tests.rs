@@ -12,7 +12,7 @@ use zeppelin::index::hierarchical::build::{build_hierarchical, load_hierarchical
 use zeppelin::index::hierarchical::tree_meta_key;
 use zeppelin::index::traits::VectorIndex;
 use zeppelin::index::HierarchicalIndex;
-use zeppelin::query::execute_query;
+use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
 use zeppelin::wal::manifest::Manifest;
 use zeppelin::wal::{WalReader, WalWriter};
@@ -521,19 +521,19 @@ async fn test_query_hierarchical_detection() {
     // Execute query through the query.rs path (detects hierarchical via tree_meta.json probe).
     let query_reader = WalReader::new(store.clone());
     let query = &centroids[0];
-    let response = execute_query(
+    let response = execute_query(QueryParams {
         store,
-        &query_reader,
-        &ns,
+        wal_reader: &query_reader,
+        namespace: &ns,
         query,
-        10,
-        4,                          // nprobe / beam_width
-        None,                       // no filter
-        ConsistencyLevel::Eventual, // skip WAL scan, just segment search
-        DistanceMetric::Euclidean,
-        3,    // oversample_factor
-        None, // no cache
-    )
+        top_k: 10,
+        nprobe: 4,                          // nprobe / beam_width
+        filter: None,                       // no filter
+        consistency: ConsistencyLevel::Eventual, // skip WAL scan, just segment search
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 3,
+        cache: None,
+    })
     .await
     .unwrap();
 
