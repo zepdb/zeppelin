@@ -278,9 +278,18 @@ impl ZeppelinStore {
         let start = std::time::Instant::now();
         let keys = self.list_prefix(prefix).await?;
         let count = keys.len();
-        for key in &keys {
-            let path = Path::parse(key)?;
-            self.inner.delete(&path).await?;
+        let inner = &self.inner;
+        let delete_futs: Vec<_> = keys
+            .iter()
+            .map(|key| async move {
+                let path = Path::parse(key)?;
+                inner.delete(&path).await?;
+                Ok::<_, ZeppelinError>(())
+            })
+            .collect();
+        let results = futures::future::join_all(delete_futs).await;
+        for result in results {
+            result?;
         }
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), count, "s3 delete_prefix");

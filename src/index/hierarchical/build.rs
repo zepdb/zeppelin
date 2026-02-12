@@ -344,25 +344,40 @@ async fn write_leaf_cluster(
     let attrs: Vec<Option<HashMap<String, AttributeValue>>> =
         vectors.iter().map(|v| v.attributes.clone()).collect();
 
+    // CPU phase: serialize all payloads.
     let cvec_data = serialize_cluster(&ids, &vecs, dim)?;
-    store
-        .put(&cluster_key(namespace, segment_id, cluster_idx), cvec_data)
-        .await?;
+    let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
 
     let cattr_data = serialize_attrs(&attrs)?;
-    store
-        .put(&attrs_key(namespace, segment_id, cluster_idx), cattr_data)
-        .await?;
+    let cattr_key = attrs_key(namespace, segment_id, cluster_idx);
 
-    // Build and write bitmap index for this leaf cluster.
-    if bitmap_index_enabled {
+    let bitmap_payload = if bitmap_index_enabled {
         let attr_refs: Vec<Option<&HashMap<String, AttributeValue>>> =
             attrs.iter().map(|a| a.as_ref()).collect();
         let bitmap_idx = crate::index::bitmap::build::build_cluster_bitmaps(&attr_refs);
         let bitmap_data = bitmap_idx.to_bytes()?;
         let bkey = crate::index::bitmap::bitmap_key(namespace, segment_id, cluster_idx);
-        store.put(&bkey, bitmap_data).await?;
-    }
+        Some((bkey, bitmap_data))
+    } else {
+        None
+    };
+
+    // I/O phase: write all artifacts in parallel.
+    let bitmap_fut = async {
+        if let Some((bkey, bitmap_data)) = bitmap_payload {
+            store.put(&bkey, bitmap_data).await
+        } else {
+            Ok(())
+        }
+    };
+    let (r1, r2, r3) = tokio::join!(
+        store.put(&cvec_key, cvec_data),
+        store.put(&cattr_key, cattr_data),
+        bitmap_fut,
+    );
+    r1?;
+    r2?;
+    r3?;
 
     Ok(())
 }
@@ -392,17 +407,33 @@ async fn write_quantized_artifacts(
                 .await?;
             debug!("wrote SQ8 calibration");
 
-            // Re-read each leaf cluster and write quantized version.
-            for i in 0..num_clusters {
-                let cluster_data = store.get(&cluster_key(namespace, segment_id, i)).await?;
+            // Phase 1: Parallel reads of all leaf clusters.
+            let read_keys: Vec<String> = (0..num_clusters)
+                .map(|i| cluster_key(namespace, segment_id, i))
+                .collect();
+            let read_futs: Vec<_> = read_keys.iter().map(|k| store.get(k)).collect();
+            let read_results = futures::future::join_all(read_futs).await;
+
+            // Phase 2: CPU — deserialize, encode, serialize.
+            let mut sq_payloads: Vec<(String, Bytes)> = Vec::with_capacity(num_clusters);
+            for (i, result) in read_results.into_iter().enumerate() {
+                let cluster_data = result?;
                 let cluster = crate::index::ivf_flat::build::deserialize_cluster(&cluster_data)?;
                 let cluster_refs: Vec<&[f32]> =
                     cluster.vectors.iter().map(|v| v.as_slice()).collect();
                 let codes = cal.encode_batch(&cluster_refs);
                 let sq_data = serialize_sq_cluster(&cluster.ids, &codes, dim)?;
-                store
-                    .put(&sq_cluster_key(namespace, segment_id, i), sq_data)
-                    .await?;
+                sq_payloads.push((sq_cluster_key(namespace, segment_id, i), sq_data));
+            }
+
+            // Phase 3: Parallel writes of all SQ8 clusters.
+            let write_futs: Vec<_> = sq_payloads
+                .iter()
+                .map(|(key, data)| store.put(key, data.clone()))
+                .collect();
+            let write_results = futures::future::join_all(write_futs).await;
+            for result in write_results {
+                result?;
             }
             info!("wrote SQ8 quantized clusters for hierarchical index");
         }
@@ -419,16 +450,33 @@ async fn write_quantized_artifacts(
                 .await?;
             debug!(m = config.pq_m, "wrote PQ codebook");
 
-            for i in 0..num_clusters {
-                let cluster_data = store.get(&cluster_key(namespace, segment_id, i)).await?;
+            // Phase 1: Parallel reads of all leaf clusters.
+            let read_keys: Vec<String> = (0..num_clusters)
+                .map(|i| cluster_key(namespace, segment_id, i))
+                .collect();
+            let read_futs: Vec<_> = read_keys.iter().map(|k| store.get(k)).collect();
+            let read_results = futures::future::join_all(read_futs).await;
+
+            // Phase 2: CPU — deserialize, encode, serialize.
+            let mut pq_payloads: Vec<(String, Bytes)> = Vec::with_capacity(num_clusters);
+            for (i, result) in read_results.into_iter().enumerate() {
+                let cluster_data = result?;
                 let cluster = crate::index::ivf_flat::build::deserialize_cluster(&cluster_data)?;
                 let cluster_refs: Vec<&[f32]> =
                     cluster.vectors.iter().map(|v| v.as_slice()).collect();
                 let codes = codebook.encode_batch(&cluster_refs);
                 let pq_data = serialize_pq_cluster(&cluster.ids, &codes, config.pq_m)?;
-                store
-                    .put(&pq_cluster_key(namespace, segment_id, i), pq_data)
-                    .await?;
+                pq_payloads.push((pq_cluster_key(namespace, segment_id, i), pq_data));
+            }
+
+            // Phase 3: Parallel writes of all PQ clusters.
+            let write_futs: Vec<_> = pq_payloads
+                .iter()
+                .map(|(key, data)| store.put(key, data.clone()))
+                .collect();
+            let write_results = futures::future::join_all(write_futs).await;
+            for result in write_results {
+                result?;
             }
             info!(
                 m = config.pq_m,

@@ -321,19 +321,18 @@ pub async fn build_ivf_flat(
     store.put(&ckey, centroids_data).await?;
     debug!(key = %ckey, "wrote centroids");
 
-    // Write per-cluster data (always write full-precision as ground truth).
+    // CPU phase: pre-serialize all cluster payloads.
     let mut bitmap_fields_set = std::collections::HashSet::new();
+    let mut cluster_payloads: Vec<(String, Bytes, String, Bytes, Option<(String, Bytes)>)> =
+        Vec::with_capacity(num_clusters);
     for i in 0..num_clusters {
         let cvec_data = serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?;
         let cvec_key = cluster_key(namespace, segment_id, i);
-        store.put(&cvec_key, cvec_data).await?;
 
         let cattr_data = serialize_attrs(&cluster_attrs[i])?;
         let cattr_key = attrs_key(namespace, segment_id, i);
-        store.put(&cattr_key, cattr_data).await?;
 
-        // Build and write bitmap index for this cluster.
-        if config.bitmap_index {
+        let bitmap = if config.bitmap_index {
             let attr_refs: Vec<Option<&HashMap<String, AttributeValue>>> =
                 cluster_attrs[i].iter().map(|a| a.as_ref()).collect();
             let bitmap_index = crate::index::bitmap::build::build_cluster_bitmaps(&attr_refs);
@@ -342,12 +341,29 @@ pub async fn build_ivf_flat(
             }
             let bitmap_data = bitmap_index.to_bytes()?;
             let bkey = crate::index::bitmap::bitmap_key(namespace, segment_id, i);
-            store.put(&bkey, bitmap_data).await?;
-        }
+            Some((bkey, bitmap_data))
+        } else {
+            None
+        };
 
-        debug!(cluster = i, key = %cvec_key, "wrote cluster data");
+        cluster_payloads.push((cvec_key, cvec_data, cattr_key, cattr_data, bitmap));
     }
     let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
+
+    // I/O phase: write all cluster data in parallel.
+    let mut write_futs = Vec::new();
+    for (cvec_key, cvec_data, cattr_key, cattr_data, bitmap) in &cluster_payloads {
+        write_futs.push(store.put(cvec_key, cvec_data.clone()));
+        write_futs.push(store.put(cattr_key, cattr_data.clone()));
+        if let Some((bkey, bitmap_data)) = bitmap {
+            write_futs.push(store.put(bkey, bitmap_data.clone()));
+        }
+    }
+    let results = futures::future::join_all(write_futs).await;
+    for result in results {
+        result?;
+    }
+    debug!(num_clusters, "wrote all cluster data");
 
     // --- Step 4: Write quantized artifacts (if configured) ---
     match quantization {
@@ -364,15 +380,24 @@ pub async fn build_ivf_flat(
                 .await?;
             debug!("wrote SQ8 calibration");
 
-            // Write quantized cluster data.
+            // CPU phase: encode all clusters.
+            let mut sq_payloads: Vec<(String, Bytes)> = Vec::with_capacity(num_clusters);
             for i in 0..num_clusters {
                 let cluster_refs: Vec<&[f32]> =
                     cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
                 let codes = cal.encode_batch(&cluster_refs);
                 let sq_data = serialize_sq_cluster(&cluster_ids[i], &codes, dim)?;
-                store
-                    .put(&sq_cluster_key(namespace, segment_id, i), sq_data)
-                    .await?;
+                sq_payloads.push((sq_cluster_key(namespace, segment_id, i), sq_data));
+            }
+
+            // I/O phase: write all SQ8 clusters in parallel.
+            let write_futs: Vec<_> = sq_payloads
+                .iter()
+                .map(|(key, data)| store.put(key, data.clone()))
+                .collect();
+            let results = futures::future::join_all(write_futs).await;
+            for result in results {
+                result?;
             }
             info!("wrote SQ8 quantized clusters");
         }
@@ -390,15 +415,24 @@ pub async fn build_ivf_flat(
                 .await?;
             debug!(m = pq_m, "wrote PQ codebook");
 
-            // Write PQ-encoded cluster data.
+            // CPU phase: encode all clusters.
+            let mut pq_payloads: Vec<(String, Bytes)> = Vec::with_capacity(num_clusters);
             for i in 0..num_clusters {
                 let cluster_refs: Vec<&[f32]> =
                     cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
                 let codes = codebook.encode_batch(&cluster_refs);
                 let pq_data = serialize_pq_cluster(&cluster_ids[i], &codes, pq_m)?;
-                store
-                    .put(&pq_cluster_key(namespace, segment_id, i), pq_data)
-                    .await?;
+                pq_payloads.push((pq_cluster_key(namespace, segment_id, i), pq_data));
+            }
+
+            // I/O phase: write all PQ clusters in parallel.
+            let write_futs: Vec<_> = pq_payloads
+                .iter()
+                .map(|(key, data)| store.put(key, data.clone()))
+                .collect();
+            let results = futures::future::join_all(write_futs).await;
+            for result in results {
+                result?;
             }
             info!(m = pq_m, "wrote PQ-encoded clusters");
         }
