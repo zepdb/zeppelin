@@ -43,14 +43,22 @@ fn reference_merge(fragments: &[TestFragment]) -> HashMap<String, TestVector> {
     for frag in fragments {
         // Collect deletes and upserts separately, matching real WalFragment
         // semantics where deletes and vectors are separate fields.
-        let frag_deletes: Vec<&String> = frag.ops.iter().filter_map(|op| match op {
-            Op::Delete(id) => Some(id),
-            _ => None,
-        }).collect();
-        let frag_upserts: Vec<&TestVector> = frag.ops.iter().filter_map(|op| match op {
-            Op::Upsert(v) => Some(v),
-            _ => None,
-        }).collect();
+        let frag_deletes: Vec<&String> = frag
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Delete(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        let frag_upserts: Vec<&TestVector> = frag
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Upsert(v) => Some(v),
+                _ => None,
+            })
+            .collect();
 
         // Process deletes first (matches production fragment semantics)
         for id in frag_deletes {
