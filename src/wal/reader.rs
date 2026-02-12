@@ -56,13 +56,21 @@ impl WalReader {
         namespace: &str,
         refs: &[FragmentRef],
     ) -> Result<Vec<WalFragment>> {
+        // Parallel prefetch all fragments concurrently.
+        let results = futures::future::join_all(
+            refs.iter()
+                .map(|fref| self.read_fragment(namespace, &fref.id)),
+        )
+        .await;
+
+        // Process results in order — ordering is preserved by join_all.
         let mut fragments = Vec::new();
-        for fref in refs {
-            match self.read_fragment(namespace, &fref.id).await {
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
                 Ok(fragment) => fragments.push(fragment),
                 Err(ZeppelinError::NotFound { key }) => {
                     warn!(
-                        fragment_id = %fref.id,
+                        fragment_id = %refs[i].id,
                         key = %key,
                         "fragment not found (likely deferred deletion), skipping"
                     );

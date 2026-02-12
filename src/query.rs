@@ -416,10 +416,22 @@ async fn segment_bm25_search(
         (f32, Option<HashMap<String, crate::types::AttributeValue>>),
     > = HashMap::new();
 
-    // Search each cluster's inverted index
-    for cluster_idx in 0..num_clusters {
+    // Parallel prefetch all cluster data (fts index, attrs, cluster vectors).
+    let prefetched = futures::future::join_all((0..num_clusters).map(|cluster_idx| {
         let fts_key = fts_index_key(namespace, segment_id, cluster_idx);
-        let fts_data = match store.get(&fts_key).await {
+        let akey = attrs_key(namespace, segment_id, cluster_idx);
+        let ckey = crate::index::ivf_flat::build::cluster_key(namespace, segment_id, cluster_idx);
+        async move {
+            let (fts_res, attrs_res, cluster_res) =
+                tokio::join!(store.get(&fts_key), store.get(&akey), store.get(&ckey),);
+            (cluster_idx, fts_res, attrs_res, cluster_res)
+        }
+    }))
+    .await;
+
+    // Process prefetched results — CPU-bound, no I/O.
+    for (_cluster_idx, fts_res, attrs_res, cluster_res) in prefetched {
+        let fts_data = match fts_res {
             Ok(data) => data,
             Err(crate::error::ZeppelinError::NotFound { .. }) => continue,
             Err(e) => return Err(e),
@@ -427,17 +439,16 @@ async fn segment_bm25_search(
 
         let inv_index = InvertedIndex::from_bytes(&fts_data)?;
 
-        // Load attribute data for this cluster to get doc IDs and attributes
-        let akey = attrs_key(namespace, segment_id, cluster_idx);
-        let attrs_data = match store.get(&akey).await {
+        let attrs_data = match attrs_res {
             Ok(data) => data,
             Err(_) => continue,
         };
         let cluster_attrs = deserialize_attrs(&attrs_data)?;
 
-        // Load cluster to get IDs
-        let ckey = crate::index::ivf_flat::build::cluster_key(namespace, segment_id, cluster_idx);
-        let cluster_data = store.get(&ckey).await?;
+        let cluster_data = match cluster_res {
+            Ok(data) => data,
+            Err(e) => return Err(e),
+        };
         let cluster = crate::index::ivf_flat::build::deserialize_cluster(&cluster_data)?;
 
         // For each field+query, search the inverted index

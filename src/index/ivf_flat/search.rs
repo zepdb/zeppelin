@@ -214,12 +214,34 @@ async fn scan_clusters_flat(
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
-    let mut candidates = Vec::new();
     let has_bitmaps = !index.bitmap_fields.is_empty();
 
-    for &cluster_idx in probe_clusters {
+    // Phase 1: Parallel prefetch — all S3 I/O fires concurrently.
+    let prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
-        let cluster_data = match fetch_with_cache(cache, store, &cvec_key).await {
+        async move {
+            let (cluster_res, prefilter, attrs) = tokio::join!(
+                fetch_with_cache(cache, store, &cvec_key),
+                try_bitmap_prefilter(
+                    &index.namespace,
+                    &index.segment_id,
+                    cluster_idx,
+                    filter,
+                    has_bitmaps,
+                    store,
+                    cache,
+                ),
+                load_attrs(index, cluster_idx, filter, store, cache),
+            );
+            (cluster_idx, cluster_res, prefilter, attrs)
+        }
+    }))
+    .await;
+
+    // Phase 2: Sequential compute — CPU-bound, no I/O.
+    let mut candidates = Vec::new();
+    for (cluster_idx, cluster_res, prefilter, attrs) in prefetched {
+        let cluster_data = match cluster_res {
             Ok(data) => data,
             Err(e) => {
                 warn!(cluster = cluster_idx, error = %e, "failed to read cluster, skipping");
@@ -228,22 +250,7 @@ async fn scan_clusters_flat(
         };
         let cluster = deserialize_cluster(&cluster_data)?;
 
-        // Try bitmap pre-filter: skip distance computation for non-matching vectors.
-        let prefilter = try_bitmap_prefilter(
-            &index.namespace,
-            &index.segment_id,
-            cluster_idx,
-            filter,
-            has_bitmaps,
-            store,
-            cache,
-        )
-        .await;
-
-        let attrs = load_attrs(index, cluster_idx, filter, store, cache).await;
-
         for (j, vec) in cluster.vectors.iter().enumerate() {
-            // If bitmap pre-filter is active, skip vectors not in the bitmap.
             if let Some(ref bm) = prefilter {
                 if !bm.contains(j as u32) {
                     continue;
@@ -286,29 +293,35 @@ async fn scan_clusters_sq(
     let cal_data = fetch_with_cache(cache, store, &cal_key).await?;
     let calibration = SqCalibration::from_bytes(&cal_data)?;
 
-    // Phase 1: Coarse ranking with quantized distances.
-    let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new(); // (id, approx_score, cluster_idx)
+    // Phase 1: Coarse ranking with quantized distances — parallel prefetch.
     let has_bitmaps = !index.bitmap_fields.is_empty();
 
-    for &cluster_idx in probe_clusters {
-        // Try bitmap pre-filter for this cluster.
-        let prefilter = try_bitmap_prefilter(
-            &index.namespace,
-            &index.segment_id,
-            cluster_idx,
-            filter,
-            has_bitmaps,
-            store,
-            cache,
-        )
-        .await;
-
+    let coarse_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let sq_key = sq_cluster_key(&index.namespace, &index.segment_id, cluster_idx);
-        let sq_data = match fetch_with_cache(cache, store, &sq_key).await {
+        async move {
+            let (prefilter, sq_res) = tokio::join!(
+                try_bitmap_prefilter(
+                    &index.namespace,
+                    &index.segment_id,
+                    cluster_idx,
+                    filter,
+                    has_bitmaps,
+                    store,
+                    cache,
+                ),
+                fetch_with_cache(cache, store, &sq_key),
+            );
+            (cluster_idx, prefilter, sq_res)
+        }
+    }))
+    .await;
+
+    let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
+    for (cluster_idx, prefilter, sq_res) in coarse_prefetched {
+        let sq_data = match sq_res {
             Ok(data) => data,
             Err(e) => {
                 warn!(cluster = cluster_idx, error = %e, "failed to read SQ cluster, falling back to flat");
-                // Fallback: use full-precision for this cluster.
                 let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
                 if let Ok(data) = fetch_with_cache(cache, store, &cvec_key).await {
                     let cluster = deserialize_cluster(&data)?;
@@ -351,8 +364,7 @@ async fn scan_clusters_sq(
         "SQ8 coarse ranking complete, starting rerank"
     );
 
-    // Phase 2: Rerank with full-precision vectors.
-    // Group candidates by cluster for batch loading.
+    // Phase 2: Rerank with full-precision vectors — parallel prefetch.
     let mut cluster_candidates: HashMap<usize, Vec<String>> = HashMap::new();
     for (id, _, cluster_idx) in &coarse_candidates {
         cluster_candidates
@@ -361,16 +373,27 @@ async fn scan_clusters_sq(
             .push(id.clone());
     }
 
-    let mut candidates = Vec::new();
+    let rerank_prefetched =
+        futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
+            let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+            let needed_ids = needed_ids.clone();
+            async move {
+                let (cluster_res, attrs) = tokio::join!(
+                    fetch_with_cache(cache, store, &cvec_key),
+                    load_attrs(index, cluster_idx, filter, store, cache),
+                );
+                (cluster_idx, needed_ids, cluster_res, attrs)
+            }
+        }))
+        .await;
 
-    for (cluster_idx, needed_ids) in &cluster_candidates {
-        let cvec_key = cluster_key(&index.namespace, &index.segment_id, *cluster_idx);
-        let cluster_data = match fetch_with_cache(cache, store, &cvec_key).await {
+    let mut candidates = Vec::new();
+    for (_, needed_ids, cluster_res, attrs) in rerank_prefetched {
+        let cluster_data = match cluster_res {
             Ok(data) => data,
             Err(_) => continue,
         };
         let cluster = deserialize_cluster(&cluster_data)?;
-        let attrs = load_attrs(index, *cluster_idx, filter, store, cache).await;
 
         let needed_set: std::collections::HashSet<&str> =
             needed_ids.iter().map(|s| s.as_str()).collect();
@@ -416,25 +439,32 @@ async fn scan_clusters_pq(
     // Precompute ADC lookup table.
     let adc_table = codebook.build_adc_table(query, distance_metric);
 
-    // Phase 1: Coarse ranking with PQ distances.
-    let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
+    // Phase 1: Coarse ranking with PQ distances — parallel prefetch.
     let has_bitmaps = !index.bitmap_fields.is_empty();
 
-    for &cluster_idx in probe_clusters {
-        // Try bitmap pre-filter for this cluster.
-        let prefilter = try_bitmap_prefilter(
-            &index.namespace,
-            &index.segment_id,
-            cluster_idx,
-            filter,
-            has_bitmaps,
-            store,
-            cache,
-        )
-        .await;
-
+    let coarse_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let pq_key = pq_cluster_key(&index.namespace, &index.segment_id, cluster_idx);
-        let pq_data = match fetch_with_cache(cache, store, &pq_key).await {
+        async move {
+            let (prefilter, pq_res) = tokio::join!(
+                try_bitmap_prefilter(
+                    &index.namespace,
+                    &index.segment_id,
+                    cluster_idx,
+                    filter,
+                    has_bitmaps,
+                    store,
+                    cache,
+                ),
+                fetch_with_cache(cache, store, &pq_key),
+            );
+            (cluster_idx, prefilter, pq_res)
+        }
+    }))
+    .await;
+
+    let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
+    for (cluster_idx, prefilter, pq_res) in coarse_prefetched {
+        let pq_data = match pq_res {
             Ok(data) => data,
             Err(e) => {
                 warn!(cluster = cluster_idx, error = %e, "failed to read PQ cluster, skipping");
@@ -465,7 +495,7 @@ async fn scan_clusters_pq(
         "PQ coarse ranking complete, starting rerank"
     );
 
-    // Phase 2: Rerank with full-precision vectors.
+    // Phase 2: Rerank with full-precision vectors — parallel prefetch.
     let mut cluster_candidates: HashMap<usize, Vec<String>> = HashMap::new();
     for (id, _, cluster_idx) in &coarse_candidates {
         cluster_candidates
@@ -474,16 +504,27 @@ async fn scan_clusters_pq(
             .push(id.clone());
     }
 
-    let mut candidates = Vec::new();
+    let rerank_prefetched =
+        futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
+            let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+            let needed_ids = needed_ids.clone();
+            async move {
+                let (cluster_res, attrs) = tokio::join!(
+                    fetch_with_cache(cache, store, &cvec_key),
+                    load_attrs(index, cluster_idx, filter, store, cache),
+                );
+                (needed_ids, cluster_res, attrs)
+            }
+        }))
+        .await;
 
-    for (cluster_idx, needed_ids) in &cluster_candidates {
-        let cvec_key = cluster_key(&index.namespace, &index.segment_id, *cluster_idx);
-        let cluster_data = match fetch_with_cache(cache, store, &cvec_key).await {
+    let mut candidates = Vec::new();
+    for (needed_ids, cluster_res, attrs) in rerank_prefetched {
+        let cluster_data = match cluster_res {
             Ok(data) => data,
             Err(_) => continue,
         };
         let cluster = deserialize_cluster(&cluster_data)?;
-        let attrs = load_attrs(index, *cluster_idx, filter, store, cache).await;
 
         let needed_set: std::collections::HashSet<&str> =
             needed_ids.iter().map(|s| s.as_str()).collect();
