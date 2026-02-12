@@ -127,9 +127,7 @@ pub async fn query_namespace(
             }));
         }
 
-        let nprobe = req
-            .nprobe
-            .unwrap_or(state.config.indexing.default_nprobe);
+        let nprobe = req.nprobe.unwrap_or(state.config.indexing.default_nprobe);
         if nprobe > state.config.indexing.max_nprobe {
             return Err(ApiError(ZeppelinError::Validation(format!(
                 "nprobe {} exceeds maximum of {}",

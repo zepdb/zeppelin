@@ -33,11 +33,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/v1/namespaces/:ns/query",
-            post(query::query_namespace)
-                .layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    middleware::concurrency_limit,
-                )),
+            post(query::query_namespace).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                middleware::concurrency_limit,
+            )),
         )
         .layer(axum::middleware::from_fn(middleware::http_metrics))
         .layer(TimeoutLayer::new(timeout))
