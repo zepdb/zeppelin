@@ -266,7 +266,7 @@ async fn test_fts_e2e_delete_and_requery() {
 
     // Delete d1
     client
-        .post(format!("{base_url}/v1/namespaces/{ns}/vectors/delete"))
+        .delete(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({ "ids": [format!("{ns}_d1")] }))
         .send()
         .await
@@ -459,7 +459,7 @@ async fn test_fts_e2e_stemming() {
         .json(&serde_json::json!({
             "vectors": [
                 { "id": format!("{ns}_d1"), "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "running quickly" } },
-                { "id": format!("{ns}_d2"), "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "runner fast" } },
+                { "id": format!("{ns}_d2"), "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "runs fast" } },
                 { "id": format!("{ns}_d3"), "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "swimming slowly" } }
             ]
         }))
@@ -467,11 +467,11 @@ async fn test_fts_e2e_stemming() {
         .await
         .unwrap();
 
-    // "runs" should match "running" and "runner" via stemming
+    // "running" stems to "run", "runs" stems to "run" — both match
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/query"))
         .json(&serde_json::json!({
-            "rank_by": ["content", "BM25", "runs"],
+            "rank_by": ["content", "BM25", "running"],
             "top_k": 10,
             "consistency": "strong"
         }))
@@ -480,7 +480,7 @@ async fn test_fts_e2e_stemming() {
         .unwrap();
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
-    assert_eq!(results.len(), 2, "stemming: 'runs' matches 'running' and 'runner'");
+    assert_eq!(results.len(), 2, "stemming: 'running' matches 'running' and 'runs' (both stem to 'run')");
 
     cleanup_ns(&harness.store, &ns).await;
 }

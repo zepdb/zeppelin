@@ -730,7 +730,7 @@ async fn test_fts_last_as_prefix() {
     let docs = vec![
         content_doc("doc1", "programming programs programmer"),
         content_doc("doc2", "testing testable tester"),
-        content_doc("doc3", "production product productivity"),
+        content_doc("doc3", "progress progressive progression"),
     ];
     upsert_docs(&client, &base_url, &ns, &docs).await;
 
@@ -755,7 +755,7 @@ async fn test_fts_last_as_prefix() {
     );
     assert!(
         ids.contains(&"doc3".to_string()),
-        "doc3 should match prefix 'prog' (production, product, productivity)"
+        "doc3 should match prefix 'prog' (progress, progressive, progression)"
     );
     assert!(
         !ids.contains(&"doc2".to_string()),

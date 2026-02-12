@@ -286,6 +286,7 @@ pub async fn execute_bm25_query(
 
     // WAL BM25 scan (always for Strong, never for Eventual)
     let wal_start = std::time::Instant::now();
+    let mut wal_deleted_ids = std::collections::HashSet::new();
     let wal_results = match consistency {
         ConsistencyLevel::Strong => {
             let refs = manifest.uncompacted_fragments().to_vec();
@@ -294,7 +295,18 @@ pub async fn execute_bm25_query(
                 .await?;
             let scan_result = wal_bm25_scan(&fragments, rank_by, fts_configs, last_as_prefix);
             scanned_fragments = scan_result.fragment_count;
-            scan_result.results
+            wal_deleted_ids = scan_result.deleted_ids;
+            // Apply post-filter to WAL results
+            let mut results = scan_result.results;
+            if let Some(f) = filter {
+                results.retain(|r| {
+                    match &r.attributes {
+                        Some(attrs) => crate::index::filter::evaluate_filter(f, attrs),
+                        None => false,
+                    }
+                });
+            }
+            results
         }
         ConsistencyLevel::Eventual => Vec::new(),
     };
@@ -343,7 +355,8 @@ pub async fn execute_bm25_query(
     );
 
     // Merge results — BM25 is higher-is-better
-    let results = merge_bm25_results(wal_results, segment_results, top_k, consistency);
+    // Pass deleted IDs so segment results for deleted docs are excluded
+    let results = merge_bm25_results(wal_results, segment_results, top_k, consistency, &wal_deleted_ids);
 
     Ok(QueryResponse {
         results,
@@ -486,11 +499,14 @@ async fn segment_bm25_search(
 }
 
 /// Merge BM25 WAL and segment results (higher score = better).
+/// `wal_deleted_ids` contains IDs explicitly deleted in the WAL — these must
+/// not appear in the final results even if they exist in the segment.
 fn merge_bm25_results(
     wal_results: Vec<SearchResult>,
     segment_results: Vec<SearchResult>,
     top_k: usize,
     consistency: ConsistencyLevel,
+    wal_deleted_ids: &HashSet<String>,
 ) -> Vec<SearchResult> {
     match consistency {
         ConsistencyLevel::Strong => {
@@ -498,7 +514,8 @@ fn merge_bm25_results(
             let mut merged: Vec<SearchResult> = wal_results;
 
             for sr in segment_results {
-                if !wal_ids.contains(&sr.id) {
+                // Exclude if WAL has a newer version OR if explicitly deleted
+                if !wal_ids.contains(&sr.id) && !wal_deleted_ids.contains(&sr.id) {
                     merged.push(sr);
                 }
             }

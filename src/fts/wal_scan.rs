@@ -21,6 +21,9 @@ type DocFieldData = HashMap<String, HashMap<String, (u32, HashMap<String, u32>)>
 pub struct WalBm25ScanResult {
     pub results: Vec<SearchResult>,
     pub fragment_count: usize,
+    /// IDs that were explicitly deleted in the WAL.
+    /// Used by the merge step to exclude these from segment results.
+    pub deleted_ids: HashSet<String>,
 }
 
 /// Brute-force BM25 scan over WAL fragments.
@@ -42,6 +45,7 @@ pub fn wal_bm25_scan(
         return WalBm25ScanResult {
             results: Vec::new(),
             fragment_count: 0,
+            deleted_ids: HashSet::new(),
         };
     }
 
@@ -67,6 +71,7 @@ pub fn wal_bm25_scan(
         return WalBm25ScanResult {
             results: Vec::new(),
             fragment_count: frag_count,
+            deleted_ids,
         };
     }
 
@@ -104,6 +109,7 @@ pub fn wal_bm25_scan(
         return WalBm25ScanResult {
             results: Vec::new(),
             fragment_count: frag_count,
+            deleted_ids,
         };
     }
 
@@ -201,15 +207,35 @@ pub fn wal_bm25_scan(
                 None => continue,
             };
 
-            // Compute BM25 score for this doc in this field
+            // Compute BM25 score for this doc in this field.
+            // For prefix mode, the last query token matches any doc token
+            // that starts with it (e.g., "prog" matches "programming").
+            let last_idx = fq_state.query_tokens.len().saturating_sub(1);
             let term_data: Vec<(f32, u32)> = fq_state
                 .query_tokens
                 .iter()
-                .map(|token| {
-                    let global_df = corpus.term_doc_freqs.get(token).copied().unwrap_or(0);
-                    let term_idf = bm25::idf(corpus.doc_count, global_df);
-                    let tf = tf_map.get(token).copied().unwrap_or(0);
-                    (term_idf, tf)
+                .enumerate()
+                .map(|(i, token)| {
+                    if last_as_prefix && i == last_idx {
+                        // Prefix match: sum TF across all doc tokens starting with this prefix
+                        let mut total_tf = 0u32;
+                        let mut total_df = 0u32;
+                        for (doc_term, &freq) in tf_map.iter() {
+                            if doc_term.starts_with(token.as_str()) {
+                                total_tf += freq;
+                                total_df = total_df.max(
+                                    corpus.term_doc_freqs.get(doc_term).copied().unwrap_or(0),
+                                );
+                            }
+                        }
+                        let term_idf = bm25::idf(corpus.doc_count, total_df);
+                        (term_idf, total_tf)
+                    } else {
+                        let global_df = corpus.term_doc_freqs.get(token).copied().unwrap_or(0);
+                        let term_idf = bm25::idf(corpus.doc_count, global_df);
+                        let tf = tf_map.get(token).copied().unwrap_or(0);
+                        (term_idf, tf)
+                    }
                 })
                 .collect();
 
@@ -248,6 +274,7 @@ pub fn wal_bm25_scan(
     WalBm25ScanResult {
         results,
         fragment_count: frag_count,
+        deleted_ids,
     }
 }
 
