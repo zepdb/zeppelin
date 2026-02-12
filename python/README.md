@@ -1,4 +1,6 @@
-# Zeppelin Python Client
+# Zeppelin Python Client (DEPRECATED)
+
+> **This client has moved to `clients/python/`.** The new SDK adds async support, BM25/FTS queries, filter builders, and RankBy builders. Please use `clients/python/` for new projects.
 
 Python client for the [Zeppelin](https://github.com/Ghatage/stormcrow) vector search engine.
 

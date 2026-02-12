@@ -88,6 +88,26 @@ curl -s -X DELETE http://localhost:8080/v1/namespaces/my-vectors/vectors \
 | `DELETE` | `/v1/namespaces/:ns/vectors`      | Delete vectors         |
 | `POST`   | `/v1/namespaces/:ns/query`        | Query nearest neighbors|
 
+## Client SDKs
+
+Official client libraries for Zeppelin:
+
+| SDK | Package | Install | Docs |
+|-----|---------|---------|------|
+| Python | `zeppelin-python` | `pip install zeppelin-python` | [clients/python/README.md](clients/python/README.md) |
+| TypeScript | `zeppelin-typescript` | `npm install zeppelin-typescript` | [clients/typescript/README.md](clients/typescript/README.md) |
+
+Both SDKs cover all 9 API endpoints with full support for:
+- Vector similarity search (ANN) with filters
+- BM25 full-text search with `rank_by` S-expressions
+- Composable filter builders (eq, range, in, contains, and/or/not, ...)
+- FTS namespace configuration (`FtsFieldConfig`)
+- Typed error hierarchy (Validation, NotFound, Conflict, Server)
+
+The Python SDK also provides an async client (`AsyncZeppelinClient`).
+
+An [OpenAPI 3.1 spec](clients/openapi/zeppelin-api.yaml) is available as the canonical API reference.
+
 ## Development
 
 ### Prerequisites

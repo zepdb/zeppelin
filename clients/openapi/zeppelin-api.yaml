@@ -1,0 +1,708 @@
+openapi: 3.1.0
+info:
+  title: Zeppelin Vector Search API
+  description: S3-native vector search engine with BM25 full-text search support.
+  version: 0.2.0
+  license:
+    name: Apache-2.0
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      summary: Health check
+      description: Returns server health status. Always returns 200 if the process is running.
+      tags: [Health]
+      responses:
+        "200":
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /readyz:
+    get:
+      operationId: readinessCheck
+      summary: Readiness check
+      description: Verifies S3 connectivity. Returns 503 if the storage backend is unreachable.
+      tags: [Health]
+      responses:
+        "200":
+          description: Server is ready
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, s3_connected]
+                properties:
+                  status:
+                    type: string
+                    example: ready
+                  s3_connected:
+                    type: boolean
+                    example: true
+        "503":
+          description: Server is not ready
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, s3_connected]
+                properties:
+                  status:
+                    type: string
+                    example: not_ready
+                  s3_connected:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus metrics
+      description: Returns Prometheus-formatted metrics.
+      tags: [Health]
+      responses:
+        "200":
+          description: Prometheus metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/namespaces:
+    post:
+      operationId: createNamespace
+      summary: Create a namespace
+      description: Creates a new namespace with the specified dimensions and distance metric.
+      tags: [Namespaces]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateNamespaceRequest"
+      responses:
+        "201":
+          description: Namespace created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+
+    get:
+      operationId: listNamespaces
+      summary: List namespaces
+      description: Returns all namespaces.
+      tags: [Namespaces]
+      responses:
+        "200":
+          description: List of namespaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NamespaceResponse"
+
+  /v1/namespaces/{ns}:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    get:
+      operationId: getNamespace
+      summary: Get namespace
+      description: Returns metadata for a single namespace.
+      tags: [Namespaces]
+      responses:
+        "200":
+          description: Namespace metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceResponse"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+    delete:
+      operationId: deleteNamespace
+      summary: Delete namespace
+      description: Deletes a namespace and all its data.
+      tags: [Namespaces]
+      responses:
+        "204":
+          description: Namespace deleted
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /v1/namespaces/{ns}/vectors:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    post:
+      operationId: upsertVectors
+      summary: Upsert vectors
+      description: Insert or update vectors in a namespace. Vectors with existing IDs are overwritten.
+      tags: [Vectors]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertVectorsRequest"
+      responses:
+        "200":
+          description: Vectors upserted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [upserted]
+                properties:
+                  upserted:
+                    type: integer
+                    example: 100
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+    delete:
+      operationId: deleteVectors
+      summary: Delete vectors
+      description: Delete vectors by ID from a namespace.
+      tags: [Vectors]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteVectorsRequest"
+      responses:
+        "200":
+          description: Vectors deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: integer
+                    example: 5
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /v1/namespaces/{ns}/query:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    post:
+      operationId: queryNamespace
+      summary: Query vectors
+      description: |
+        Run a vector similarity search or BM25 full-text search.
+        Exactly one of `vector` or `rank_by` must be provided.
+      tags: [Query]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+      responses:
+        "200":
+          description: Query results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+components:
+  parameters:
+    NamespacePath:
+      name: ns
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Namespace name
+
+  responses:
+    ValidationError:
+      description: Validation error (400)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFoundError:
+      description: Resource not found (404)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ConflictError:
+      description: Resource conflict (409)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error, status]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+        status:
+          type: integer
+          description: HTTP status code
+      example:
+        error: "namespace 'test' not found"
+        status: 404
+
+    DistanceMetric:
+      type: string
+      enum: [cosine, euclidean, dot_product]
+      default: cosine
+
+    ConsistencyLevel:
+      type: string
+      enum: [strong, eventual]
+      default: strong
+
+    FtsLanguage:
+      type: string
+      enum: [english]
+      default: english
+
+    AttributeValue:
+      description: |
+        A scalar or array attribute value. One of:
+        - string
+        - integer (int64)
+        - number (float64)
+        - boolean
+        - array of strings
+        - array of integers
+        - array of numbers
+      oneOf:
+        - type: string
+        - type: integer
+          format: int64
+        - type: number
+          format: double
+        - type: boolean
+        - type: array
+          items:
+            type: string
+        - type: array
+          items:
+            type: integer
+            format: int64
+        - type: array
+          items:
+            type: number
+            format: double
+
+    FtsFieldConfig:
+      type: object
+      description: Per-field configuration for full-text search.
+      properties:
+        language:
+          $ref: "#/components/schemas/FtsLanguage"
+        stemming:
+          type: boolean
+          default: true
+          description: Whether to apply stemming (e.g., "running" -> "run").
+        remove_stopwords:
+          type: boolean
+          default: true
+          description: Whether to remove common stopwords.
+        case_sensitive:
+          type: boolean
+          default: false
+          description: Whether matching is case-sensitive.
+        k1:
+          type: number
+          format: float
+          default: 1.2
+          description: "BM25 k1 parameter: term frequency saturation."
+        b:
+          type: number
+          format: float
+          default: 0.75
+          description: "BM25 b parameter: length normalization."
+        max_token_length:
+          type: integer
+          default: 40
+          description: Maximum token length; tokens exceeding this are discarded.
+
+    Filter:
+      type: object
+      required: [op]
+      description: |
+        Filter condition discriminated by the `op` field. Supported operators:
+        - `eq`: Exact match on a field
+        - `not_eq`: Not equal
+        - `range`: Numeric range (gte, lte, gt, lt)
+        - `in`: Field value is one of the given values
+        - `not_in`: Field value is not one of the given values
+        - `contains`: Array field contains the given value
+        - `contains_all_tokens`: All tokens must be present (order-independent)
+        - `contains_token_sequence`: Tokens must appear as exact phrase
+        - `and`: All sub-filters must match
+        - `or`: Any sub-filter must match
+        - `not`: Negate a sub-filter
+      discriminator:
+        propertyName: op
+        mapping:
+          eq: "#/components/schemas/FilterEq"
+          not_eq: "#/components/schemas/FilterNotEq"
+          range: "#/components/schemas/FilterRange"
+          in: "#/components/schemas/FilterIn"
+          not_in: "#/components/schemas/FilterNotIn"
+          contains: "#/components/schemas/FilterContains"
+          contains_all_tokens: "#/components/schemas/FilterContainsAllTokens"
+          contains_token_sequence: "#/components/schemas/FilterContainsTokenSequence"
+          and: "#/components/schemas/FilterAnd"
+          or: "#/components/schemas/FilterOr"
+          not: "#/components/schemas/FilterNot"
+      oneOf:
+        - $ref: "#/components/schemas/FilterEq"
+        - $ref: "#/components/schemas/FilterNotEq"
+        - $ref: "#/components/schemas/FilterRange"
+        - $ref: "#/components/schemas/FilterIn"
+        - $ref: "#/components/schemas/FilterNotIn"
+        - $ref: "#/components/schemas/FilterContains"
+        - $ref: "#/components/schemas/FilterContainsAllTokens"
+        - $ref: "#/components/schemas/FilterContainsTokenSequence"
+        - $ref: "#/components/schemas/FilterAnd"
+        - $ref: "#/components/schemas/FilterOr"
+        - $ref: "#/components/schemas/FilterNot"
+
+    FilterEq:
+      type: object
+      required: [op, field, value]
+      properties:
+        op:
+          type: string
+          const: eq
+        field:
+          type: string
+        value:
+          $ref: "#/components/schemas/AttributeValue"
+
+    FilterNotEq:
+      type: object
+      required: [op, field, value]
+      properties:
+        op:
+          type: string
+          const: not_eq
+        field:
+          type: string
+        value:
+          $ref: "#/components/schemas/AttributeValue"
+
+    FilterRange:
+      type: object
+      required: [op, field]
+      properties:
+        op:
+          type: string
+          const: range
+        field:
+          type: string
+        gte:
+          type: number
+        lte:
+          type: number
+        gt:
+          type: number
+        lt:
+          type: number
+
+    FilterIn:
+      type: object
+      required: [op, field, values]
+      properties:
+        op:
+          type: string
+          const: in
+        field:
+          type: string
+        values:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttributeValue"
+
+    FilterNotIn:
+      type: object
+      required: [op, field, values]
+      properties:
+        op:
+          type: string
+          const: not_in
+        field:
+          type: string
+        values:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttributeValue"
+
+    FilterContains:
+      type: object
+      required: [op, field, value]
+      properties:
+        op:
+          type: string
+          const: contains
+        field:
+          type: string
+        value:
+          $ref: "#/components/schemas/AttributeValue"
+
+    FilterContainsAllTokens:
+      type: object
+      required: [op, field, tokens]
+      properties:
+        op:
+          type: string
+          const: contains_all_tokens
+        field:
+          type: string
+        tokens:
+          type: array
+          items:
+            type: string
+
+    FilterContainsTokenSequence:
+      type: object
+      required: [op, field, tokens]
+      properties:
+        op:
+          type: string
+          const: contains_token_sequence
+        field:
+          type: string
+        tokens:
+          type: array
+          items:
+            type: string
+
+    FilterAnd:
+      type: object
+      required: [op, filters]
+      properties:
+        op:
+          type: string
+          const: and
+        filters:
+          type: array
+          items:
+            $ref: "#/components/schemas/Filter"
+
+    FilterOr:
+      type: object
+      required: [op, filters]
+      properties:
+        op:
+          type: string
+          const: or
+        filters:
+          type: array
+          items:
+            $ref: "#/components/schemas/Filter"
+
+    FilterNot:
+      type: object
+      required: [op, filter]
+      properties:
+        op:
+          type: string
+          const: not
+        filter:
+          $ref: "#/components/schemas/Filter"
+
+    RankByExpression:
+      description: |
+        BM25 ranking expression as an S-expression JSON array. Examples:
+        - Single field: `["content", "BM25", "search query"]`
+        - Multi-field sum: `["Sum", [["title", "BM25", "q"], ["content", "BM25", "q"]]]`
+        - Weighted: `["Product", 2.0, ["title", "BM25", "q"]]`
+        - Max: `["Max", [["title", "BM25", "q"], ["body", "BM25", "q"]]]`
+      type: array
+      items: {}
+      examples:
+        - ["content", "BM25", "search query"]
+        - ["Sum", [["title", "BM25", "q"], ["content", "BM25", "q"]]]
+        - ["Product", 2.0, ["title", "BM25", "q"]]
+
+    VectorEntry:
+      type: object
+      required: [id, values]
+      properties:
+        id:
+          type: string
+          description: Unique vector identifier
+        values:
+          type: array
+          items:
+            type: number
+            format: float
+          description: Vector embedding values
+        attributes:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/AttributeValue"
+          description: Optional key-value metadata for filtering
+
+    SearchResult:
+      type: object
+      required: [id, score]
+      properties:
+        id:
+          type: string
+          description: Vector identifier
+        score:
+          type: number
+          format: float
+          description: Distance (vector search, lower is better) or BM25 relevance score (higher is better)
+        attributes:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/AttributeValue"
+
+    CreateNamespaceRequest:
+      type: object
+      required: [name, dimensions]
+      properties:
+        name:
+          type: string
+          description: Namespace name
+        dimensions:
+          type: integer
+          minimum: 1
+          description: Vector dimensionality
+        distance_metric:
+          $ref: "#/components/schemas/DistanceMetric"
+        full_text_search:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/FtsFieldConfig"
+          description: Per-field FTS configuration. Keys are attribute field names.
+
+    NamespaceResponse:
+      type: object
+      required: [name, dimensions, distance_metric, vector_count, created_at, updated_at]
+      properties:
+        name:
+          type: string
+        dimensions:
+          type: integer
+        distance_metric:
+          $ref: "#/components/schemas/DistanceMetric"
+        vector_count:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        full_text_search:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/FtsFieldConfig"
+          description: Present only when FTS fields are configured.
+
+    UpsertVectorsRequest:
+      type: object
+      required: [vectors]
+      properties:
+        vectors:
+          type: array
+          items:
+            $ref: "#/components/schemas/VectorEntry"
+          minItems: 1
+
+    DeleteVectorsRequest:
+      type: object
+      required: [ids]
+      properties:
+        ids:
+          type: array
+          items:
+            type: string
+
+    QueryRequest:
+      type: object
+      description: |
+        Exactly one of `vector` or `rank_by` must be provided.
+        - `vector`: Run ANN vector similarity search
+        - `rank_by`: Run BM25 full-text search
+      properties:
+        vector:
+          type: array
+          items:
+            type: number
+            format: float
+          description: Query vector for ANN search
+        rank_by:
+          $ref: "#/components/schemas/RankByExpression"
+        last_as_prefix:
+          type: boolean
+          default: false
+          description: Treat the last token of each BM25 query as a prefix (for autocomplete).
+        top_k:
+          type: integer
+          default: 10
+          minimum: 1
+          description: Number of results to return
+        filter:
+          $ref: "#/components/schemas/Filter"
+        consistency:
+          $ref: "#/components/schemas/ConsistencyLevel"
+        nprobe:
+          type: integer
+          minimum: 1
+          description: Number of IVF clusters to probe (vector search only)
+
+    QueryResponse:
+      type: object
+      required: [results, scanned_fragments, scanned_segments]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/SearchResult"
+        scanned_fragments:
+          type: integer
+          description: Number of WAL fragments scanned
+        scanned_segments:
+          type: integer
+          description: Number of index segments scanned
