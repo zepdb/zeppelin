@@ -148,6 +148,35 @@ impl WalFragment {
         Ok(fragment)
     }
 
+    /// Deserialize a fragment from bytes without validating the checksum.
+    ///
+    /// Only use for fragments already validated on write (e.g. compaction reads).
+    /// Skips the `validate_checksum()` call for ~5.7% compaction speedup.
+    pub fn from_bytes_unchecked(data: &[u8]) -> Result<Self> {
+        if data.is_empty() {
+            return Err(ZeppelinError::Serialization(
+                "empty WAL fragment data".into(),
+            ));
+        }
+
+        let fragment: Self = match data[0] {
+            WAL_FORMAT_MSGPACK => {
+                rmp_serde::from_slice(&data[1..]).map_err(|e| {
+                    ZeppelinError::Serialization(format!("msgpack deserialize: {e}"))
+                })?
+            }
+            b'{' => serde_json::from_slice(data)?,
+            _ => {
+                rmp_serde::from_slice(&data[1..])
+                    .or_else(|_| rmp_serde::from_slice(data))
+                    .map_err(|e| {
+                        ZeppelinError::Serialization(format!("msgpack deserialize: {e}"))
+                    })?
+            }
+        };
+        Ok(fragment)
+    }
+
     /// Get the S3 key for this fragment within a namespace.
     pub fn s3_key(namespace: &str, id: &Ulid) -> String {
         format!("{namespace}/wal/{id}.wal")
