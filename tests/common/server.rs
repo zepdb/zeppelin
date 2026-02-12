@@ -37,6 +37,9 @@ pub async fn start_test_server_with_config(
         config.indexing.clone(),
     ));
 
+    let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        config.server.max_concurrent_queries,
+    ));
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
@@ -45,6 +48,7 @@ pub async fn start_test_server_with_config(
         config: Arc::new(config),
         compactor,
         cache: cache.clone(),
+        query_semaphore,
     };
 
     let app = build_router(state);
@@ -87,6 +91,9 @@ pub async fn start_test_server_with_compactor(
         config.indexing.clone(),
     ));
 
+    let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        config.server.max_concurrent_queries,
+    ));
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
@@ -95,6 +102,7 @@ pub async fn start_test_server_with_compactor(
         config: Arc::new(config),
         compactor: compactor.clone(),
         cache: cache.clone(),
+        query_semaphore,
     };
 
     let app = build_router(state);
@@ -150,6 +158,9 @@ pub async fn start_test_server_with_compaction(
         });
     }
 
+    let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        config.server.max_concurrent_queries,
+    ));
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager,
@@ -158,6 +169,7 @@ pub async fn start_test_server_with_compaction(
         config: Arc::new(config),
         compactor,
         cache: cache.clone(),
+        query_semaphore,
     };
 
     let app = build_router(state);

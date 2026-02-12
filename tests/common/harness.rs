@@ -1,5 +1,5 @@
 use uuid::Uuid;
-use zeppelin::config::StorageConfig;
+use zeppelin::config::{StorageBackend, StorageConfig};
 use zeppelin::storage::ZeppelinStore;
 
 /// Test harness that connects to real S3 (or MinIO), isolates each test
@@ -23,7 +23,7 @@ impl TestHarness {
 
         let config = match backend.as_str() {
             "s3" => StorageConfig {
-                backend: "s3".to_string(),
+                backend: StorageBackend::S3,
                 bucket: bucket.clone(),
                 s3_region: std::env::var("AWS_REGION").ok(),
                 s3_endpoint: std::env::var("S3_ENDPOINT").ok().filter(|s| !s.is_empty()),
@@ -38,7 +38,7 @@ impl TestHarness {
                 azure_access_key: None,
             },
             "minio" => StorageConfig {
-                backend: "s3".to_string(),
+                backend: StorageBackend::S3,
                 bucket: bucket.clone(),
                 s3_region: Some("us-east-1".to_string()),
                 s3_endpoint: Some(

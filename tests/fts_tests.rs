@@ -125,7 +125,7 @@ async fn delete_docs(client: &reqwest::Client, base_url: &str, ns: &str, ids: &[
         .unwrap();
     assert_eq!(
         resp.status(),
-        200,
+        204,
         "delete failed: {}",
         resp.text().await.unwrap()
     );

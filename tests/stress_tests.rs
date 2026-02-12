@@ -605,7 +605,7 @@ async fn test_stress_concurrent_upsert_and_delete() {
                     .send()
                     .await
                     .unwrap();
-                assert_eq!(resp.status(), 200);
+                assert_eq!(resp.status(), 204);
             })
         })
         .collect();

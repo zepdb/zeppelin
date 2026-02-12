@@ -1,10 +1,13 @@
-use axum::extract::MatchedPath;
+use axum::extract::{MatchedPath, State};
 use axum::http::Request;
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use tracing::Instrument;
 
+use crate::error::ZeppelinError;
 use crate::metrics::HTTP_REQUESTS_TOTAL;
+use crate::server::handlers::ApiError;
+use crate::server::AppState;
 
 /// Middleware that increments `HTTP_REQUESTS_TOTAL` for every response.
 ///
@@ -50,4 +53,19 @@ pub async fn request_id(request: Request<axum::body::Body>, next: Next) -> Respo
     }
     .instrument(tracing::info_span!("request", request_id = %id))
     .await
+}
+
+/// Middleware that limits concurrent query execution.
+///
+/// Acquires a permit from the query semaphore before forwarding the request.
+/// Returns 503 Service Unavailable when all permits are exhausted.
+pub async fn concurrency_limit(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    match state.query_semaphore.try_acquire() {
+        Ok(_permit) => next.run(request).await,
+        Err(_) => ApiError(ZeppelinError::QueryConcurrencyExhausted).into_response(),
+    }
 }
