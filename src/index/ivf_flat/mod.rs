@@ -58,6 +58,21 @@ impl IvfFlatIndex {
     pub async fn load(store: &ZeppelinStore, namespace: &str, segment_id: &str) -> Result<Self> {
         build::load_ivf_flat(store, namespace, segment_id).await
     }
+
+    /// Load an IVF-Flat index using pre-known metadata from the manifest.
+    ///
+    /// Only fetches centroids — skips cluster-count probing and quantization
+    /// detection, saving ~18 S3 GETs per query.
+    pub async fn load_from_manifest(
+        store: &ZeppelinStore,
+        namespace: &str,
+        segment_id: &str,
+        num_vectors: usize,
+        quantization: crate::index::quantization::QuantizationType,
+    ) -> Result<Self> {
+        build::load_ivf_flat_from_manifest(store, namespace, segment_id, num_vectors, quantization)
+            .await
+    }
 }
 
 #[async_trait]

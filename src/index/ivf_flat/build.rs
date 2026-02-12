@@ -426,6 +426,43 @@ pub async fn build_ivf_flat(
     })
 }
 
+/// Load an IVF-Flat index using pre-known metadata from the manifest.
+///
+/// Only fetches centroids from S3 — skips the cluster-count probe loop
+/// and quantization-type detection that `load_ivf_flat` performs, saving
+/// ~18 S3 GETs per query.
+pub async fn load_ivf_flat_from_manifest(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_id: &str,
+    num_vectors: usize,
+    quantization: QuantizationType,
+) -> Result<IvfFlatIndex> {
+    let ckey = centroids_key(namespace, segment_id);
+    let data = store.get(&ckey).await?;
+    let (centroids, dim) = deserialize_centroids(&data)?;
+
+    info!(
+        namespace = namespace,
+        segment_id = segment_id,
+        num_vectors = num_vectors,
+        num_clusters = centroids.len(),
+        dim = dim,
+        quantization = ?quantization,
+        "loaded IVF-Flat index from manifest metadata"
+    );
+
+    Ok(IvfFlatIndex {
+        centroids,
+        num_vectors,
+        dim,
+        namespace: namespace.to_string(),
+        segment_id: segment_id.to_string(),
+        quantization,
+        bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
+    })
+}
+
 /// Load an existing IVF-Flat index from S3 artifacts.
 ///
 /// Only the centroids are loaded into memory; cluster data is fetched

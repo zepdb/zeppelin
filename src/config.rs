@@ -280,7 +280,10 @@ fn default_compaction_interval() -> u64 {
         .unwrap_or(30)
 }
 fn default_max_wal_fragments() -> usize {
-    1000
+    std::env::var("ZEPPELIN_MAX_WAL_FRAGMENTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
 }
 fn default_retrain_threshold() -> f64 {
     5.0
@@ -543,12 +546,34 @@ impl Config {
             self.indexing.default_nprobe = v;
         }
 
+        // Indexing (continued)
+        if let Ok(v) = std::env::var("ZEPPELIN_QUANTIZATION") {
+            match v.to_lowercase().as_str() {
+                "none" => self.indexing.quantization = crate::index::quantization::QuantizationType::None,
+                "scalar" | "sq8" => self.indexing.quantization = crate::index::quantization::QuantizationType::Scalar,
+                "product" | "pq" => self.indexing.quantization = crate::index::quantization::QuantizationType::Product,
+                _ => tracing::warn!("Unknown ZEPPELIN_QUANTIZATION value: {v}"),
+            }
+        }
+        if let Ok(v) = std::env::var("ZEPPELIN_BITMAP_INDEX") {
+            self.indexing.bitmap_index = v == "true";
+        }
+        if let Ok(v) = std::env::var("ZEPPELIN_FTS_INDEX") {
+            self.indexing.fts_index = v == "true";
+        }
+
         // Compaction
         if let Some(v) = std::env::var("ZEPPELIN_COMPACTION_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
         {
             self.compaction.interval_secs = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_WAL_FRAGMENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.compaction.max_wal_fragments_before_compact = v;
         }
 
         // Logging

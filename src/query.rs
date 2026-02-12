@@ -18,6 +18,7 @@ use crate::index::IvfFlatIndex;
 use crate::server::handlers::query::QueryResponse;
 use crate::storage::ZeppelinStore;
 use crate::types::{ConsistencyLevel, DistanceMetric, Filter, SearchResult};
+use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 use crate::wal::WalReader;
 
@@ -72,29 +73,31 @@ pub async fn execute_query(
     // Segment search
     let segment_start = std::time::Instant::now();
     let segment_results = if let Some(ref segment_id) = manifest.active_segment {
-        // Look up bitmap_fields from the manifest's SegmentRef.
-        let bitmap_fields = manifest
+        // Look up the full SegmentRef from the manifest.
+        let segment_ref = manifest
             .segments
             .iter()
             .find(|s| s.id == *segment_id)
-            .map(|s| s.bitmap_fields.clone())
-            .unwrap_or_default();
-        let results = segment_search(
-            store,
-            namespace,
-            segment_id,
-            query,
-            top_k,
-            nprobe,
-            filter,
-            distance_metric,
-            oversample_factor,
-            cache,
-            &bitmap_fields,
-        )
-        .await?;
-        scanned_segments = 1;
-        results
+            .cloned();
+        if let Some(seg_ref) = segment_ref {
+            let results = segment_search(
+                store,
+                namespace,
+                &seg_ref,
+                query,
+                top_k,
+                nprobe,
+                filter,
+                distance_metric,
+                oversample_factor,
+                cache,
+            )
+            .await?;
+            scanned_segments = 1;
+            results
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
@@ -207,13 +210,14 @@ async fn wal_scan(
 
 /// Search a single segment via IVF-Flat or Hierarchical index.
 ///
-/// Detection: if a `tree_meta.json` exists for the segment, use hierarchical
-/// search; otherwise fall back to IVF-Flat.
+/// Uses `SegmentRef` metadata to determine index type (hierarchical vs flat)
+/// without probing S3, and loads the IVF-Flat index with pre-known metadata
+/// to skip cluster-count probing and quantization detection.
 #[allow(clippy::too_many_arguments)]
 async fn segment_search(
     store: &ZeppelinStore,
     namespace: &str,
-    segment_id: &str,
+    segment_ref: &SegmentRef,
     query: &[f32],
     top_k: usize,
     nprobe: usize,
@@ -221,13 +225,13 @@ async fn segment_search(
     distance_metric: DistanceMetric,
     oversample_factor: usize,
     cache: Option<&Arc<DiskCache>>,
-    bitmap_fields: &[String],
 ) -> Result<Vec<SearchResult>> {
-    // Detect hierarchical index by probing for tree_meta.json.
-    let tree_meta_key = crate::index::hierarchical::tree_meta_key(namespace, segment_id);
-    if store.get(&tree_meta_key).await.is_ok() {
+    let segment_id = &segment_ref.id;
+
+    // Use manifest metadata to determine index type — no S3 probe needed.
+    if segment_ref.hierarchical {
         let mut index = HierarchicalIndex::load(store, namespace, segment_id).await?;
-        index.bitmap_fields = bitmap_fields.to_vec();
+        index.bitmap_fields = segment_ref.bitmap_fields.clone();
         use crate::index::hierarchical::search::search_hierarchical;
         let results = search_hierarchical(
             &index,
@@ -244,8 +248,16 @@ async fn segment_search(
         return Ok(results);
     }
 
-    let mut index = IvfFlatIndex::load(store, namespace, segment_id).await?;
-    index.bitmap_fields = bitmap_fields.to_vec();
+    // Use manifest metadata to skip cluster-count probing and quant detection.
+    let mut index = IvfFlatIndex::load_from_manifest(
+        store,
+        namespace,
+        segment_id,
+        segment_ref.vector_count,
+        segment_ref.quantization,
+    )
+    .await?;
+    index.bitmap_fields = segment_ref.bitmap_fields.clone();
     use crate::index::ivf_flat::search::search_ivf_flat;
     let results = search_ivf_flat(
         &index,
@@ -318,27 +330,29 @@ pub async fn execute_bm25_query(
     // Segment BM25 search
     let segment_start = std::time::Instant::now();
     let segment_results = if let Some(ref segment_id) = manifest.active_segment {
-        let fts_fields = manifest
+        let segment_ref = manifest
             .segments
             .iter()
             .find(|s| s.id == *segment_id)
-            .map(|s| s.fts_fields.clone())
-            .unwrap_or_default();
+            .cloned();
 
-        if !fts_fields.is_empty() {
-            let results = segment_bm25_search(
-                store,
-                namespace,
-                segment_id,
-                rank_by,
-                fts_configs,
-                &fts_fields,
-                filter,
-                last_as_prefix,
-            )
-            .await?;
-            scanned_segments = 1;
-            results
+        if let Some(seg_ref) = segment_ref {
+            if !seg_ref.fts_fields.is_empty() {
+                let results = segment_bm25_search(
+                    store,
+                    namespace,
+                    &seg_ref,
+                    rank_by,
+                    fts_configs,
+                    filter,
+                    last_as_prefix,
+                )
+                .await?;
+                scanned_segments = 1;
+                results
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         }
@@ -374,17 +388,26 @@ pub async fn execute_bm25_query(
 async fn segment_bm25_search(
     store: &ZeppelinStore,
     namespace: &str,
-    segment_id: &str,
+    segment_ref: &SegmentRef,
     rank_by: &RankBy,
     fts_configs: &HashMap<String, FtsFieldConfig>,
-    fts_fields: &[String],
     filter: Option<&Filter>,
     last_as_prefix: bool,
 ) -> Result<Vec<SearchResult>> {
     use crate::index::ivf_flat::build::{attrs_key, deserialize_attrs};
 
-    // Load the IVF-Flat index to get centroid count
-    let index = IvfFlatIndex::load(store, namespace, segment_id).await?;
+    let segment_id = &segment_ref.id;
+    let fts_fields = &segment_ref.fts_fields;
+
+    // Load the IVF-Flat index using manifest metadata to skip cluster probing.
+    let index = IvfFlatIndex::load_from_manifest(
+        store,
+        namespace,
+        segment_id,
+        segment_ref.vector_count,
+        segment_ref.quantization,
+    )
+    .await?;
     let num_clusters = index.num_clusters();
 
     let field_queries = rank_by.extract_field_queries();
