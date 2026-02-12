@@ -20,6 +20,7 @@ use crate::namespace::NamespaceManager;
 use crate::server::routes::build_router;
 use crate::server::AppState;
 use crate::storage::ZeppelinStore;
+use crate::wal::batch_writer::BatchWalWriter;
 use crate::wal::{WalReader, WalWriter};
 
 /// Resolve the configuration file path.
@@ -137,6 +138,22 @@ pub async fn build_app(
         manifest_cache.clone(),
     );
 
+    // Initialize batch WAL writer (if batch_manifest_size > 1)
+    let batch_wal_writer = if config.wal.batch_manifest_size > 1 {
+        tracing::info!(
+            batch_size = config.wal.batch_manifest_size,
+            timeout_ms = config.wal.batch_manifest_timeout_ms,
+            "batched manifest updates enabled"
+        );
+        Some(Arc::new(BatchWalWriter::new(
+            store.clone(),
+            config.wal.batch_manifest_size,
+            config.wal.batch_manifest_timeout_ms,
+        )))
+    } else {
+        None
+    };
+
     // Build application state
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.server.max_concurrent_queries,
@@ -151,6 +168,7 @@ pub async fn build_app(
         cache,
         manifest_cache,
         query_semaphore,
+        batch_wal_writer,
     };
 
     // Build router
