@@ -4,6 +4,7 @@
 //! and query evaluation for text-based search alongside vector search.
 
 pub mod bm25;
+pub mod global_index;
 pub mod inverted_index;
 pub mod rank_by;
 pub mod tokenizer;

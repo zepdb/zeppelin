@@ -357,6 +357,7 @@ impl Compactor {
         );
 
         // 8b. Build FTS inverted indexes (if FTS fields configured)
+        let mut has_global_fts = false;
         let fts_fields: Vec<String> = if !fts_configs.is_empty() && self.indexing_config.fts_index {
             let fts_start = std::time::Instant::now();
             let mut fts_field_names = Vec::new();
@@ -382,7 +383,8 @@ impl Compactor {
                 }
             }
 
-            // Build inverted indexes in parallel using spawn_blocking
+            // Build inverted indexes in parallel using spawn_blocking.
+            // Also collect InvertedIndex objects for global index construction.
             let build_futs: Vec<_> = cluster_data
                 .into_iter()
                 .map(|(cluster_idx, data)| {
@@ -399,15 +401,16 @@ impl Compactor {
                             inv_index.fields.keys().cloned().collect();
                         let fts_data = inv_index.to_bytes()?;
                         let fts_key = fts_index_key(&ns, &seg, cluster_idx);
-                        Ok::<_, ZeppelinError>((fts_key, fts_data, field_names))
+                        Ok::<_, ZeppelinError>((cluster_idx, fts_key, fts_data, field_names, inv_index))
                     })
                 })
                 .collect();
 
             let build_results = futures::future::join_all(build_futs).await;
             let mut write_payloads = Vec::new();
+            let mut cluster_inv_indexes: Vec<(usize, InvertedIndex)> = Vec::new();
             for result in build_results {
-                let (fts_key, fts_data, field_names) = result
+                let (cluster_idx, fts_key, fts_data, field_names, inv_index) = result
                     .map_err(|e| ZeppelinError::Index(format!("FTS build task failed: {e}")))?
                     ?;
                 for name in field_names {
@@ -416,9 +419,26 @@ impl Compactor {
                     }
                 }
                 write_payloads.push((fts_key, fts_data));
+                cluster_inv_indexes.push((cluster_idx, inv_index));
             }
 
-            // Phase 3: Parallel writes of FTS indexes.
+            // Phase 2b: Build global FTS index from per-cluster indexes.
+            has_global_fts = if !cluster_inv_indexes.is_empty() {
+                use crate::fts::global_index::{GlobalInvertedIndex, global_fts_key};
+                let refs: Vec<(usize, &InvertedIndex)> = cluster_inv_indexes
+                    .iter()
+                    .map(|(idx, inv)| (*idx, inv))
+                    .collect();
+                let global_index = GlobalInvertedIndex::build(&refs);
+                let global_data = global_index.to_bytes()?;
+                let gkey = global_fts_key(namespace, &segment_id);
+                write_payloads.push((gkey, global_data));
+                true
+            } else {
+                false
+            };
+
+            // Phase 3: Parallel writes of FTS indexes (per-cluster + global).
             let write_futs: Vec<_> = write_payloads
                 .iter()
                 .map(|(key, data)| self.store.put(key, data.clone()))
@@ -472,6 +492,7 @@ impl Compactor {
                 hierarchical: is_hierarchical,
                 bitmap_fields: bitmap_fields.clone(),
                 fts_fields: fts_fields.clone(),
+                has_global_fts,
             });
             fresh_manifest.remove_compacted_fragments(last_fragment_id);
             fresh_manifest.pending_deletes = deferred_deletes.clone();
