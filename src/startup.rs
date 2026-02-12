@@ -134,6 +134,7 @@ pub async fn build_app(
         namespace_manager.clone(),
         shutdown_rx,
         cpu_budget.compaction_workers,
+        manifest_cache.clone(),
     );
 
     // Build application state

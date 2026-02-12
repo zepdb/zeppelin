@@ -57,9 +57,23 @@ impl ManifestCache {
         Ok(manifest)
     }
 
+    /// Insert a manifest directly into the cache (write-through).
+    ///
+    /// Called after WAL writes so the next query sees fresh data without
+    /// an S3 roundtrip. Avoids the invalidate-then-refetch pattern.
+    pub fn insert(&self, namespace: &str, manifest: Manifest) {
+        self.entries.insert(
+            namespace.to_string(),
+            CachedManifest {
+                manifest,
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+
     /// Invalidate the cached manifest for a namespace.
     ///
-    /// Called after writes or compaction to ensure the next read sees fresh data.
+    /// Called after compaction to ensure the next read sees fresh data.
     pub fn invalidate(&self, namespace: &str) {
         self.entries.remove(namespace);
     }

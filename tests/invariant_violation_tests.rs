@@ -89,7 +89,7 @@ async fn test_compaction_safety_cas_prevents_stale_overwrite() {
     assert_eq!(stale_manifest.fragments.len(), 2);
 
     // 4. Concurrent writer appends fragment 3 (changes the ETag)
-    let f3 = writer
+    let (f3, _) = writer
         .append(&ns, make_vectors("f3", 5, 16), vec![])
         .await
         .unwrap();
@@ -191,11 +191,11 @@ async fn test_namespace_deletion_manifest_first() {
     // 1. Create namespace with manifest + fragments
     Manifest::new().write(store, &ns).await.unwrap();
 
-    let f1 = writer
+    let (f1, _) = writer
         .append(&ns, make_vectors("del1", 10, 16), vec![])
         .await
         .unwrap();
-    let f2 = writer
+    let (f2, _) = writer
         .append(&ns, make_vectors("del2", 10, 16), vec![])
         .await
         .unwrap();

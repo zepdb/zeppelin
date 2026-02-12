@@ -265,13 +265,13 @@ async fn test_sequential_writers_with_leases() {
     // Writer 1: acquire lease, write fragment, release
     let lease1 = manager1.acquire(&ns).await.unwrap();
     let vectors1 = random_vectors(3, 16);
-    let frag1 = writer.append(&ns, vectors1, vec![]).await.unwrap();
+    let (frag1, _) = writer.append(&ns, vectors1, vec![]).await.unwrap();
     manager1.release(&ns, &lease1).await.unwrap();
 
     // Writer 2: acquire lease, write fragment, release
     let lease2 = manager2.acquire(&ns).await.unwrap();
     let vectors2 = random_vectors(3, 16);
-    let frag2 = writer.append(&ns, vectors2, vec![]).await.unwrap();
+    let (frag2, _) = writer.append(&ns, vectors2, vec![]).await.unwrap();
     manager2.release(&ns, &lease2).await.unwrap();
 
     // Both fragments should be in manifest

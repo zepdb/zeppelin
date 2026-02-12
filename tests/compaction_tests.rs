@@ -104,9 +104,9 @@ async fn test_compact_multiple_fragments() {
         })
         .collect();
 
-    let f1 = writer.append(&ns, vecs1, vec![]).await.unwrap();
-    let f2 = writer.append(&ns, vecs2, vec![]).await.unwrap();
-    let f3 = writer.append(&ns, vecs3, vec![]).await.unwrap();
+    let (f1, _) = writer.append(&ns, vecs1, vec![]).await.unwrap();
+    let (f2, _) = writer.append(&ns, vecs2, vec![]).await.unwrap();
+    let (f3, _) = writer.append(&ns, vecs3, vec![]).await.unwrap();
 
     // Record fragment keys
     let frag_keys: Vec<String> = [&f1, &f2, &f3]
@@ -260,7 +260,7 @@ async fn test_compact_updates_manifest() {
         .append(&ns, random_vectors(20, 16), vec![])
         .await
         .unwrap();
-    let f2 = writer
+    let (f2, _) = writer
         .append(&ns, random_vectors(30, 16), vec![])
         .await
         .unwrap();
@@ -292,15 +292,15 @@ async fn test_compact_cleans_up_fragments() {
     manifest.write(store, &ns).await.unwrap();
 
     // Append 3 fragments, record their S3 keys
-    let f1 = writer
+    let (f1, _) = writer
         .append(&ns, random_vectors(10, 16), vec![])
         .await
         .unwrap();
-    let f2 = writer
+    let (f2, _) = writer
         .append(&ns, random_vectors(10, 16), vec![])
         .await
         .unwrap();
-    let f3 = writer
+    let (f3, _) = writer
         .append(&ns, random_vectors(10, 16), vec![])
         .await
         .unwrap();
@@ -347,7 +347,7 @@ async fn test_compact_preserves_new_fragments() {
     manifest.write(store, &ns).await.unwrap();
 
     // Append A, compact
-    let frag_a = writer
+    let (frag_a, _) = writer
         .append(&ns, random_vectors(20, 16), vec![])
         .await
         .unwrap();
@@ -356,7 +356,7 @@ async fn test_compact_preserves_new_fragments() {
     compactor.compact(&ns).await.unwrap();
 
     // Append B (after compaction)
-    let frag_b = writer
+    let (frag_b, _) = writer
         .append(&ns, random_vectors(10, 16), vec![])
         .await
         .unwrap();
