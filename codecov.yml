@@ -16,5 +16,4 @@ comment:
 
 ignore:
   - "tests/**/*"
-  - "python/**/*"
   - "claude_files/**/*"
