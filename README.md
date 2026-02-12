@@ -5,8 +5,8 @@
 <p align="center">
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.84+-DEA584?logo=rust&logoColor=white" alt="Rust: 1.84+"></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/Ghatage/zeppelin/actions/workflows/ci.yml"><img src="https://github.com/Ghatage/zeppelin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://codecov.io/gh/Ghatage/zeppelin"><img src="https://codecov.io/gh/Ghatage/zeppelin/branch/main/graph/badge.svg" alt="codecov"></a>
+  <a href="https://github.com/zepdb/zeppelin/actions/workflows/ci.yml"><img src="https://github.com/zepdb/zeppelin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://codecov.io/gh/zepdb/zeppelin"><img src="https://codecov.io/gh/zepdb/zeppelin/branch/main/graph/badge.svg" alt="codecov"></a>
 </p>
 <p align="center">
   An S3-native vector search engine. Object storage is the source of truth. Nodes are stateless.
@@ -94,10 +94,10 @@ curl -s -X DELETE http://localhost:8080/v1/namespaces/my-vectors/vectors \
 
 Official client libraries for Zeppelin:
 
-| SDK | Package | Install | Docs |
+| SDK | Package | Install | Repo |
 |-----|---------|---------|------|
-| Python | `zeppelin-python` | `pip install zeppelin-python` | [clients/python/README.md](clients/python/README.md) |
-| TypeScript | `zeppelin-typescript` | `npm install zeppelin-typescript` | [clients/typescript/README.md](clients/typescript/README.md) |
+| Python | `zeppelin-python` | `pip install zeppelin-python` | [zepdb/zeppelin-py](https://github.com/zepdb/zeppelin-py) |
+| TypeScript | `zeppelin-typescript` | `npm install zeppelin-typescript` | [zepdb/zeppelin-typescript](https://github.com/zepdb/zeppelin-typescript) |
 
 Both SDKs cover all 9 API endpoints with full support for:
 - Vector similarity search (ANN) with filters
@@ -108,7 +108,7 @@ Both SDKs cover all 9 API endpoints with full support for:
 
 The Python SDK also provides an async client (`AsyncZeppelinClient`).
 
-An [OpenAPI 3.1 spec](clients/openapi/zeppelin-api.yaml) is available as the canonical API reference.
+An [OpenAPI 3.1 spec](api/zeppelin-api.yaml) is available as the canonical API reference.
 
 ## Development
 

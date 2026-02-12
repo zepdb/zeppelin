@@ -45,10 +45,6 @@ tests/fixtures/tmp/
 # Cache
 /cache/
 
-# Client SDKs build artifacts
-clients/python/.venv/
-clients/typescript/node_modules/
-clients/typescript/dist/
 
 # Docker volumes
 minio_data/
