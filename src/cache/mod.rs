@@ -1,4 +1,5 @@
 pub mod manifest_cache;
+pub mod memory_cache;
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -14,6 +15,8 @@ use tracing::{debug, instrument};
 use crate::config::CacheConfig;
 use crate::error::{Result, ZeppelinError};
 
+use self::memory_cache::MemoryCache;
+
 /// Metadata for a cached entry.
 struct CacheEntry {
     /// Filename on disk (key with `/` replaced by `__`).
@@ -24,7 +27,7 @@ struct CacheEntry {
     last_accessed: Instant,
 }
 
-/// LRU disk cache for segment cluster data.
+/// Tiered LRU cache: memory → disk → S3.
 ///
 /// Files are stored at `{dir}/{filename}` where filename is the key with
 /// `/` replaced by `__`. On startup, the directory is scanned to rebuild
@@ -40,17 +43,34 @@ pub struct DiskCache {
     entries: DashMap<String, CacheEntry>,
     pinned: RwLock<HashSet<String>>,
     total_size: AtomicU64,
+    /// Optional in-memory tier sitting above disk.
+    memory: Option<MemoryCache>,
 }
 
 impl DiskCache {
     /// Create a new disk cache from config.
     pub fn new(config: &CacheConfig) -> Result<Self> {
         let max_bytes = config.max_size_gb * 1024 * 1024 * 1024;
-        Self::new_with_max_bytes(config.dir.clone(), max_bytes)
+        let memory_max = config.memory_cache_max_mb as u64 * 1024 * 1024;
+        let memory = if memory_max > 0 {
+            Some(MemoryCache::new(memory_max))
+        } else {
+            None
+        };
+        Self::new_with_options(config.dir.clone(), max_bytes, memory)
     }
 
     /// Create a new disk cache with an explicit max size in bytes.
     pub fn new_with_max_bytes(dir: PathBuf, max_size_bytes: u64) -> Result<Self> {
+        Self::new_with_options(dir, max_size_bytes, None)
+    }
+
+    /// Create a new disk cache with explicit options.
+    pub fn new_with_options(
+        dir: PathBuf,
+        max_size_bytes: u64,
+        memory: Option<MemoryCache>,
+    ) -> Result<Self> {
         // Ensure directory exists
         std::fs::create_dir_all(&dir).map_err(|e| {
             ZeppelinError::Cache(format!("failed to create cache dir {:?}: {}", dir, e))
@@ -62,6 +82,7 @@ impl DiskCache {
             entries: DashMap::new(),
             pinned: RwLock::new(HashSet::new()),
             total_size: AtomicU64::new(0),
+            memory,
         };
 
         // Scan existing files to rebuild index
@@ -126,9 +147,23 @@ impl DiskCache {
     }
 
     /// Get a cached value by key.
+    ///
+    /// Checks memory tier first (sub-microsecond), then disk.
+    /// On disk hit, promotes to memory tier.
     #[instrument(skip(self), fields(key = key))]
     pub async fn get(&self, key: &str) -> Option<Bytes> {
-        // Check in-memory index and update last_accessed — no global write lock needed.
+        // Memory tier check
+        if let Some(ref mem) = self.memory {
+            if let Some(data) = mem.get(key) {
+                crate::metrics::CACHE_HITS_TOTAL
+                    .with_label_values(&["memory_hit"])
+                    .inc();
+                debug!("memory cache hit");
+                return Some(data);
+            }
+        }
+
+        // Check disk index and update last_accessed.
         {
             let mut entry = self.entries.get_mut(key)?;
             entry.last_accessed = Instant::now();
@@ -138,11 +173,16 @@ impl DiskCache {
         let path = self.file_path(key);
         match tokio::fs::read(&path).await {
             Ok(data) => {
+                let bytes = Bytes::from(data);
+                // Promote to memory tier
+                if let Some(ref mem) = self.memory {
+                    mem.insert(key, bytes.clone());
+                }
                 crate::metrics::CACHE_HITS_TOTAL
                     .with_label_values(&["hit"])
                     .inc();
                 debug!("cache hit");
-                Some(Bytes::from(data))
+                Some(bytes)
             }
             Err(_) => {
                 // File disappeared — remove from index
@@ -159,7 +199,7 @@ impl DiskCache {
         }
     }
 
-    /// Put a value into the cache.
+    /// Put a value into the cache (both memory and disk tiers).
     #[instrument(skip(self, data), fields(key = key, size = data.len()))]
     pub async fn put(&self, key: &str, data: &Bytes) -> Result<()> {
         let size = data.len() as u64;
@@ -179,7 +219,12 @@ impl DiskCache {
             .await
             .map_err(|e| ZeppelinError::Cache(format!("failed to rename cache file: {e}")))?;
 
-        // Update index
+        // Insert into memory tier
+        if let Some(ref mem) = self.memory {
+            mem.insert(key, data.clone());
+        }
+
+        // Update disk index
         let old = self.entries.insert(
             key.to_string(),
             CacheEntry {
@@ -189,7 +234,6 @@ impl DiskCache {
             },
         );
         let is_new = if let Some(old_entry) = old {
-            // Replacing existing entry: subtract old size
             self.total_size.fetch_sub(old_entry.size, Ordering::Relaxed);
             false
         } else {
@@ -209,6 +253,8 @@ impl DiskCache {
     }
 
     /// Get a value from cache, or fetch it using the provided function if not cached.
+    ///
+    /// Three-tier: memory → disk → fetch (S3). Populates both tiers on miss.
     pub async fn get_or_fetch<F, Fut>(&self, key: &str, fetch: F) -> Result<Bytes>
     where
         F: FnOnce() -> Fut,
@@ -239,9 +285,14 @@ impl DiskCache {
         pinned.remove(key);
     }
 
-    /// Invalidate (remove) a single key from the cache.
+    /// Invalidate (remove) a single key from both memory and disk tiers.
     #[instrument(skip(self), fields(key = key))]
     pub async fn invalidate(&self, key: &str) -> Result<()> {
+        // Invalidate memory tier
+        if let Some(ref mem) = self.memory {
+            mem.invalidate(key);
+        }
+
         if let Some((_, entry)) = self.entries.remove(key) {
             self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
             crate::metrics::CACHE_ENTRIES.dec();
@@ -257,9 +308,14 @@ impl DiskCache {
         Ok(())
     }
 
-    /// Invalidate all keys that start with the given prefix.
+    /// Invalidate all keys that start with the given prefix from both tiers.
     #[instrument(skip(self), fields(prefix = prefix))]
     pub async fn invalidate_prefix(&self, prefix: &str) -> Result<()> {
+        // Invalidate memory tier
+        if let Some(ref mem) = self.memory {
+            mem.invalidate_prefix(prefix);
+        }
+
         // Collect matching keys first to avoid holding DashMap shards during I/O.
         let matching: Vec<(String, CacheEntry)> = self
             .entries
@@ -289,7 +345,7 @@ impl DiskCache {
         Ok(())
     }
 
-    /// Get the total size of all cached data in bytes.
+    /// Get the total size of all cached data on disk in bytes.
     pub fn total_size(&self) -> u64 {
         self.total_size.load(Ordering::Relaxed)
     }
@@ -316,6 +372,10 @@ impl DiskCache {
 
             match victim {
                 Some(key) => {
+                    // Also evict from memory tier
+                    if let Some(ref mem) = self.memory {
+                        mem.invalidate(&key);
+                    }
                     if let Some((_, entry)) = self.entries.remove(&key) {
                         self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
                         crate::metrics::CACHE_ENTRIES.dec();

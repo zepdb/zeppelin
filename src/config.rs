@@ -116,6 +116,10 @@ pub struct CacheConfig {
     pub max_size_gb: u64,
     #[serde(default)]
     pub eviction: EvictionPolicy,
+    /// Maximum memory cache size in MB. Set to 0 to disable.
+    /// Default: 256 MB. Override via ZEPPELIN_MEMORY_CACHE_MAX_MB.
+    #[serde(default = "default_memory_cache_max_mb")]
+    pub memory_cache_max_mb: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +237,9 @@ fn default_cache_dir() -> PathBuf {
 fn default_max_size_gb() -> u64 {
     50
 }
+fn default_memory_cache_max_mb() -> usize {
+    256
+}
 fn default_num_centroids() -> usize {
     256
 }
@@ -320,6 +327,7 @@ impl Default for CacheConfig {
             dir: default_cache_dir(),
             max_size_gb: default_max_size_gb(),
             eviction: EvictionPolicy::default(),
+            memory_cache_max_mb: default_memory_cache_max_mb(),
         }
     }
 }
@@ -557,6 +565,12 @@ impl Config {
             .and_then(|v| v.parse().ok())
         {
             self.cache.max_size_gb = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MEMORY_CACHE_MAX_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.cache.memory_cache_max_mb = v;
         }
 
         // Indexing

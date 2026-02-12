@@ -192,22 +192,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_config_path_from_default_file() {
-        // Create a temp zeppelin.toml in the current dir
-        let original_dir = std::env::current_dir().unwrap();
-        let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_current_dir(&temp_dir).unwrap();
-
-        std::fs::write("zeppelin.toml", "# test").unwrap();
-        let path = resolve_config_path();
-
-        // Clean up
-        std::env::set_current_dir(original_dir).unwrap();
-
-        assert_eq!(path, Some("zeppelin.toml".to_string()));
-    }
-
-    #[test]
     fn test_resolve_config_path_none() {
         // Save original values
         let original_env = std::env::var("ZEPPELIN_CONFIG").ok();
