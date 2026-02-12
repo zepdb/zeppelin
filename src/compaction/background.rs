@@ -9,6 +9,31 @@ use super::Compactor;
 
 /// Background compaction loop that periodically checks all namespaces
 /// and compacts any that exceed the fragment threshold.
+///
+/// Runs on a dedicated tokio runtime to isolate compaction CPU from
+/// query-serving threads. This prevents k-means training and FTS index
+/// building from stealing CPU time during query processing.
+pub fn start_compaction_thread(
+    compactor: Arc<Compactor>,
+    namespace_manager: Arc<NamespaceManager>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("compaction-runtime".to_string())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("compaction-worker")
+                .enable_all()
+                .build()
+                .expect("failed to build compaction runtime");
+
+            rt.block_on(compaction_loop(compactor, namespace_manager, shutdown));
+        })
+        .expect("failed to spawn compaction thread")
+}
+
+/// Background compaction loop (runs on the compaction runtime).
 pub async fn compaction_loop(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,

@@ -328,28 +328,53 @@ impl Compactor {
             let read_futs: Vec<_> = attr_keys.iter().map(|k| self.store.get(k)).collect();
             let read_results = futures::future::join_all(read_futs).await;
 
-            // Phase 2: CPU — build inverted indexes.
-            let mut write_payloads = Vec::new();
+            // Phase 2: CPU — build inverted indexes (parallelized via spawn_blocking).
+            let fts_configs_clone = fts_configs.clone();
+            let segment_id_clone = segment_id.clone();
+            let namespace_clone = namespace.to_string();
+
+            // Collect successful deserializations
+            let mut cluster_data: Vec<(usize, bytes::Bytes)> = Vec::new();
             for (cluster_idx, result) in read_results.into_iter().enumerate() {
-                let cluster_attrs = match result {
-                    Ok(data) => deserialize_attrs(&data)?,
+                match result {
+                    Ok(data) => cluster_data.push((cluster_idx, data)),
                     Err(_) => continue,
-                };
+                }
+            }
 
-                let attr_refs: Vec<Option<&HashMap<String, crate::types::AttributeValue>>> =
-                    cluster_attrs.iter().map(|a| a.as_ref()).collect();
+            // Build inverted indexes in parallel using spawn_blocking
+            let build_futs: Vec<_> = cluster_data
+                .into_iter()
+                .map(|(cluster_idx, data)| {
+                    let configs = fts_configs_clone.clone();
+                    let ns = namespace_clone.clone();
+                    let seg = segment_id_clone.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let cluster_attrs = deserialize_attrs(&data)?;
+                        let attr_refs: Vec<
+                            Option<&HashMap<String, crate::types::AttributeValue>>,
+                        > = cluster_attrs.iter().map(|a| a.as_ref()).collect();
+                        let inv_index = InvertedIndex::build(&attr_refs, &configs);
+                        let field_names: Vec<String> =
+                            inv_index.fields.keys().cloned().collect();
+                        let fts_data = inv_index.to_bytes()?;
+                        let fts_key = fts_index_key(&ns, &seg, cluster_idx);
+                        Ok::<_, ZeppelinError>((fts_key, fts_data, field_names))
+                    })
+                })
+                .collect();
 
-                let inv_index = InvertedIndex::build(&attr_refs, fts_configs);
-
-                // Track which fields were indexed
-                for field_name in inv_index.fields.keys() {
-                    if !fts_field_names.contains(field_name) {
-                        fts_field_names.push(field_name.clone());
+            let build_results = futures::future::join_all(build_futs).await;
+            let mut write_payloads = Vec::new();
+            for result in build_results {
+                let (fts_key, fts_data, field_names) = result
+                    .map_err(|e| ZeppelinError::Index(format!("FTS build task failed: {e}")))?
+                    ?;
+                for name in field_names {
+                    if !fts_field_names.contains(&name) {
+                        fts_field_names.push(name);
                     }
                 }
-
-                let fts_data = inv_index.to_bytes()?;
-                let fts_key = fts_index_key(namespace, &segment_id, cluster_idx);
                 write_payloads.push((fts_key, fts_data));
             }
 

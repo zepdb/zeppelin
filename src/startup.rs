@@ -11,7 +11,7 @@ use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 use crate::cache::DiskCache;
-use crate::compaction::background::compaction_loop;
+use crate::compaction::background::start_compaction_thread;
 use crate::compaction::Compactor;
 use crate::config::Config;
 use crate::namespace::NamespaceManager;
@@ -113,15 +113,13 @@ pub async fn build_app(
         config.indexing.clone(),
     ));
 
-    // Spawn background compaction loop
+    // Spawn background compaction on a dedicated runtime (CPU isolation from queries)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    {
-        let compactor = compactor.clone();
-        let namespace_manager = namespace_manager.clone();
-        tokio::spawn(async move {
-            compaction_loop(compactor, namespace_manager, shutdown_rx).await;
-        });
-    }
+    let _compaction_handle = start_compaction_thread(
+        compactor.clone(),
+        namespace_manager.clone(),
+        shutdown_rx,
+    );
 
     // Build application state
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(

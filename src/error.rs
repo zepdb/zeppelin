@@ -19,6 +19,9 @@ pub enum ZeppelinError {
     #[error("bincode serialization error: {0}")]
     Bincode(String),
 
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
     // WAL errors
     #[error("checksum mismatch: expected {expected}, got {actual}")]
     ChecksumMismatch { expected: u64, actual: u64 },

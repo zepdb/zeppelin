@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{ClientOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
 use std::sync::Arc;
 use tracing::{debug, instrument};
 
@@ -44,6 +44,15 @@ impl ZeppelinStore {
                     // Enable conditional PUT (ETag-based CAS) — required for
                     // manifest conflict detection and lease CAS operations.
                     builder = builder.with_conditional_put(S3ConditionalPut::ETagMatch);
+
+                    // Connection pool tuning: increase idle connections and timeouts
+                    // to prevent 28% sustained throughput degradation observed in Run-007.
+                    let client_options = ClientOptions::new()
+                        .with_pool_max_idle_per_host(64)
+                        .with_timeout(std::time::Duration::from_secs(30))
+                        .with_connect_timeout(std::time::Duration::from_secs(10))
+                        .with_pool_idle_timeout(std::time::Duration::from_secs(90));
+                    builder = builder.with_client_options(client_options);
 
                     Arc::new(builder.build().map_err(|e| {
                         ZeppelinError::Config(format!("failed to build S3 store: {e}"))
