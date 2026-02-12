@@ -161,10 +161,11 @@ impl Compactor {
 
         info!(fragment_count = fragments_removed, "starting compaction");
 
-        // 3. Read fragments using snapshot refs (not re-reading manifest)
+        // 3. Read fragments using snapshot refs (not re-reading manifest).
+        // Uses unchecked read — fragments were validated on write.
         let fragments = self
             .wal_reader
-            .read_fragments_from_refs(namespace, &fragment_refs)
+            .read_fragments_from_refs_unchecked(namespace, &fragment_refs)
             .await?;
 
         // 4. Merge vectors: process in manifest order (sequence number), latest wins
