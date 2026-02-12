@@ -135,8 +135,8 @@ create_security_group() {
 build_and_transfer_image() {
     local ip="$1"
 
-    echo "Building Docker image (linux/amd64)..."
-    docker build --platform linux/amd64 -t zeppelin:latest "$PROJECT_ROOT"
+    echo "Building Docker image (linux/amd64) with profiling support..."
+    docker build --platform linux/amd64 --build-arg FEATURES=profiling -t zeppelin:latest "$PROJECT_ROOT"
 
     echo "Saving Docker image..."
     docker save zeppelin:latest | gzip > "$STATE_DIR/zeppelin-image.tar.gz"

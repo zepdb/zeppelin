@@ -6,6 +6,10 @@ description = "S3-native vector search engine"
 license = "Apache-2.0"
 rust-version = "1.84"
 
+[features]
+default = []
+profiling = ["dep:pprof"]
+
 [[bin]]
 name = "zeppelin"
 path = "src/main.rs"
@@ -79,6 +83,13 @@ roaring = { version = "0.10", features = ["serde"] }
 # Full-text search (BM25)
 unicode-segmentation = "1.11"
 rust-stemmers = "1.2"
+
+# CPU profiling (optional, behind "profiling" feature)
+pprof = { version = "0.14", features = ["flamegraph", "prost-codec"], optional = true }
+
+[profile.release]
+debug = 1
+lto = "thin"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

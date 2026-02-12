@@ -8,6 +8,8 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
+#[cfg(feature = "profiling")]
+use super::handlers::profiling;
 use super::handlers::{health, metrics, namespace, query, vectors};
 use super::middleware;
 use super::AppState;
@@ -15,10 +17,18 @@ use super::AppState;
 pub fn build_router(state: AppState) -> Router {
     let timeout = Duration::from_secs(state.config.server.request_timeout_secs);
 
-    Router::new()
+    #[allow(unused_mut)]
+    let mut router = Router::new()
         .route("/healthz", get(health::health_check))
         .route("/readyz", get(health::readiness_check))
-        .route("/metrics", get(metrics::metrics_handler))
+        .route("/metrics", get(metrics::metrics_handler));
+
+    #[cfg(feature = "profiling")]
+    {
+        router = router.route("/debug/pprof/cpu", get(profiling::cpu_profile));
+    }
+
+    router
         .route(
             "/v1/namespaces",
             post(namespace::create_namespace).get(namespace::list_namespaces),

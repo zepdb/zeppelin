@@ -3,11 +3,13 @@
 # ---- Builder stage ----
 FROM rust:1.84-bookworm AS builder
 
+ARG FEATURES=""
+
 WORKDIR /app
 
-# Install OpenSSL dev headers for static linking
+# Install build dependencies (protobuf-compiler needed by pprof's prost-codec)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends pkg-config libssl-dev && \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy manifests first for dependency caching
@@ -18,7 +20,7 @@ RUN mkdir -p src benches && \
     echo "fn main() {}" > src/main.rs && \
     echo "" > src/lib.rs && \
     echo "fn main() {}" > benches/core_benchmarks.rs && \
-    cargo build --release && \
+    cargo build --release ${FEATURES:+--features $FEATURES} && \
     rm -rf src benches
 
 # Copy real source code
@@ -27,7 +29,7 @@ COPY benches/ benches/
 
 # Touch files so cargo detects changes from the dummy build
 RUN touch src/main.rs src/lib.rs && \
-    cargo build --release
+    cargo build --release ${FEATURES:+--features $FEATURES}
 
 # ---- Runtime stage ----
 FROM debian:bookworm-slim
