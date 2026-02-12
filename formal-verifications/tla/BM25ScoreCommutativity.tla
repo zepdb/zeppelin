@@ -1,29 +1,28 @@
----------------------- MODULE BM25ScoreCommutativity ----------------------
-\* Formal verification of BM25 score algebraic properties:
-\* multi-field combinator commutativity, WAL vs segment equivalence,
-\* product associativity, and top-k stability.
+--------------------- MODULE BM25ScoreCommutativity -----------------------
+\* Formal verification of BM25 multi-field combinators and WAL vs segment
+\* scoring equivalence.
 \*
-\* MODELS: Deterministic BM25 scoring across two paths (WAL vs segment)
-\*         and multi-field combination orderings.
+\* MODELS: Multi-field BM25 score combination + WAL/segment paths
+\* VERIFIES: Sum commutativity, WAL vs segment equivalence,
+\*           Product associativity, and TopK stability under tie-breaking.
 \*
 \* ==========================================================================
 \* SCENARIO:
-\*   3 documents scored across 2 fields (title, body). Each field
-\*   produces a per-document BM25 score. Multi-field combinators
-\*   (Sum, Product) combine field scores into a final score.
-\*   We verify algebraic properties: Sum is commutative, Product
-\*   is deterministic, same data via WAL vs segment yields identical
-\*   scores, and top-k ordering is stable (no non-determinism for
-\*   equal scores with tie-breaking by doc_id).
+\*   BM25 scores for 4 documents across 2 fields (title, body).
+\*   Documents can be stored in WAL or segment -- scores must be identical
+\*   regardless of storage path. Multi-field combinators (Sum, Product)
+\*   must be deterministic and commutative/associative. TopK ordering
+\*   must be stable when scores are equal (tie-breaking by doc_id).
 \*
 \* Code references:
-\*   - src/query.rs: multi-field BM25 scoring
-\*   - src/index/ivf_flat/search.rs: BM25 score computation
+\*   - src/query.rs: multi-field BM25 scoring, combinator logic
+\*   - src/index/ivf_flat/search.rs: BM25 score computation per cluster
+\*   - src/compaction/mod.rs: data equivalence across WAL and segment
 \*
 \* EXPECTED RESULT: All invariants hold (correctness proof).
 \* ==========================================================================
 
-EXTENDS Naturals, FiniteSets, Sequences
+EXTENDS Integers, FiniteSets, Sequences
 
 \* ==========================================================================
 \* Constants
@@ -33,24 +32,27 @@ EXTENDS Naturals, FiniteSets, Sequences
 D1 == 1
 D2 == 2
 D3 == 3
+D4 == 4
 
-AllDocs == {D1, D2, D3}
+AllDocs == {D1, D2, D3, D4}
 
 \* Fields
 Fields == {"title", "body"}
 
-\* BM25 scores per (doc, field) — fixed test data
+\* BM25 scores per (doc, field) -- fixed test data
 \* Using integers scaled by 100 to avoid floating point
 \* (e.g., 250 represents 2.50)
 TitleScore(d) ==
     CASE d = D1 -> 250    \* 2.50
       [] d = D2 -> 180    \* 1.80
       [] d = D3 -> 300    \* 3.00
+      [] d = D4 -> 200    \* 2.00
 
 BodyScore(d) ==
     CASE d = D1 -> 150    \* 1.50
       [] d = D2 -> 320    \* 3.20
       [] d = D3 -> 100    \* 1.00
+      [] d = D4 -> 300    \* 3.00
 
 \* Field score lookup
 FieldScore(field, d) ==
@@ -62,7 +64,7 @@ TitleWeight == 2
 BodyWeight == 3
 
 \* Top-K
-TopK == 2
+TopKConst == 2
 
 \* ==========================================================================
 \* Combinators (deterministic integer arithmetic)
@@ -88,19 +90,22 @@ ProductScoreReversed(d) == BodyWeight * BodyScore(d) + TitleWeight * TitleScore(
 \* WAL path: reads raw vectors from WAL fragments, computes BM25 inline
 \* Segment path: reads pre-indexed posting lists from segment
 \*
-\* We model this as two independent computations that must agree.
+\* We model both as the same deterministic BM25 formula applied to the
+\* same underlying term frequencies and document lengths. If the formula
+\* is deterministic (which it must be), both paths agree.
 \* ==========================================================================
 
 \* BM25 formula components (simplified, using integers)
-\* IDF component: log(N / df) scaled. For our 3-doc corpus:
-\* If term appears in 2 of 3 docs: IDF = log(3/2) ~ 0.41 -> scaled to 41
-\* If term appears in 1 of 3 docs: IDF = log(3/1) ~ 1.10 -> scaled to 110
+\* IDF component: log(N / df) scaled. For our 4-doc corpus:
+\* If term appears in 2 of 4 docs: IDF = log(4/2) ~ 0.69 -> scaled to 69
+IDF_TERM == 69
 
 \* Term frequencies for title field (modeled as fixed values)
 TitleTF(d) ==
     CASE d = D1 -> 3    \* "alpha alpha alpha" in title
       [] d = D2 -> 1    \* "alpha" in title
       [] d = D3 -> 2    \* "alpha alpha" in title
+      [] d = D4 -> 4    \* "alpha alpha alpha alpha" in title
 
 \* Title field average length
 TitleAvgDL == 2    \* average doc length in title field
@@ -110,17 +115,17 @@ TitleDL(d) ==
     CASE d = D1 -> 3
       [] d = D2 -> 1
       [] d = D3 -> 2
+      [] d = D4 -> 4
 
 \* BM25 parameters (k1=120 means 1.20 scaled, b=75 means 0.75 scaled)
 K1 == 120
-B == 75
-IDF_TERM == 41    \* IDF for a term appearing in 2/3 docs
+BParam == 75
 
 \* BM25(d) = IDF * (tf * (k1 + 100)) / (tf + k1 * (100 - b + b * dl / avgdl))
 \* All values scaled by 100 to keep integers.
 \* We compute a simplified BM25 numerator and denominator.
 BM25Numerator(d) == IDF_TERM * (TitleTF(d) * (K1 + 100))
-BM25Denominator(d) == (TitleTF(d) * 100) + (K1 * (100 - B + ((B * TitleDL(d) * 100) \div TitleAvgDL)))
+BM25Denominator(d) == (TitleTF(d) * 100) + (K1 * (100 - BParam + ((BParam * TitleDL(d) * 100) \div TitleAvgDL)))
 
 \* WAL path computes from raw TF/DF
 WalBM25(d) == (BM25Numerator(d) * 1000) \div BM25Denominator(d)
@@ -132,20 +137,20 @@ SegBM25(d) == (BM25Numerator(d) * 1000) \div BM25Denominator(d)
 \* Top-K with tie-breaking by doc_id (ascending)
 \* ==========================================================================
 
-\* Count of docs with strictly better (higher) sum score
+\* Count of docs that rank strictly above d: (higher score, or same score + lower id)
 BetterSumCount(d) == Cardinality({d2 \in AllDocs :
     \/ SumScore(d2) > SumScore(d)
     \/ (SumScore(d2) = SumScore(d) /\ d2 < d)})
 
 \* Top-K by sum score with doc_id tie-breaking
-TopKBySum == {d \in AllDocs : BetterSumCount(d) < TopK}
+TopKBySum == {d \in AllDocs : BetterSumCount(d) < TopKConst}
 
 \* Same computation but using reversed sum (should give same result)
 BetterSumRevCount(d) == Cardinality({d2 \in AllDocs :
     \/ SumScoreReversed(d2) > SumScoreReversed(d)
     \/ (SumScoreReversed(d2) = SumScoreReversed(d) /\ d2 < d)})
 
-TopKBySumReversed == {d \in AllDocs : BetterSumRevCount(d) < TopK}
+TopKBySumReversed == {d \in AllDocs : BetterSumRevCount(d) < TopKConst}
 
 \* ==========================================================================
 \* State Variables

@@ -61,7 +61,7 @@ impl RankBy {
                     ZeppelinError::Validation("Sum argument must be an array".into())
                 })?;
                 let parsed: Result<Vec<RankBy>> =
-                    exprs.iter().map(|e| RankBy::from_value(e)).collect();
+                    exprs.iter().map(RankBy::from_value).collect();
                 Ok(RankBy::Sum(parsed?))
             }
             "Max" | "max" => {
@@ -74,7 +74,7 @@ impl RankBy {
                     ZeppelinError::Validation("Max argument must be an array".into())
                 })?;
                 let parsed: Result<Vec<RankBy>> =
-                    exprs.iter().map(|e| RankBy::from_value(e)).collect();
+                    exprs.iter().map(RankBy::from_value).collect();
                 Ok(RankBy::Max(parsed?))
             }
             "Product" | "product" => {
