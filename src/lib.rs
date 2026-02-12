@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod namespace;
 pub mod query;
 pub mod server;
+pub mod startup;
 pub mod storage;
 pub mod types;
 pub mod wal;
