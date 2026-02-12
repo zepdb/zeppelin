@@ -13,16 +13,21 @@ use super::Compactor;
 /// Runs on a dedicated tokio runtime to isolate compaction CPU from
 /// query-serving threads. This prevents k-means training and FTS index
 /// building from stealing CPU time during query processing.
+///
+/// `compaction_workers` controls the number of tokio worker threads for
+/// the compaction runtime. Set via `CpuBudget::auto()` (typically CPUs - 1).
 pub fn start_compaction_thread(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    compaction_workers: usize,
 ) -> std::thread::JoinHandle<()> {
+    info!(compaction_workers, "starting compaction runtime");
     std::thread::Builder::new()
         .name("compaction-runtime".to_string())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+                .worker_threads(compaction_workers)
                 .thread_name("compaction-worker")
                 .enable_all()
                 .build()

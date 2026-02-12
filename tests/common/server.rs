@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 
 use super::harness::TestHarness;
 
+use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::compaction_loop;
 use zeppelin::compaction::Compactor;
@@ -48,6 +50,7 @@ pub async fn start_test_server_with_config(
         config: Arc::new(config),
         compactor,
         cache: cache.clone(),
+        manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
         query_semaphore,
     };
 
@@ -102,6 +105,7 @@ pub async fn start_test_server_with_compactor(
         config: Arc::new(config),
         compactor: compactor.clone(),
         cache: cache.clone(),
+        manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
         query_semaphore,
     };
 
@@ -169,6 +173,7 @@ pub async fn start_test_server_with_compaction(
         config: Arc::new(config),
         compactor,
         cache: cache.clone(),
+        manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
         query_semaphore,
     };
 

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
+use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
 use crate::compaction::Compactor;
 use crate::config::Config;
@@ -23,5 +24,6 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub compactor: Arc<Compactor>,
     pub cache: Arc<DiskCache>,
+    pub manifest_cache: Arc<ManifestCache>,
     pub query_semaphore: Arc<Semaphore>,
 }
