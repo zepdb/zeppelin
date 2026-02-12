@@ -80,6 +80,22 @@ lazy_static::lazy_static! {
         "zeppelin_bitmap_fallback_postfilter_total", "Times bitmap fell back to post-filter",
         &["namespace"]
     ).unwrap();
+
+    // Full-text search metrics
+    pub static ref FTS_QUERY_DURATION: HistogramVec = register_histogram_vec!(
+        "zeppelin_fts_query_duration_seconds", "FTS query duration",
+        &["namespace"],
+        vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+    ).unwrap();
+    pub static ref FTS_INDEX_BUILD_DURATION: HistogramVec = register_histogram_vec!(
+        "zeppelin_fts_index_build_duration_seconds", "FTS inverted index build duration",
+        &["namespace"],
+        vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]
+    ).unwrap();
+    pub static ref FTS_QUERIES_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "zeppelin_fts_queries_total", "Total FTS queries",
+        &["namespace"]
+    ).unwrap();
 }
 
 /// RAII guard that decrements an IntGauge on drop.
@@ -111,4 +127,7 @@ pub fn init() {
     lazy_static::initialize(&BITMAP_FIELDS_BUILT);
     lazy_static::initialize(&BITMAP_PREFILTER_USED);
     lazy_static::initialize(&BITMAP_FALLBACK_POSTFILTER);
+    lazy_static::initialize(&FTS_QUERY_DURATION);
+    lazy_static::initialize(&FTS_INDEX_BUILD_DURATION);
+    lazy_static::initialize(&FTS_QUERIES_TOTAL);
 }

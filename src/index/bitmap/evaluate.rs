@@ -162,6 +162,9 @@ pub fn evaluate_filter_bitmap(
                 None
             }
         }
+
+        // FTS token filters require tokenization — fall back to post-filter
+        Filter::ContainsAllTokens { .. } | Filter::ContainsTokenSequence { .. } => None,
     }
 }
 

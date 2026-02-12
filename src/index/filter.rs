@@ -87,6 +87,51 @@ pub fn evaluate_filter(filter: &Filter, attributes: &HashMap<String, AttributeVa
             };
             attr_contains(attr, value)
         }
+
+        Filter::ContainsAllTokens { field, tokens } => {
+            let Some(attr) = attributes.get(field) else {
+                return false;
+            };
+            let text = match attr {
+                AttributeValue::String(s) => s.as_str(),
+                _ => return false,
+            };
+            let config = crate::fts::types::FtsFieldConfig::default();
+            let doc_tokens: std::collections::HashSet<String> =
+                crate::fts::tokenizer::tokenize_text(text, &config, false)
+                    .into_iter()
+                    .collect();
+            let query_tokens: Vec<String> = tokens
+                .iter()
+                .flat_map(|t| crate::fts::tokenizer::tokenize_text(t, &config, false))
+                .collect();
+            query_tokens.iter().all(|t| doc_tokens.contains(t))
+        }
+
+        Filter::ContainsTokenSequence { field, tokens } => {
+            let Some(attr) = attributes.get(field) else {
+                return false;
+            };
+            let text = match attr {
+                AttributeValue::String(s) => s.as_str(),
+                _ => return false,
+            };
+            let config = crate::fts::types::FtsFieldConfig::default();
+            let doc_tokens = crate::fts::tokenizer::tokenize_text(text, &config, false);
+            let query_tokens: Vec<String> = tokens
+                .iter()
+                .flat_map(|t| crate::fts::tokenizer::tokenize_text(t, &config, false))
+                .collect();
+            if query_tokens.is_empty() {
+                return true;
+            }
+            if query_tokens.len() > doc_tokens.len() {
+                return false;
+            }
+            doc_tokens
+                .windows(query_tokens.len())
+                .any(|window| window == query_tokens.as_slice())
+        }
     }
 }
 

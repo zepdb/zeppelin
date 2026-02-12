@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
 use crate::error::{Result, ZeppelinError};
+use crate::fts::types::FtsFieldConfig;
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, IndexType};
 
@@ -18,6 +19,10 @@ pub struct NamespaceMetadata {
     pub vector_count: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Per-field full-text search configuration.
+    /// Empty map means FTS is not enabled for this namespace.
+    #[serde(default)]
+    pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
 }
 
 impl NamespaceMetadata {
@@ -58,6 +63,19 @@ impl NamespaceManager {
         dimensions: usize,
         distance_metric: DistanceMetric,
     ) -> Result<NamespaceMetadata> {
+        self.create_with_fts(name, dimensions, distance_metric, std::collections::HashMap::new())
+            .await
+    }
+
+    /// Create a new namespace with optional FTS field configuration.
+    #[instrument(skip(self, full_text_search), fields(namespace = name))]
+    pub async fn create_with_fts(
+        &self,
+        name: &str,
+        dimensions: usize,
+        distance_metric: DistanceMetric,
+        full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
+    ) -> Result<NamespaceMetadata> {
         // Validate namespace name
         if !is_valid_namespace_name(name) {
             return Err(ZeppelinError::Validation(format!(
@@ -89,6 +107,7 @@ impl NamespaceManager {
             vector_count: 0,
             created_at: now,
             updated_at: now,
+            full_text_search,
         };
 
         // Write to S3

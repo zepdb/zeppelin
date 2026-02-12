@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
 use crate::error::ZeppelinError;
+use crate::fts::types::FtsFieldConfig;
 use crate::namespace::manager::NamespaceMetadata;
 use crate::server::AppState;
 use crate::types::DistanceMetric;
@@ -17,6 +18,8 @@ pub struct CreateNamespaceRequest {
     pub dimensions: usize,
     #[serde(default = "default_distance_metric")]
     pub distance_metric: DistanceMetric,
+    #[serde(default)]
+    pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
 }
 
 fn default_distance_metric() -> DistanceMetric {
@@ -31,6 +34,8 @@ pub struct NamespaceResponse {
     pub vector_count: u64,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
 }
 
 impl From<NamespaceMetadata> for NamespaceResponse {
@@ -42,6 +47,7 @@ impl From<NamespaceMetadata> for NamespaceResponse {
             vector_count: meta.vector_count,
             created_at: meta.created_at.to_rfc3339(),
             updated_at: meta.updated_at.to_rfc3339(),
+            full_text_search: meta.full_text_search,
         }
     }
 }
@@ -61,7 +67,7 @@ pub async fn create_namespace(
     info!(namespace = %req.name, dimensions = req.dimensions, "creating namespace");
     let meta = state
         .namespace_manager
-        .create(&req.name, req.dimensions, req.distance_metric)
+        .create_with_fts(&req.name, req.dimensions, req.distance_metric, req.full_text_search)
         .await
         .map_err(ApiError::from)?;
 

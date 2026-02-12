@@ -129,6 +129,9 @@ pub struct IndexingConfig {
     /// enabling filter evaluation before distance computation.
     #[serde(default = "default_bitmap_index")]
     pub bitmap_index: bool,
+    /// Whether to build FTS inverted indexes during compaction.
+    #[serde(default)]
+    pub fts_index: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +364,7 @@ impl Default for IndexingConfig {
             beam_width: default_beam_width(),
             leaf_size: None,
             bitmap_index: default_bitmap_index(),
+            fts_index: false,
         }
     }
 }

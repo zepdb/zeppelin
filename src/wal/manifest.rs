@@ -34,6 +34,9 @@ pub struct SegmentRef {
     /// Empty if bitmap indexing was not enabled when the segment was built.
     #[serde(default)]
     pub bitmap_fields: Vec<String>,
+    /// Fields that have FTS inverted indexes in this segment.
+    #[serde(default)]
+    pub fts_fields: Vec<String>,
 }
 
 /// The manifest is the single source of truth for what data exists

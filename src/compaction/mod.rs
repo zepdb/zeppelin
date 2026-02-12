@@ -7,6 +7,8 @@ use ulid::Ulid;
 
 use crate::config::{CompactionConfig, IndexingConfig};
 use crate::error::{Result, ZeppelinError};
+use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
+use crate::fts::types::FtsFieldConfig;
 use crate::index::hierarchical::build::build_hierarchical;
 use crate::index::ivf_flat::build::{
     attrs_key, build_ivf_flat, cluster_key, deserialize_attrs, deserialize_cluster,
@@ -98,6 +100,18 @@ impl Compactor {
         &self,
         namespace: &str,
         fencing_token: Option<u64>,
+    ) -> Result<CompactionResult> {
+        self.compact_with_fts(namespace, fencing_token, &HashMap::new())
+            .await
+    }
+
+    /// Compact with optional fencing token and FTS field configurations.
+    #[instrument(skip(self, fts_configs), fields(namespace = namespace))]
+    pub async fn compact_with_fts(
+        &self,
+        namespace: &str,
+        fencing_token: Option<u64>,
+        fts_configs: &HashMap<String, FtsFieldConfig>,
     ) -> Result<CompactionResult> {
         let start = std::time::Instant::now();
 
@@ -292,6 +306,52 @@ impl Compactor {
             "index build phase complete"
         );
 
+        // 8b. Build FTS inverted indexes (if FTS fields configured)
+        let fts_fields: Vec<String> = if !fts_configs.is_empty() && self.indexing_config.fts_index {
+            let fts_start = std::time::Instant::now();
+            let mut fts_field_names = Vec::new();
+
+            // Build inverted index per cluster
+            for cluster_idx in 0..cluster_count {
+                let akey = attrs_key(namespace, &segment_id, cluster_idx);
+                let cluster_attrs = match self.store.get(&akey).await {
+                    Ok(data) => deserialize_attrs(&data)?,
+                    Err(_) => continue,
+                };
+
+                let attr_refs: Vec<Option<&HashMap<String, crate::types::AttributeValue>>> =
+                    cluster_attrs.iter().map(|a| a.as_ref()).collect();
+
+                let inv_index = InvertedIndex::build(&attr_refs, fts_configs);
+
+                // Track which fields were indexed
+                for field_name in inv_index.fields.keys() {
+                    if !fts_field_names.contains(field_name) {
+                        fts_field_names.push(field_name.clone());
+                    }
+                }
+
+                let fts_data = inv_index.to_bytes()?;
+                let fts_key = fts_index_key(namespace, &segment_id, cluster_idx);
+                self.store.put(&fts_key, fts_data).await?;
+            }
+
+            let fts_elapsed = fts_start.elapsed();
+            crate::metrics::FTS_INDEX_BUILD_DURATION
+                .with_label_values(&[namespace])
+                .observe(fts_elapsed.as_secs_f64());
+            debug!(
+                fts_fields = ?fts_field_names,
+                fts_build_duration_ms = fts_elapsed.as_millis() as u64,
+                clusters = cluster_count,
+                "FTS inverted index build complete"
+            );
+
+            fts_field_names
+        } else {
+            Vec::new()
+        };
+
         // 9. CAS loop: re-read manifest, apply changes, write conditionally
         for attempt in 0..MAX_CAS_RETRIES {
             let (mut fresh_manifest, version) =
@@ -319,6 +379,7 @@ impl Compactor {
                 quantization: self.indexing_config.quantization,
                 hierarchical: is_hierarchical,
                 bitmap_fields: bitmap_fields.clone(),
+                fts_fields: fts_fields.clone(),
             });
             fresh_manifest.remove_compacted_fragments(last_fragment_id);
             fresh_manifest.pending_deletes = deferred_deletes.clone();

@@ -5,6 +5,12 @@ use tracing::{debug, instrument};
 
 use crate::cache::DiskCache;
 use crate::error::Result;
+use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
+use crate::fts::rank_by::{evaluate_rank_by, RankBy};
+use crate::fts::bm25::Bm25Params;
+use crate::fts::tokenizer::tokenize_text;
+use crate::fts::types::FtsFieldConfig;
+use crate::fts::wal_scan::wal_bm25_scan;
 use crate::index::distance::compute_distance;
 use crate::index::filter::evaluate_filter;
 use crate::index::HierarchicalIndex;
@@ -255,6 +261,268 @@ async fn segment_search(
     .await?;
 
     Ok(results)
+}
+
+/// Execute a BM25 full-text search query against a namespace.
+///
+/// Combines WAL brute-force scan with segment inverted index search.
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip(store, wal_reader, rank_by, fts_configs, filter), fields(namespace = namespace))]
+pub async fn execute_bm25_query(
+    store: &ZeppelinStore,
+    wal_reader: &WalReader,
+    namespace: &str,
+    rank_by: &RankBy,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    top_k: usize,
+    filter: Option<&Filter>,
+    consistency: ConsistencyLevel,
+    last_as_prefix: bool,
+) -> Result<QueryResponse> {
+    let manifest = Manifest::read(store, namespace).await?.unwrap_or_default();
+
+    let mut scanned_fragments = 0;
+    let mut scanned_segments = 0;
+
+    // WAL BM25 scan (always for Strong, never for Eventual)
+    let wal_start = std::time::Instant::now();
+    let wal_results = match consistency {
+        ConsistencyLevel::Strong => {
+            let refs = manifest.uncompacted_fragments().to_vec();
+            let fragments = wal_reader
+                .read_fragments_from_refs(namespace, &refs)
+                .await?;
+            let scan_result = wal_bm25_scan(&fragments, rank_by, fts_configs, last_as_prefix);
+            scanned_fragments = scan_result.fragment_count;
+            scan_result.results
+        }
+        ConsistencyLevel::Eventual => Vec::new(),
+    };
+    let wal_duration = wal_start.elapsed();
+    debug!(
+        wal_duration_ms = wal_duration.as_millis() as u64,
+        fragments_scanned = scanned_fragments,
+        "BM25 query phase: WAL scan"
+    );
+
+    // Segment BM25 search
+    let segment_start = std::time::Instant::now();
+    let segment_results = if let Some(ref segment_id) = manifest.active_segment {
+        let fts_fields = manifest
+            .segments
+            .iter()
+            .find(|s| s.id == *segment_id)
+            .map(|s| s.fts_fields.clone())
+            .unwrap_or_default();
+
+        if !fts_fields.is_empty() {
+            let results = segment_bm25_search(
+                store,
+                namespace,
+                segment_id,
+                rank_by,
+                fts_configs,
+                &fts_fields,
+                filter,
+                last_as_prefix,
+            )
+            .await?;
+            scanned_segments = 1;
+            results
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let segment_duration = segment_start.elapsed();
+    debug!(
+        segment_duration_ms = segment_duration.as_millis() as u64,
+        segments_scanned = scanned_segments,
+        "BM25 query phase: segment search"
+    );
+
+    // Merge results — BM25 is higher-is-better
+    let results = merge_bm25_results(wal_results, segment_results, top_k, consistency);
+
+    Ok(QueryResponse {
+        results,
+        scanned_fragments,
+        scanned_segments,
+    })
+}
+
+/// Search a segment's inverted indexes for a BM25 query.
+#[allow(clippy::too_many_arguments)]
+async fn segment_bm25_search(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_id: &str,
+    rank_by: &RankBy,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    fts_fields: &[String],
+    filter: Option<&Filter>,
+    last_as_prefix: bool,
+) -> Result<Vec<SearchResult>> {
+    use crate::index::ivf_flat::build::{attrs_key, deserialize_attrs};
+
+    // Load the IVF-Flat index to get centroid count
+    let index = IvfFlatIndex::load(store, namespace, segment_id).await?;
+    let num_clusters = index.num_clusters();
+
+    let field_queries = rank_by.extract_field_queries();
+    let mut all_results: HashMap<String, (f32, Option<HashMap<String, crate::types::AttributeValue>>)> =
+        HashMap::new();
+
+    // Search each cluster's inverted index
+    for cluster_idx in 0..num_clusters {
+        let fts_key = fts_index_key(namespace, segment_id, cluster_idx);
+        let fts_data = match store.get(&fts_key).await {
+            Ok(data) => data,
+            Err(crate::error::ZeppelinError::NotFound { .. }) => continue,
+            Err(e) => return Err(e),
+        };
+
+        let inv_index = InvertedIndex::from_bytes(&fts_data)?;
+
+        // Load attribute data for this cluster to get doc IDs and attributes
+        let akey = attrs_key(namespace, segment_id, cluster_idx);
+        let attrs_data = match store.get(&akey).await {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        let cluster_attrs = deserialize_attrs(&attrs_data)?;
+
+        // Load cluster to get IDs
+        let ckey = crate::index::ivf_flat::build::cluster_key(namespace, segment_id, cluster_idx);
+        let cluster_data = store.get(&ckey).await?;
+        let cluster = crate::index::ivf_flat::build::deserialize_cluster(&cluster_data)?;
+
+        // For each field+query, search the inverted index
+        let mut position_field_scores: HashMap<u32, HashMap<String, f32>> = HashMap::new();
+
+        for (field, query) in &field_queries {
+            let config = match fts_configs.get(field.as_str()) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if !fts_fields.contains(field) {
+                continue;
+            }
+
+            let query_tokens = tokenize_text(query, config, last_as_prefix);
+
+            let params = Bm25Params {
+                k1: config.k1,
+                b: config.b,
+            };
+            let results = if last_as_prefix {
+                inv_index.search_prefix(field, &query_tokens, &params)
+            } else {
+                inv_index.search(field, &query_tokens, &params)
+            };
+
+            for (pos, score) in results {
+                let entry = position_field_scores.entry(pos).or_default();
+                *entry.entry(field.to_string()).or_insert(0.0) += score;
+            }
+        }
+
+        // Evaluate rank_by expression and collect results
+        for (pos, field_scores) in position_field_scores {
+            let final_score = evaluate_rank_by(rank_by, &field_scores);
+            if final_score <= 0.0 {
+                continue;
+            }
+
+            let pos_usize = pos as usize;
+            if pos_usize >= cluster.ids.len() {
+                continue;
+            }
+
+            let id = cluster.ids[pos_usize].clone();
+            let attrs = cluster_attrs.get(pos_usize).cloned().flatten();
+
+            // Apply post-filter
+            if let Some(f) = filter {
+                match &attrs {
+                    Some(a) => {
+                        if !evaluate_filter(f, a) {
+                            continue;
+                        }
+                    }
+                    None => continue,
+                }
+            }
+
+            // Accumulate: same ID might appear in multiple clusters (shouldn't, but be safe)
+            let entry = all_results
+                .entry(id.clone())
+                .or_insert((0.0, attrs));
+            if final_score > entry.0 {
+                entry.0 = final_score;
+            }
+        }
+    }
+
+    let mut results: Vec<SearchResult> = all_results
+        .into_iter()
+        .map(|(id, (score, attributes))| SearchResult {
+            id,
+            score,
+            attributes,
+        })
+        .collect();
+
+    // Sort descending by score
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(results)
+}
+
+/// Merge BM25 WAL and segment results (higher score = better).
+fn merge_bm25_results(
+    wal_results: Vec<SearchResult>,
+    segment_results: Vec<SearchResult>,
+    top_k: usize,
+    consistency: ConsistencyLevel,
+) -> Vec<SearchResult> {
+    match consistency {
+        ConsistencyLevel::Strong => {
+            let wal_ids: HashSet<String> = wal_results.iter().map(|r| r.id.clone()).collect();
+            let mut merged: Vec<SearchResult> = wal_results;
+
+            for sr in segment_results {
+                if !wal_ids.contains(&sr.id) {
+                    merged.push(sr);
+                }
+            }
+
+            // Sort DESCENDING (higher BM25 score = more relevant)
+            merged.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            merged.truncate(top_k);
+            merged
+        }
+        ConsistencyLevel::Eventual => {
+            let mut results = segment_results;
+            results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results.truncate(top_k);
+            results
+        }
+    }
 }
 
 /// Merge WAL results and segment results.

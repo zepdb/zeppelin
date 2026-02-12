@@ -4,6 +4,7 @@ pub mod cache;
 pub mod compaction;
 pub mod config;
 pub mod error;
+pub mod fts;
 pub mod index;
 pub mod metrics;
 pub mod namespace;

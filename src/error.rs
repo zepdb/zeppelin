@@ -75,6 +75,13 @@ pub enum ZeppelinError {
     // Cache errors
     #[error("cache error: {0}")]
     Cache(String),
+
+    // Full-text search errors
+    #[error("full-text search error: {0}")]
+    FullTextSearch(String),
+
+    #[error("FTS field not configured on namespace {namespace}: {field}")]
+    FtsFieldNotConfigured { namespace: String, field: String },
 }
 
 impl From<Box<bincode::ErrorKind>> for ZeppelinError {
@@ -98,7 +105,9 @@ impl ZeppelinError {
             | ZeppelinError::LeaseExpired { .. }
             | ZeppelinError::FencingTokenStale { .. } => 409,
 
-            ZeppelinError::DimensionMismatch { .. } | ZeppelinError::Validation(_) => 400,
+            ZeppelinError::DimensionMismatch { .. }
+            | ZeppelinError::Validation(_)
+            | ZeppelinError::FtsFieldNotConfigured { .. } => 400,
 
             _ => 500,
         }

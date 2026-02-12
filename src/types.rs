@@ -100,6 +100,16 @@ pub enum Filter {
         field: String,
         value: AttributeValue,
     },
+    /// All specified tokens must be present in the field (order-independent).
+    ContainsAllTokens {
+        field: String,
+        tokens: Vec<String>,
+    },
+    /// Tokens must appear as an exact phrase (adjacent, in order).
+    ContainsTokenSequence {
+        field: String,
+        tokens: Vec<String>,
+    },
 }
 
 /// Consistency level for queries.

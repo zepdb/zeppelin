@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
 use crate::error::ZeppelinError;
+use crate::fts::rank_by::RankBy;
 use crate::query;
 use crate::server::AppState;
 use crate::types::{ConsistencyLevel, Filter, SearchResult};
@@ -12,7 +13,15 @@ use super::ApiError;
 
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
-    pub vector: Vec<f32>,
+    /// Vector for ANN search. Required unless `rank_by` is provided.
+    #[serde(default)]
+    pub vector: Option<Vec<f32>>,
+    /// BM25 ranking expression. Required unless `vector` is provided.
+    #[serde(default)]
+    pub rank_by: Option<RankBy>,
+    /// Whether the last token of each BM25 query should be treated as a prefix.
+    #[serde(default)]
+    pub last_as_prefix: bool,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
     #[serde(default)]
@@ -47,18 +56,23 @@ pub async fn query_namespace(
         .with_label_values(&[&ns])
         .inc();
 
+    // Exactly one of vector or rank_by must be provided
+    if req.vector.is_none() && req.rank_by.is_none() {
+        return Err(ApiError(ZeppelinError::Validation(
+            "exactly one of 'vector' or 'rank_by' must be provided".into(),
+        )));
+    }
+    if req.vector.is_some() && req.rank_by.is_some() {
+        return Err(ApiError(ZeppelinError::Validation(
+            "cannot provide both 'vector' and 'rank_by'".into(),
+        )));
+    }
+
     let meta = state
         .namespace_manager
         .get(&ns)
         .await
         .map_err(ApiError::from)?;
-
-    if req.vector.len() != meta.dimensions {
-        return Err(ApiError(ZeppelinError::DimensionMismatch {
-            expected: meta.dimensions,
-            actual: req.vector.len(),
-        }));
-    }
 
     if req.top_k == 0 {
         return Err(ApiError(ZeppelinError::Validation(
@@ -72,26 +86,66 @@ pub async fn query_namespace(
         ))));
     }
 
-    let nprobe = req
-        .nprobe
-        .unwrap_or(state.config.indexing.default_nprobe)
-        .min(state.config.indexing.max_nprobe);
+    let result = if let Some(ref rank_by) = req.rank_by {
+        // BM25 query path
+        // Validate all referenced fields are configured
+        for (field, _) in rank_by.extract_field_queries() {
+            if !meta.full_text_search.contains_key(&field) {
+                return Err(ApiError(ZeppelinError::FtsFieldNotConfigured {
+                    namespace: ns.clone(),
+                    field,
+                }));
+            }
+        }
 
-    let result = query::execute_query(
-        &state.store,
-        &state.wal_reader,
-        &ns,
-        &req.vector,
-        req.top_k,
-        nprobe,
-        req.filter.as_ref(),
-        req.consistency,
-        meta.distance_metric,
-        state.config.indexing.oversample_factor,
-        Some(&state.cache),
-    )
-    .await
-    .map_err(ApiError::from)?;
+        crate::metrics::FTS_QUERIES_TOTAL
+            .with_label_values(&[&ns])
+            .inc();
+
+        query::execute_bm25_query(
+            &state.store,
+            &state.wal_reader,
+            &ns,
+            rank_by,
+            &meta.full_text_search,
+            req.top_k,
+            req.filter.as_ref(),
+            req.consistency,
+            req.last_as_prefix,
+        )
+        .await
+        .map_err(ApiError::from)?
+    } else {
+        // Vector query path
+        let vector = req.vector.as_ref().unwrap();
+        if vector.len() != meta.dimensions {
+            return Err(ApiError(ZeppelinError::DimensionMismatch {
+                expected: meta.dimensions,
+                actual: vector.len(),
+            }));
+        }
+
+        let nprobe = req
+            .nprobe
+            .unwrap_or(state.config.indexing.default_nprobe)
+            .min(state.config.indexing.max_nprobe);
+
+        query::execute_query(
+            &state.store,
+            &state.wal_reader,
+            &ns,
+            vector,
+            req.top_k,
+            nprobe,
+            req.filter.as_ref(),
+            req.consistency,
+            meta.distance_metric,
+            state.config.indexing.oversample_factor,
+            Some(&state.cache),
+        )
+        .await
+        .map_err(ApiError::from)?
+    };
 
     let elapsed = start.elapsed();
     crate::metrics::QUERY_DURATION
