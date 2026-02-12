@@ -549,9 +549,17 @@ impl Config {
         // Indexing (continued)
         if let Ok(v) = std::env::var("ZEPPELIN_QUANTIZATION") {
             match v.to_lowercase().as_str() {
-                "none" => self.indexing.quantization = crate::index::quantization::QuantizationType::None,
-                "scalar" | "sq8" => self.indexing.quantization = crate::index::quantization::QuantizationType::Scalar,
-                "product" | "pq" => self.indexing.quantization = crate::index::quantization::QuantizationType::Product,
+                "none" => {
+                    self.indexing.quantization = crate::index::quantization::QuantizationType::None
+                }
+                "scalar" | "sq8" => {
+                    self.indexing.quantization =
+                        crate::index::quantization::QuantizationType::Scalar
+                }
+                "product" | "pq" => {
+                    self.indexing.quantization =
+                        crate::index::quantization::QuantizationType::Product
+                }
                 _ => tracing::warn!("Unknown ZEPPELIN_QUANTIZATION value: {v}"),
             }
         }

@@ -6,9 +6,7 @@
 
 use std::collections::HashMap;
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::Rng;
 
 use zeppelin::fts::bm25::{self, Bm25Params};
@@ -66,9 +64,8 @@ fn bench_distance(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("dispatch", dim), &dim, |bench, _| {
-            bench.iter(|| {
-                compute_distance(black_box(&a), black_box(&b), DistanceMetric::Euclidean)
-            });
+            bench
+                .iter(|| compute_distance(black_box(&a), black_box(&b), DistanceMetric::Euclidean));
         });
     }
 
@@ -182,14 +179,64 @@ fn bench_pq_quantization(c: &mut Criterion) {
 /// Generate realistic-ish text documents for BM25 benchmarks.
 fn generate_documents(n: usize) -> Vec<String> {
     let words = [
-        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "vector", "search",
-        "engine", "database", "index", "query", "fast", "performance", "benchmark", "storage",
-        "cloud", "native", "distributed", "system", "machine", "learning", "neural", "network",
-        "embedding", "dimension", "cluster", "centroid", "quantization", "compression", "latency",
-        "throughput", "scalable", "efficient", "algorithm", "data", "structure", "optimization",
-        "parallel", "concurrent", "async", "runtime", "memory", "cache", "disk", "object",
-        "storage", "retrieval", "ranking", "relevance", "similarity", "distance", "metric",
-        "cosine", "euclidean", "product",
+        "the",
+        "quick",
+        "brown",
+        "fox",
+        "jumps",
+        "over",
+        "lazy",
+        "dog",
+        "vector",
+        "search",
+        "engine",
+        "database",
+        "index",
+        "query",
+        "fast",
+        "performance",
+        "benchmark",
+        "storage",
+        "cloud",
+        "native",
+        "distributed",
+        "system",
+        "machine",
+        "learning",
+        "neural",
+        "network",
+        "embedding",
+        "dimension",
+        "cluster",
+        "centroid",
+        "quantization",
+        "compression",
+        "latency",
+        "throughput",
+        "scalable",
+        "efficient",
+        "algorithm",
+        "data",
+        "structure",
+        "optimization",
+        "parallel",
+        "concurrent",
+        "async",
+        "runtime",
+        "memory",
+        "cache",
+        "disk",
+        "object",
+        "storage",
+        "retrieval",
+        "ranking",
+        "relevance",
+        "similarity",
+        "distance",
+        "metric",
+        "cosine",
+        "euclidean",
+        "product",
     ];
 
     let mut rng = rand::thread_rng();
@@ -261,10 +308,7 @@ fn bench_bm25(c: &mut Criterion) {
         .iter()
         .map(|doc| {
             let mut m = HashMap::new();
-            m.insert(
-                "content".to_string(),
-                AttributeValue::String(doc.clone()),
-            );
+            m.insert("content".to_string(), AttributeValue::String(doc.clone()));
             Some(m)
         })
         .collect();
@@ -279,7 +323,13 @@ fn bench_bm25(c: &mut Criterion) {
     let query_tokens = tokenize_text("vector search engine", &config, false);
 
     group.bench_function("inverted_index_search_10k", |bench| {
-        bench.iter(|| index.search(black_box("content"), black_box(&query_tokens), black_box(&params)));
+        bench.iter(|| {
+            index.search(
+                black_box("content"),
+                black_box(&query_tokens),
+                black_box(&params),
+            )
+        });
     });
 
     let prefix_tokens = tokenize_text("vector sea", &config, true);
@@ -339,13 +389,9 @@ fn bench_bitmap(c: &mut Criterion) {
         let attr_refs: Vec<Option<&HashMap<String, AttributeValue>>> =
             attr_maps.iter().map(|a| a.as_ref()).collect();
 
-        group.bench_with_input(
-            BenchmarkId::new("build", n_vecs),
-            &n_vecs,
-            |bench, _| {
-                bench.iter(|| build_cluster_bitmaps(black_box(&attr_refs)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("build", n_vecs), &n_vecs, |bench, _| {
+            bench.iter(|| build_cluster_bitmaps(black_box(&attr_refs)));
+        });
 
         let bitmap_index = build_cluster_bitmaps(&attr_refs);
 
@@ -354,15 +400,9 @@ fn bench_bitmap(c: &mut Criterion) {
             field: "category".to_string(),
             value: AttributeValue::String("cat_a".to_string()),
         };
-        group.bench_with_input(
-            BenchmarkId::new("eval_eq", n_vecs),
-            &n_vecs,
-            |bench, _| {
-                bench.iter(|| {
-                    evaluate_filter_bitmap(black_box(&eq_filter), black_box(&bitmap_index))
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("eval_eq", n_vecs), &n_vecs, |bench, _| {
+            bench.iter(|| evaluate_filter_bitmap(black_box(&eq_filter), black_box(&bitmap_index)));
+        });
 
         // And filter
         let and_filter = Filter::And {
@@ -380,15 +420,9 @@ fn bench_bitmap(c: &mut Criterion) {
                 },
             ],
         };
-        group.bench_with_input(
-            BenchmarkId::new("eval_and", n_vecs),
-            &n_vecs,
-            |bench, _| {
-                bench.iter(|| {
-                    evaluate_filter_bitmap(black_box(&and_filter), black_box(&bitmap_index))
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("eval_and", n_vecs), &n_vecs, |bench, _| {
+            bench.iter(|| evaluate_filter_bitmap(black_box(&and_filter), black_box(&bitmap_index)));
+        });
 
         // Or filter
         let or_filter = Filter::Or {
@@ -403,15 +437,9 @@ fn bench_bitmap(c: &mut Criterion) {
                 },
             ],
         };
-        group.bench_with_input(
-            BenchmarkId::new("eval_or", n_vecs),
-            &n_vecs,
-            |bench, _| {
-                bench.iter(|| {
-                    evaluate_filter_bitmap(black_box(&or_filter), black_box(&bitmap_index))
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("eval_or", n_vecs), &n_vecs, |bench, _| {
+            bench.iter(|| evaluate_filter_bitmap(black_box(&or_filter), black_box(&bitmap_index)));
+        });
     }
 
     group.finish();
