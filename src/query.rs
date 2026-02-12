@@ -11,6 +11,7 @@ use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
 use crate::fts::rank_by::{evaluate_rank_by, RankBy};
 use crate::fts::tokenizer::tokenize_text;
 use crate::fts::types::FtsFieldConfig;
+use crate::fts::wal_cache::WalFtsCache;
 use crate::fts::wal_scan::wal_bm25_scan;
 use crate::index::distance::compute_distance;
 use crate::index::filter::evaluate_filter;
@@ -301,7 +302,7 @@ async fn segment_search(
 ///
 /// Combines WAL brute-force scan with segment inverted index search.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(store, wal_reader, rank_by, fts_configs, filter, manifest_cache), fields(namespace = namespace))]
+#[instrument(skip(store, wal_reader, rank_by, fts_configs, filter, manifest_cache, fts_cache), fields(namespace = namespace))]
 pub async fn execute_bm25_query(
     store: &ZeppelinStore,
     wal_reader: &WalReader,
@@ -313,11 +314,18 @@ pub async fn execute_bm25_query(
     consistency: ConsistencyLevel,
     last_as_prefix: bool,
     manifest_cache: Option<&Arc<ManifestCache>>,
+    fts_cache: Option<&Arc<WalFtsCache>>,
 ) -> Result<QueryResponse> {
     let manifest = match manifest_cache {
         Some(mc) => mc.get(store, namespace).await?,
         None => Manifest::read(store, namespace).await?.unwrap_or_default(),
     };
+
+    // Evict compacted fragments from the FTS cache to prevent unbounded growth
+    if let Some(cache) = fts_cache {
+        let active_ids: Vec<ulid::Ulid> = manifest.uncompacted_fragments().iter().map(|f| f.id).collect();
+        cache.evict_compacted(&active_ids);
+    }
 
     let mut scanned_fragments = 0;
     let mut scanned_segments = 0;
@@ -332,7 +340,7 @@ pub async fn execute_bm25_query(
             let fragments = wal_reader
                 .read_fragments_from_refs(namespace, &refs)
                 .await?;
-            let scan_result = wal_bm25_scan(&fragments, rank_by, fts_configs, last_as_prefix, None, Some(top_k));
+            let scan_result = wal_bm25_scan(&fragments, rank_by, fts_configs, last_as_prefix, fts_cache.map(|c| c.as_ref()), Some(top_k));
             scanned_fragments = scan_result.fragment_count;
             wal_deleted_ids = scan_result.deleted_ids;
             // Apply post-filter to WAL results

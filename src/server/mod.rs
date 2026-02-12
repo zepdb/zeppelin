@@ -10,6 +10,7 @@ use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
 use crate::compaction::Compactor;
 use crate::config::Config;
+use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::NamespaceManager;
 use crate::storage::ZeppelinStore;
 use crate::wal::batch_writer::BatchWalWriter;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub compactor: Arc<Compactor>,
     pub cache: Arc<DiskCache>,
     pub manifest_cache: Arc<ManifestCache>,
+    pub fts_cache: Arc<WalFtsCache>,
     pub query_semaphore: Arc<Semaphore>,
     /// Optional batched WAL writer (enabled when batch_manifest_size > 1).
     pub batch_wal_writer: Option<Arc<BatchWalWriter>>,

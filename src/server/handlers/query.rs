@@ -115,6 +115,7 @@ pub async fn query_namespace(
             req.consistency,
             req.last_as_prefix,
             Some(&state.manifest_cache),
+            Some(&state.fts_cache),
         )
         .await
         .map_err(ApiError::from)?
