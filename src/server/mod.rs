@@ -12,6 +12,7 @@ use crate::compaction::Compactor;
 use crate::config::Config;
 use crate::namespace::NamespaceManager;
 use crate::storage::ZeppelinStore;
+use crate::wal::batch_writer::BatchWalWriter;
 use crate::wal::{WalReader, WalWriter};
 
 /// Shared application state injected into all handlers via axum's State extractor.
@@ -26,4 +27,6 @@ pub struct AppState {
     pub cache: Arc<DiskCache>,
     pub manifest_cache: Arc<ManifestCache>,
     pub query_semaphore: Arc<Semaphore>,
+    /// Optional batched WAL writer (enabled when batch_manifest_size > 1).
+    pub batch_wal_writer: Option<Arc<BatchWalWriter>>,
 }

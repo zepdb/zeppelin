@@ -85,11 +85,22 @@ pub async fn upsert_vectors(
     }
 
     let count = req.vectors.len();
-    let (_, manifest) = state
-        .wal_writer
-        .append(&ns, req.vectors, vec![])
-        .await
-        .map_err(ApiError::from)?;
+    let manifest = if let Some(ref batch_writer) = state.batch_wal_writer {
+        let fragment = crate::wal::WalFragment::try_new(req.vectors, vec![])
+            .map_err(ApiError::from)?;
+        let (_, manifest) = batch_writer
+            .append(&state.store, &ns, fragment)
+            .await
+            .map_err(ApiError::from)?;
+        manifest
+    } else {
+        let (_, manifest) = state
+            .wal_writer
+            .append(&ns, req.vectors, vec![])
+            .await
+            .map_err(ApiError::from)?;
+        manifest
+    };
 
     // Write-through: insert fresh manifest so next query skips S3 GET.
     state.manifest_cache.insert(&ns, manifest);
@@ -123,11 +134,22 @@ pub async fn delete_vectors(
         .map_err(ApiError::from)?;
 
     let count = req.ids.len();
-    let (_, manifest) = state
-        .wal_writer
-        .append(&ns, vec![], req.ids)
-        .await
-        .map_err(ApiError::from)?;
+    let manifest = if let Some(ref batch_writer) = state.batch_wal_writer {
+        let fragment = crate::wal::WalFragment::try_new(vec![], req.ids)
+            .map_err(ApiError::from)?;
+        let (_, manifest) = batch_writer
+            .append(&state.store, &ns, fragment)
+            .await
+            .map_err(ApiError::from)?;
+        manifest
+    } else {
+        let (_, manifest) = state
+            .wal_writer
+            .append(&ns, vec![], req.ids)
+            .await
+            .map_err(ApiError::from)?;
+        manifest
+    };
 
     // Write-through: insert fresh manifest so next query skips S3 GET.
     state.manifest_cache.insert(&ns, manifest);

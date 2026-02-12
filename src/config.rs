@@ -18,6 +18,29 @@ pub struct Config {
     pub consistency: ConsistencyConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub wal: WalConfig,
+}
+
+/// WAL configuration for batched manifest updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalConfig {
+    /// Number of fragment refs to batch before flushing manifest.
+    /// Set to 1 (default) to disable batching.
+    #[serde(default = "default_batch_manifest_size")]
+    pub batch_manifest_size: usize,
+    /// Maximum time (ms) to wait for a full batch before flushing.
+    #[serde(default = "default_batch_manifest_timeout_ms")]
+    pub batch_manifest_timeout_ms: u64,
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            batch_manifest_size: default_batch_manifest_size(),
+            batch_manifest_timeout_ms: default_batch_manifest_timeout_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +301,12 @@ fn default_max_wal_fragments() -> usize {
 }
 fn default_retrain_threshold() -> f64 {
     5.0
+}
+fn default_batch_manifest_size() -> usize {
+    1 // disabled by default
+}
+fn default_batch_manifest_timeout_ms() -> u64 {
+    100
 }
 fn default_log_level() -> String {
     "info".to_string()

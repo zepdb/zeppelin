@@ -1,3 +1,4 @@
+pub mod batch_writer;
 pub mod fragment;
 pub mod lease;
 pub mod manifest;

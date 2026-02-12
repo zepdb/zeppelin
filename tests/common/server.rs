@@ -52,6 +52,7 @@ pub async fn start_test_server_with_config(
         cache: cache.clone(),
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
         query_semaphore,
+        batch_wal_writer: None,
     };
 
     let app = build_router(state);
@@ -107,6 +108,7 @@ pub async fn start_test_server_with_compactor(
         cache: cache.clone(),
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
         query_semaphore,
+        batch_wal_writer: None,
     };
 
     let app = build_router(state);
@@ -177,6 +179,7 @@ pub async fn start_test_server_with_compaction(
         cache: cache.clone(),
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
         query_semaphore,
+        batch_wal_writer: None,
     };
 
     let app = build_router(state);
