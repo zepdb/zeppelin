@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
+use crate::cache::manifest_cache::ManifestCache;
 use crate::namespace::NamespaceManager;
 
 use super::Compactor;
@@ -21,6 +22,7 @@ pub fn start_compaction_thread(
     namespace_manager: Arc<NamespaceManager>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     compaction_workers: usize,
+    manifest_cache: Arc<ManifestCache>,
 ) -> std::thread::JoinHandle<()> {
     info!(compaction_workers, "starting compaction runtime");
     std::thread::Builder::new()
@@ -33,7 +35,12 @@ pub fn start_compaction_thread(
                 .build()
                 .expect("failed to build compaction runtime");
 
-            rt.block_on(compaction_loop(compactor, namespace_manager, shutdown));
+            rt.block_on(compaction_loop(
+                compactor,
+                namespace_manager,
+                shutdown,
+                manifest_cache,
+            ));
         })
         .expect("failed to spawn compaction thread")
 }
@@ -43,6 +50,7 @@ pub async fn compaction_loop(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    manifest_cache: Arc<ManifestCache>,
 ) {
     info!(
         interval_secs = compactor.config().interval_secs,
@@ -80,6 +88,8 @@ pub async fn compaction_loop(
                             crate::metrics::COMPACTIONS_TOTAL
                                 .with_label_values(&[&ns.name, "success"])
                                 .inc();
+                            // Invalidate manifest cache so queries see new segment.
+                            manifest_cache.invalidate(&ns.name);
                             info!(
                                 namespace = %ns.name,
                                 vectors_compacted = result.vectors_compacted,

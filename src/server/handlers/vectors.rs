@@ -85,14 +85,14 @@ pub async fn upsert_vectors(
     }
 
     let count = req.vectors.len();
-    state
+    let (_, manifest) = state
         .wal_writer
         .append(&ns, req.vectors, vec![])
         .await
         .map_err(ApiError::from)?;
 
-    // Invalidate cached manifest so next query sees the new fragment.
-    state.manifest_cache.invalidate(&ns);
+    // Write-through: insert fresh manifest so next query skips S3 GET.
+    state.manifest_cache.insert(&ns, manifest);
 
     info!(upserted = count, "vectors upserted");
     Ok((
@@ -123,14 +123,14 @@ pub async fn delete_vectors(
         .map_err(ApiError::from)?;
 
     let count = req.ids.len();
-    state
+    let (_, manifest) = state
         .wal_writer
         .append(&ns, vec![], req.ids)
         .await
         .map_err(ApiError::from)?;
 
-    // Invalidate cached manifest so next query sees the delete.
-    state.manifest_cache.invalidate(&ns);
+    // Write-through: insert fresh manifest so next query skips S3 GET.
+    state.manifest_cache.insert(&ns, manifest);
 
     info!(deleted = count, "vectors deleted");
     Ok(StatusCode::NO_CONTENT)

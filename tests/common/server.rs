@@ -153,12 +153,14 @@ pub async fn start_test_server_with_compaction(
     ));
 
     // Spawn background compaction loop (mirrors main.rs)
+    let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(500)));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let compactor = compactor.clone();
         let namespace_manager = namespace_manager.clone();
+        let manifest_cache = manifest_cache.clone();
         tokio::spawn(async move {
-            compaction_loop(compactor, namespace_manager, shutdown_rx).await;
+            compaction_loop(compactor, namespace_manager, shutdown_rx, manifest_cache).await;
         });
     }
 

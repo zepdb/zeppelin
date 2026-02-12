@@ -40,13 +40,15 @@ impl WalWriter {
     /// Append vectors and deletes to the WAL for a namespace.
     /// Creates a new fragment, writes it to S3, and updates the manifest.
     /// Uses CAS (compare-and-swap) for manifest updates to prevent concurrent overwrites.
+    ///
+    /// Returns the fragment and the updated manifest for write-through caching.
     #[instrument(skip(self, vectors, deletes), fields(namespace = namespace))]
     pub async fn append(
         &self,
         namespace: &str,
         vectors: Vec<VectorEntry>,
         deletes: Vec<VectorId>,
-    ) -> Result<WalFragment> {
+    ) -> Result<(WalFragment, Manifest)> {
         self.append_with_lease(namespace, vectors, deletes, None)
             .await
     }
@@ -60,6 +62,8 @@ impl WalWriter {
     ///   from read, re-checking fencing. A zombie is caught on retry.
     ///
     /// When `fencing_token` is `None`: behaves identically to `append()`.
+    ///
+    /// Returns the fragment and the updated manifest for write-through caching.
     #[instrument(skip(self, vectors, deletes), fields(namespace = namespace))]
     pub async fn append_with_lease(
         &self,
@@ -67,7 +71,7 @@ impl WalWriter {
         vectors: Vec<VectorEntry>,
         deletes: Vec<VectorId>,
         fencing_token: Option<u64>,
-    ) -> Result<WalFragment> {
+    ) -> Result<(WalFragment, Manifest)> {
         let lock = self.namespace_lock(namespace);
         let _guard = lock.lock().await;
 
@@ -126,7 +130,7 @@ impl WalWriter {
                         fragment_count = manifest.fragments.len(),
                         attempt, "updated manifest"
                     );
-                    return Ok(fragment);
+                    return Ok((fragment, manifest));
                 }
                 Err(ZeppelinError::ManifestConflict { .. }) => {
                     warn!(

@@ -55,7 +55,7 @@ async fn test_wal_writer_append_single_fragment() {
 
     let writer = WalWriter::new(harness.store.clone());
     let vectors = random_vectors(3, 16);
-    let fragment = writer.append(&ns, vectors, vec![]).await.unwrap();
+    let (fragment, _) = writer.append(&ns, vectors, vec![]).await.unwrap();
 
     // Verify fragment exists on S3
     let frag_key = WalFragment::s3_key(&ns, &fragment.id);
@@ -81,15 +81,15 @@ async fn test_wal_writer_append_multiple_fragments() {
 
     let writer = WalWriter::new(harness.store.clone());
 
-    let f1 = writer
+    let (f1, _) = writer
         .append(&ns, random_vectors(2, 8), vec![])
         .await
         .unwrap();
-    let f2 = writer
+    let (f2, _) = writer
         .append(&ns, random_vectors(3, 8), vec!["del_1".to_string()])
         .await
         .unwrap();
-    let f3 = writer
+    let (f3, _) = writer
         .append(&ns, vec![], vec!["del_2".to_string(), "del_3".to_string()])
         .await
         .unwrap();
@@ -114,11 +114,11 @@ async fn test_wal_reader_read_uncompacted_fragments() {
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let writer = WalWriter::new(harness.store.clone());
-    let f1 = writer
+    let (f1, _) = writer
         .append(&ns, random_vectors(2, 8), vec![])
         .await
         .unwrap();
-    let f2 = writer
+    let (f2, _) = writer
         .append(&ns, random_vectors(3, 8), vec![])
         .await
         .unwrap();
