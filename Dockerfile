@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---- Builder stage ----
-FROM rust:1.84-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 
 ARG FEATURES=""
 
