@@ -355,7 +355,6 @@ impl Default for CompactionConfig {
     }
 }
 
-
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {

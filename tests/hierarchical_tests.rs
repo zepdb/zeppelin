@@ -527,8 +527,8 @@ async fn test_query_hierarchical_detection() {
         namespace: &ns,
         query,
         top_k: 10,
-        nprobe: 4,                          // nprobe / beam_width
-        filter: None,                       // no filter
+        nprobe: 4,                               // nprobe / beam_width
+        filter: None,                            // no filter
         consistency: ConsistencyLevel::Eventual, // skip WAL scan, just segment search
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 3,
