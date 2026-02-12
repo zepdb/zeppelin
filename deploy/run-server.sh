@@ -34,6 +34,9 @@ docker run -d --name zeppelin \
     -e ZEPPELIN_DEFAULT_NPROBE="${ZEPPELIN_DEFAULT_NPROBE:-4}" \
     -e ZEPPELIN_BITMAP_INDEX="${ZEPPELIN_BITMAP_INDEX:-true}" \
     -e ZEPPELIN_CACHE_MAX_SIZE_GB="${ZEPPELIN_CACHE_MAX_SIZE_GB:-2}" \
+    -e ZEPPELIN_HIERARCHICAL="${ZEPPELIN_HIERARCHICAL:-false}" \
+    -e ZEPPELIN_BEAM_WIDTH="${ZEPPELIN_BEAM_WIDTH:-10}" \
+    -e ZEPPELIN_LEAF_SIZE="${ZEPPELIN_LEAF_SIZE:-}" \
     zeppelin:latest
 
 echo "Zeppelin started. Waiting for health check..."
