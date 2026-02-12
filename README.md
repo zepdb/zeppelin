@@ -18,7 +18,9 @@
 
 - **S3-native** -- Object storage is the single source of truth
 - **Stateless nodes** -- Any node can serve any query
-- **IVF-Flat indexing** -- 2 sequential S3 roundtrips per query
+- **IVF indexing** -- IVF-Flat, IVF-SQ8 (4x compression), IVF-PQ (16-32x), and Hierarchical ANN
+- **BM25 full-text search** -- Inverted indexes with configurable tokenization, stemming, and multi-field `rank_by` expressions
+- **Bitmap pre-filters** -- RoaringBitmap indexes for sub-millisecond attribute filtering
 - **Write-ahead log** -- Durable writes with compaction into indexed segments
 - **Strong & eventual consistency** -- Choose per-query
 - **Multi-cloud** -- Works with S3, GCS, and Azure Blob Storage
@@ -167,7 +169,7 @@ src/
   server/      Axum HTTP handlers, routes, middleware
 ```
 
-Writes land in the WAL as immutable fragments. Background compaction merges fragments into IVF-Flat indexed segments. Queries probe the closest centroids (2 S3 reads) and merge results from any un-compacted WAL fragments.
+Writes land in the WAL as immutable fragments. Background compaction merges fragments into indexed segments (IVF, bitmap pre-filters, BM25 inverted indexes). Queries probe the closest centroids and merge results from any un-compacted WAL fragments.
 
 ## License
 
