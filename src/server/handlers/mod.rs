@@ -1,6 +1,8 @@
 pub mod health;
 pub mod metrics;
 pub mod namespace;
+#[cfg(feature = "profiling")]
+pub mod profiling;
 pub mod query;
 pub mod vectors;
 
