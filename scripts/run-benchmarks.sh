@@ -106,11 +106,13 @@ check_profiling_available() {
     if [ "$SKIP_PROFILING" = true ]; then
         return 1
     fi
-    # Quick 1-second profile to check if endpoint exists
-    if curl -sf --max-time 10 "$TARGET/debug/pprof/cpu?seconds=1" -o /dev/null 2>&1; then
+    # Check if the profiling endpoint exists by doing a quick 1-second profile
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$TARGET/debug/pprof/cpu?seconds=1" 2>/dev/null)
+    if [ "$http_code" = "200" ]; then
         return 0
     else
-        log "WARNING: Profiling endpoint not available, falling back to --skip-profiling"
+        log "WARNING: Profiling endpoint returned HTTP $http_code, falling back to --skip-profiling"
         SKIP_PROFILING=true
         return 1
     fi
@@ -123,7 +125,7 @@ run_scenario() {
     log "Running scenario: $scenario"
     local output_file="$RESULTS_DIR/${scenario}.json"
 
-    cargo run -p zeppelin-bench --release -- \
+    cargo run --manifest-path "$PROJECT_ROOT/benchmarks/Cargo.toml" --release -- \
         --target "$TARGET" \
         --scenario "$scenario" \
         --vectors "$VECTORS" \
@@ -307,8 +309,11 @@ for scenario in "${SCENARIO_LIST[@]}"; do
             capture_metrics "post_ingest"
             ;;
         compaction)
-            # k-means + index build — profile for 45s
-            run_scenario_with_profile "compaction" 45 "--batch-size 50"
+            # k-means + index build — profile for 45s, use small batches to trigger more compactions
+            _saved_batch_size="$BATCH_SIZE"
+            BATCH_SIZE=50
+            run_scenario_with_profile "compaction" 45
+            BATCH_SIZE="$_saved_batch_size"
             capture_metrics "post_compaction"
             ;;
         query_latency)
