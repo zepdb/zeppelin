@@ -276,10 +276,49 @@ impl Compactor {
         // 7. Generate new segment ID
         let segment_id = format!("seg_{}", Ulid::new());
 
+        // 7b. Incremental compaction decision: skip k-means retraining when
+        // new vectors are a small fraction of the total.
+        let new_from_wal = fragments.iter().map(|f| f.vectors.len()).sum::<usize>();
+        let existing_count = vectors.len().saturating_sub(new_from_wal);
+        let should_retrain = existing_count == 0
+            || (new_from_wal as f64 / existing_count.max(1) as f64)
+                > self.config.retrain_imbalance_threshold;
+
         // 8. Build index (expensive, done once — NOT retried)
         // Choose hierarchical or flat based on config.
         let build_start = std::time::Instant::now();
-        let (cluster_count, is_hierarchical, bitmap_fields) = if self.indexing_config.hierarchical {
+        let (cluster_count, is_hierarchical, bitmap_fields) = if !should_retrain
+            && old_segment_id.is_some()
+            && !self.indexing_config.hierarchical
+        {
+            // Incremental path: reuse existing centroids, just reassign vectors.
+            match self
+                .incremental_build(namespace, old_segment_id.as_deref().unwrap(), &segment_id, &vectors)
+                .await
+            {
+                Ok((count, bf)) => {
+                    info!(
+                        new_from_wal,
+                        existing_count,
+                        "incremental compaction: reusing centroids"
+                    );
+                    (count, false, bf)
+                }
+                Err(e) => {
+                    warn!(error = %e, "incremental build failed, falling back to full retrain");
+                    let index = build_ivf_flat(
+                        &vectors,
+                        &self.indexing_config,
+                        &self.store,
+                        namespace,
+                        &segment_id,
+                    )
+                    .await?;
+                    let bf = index.bitmap_fields.clone();
+                    (index.num_clusters(), false, bf)
+                }
+            }
+        } else if self.indexing_config.hierarchical {
             let h_index = build_hierarchical(
                 &vectors,
                 &self.indexing_config,
@@ -475,6 +514,99 @@ impl Compactor {
         Err(ZeppelinError::ManifestConflict {
             namespace: namespace.to_string(),
         })
+    }
+}
+
+impl Compactor {
+    /// Incremental build: reuse centroids from old segment, assign all vectors
+    /// to nearest centroid, write new cluster data without k-means training.
+    ///
+    /// Returns (cluster_count, bitmap_fields) on success.
+    async fn incremental_build(
+        &self,
+        namespace: &str,
+        old_segment_id: &str,
+        new_segment_id: &str,
+        vectors: &[VectorEntry],
+    ) -> Result<(usize, Vec<String>)> {
+        use bytes::Bytes;
+        use crate::index::distance::euclidean_distance;
+        use crate::index::ivf_flat::build::{
+            centroids_key, serialize_centroids, deserialize_centroids,
+            serialize_cluster, serialize_attrs,
+        };
+
+        // Load existing centroids
+        let ckey = centroids_key(namespace, old_segment_id);
+        let centroids_data = self.store.get(&ckey).await?;
+        let (centroids, dim) = deserialize_centroids(&centroids_data)?;
+        let num_clusters = centroids.len();
+
+        // Assign ALL vectors to nearest centroid
+        let mut cluster_ids: Vec<Vec<String>> = vec![Vec::new(); num_clusters];
+        let mut cluster_vecs: Vec<Vec<Vec<f32>>> = vec![Vec::new(); num_clusters];
+        let mut cluster_attrs: Vec<Vec<Option<HashMap<String, crate::types::AttributeValue>>>> =
+            vec![Vec::new(); num_clusters];
+
+        for entry in vectors {
+            let mut best_dist = f32::MAX;
+            let mut best_cluster = 0usize;
+            for (c, centroid) in centroids.iter().enumerate() {
+                let d = euclidean_distance(&entry.values, centroid);
+                if d < best_dist {
+                    best_dist = d;
+                    best_cluster = c;
+                }
+            }
+            cluster_ids[best_cluster].push(entry.id.clone());
+            cluster_vecs[best_cluster].push(entry.values.clone());
+            cluster_attrs[best_cluster].push(entry.attributes.clone());
+        }
+
+        // Write centroids (copy to new segment path)
+        let new_ckey = centroids_key(namespace, new_segment_id);
+        let new_centroids_data = serialize_centroids(&centroids, dim)?;
+        self.store.put(&new_ckey, new_centroids_data).await?;
+
+        // CPU phase: pre-serialize all cluster payloads
+        let mut bitmap_fields_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut payloads: Vec<(String, Bytes)> = Vec::new();
+
+        for i in 0..num_clusters {
+            let cvec_data = serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?;
+            let cvec_key = cluster_key(namespace, new_segment_id, i);
+
+            let cattr_data = serialize_attrs(&cluster_attrs[i])?;
+            let cattr_key = attrs_key(namespace, new_segment_id, i);
+
+            payloads.push((cvec_key, cvec_data));
+            payloads.push((cattr_key, cattr_data));
+
+            if self.indexing_config.bitmap_index {
+                let attr_refs: Vec<Option<&HashMap<String, crate::types::AttributeValue>>> =
+                    cluster_attrs[i].iter().map(|a| a.as_ref()).collect();
+                let bitmap_index = crate::index::bitmap::build::build_cluster_bitmaps(&attr_refs);
+                for field_name in bitmap_index.fields.keys() {
+                    bitmap_fields_set.insert(field_name.clone());
+                }
+                let bitmap_data = bitmap_index.to_bytes()?;
+                let bkey = crate::index::bitmap::bitmap_key(namespace, new_segment_id, i);
+                payloads.push((bkey, bitmap_data));
+            }
+        }
+
+        // I/O phase: write all in parallel
+        let write_futs: Vec<_> = payloads
+            .iter()
+            .map(|(key, data)| self.store.put(key, data.clone()))
+            .collect();
+        let results = futures::future::join_all(write_futs).await;
+        for result in results {
+            result?;
+        }
+
+        let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
+        Ok((num_clusters, bitmap_fields))
     }
 }
 
