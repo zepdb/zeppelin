@@ -2,6 +2,9 @@
 //!
 //! Same pattern as vector WAL scan in `src/query.rs`: read fragments from
 //! manifest snapshot, dedup, apply deletes, tokenize on the fly, score.
+//!
+//! When a `WalFtsCache` is provided, pre-tokenized data is reused across
+//! queries instead of re-tokenizing every document on every query.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,6 +14,7 @@ use crate::fts::bm25::{self, Bm25Params};
 use crate::fts::rank_by::{evaluate_rank_by, RankBy};
 use crate::fts::tokenizer::tokenize_text;
 use crate::fts::types::FtsFieldConfig;
+use crate::fts::wal_cache::WalFtsCache;
 use crate::types::{AttributeValue, SearchResult};
 use crate::wal::fragment::WalFragment;
 
@@ -33,11 +37,19 @@ pub struct WalBm25ScanResult {
 /// 3. Score via BM25
 /// 4. Evaluate rank_by expression
 /// 5. Return sorted results (higher score = better)
+///
+/// When `fts_cache` is provided, tokenization results are cached per-fragment
+/// and reused across queries, eliminating the dominant CPU cost.
+///
+/// When `top_k` is provided, results are truncated to the top K after scoring.
+/// This enables callers to limit work in the merge phase.
 pub fn wal_bm25_scan(
     fragments: &[WalFragment],
     rank_by: &RankBy,
     fts_configs: &HashMap<String, FtsFieldConfig>,
     last_as_prefix: bool,
+    fts_cache: Option<&WalFtsCache>,
+    top_k: Option<usize>,
 ) -> WalBm25ScanResult {
     let frag_count = fragments.len();
 
@@ -111,8 +123,74 @@ pub fn wal_bm25_scan(
         };
     }
 
-    // 4. Build ephemeral corpus stats per field:
-    //    - doc count, total token length, per-term doc frequency
+    // Gather all unique fields we need to index
+    let fields_needed: Vec<&str> = field_query_states
+        .iter()
+        .map(|s| s.field.as_str())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // 4. Build per-doc, per-field tokenized data — using cache when available
+    let mut doc_field_data: DocFieldData = HashMap::new();
+
+    if let Some(cache) = fts_cache {
+        // Fast path: use cached pre-tokenized data
+        for fragment in fragments {
+            let cached = cache.get_or_tokenize(fragment, fts_configs, &fields_needed);
+            for ((doc_id, field_name), token_data) in &cached.doc_field_data {
+                // Only include docs that survived dedup
+                if latest_vectors.contains_key(doc_id) {
+                    doc_field_data
+                        .entry(doc_id.clone())
+                        .or_default()
+                        .insert(
+                            field_name.clone(),
+                            (token_data.doc_length, token_data.term_freqs.clone()),
+                        );
+                }
+            }
+        }
+    } else {
+        // Slow path: tokenize inline (no cache)
+        for (doc_id, attrs_opt) in &latest_vectors {
+            let attrs = match attrs_opt {
+                Some(a) => a,
+                None => continue,
+            };
+
+            for &field_name in &fields_needed {
+                let config = match fts_configs.get(field_name) {
+                    Some(c) => c,
+                    None => continue,
+                };
+
+                let text = match attrs.get(field_name) {
+                    Some(AttributeValue::String(s)) => s.as_str(),
+                    _ => continue,
+                };
+
+                let tokens = tokenize_text(text, config, false);
+                let doc_length = tokens.len() as u32;
+
+                if doc_length == 0 {
+                    continue;
+                }
+
+                let mut tf_map: HashMap<String, u32> = HashMap::new();
+                for token in &tokens {
+                    *tf_map.entry(token.clone()).or_insert(0) += 1;
+                }
+
+                doc_field_data
+                    .entry(doc_id.clone())
+                    .or_default()
+                    .insert(field_name.to_string(), (doc_length, tf_map));
+            }
+        }
+    }
+
+    // 5. Build ephemeral corpus stats per field
     struct CorpusStats {
         doc_count: u32,
         avg_doc_length: f32,
@@ -120,65 +198,22 @@ pub fn wal_bm25_scan(
     }
 
     let mut field_corpus_stats: HashMap<String, CorpusStats> = HashMap::new();
-    // Per-doc, per-field: (doc_length, term→tf)
-    let mut doc_field_data: DocFieldData = HashMap::new();
 
-    // Gather all unique fields we need to index
-    let fields_needed: HashSet<&str> = field_query_states
-        .iter()
-        .map(|s| s.field.as_str())
-        .collect();
-
-    for (doc_id, attrs_opt) in &latest_vectors {
-        let attrs = match attrs_opt {
-            Some(a) => a,
-            None => continue,
-        };
-
-        for &field_name in &fields_needed {
-            let config = match fts_configs.get(field_name) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            let text = match attrs.get(field_name) {
-                Some(AttributeValue::String(s)) => s.as_str(),
-                _ => continue,
-            };
-
-            let tokens = tokenize_text(text, config, false);
-            let doc_length = tokens.len() as u32;
-
-            if doc_length == 0 {
-                continue;
-            }
-
-            // Term frequencies
-            let mut tf_map: HashMap<String, u32> = HashMap::new();
-            for token in &tokens {
-                *tf_map.entry(token.clone()).or_insert(0) += 1;
-            }
-
-            // Update corpus stats
+    for doc_data in doc_field_data.values() {
+        for (field_name, (doc_length, tf_map)) in doc_data {
             let stats = field_corpus_stats
-                .entry(field_name.to_string())
+                .entry(field_name.clone())
                 .or_insert_with(|| CorpusStats {
                     doc_count: 0,
                     avg_doc_length: 0.0,
                     term_doc_freqs: HashMap::new(),
                 });
             stats.doc_count += 1;
-            // We'll compute avg later
-            stats.avg_doc_length += doc_length as f32; // accumulate total
+            stats.avg_doc_length += *doc_length as f32; // accumulate total
 
             for term in tf_map.keys() {
                 *stats.term_doc_freqs.entry(term.clone()).or_insert(0) += 1;
             }
-
-            doc_field_data
-                .entry(doc_id.clone())
-                .or_default()
-                .insert(field_name.to_string(), (doc_length, tf_map));
         }
     }
 
@@ -189,7 +224,7 @@ pub fn wal_bm25_scan(
         }
     }
 
-    // 5. Score each document
+    // 6. Score each document
     let mut results: Vec<SearchResult> = Vec::new();
 
     for (doc_id, attrs_opt) in &latest_vectors {
@@ -208,9 +243,6 @@ pub fn wal_bm25_scan(
                 None => continue,
             };
 
-            // Compute BM25 score for this doc in this field.
-            // For prefix mode, the last query token matches any doc token
-            // that starts with it (e.g., "prog" matches "programming").
             let last_idx = fq_state.query_tokens.len().saturating_sub(1);
             let term_data: Vec<(f32, u32)> = fq_state
                 .query_tokens
@@ -218,7 +250,6 @@ pub fn wal_bm25_scan(
                 .enumerate()
                 .map(|(i, token)| {
                     if last_as_prefix && i == last_idx {
-                        // Prefix match: sum TF across all doc tokens starting with this prefix
                         let mut total_tf = 0u32;
                         let mut total_df = 0u32;
                         for (doc_term, &freq) in tf_map.iter() {
@@ -264,6 +295,11 @@ pub fn wal_bm25_scan(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // Early termination: truncate to top_k if specified
+    if let Some(k) = top_k {
+        results.truncate(k);
+    }
 
     debug!(
         surviving_vectors = results.len(),
@@ -335,10 +371,39 @@ mod tests {
             query: "cat".to_string(),
         };
 
-        let result = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false);
+        let result = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false, None, None);
         assert_eq!(result.fragment_count, 1);
         assert_eq!(result.results.len(), 2); // v1 and v2 contain "cat"
         assert!(result.results[0].score >= result.results[1].score);
+    }
+
+    #[test]
+    fn test_wal_scan_with_cache() {
+        let fragments = vec![make_fragment(
+            vec![
+                make_vec_entry("v1", "cat dog"),
+                make_vec_entry("v2", "cat bird"),
+                make_vec_entry("v3", "fish"),
+            ],
+            vec![],
+        )];
+
+        let rank_by = RankBy::Bm25 {
+            field: "content".to_string(),
+            query: "cat".to_string(),
+        };
+
+        let cache = WalFtsCache::new();
+
+        // First scan (populates cache)
+        let result1 = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false, Some(&cache), None);
+        assert_eq!(result1.results.len(), 2);
+        assert_eq!(cache.len(), 1);
+
+        // Second scan (uses cache)
+        let result2 = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false, Some(&cache), None);
+        assert_eq!(result2.results.len(), 2);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
@@ -359,7 +424,7 @@ mod tests {
             query: "cat".to_string(),
         };
 
-        let result = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false);
+        let result = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false, None, None);
         assert_eq!(result.results.len(), 1); // v1 was deleted
         assert_eq!(result.results[0].id, "v2");
     }
@@ -374,6 +439,8 @@ mod tests {
             },
             &make_configs(),
             false,
+            None,
+            None,
         );
         assert!(result.results.is_empty());
         assert_eq!(result.fragment_count, 0);
@@ -388,7 +455,7 @@ mod tests {
             query: "".to_string(),
         };
 
-        let result = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false);
+        let result = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false, None, None);
         assert!(result.results.is_empty());
     }
 
@@ -435,7 +502,7 @@ mod tests {
             },
         );
 
-        let result = wal_bm25_scan(&fragments, &rank_by, &configs, false);
+        let result = wal_bm25_scan(&fragments, &rank_by, &configs, false, None, None);
         assert_eq!(result.results.len(), 1);
         assert!(result.results[0].score > 0.0);
     }

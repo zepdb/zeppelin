@@ -61,9 +61,10 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
     // WAL scan (always for Strong, never for Eventual)
     // Uses the manifest we already read for snapshot consistency — avoids re-reading
     // a newer manifest whose fragments may have been deleted by compaction.
+    // Short-circuit: skip WAL scan if no uncompacted fragments exist.
     let wal_start = std::time::Instant::now();
     let wal_results = match consistency {
-        ConsistencyLevel::Strong => {
+        ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
             let (results, frag_count) = wal_scan(
                 wal_reader,
                 namespace,
@@ -76,7 +77,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
             scanned_fragments = frag_count;
             results
         }
-        ConsistencyLevel::Eventual => Vec::new(),
+        _ => Vec::new(),
     };
     let wal_duration = wal_start.elapsed();
     debug!(
@@ -312,15 +313,16 @@ pub async fn execute_bm25_query(
     let mut scanned_segments = 0;
 
     // WAL BM25 scan (always for Strong, never for Eventual)
+    // Short-circuit: skip WAL scan if no uncompacted fragments exist.
     let wal_start = std::time::Instant::now();
     let mut wal_deleted_ids = std::collections::HashSet::new();
     let wal_results = match consistency {
-        ConsistencyLevel::Strong => {
+        ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
             let refs = manifest.uncompacted_fragments().to_vec();
             let fragments = wal_reader
                 .read_fragments_from_refs(namespace, &refs)
                 .await?;
-            let scan_result = wal_bm25_scan(&fragments, rank_by, fts_configs, last_as_prefix);
+            let scan_result = wal_bm25_scan(&fragments, rank_by, fts_configs, last_as_prefix, None, Some(top_k));
             scanned_fragments = scan_result.fragment_count;
             wal_deleted_ids = scan_result.deleted_ids;
             // Apply post-filter to WAL results
@@ -333,7 +335,7 @@ pub async fn execute_bm25_query(
             }
             results
         }
-        ConsistencyLevel::Eventual => Vec::new(),
+        _ => Vec::new(),
     };
     let wal_duration = wal_start.elapsed();
     debug!(

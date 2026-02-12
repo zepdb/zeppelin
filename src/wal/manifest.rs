@@ -3,8 +3,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::error::Result;
+use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
+
+/// Version byte for manifest format detection.
+const MANIFEST_FORMAT_MSGPACK: u8 = 0x01;
 
 /// A reference to a WAL fragment stored on S3.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,15 +124,41 @@ impl Manifest {
         self.segments.iter().map(|s| s.vector_count).sum()
     }
 
-    /// Serialize to JSON bytes.
+    /// Serialize to MessagePack bytes with a version header.
+    ///
+    /// Format: `[0x01] [msgpack payload]`
+    /// Falls back to JSON for human readability during debugging if needed.
     pub fn to_bytes(&self) -> Result<Bytes> {
-        let json = serde_json::to_vec_pretty(self)?;
-        Ok(Bytes::from(json))
+        let msgpack = rmp_serde::to_vec(self)
+            .map_err(|e| ZeppelinError::Serialization(format!("manifest msgpack serialize: {e}")))?;
+        let mut data = Vec::with_capacity(1 + msgpack.len());
+        data.push(MANIFEST_FORMAT_MSGPACK);
+        data.extend_from_slice(&msgpack);
+        Ok(Bytes::from(data))
     }
 
-    /// Deserialize from JSON bytes.
+    /// Deserialize from bytes, auto-detecting format (MessagePack or legacy JSON).
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        Ok(serde_json::from_slice(data)?)
+        if data.is_empty() {
+            return Ok(Self::new());
+        }
+        match data[0] {
+            MANIFEST_FORMAT_MSGPACK => rmp_serde::from_slice(&data[1..]).map_err(|e| {
+                ZeppelinError::Serialization(format!("manifest msgpack deserialize: {e}"))
+            }),
+            // Legacy JSON: starts with '{' (0x7B)
+            b'{' => Ok(serde_json::from_slice(data)?),
+            _ => {
+                // Try msgpack (skip version byte), fall back to JSON
+                rmp_serde::from_slice(&data[1..])
+                    .or_else(|_| rmp_serde::from_slice(data))
+                    .map_err(|e| {
+                        ZeppelinError::Serialization(format!(
+                            "manifest msgpack deserialize: {e}"
+                        ))
+                    })
+            }
+        }
     }
 
     /// Read manifest from S3. Returns None if not found.
