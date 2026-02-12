@@ -411,8 +411,197 @@ pub async fn execute_bm25_query(
 }
 
 /// Search a segment's inverted indexes for a BM25 query.
+///
+/// Uses the global FTS index when available (1 S3 GET instead of N),
+/// falling back to full per-cluster scan for older segments.
 #[allow(clippy::too_many_arguments)]
 async fn segment_bm25_search(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_ref: &SegmentRef,
+    rank_by: &RankBy,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    filter: Option<&Filter>,
+    last_as_prefix: bool,
+) -> Result<Vec<SearchResult>> {
+    if segment_ref.has_global_fts {
+        return segment_bm25_search_global(
+            store,
+            namespace,
+            segment_ref,
+            rank_by,
+            fts_configs,
+            filter,
+            last_as_prefix,
+        )
+        .await;
+    }
+    segment_bm25_search_full_scan(
+        store,
+        namespace,
+        segment_ref,
+        rank_by,
+        fts_configs,
+        filter,
+        last_as_prefix,
+    )
+    .await
+}
+
+/// BM25 search using the global FTS index (fast path).
+#[allow(clippy::too_many_arguments)]
+async fn segment_bm25_search_global(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_ref: &SegmentRef,
+    rank_by: &RankBy,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    filter: Option<&Filter>,
+    last_as_prefix: bool,
+) -> Result<Vec<SearchResult>> {
+    use crate::fts::global_index::{GlobalInvertedIndex, global_fts_key};
+    use crate::fts::bm25::Bm25Params;
+    use crate::fts::rank_by::evaluate_rank_by;
+    use crate::index::ivf_flat::build::{attrs_key, deserialize_attrs, cluster_key, deserialize_cluster};
+
+    let segment_id = &segment_ref.id;
+
+    // Load global FTS index (1 S3 GET, ~50KB)
+    let gkey = global_fts_key(namespace, segment_id);
+    let global_data = store.get(&gkey).await?;
+    let global_index = GlobalInvertedIndex::from_bytes(&global_data)?;
+
+    let field_queries = rank_by.extract_field_queries();
+
+    // Score documents via global index
+    let mut position_field_scores: HashMap<(u16, u32), HashMap<String, f32>> = HashMap::new();
+
+    for (field, query) in &field_queries {
+        let config = match fts_configs.get(field.as_str()) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let query_tokens = tokenize_text(query, config, last_as_prefix);
+        let params = Bm25Params {
+            k1: config.k1,
+            b: config.b,
+        };
+
+        let results = if last_as_prefix {
+            global_index.search_prefix(field, &query_tokens, &params)
+        } else {
+            global_index.search(field, &query_tokens, &params)
+        };
+
+        for (cluster_idx, position, score) in results {
+            let entry = position_field_scores
+                .entry((cluster_idx, position))
+                .or_default();
+            *entry.entry(field.to_string()).or_insert(0.0) += score;
+        }
+    }
+
+    if position_field_scores.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Identify which clusters we need to fetch attrs from
+    let needed_clusters: HashSet<u16> = position_field_scores
+        .keys()
+        .map(|(c, _)| *c)
+        .collect();
+
+    // Parallel fetch attrs only for matching clusters
+    let cluster_attrs_results = futures::future::join_all(
+        needed_clusters.iter().map(|&cluster_idx| {
+            let akey = attrs_key(namespace, segment_id, cluster_idx as usize);
+            let ckey = cluster_key(namespace, segment_id, cluster_idx as usize);
+            async move {
+                let (attrs_res, cluster_res) = tokio::join!(store.get(&akey), store.get(&ckey));
+                (cluster_idx, attrs_res, cluster_res)
+            }
+        }),
+    )
+    .await;
+
+    // Build lookup: cluster_idx -> (attrs, cluster)
+    let mut cluster_data: HashMap<u16, (Vec<Option<HashMap<String, crate::types::AttributeValue>>>, Vec<String>)> =
+        HashMap::new();
+    for (cluster_idx, attrs_res, cluster_res) in cluster_attrs_results {
+        let attrs = match attrs_res {
+            Ok(data) => deserialize_attrs(&data)?,
+            Err(_) => continue,
+        };
+        let cluster = match cluster_res {
+            Ok(data) => deserialize_cluster(&data)?,
+            Err(_) => continue,
+        };
+        cluster_data.insert(cluster_idx, (attrs, cluster.ids));
+    }
+
+    // Collect results
+    let mut all_results: HashMap<String, (f32, Option<HashMap<String, crate::types::AttributeValue>>)> =
+        HashMap::new();
+
+    for ((cluster_idx, position), field_scores) in position_field_scores {
+        let final_score = evaluate_rank_by(rank_by, &field_scores);
+        if final_score <= 0.0 {
+            continue;
+        }
+
+        let (attrs, ids) = match cluster_data.get(&cluster_idx) {
+            Some(data) => data,
+            None => continue,
+        };
+
+        let pos = position as usize;
+        if pos >= ids.len() {
+            continue;
+        }
+
+        let id = ids[pos].clone();
+        let attr = attrs.get(pos).cloned().flatten();
+
+        // Apply post-filter
+        if let Some(f) = filter {
+            match &attr {
+                Some(a) => {
+                    if !evaluate_filter(f, a) {
+                        continue;
+                    }
+                }
+                None => continue,
+            }
+        }
+
+        let entry = all_results.entry(id).or_insert((0.0, attr));
+        if final_score > entry.0 {
+            entry.0 = final_score;
+        }
+    }
+
+    let mut results: Vec<SearchResult> = all_results
+        .into_iter()
+        .map(|(id, (score, attributes))| SearchResult {
+            id,
+            score,
+            attributes,
+        })
+        .collect();
+
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok(results)
+}
+
+/// BM25 search using full per-cluster scan (backward compat fallback).
+#[allow(clippy::too_many_arguments)]
+async fn segment_bm25_search_full_scan(
     store: &ZeppelinStore,
     namespace: &str,
     segment_ref: &SegmentRef,

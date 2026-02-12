@@ -40,6 +40,9 @@ pub struct SegmentRef {
     /// Fields that have FTS inverted indexes in this segment.
     #[serde(default)]
     pub fts_fields: Vec<String>,
+    /// Whether this segment has a global FTS index.
+    #[serde(default)]
+    pub has_global_fts: bool,
 }
 
 /// The manifest is the single source of truth for what data exists

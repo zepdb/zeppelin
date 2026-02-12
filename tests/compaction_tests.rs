@@ -403,6 +403,7 @@ async fn test_compact_with_existing_segment() {
         hierarchical: false,
         bitmap_fields: Vec::new(),
         fts_fields: Vec::new(),
+        has_global_fts: false,
     });
     manifest.write(store, &ns).await.unwrap();
 
