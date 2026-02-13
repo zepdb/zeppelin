@@ -35,7 +35,7 @@ struct Args {
     dimensions: usize,
 
     /// Concurrent clients
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 16)]
     concurrency: usize,
 
     /// Duration for sustained load tests (seconds)
