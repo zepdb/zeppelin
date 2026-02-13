@@ -188,9 +188,9 @@ pub async fn run(args: &Args, client: &dyn BenchClient) -> Result<serde_json::Va
     );
 
     // ── Phase 3: Compaction wait with stabilization ────────────────────────
-    eprintln!("  Phase 3: Waiting for compaction to stabilize (up to 120s)...");
+    eprintln!("  Phase 3: Waiting for compaction to stabilize (up to 600s)...");
     let compact_start = Instant::now();
-    let max_wait = Duration::from_secs(120);
+    let max_wait = Duration::from_secs(600);
     let poll_interval = Duration::from_secs(5);
     let queries_per_poll = 10;
     let mut poll_p50s: Vec<f64> = Vec::new();
