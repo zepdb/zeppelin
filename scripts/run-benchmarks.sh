@@ -352,7 +352,7 @@ for scenario in "${SCENARIO_LIST[@]}"; do
             run_scenario_with_profile "bm25" 30
             ;;
         scale_test)
-            run_scenario_with_profile "scale_test" 60
+            run_scenario_with_profile "scale_test" 900
             ;;
         index_comparison)
             run_scenario_with_profile "index_comparison" 45

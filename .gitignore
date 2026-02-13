@@ -55,3 +55,4 @@ deploy/.state/
 # Benchmark results and build artifacts
 benchmarks/results/
 benchmarks/target/
+demo/
