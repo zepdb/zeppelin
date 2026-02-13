@@ -309,10 +309,14 @@ for scenario in "${SCENARIO_LIST[@]}"; do
             capture_metrics "post_ingest"
             ;;
         compaction)
-            # k-means + index build — profile for 45s, use small batches to trigger more compactions
+            # k-means + index build — use small batches to trigger more compactions
             _saved_batch_size="$BATCH_SIZE"
-            BATCH_SIZE=50
-            run_scenario_with_profile "compaction" 45
+            if [ "$VECTORS" -ge 100000 ]; then
+                BATCH_SIZE=200   # 100K/200 = 500 fragments (manageable)
+            else
+                BATCH_SIZE=50    # 10K/50 = 200 fragments (existing behavior)
+            fi
+            run_scenario_with_profile "compaction" 60
             BATCH_SIZE="$_saved_batch_size"
             capture_metrics "post_compaction"
             ;;
