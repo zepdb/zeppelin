@@ -1,15 +1,44 @@
 //! Query latency benchmark.
 //!
-//! Measures p50/p95/p99/max latency at various concurrency levels.
+//! Measures p50/p95/p99/max latency at various concurrency levels using
+//! FuturesUnordered for true concurrent query execution.
 
+use std::pin::Pin;
 use std::time::Instant;
 
+use futures::stream::{FuturesUnordered, StreamExt};
+use futures::Future;
 use hdrhistogram::Histogram;
 
-use crate::client::{BenchClient, QueryRequest};
+use crate::client::{BenchClient, QueryRequest, QueryResponse};
 use crate::datasets;
 use crate::results;
 use crate::Args;
+
+type QueryFuture<'a> =
+    Pin<Box<dyn Future<Output = (Instant, Result<QueryResponse, String>)> + Send + 'a>>;
+
+fn submit_query<'a>(
+    client: &'a dyn BenchClient,
+    ns: &'a str,
+    dims: usize,
+    top_k: usize,
+    nprobe: Option<usize>,
+) -> QueryFuture<'a> {
+    let query_vec = datasets::random_query(dims);
+    let req = QueryRequest {
+        vector: Some(query_vec),
+        top_k,
+        filter: None,
+        nprobe,
+        rank_by: None,
+    };
+    let t = Instant::now();
+    Box::pin(async move {
+        let result = client.query(ns, &req).await;
+        (t, result)
+    })
+}
 
 pub async fn run(args: &Args, client: &dyn BenchClient) -> Result<serde_json::Value, anyhow::Error> {
     let ns = format!("bench-qlat-{}", rand::random::<u32>());
@@ -37,32 +66,34 @@ pub async fn run(args: &Args, client: &dyn BenchClient) -> Result<serde_json::Va
     for &concurrency in &[1, 4, 16, 64] {
         eprintln!("  Running {n_queries} queries at concurrency={concurrency}...");
         let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut completed = 0u64;
 
         let start = Instant::now();
+        let mut pending: FuturesUnordered<QueryFuture<'_>> = FuturesUnordered::new();
 
-        let queries: Vec<Vec<f32>> = (0..n_queries)
-            .map(|_| datasets::random_query(args.dimensions))
-            .collect();
+        // Seed the pipeline up to concurrency level
+        let mut submitted = 0usize;
+        while submitted < concurrency.min(n_queries) {
+            pending.push(submit_query(client, &ns, args.dimensions, args.top_k, args.nprobe));
+            submitted += 1;
+        }
 
-        // Process in chunks to simulate concurrency level
-        for chunk in queries.chunks(concurrency) {
-            for q in chunk {
-                let req = QueryRequest {
-                    vector: Some(q.clone()),
-                    top_k: args.top_k,
-                    filter: None,
-                    nprobe: args.nprobe,
-                    rank_by: None,
-                };
-                let t = Instant::now();
-                if client.query(&ns, &req).await.is_ok() {
-                    hist.record(t.elapsed().as_micros() as u64).ok();
-                }
+        // Drive concurrent queries, submitting new ones as each completes
+        while let Some((t, result)) = pending.next().await {
+            if result.is_ok() {
+                hist.record(t.elapsed().as_micros() as u64).ok();
+                completed += 1;
+            }
+
+            // Submit more until we've queued all n_queries
+            if submitted < n_queries {
+                pending.push(submit_query(client, &ns, args.dimensions, args.top_k, args.nprobe));
+                submitted += 1;
             }
         }
 
         let total_elapsed = start.elapsed();
-        let qps = n_queries as f64 / total_elapsed.as_secs_f64();
+        let qps = completed as f64 / total_elapsed.as_secs_f64();
 
         eprintln!(
             "    p50={:.1}ms p95={:.1}ms p99={:.1}ms max={:.1}ms qps={:.0}",
@@ -76,7 +107,7 @@ pub async fn run(args: &Args, client: &dyn BenchClient) -> Result<serde_json::Va
         let mut stats = results::latency_stats(&hist);
         stats["concurrency"] = serde_json::json!(concurrency);
         stats["qps"] = serde_json::json!(qps);
-        stats["total_queries"] = serde_json::json!(n_queries);
+        stats["total_queries"] = serde_json::json!(completed);
         level_results.push(stats);
     }
 

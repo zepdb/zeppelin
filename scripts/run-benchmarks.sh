@@ -286,6 +286,22 @@ log ""
 check_health
 log "Server is healthy"
 
+# Clean up stale bench-* namespaces from previous runs
+log "Cleaning up stale benchmark namespaces..."
+stale_ns=$(curl -sf "$TARGET/v1/namespaces" 2>/dev/null | \
+    python3 -c "import sys,json; [print(n['name']) for n in json.load(sys.stdin).get('namespaces',[]) if n.get('name','').startswith('bench-')]" 2>/dev/null || true)
+if [ -n "$stale_ns" ]; then
+    ns_count=$(echo "$stale_ns" | wc -l | tr -d ' ')
+    log "Found $ns_count stale bench-* namespaces, deleting..."
+    echo "$stale_ns" | while read -r ns_name; do
+        curl -sf -X DELETE "$TARGET/v1/namespaces/$ns_name" > /dev/null 2>&1 || true
+        log "  Deleted: $ns_name"
+    done
+    log "Cleanup complete"
+else
+    log "No stale namespaces found"
+fi
+
 # Check profiling availability (runs 1s test profile)
 if [ "$SKIP_PROFILING" = false ]; then
     log "Checking profiling endpoint..."
