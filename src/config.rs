@@ -235,7 +235,7 @@ fn default_max_concurrent_queries() -> usize {
     64
 }
 fn default_max_batch_size() -> usize {
-    10_000
+    50_000
 }
 fn default_max_top_k() -> usize {
     10_000
@@ -250,7 +250,7 @@ fn default_max_vector_id_length() -> usize {
     1024
 }
 fn default_max_request_body_mb() -> usize {
-    50
+    512
 }
 fn default_bucket() -> String {
     "zeppelin".to_string()
