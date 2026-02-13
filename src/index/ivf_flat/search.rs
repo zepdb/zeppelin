@@ -106,6 +106,23 @@ pub async fn search_ivf_flat(
         "probing clusters"
     );
 
+    // Speculative prefetch: warm the cache for the next closest cluster beyond nprobe.
+    // This fires a background S3 GET so the next query with overlapping clusters hits cache.
+    if effective_nprobe < num_clusters {
+        if let Some(&(next_cluster_idx, _)) = centroid_dists.get(effective_nprobe) {
+            if let Some(c) = cache {
+                let cvec_key = cluster_key(&index.namespace, &index.segment_id, next_cluster_idx);
+                let cache_clone = c.clone();
+                let store_clone = store.clone();
+                tokio::spawn(async move {
+                    let _ = cache_clone
+                        .get_or_fetch(&cvec_key, || store_clone.get(&cvec_key))
+                        .await;
+                });
+            }
+        }
+    }
+
     // --- Step 2: Determine fetch size (oversample if filtering) ---
     let fetch_k = if filter.is_some() {
         oversampled_k(top_k, oversample_factor)

@@ -1,19 +1,27 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use tokio::sync::Mutex;
 
 use crate::error::Result;
 use crate::storage::ZeppelinStore;
 use crate::wal::Manifest;
 
-/// In-memory manifest cache with per-namespace TTL.
+/// In-memory manifest cache with per-namespace TTL and singleflight.
 ///
 /// Every query reads the manifest from S3 (~27ms). With a short TTL (500ms),
 /// we can serve most queries from memory while keeping staleness bounded.
-/// The cache is automatically invalidated when the TTL expires.
+///
+/// **Singleflight**: When the TTL expires and multiple queries arrive
+/// simultaneously, only ONE fetch goes to S3 — the rest wait on the same
+/// result. This prevents thundering herd on manifest reads (20+ concurrent
+/// queries all fetching the same manifest from S3).
 pub struct ManifestCache {
     entries: DashMap<String, CachedManifest>,
     ttl: Duration,
+    /// Per-namespace mutex to coalesce concurrent fetches (singleflight).
+    inflight: DashMap<String, Arc<Mutex<()>>>,
 }
 
 struct CachedManifest {
@@ -27,21 +35,42 @@ impl ManifestCache {
         Self {
             entries: DashMap::new(),
             ttl,
+            inflight: DashMap::new(),
         }
     }
 
     /// Get the manifest for a namespace, using the cache if fresh.
     ///
+    /// Uses singleflight to coalesce concurrent fetches: if multiple queries
+    /// hit an expired entry simultaneously, only one fetches from S3.
+    ///
     /// Returns `Ok(Manifest::default())` if the namespace has no manifest on S3.
     pub async fn get(&self, store: &ZeppelinStore, namespace: &str) -> Result<Manifest> {
-        // Check cache first
+        // Fast path: check cache first (no lock)
         if let Some(entry) = self.entries.get(namespace) {
             if entry.fetched_at.elapsed() < self.ttl {
                 return Ok(entry.manifest.clone());
             }
         }
 
-        // Cache miss or expired — fetch from S3
+        // Singleflight: acquire per-namespace mutex so only one fetch proceeds.
+        let lock = self
+            .inflight
+            .entry(namespace.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value()
+            .clone();
+
+        let _guard = lock.lock().await;
+
+        // Re-check cache after acquiring lock — another task may have just fetched.
+        if let Some(entry) = self.entries.get(namespace) {
+            if entry.fetched_at.elapsed() < self.ttl {
+                return Ok(entry.manifest.clone());
+            }
+        }
+
+        // We won the race — fetch from S3.
         let manifest = Manifest::read(store, namespace)
             .await?
             .unwrap_or_default();
@@ -94,5 +123,18 @@ mod tests {
         let cache = ManifestCache::new(Duration::from_millis(500));
         // Should not panic on non-existent key
         cache.invalidate("nonexistent");
+    }
+
+    #[tokio::test]
+    async fn test_manifest_cache_singleflight_insert_and_get() {
+        let cache = ManifestCache::new(Duration::from_millis(500));
+        let manifest = Manifest::default();
+        cache.insert("test_ns", manifest.clone());
+
+        // Create a dummy store — won't be used since cache is fresh.
+        let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = crate::storage::ZeppelinStore::new(mem);
+        let result = cache.get(&store, "test_ns").await.unwrap();
+        assert_eq!(result.fragments.len(), manifest.fragments.len());
     }
 }

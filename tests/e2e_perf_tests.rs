@@ -36,6 +36,8 @@ fn prefixed_vectors_with_attrs(prefix: &str, n: usize, dims: usize) -> Vec<Vecto
 }
 
 /// Test config with small centroids for fast compaction.
+/// Explicitly sets quantization to None since these tests focus on
+/// compaction/query lifecycle, not quantization behavior.
 fn e2e_test_config() -> Config {
     let mut config = Config::load(None).unwrap();
     config.compaction = CompactionConfig {
@@ -45,6 +47,7 @@ fn e2e_test_config() -> Config {
     config.indexing = IndexingConfig {
         default_num_centroids: 4,
         kmeans_max_iterations: 10,
+        quantization: zeppelin::index::quantization::QuantizationType::None,
         ..Default::default()
     };
     config

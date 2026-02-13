@@ -110,11 +110,53 @@ impl Manifest {
         self.updated_at = Utc::now();
     }
 
-    /// Add a segment reference.
+    /// Maximum number of pending deletes to keep in the manifest.
+    /// Older entries beyond this limit are silently dropped (the S3 objects
+    /// may already have been deleted, or will be orphaned and cleaned up
+    /// by a future GC sweep).
+    const MAX_PENDING_DELETES: usize = 1000;
+
+    /// Maximum number of old (non-active) segments to retain.
+    /// Only the active segment is used for queries; older segments are
+    /// historical and can be pruned to keep the manifest small.
+    const MAX_OLD_SEGMENTS: usize = 10;
+
+    /// Add a segment reference and prune old segments/pending_deletes.
     pub fn add_segment(&mut self, sref: SegmentRef) {
         self.active_segment = Some(sref.id.clone());
         self.segments.push(sref);
         self.updated_at = Utc::now();
+        self.prune();
+    }
+
+    /// Prune the manifest to prevent unbounded growth at 1M+ scale.
+    ///
+    /// - Caps `pending_deletes` to the most recent MAX_PENDING_DELETES entries.
+    /// - Retains only the most recent MAX_OLD_SEGMENTS non-active segments.
+    fn prune(&mut self) {
+        // Cap pending deletes (keep newest)
+        if self.pending_deletes.len() > Self::MAX_PENDING_DELETES {
+            let excess = self.pending_deletes.len() - Self::MAX_PENDING_DELETES;
+            self.pending_deletes.drain(..excess);
+        }
+
+        // Prune old segments: keep active + most recent MAX_OLD_SEGMENTS
+        if self.segments.len() > Self::MAX_OLD_SEGMENTS + 1 {
+            let active_id = self.active_segment.as_deref();
+            // Partition: keep active segment and the newest MAX_OLD_SEGMENTS others.
+            // Segments are appended in order, so newest are at the end.
+            let keep_from = self.segments.len() - (Self::MAX_OLD_SEGMENTS + 1);
+            let mut pruned: Vec<SegmentRef> = self.segments.drain(keep_from..).collect();
+            // Ensure active segment is retained even if it wasn't in the tail
+            if let Some(aid) = active_id {
+                if !pruned.iter().any(|s| s.id == aid) {
+                    if let Some(active) = self.segments.iter().find(|s| s.id == aid).cloned() {
+                        pruned.insert(0, active);
+                    }
+                }
+            }
+            self.segments = pruned;
+        }
     }
 
     /// Get uncompacted fragments (those after the compaction watermark).

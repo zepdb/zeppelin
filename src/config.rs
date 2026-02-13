@@ -160,7 +160,8 @@ pub struct IndexingConfig {
     #[serde(default = "default_oversample_factor")]
     pub oversample_factor: usize,
     /// Quantization type for vector compression.
-    #[serde(default)]
+    /// Default: Scalar (SQ8) for 4x compression and better cache utilization.
+    #[serde(default = "default_quantization")]
     pub quantization: crate::index::quantization::QuantizationType,
     /// Number of PQ subquantizers (only used when quantization = product).
     /// Must divide vector dimension evenly. Default: 8.
@@ -290,6 +291,9 @@ fn default_rerank_factor() -> usize {
 fn default_beam_width() -> usize {
     10
 }
+fn default_quantization() -> crate::index::quantization::QuantizationType {
+    crate::index::quantization::QuantizationType::Scalar
+}
 fn default_bitmap_index() -> bool {
     true
 }
@@ -370,7 +374,7 @@ impl Default for IndexingConfig {
             kmeans_max_iterations: default_kmeans_max_iterations(),
             kmeans_convergence_epsilon: default_kmeans_convergence_epsilon(),
             oversample_factor: default_oversample_factor(),
-            quantization: Default::default(),
+            quantization: default_quantization(),
             pq_m: default_pq_m(),
             rerank_factor: default_rerank_factor(),
             hierarchical: false,
@@ -405,7 +409,8 @@ impl Default for LoggingConfig {
 ///
 /// Detected at startup via `available_parallelism()`, then allocated:
 /// - **Query workers**: 2× CPUs (overcommit OK — 80%+ I/O-blocked on S3 GETs)
-/// - **Compaction workers**: CPUs - 1 (CPU-bound k-means/FTS, reserve 1 for queries)
+/// - **Compaction workers**: max(1, CPUs/4) — reserve most cores for queries.
+///   On a 4-vCPU c7i.xlarge, this gives 1 compaction worker + 3 for queries.
 /// - **Rayon threads**: match physical cores (work-stealing at core count)
 #[derive(Debug, Clone)]
 pub struct CpuBudget {
@@ -421,9 +426,11 @@ impl CpuBudget {
             .map(|n| n.get())
             .unwrap_or(4);
 
+        // Cap compaction to 25% of cores (max 1 on ≤4 cores) to leave
+        // CPU headroom for queries. Compaction is I/O-heavy anyway.
         let mut budget = Self {
             query_workers: (cpus * 2).max(4),
-            compaction_workers: cpus.saturating_sub(1).max(1),
+            compaction_workers: (cpus / 4).max(1),
             rayon_threads: cpus,
         };
 

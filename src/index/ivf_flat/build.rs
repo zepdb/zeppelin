@@ -193,16 +193,13 @@ pub(crate) fn deserialize_cluster(data: &[u8]) -> Result<ClusterData> {
                 "cluster blob truncated at vector data".into(),
             ));
         }
-        let mut vec = Vec::with_capacity(dim);
-        for _ in 0..dim {
-            let val = f32::from_le_bytes(
-                data[offset..offset + 4]
-                    .try_into()
-                    .map_err(|_| ZeppelinError::Index("cluster float parse error".into()))?,
-            );
-            vec.push(val);
-            offset += 4;
-        }
+        // Parse f32 slice using chunks_exact — enables compiler auto-vectorization
+        // and removes per-element try_into/map_err overhead.
+        let vec: Vec<f32> = data[offset..offset + float_bytes]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        offset += float_bytes;
 
         ids.push(id);
         vectors.push(vec);

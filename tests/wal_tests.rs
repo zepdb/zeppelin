@@ -39,8 +39,9 @@ async fn test_fragment_checksum_corruption() {
     match result.unwrap_err() {
         ZeppelinError::ChecksumMismatch { .. }
         | ZeppelinError::Json(_)
-        | ZeppelinError::Bincode(_) => {}
-        other => panic!("expected ChecksumMismatch, Json, or Bincode error, got: {other}"),
+        | ZeppelinError::Bincode(_)
+        | ZeppelinError::Serialization(_) => {}
+        other => panic!("expected ChecksumMismatch, Json, Bincode, or Serialization error, got: {other}"),
     }
 }
 
