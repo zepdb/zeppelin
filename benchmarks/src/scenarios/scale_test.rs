@@ -6,13 +6,16 @@
 //!   3. Compaction wait with stabilization detection
 //!   4. Post-compaction cold cache queries
 //!   5. Post-compaction warm cache queries
-//!   6. Sustained throughput (60s)
+//!   6. Sustained throughput (60s, concurrent)
 
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+use futures::stream::{FuturesUnordered, StreamExt};
+use futures::Future;
 use hdrhistogram::Histogram;
 
-use crate::client::{BenchClient, QueryRequest};
+use crate::client::{BenchClient, QueryRequest, QueryResponse};
 use crate::datasets;
 use crate::results;
 use crate::Args;
@@ -30,7 +33,36 @@ fn is_stabilized(recent_p50s: &[f64]) -> bool {
     last3.iter().all(|v| (v - mean).abs() / mean < 0.15)
 }
 
-/// Run sustained queries for a fixed duration, returning (total_queries, histogram).
+type QueryFuture<'a> =
+    Pin<Box<dyn Future<Output = (Instant, Result<QueryResponse, String>)> + Send + 'a>>;
+
+/// Submit a single query future, returning (start_time, result).
+fn submit_query<'a>(
+    client: &'a dyn BenchClient,
+    ns: &'a str,
+    dims: usize,
+    top_k: usize,
+    nprobe: Option<usize>,
+) -> QueryFuture<'a> {
+    let query_vec = datasets::random_query(dims);
+    let req = QueryRequest {
+        vector: Some(query_vec),
+        top_k,
+        filter: None,
+        nprobe,
+        rank_by: None,
+    };
+    let t = Instant::now();
+    Box::pin(async move {
+        let result = client.query(ns, &req).await;
+        (t, result)
+    })
+}
+
+/// Run sustained queries for a fixed duration with concurrency, returning (total_queries, histogram).
+///
+/// Uses `FuturesUnordered` to maintain `concurrency` in-flight queries at all times.
+/// As each query completes, a new one is immediately submitted, maximizing throughput.
 async fn run_sustained_queries(
     client: &dyn BenchClient,
     ns: &str,
@@ -38,25 +70,40 @@ async fn run_sustained_queries(
     top_k: usize,
     nprobe: Option<usize>,
     duration: Duration,
+    concurrency: usize,
 ) -> (u64, Histogram<u64>) {
     let mut hist = Histogram::<u64>::new(3).unwrap();
     let start = Instant::now();
     let mut total = 0u64;
+    let mut err_count = 0u64;
 
-    while start.elapsed() < duration {
-        let query_vec = datasets::random_query(dims);
-        let req = QueryRequest {
-            vector: Some(query_vec),
-            top_k,
-            filter: None,
-            nprobe,
-            rank_by: None,
-        };
-        let t = Instant::now();
-        if client.query(ns, &req).await.is_ok() {
+    let mut pending: FuturesUnordered<QueryFuture<'_>> = FuturesUnordered::new();
+
+    // Seed the pipeline with `concurrency` initial queries
+    for _ in 0..concurrency {
+        if start.elapsed() >= duration {
+            break;
+        }
+        pending.push(submit_query(client, ns, dims, top_k, nprobe));
+    }
+
+    // Main loop: as each query completes, record it and submit a new one
+    while let Some((t, result)) = pending.next().await {
+        if result.is_ok() {
             hist.record(t.elapsed().as_micros() as u64).ok();
             total += 1;
+        } else {
+            err_count += 1;
         }
+
+        // Submit a replacement query if still within duration
+        if start.elapsed() < duration {
+            pending.push(submit_query(client, ns, dims, top_k, nprobe));
+        }
+    }
+
+    if err_count > 0 {
+        eprintln!("    ({err_count} query errors during sustained load)");
     }
 
     (total, hist)
@@ -238,9 +285,14 @@ pub async fn run(args: &Args, client: &dyn BenchClient) -> Result<serde_json::Va
         warm_hist.value_at_quantile(0.99) as f64 / 1000.0,
     );
 
-    // ── Phase 6: Sustained throughput (60s) ────────────────────────────────
-    let sustained_duration = Duration::from_secs(60);
-    eprintln!("  Phase 6: Sustained throughput for {}s...", sustained_duration.as_secs());
+    // ── Phase 6: Sustained throughput (60s, concurrent) ──────────────────
+    let sustained_duration = Duration::from_secs(args.duration);
+    let concurrency = args.concurrency;
+    eprintln!(
+        "  Phase 6: Sustained throughput for {}s at concurrency={}...",
+        sustained_duration.as_secs(),
+        concurrency,
+    );
 
     let (total_queries, sustained_hist) = run_sustained_queries(
         client,
@@ -249,14 +301,16 @@ pub async fn run(args: &Args, client: &dyn BenchClient) -> Result<serde_json::Va
         args.top_k,
         args.nprobe,
         sustained_duration,
+        concurrency,
     )
     .await;
 
     let qps = total_queries as f64 / sustained_duration.as_secs_f64();
     eprintln!(
-        "  Phase 6 done: {qps:.1} QPS, {} queries, p50={:.1}ms",
+        "  Phase 6 done: {qps:.1} QPS, {} queries, p50={:.1}ms (concurrency={})",
         total_queries,
         sustained_hist.value_at_quantile(0.50) as f64 / 1000.0,
+        concurrency,
     );
 
     // Cleanup
@@ -265,6 +319,7 @@ pub async fn run(args: &Args, client: &dyn BenchClient) -> Result<serde_json::Va
     // ── Build result JSON ──────────────────────────────────────────────────
     Ok(serde_json::json!({
         "scale": scale,
+        "concurrency": concurrency,
         "ingest": {
             "total_secs": ingest_elapsed.as_secs_f64(),
             "total_vps": total_vps,
@@ -279,6 +334,7 @@ pub async fn run(args: &Args, client: &dyn BenchClient) -> Result<serde_json::Va
         "sustained_throughput": {
             "qps": qps,
             "total_queries": total_queries,
+            "concurrency": concurrency,
             "latency": results::latency_stats(&sustained_hist),
         }
     }))

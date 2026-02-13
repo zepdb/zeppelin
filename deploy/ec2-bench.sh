@@ -31,8 +31,8 @@ fi
 : "${S3_BUCKET:?S3_BUCKET is required in deploy/.env}"
 : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required in deploy/.env}"
 : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required in deploy/.env}"
-: "${AWS_REGION:=us-east-1}"
-: "${EC2_INSTANCE_TYPE:=c7i.xlarge}"
+: "${AWS_REGION:=us-west-2}"
+: "${EC2_INSTANCE_TYPE:=c7i.8xlarge}"
 
 EC2_KEY_FILE="${EC2_KEY_FILE/#\~/$HOME}"
 
