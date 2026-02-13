@@ -159,8 +159,10 @@ async fn wal_scan(
     distance_metric: DistanceMetric,
 ) -> Result<(Vec<SearchResult>, usize)> {
     let refs = manifest.uncompacted_fragments().to_vec();
+    // Skip checksum validation on query reads — fragments were already
+    // validated on write. Saves ~11% CPU on fragment deserialization.
     let fragments = wal_reader
-        .read_fragments_from_refs(namespace, &refs)
+        .read_fragments_from_refs_unchecked(namespace, &refs)
         .await?;
     let frag_count = fragments.len();
 
@@ -337,8 +339,9 @@ pub async fn execute_bm25_query(
     let wal_results = match consistency {
         ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
             let refs = manifest.uncompacted_fragments().to_vec();
+            // Skip checksum validation — already validated on write.
             let fragments = wal_reader
-                .read_fragments_from_refs(namespace, &refs)
+                .read_fragments_from_refs_unchecked(namespace, &refs)
                 .await?;
             let scan_result = wal_bm25_scan(&fragments, rank_by, fts_configs, last_as_prefix, fts_cache.map(|c| c.as_ref()), Some(top_k));
             scanned_fragments = scan_result.fragment_count;
@@ -444,6 +447,12 @@ async fn segment_bm25_search(
         )
         .await;
     }
+    tracing::warn!(
+        namespace = namespace,
+        segment_id = %segment_ref.id,
+        "BM25 falling back to full cluster scan — segment missing global FTS index. \
+         Recompact with fts_index=true for 10-100x faster BM25 queries."
+    );
     segment_bm25_search_full_scan(
         store,
         namespace,
@@ -608,6 +617,10 @@ async fn segment_bm25_search_global(
 }
 
 /// BM25 search using full per-cluster scan (backward compat fallback).
+///
+/// At 1M scale this is O(N × clusters) and can take 15+ seconds.
+/// Segments should be recompacted with `fts_index=true` to build a
+/// global FTS index, which reduces BM25 queries to 1 S3 GET.
 #[allow(clippy::too_many_arguments)]
 async fn segment_bm25_search_full_scan(
     store: &ZeppelinStore,
