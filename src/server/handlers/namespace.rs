@@ -121,6 +121,10 @@ pub async fn delete_namespace(
         .await
         .map_err(ApiError::from)?;
 
+    // Clean up per-namespace in-memory state to prevent unbounded growth
+    state.wal_writer.remove_lock(&ns);
+    state.manifest_cache.invalidate(&ns);
+
     info!(namespace = %ns, "namespace deleted");
     Ok(StatusCode::NO_CONTENT)
 }

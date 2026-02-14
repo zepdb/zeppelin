@@ -37,6 +37,17 @@ impl WalWriter {
             .clone()
     }
 
+    /// Remove the per-namespace lock entry. Called on namespace deletion.
+    pub fn remove_lock(&self, namespace: &str) {
+        self.locks.remove(namespace);
+    }
+
+    /// Return the number of namespace locks held (for testing).
+    #[cfg(test)]
+    pub fn lock_count(&self) -> usize {
+        self.locks.len()
+    }
+
     /// Append vectors and deletes to the WAL for a namespace.
     /// Creates a new fragment, writes it to S3, and updates the manifest.
     /// Uses CAS (compare-and-swap) for manifest updates to prevent concurrent overwrites.
@@ -150,5 +161,41 @@ impl WalWriter {
         Err(ZeppelinError::ManifestConflict {
             namespace: namespace.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remove_lock_cleans_up() {
+        let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = crate::storage::ZeppelinStore::new(mem);
+        let writer = WalWriter::new(store);
+
+        // Create locks by accessing namespace_lock
+        let _lock1 = writer.namespace_lock("ns1");
+        let _lock2 = writer.namespace_lock("ns2");
+        assert_eq!(writer.lock_count(), 2);
+
+        // Remove one lock
+        writer.remove_lock("ns1");
+        assert_eq!(writer.lock_count(), 1);
+
+        // Remove the other
+        writer.remove_lock("ns2");
+        assert_eq!(writer.lock_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_lock_nonexistent_is_noop() {
+        let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = crate::storage::ZeppelinStore::new(mem);
+        let writer = WalWriter::new(store);
+
+        // Should not panic
+        writer.remove_lock("nonexistent");
+        assert_eq!(writer.lock_count(), 0);
     }
 }

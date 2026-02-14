@@ -23,7 +23,7 @@
 - **Bitmap pre-filters** -- RoaringBitmap indexes for sub-millisecond attribute filtering
 - **Write-ahead log** -- Durable writes with compaction into indexed segments
 - **Strong & eventual consistency** -- Choose per-query
-- **Multi-cloud** -- Works with S3, GCS, and Azure Blob Storage
+- **Object storage** -- S3, MinIO, and S3-compatible backends. GCS and Azure planned
 
 ## Quick Start
 
@@ -160,7 +160,7 @@ cargo clippy -- -D warnings
 
 ```
 src/
-  storage/     Object store abstraction (S3, GCS, Azure)
+  storage/     Object store abstraction (S3, S3-compatible)
   wal/         Write-ahead log: fragments, manifest, reader/writer
   namespace/   Namespace CRUD and metadata
   index/       Vector indexing (IVF-Flat with k-means)

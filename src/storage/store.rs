@@ -9,7 +9,7 @@ use crate::config::StorageConfig;
 use crate::error::{Result, ZeppelinError};
 
 /// Wrapper around the `object_store` crate providing a unified interface
-/// for S3, GCS, Azure, and local storage backends.
+/// for S3, S3-compatible, and local storage backends.
 #[derive(Clone)]
 pub struct ZeppelinStore {
     inner: Arc<dyn ObjectStore>,
@@ -203,12 +203,7 @@ impl ZeppelinStore {
     /// Returns `NamespaceAlreadyExists` if the key already exists.
     /// Uses S3's `If-None-Match: *` header via `PutMode::Create`.
     #[instrument(skip(self, data), fields(key = key))]
-    pub async fn put_if_not_exists(
-        &self,
-        key: &str,
-        data: Bytes,
-        namespace: &str,
-    ) -> Result<()> {
+    pub async fn put_if_not_exists(&self, key: &str, data: Bytes, namespace: &str) -> Result<()> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let options = PutOptions {

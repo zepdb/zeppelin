@@ -321,11 +321,16 @@ impl DiskCache {
             .entries
             .iter()
             .filter(|r| r.key().starts_with(prefix))
-            .map(|r| (r.key().clone(), CacheEntry {
-                filename: r.value().filename.clone(),
-                size: r.value().size,
-                last_accessed: r.value().last_accessed,
-            }))
+            .map(|r| {
+                (
+                    r.key().clone(),
+                    CacheEntry {
+                        filename: r.value().filename.clone(),
+                        size: r.value().size,
+                        last_accessed: r.value().last_accessed,
+                    },
+                )
+            })
             .collect();
 
         for (key, entry) in &matching {

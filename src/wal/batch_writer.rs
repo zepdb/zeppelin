@@ -6,8 +6,6 @@
 //!
 //! **Default disabled**: `batch_manifest_size=1` gives per-append behavior.
 
-use std::sync::Arc;
-
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -80,9 +78,7 @@ impl BatchWalWriter {
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| {
-                ZeppelinError::Index("batch writer channel closed".to_string())
-            })?;
+            .map_err(|_| ZeppelinError::Index("batch writer channel closed".to_string()))?;
 
         // Wait for manifest flush
         let manifest = reply_rx.await.map_err(|_| {
@@ -116,8 +112,7 @@ async fn flush_loop(
         }
 
         // Try to fill the batch up to batch_size, with a timeout
-        let deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_millis(timeout_ms);
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
 
         while batch.len() < batch_size {
             tokio::select! {
@@ -178,11 +173,10 @@ async fn flush_namespace(
     requests: &[WriteRequest],
 ) -> Result<Manifest> {
     for attempt in 0..MAX_CAS_RETRIES {
-        let (mut manifest, version) =
-            match Manifest::read_versioned(store, namespace).await? {
-                Some(pair) => pair,
-                None => (Manifest::default(), ManifestVersion(None)),
-            };
+        let (mut manifest, version) = match Manifest::read_versioned(store, namespace).await? {
+            Some(pair) => pair,
+            None => (Manifest::default(), ManifestVersion(None)),
+        };
 
         for req in requests {
             manifest.add_fragment(FragmentRef {
@@ -193,10 +187,7 @@ async fn flush_namespace(
             });
         }
 
-        match manifest
-            .write_conditional(store, namespace, &version)
-            .await
-        {
+        match manifest.write_conditional(store, namespace, &version).await {
             Ok(()) => {
                 debug!(
                     namespace = namespace,

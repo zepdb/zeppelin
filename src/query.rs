@@ -317,6 +317,7 @@ pub async fn execute_bm25_query(
     last_as_prefix: bool,
     manifest_cache: Option<&Arc<ManifestCache>>,
     fts_cache: Option<&Arc<WalFtsCache>>,
+    max_full_scan_clusters: usize,
 ) -> Result<QueryResponse> {
     let manifest = match manifest_cache {
         Some(mc) => mc.get(store, namespace).await?,
@@ -325,7 +326,11 @@ pub async fn execute_bm25_query(
 
     // Evict compacted fragments from the FTS cache to prevent unbounded growth
     if let Some(cache) = fts_cache {
-        let active_ids: Vec<ulid::Ulid> = manifest.uncompacted_fragments().iter().map(|f| f.id).collect();
+        let active_ids: Vec<ulid::Ulid> = manifest
+            .uncompacted_fragments()
+            .iter()
+            .map(|f| f.id)
+            .collect();
         cache.evict_compacted(&active_ids);
     }
 
@@ -343,7 +348,14 @@ pub async fn execute_bm25_query(
             let fragments = wal_reader
                 .read_fragments_from_refs_unchecked(namespace, &refs)
                 .await?;
-            let scan_result = wal_bm25_scan(&fragments, rank_by, fts_configs, last_as_prefix, fts_cache.map(|c| c.as_ref()), Some(top_k));
+            let scan_result = wal_bm25_scan(
+                &fragments,
+                rank_by,
+                fts_configs,
+                last_as_prefix,
+                fts_cache.map(|c| c.as_ref()),
+                Some(top_k),
+            );
             scanned_fragments = scan_result.fragment_count;
             wal_deleted_ids = scan_result.deleted_ids;
             // Apply post-filter to WAL results
@@ -384,6 +396,7 @@ pub async fn execute_bm25_query(
                     fts_configs,
                     filter,
                     last_as_prefix,
+                    max_full_scan_clusters,
                 )
                 .await?;
                 scanned_segments = 1;
@@ -425,6 +438,9 @@ pub async fn execute_bm25_query(
 ///
 /// Uses the global FTS index when available (1 S3 GET instead of N),
 /// falling back to full per-cluster scan for older segments.
+///
+/// When `max_full_scan_clusters > 0` and the segment lacks a global FTS index,
+/// returns an error if the cluster count exceeds the limit (circuit breaker).
 #[allow(clippy::too_many_arguments)]
 async fn segment_bm25_search(
     store: &ZeppelinStore,
@@ -434,6 +450,7 @@ async fn segment_bm25_search(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    max_full_scan_clusters: usize,
 ) -> Result<Vec<SearchResult>> {
     if segment_ref.has_global_fts {
         return segment_bm25_search_global(
@@ -447,9 +464,18 @@ async fn segment_bm25_search(
         )
         .await;
     }
+    // Circuit breaker: reject full-scan if cluster count exceeds limit
+    if max_full_scan_clusters > 0 && segment_ref.cluster_count > max_full_scan_clusters {
+        return Err(crate::error::ZeppelinError::Validation(format!(
+            "BM25 query on segment {} requires full scan of {} clusters (limit: {}). \
+             Recompact with fts_index=true.",
+            segment_ref.id, segment_ref.cluster_count, max_full_scan_clusters
+        )));
+    }
     tracing::warn!(
         namespace = namespace,
         segment_id = %segment_ref.id,
+        cluster_count = segment_ref.cluster_count,
         "BM25 falling back to full cluster scan — segment missing global FTS index. \
          Recompact with fts_index=true for 10-100x faster BM25 queries."
     );
@@ -476,10 +502,12 @@ async fn segment_bm25_search_global(
     filter: Option<&Filter>,
     last_as_prefix: bool,
 ) -> Result<Vec<SearchResult>> {
-    use crate::fts::global_index::{GlobalInvertedIndex, global_fts_key};
     use crate::fts::bm25::Bm25Params;
+    use crate::fts::global_index::{global_fts_key, GlobalInvertedIndex};
     use crate::fts::rank_by::evaluate_rank_by;
-    use crate::index::ivf_flat::build::{attrs_key, deserialize_attrs, cluster_key, deserialize_cluster};
+    use crate::index::ivf_flat::build::{
+        attrs_key, cluster_key, deserialize_attrs, deserialize_cluster,
+    };
 
     let segment_id = &segment_ref.id;
 
@@ -524,27 +552,29 @@ async fn segment_bm25_search_global(
     }
 
     // Identify which clusters we need to fetch attrs from
-    let needed_clusters: HashSet<u16> = position_field_scores
-        .keys()
-        .map(|(c, _)| *c)
-        .collect();
+    let needed_clusters: HashSet<u16> = position_field_scores.keys().map(|(c, _)| *c).collect();
 
     // Parallel fetch attrs only for matching clusters
-    let cluster_attrs_results = futures::future::join_all(
-        needed_clusters.iter().map(|&cluster_idx| {
+    let cluster_attrs_results =
+        futures::future::join_all(needed_clusters.iter().map(|&cluster_idx| {
             let akey = attrs_key(namespace, segment_id, cluster_idx as usize);
             let ckey = cluster_key(namespace, segment_id, cluster_idx as usize);
             async move {
                 let (attrs_res, cluster_res) = tokio::join!(store.get(&akey), store.get(&ckey));
                 (cluster_idx, attrs_res, cluster_res)
             }
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     // Build lookup: cluster_idx -> (attrs, cluster)
-    let mut cluster_data: HashMap<u16, (Vec<Option<HashMap<String, crate::types::AttributeValue>>>, Vec<String>)> =
-        HashMap::new();
+    #[allow(clippy::type_complexity)]
+    let mut cluster_data: HashMap<
+        u16,
+        (
+            Vec<Option<HashMap<String, crate::types::AttributeValue>>>,
+            Vec<String>,
+        ),
+    > = HashMap::new();
     for (cluster_idx, attrs_res, cluster_res) in cluster_attrs_results {
         let attrs = match attrs_res {
             Ok(data) => deserialize_attrs(&data)?,
@@ -558,8 +588,10 @@ async fn segment_bm25_search_global(
     }
 
     // Collect results
-    let mut all_results: HashMap<String, (f32, Option<HashMap<String, crate::types::AttributeValue>>)> =
-        HashMap::new();
+    let mut all_results: HashMap<
+        String,
+        (f32, Option<HashMap<String, crate::types::AttributeValue>>),
+    > = HashMap::new();
 
     for ((cluster_idx, position), field_scores) in position_field_scores {
         let final_score = evaluate_rank_by(rank_by, &field_scores);
@@ -852,6 +884,97 @@ fn merge_results(
             let mut results = segment_results;
             results.truncate(top_k);
             results
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_segment_ref(cluster_count: usize, has_global_fts: bool) -> SegmentRef {
+        SegmentRef {
+            id: "seg_test".to_string(),
+            vector_count: 10000,
+            cluster_count,
+            quantization: crate::index::quantization::QuantizationType::None,
+            hierarchical: false,
+            bitmap_fields: Vec::new(),
+            fts_fields: vec!["text".to_string()],
+            has_global_fts,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bm25_circuit_breaker_rejects_over_limit() {
+        let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = crate::storage::ZeppelinStore::new(mem);
+        let rank_by = RankBy::Bm25 {
+            field: "text".to_string(),
+            query: "hello".to_string(),
+        };
+        let fts_configs = HashMap::new();
+        let seg = make_segment_ref(600, false);
+
+        let result =
+            segment_bm25_search(&store, "ns", &seg, &rank_by, &fts_configs, None, false, 500).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            crate::error::ZeppelinError::Validation(msg) => {
+                assert!(msg.contains("600 clusters"));
+                assert!(msg.contains("limit: 500"));
+            }
+            _ => panic!("expected Validation error, got: {err:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bm25_circuit_breaker_allows_under_limit() {
+        let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = crate::storage::ZeppelinStore::new(mem);
+        let rank_by = RankBy::Bm25 {
+            field: "text".to_string(),
+            query: "hello".to_string(),
+        };
+        let fts_configs = HashMap::new();
+        let seg = make_segment_ref(400, false);
+
+        // Under limit: should attempt the scan (will fail with NotFound on the index,
+        // not with a Validation error)
+        let result =
+            segment_bm25_search(&store, "ns", &seg, &rank_by, &fts_configs, None, false, 500).await;
+
+        // Should NOT be a Validation error (it'll be NotFound or similar from missing data)
+        match &result {
+            Err(crate::error::ZeppelinError::Validation(_)) => {
+                panic!("should not have triggered circuit breaker");
+            }
+            _ => {} // Any other result is fine (expected to fail on missing data)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bm25_circuit_breaker_disabled_when_zero() {
+        let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = crate::storage::ZeppelinStore::new(mem);
+        let rank_by = RankBy::Bm25 {
+            field: "text".to_string(),
+            query: "hello".to_string(),
+        };
+        let fts_configs = HashMap::new();
+        let seg = make_segment_ref(9999, false);
+
+        // Limit=0 means disabled — should not reject
+        let result =
+            segment_bm25_search(&store, "ns", &seg, &rank_by, &fts_configs, None, false, 0).await;
+
+        match &result {
+            Err(crate::error::ZeppelinError::Validation(_)) => {
+                panic!("should not have triggered circuit breaker when limit=0");
+            }
+            _ => {} // Expected to fail on missing data, not circuit breaker
         }
     }
 }

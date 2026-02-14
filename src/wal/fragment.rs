@@ -128,21 +128,14 @@ impl WalFragment {
         }
 
         let fragment: Self = match data[0] {
-            WAL_FORMAT_MSGPACK => {
-                rmp_serde::from_slice(&data[1..]).map_err(|e| {
-                    ZeppelinError::Serialization(format!("msgpack deserialize: {e}"))
-                })?
-            }
+            WAL_FORMAT_MSGPACK => rmp_serde::from_slice(&data[1..])
+                .map_err(|e| ZeppelinError::Serialization(format!("msgpack deserialize: {e}")))?,
             // Legacy JSON format: first byte is '{' (0x7B)
             b'{' => serde_json::from_slice(data)?,
             // Unknown: try msgpack (skip version byte), fall back to JSON
-            _ => {
-                rmp_serde::from_slice(&data[1..])
-                    .or_else(|_| rmp_serde::from_slice(data))
-                    .map_err(|e| {
-                        ZeppelinError::Serialization(format!("msgpack deserialize: {e}"))
-                    })?
-            }
+            _ => rmp_serde::from_slice(&data[1..])
+                .or_else(|_| rmp_serde::from_slice(data))
+                .map_err(|e| ZeppelinError::Serialization(format!("msgpack deserialize: {e}")))?,
         };
         fragment.validate_checksum()?;
         Ok(fragment)
@@ -160,19 +153,12 @@ impl WalFragment {
         }
 
         let fragment: Self = match data[0] {
-            WAL_FORMAT_MSGPACK => {
-                rmp_serde::from_slice(&data[1..]).map_err(|e| {
-                    ZeppelinError::Serialization(format!("msgpack deserialize: {e}"))
-                })?
-            }
+            WAL_FORMAT_MSGPACK => rmp_serde::from_slice(&data[1..])
+                .map_err(|e| ZeppelinError::Serialization(format!("msgpack deserialize: {e}")))?,
             b'{' => serde_json::from_slice(data)?,
-            _ => {
-                rmp_serde::from_slice(&data[1..])
-                    .or_else(|_| rmp_serde::from_slice(data))
-                    .map_err(|e| {
-                        ZeppelinError::Serialization(format!("msgpack deserialize: {e}"))
-                    })?
-            }
+            _ => rmp_serde::from_slice(&data[1..])
+                .or_else(|_| rmp_serde::from_slice(data))
+                .map_err(|e| ZeppelinError::Serialization(format!("msgpack deserialize: {e}")))?,
         };
         Ok(fragment)
     }

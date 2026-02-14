@@ -110,42 +110,42 @@ impl Manifest {
         self.updated_at = Utc::now();
     }
 
-    /// Maximum number of pending deletes to keep in the manifest.
-    /// Older entries beyond this limit are silently dropped (the S3 objects
-    /// may already have been deleted, or will be orphaned and cleaned up
-    /// by a future GC sweep).
-    const MAX_PENDING_DELETES: usize = 1000;
-
-    /// Maximum number of old (non-active) segments to retain.
-    /// Only the active segment is used for queries; older segments are
-    /// historical and can be pruned to keep the manifest small.
-    const MAX_OLD_SEGMENTS: usize = 10;
-
-    /// Add a segment reference and prune old segments/pending_deletes.
-    pub fn add_segment(&mut self, sref: SegmentRef) {
+    /// Add a segment reference and prune old segments/pending_deletes
+    /// using the provided limits.
+    pub fn add_segment_with_limits(
+        &mut self,
+        sref: SegmentRef,
+        max_pending_deletes: usize,
+        max_old_segments: usize,
+    ) {
         self.active_segment = Some(sref.id.clone());
         self.segments.push(sref);
         self.updated_at = Utc::now();
-        self.prune();
+        self.prune(max_pending_deletes, max_old_segments);
+    }
+
+    /// Add a segment reference and prune with default limits.
+    pub fn add_segment(&mut self, sref: SegmentRef) {
+        self.add_segment_with_limits(sref, 1000, 10);
     }
 
     /// Prune the manifest to prevent unbounded growth at 1M+ scale.
     ///
-    /// - Caps `pending_deletes` to the most recent MAX_PENDING_DELETES entries.
-    /// - Retains only the most recent MAX_OLD_SEGMENTS non-active segments.
-    fn prune(&mut self) {
+    /// - Caps `pending_deletes` to the most recent `max_pending_deletes` entries.
+    /// - Retains only the most recent `max_old_segments` non-active segments.
+    pub fn prune(&mut self, max_pending_deletes: usize, max_old_segments: usize) {
         // Cap pending deletes (keep newest)
-        if self.pending_deletes.len() > Self::MAX_PENDING_DELETES {
-            let excess = self.pending_deletes.len() - Self::MAX_PENDING_DELETES;
+        if self.pending_deletes.len() > max_pending_deletes {
+            let excess = self.pending_deletes.len() - max_pending_deletes;
             self.pending_deletes.drain(..excess);
         }
 
-        // Prune old segments: keep active + most recent MAX_OLD_SEGMENTS
-        if self.segments.len() > Self::MAX_OLD_SEGMENTS + 1 {
+        // Prune old segments: keep active + most recent max_old_segments
+        if self.segments.len() > max_old_segments + 1 {
             let active_id = self.active_segment.as_deref();
-            // Partition: keep active segment and the newest MAX_OLD_SEGMENTS others.
+            // Partition: keep active segment and the newest max_old_segments others.
             // Segments are appended in order, so newest are at the end.
-            let keep_from = self.segments.len() - (Self::MAX_OLD_SEGMENTS + 1);
+            let keep_from = self.segments.len() - (max_old_segments + 1);
             let mut pruned: Vec<SegmentRef> = self.segments.drain(keep_from..).collect();
             // Ensure active segment is retained even if it wasn't in the tail
             if let Some(aid) = active_id {
@@ -174,8 +174,9 @@ impl Manifest {
     /// Format: `[0x01] [msgpack payload]`
     /// Falls back to JSON for human readability during debugging if needed.
     pub fn to_bytes(&self) -> Result<Bytes> {
-        let msgpack = rmp_serde::to_vec(self)
-            .map_err(|e| ZeppelinError::Serialization(format!("manifest msgpack serialize: {e}")))?;
+        let msgpack = rmp_serde::to_vec(self).map_err(|e| {
+            ZeppelinError::Serialization(format!("manifest msgpack serialize: {e}"))
+        })?;
         let mut data = Vec::with_capacity(1 + msgpack.len());
         data.push(MANIFEST_FORMAT_MSGPACK);
         data.extend_from_slice(&msgpack);
@@ -198,9 +199,7 @@ impl Manifest {
                 rmp_serde::from_slice(&data[1..])
                     .or_else(|_| rmp_serde::from_slice(data))
                     .map_err(|e| {
-                        ZeppelinError::Serialization(format!(
-                            "manifest msgpack deserialize: {e}"
-                        ))
+                        ZeppelinError::Serialization(format!("manifest msgpack deserialize: {e}"))
                     })
             }
         }
@@ -265,5 +264,63 @@ pub struct ManifestVersion(pub Option<String>);
 impl Default for Manifest {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_segment(id: &str) -> SegmentRef {
+        SegmentRef {
+            id: id.to_string(),
+            vector_count: 100,
+            cluster_count: 4,
+            quantization: crate::index::quantization::QuantizationType::None,
+            hierarchical: false,
+            bitmap_fields: Vec::new(),
+            fts_fields: Vec::new(),
+            has_global_fts: false,
+        }
+    }
+
+    #[test]
+    fn test_prune_caps_pending_deletes() {
+        let mut manifest = Manifest::new();
+        for i in 0..10 {
+            manifest.pending_deletes.push(format!("key_{i}"));
+        }
+        manifest.prune(5, 10);
+        assert_eq!(manifest.pending_deletes.len(), 5);
+        // Should keep the newest (tail) entries
+        assert_eq!(manifest.pending_deletes[0], "key_5");
+        assert_eq!(manifest.pending_deletes[4], "key_9");
+    }
+
+    #[test]
+    fn test_prune_caps_old_segments() {
+        let mut manifest = Manifest::new();
+        for i in 0..6 {
+            manifest.add_segment_with_limits(make_segment(&format!("seg_{i}")), 1000, 10);
+        }
+        // 6 segments, active is seg_5
+        assert_eq!(manifest.segments.len(), 6);
+
+        // Now prune with max_old_segments=2 → keep active + 2 old = 3
+        manifest.prune(1000, 2);
+        assert_eq!(manifest.segments.len(), 3);
+        // Active segment must be retained
+        assert!(manifest.segments.iter().any(|s| s.id == "seg_5"));
+    }
+
+    #[test]
+    fn test_add_segment_with_limits_prunes() {
+        let mut manifest = Manifest::new();
+        for i in 0..10 {
+            manifest.pending_deletes.push(format!("key_{i}"));
+        }
+        // Add segment with small limits
+        manifest.add_segment_with_limits(make_segment("seg_new"), 3, 2);
+        assert!(manifest.pending_deletes.len() <= 3);
     }
 }

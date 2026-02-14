@@ -86,8 +86,8 @@ pub async fn upsert_vectors(
 
     let count = req.vectors.len();
     let manifest = if let Some(ref batch_writer) = state.batch_wal_writer {
-        let fragment = crate::wal::WalFragment::try_new(req.vectors, vec![])
-            .map_err(ApiError::from)?;
+        let fragment =
+            crate::wal::WalFragment::try_new(req.vectors, vec![]).map_err(ApiError::from)?;
         let (_, manifest) = batch_writer
             .append(&state.store, &ns, fragment)
             .await
@@ -135,8 +135,7 @@ pub async fn delete_vectors(
 
     let count = req.ids.len();
     let manifest = if let Some(ref batch_writer) = state.batch_wal_writer {
-        let fragment = crate::wal::WalFragment::try_new(vec![], req.ids)
-            .map_err(ApiError::from)?;
+        let fragment = crate::wal::WalFragment::try_new(vec![], req.ids).map_err(ApiError::from)?;
         let (_, manifest) = batch_writer
             .append(&state.store, &ns, fragment)
             .await
