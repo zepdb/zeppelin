@@ -395,8 +395,10 @@ async fn test_tla_cache_staleness_during_compaction() {
         "S3 manifest v3 should have 2 fragments"
     );
 
-    // Compactor adds a segment and removes the compacted fragments
-    let last_frag_id = compacted_manifest.fragments.last().unwrap().id;
+    // Compactor adds a segment and removes the compacted fragments.
+    // Use max() not last() — ULIDs generated in the same millisecond have
+    // random ordering (Ulid::new() doesn't guarantee monotonicity).
+    let max_frag_id = compacted_manifest.fragments.iter().map(|f| f.id).max().unwrap();
     compacted_manifest.add_segment(SegmentRef {
         id: "seg_compacted_001".to_string(),
         vector_count: 10,
@@ -407,7 +409,11 @@ async fn test_tla_cache_staleness_during_compaction() {
         fts_fields: vec![],
         has_global_fts: false,
     });
-    compacted_manifest.remove_compacted_fragments(last_frag_id);
+    compacted_manifest.remove_compacted_fragments(max_frag_id);
+    assert_eq!(
+        compacted_manifest.segments.len(), 1,
+        "DEBUG: compacted manifest should have 1 segment"
+    );
 
     // CAS write: v3→v4
     compacted_manifest
