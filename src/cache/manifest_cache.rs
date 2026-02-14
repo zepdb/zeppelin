@@ -76,9 +76,7 @@ impl ManifestCache {
         }
 
         // We won the race — fetch from S3.
-        let manifest = Manifest::read(store, namespace)
-            .await?
-            .unwrap_or_default();
+        let manifest = Manifest::read(store, namespace).await?.unwrap_or_default();
 
         self.entries.insert(
             namespace.to_string(),
@@ -101,8 +99,16 @@ impl ManifestCache {
     /// silently dropped. This prevents a delayed write-through from overwriting
     /// a cache invalidation that was triggered by a more recent compaction.
     pub fn insert(&self, namespace: &str, manifest: Manifest) {
+        // Reject if older than last invalidation
         if let Some(inv_time) = self.last_invalidated.get(namespace) {
             if manifest.updated_at <= *inv_time {
+                return;
+            }
+        }
+        // Reject if older than current cached version (prevents write-through races
+        // where a slow write-through inserts version N after version N+1 is already cached)
+        if let Some(entry) = self.entries.get(namespace) {
+            if manifest.next_sequence <= entry.manifest.next_sequence {
                 return;
             }
         }
@@ -155,5 +161,79 @@ mod tests {
         let store = crate::storage::ZeppelinStore::new(mem);
         let result = cache.get(&store, "test_ns").await.unwrap();
         assert_eq!(result.fragments.len(), manifest.fragments.len());
+    }
+
+    #[test]
+    fn test_insert_rejects_older_version() {
+        let cache = ManifestCache::new(Duration::from_millis(500));
+
+        // Insert manifest v3
+        let mut v3 = Manifest::default();
+        v3.next_sequence = 3;
+        cache.insert("ns", v3);
+
+        // Try to insert manifest v2 (older) — should be rejected
+        let mut v2 = Manifest::default();
+        v2.next_sequence = 2;
+        cache.insert("ns", v2);
+
+        // Cache should still hold v3
+        let entry = cache.entries.get("ns").unwrap();
+        assert_eq!(entry.manifest.next_sequence, 3);
+    }
+
+    #[test]
+    fn test_insert_accepts_newer_version() {
+        let cache = ManifestCache::new(Duration::from_millis(500));
+
+        // Insert manifest v3
+        let mut v3 = Manifest::default();
+        v3.next_sequence = 3;
+        cache.insert("ns", v3);
+
+        // Insert manifest v4 (newer) — should be accepted
+        let mut v4 = Manifest::default();
+        v4.next_sequence = 4;
+        cache.insert("ns", v4);
+
+        let entry = cache.entries.get("ns").unwrap();
+        assert_eq!(entry.manifest.next_sequence, 4);
+    }
+
+    #[test]
+    fn test_insert_rejects_equal_version() {
+        let cache = ManifestCache::new(Duration::from_millis(500));
+
+        // Insert manifest v3
+        let mut v3 = Manifest::default();
+        v3.next_sequence = 3;
+        cache.insert("ns", v3);
+
+        // Insert another manifest with same sequence — should be rejected (not newer)
+        let mut v3_dup = Manifest::default();
+        v3_dup.next_sequence = 3;
+        cache.insert("ns", v3_dup);
+
+        let entry = cache.entries.get("ns").unwrap();
+        assert_eq!(entry.manifest.next_sequence, 3);
+    }
+
+    #[test]
+    fn test_insert_rejects_stale_after_invalidation() {
+        let cache = ManifestCache::new(Duration::from_millis(500));
+
+        // Insert then invalidate
+        let mut v3 = Manifest::default();
+        v3.next_sequence = 3;
+        cache.insert("ns", v3);
+        cache.invalidate("ns");
+
+        // Insert with updated_at before invalidation — should be rejected
+        let mut stale = Manifest::default();
+        stale.next_sequence = 4;
+        stale.updated_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+        cache.insert("ns", stale);
+
+        assert!(cache.entries.get("ns").is_none());
     }
 }

@@ -141,13 +141,10 @@ pub fn wal_bm25_scan(
             for ((doc_id, field_name), token_data) in &cached.doc_field_data {
                 // Only include docs that survived dedup
                 if latest_vectors.contains_key(doc_id) {
-                    doc_field_data
-                        .entry(doc_id.clone())
-                        .or_default()
-                        .insert(
-                            field_name.clone(),
-                            (token_data.doc_length, token_data.term_freqs.clone()),
-                        );
+                    doc_field_data.entry(doc_id.clone()).or_default().insert(
+                        field_name.clone(),
+                        (token_data.doc_length, token_data.term_freqs.clone()),
+                    );
                 }
             }
         }
@@ -396,12 +393,26 @@ mod tests {
         let cache = WalFtsCache::new();
 
         // First scan (populates cache)
-        let result1 = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false, Some(&cache), None);
+        let result1 = wal_bm25_scan(
+            &fragments,
+            &rank_by,
+            &make_configs(),
+            false,
+            Some(&cache),
+            None,
+        );
         assert_eq!(result1.results.len(), 2);
         assert_eq!(cache.len(), 1);
 
         // Second scan (uses cache)
-        let result2 = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false, Some(&cache), None);
+        let result2 = wal_bm25_scan(
+            &fragments,
+            &rank_by,
+            &make_configs(),
+            false,
+            Some(&cache),
+            None,
+        );
         assert_eq!(result2.results.len(), 2);
         assert_eq!(cache.len(), 1);
     }

@@ -47,8 +47,11 @@ pub async fn query_namespace(
     Path(ns): Path<String>,
     body: bytes::Bytes,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    let req: QueryRequest = serde_json::from_slice(&body)
-        .map_err(|e| ApiError(ZeppelinError::Validation(format!("invalid request body: {e}"))))?;
+    let req: QueryRequest = serde_json::from_slice(&body).map_err(|e| {
+        ApiError(ZeppelinError::Validation(format!(
+            "invalid request body: {e}"
+        )))
+    })?;
     let start = std::time::Instant::now();
     let ns_for_metrics = ns.clone();
     let _duration_guard = DurationGuard {
@@ -120,6 +123,7 @@ pub async fn query_namespace(
             req.last_as_prefix,
             Some(&state.manifest_cache),
             Some(&state.fts_cache),
+            state.config.indexing.bm25_max_full_scan_clusters,
         )
         .await
         .map_err(ApiError::from)?

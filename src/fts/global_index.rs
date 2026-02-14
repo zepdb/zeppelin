@@ -67,29 +67,34 @@ impl GlobalInvertedIndex {
     /// `cluster_indexes` is `(cluster_idx, InvertedIndex)` for each cluster.
     #[must_use]
     pub fn build(cluster_indexes: &[(usize, &InvertedIndex)]) -> Self {
-        let total_docs: u32 = cluster_indexes.iter().map(|(_, idx)| idx.vector_count).sum();
+        let total_docs: u32 = cluster_indexes
+            .iter()
+            .map(|(_, idx)| idx.vector_count)
+            .sum();
         let mut fields: BTreeMap<String, GlobalFieldIndex> = BTreeMap::new();
 
         for &(cluster_idx, idx) in cluster_indexes {
             for (field_name, field_index) in &idx.fields {
-                let global_field = fields.entry(field_name.clone()).or_insert_with(|| {
-                    GlobalFieldIndex {
-                        avg_doc_length: 0.0,
-                        doc_count: 0,
-                        postings: BTreeMap::new(),
-                    }
-                });
+                let global_field =
+                    fields
+                        .entry(field_name.clone())
+                        .or_insert_with(|| GlobalFieldIndex {
+                            avg_doc_length: 0.0,
+                            doc_count: 0,
+                            postings: BTreeMap::new(),
+                        });
 
                 global_field.doc_count += field_index.doc_count;
 
                 for (term, posting_list) in &field_index.postings {
-                    let global_pl = global_field
-                        .postings
-                        .entry(term.clone())
-                        .or_insert_with(|| GlobalPostingList {
-                            df: 0,
-                            entries: Vec::new(),
-                        });
+                    let global_pl =
+                        global_field
+                            .postings
+                            .entry(term.clone())
+                            .or_insert_with(|| GlobalPostingList {
+                                df: 0,
+                                entries: Vec::new(),
+                            });
 
                     global_pl.df += posting_list.df;
 
@@ -160,10 +165,8 @@ impl GlobalInvertedIndex {
             }
         }
 
-        let mut results: Vec<(u16, u32, f32)> = scores
-            .into_iter()
-            .map(|((c, p), s)| (c, p, s))
-            .collect();
+        let mut results: Vec<(u16, u32, f32)> =
+            scores.into_iter().map(|((c, p), s)| (c, p, s)).collect();
         results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         results
     }
@@ -194,13 +197,8 @@ impl GlobalInvertedIndex {
             };
             let idf = bm25::idf(field_index.doc_count, pl.df);
             for posting in &pl.entries {
-                let score = bm25::bm25_term_score(
-                    idf,
-                    posting.tf,
-                    0,
-                    field_index.avg_doc_length,
-                    params,
-                );
+                let score =
+                    bm25::bm25_term_score(idf, posting.tf, 0, field_index.avg_doc_length, params);
                 *scores
                     .entry((posting.cluster_idx, posting.position))
                     .or_insert(0.0) += score;
@@ -227,10 +225,8 @@ impl GlobalInvertedIndex {
             }
         }
 
-        let mut results: Vec<(u16, u32, f32)> = scores
-            .into_iter()
-            .map(|((c, p), s)| (c, p, s))
-            .collect();
+        let mut results: Vec<(u16, u32, f32)> =
+            scores.into_iter().map(|((c, p), s)| (c, p, s)).collect();
         results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         results
     }
@@ -256,8 +252,9 @@ impl GlobalInvertedIndex {
 
     /// Serialize to bytes: `ZGFTS` magic (5B) + version (1B) + MessagePack payload.
     pub fn to_bytes(&self) -> Result<Bytes> {
-        let msgpack = rmp_serde::to_vec(self)
-            .map_err(|e| ZeppelinError::Serialization(format!("global FTS index serialize: {e}")))?;
+        let msgpack = rmp_serde::to_vec(self).map_err(|e| {
+            ZeppelinError::Serialization(format!("global FTS index serialize: {e}"))
+        })?;
         let mut data = Vec::with_capacity(6 + msgpack.len());
         data.extend_from_slice(ZGFTS_MAGIC);
         data.push(ZGFTS_VERSION);
@@ -330,7 +327,11 @@ mod tests {
     #[test]
     fn test_build_from_cluster_indexes() {
         let idx0 = make_cluster_index(3, "title", &[("hello", vec![(0, 1), (2, 2)])]);
-        let idx1 = make_cluster_index(2, "title", &[("hello", vec![(0, 1)]), ("world", vec![(1, 1)])]);
+        let idx1 = make_cluster_index(
+            2,
+            "title",
+            &[("hello", vec![(0, 1)]), ("world", vec![(1, 1)])],
+        );
 
         let global = GlobalInvertedIndex::build(&[(0, &idx0), (1, &idx1)]);
 
@@ -398,11 +399,15 @@ mod tests {
 
     #[test]
     fn test_search_prefix() {
-        let idx0 = make_cluster_index(3, "title", &[
-            ("rustlang", vec![(0, 1)]),
-            ("rustic", vec![(1, 1)]),
-            ("python", vec![(2, 1)]),
-        ]);
+        let idx0 = make_cluster_index(
+            3,
+            "title",
+            &[
+                ("rustlang", vec![(0, 1)]),
+                ("rustic", vec![(1, 1)]),
+                ("python", vec![(2, 1)]),
+            ],
+        );
         let global = GlobalInvertedIndex::build(&[(0, &idx0)]);
         let params = Bm25Params::default();
         let results = global.search_prefix("title", &["rust".to_string()], &params);

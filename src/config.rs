@@ -194,6 +194,10 @@ pub struct IndexingConfig {
     /// Whether to build FTS inverted indexes during compaction.
     #[serde(default)]
     pub fts_index: bool,
+    /// Maximum clusters to scan in BM25 full-scan fallback before returning an error.
+    /// Set to 0 to disable the circuit breaker (allow unlimited scan). Default: 500.
+    #[serde(default = "default_bm25_max_full_scan_clusters")]
+    pub bm25_max_full_scan_clusters: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +208,14 @@ pub struct CompactionConfig {
     pub max_wal_fragments_before_compact: usize,
     #[serde(default = "default_retrain_threshold")]
     pub retrain_imbalance_threshold: f64,
+    /// Maximum pending deletes to retain in the manifest before pruning.
+    /// Older entries beyond this limit are dropped. Default: 1000.
+    #[serde(default = "default_max_pending_deletes")]
+    pub max_pending_deletes: usize,
+    /// Maximum old (non-active) segments to retain in the manifest.
+    /// Default: 10.
+    #[serde(default = "default_max_old_segments")]
+    pub max_old_segments: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -306,6 +318,15 @@ fn default_max_wal_fragments() -> usize {
 fn default_retrain_threshold() -> f64 {
     5.0
 }
+fn default_bm25_max_full_scan_clusters() -> usize {
+    500
+}
+fn default_max_pending_deletes() -> usize {
+    1000
+}
+fn default_max_old_segments() -> usize {
+    10
+}
 fn default_batch_manifest_size() -> usize {
     1 // disabled by default
 }
@@ -382,6 +403,7 @@ impl Default for IndexingConfig {
             leaf_size: None,
             bitmap_index: default_bitmap_index(),
             fts_index: false,
+            bm25_max_full_scan_clusters: default_bm25_max_full_scan_clusters(),
         }
     }
 }
@@ -392,6 +414,8 @@ impl Default for CompactionConfig {
             interval_secs: default_compaction_interval(),
             max_wal_fragments_before_compact: default_max_wal_fragments(),
             retrain_imbalance_threshold: default_retrain_threshold(),
+            max_pending_deletes: default_max_pending_deletes(),
+            max_old_segments: default_max_old_segments(),
         }
     }
 }
@@ -646,6 +670,12 @@ impl Config {
         if let Ok(v) = std::env::var("ZEPPELIN_FTS_INDEX") {
             self.indexing.fts_index = v == "true";
         }
+        if let Some(v) = std::env::var("ZEPPELIN_BM25_MAX_FULL_SCAN_CLUSTERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.indexing.bm25_max_full_scan_clusters = v;
+        }
         // Hierarchical indexing
         if let Ok(v) = std::env::var("ZEPPELIN_HIERARCHICAL") {
             self.indexing.hierarchical = v == "true";
@@ -675,6 +705,18 @@ impl Config {
             .and_then(|v| v.parse().ok())
         {
             self.compaction.max_wal_fragments_before_compact = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_PENDING_DELETES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.compaction.max_pending_deletes = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_OLD_SEGMENTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.compaction.max_old_segments = v;
         }
 
         // Logging

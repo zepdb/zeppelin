@@ -97,9 +97,7 @@ async fn test_tla_concurrent_namespace_create() {
 
     // Client B tries to create same namespace with dim=256, euclidean — should FAIL
     let manager_b = NamespaceManager::new(store.clone());
-    let result_b = manager_b
-        .create(ns, 256, DistanceMetric::Euclidean)
-        .await;
+    let result_b = manager_b.create(ns, 256, DistanceMetric::Euclidean).await;
     assert!(
         matches!(result_b, Err(ZeppelinError::NamespaceAlreadyExists { .. })),
         "Client B should fail with NamespaceAlreadyExists, got: {:?}",
@@ -483,12 +481,7 @@ async fn test_tla_compaction_retry_starvation() {
 
     // States 2-3: Compactor reads manifest snapshot and "builds index"
     // Use max() instead of last() to handle ULID non-monotonicity (Bug 40 fix)
-    let last_frag_id = pre_manifest
-        .fragments
-        .iter()
-        .map(|f| f.id)
-        .max()
-        .unwrap();
+    let last_frag_id = pre_manifest.fragments.iter().map(|f| f.id).max().unwrap();
 
     // The segment the compactor would have built
     let compactor_segment = SegmentRef {
@@ -511,10 +504,8 @@ async fn test_tla_compaction_retry_starvation() {
     // Phase 1: 5 attempts that all conflict (writer interferes each time)
     for attempt in 0..old_max_retries {
         // Compactor reads fresh manifest (as the real CAS loop does)
-        let (mut fresh_manifest, version) = Manifest::read_versioned(&store, ns)
-            .await
-            .unwrap()
-            .unwrap();
+        let (mut fresh_manifest, version) =
+            Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
 
         // BEFORE the compactor can write: a writer bumps the etag
         writer
@@ -526,9 +517,7 @@ async fn test_tla_compaction_retry_starvation() {
         fresh_manifest.add_segment(compactor_segment.clone());
         fresh_manifest.remove_compacted_fragments(last_frag_id);
 
-        let cas_result = fresh_manifest
-            .write_conditional(&store, ns, &version)
-            .await;
+        let cas_result = fresh_manifest.write_conditional(&store, ns, &version).await;
 
         match cas_result {
             Err(ZeppelinError::ManifestConflict { .. }) => {
@@ -554,17 +543,13 @@ async fn test_tla_compaction_retry_starvation() {
     // Phase 2: The 6th attempt succeeds (no writer interference)
     // This is the fix: the compactor now has 10 retries, so after 5 conflicts
     // it still has 5 more chances. Without interference, the CAS succeeds.
-    let (mut fresh_manifest, version) = Manifest::read_versioned(&store, ns)
-        .await
-        .unwrap()
-        .unwrap();
+    let (mut fresh_manifest, version) =
+        Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
 
     fresh_manifest.add_segment(compactor_segment.clone());
     fresh_manifest.remove_compacted_fragments(last_frag_id);
 
-    let cas_result = fresh_manifest
-        .write_conditional(&store, ns, &version)
-        .await;
+    let cas_result = fresh_manifest.write_conditional(&store, ns, &version).await;
 
     assert!(
         cas_result.is_ok(),

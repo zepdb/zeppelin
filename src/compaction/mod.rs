@@ -299,60 +299,62 @@ impl Compactor {
         // 8. Build index (expensive, done once — NOT retried)
         // Choose hierarchical or flat based on config.
         let build_start = std::time::Instant::now();
-        let (cluster_count, is_hierarchical, bitmap_fields) = if !should_retrain
-            && old_segment_id.is_some()
-            && !self.indexing_config.hierarchical
-        {
-            // Incremental path: reuse existing centroids, just reassign vectors.
-            match self
-                .incremental_build(namespace, old_segment_id.as_deref().unwrap(), &segment_id, &vectors)
-                .await
-            {
-                Ok((count, bf)) => {
-                    info!(
-                        new_from_wal,
-                        existing_count,
-                        "incremental compaction: reusing centroids"
-                    );
-                    (count, false, bf)
-                }
-                Err(e) => {
-                    warn!(error = %e, "incremental build failed, falling back to full retrain");
-                    let index = build_ivf_flat(
-                        &vectors,
-                        &self.indexing_config,
-                        &self.store,
+        let (cluster_count, is_hierarchical, bitmap_fields) =
+            if !should_retrain && old_segment_id.is_some() && !self.indexing_config.hierarchical {
+                // Incremental path: reuse existing centroids, just reassign vectors.
+                match self
+                    .incremental_build(
                         namespace,
+                        old_segment_id.as_deref().unwrap(),
                         &segment_id,
+                        &vectors,
                     )
-                    .await?;
-                    let bf = index.bitmap_fields.clone();
-                    (index.num_clusters(), false, bf)
+                    .await
+                {
+                    Ok((count, bf)) => {
+                        info!(
+                            new_from_wal,
+                            existing_count, "incremental compaction: reusing centroids"
+                        );
+                        (count, false, bf)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "incremental build failed, falling back to full retrain");
+                        let index = build_ivf_flat(
+                            &vectors,
+                            &self.indexing_config,
+                            &self.store,
+                            namespace,
+                            &segment_id,
+                        )
+                        .await?;
+                        let bf = index.bitmap_fields.clone();
+                        (index.num_clusters(), false, bf)
+                    }
                 }
-            }
-        } else if self.indexing_config.hierarchical {
-            let h_index = build_hierarchical(
-                &vectors,
-                &self.indexing_config,
-                &self.store,
-                namespace,
-                &segment_id,
-            )
-            .await?;
-            let bf = h_index.bitmap_fields.clone();
-            (h_index.num_leaf_clusters(), true, bf)
-        } else {
-            let index = build_ivf_flat(
-                &vectors,
-                &self.indexing_config,
-                &self.store,
-                namespace,
-                &segment_id,
-            )
-            .await?;
-            let bf = index.bitmap_fields.clone();
-            (index.num_clusters(), false, bf)
-        };
+            } else if self.indexing_config.hierarchical {
+                let h_index = build_hierarchical(
+                    &vectors,
+                    &self.indexing_config,
+                    &self.store,
+                    namespace,
+                    &segment_id,
+                )
+                .await?;
+                let bf = h_index.bitmap_fields.clone();
+                (h_index.num_leaf_clusters(), true, bf)
+            } else {
+                let index = build_ivf_flat(
+                    &vectors,
+                    &self.indexing_config,
+                    &self.store,
+                    namespace,
+                    &segment_id,
+                )
+                .await?;
+                let bf = index.bitmap_fields.clone();
+                (index.num_clusters(), false, bf)
+            };
         let build_elapsed = build_start.elapsed();
         let index_type_label = if is_hierarchical {
             "hierarchical"
@@ -405,15 +407,19 @@ impl Compactor {
                     let seg = segment_id_clone.clone();
                     tokio::task::spawn_blocking(move || {
                         let cluster_attrs = deserialize_attrs(&data)?;
-                        let attr_refs: Vec<
-                            Option<&HashMap<String, crate::types::AttributeValue>>,
-                        > = cluster_attrs.iter().map(|a| a.as_ref()).collect();
+                        let attr_refs: Vec<Option<&HashMap<String, crate::types::AttributeValue>>> =
+                            cluster_attrs.iter().map(|a| a.as_ref()).collect();
                         let inv_index = InvertedIndex::build(&attr_refs, &configs);
-                        let field_names: Vec<String> =
-                            inv_index.fields.keys().cloned().collect();
+                        let field_names: Vec<String> = inv_index.fields.keys().cloned().collect();
                         let fts_data = inv_index.to_bytes()?;
                         let fts_key = fts_index_key(&ns, &seg, cluster_idx);
-                        Ok::<_, ZeppelinError>((cluster_idx, fts_key, fts_data, field_names, inv_index))
+                        Ok::<_, ZeppelinError>((
+                            cluster_idx,
+                            fts_key,
+                            fts_data,
+                            field_names,
+                            inv_index,
+                        ))
                     })
                 })
                 .collect();
@@ -423,8 +429,7 @@ impl Compactor {
             let mut cluster_inv_indexes: Vec<(usize, InvertedIndex)> = Vec::new();
             for result in build_results {
                 let (cluster_idx, fts_key, fts_data, field_names, inv_index) = result
-                    .map_err(|e| ZeppelinError::Index(format!("FTS build task failed: {e}")))?
-                    ?;
+                    .map_err(|e| ZeppelinError::Index(format!("FTS build task failed: {e}")))??;
                 for name in field_names {
                     if !fts_field_names.contains(&name) {
                         fts_field_names.push(name);
@@ -436,7 +441,7 @@ impl Compactor {
 
             // Phase 2b: Build global FTS index from per-cluster indexes.
             has_global_fts = if !cluster_inv_indexes.is_empty() {
-                use crate::fts::global_index::{GlobalInvertedIndex, global_fts_key};
+                use crate::fts::global_index::{global_fts_key, GlobalInvertedIndex};
                 let refs: Vec<(usize, &InvertedIndex)> = cluster_inv_indexes
                     .iter()
                     .map(|(idx, inv)| (*idx, inv))
@@ -496,16 +501,20 @@ impl Compactor {
                 fresh_manifest.fencing_token = token;
             }
 
-            fresh_manifest.add_segment(SegmentRef {
-                id: segment_id.clone(),
-                vector_count: vectors_compacted,
-                cluster_count,
-                quantization: self.indexing_config.quantization,
-                hierarchical: is_hierarchical,
-                bitmap_fields: bitmap_fields.clone(),
-                fts_fields: fts_fields.clone(),
-                has_global_fts,
-            });
+            fresh_manifest.add_segment_with_limits(
+                SegmentRef {
+                    id: segment_id.clone(),
+                    vector_count: vectors_compacted,
+                    cluster_count,
+                    quantization: self.indexing_config.quantization,
+                    hierarchical: is_hierarchical,
+                    bitmap_fields: bitmap_fields.clone(),
+                    fts_fields: fts_fields.clone(),
+                    has_global_fts,
+                },
+                self.config.max_pending_deletes,
+                self.config.max_old_segments,
+            );
             fresh_manifest.remove_compacted_fragments(last_fragment_id);
             fresh_manifest.pending_deletes = deferred_deletes.clone();
 
@@ -537,7 +546,10 @@ impl Compactor {
                     });
                 }
                 Err(ZeppelinError::ManifestConflict { .. }) => {
-                    warn!(attempt, "manifest CAS conflict in compactor, retrying with backoff");
+                    warn!(
+                        attempt,
+                        "manifest CAS conflict in compactor, retrying with backoff"
+                    );
                     let backoff_ms = (50u64 * (1 << attempt.min(5))).min(2000);
                     let jitter_ms = rand::thread_rng().gen_range(0..50);
                     tokio::time::sleep(Duration::from_millis(backoff_ms + jitter_ms)).await;
@@ -565,12 +577,12 @@ impl Compactor {
         new_segment_id: &str,
         vectors: &[VectorEntry],
     ) -> Result<(usize, Vec<String>)> {
-        use bytes::Bytes;
         use crate::index::distance::euclidean_distance;
         use crate::index::ivf_flat::build::{
-            centroids_key, serialize_centroids, deserialize_centroids,
-            serialize_cluster, serialize_attrs,
+            centroids_key, deserialize_centroids, serialize_attrs, serialize_centroids,
+            serialize_cluster,
         };
+        use bytes::Bytes;
 
         // Load existing centroids
         let ckey = centroids_key(namespace, old_segment_id);
@@ -605,7 +617,8 @@ impl Compactor {
         self.store.put(&new_ckey, new_centroids_data).await?;
 
         // CPU phase: pre-serialize all cluster payloads
-        let mut bitmap_fields_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut bitmap_fields_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut payloads: Vec<(String, Bytes)> = Vec::new();
 
         for i in 0..num_clusters {

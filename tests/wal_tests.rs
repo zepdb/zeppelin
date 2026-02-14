@@ -41,7 +41,9 @@ async fn test_fragment_checksum_corruption() {
         | ZeppelinError::Json(_)
         | ZeppelinError::Bincode(_)
         | ZeppelinError::Serialization(_) => {}
-        other => panic!("expected ChecksumMismatch, Json, Bincode, or Serialization error, got: {other}"),
+        other => {
+            panic!("expected ChecksumMismatch, Json, Bincode, or Serialization error, got: {other}")
+        }
     }
 }
 
