@@ -9,7 +9,7 @@ use crate::config::{CompactionConfig, IndexingConfig};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
 use crate::fts::types::FtsFieldConfig;
-use crate::index::hierarchical::build::build_hierarchical;
+use crate::index::hierarchical::build::{build_hierarchical, load_hierarchical};
 use crate::index::ivf_flat::build::{
     attrs_key, build_ivf_flat, cluster_key, deserialize_attrs, deserialize_cluster,
 };
@@ -186,7 +186,14 @@ impl Compactor {
         // 5. If existing active_segment: load vectors from it, merge
         let old_segment_id = manifest.active_segment.clone();
         if let Some(ref seg_id) = old_segment_id {
-            let existing_vecs = load_segment_vectors(&self.store, namespace, seg_id).await?;
+            let is_hierarchical = manifest
+                .segments
+                .iter()
+                .find(|s| s.id == *seg_id)
+                .map(|s| s.hierarchical)
+                .unwrap_or(false);
+            let existing_vecs =
+                load_segment_vectors(&self.store, namespace, seg_id, is_hierarchical).await?;
             for vec in existing_vecs {
                 // WAL overrides: only insert if not already in latest_vectors and not deleted
                 if !latest_vectors.contains_key(&vec.id) && !deleted_ids.contains(&vec.id) {
@@ -639,11 +646,18 @@ async fn load_segment_vectors(
     store: &ZeppelinStore,
     namespace: &str,
     segment_id: &str,
+    is_hierarchical: bool,
 ) -> Result<Vec<VectorEntry>> {
-    use crate::index::IvfFlatIndex;
-
-    let index = IvfFlatIndex::load(store, namespace, segment_id).await?;
-    let num_clusters = index.num_clusters();
+    // Determine cluster count: hierarchical segments store it in tree_meta.json,
+    // IVF-Flat segments store it in centroids.bin.
+    let num_clusters = if is_hierarchical {
+        let h_index = load_hierarchical(store, namespace, segment_id).await?;
+        h_index.num_leaf_clusters()
+    } else {
+        use crate::index::IvfFlatIndex;
+        let index = IvfFlatIndex::load(store, namespace, segment_id).await?;
+        index.num_clusters()
+    };
 
     // Parallel fetch: 2 GETs per cluster via tokio::join!
     let cluster_results = futures::future::join_all((0..num_clusters).map(|i| {
