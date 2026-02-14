@@ -1,7 +1,9 @@
 pub mod background;
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
+use rand::Rng;
 use tracing::{debug, info, instrument, warn};
 use ulid::Ulid;
 
@@ -20,7 +22,7 @@ use crate::wal::manifest::{Manifest, ManifestVersion, SegmentRef};
 use crate::wal::WalReader;
 
 /// Maximum CAS retry attempts for manifest updates.
-const MAX_CAS_RETRIES: u32 = 5;
+const MAX_CAS_RETRIES: u32 = 10;
 
 /// Result of a compaction run.
 #[derive(Debug)]
@@ -157,7 +159,7 @@ impl Compactor {
 
         let fragment_refs = manifest.uncompacted_fragments().to_vec();
         let fragments_removed = fragment_refs.len();
-        let last_fragment_id = fragment_refs.last().unwrap().id;
+        let last_fragment_id = fragment_refs.iter().map(|f| f.id).max().unwrap();
 
         info!(fragment_count = fragments_removed, "starting compaction");
 
@@ -268,8 +270,11 @@ impl Compactor {
                     Err(ZeppelinError::ManifestConflict { .. }) => {
                         warn!(
                             attempt,
-                            "manifest CAS conflict in compactor (empty), retrying"
+                            "manifest CAS conflict in compactor (empty), retrying with backoff"
                         );
+                        let backoff_ms = (50u64 * (1 << attempt.min(5))).min(2000);
+                        let jitter_ms = rand::thread_rng().gen_range(0..50);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms + jitter_ms)).await;
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -532,7 +537,10 @@ impl Compactor {
                     });
                 }
                 Err(ZeppelinError::ManifestConflict { .. }) => {
-                    warn!(attempt, "manifest CAS conflict in compactor, retrying");
+                    warn!(attempt, "manifest CAS conflict in compactor, retrying with backoff");
+                    let backoff_ms = (50u64 * (1 << attempt.min(5))).min(2000);
+                    let jitter_ms = rand::thread_rng().gen_range(0..50);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms + jitter_ms)).await;
                     continue;
                 }
                 Err(e) => return Err(e),

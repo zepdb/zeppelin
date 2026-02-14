@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use tokio::sync::Mutex;
 
@@ -22,6 +23,9 @@ pub struct ManifestCache {
     ttl: Duration,
     /// Per-namespace mutex to coalesce concurrent fetches (singleflight).
     inflight: DashMap<String, Arc<Mutex<()>>>,
+    /// Tracks the last invalidation time per namespace.
+    /// Used to reject stale write-throughs that arrive after an invalidation.
+    last_invalidated: DashMap<String, DateTime<Utc>>,
 }
 
 struct CachedManifest {
@@ -36,6 +40,7 @@ impl ManifestCache {
             entries: DashMap::new(),
             ttl,
             inflight: DashMap::new(),
+            last_invalidated: DashMap::new(),
         }
     }
 
@@ -90,7 +95,17 @@ impl ManifestCache {
     ///
     /// Called after WAL writes so the next query sees fresh data without
     /// an S3 roundtrip. Avoids the invalidate-then-refetch pattern.
+    ///
+    /// Rejects stale write-throughs: if the manifest's `updated_at` is at or
+    /// before the last invalidation time for this namespace, the insert is
+    /// silently dropped. This prevents a delayed write-through from overwriting
+    /// a cache invalidation that was triggered by a more recent compaction.
     pub fn insert(&self, namespace: &str, manifest: Manifest) {
+        if let Some(inv_time) = self.last_invalidated.get(namespace) {
+            if manifest.updated_at <= *inv_time {
+                return;
+            }
+        }
         self.entries.insert(
             namespace.to_string(),
             CachedManifest {
@@ -103,7 +118,11 @@ impl ManifestCache {
     /// Invalidate the cached manifest for a namespace.
     ///
     /// Called after compaction to ensure the next read sees fresh data.
+    /// Records the invalidation timestamp so that stale write-throughs
+    /// arriving after this point are rejected by `insert()`.
     pub fn invalidate(&self, namespace: &str) {
+        self.last_invalidated
+            .insert(namespace.to_string(), Utc::now());
         self.entries.remove(namespace);
     }
 }
