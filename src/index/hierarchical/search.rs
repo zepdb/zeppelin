@@ -124,9 +124,56 @@ pub async fn search_hierarchical(
         .await;
     }
 
-    // Descend through internal levels.
-    let mut current_ids: Vec<String> = beam.into_iter().map(|(id, _)| id).collect();
+    // Partition root beam into leaf clusters vs internal nodes.
+    // Root `is_leaf == false` does NOT mean all children are internal nodes —
+    // hybrid nodes have a mix of leaf cluster IDs (numeric, e.g. "42") and
+    // internal node IDs (e.g. "n_2_ULID"). Without this partition, leaf cluster
+    // IDs enter the descent loop, fail to load as tree nodes, and get silently
+    // skipped — causing 0 results for namespaces with mostly-leaf root children.
+    let mut root_leaf_clusters: Vec<usize> = Vec::new();
+    let mut current_ids: Vec<String> = Vec::new();
+    for (id, _) in beam {
+        if let Ok(idx) = id.parse::<usize>() {
+            root_leaf_clusters.push(idx);
+        } else {
+            current_ids.push(id);
+        }
+    }
+
     let mut accumulated: Vec<SearchResult> = Vec::new();
+
+    // Scan any leaf clusters found at root level.
+    if !root_leaf_clusters.is_empty() {
+        debug!(
+            leaf_count = root_leaf_clusters.len(),
+            internal_count = current_ids.len(),
+            "root beam: partitioned into leaf clusters and internal nodes"
+        );
+        let leaf_results = scan_leaf_clusters(
+            index,
+            &root_leaf_clusters,
+            query,
+            top_k,
+            filter,
+            distance_metric,
+            store,
+            oversample_factor,
+            cache,
+        )
+        .await?;
+        accumulated.extend(leaf_results);
+    }
+
+    if current_ids.is_empty() {
+        // All root beam entries were leaf clusters — return results.
+        accumulated.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        accumulated.truncate(top_k);
+        return Ok(accumulated);
+    }
 
     loop {
         let mut next_beam: Vec<(String, f32, bool)> = Vec::new(); // (child_id, dist, is_leaf)

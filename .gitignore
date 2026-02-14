@@ -49,10 +49,7 @@ tests/fixtures/tmp/
 # Docker volumes
 minio_data/
 
-# Deployment state
-deploy/.state/
-
-# Benchmark results and build artifacts
-benchmarks/results/
-benchmarks/target/
+# Benchmarks and deploy (moved to ../zepdb/zeppelin-benchmark/)
+benchmarks/
+deploy/
 demo/
