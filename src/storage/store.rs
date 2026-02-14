@@ -199,6 +199,47 @@ impl ZeppelinStore {
         Ok(())
     }
 
+    /// Put an object only if it does NOT already exist (atomic create).
+    /// Returns `NamespaceAlreadyExists` if the key already exists.
+    /// Uses S3's `If-None-Match: *` header via `PutMode::Create`.
+    #[instrument(skip(self, data), fields(key = key))]
+    pub async fn put_if_not_exists(
+        &self,
+        key: &str,
+        data: Bytes,
+        namespace: &str,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        let path = Path::parse(key)?;
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        self.inner
+            .put_opts(&path, PutPayload::from(data), options)
+            .await
+            .map_err(|e| match e {
+                object_store::Error::AlreadyExists { path, .. } => {
+                    tracing::debug!(key = %path, "put_if_not_exists: object already exists");
+                    ZeppelinError::NamespaceAlreadyExists {
+                        namespace: namespace.to_string(),
+                    }
+                }
+                other => {
+                    crate::metrics::S3_ERRORS_TOTAL
+                        .with_label_values(&["put"])
+                        .inc();
+                    ZeppelinError::Storage(other)
+                }
+            })?;
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), "s3 put_if_not_exists");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["put"])
+            .observe(elapsed.as_secs_f64());
+        Ok(())
+    }
+
     /// Delete an object by key.
     #[instrument(skip(self), fields(key = key))]
     pub async fn delete(&self, key: &str) -> Result<()> {

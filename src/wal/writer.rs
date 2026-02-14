@@ -8,7 +8,7 @@ use crate::storage::ZeppelinStore;
 use crate::types::{VectorEntry, VectorId};
 
 use super::fragment::WalFragment;
-use super::manifest::{FragmentRef, Manifest, ManifestVersion};
+use super::manifest::{FragmentRef, Manifest};
 
 /// Maximum CAS retry attempts for manifest updates.
 const MAX_CAS_RETRIES: u32 = 5;
@@ -98,7 +98,11 @@ impl WalWriter {
             let (mut manifest, version) =
                 match Manifest::read_versioned(&self.store, namespace).await? {
                     Some(pair) => pair,
-                    None => (Manifest::default(), ManifestVersion(None)),
+                    None => {
+                        return Err(ZeppelinError::ManifestNotFound {
+                            namespace: namespace.to_string(),
+                        });
+                    }
                 };
 
             // Layer 1: Fencing check — reject zombie writers.

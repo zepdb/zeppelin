@@ -95,13 +95,11 @@ impl NamespaceManager {
             ));
         }
 
-        // Check if exists
+        // Atomic create: write meta.json only if it doesn't already exist.
+        // Uses S3 `If-None-Match: *` (PutMode::Create) to prevent TOCTOU races
+        // where two concurrent creators both pass an exists() check and silently
+        // overwrite each other's configuration.
         let key = NamespaceMetadata::s3_key(name);
-        if self.store.exists(&key).await? {
-            return Err(ZeppelinError::NamespaceAlreadyExists {
-                namespace: name.to_string(),
-            });
-        }
 
         let now = Utc::now();
         let meta = NamespaceMetadata {
@@ -115,8 +113,10 @@ impl NamespaceManager {
             full_text_search,
         };
 
-        // Write to S3
-        self.store.put(&key, meta.to_bytes()?).await?;
+        // Atomic write — returns NamespaceAlreadyExists if meta.json exists
+        self.store
+            .put_if_not_exists(&key, meta.to_bytes()?, name)
+            .await?;
 
         // Also initialize an empty manifest
         let manifest = crate::wal::Manifest::new();
