@@ -10,7 +10,9 @@
 //! [4 bytes magic: "ZBMP"] [1 byte version] [JSON payload]
 //! ```
 
+/// Bitmap index construction from cluster attributes.
 pub mod build;
+/// Bitmap filter evaluation against roaring bitmaps.
 pub mod evaluate;
 
 use roaring::RoaringBitmap;
@@ -36,6 +38,7 @@ pub const MAX_CARDINALITY: usize = 10_000;
 pub struct BitmapKey(pub String);
 
 impl BitmapKey {
+    /// Create a bitmap key from an attribute value.
     pub fn from_attr(value: &AttributeValue) -> Self {
         match value {
             AttributeValue::String(s) => BitmapKey(format!("s:{s}")),
@@ -58,10 +61,12 @@ impl BitmapKey {
         BitmapKey(format!("s:{s}"))
     }
 
+    /// Create a bitmap key for a single integer list element.
     pub fn from_integer_element(i: i64) -> Self {
         BitmapKey(format!("i:{i}"))
     }
 
+    /// Create a bitmap key for a single float list element.
     pub fn from_float_element(f: f64) -> Self {
         BitmapKey(format!("f:{}", f.to_bits()))
     }
@@ -148,6 +153,7 @@ pub fn bitmap_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> Stri
     format!("{namespace}/segments/{segment_id}/bitmap_{cluster_idx}.bin")
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -13,6 +13,7 @@ use crate::server::AppState;
 ///
 /// Uses `MatchedPath` to normalize route patterns (avoids unbounded cardinality
 /// from namespace names in URLs).
+#[allow(clippy::unwrap_used)]
 pub async fn http_metrics(
     matched_path: Option<MatchedPath>,
     request: Request<axum::body::Body>,
@@ -36,6 +37,7 @@ pub async fn http_metrics(
 /// - Otherwise generates a UUID v4.
 /// - Creates a tracing span so all downstream logs include the request ID.
 /// - Returns the request ID in the response `x-request-id` header.
+#[allow(clippy::unwrap_used)]
 pub async fn request_id(request: Request<axum::body::Body>, next: Next) -> Response {
     let id = request
         .headers()

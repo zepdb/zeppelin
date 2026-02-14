@@ -312,7 +312,12 @@ fn kmeans_pp_init(vectors: &[&[f32]], dim: usize, k: usize) -> Result<Vec<Vec<f3
                 "all remaining distances are zero, duplicating last centroid"
             );
             while centroids.len() < k {
-                centroids.push(centroids.last().unwrap().clone());
+                centroids.push(
+                    centroids
+                        .last()
+                        .ok_or_else(|| ZeppelinError::Index("empty centroids in k-means++".into()))?
+                        .clone(),
+                );
             }
             return Ok(centroids);
         }
@@ -355,6 +360,7 @@ fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

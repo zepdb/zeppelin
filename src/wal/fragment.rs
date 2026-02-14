@@ -28,6 +28,7 @@ pub struct WalFragment {
 impl WalFragment {
     /// Create a new WAL fragment, panicking if any vector ID appears in both
     /// upserts and deletes. Per project rule: no fallbacks, crash explicitly.
+    #[allow(clippy::expect_used)]
     pub fn new(vectors: Vec<VectorEntry>, deletes: Vec<VectorId>) -> Self {
         Self::try_new(vectors, deletes)
             .expect("WalFragment::new called with overlapping vector IDs in upserts and deletes")
@@ -84,6 +85,7 @@ impl WalFragment {
                 (v.id.as_str(), v.values.as_slice(), attrs)
             })
             .collect();
+        #[allow(clippy::expect_used)]
         let payload =
             serde_json::to_vec(&(&canonical, deletes)).expect("serialization should not fail");
         xxh3_64(&payload)

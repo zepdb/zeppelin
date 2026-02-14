@@ -5,10 +5,12 @@ use serde_json::{json, Value};
 
 use crate::server::AppState;
 
+/// Liveness probe: returns 200 OK if the server process is running.
 pub async fn health_check() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
+/// Readiness probe: returns 200 OK when S3 connectivity is confirmed.
 pub async fn readiness_check(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {

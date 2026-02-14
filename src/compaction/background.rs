@@ -17,6 +17,7 @@ use super::Compactor;
 ///
 /// `compaction_workers` controls the number of tokio worker threads for
 /// the compaction runtime. Set via `CpuBudget::auto()` (typically CPUs - 1).
+#[allow(clippy::expect_used)]
 pub fn start_compaction_thread(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,

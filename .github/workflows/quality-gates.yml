@@ -1,0 +1,200 @@
+name: Quality Gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Gate 5: Security Audit
+  audit:
+    name: Security Audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Gate 6: Dependency Check
+  deny:
+    name: Dependency Check (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Gate 7: Unused Dependencies
+  udeps:
+    name: Unused Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-udeps
+        run: cargo install cargo-udeps --locked
+      - name: Check unused deps
+        run: cargo +nightly udeps --all-targets
+
+  # Gate 8: Unsafe Report
+  geiger:
+    name: Unsafe Report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-geiger
+        run: cargo install cargo-geiger
+      - name: Run geiger
+        run: cargo geiger --output-format ascii 2>&1 | tee geiger-report.txt || true
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: geiger-report
+          path: geiger-report.txt
+
+  # Gate 9: Unwrap/Unsafe Audit
+  unwrap-audit:
+    name: Unwrap/Unsafe Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Count unsafe blocks
+        run: |
+          UNSAFE_COUNT=$(grep -rn 'unsafe {' src/ --include='*.rs' | wc -l | tr -d ' ')
+          echo "Unsafe blocks: $UNSAFE_COUNT"
+          if [ "$UNSAFE_COUNT" -gt 6 ]; then
+            echo "::error::Unsafe count ($UNSAFE_COUNT) exceeds threshold (6)"
+            exit 1
+          fi
+      - name: Count unwrap/expect allows
+        run: |
+          ALLOW_COUNT=$(grep -rn 'allow(clippy::unwrap_used)\|allow(clippy::expect_used)' src/ --include='*.rs' | wc -l | tr -d ' ')
+          echo "Allow annotations: $ALLOW_COUNT"
+          if [ "$ALLOW_COUNT" -gt 30 ]; then
+            echo "::error::Allow count ($ALLOW_COUNT) exceeds threshold (30)"
+            exit 1
+          fi
+
+  # Gate 12: Code Duplication
+  duplication:
+    name: Code Duplication
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install -g jscpd
+      - name: Check duplication
+        run: jscpd --config .jscpd.json
+
+  # Gate 1: Miri (UB Detection)
+  miri:
+    name: Miri (UB Detection)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Miri
+        run: cargo +nightly miri test --lib
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-tree-borrows"
+
+  # Gate 3: Fuzz Testing
+  fuzz:
+    name: Fuzz Testing (60s each)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Run fuzz targets
+        run: |
+          cd fuzz
+          for target in $(cargo +nightly fuzz list 2>/dev/null); do
+            echo "=== Fuzzing $target ==="
+            cargo +nightly fuzz run "$target" -- -max_total_time=60 -max_len=4096 || exit 1
+          done
+
+  # Gate 2: Loom Concurrency Tests
+  loom:
+    name: Loom Concurrency Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run loom tests
+        run: RUSTFLAGS="--cfg loom" cargo test --test loom_tests -- --nocapture
+        env:
+          LOOM_MAX_PREEMPTIONS: 3
+
+  # Gate 11: Benchmark Regression (PR only)
+  benchmark-regression:
+    name: Benchmark Regression
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install critcmp
+        run: cargo install critcmp
+      - name: Bench base branch
+        run: |
+          git checkout ${{ github.event.pull_request.base.sha }}
+          cargo bench -- --save-baseline base
+      - name: Bench PR branch
+        run: |
+          git checkout ${{ github.event.pull_request.head.sha }}
+          cargo bench -- --save-baseline pr
+      - name: Compare (fail on >10% regression)
+        run: critcmp base pr --threshold 10
+
+  # Gate 4: Mutation Testing
+  mutants:
+    name: Mutation Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants
+      - name: Run mutation testing
+        run: |
+          cargo mutants --timeout 60 --jobs 2 -- --lib 2>&1 | tee mutants-output.txt
+          # Parse and check kill rate
+          if grep -q 'mutants tested' mutants-output.txt; then
+            MISSED=$(grep -oP 'missed: \K\d+' mutants-output.txt || echo 0)
+            CAUGHT=$(grep -oP 'caught: \K\d+' mutants-output.txt || echo 0)
+            TOTAL=$((CAUGHT + MISSED))
+            if [ "$TOTAL" -gt 0 ]; then
+              RATE=$((CAUGHT * 100 / TOTAL))
+              echo "Kill rate: $RATE% ($CAUGHT/$TOTAL)"
+              if [ "$RATE" -lt 80 ]; then
+                echo "::error::Mutation kill rate ($RATE%) below 80%"
+                exit 1
+              fi
+            fi
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-report
+          path: mutants_out/

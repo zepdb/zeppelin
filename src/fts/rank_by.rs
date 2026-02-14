@@ -18,13 +18,23 @@ use crate::error::{Result, ZeppelinError};
 #[derive(Debug, Clone, PartialEq)]
 pub enum RankBy {
     /// Single-field BM25: `["field", "BM25", "query"]`
-    Bm25 { field: String, query: String },
+    Bm25 {
+        /// Field name to search.
+        field: String,
+        /// Query text to score against.
+        query: String,
+    },
     /// Sum of multiple expressions: `["Sum", [...exprs]]`
     Sum(Vec<RankBy>),
     /// Max of multiple expressions: `["Max", [...exprs]]`
     Max(Vec<RankBy>),
     /// Weighted expression: `["Product", weight, expr]`
-    Product { weight: f32, expr: Box<RankBy> },
+    Product {
+        /// Scalar weight multiplier.
+        weight: f32,
+        /// Inner expression to weight.
+        expr: Box<RankBy>,
+    },
 }
 
 impl RankBy {
@@ -200,6 +210,7 @@ pub fn evaluate_rank_by(
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

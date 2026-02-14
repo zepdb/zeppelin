@@ -12,8 +12,11 @@ const MANIFEST_FORMAT_MSGPACK: u8 = 0x01;
 /// A reference to a WAL fragment stored on S3.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FragmentRef {
+    /// ULID identifying this fragment.
     pub id: Ulid,
+    /// Number of vectors in the fragment.
     pub vector_count: usize,
+    /// Number of delete tombstones in the fragment.
     pub delete_count: usize,
     /// Monotonic sequence number assigned at manifest write time.
     /// Immune to clock skew — determines merge order instead of ULID.
@@ -24,8 +27,11 @@ pub struct FragmentRef {
 /// A reference to an IVF segment stored on S3.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SegmentRef {
+    /// Unique segment identifier (e.g., `seg_<ULID>`).
     pub id: String,
+    /// Number of vectors in the segment.
     pub vector_count: usize,
+    /// Number of IVF clusters in the segment.
     pub cluster_count: usize,
     /// Quantization method used for this segment.
     #[serde(default)]
@@ -267,6 +273,7 @@ impl Default for Manifest {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

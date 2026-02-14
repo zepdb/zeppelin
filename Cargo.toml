@@ -6,6 +6,9 @@ description = "S3-native vector search engine"
 license = "Apache-2.0"
 rust-version = "1.85"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [features]
 default = []
 profiling = ["dep:pprof"]
@@ -100,6 +103,7 @@ tokio-test = "0.4"
 assert_approx_eq = "1"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+loom = "0.7"
 
 [[bench]]
 name = "core_benchmarks"

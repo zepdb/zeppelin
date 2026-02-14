@@ -1,0 +1,9 @@
+{
+  "threshold": 5,
+  "reporters": ["console"],
+  "pattern": "src/**/*.rs",
+  "ignore": ["target/**", "tests/**", "fuzz/**"],
+  "minLines": 20,
+  "minTokens": 50,
+  "format": ["rust"]
+}

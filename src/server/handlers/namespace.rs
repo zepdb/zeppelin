@@ -12,12 +12,17 @@ use crate::types::DistanceMetric;
 
 use super::ApiError;
 
+/// Request body for creating a new namespace.
 #[derive(Debug, Deserialize)]
 pub struct CreateNamespaceRequest {
+    /// Unique namespace name.
     pub name: String,
+    /// Dimensionality of vectors stored in this namespace.
     pub dimensions: usize,
+    /// Distance metric for similarity search (defaults to Cosine).
     #[serde(default = "default_distance_metric")]
     pub distance_metric: DistanceMetric,
+    /// Full-text search field configurations (empty map disables FTS).
     #[serde(default)]
     pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
 }
@@ -26,18 +31,27 @@ fn default_distance_metric() -> DistanceMetric {
     DistanceMetric::Cosine
 }
 
+/// Response body containing namespace metadata.
 #[derive(Debug, Serialize)]
 pub struct NamespaceResponse {
+    /// Namespace name.
     pub name: String,
+    /// Vector dimensionality.
     pub dimensions: usize,
+    /// Distance metric used for similarity search.
     pub distance_metric: DistanceMetric,
+    /// Total number of vectors in this namespace.
     pub vector_count: u64,
+    /// RFC 3339 timestamp of namespace creation.
     pub created_at: String,
+    /// RFC 3339 timestamp of the last update.
     pub updated_at: String,
+    /// Full-text search field configurations (omitted when empty).
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
 }
 
+/// Converts internal `NamespaceMetadata` into the API response representation.
 impl From<NamespaceMetadata> for NamespaceResponse {
     fn from(meta: NamespaceMetadata) -> Self {
         Self {
@@ -52,6 +66,7 @@ impl From<NamespaceMetadata> for NamespaceResponse {
     }
 }
 
+/// Creates a new namespace with the given dimensions and distance metric.
 #[instrument(skip(state), fields(namespace = %req.name, dimensions = req.dimensions))]
 pub async fn create_namespace(
     State(state): State<AppState>,
@@ -80,6 +95,7 @@ pub async fn create_namespace(
     Ok((StatusCode::CREATED, Json(NamespaceResponse::from(meta))))
 }
 
+/// Lists all namespaces.
 #[instrument(skip(state))]
 pub async fn list_namespaces(
     State(state): State<AppState>,
@@ -95,6 +111,7 @@ pub async fn list_namespaces(
     Ok(Json(responses))
 }
 
+/// Returns metadata for a single namespace.
 #[instrument(skip(state), fields(namespace = %ns))]
 pub async fn get_namespace(
     State(state): State<AppState>,
@@ -109,6 +126,7 @@ pub async fn get_namespace(
     Ok(Json(NamespaceResponse::from(meta)))
 }
 
+/// Deletes a namespace and cleans up associated in-memory state.
 #[instrument(skip(state), fields(namespace = %ns))]
 pub async fn delete_namespace(
     State(state): State<AppState>,

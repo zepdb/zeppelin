@@ -57,6 +57,7 @@ pub fn serialize_f16_cluster(ids: &[String], vectors: &[Vec<f32>], dim: usize) -
 /// Deserialized f16 cluster data with vectors promoted to f32.
 #[derive(Debug)]
 pub struct F16ClusterData {
+    /// Vector IDs in cluster order.
     pub ids: Vec<String>,
     /// Vectors have been promoted to f32 for distance computation.
     pub vectors: Vec<Vec<f32>>,
@@ -145,6 +146,7 @@ pub fn compression_ratio(dim: usize, num_vectors: usize) -> f64 {
     f16_bytes as f64 / f32_bytes as f64
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

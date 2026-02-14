@@ -182,6 +182,7 @@ pub async fn build_app(
     Ok((app, shutdown_tx))
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

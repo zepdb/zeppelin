@@ -1,0 +1,21 @@
+# SIMD intrinsics — mutating causes UB or compile errors
+[[exclude]]
+file = "src/index/distance.rs"
+
+# Prometheus metric registration — unwraps are intentional startup panics
+[[exclude]]
+file = "src/metrics.rs"
+
+# Binary entrypoint — not unit testable
+[[exclude]]
+file = "src/main.rs"
+
+# Thread spawn boilerplate
+[[exclude]]
+function = "start_compaction_thread"
+file = "src/compaction/background.rs"
+
+# Logging setup — side-effect only
+[[exclude]]
+function = "init_logging"
+file = "src/startup.rs"

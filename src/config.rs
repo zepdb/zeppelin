@@ -2,22 +2,31 @@ use crate::error::{Result, ZeppelinError};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Top-level application configuration loaded from a TOML file, env vars, or defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
+    /// HTTP server settings (host, port, limits).
     #[serde(default)]
     pub server: ServerConfig,
+    /// Object storage backend and credentials.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Local disk and in-memory cache settings.
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Vector indexing parameters (centroids, quantization, hierarchical).
     #[serde(default)]
     pub indexing: IndexingConfig,
+    /// Background compaction schedule and thresholds.
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Default consistency level for reads.
     #[serde(default)]
     pub consistency: ConsistencyConfig,
+    /// Structured logging level and format.
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Write-ahead log batching configuration.
     #[serde(default)]
     pub wal: WalConfig,
 }
@@ -43,28 +52,40 @@ impl Default for WalConfig {
     }
 }
 
+/// HTTP server configuration including bind address, timeouts, and request limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// Bind address for the HTTP server. Default: `"0.0.0.0"`.
     #[serde(default = "default_host")]
     pub host: String,
+    /// TCP port to listen on. Default: `8080`.
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Per-request timeout in seconds. Default: `30`.
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+    /// Maximum number of concurrent query handlers. Default: `64`.
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
+    /// Maximum vectors per upsert batch. Default: `50_000`.
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
+    /// Hard upper bound on `top_k` query parameter. Default: `10_000`.
     #[serde(default = "default_max_top_k")]
     pub max_top_k: usize,
+    /// Graceful shutdown timeout in seconds. Default: `30`.
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
+    /// Maximum allowed vector dimensionality. Default: `65_536`.
     #[serde(default = "default_max_dimensions")]
     pub max_dimensions: usize,
+    /// Maximum byte length for vector IDs. Default: `1024`.
     #[serde(default = "default_max_vector_id_length")]
     pub max_vector_id_length: usize,
+    /// Maximum request body size in megabytes. Default: `512`.
     #[serde(default = "default_max_request_body_mb")]
     pub max_request_body_mb: usize,
+    /// Default `top_k` when the client omits it. Default: `10`.
     #[serde(default = "default_top_k")]
     pub default_top_k: usize,
 }
@@ -73,13 +94,18 @@ fn default_top_k() -> usize {
     10
 }
 
+/// Supported object storage backends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
+    /// Amazon S3, MinIO, or any S3-compatible endpoint (default).
     #[default]
     S3,
+    /// Google Cloud Storage.
     Gcs,
+    /// Azure Blob Storage.
     Azure,
+    /// Local filesystem (development/testing only).
     Local,
 }
 
@@ -94,49 +120,66 @@ impl std::fmt::Display for StorageBackend {
     }
 }
 
+/// Object storage backend selection and credential configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
+    /// Which storage backend to use. Default: `S3`.
     #[serde(default)]
     pub backend: StorageBackend,
+    /// Bucket (or container) name. Default: `"zeppelin"`.
     #[serde(default = "default_bucket")]
     pub bucket: String,
 
     // S3 / MinIO / R2
+    /// AWS region for S3 (e.g. `"us-east-1"`).
     #[serde(default)]
     pub s3_region: Option<String>,
+    /// Custom S3-compatible endpoint URL (MinIO, R2, etc.).
     #[serde(default)]
     pub s3_endpoint: Option<String>,
+    /// AWS access key ID for static credentials.
     #[serde(default)]
     pub s3_access_key_id: Option<String>,
+    /// AWS secret access key for static credentials.
     #[serde(default)]
     pub s3_secret_access_key: Option<String>,
+    /// Allow plain HTTP (non-TLS) connections to S3. Default: `false`.
     #[serde(default)]
     pub s3_allow_http: bool,
 
     // GCS
+    /// Path to a GCS service account JSON key file.
     #[serde(default)]
     pub gcs_service_account_path: Option<String>,
 
     // Azure
+    /// Azure storage account name.
     #[serde(default)]
     pub azure_account: Option<String>,
+    /// Azure storage account access key.
     #[serde(default)]
     pub azure_access_key: Option<String>,
 }
 
+/// Cache eviction strategy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvictionPolicy {
+    /// Least-recently-used eviction (default).
     #[default]
     Lru,
 }
 
+/// Local disk and in-memory cache settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
+    /// Directory for on-disk cache files. Default: `/var/cache/zeppelin`.
     #[serde(default = "default_cache_dir")]
     pub dir: PathBuf,
+    /// Maximum disk cache size in gigabytes. Default: `50`.
     #[serde(default = "default_max_size_gb")]
     pub max_size_gb: u64,
+    /// Eviction policy for the disk cache. Default: LRU.
     #[serde(default)]
     pub eviction: EvictionPolicy,
     /// Maximum memory cache size in MB. Set to 0 to disable.
@@ -145,18 +188,25 @@ pub struct CacheConfig {
     pub memory_cache_max_mb: usize,
 }
 
+/// Vector indexing parameters controlling IVF-Flat, quantization, and hierarchical trees.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexingConfig {
+    /// Default number of IVF centroids per segment. Default: `256`.
     #[serde(default = "default_num_centroids")]
     pub default_num_centroids: usize,
+    /// Default number of clusters to probe at query time. Default: `16`.
     #[serde(default = "default_nprobe")]
     pub default_nprobe: usize,
+    /// Hard upper bound on nprobe to prevent expensive full scans. Default: `128`.
     #[serde(default = "default_max_nprobe")]
     pub max_nprobe: usize,
+    /// Maximum k-means iterations during centroid training. Default: `25`.
     #[serde(default = "default_kmeans_max_iterations")]
     pub kmeans_max_iterations: usize,
+    /// k-means convergence threshold (stop when delta < epsilon). Default: `1e-4`.
     #[serde(default = "default_kmeans_convergence_epsilon")]
     pub kmeans_convergence_epsilon: f64,
+    /// Oversampling factor for k-means initialization. Default: `3`.
     #[serde(default = "default_oversample_factor")]
     pub oversample_factor: usize,
     /// Quantization type for vector compression.
@@ -200,12 +250,16 @@ pub struct IndexingConfig {
     pub bm25_max_full_scan_clusters: usize,
 }
 
+/// Background WAL-to-segment compaction schedule and thresholds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionConfig {
+    /// Polling interval between compaction checks, in seconds. Default: `30`.
     #[serde(default = "default_compaction_interval")]
     pub interval_secs: u64,
+    /// Trigger compaction when pending WAL fragments exceed this count. Default: `1000`.
     #[serde(default = "default_max_wal_fragments")]
     pub max_wal_fragments_before_compact: usize,
+    /// Ratio of new-to-existing vectors that triggers centroid retraining. Default: `5.0`.
     #[serde(default = "default_retrain_threshold")]
     pub retrain_imbalance_threshold: f64,
     /// Maximum pending deletes to retain in the manifest before pruning.
@@ -218,16 +272,21 @@ pub struct CompactionConfig {
     pub max_old_segments: usize,
 }
 
+/// Read consistency defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConsistencyConfig {
+    /// Default consistency level applied when the client does not specify one.
     #[serde(default)]
     pub default: crate::types::ConsistencyLevel,
 }
 
+/// Structured logging configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
+    /// Log verbosity filter (e.g. `"info"`, `"debug"`). Default: `"info"`.
     #[serde(default = "default_log_level")]
     pub level: String,
+    /// Output format: `"json"` or `"pretty"`. Default: `"json"`.
     #[serde(default = "default_log_format")]
     pub format: String,
 }
@@ -438,8 +497,11 @@ impl Default for LoggingConfig {
 /// - **Rayon threads**: match physical cores (work-stealing at core count)
 #[derive(Debug, Clone)]
 pub struct CpuBudget {
+    /// Number of tokio workers dedicated to query handling (2x CPUs).
     pub query_workers: usize,
+    /// Number of tokio workers dedicated to background compaction (CPUs/4, min 1).
     pub compaction_workers: usize,
+    /// Rayon thread pool size for CPU-bound work (matches physical core count).
     pub rayon_threads: usize,
 }
 

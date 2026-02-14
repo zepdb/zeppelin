@@ -291,7 +291,9 @@ pub fn serialize_sq_cluster(ids: &[String], codes: &[Vec<u8>], dim: usize) -> Re
 /// Deserialized SQ8 cluster data.
 #[derive(Debug)]
 pub struct SqClusterData {
+    /// Vector IDs in cluster order.
     pub ids: Vec<String>,
+    /// SQ8 encoded codes for each vector.
     pub codes: Vec<Vec<u8>>,
 }
 
@@ -364,6 +366,7 @@ pub fn sq_cluster_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> 
     format!("{namespace}/segments/{segment_id}/sq_cluster_{cluster_idx}.bin")
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

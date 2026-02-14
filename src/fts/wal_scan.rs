@@ -23,7 +23,9 @@ type DocFieldData = HashMap<String, HashMap<String, (u32, HashMap<String, u32>)>
 
 /// Result of a WAL BM25 scan.
 pub struct WalBm25ScanResult {
+    /// Scored search results, sorted descending by BM25 score.
     pub results: Vec<SearchResult>,
+    /// Number of WAL fragments scanned.
     pub fragment_count: usize,
     /// IDs that were explicitly deleted in the WAL.
     /// Used by the merge step to exclude these from segment results.
@@ -311,6 +313,7 @@ pub fn wal_bm25_scan(
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

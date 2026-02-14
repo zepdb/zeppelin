@@ -10,9 +10,13 @@ use crate::storage::ZeppelinStore;
 /// A lease granting exclusive write access to a namespace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lease {
+    /// ID of the process that holds this lease.
     pub holder_id: String,
+    /// Monotonically increasing fencing token to prevent zombie writes.
     pub fencing_token: u64,
+    /// When the lease was acquired.
     pub acquired_at: DateTime<Utc>,
+    /// When the lease expires (wall clock).
     pub expires_at: DateTime<Utc>,
     /// ETag of the lease.json object — used for CAS on lease operations.
     #[serde(skip)]
@@ -37,6 +41,7 @@ fn lease_key(namespace: &str) -> String {
 }
 
 impl LeaseManager {
+    /// Create a new lease manager for the given store and holder.
     pub fn new(store: ZeppelinStore, holder_id: String, lease_duration: Duration) -> Self {
         Self {
             store,
@@ -198,6 +203,7 @@ impl LeaseManager {
     /// Build a new Lease with the given token and current timestamps.
     fn build_lease(&self, fencing_token: u64) -> Lease {
         let now = Utc::now();
+        #[allow(clippy::expect_used)]
         let expires_at = now
             + chrono::Duration::from_std(self.lease_duration)
                 .expect("lease_duration out of range for chrono");

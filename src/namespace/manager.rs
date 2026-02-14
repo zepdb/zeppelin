@@ -12,12 +12,19 @@ use crate::types::{DistanceMetric, IndexType};
 /// Metadata for a namespace, stored as meta.json on S3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceMetadata {
+    /// Unique namespace identifier.
     pub name: String,
+    /// Vector dimensionality.
     pub dimensions: usize,
+    /// Distance metric used for queries.
     pub distance_metric: DistanceMetric,
+    /// Index algorithm type.
     pub index_type: IndexType,
+    /// Total number of vectors (approximate).
     pub vector_count: u64,
+    /// Timestamp when the namespace was created.
     pub created_at: DateTime<Utc>,
+    /// Timestamp of the last metadata update.
     pub updated_at: DateTime<Utc>,
     /// Per-field full-text search configuration.
     /// Empty map means FTS is not enabled for this namespace.
@@ -26,15 +33,18 @@ pub struct NamespaceMetadata {
 }
 
 impl NamespaceMetadata {
+    /// Return the S3 key for this namespace's metadata file.
     pub fn s3_key(namespace: &str) -> String {
         format!("{namespace}/meta.json")
     }
 
+    /// Serialize metadata to pretty-printed JSON bytes.
     pub fn to_bytes(&self) -> Result<Bytes> {
         let json = serde_json::to_vec_pretty(self)?;
         Ok(Bytes::from(json))
     }
 
+    /// Deserialize metadata from JSON bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         Ok(serde_json::from_slice(data)?)
     }
@@ -48,6 +58,7 @@ pub struct NamespaceManager {
 }
 
 impl NamespaceManager {
+    /// Create a new namespace manager backed by the given store.
     pub fn new(store: ZeppelinStore) -> Self {
         Self {
             store,

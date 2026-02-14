@@ -8,8 +8,11 @@ pub type VectorId = String;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DistanceMetric {
+    /// Cosine similarity (1 - cosine distance).
     Cosine,
+    /// Euclidean (L2) distance.
     Euclidean,
+    /// Dot product similarity.
     DotProduct,
 }
 
@@ -27,20 +30,30 @@ impl std::fmt::Display for DistanceMetric {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AttributeValue {
+    /// A UTF-8 string value.
     String(String),
+    /// A 64-bit signed integer value.
     Integer(i64),
+    /// A 64-bit floating-point value.
     Float(f64),
+    /// A boolean value.
     Bool(bool),
+    /// A list of UTF-8 string values.
     StringList(Vec<String>),
+    /// A list of 64-bit signed integer values.
     IntegerList(Vec<i64>),
+    /// A list of 64-bit floating-point values.
     FloatList(Vec<f64>),
 }
 
 /// A vector entry with its ID, values, and optional attributes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorEntry {
+    /// Unique identifier for this vector.
     pub id: VectorId,
+    /// The raw floating-point vector values.
     pub values: Vec<f32>,
+    /// Optional key-value attributes for metadata filtering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributes: Option<HashMap<String, AttributeValue>>,
 }
@@ -48,8 +61,11 @@ pub struct VectorEntry {
 /// A search result containing the vector ID, distance/score, and optional attributes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
+    /// Identifier of the matched vector.
     pub id: VectorId,
+    /// Similarity or distance score for this result.
     pub score: f32,
+    /// Optional attributes returned with the result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributes: Option<HashMap<String, AttributeValue>>,
 }
@@ -58,56 +74,87 @@ pub struct SearchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Filter {
+    /// Matches when the field equals the given value.
     Eq {
+        /// Attribute field name to compare.
         field: String,
+        /// Value to test for equality.
         value: AttributeValue,
     },
+    /// Matches when the field does not equal the given value.
     #[serde(rename = "not_eq")]
     NotEq {
+        /// Attribute field name to compare.
         field: String,
+        /// Value to test for inequality.
         value: AttributeValue,
     },
+    /// Matches when a numeric field falls within the specified bounds.
     Range {
+        /// Attribute field name to compare.
         field: String,
+        /// Optional inclusive lower bound.
         #[serde(skip_serializing_if = "Option::is_none")]
         gte: Option<f64>,
+        /// Optional inclusive upper bound.
         #[serde(skip_serializing_if = "Option::is_none")]
         lte: Option<f64>,
+        /// Optional exclusive lower bound.
         #[serde(skip_serializing_if = "Option::is_none")]
         gt: Option<f64>,
+        /// Optional exclusive upper bound.
         #[serde(skip_serializing_if = "Option::is_none")]
         lt: Option<f64>,
     },
+    /// Matches when the field value is one of the given values.
     In {
+        /// Attribute field name to compare.
         field: String,
+        /// Set of values to match against.
         values: Vec<AttributeValue>,
     },
+    /// Matches when the field value is not in the given set.
     #[serde(rename = "not_in")]
     NotIn {
+        /// Attribute field name to compare.
         field: String,
+        /// Set of values to exclude.
         values: Vec<AttributeValue>,
     },
+    /// Logical AND: all sub-filters must match.
     And {
+        /// Sub-filters that must all be satisfied.
         filters: Vec<Filter>,
     },
+    /// Logical OR: at least one sub-filter must match.
     Or {
+        /// Sub-filters where at least one must be satisfied.
         filters: Vec<Filter>,
     },
+    /// Logical NOT: the inner filter must not match.
     Not {
+        /// The filter to negate.
         filter: Box<Filter>,
     },
+    /// Matches when a list field contains the given value.
     Contains {
+        /// Attribute field name to search within.
         field: String,
+        /// Value that must be present in the list.
         value: AttributeValue,
     },
     /// All specified tokens must be present in the field (order-independent).
     ContainsAllTokens {
+        /// Attribute field name to search within.
         field: String,
+        /// Tokens that must all appear in the field.
         tokens: Vec<String>,
     },
     /// Tokens must appear as an exact phrase (adjacent, in order).
     ContainsTokenSequence {
+        /// Attribute field name to search within.
         field: String,
+        /// Ordered sequence of tokens forming the phrase.
         tokens: Vec<String>,
     },
 }
@@ -127,6 +174,7 @@ pub enum ConsistencyLevel {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexType {
+    /// Inverted File with flat (uncompressed) vectors.
     #[default]
     IvfFlat,
     /// IVF-Flat with Scalar Quantization (4x compression).
@@ -137,6 +185,7 @@ pub enum IndexType {
     Hierarchical,
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

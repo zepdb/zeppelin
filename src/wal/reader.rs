@@ -13,6 +13,7 @@ pub struct WalReader {
 }
 
 impl WalReader {
+    /// Create a new WAL reader backed by the given store.
     pub fn new(store: ZeppelinStore) -> Self {
         Self { store }
     }

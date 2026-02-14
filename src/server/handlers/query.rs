@@ -11,6 +11,7 @@ use crate::types::{ConsistencyLevel, Filter, SearchResult};
 
 use super::ApiError;
 
+/// Request body for querying vectors by ANN or BM25 ranking.
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
     /// Vector for ANN search. Required unless `rank_by` is provided.
@@ -22,20 +23,28 @@ pub struct QueryRequest {
     /// Whether the last token of each BM25 query should be treated as a prefix.
     #[serde(default)]
     pub last_as_prefix: bool,
+    /// Maximum number of results to return (defaults to server config).
     #[serde(default)]
     pub top_k: Option<usize>,
+    /// Optional attribute filter applied before ranking.
     #[serde(default)]
     pub filter: Option<Filter>,
+    /// Read consistency level (eventual or strong).
     #[serde(default)]
     pub consistency: ConsistencyLevel,
+    /// Number of IVF clusters to probe (defaults to server config).
     #[serde(default)]
     pub nprobe: Option<usize>,
 }
 
+/// Response body containing ranked search results and scan statistics.
 #[derive(Debug, Serialize)]
 pub struct QueryResponse {
+    /// Ranked search results ordered by relevance.
     pub results: Vec<SearchResult>,
+    /// Number of WAL fragments scanned during the query.
     pub scanned_fragments: usize,
+    /// Number of compacted segments scanned during the query.
     pub scanned_segments: usize,
 }
 
@@ -129,7 +138,11 @@ pub async fn query_namespace(
         .map_err(ApiError::from)?
     } else {
         // Vector query path
-        let vector = req.vector.as_ref().unwrap();
+        let vector = req.vector.as_ref().ok_or_else(|| {
+            ApiError(ZeppelinError::Validation(
+                "vector must be provided for ANN search".into(),
+            ))
+        })?;
         if vector.len() != meta.dimensions {
             return Err(ApiError(ZeppelinError::DimensionMismatch {
                 expected: meta.dimensions,
