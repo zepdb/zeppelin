@@ -201,6 +201,7 @@ fn try_f64_to_i64(f: f64) -> Option<i64> {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

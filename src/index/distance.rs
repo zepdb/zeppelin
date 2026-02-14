@@ -409,6 +409,7 @@ pub fn normalize(v: &mut [f32]) {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

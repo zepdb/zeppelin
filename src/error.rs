@@ -1,91 +1,160 @@
 use thiserror::Error;
 
+/// All errors that can occur within the Zeppelin vector search engine.
 #[derive(Error, Debug)]
 pub enum ZeppelinError {
     // Storage errors
+    /// An object was not found at the given S3 key.
     #[error("object not found: {key}")]
-    NotFound { key: String },
+    NotFound {
+        /// The S3 object key that was not found.
+        key: String,
+    },
 
+    /// An error from the underlying object_store layer.
     #[error("storage error: {0}")]
     Storage(#[from] object_store::Error),
 
+    /// An invalid or unparseable object_store path.
     #[error("storage path error: {0}")]
     StoragePath(#[from] object_store::path::Error),
 
     // Serialization errors
+    /// A JSON serialization or deserialization failure.
     #[error("json serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// A bincode serialization or deserialization failure.
     #[error("bincode serialization error: {0}")]
     Bincode(String),
 
+    /// A generic serialization error (e.g. MessagePack).
     #[error("serialization error: {0}")]
     Serialization(String),
 
     // WAL errors
+    /// Data integrity failure: stored checksum does not match computed checksum.
     #[error("checksum mismatch: expected {expected}, got {actual}")]
-    ChecksumMismatch { expected: u64, actual: u64 },
+    ChecksumMismatch {
+        /// The checksum value that was expected.
+        expected: u64,
+        /// The checksum value that was actually computed.
+        actual: u64,
+    },
 
+    /// No manifest exists yet for the given namespace.
     #[error("manifest not found for namespace: {namespace}")]
-    ManifestNotFound { namespace: String },
+    ManifestNotFound {
+        /// The namespace whose manifest is missing.
+        namespace: String,
+    },
 
+    /// A concurrent write caused a manifest CAS conflict.
     #[error("manifest conflict (concurrent write) for namespace: {namespace}")]
-    ManifestConflict { namespace: String },
+    ManifestConflict {
+        /// The namespace where the conflict occurred.
+        namespace: String,
+    },
 
     // Lease errors
+    /// Another writer currently holds the lease on this namespace.
     #[error("lease held on namespace {namespace} by {holder}")]
-    LeaseHeld { namespace: String, holder: String },
+    LeaseHeld {
+        /// The namespace with the held lease.
+        namespace: String,
+        /// The identifier of the current lease holder.
+        holder: String,
+    },
 
+    /// The caller's lease has expired and is no longer valid.
     #[error("lease expired for namespace {namespace}")]
-    LeaseExpired { namespace: String },
+    LeaseExpired {
+        /// The namespace whose lease expired.
+        namespace: String,
+    },
 
+    /// The caller's fencing token is behind the manifest's token (zombie writer).
     #[error("fencing token stale for namespace {namespace}: ours={our_token}, manifest={manifest_token}")]
     FencingTokenStale {
+        /// The namespace where the stale token was detected.
         namespace: String,
+        /// The caller's outdated fencing token.
         our_token: u64,
+        /// The current fencing token stored in the manifest.
         manifest_token: u64,
     },
 
     // Namespace errors
+    /// The requested namespace does not exist.
     #[error("namespace not found: {namespace}")]
-    NamespaceNotFound { namespace: String },
+    NamespaceNotFound {
+        /// The name of the missing namespace.
+        namespace: String,
+    },
 
+    /// A namespace with this name already exists.
     #[error("namespace already exists: {namespace}")]
-    NamespaceAlreadyExists { namespace: String },
+    NamespaceAlreadyExists {
+        /// The name of the already-existing namespace.
+        namespace: String,
+    },
 
     // Index errors
+    /// A vector indexing operation failed.
     #[error("index error: {0}")]
     Index(String),
 
+    /// K-means clustering did not converge within the iteration limit.
     #[error("k-means failed to converge after {iterations} iterations")]
-    KMeansConvergence { iterations: usize },
+    KMeansConvergence {
+        /// The number of iterations attempted before giving up.
+        iterations: usize,
+    },
 
     // Validation errors
+    /// Vector dimensions do not match the namespace's configured dimensionality.
     #[error("dimension mismatch: expected {expected}, got {actual}")]
-    DimensionMismatch { expected: usize, actual: usize },
+    DimensionMismatch {
+        /// The expected number of dimensions.
+        expected: usize,
+        /// The actual number of dimensions provided.
+        actual: usize,
+    },
 
+    /// A request failed input validation.
     #[error("validation error: {0}")]
     Validation(String),
 
     // Config errors
+    /// An invalid or missing configuration value.
     #[error("config error: {0}")]
     Config(String),
 
     // IO errors
+    /// A local filesystem I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
     // Cache errors
+    /// A local disk or memory cache operation failed.
     #[error("cache error: {0}")]
     Cache(String),
 
     // Full-text search errors
+    /// A full-text search indexing or query error.
     #[error("full-text search error: {0}")]
     FullTextSearch(String),
 
+    /// The requested FTS field is not configured on the namespace.
     #[error("FTS field not configured on namespace {namespace}: {field}")]
-    FtsFieldNotConfigured { namespace: String, field: String },
+    FtsFieldNotConfigured {
+        /// The namespace that lacks the FTS field.
+        namespace: String,
+        /// The FTS field name that is not configured.
+        field: String,
+    },
 
+    /// The query concurrency semaphore is exhausted; the caller should retry.
     #[error("query concurrency limit reached, try again later")]
     QueryConcurrencyExhausted,
 }
@@ -96,9 +165,11 @@ impl From<Box<bincode::ErrorKind>> for ZeppelinError {
     }
 }
 
+/// A convenience type alias for `std::result::Result<T, ZeppelinError>`.
 pub type Result<T> = std::result::Result<T, ZeppelinError>;
 
 impl ZeppelinError {
+    /// Returns the HTTP status code appropriate for this error variant.
     pub fn status_code(&self) -> u16 {
         match self {
             ZeppelinError::NotFound { .. }
@@ -122,6 +193,7 @@ impl ZeppelinError {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

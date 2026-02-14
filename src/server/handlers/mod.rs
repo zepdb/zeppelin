@@ -1,9 +1,15 @@
+/// Health and readiness probe handlers.
 pub mod health;
+/// Prometheus metrics exposition handler.
 pub mod metrics;
+/// Namespace CRUD handlers.
 pub mod namespace;
 #[cfg(feature = "profiling")]
+/// CPU profiling handler (feature-gated).
 pub mod profiling;
+/// Vector similarity and BM25 query handler.
 pub mod query;
+/// Vector upsert and delete handlers.
 pub mod vectors;
 
 use axum::http::StatusCode;
@@ -15,12 +21,14 @@ use crate::error::ZeppelinError;
 /// Wrapper that converts `ZeppelinError` into an HTTP response.
 pub struct ApiError(pub ZeppelinError);
 
+/// Converts a `ZeppelinError` into an `ApiError`.
 impl From<ZeppelinError> for ApiError {
     fn from(e: ZeppelinError) -> Self {
         ApiError(e)
     }
 }
 
+/// Maps `ApiError` to an HTTP response with a JSON body and appropriate status code.
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.0.status_code();

@@ -102,7 +102,12 @@ impl PqCodebook {
             // Pad to PQ_K if we have fewer than 256 training points.
             let mut padded = sub_centroids;
             while padded.len() < PQ_K {
-                padded.push(padded.last().unwrap().clone());
+                padded.push(
+                    padded
+                        .last()
+                        .ok_or_else(|| ZeppelinError::Index("empty PQ sub-centroids".into()))?
+                        .clone(),
+                );
             }
 
             centroids.extend(padded);
@@ -314,7 +319,9 @@ pub fn serialize_pq_cluster(ids: &[String], codes: &[Vec<u8>], m: usize) -> Resu
 /// Deserialized PQ cluster data.
 #[derive(Debug)]
 pub struct PqClusterData {
+    /// Vector IDs in cluster order.
     pub ids: Vec<String>,
+    /// PQ encoded codes for each vector (M bytes per vector).
     pub codes: Vec<Vec<u8>>,
 }
 
@@ -410,6 +417,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

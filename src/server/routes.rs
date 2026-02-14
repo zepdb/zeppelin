@@ -14,6 +14,7 @@ use super::handlers::{health, metrics, namespace, query, vectors};
 use super::middleware;
 use super::AppState;
 
+/// Builds the axum router with all routes, middleware, and shared state.
 pub fn build_router(state: AppState) -> Router {
     let timeout = Duration::from_secs(state.config.server.request_timeout_secs);
     let body_limit = state.config.server.max_request_body_mb * 1024 * 1024;

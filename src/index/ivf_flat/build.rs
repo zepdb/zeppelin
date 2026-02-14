@@ -565,6 +565,7 @@ pub async fn load_ivf_flat(
     })
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

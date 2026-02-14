@@ -1,0 +1,58 @@
+[package]
+name = "zeppelin-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.zeppelin]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_manifest"
+path = "fuzz_targets/fuzz_manifest.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_wal_fragment"
+path = "fuzz_targets/fuzz_wal_fragment.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_inverted_index"
+path = "fuzz_targets/fuzz_inverted_index.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_global_index"
+path = "fuzz_targets/fuzz_global_index.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_bitmap_index"
+path = "fuzz_targets/fuzz_bitmap_index.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_quantization"
+path = "fuzz_targets/fuzz_quantization.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_filter"
+path = "fuzz_targets/fuzz_filter.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_tree_node"
+path = "fuzz_targets/fuzz_tree_node.rs"
+doc = false

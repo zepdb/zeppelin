@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FtsLanguage {
+    /// English language tokenization and stemming.
     #[default]
     English,
 }
@@ -75,6 +76,7 @@ pub struct CorpusStats {
     pub avg_doc_length: f32,
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -195,6 +195,7 @@ pub fn oversampled_k(top_k: usize, oversample_factor: usize) -> usize {
     top_k.saturating_mul(oversample_factor).max(top_k)
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,3 +1,4 @@
+/// Background compaction task management.
 pub mod background;
 
 use std::collections::{HashMap, HashSet};
@@ -46,6 +47,7 @@ pub struct Compactor {
 }
 
 impl Compactor {
+    /// Create a new compactor with the given store and configuration.
     pub fn new(
         store: ZeppelinStore,
         wal_reader: WalReader,
@@ -60,6 +62,7 @@ impl Compactor {
         }
     }
 
+    /// Return a reference to the compaction configuration.
     pub fn config(&self) -> &CompactionConfig {
         &self.config
     }
@@ -159,7 +162,11 @@ impl Compactor {
 
         let fragment_refs = manifest.uncompacted_fragments().to_vec();
         let fragments_removed = fragment_refs.len();
-        let last_fragment_id = fragment_refs.iter().map(|f| f.id).max().unwrap();
+        let last_fragment_id = fragment_refs
+            .iter()
+            .map(|f| f.id)
+            .max()
+            .ok_or_else(|| ZeppelinError::Index("no fragments to compact".into()))?;
 
         info!(fragment_count = fragments_removed, "starting compaction");
 
@@ -305,7 +312,9 @@ impl Compactor {
                 match self
                     .incremental_build(
                         namespace,
-                        old_segment_id.as_deref().unwrap(),
+                        old_segment_id.as_deref().ok_or_else(|| {
+                            ZeppelinError::Index("no old segment for incremental build".into())
+                        })?,
                         &segment_id,
                         &vectors,
                     )

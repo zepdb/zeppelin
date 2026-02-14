@@ -2,6 +2,7 @@ use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use prometheus::{Encoder, TextEncoder};
 
+/// Serves Prometheus metrics in the text exposition format.
 pub async fn metrics_handler() -> impl IntoResponse {
     let encoder = TextEncoder::new();
     let families = prometheus::gather();

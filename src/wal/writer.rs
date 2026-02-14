@@ -21,6 +21,7 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
+    /// Create a new WAL writer backed by the given store.
     pub fn new(store: ZeppelinStore) -> Self {
         Self {
             store,
@@ -164,6 +165,7 @@ impl WalWriter {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

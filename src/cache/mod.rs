@@ -1,4 +1,6 @@
+/// Manifest-level TTL cache to avoid repeated S3 reads.
 pub mod manifest_cache;
+/// In-memory LRU cache tier (sits above disk).
 pub mod memory_cache;
 
 use std::collections::HashSet;

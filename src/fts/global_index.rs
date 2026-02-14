@@ -285,6 +285,7 @@ pub fn global_fts_key(namespace: &str, segment_id: &str) -> String {
     format!("{namespace}/segments/{segment_id}/global_fts.bin")
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

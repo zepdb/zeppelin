@@ -42,6 +42,7 @@ pub struct WalFtsCache {
 }
 
 impl WalFtsCache {
+    /// Create a new empty WAL FTS cache.
     pub fn new() -> Self {
         Self {
             cache: Arc::new(DashMap::new()),
@@ -133,6 +134,7 @@ impl Default for WalFtsCache {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

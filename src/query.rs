@@ -26,17 +26,29 @@ use crate::wal::WalReader;
 
 /// Parameters for a vector query, grouped to avoid excessive function arguments.
 pub struct QueryParams<'a> {
+    /// S3 storage backend.
     pub store: &'a ZeppelinStore,
+    /// WAL fragment reader.
     pub wal_reader: &'a WalReader,
+    /// Target namespace name.
     pub namespace: &'a str,
+    /// Query vector.
     pub query: &'a [f32],
+    /// Maximum number of results to return.
     pub top_k: usize,
+    /// Number of IVF clusters to probe.
     pub nprobe: usize,
+    /// Optional attribute filter.
     pub filter: Option<&'a Filter>,
+    /// Read consistency level (strong or eventual).
     pub consistency: ConsistencyLevel,
+    /// Distance metric for scoring.
     pub distance_metric: DistanceMetric,
+    /// Oversample multiplier for filtered queries.
     pub oversample_factor: usize,
+    /// Optional disk cache for cluster data.
     pub cache: Option<&'a Arc<DiskCache>>,
+    /// Optional manifest cache to avoid redundant S3 reads.
     pub manifest_cache: Option<&'a Arc<ManifestCache>>,
 }
 
@@ -888,6 +900,7 @@ fn merge_results(
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::single_match)]
 #[cfg(test)]
 mod tests {
     use super::*;

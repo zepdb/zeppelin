@@ -458,6 +458,7 @@ fn compute_doc_lengths(field_index: &FieldIndex) -> HashMap<u32, u32> {
     lengths
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

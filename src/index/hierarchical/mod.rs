@@ -8,7 +8,9 @@
 //! - Data clusters use the same format as IVF-Flat (reuses serialization).
 //! - Beam search maintains `beam_width` candidates per level for recall.
 
+/// Hierarchical index construction (k-means tree building).
 pub mod build;
+/// Beam search over the hierarchical centroid tree.
 pub mod search;
 
 use async_trait::async_trait;
@@ -135,8 +137,16 @@ pub fn deserialize_tree_node(data: &[u8]) -> Result<TreeNode> {
         ));
     }
 
-    let n = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    let dim = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    let n = u32::from_le_bytes(
+        data[0..4]
+            .try_into()
+            .map_err(|_| ZeppelinError::Serialization("tree node header parse error".into()))?,
+    ) as usize;
+    let dim = u32::from_le_bytes(
+        data[4..8]
+            .try_into()
+            .map_err(|_| ZeppelinError::Serialization("tree node header parse error".into()))?,
+    ) as usize;
     let is_leaf = data[8] != 0;
 
     let mut offset = 9;
@@ -152,7 +162,9 @@ pub fn deserialize_tree_node(data: &[u8]) -> Result<TreeNode> {
         }
         let mut c = Vec::with_capacity(dim);
         for _ in 0..dim {
-            let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            let val = f32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                ZeppelinError::Serialization("tree node centroid parse error".into())
+            })?);
             c.push(val);
             offset += 4;
         }
@@ -167,7 +179,10 @@ pub fn deserialize_tree_node(data: &[u8]) -> Result<TreeNode> {
                 "tree node blob truncated at child id".into(),
             ));
         }
-        let id_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let id_len =
+            u32::from_le_bytes(data[offset..offset + 4].try_into().map_err(|_| {
+                ZeppelinError::Serialization("tree node child id parse error".into())
+            })?) as usize;
         offset += 4;
         if offset + id_len > data.len() {
             return Err(ZeppelinError::Index(
@@ -187,14 +202,17 @@ pub fn deserialize_tree_node(data: &[u8]) -> Result<TreeNode> {
 }
 
 impl HierarchicalIndex {
+    /// Return the total number of leaf clusters.
     pub fn num_leaf_clusters(&self) -> usize {
         self.meta.num_leaf_clusters
     }
 
+    /// Return the namespace this index belongs to.
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
 
+    /// Return the segment ID this index belongs to.
     pub fn segment_id(&self) -> &str {
         &self.segment_id
     }
@@ -250,6 +268,7 @@ impl VectorIndex for HierarchicalIndex {
     }
 }
 
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;

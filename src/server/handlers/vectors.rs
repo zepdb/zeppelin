@@ -10,21 +10,28 @@ use crate::types::{VectorEntry, VectorId};
 
 use super::ApiError;
 
+/// Request body for upserting vectors into a namespace.
 #[derive(Debug, Deserialize)]
 pub struct UpsertVectorsRequest {
+    /// Vectors to upsert (insert or update by ID).
     pub vectors: Vec<VectorEntry>,
 }
 
+/// Response body confirming the number of vectors upserted.
 #[derive(Debug, Serialize)]
 pub struct UpsertVectorsResponse {
+    /// Number of vectors successfully upserted.
     pub upserted: usize,
 }
 
+/// Request body for deleting vectors by ID.
 #[derive(Debug, Deserialize)]
 pub struct DeleteVectorsRequest {
+    /// IDs of vectors to delete.
     pub ids: Vec<VectorId>,
 }
 
+/// Upserts a batch of vectors into the specified namespace via the WAL.
 #[instrument(skip(state, req), fields(namespace = %ns, vector_count = req.vectors.len()))]
 pub async fn upsert_vectors(
     State(state): State<AppState>,
@@ -112,6 +119,7 @@ pub async fn upsert_vectors(
     ))
 }
 
+/// Deletes vectors by ID from the specified namespace via the WAL.
 #[instrument(skip(state, req), fields(namespace = %ns, delete_count = req.ids.len()))]
 pub async fn delete_vectors(
     State(state): State<AppState>,
