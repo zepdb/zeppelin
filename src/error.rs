@@ -157,6 +157,13 @@ pub enum ZeppelinError {
     /// The query concurrency semaphore is exhausted; the caller should retry.
     #[error("query concurrency limit reached, try again later")]
     QueryConcurrencyExhausted,
+
+    /// Per-IP rate limit exceeded.
+    #[error("rate limit exceeded, retry after {retry_after_secs}s")]
+    RateLimitExceeded {
+        /// Seconds until the next token becomes available.
+        retry_after_secs: u64,
+    },
 }
 
 impl From<Box<bincode::ErrorKind>> for ZeppelinError {
@@ -187,6 +194,8 @@ impl ZeppelinError {
             | ZeppelinError::FtsFieldNotConfigured { .. } => 400,
 
             ZeppelinError::QueryConcurrencyExhausted => 503,
+
+            ZeppelinError::RateLimitExceeded { .. } => 429,
 
             _ => 500,
         }
@@ -243,6 +252,15 @@ mod tests {
     fn test_validation_status_code() {
         let err = ZeppelinError::Validation("bad input".into());
         assert_eq!(err.status_code(), 400);
+    }
+
+    #[test]
+    fn test_rate_limit_exceeded_status_code() {
+        let err = ZeppelinError::RateLimitExceeded {
+            retry_after_secs: 1,
+        };
+        assert_eq!(err.status_code(), 429);
+        assert!(err.to_string().contains("rate limit exceeded"));
     }
 
     #[test]

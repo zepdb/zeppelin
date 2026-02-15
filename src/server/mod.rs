@@ -5,8 +5,11 @@ pub mod middleware;
 /// Axum router construction and route definitions.
 pub mod routes;
 
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
+use dashmap::DashMap;
 use tokio::sync::Semaphore;
 
 use crate::cache::manifest_cache::ManifestCache;
@@ -44,4 +47,7 @@ pub struct AppState {
     pub query_semaphore: Arc<Semaphore>,
     /// Optional batched WAL writer (enabled when batch_manifest_size > 1).
     pub batch_wal_writer: Option<Arc<BatchWalWriter>>,
+    /// Per-IP token bucket state for rate limiting.
+    /// Maps IP → (available tokens, last refill time).
+    pub rate_limiters: Arc<DashMap<IpAddr, (u64, Instant)>>,
 }

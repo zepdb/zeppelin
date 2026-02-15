@@ -42,6 +42,14 @@ impl IntoResponse for ApiError {
             "error": self.0.to_string(),
             "status": status,
         });
+        // Include Retry-After header for rate-limited responses.
+        if let ZeppelinError::RateLimitExceeded { retry_after_secs } = &self.0 {
+            let mut response = (status_code, axum::Json(body)).into_response();
+            if let Ok(val) = retry_after_secs.to_string().parse() {
+                response.headers_mut().insert("retry-after", val);
+            }
+            return response;
+        }
         (status_code, axum::Json(body)).into_response()
     }
 }

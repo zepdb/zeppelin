@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use dashmap::DashMap;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
@@ -162,6 +163,7 @@ pub async fn build_app(
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.server.max_concurrent_queries,
     ));
+    let rate_limiters = Arc::new(DashMap::new());
     let state = AppState {
         store,
         namespace_manager,
@@ -174,6 +176,7 @@ pub async fn build_app(
         fts_cache,
         query_semaphore,
         batch_wal_writer,
+        rate_limiters,
     };
 
     // Build router

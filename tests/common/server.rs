@@ -1,6 +1,8 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use tokio::net::TcpListener;
 
 use super::harness::TestHarness;
@@ -55,6 +57,7 @@ pub async fn start_test_server_with_config(
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         batch_wal_writer: None,
+        rate_limiters: Arc::new(DashMap::new()),
     };
 
     let app = build_router(state);
@@ -63,7 +66,12 @@ pub async fn start_test_server_with_config(
     let base_url = format!("http://{addr}");
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     (base_url, harness, cache, cache_dir)
@@ -112,6 +120,7 @@ pub async fn start_test_server_with_compactor(
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         batch_wal_writer: None,
+        rate_limiters: Arc::new(DashMap::new()),
     };
 
     let app = build_router(state);
@@ -120,7 +129,12 @@ pub async fn start_test_server_with_compactor(
     let base_url = format!("http://{addr}");
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     (base_url, harness, cache, cache_dir, compactor)
@@ -184,6 +198,7 @@ pub async fn start_test_server_with_compaction(
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         batch_wal_writer: None,
+        rate_limiters: Arc::new(DashMap::new()),
     };
 
     let app = build_router(state);
@@ -192,7 +207,12 @@ pub async fn start_test_server_with_compaction(
     let base_url = format!("http://{addr}");
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     (base_url, harness, cache, cache_dir, shutdown_tx)
