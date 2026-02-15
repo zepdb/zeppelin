@@ -52,10 +52,7 @@ pub fn build_router(state: AppState) -> Router {
     }
 
     other_routes = other_routes
-        .route(
-            "/v1/namespaces",
-            post(namespace::create_namespace).get(namespace::list_namespaces),
-        )
+        .route("/v1/namespaces", post(namespace::create_namespace))
         .route(
             "/v1/namespaces/:ns",
             get(namespace::get_namespace).delete(namespace::delete_namespace),

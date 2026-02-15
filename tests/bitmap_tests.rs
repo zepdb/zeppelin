@@ -1,6 +1,6 @@
 mod common;
 
-use common::server::{api_ns, cleanup_ns, start_test_server_with_compactor};
+use common::server::{cleanup_ns, create_ns_api_with, start_test_server_with_compactor};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -101,19 +101,15 @@ async fn test_bitmap_ivf_flat_eq_filter() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "bm-ivf-eq");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     // Ingest 100 vectors with status=active/inactive
     let vectors = status_vectors("ivfeq", 100, 16);
@@ -201,18 +197,15 @@ async fn test_bitmap_hierarchical_eq_filter() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "bm-hann-eq");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     let vectors = status_vectors("hanneq", 100, 16);
     let query_vec = vectors[0].values.clone();
@@ -268,18 +261,15 @@ async fn test_bitmap_backward_compat() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "bm-compat");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     let vectors = status_vectors("compat", 50, 16);
     let query_vec = vectors[0].values.clone();
@@ -358,18 +348,15 @@ async fn test_bitmap_low_selectivity() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "bm-lowsel");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     // 100 vectors, filter matches priority==42 (exactly 1)
     let vectors = status_vectors("lowsel", 100, 16);
@@ -425,18 +412,15 @@ async fn test_bitmap_range_filter() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "bm-range");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     let vectors = status_vectors("range", 100, 16);
     let query_vec = vectors[0].values.clone();
@@ -500,18 +484,15 @@ async fn test_bitmap_compound_filter() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "bm-compound");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     let vectors = status_vectors("compound", 100, 16);
     let query_vec = vectors[0].values.clone();
@@ -585,18 +566,15 @@ async fn test_bitmap_list_contains() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "bm-contains");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     // Ingest vectors with StringList tags: [alpha, common], [beta, common], [gamma]
     let vectors = tagged_vectors("contains", 90, 16);

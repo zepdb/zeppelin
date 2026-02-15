@@ -1,6 +1,6 @@
 mod common;
 
-use common::server::{api_ns, cleanup_ns, start_test_server_with_compactor};
+use common::server::{cleanup_ns, create_ns_api_fts, start_test_server_with_compactor};
 
 use std::collections::HashMap;
 use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
@@ -38,6 +38,12 @@ fn fts_configs() -> HashMap<String, zeppelin::fts::types::FtsFieldConfig> {
     m
 }
 
+fn fts_json() -> serde_json::Value {
+    serde_json::json!({
+        "content": { "stemming": false, "remove_stopwords": false }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: Full lifecycle — create ns, upsert, query WAL, compact, query segment
 // ---------------------------------------------------------------------------
@@ -48,31 +54,16 @@ async fn test_fts_e2e_full_lifecycle() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-lifecycle");
-
-    // Create namespace with FTS
-    let resp = client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "content": { "stemming": false, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+    let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     // Upsert documents
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({
             "vectors": [
-                { "id": format!("{ns}_d1"), "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "rust programming language" } },
-                { "id": format!("{ns}_d2"), "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "python programming language" } },
-                { "id": format!("{ns}_d3"), "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "rust systems programming" } }
+                { "id": "d1", "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "rust programming language" } },
+                { "id": "d2", "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "python programming language" } },
+                { "id": "d3", "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "rust systems programming" } }
             ]
         }))
         .send()
@@ -143,27 +134,14 @@ async fn test_fts_e2e_strong_consistency_during_compaction() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-strong");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "content": { "stemming": false, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     // Batch 1: upsert + compact
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({
             "vectors": [
-                { "id": format!("{ns}_d1"), "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "alpha beta" } }
+                { "id": "d1", "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "alpha beta" } }
             ]
         }))
         .send()
@@ -180,7 +158,7 @@ async fn test_fts_e2e_strong_consistency_during_compaction() {
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({
             "vectors": [
-                { "id": format!("{ns}_d2"), "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "alpha gamma" } }
+                { "id": "d2", "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "alpha gamma" } }
             ]
         }))
         .send()
@@ -230,28 +208,15 @@ async fn test_fts_e2e_delete_and_requery() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-delete");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "content": { "stemming": false, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({
             "vectors": [
-                { "id": format!("{ns}_d1"), "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "quantum computing" } },
-                { "id": format!("{ns}_d2"), "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "quantum physics" } },
-                { "id": format!("{ns}_d3"), "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "classical mechanics" } }
+                { "id": "d1", "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "quantum computing" } },
+                { "id": "d2", "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "quantum physics" } },
+                { "id": "d3", "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "classical mechanics" } }
             ]
         }))
         .send()
@@ -267,7 +232,7 @@ async fn test_fts_e2e_delete_and_requery() {
     // Delete d1
     client
         .delete(format!("{base_url}/v1/namespaces/{ns}/vectors"))
-        .json(&serde_json::json!({ "ids": [format!("{ns}_d1")] }))
+        .json(&serde_json::json!({ "ids": ["d1"] }))
         .send()
         .await
         .unwrap();
@@ -286,7 +251,7 @@ async fn test_fts_e2e_delete_and_requery() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 1, "d1 deleted, only d2 should match quantum");
-    assert!(results[0]["id"].as_str().unwrap().ends_with("_d2"));
+    assert_eq!(results[0]["id"], "d2");
 
     cleanup_ns(&harness.store, &ns).await;
 }
@@ -301,7 +266,6 @@ async fn test_fts_e2e_multi_field_with_compaction() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-multi");
 
     let mut fts = HashMap::new();
     fts.insert(
@@ -321,26 +285,23 @@ async fn test_fts_e2e_multi_field_with_compaction() {
         },
     );
 
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "title": { "stemming": false, "remove_stopwords": false },
-                "body": { "stemming": false, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "title": { "stemming": false, "remove_stopwords": false },
+            "body": { "stemming": false, "remove_stopwords": false }
+        }),
+    )
+    .await;
 
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({
             "vectors": [
-                { "id": format!("{ns}_d1"), "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "title": "rust guide", "body": "learn rust programming" } },
-                { "id": format!("{ns}_d2"), "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "title": "python guide", "body": "learn rust basics" } }
+                { "id": "d1", "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "title": "rust guide", "body": "learn rust programming" } },
+                { "id": "d2", "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "title": "python guide", "body": "learn rust basics" } }
             ]
         }))
         .send()
@@ -367,7 +328,7 @@ async fn test_fts_e2e_multi_field_with_compaction() {
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 2, "both docs contain 'rust' somewhere");
     // d1 has rust in both title AND body, should rank higher
-    assert!(results[0]["id"].as_str().unwrap().ends_with("_d1"));
+    assert_eq!(results[0]["id"], "d1");
 
     cleanup_ns(&harness.store, &ns).await;
 }
@@ -382,28 +343,15 @@ async fn test_fts_e2e_prefix_search() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-prefix");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "content": { "stemming": false, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({
             "vectors": [
-                { "id": format!("{ns}_d1"), "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "programming language" } },
-                { "id": format!("{ns}_d2"), "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "programmer tools" } },
-                { "id": format!("{ns}_d3"), "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "database management" } }
+                { "id": "d1", "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "programming language" } },
+                { "id": "d2", "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "programmer tools" } },
+                { "id": "d3", "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "database management" } }
             ]
         }))
         .send()
@@ -439,28 +387,23 @@ async fn test_fts_e2e_stemming() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-stem");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "content": { "stemming": true, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "content": { "stemming": true, "remove_stopwords": false }
+        }),
+    )
+    .await;
 
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({
             "vectors": [
-                { "id": format!("{ns}_d1"), "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "running quickly" } },
-                { "id": format!("{ns}_d2"), "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "runs fast" } },
-                { "id": format!("{ns}_d3"), "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "swimming slowly" } }
+                { "id": "d1", "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "running quickly" } },
+                { "id": "d2", "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "runs fast" } },
+                { "id": "d3", "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "swimming slowly" } }
             ]
         }))
         .send()
@@ -499,28 +442,15 @@ async fn test_fts_e2e_incremental_compaction() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-incr");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "content": { "stemming": false, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     // Batch 1
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({
             "vectors": [
-                { "id": format!("{ns}_d1"), "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "alpha beta" } },
-                { "id": format!("{ns}_d2"), "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "gamma delta" } }
+                { "id": "d1", "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "alpha beta" } },
+                { "id": "d2", "values": [0.5, 0.6, 0.7, 0.8], "attributes": { "content": "gamma delta" } }
             ]
         }))
         .send()
@@ -537,7 +467,7 @@ async fn test_fts_e2e_incremental_compaction() {
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({
             "vectors": [
-                { "id": format!("{ns}_d3"), "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "alpha epsilon" } }
+                { "id": "d3", "values": [0.2, 0.3, 0.4, 0.5], "attributes": { "content": "alpha epsilon" } }
             ]
         }))
         .send()
@@ -578,26 +508,13 @@ async fn test_fts_e2e_eventual_vs_strong() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-cons");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "content": { "stemming": false, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&serde_json::json!({
             "vectors": [
-                { "id": format!("{ns}_d1"), "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "hello world" } }
+                { "id": "d1", "values": [0.1, 0.2, 0.3, 0.4], "attributes": { "content": "hello world" } }
             ]
         }))
         .send()

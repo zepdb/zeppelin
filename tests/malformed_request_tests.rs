@@ -1,29 +1,17 @@
 mod common;
 
+use common::server::create_ns_api_with;
 use serde_json::json;
-
-/// Helper to create a namespace for testing.
-async fn create_test_namespace(base_url: &str, ns: &str) -> reqwest::Response {
-    let client = reqwest::Client::new();
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&json!({
-            "name": ns,
-            "dimensions": 4,
-            "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap()
-}
 
 #[tokio::test]
 async fn test_empty_body_upsert() {
     let (base_url, harness) = common::server::start_test_server().await;
-    let ns = common::server::api_ns(&harness, "empty-upsert");
-    create_test_namespace(&base_url, &ns).await;
-
     let client = reqwest::Client::new();
+    let ns = create_ns_api_with(&client, &base_url, json!({
+        "dimensions": 4,
+        "distance_metric": "euclidean"
+    })).await;
+
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .header("content-type", "application/json")
@@ -41,10 +29,12 @@ async fn test_empty_body_upsert() {
 #[tokio::test]
 async fn test_empty_vectors_array() {
     let (base_url, harness) = common::server::start_test_server().await;
-    let ns = common::server::api_ns(&harness, "empty-vec");
-    create_test_namespace(&base_url, &ns).await;
-
     let client = reqwest::Client::new();
+    let ns = create_ns_api_with(&client, &base_url, json!({
+        "dimensions": 4,
+        "distance_metric": "euclidean"
+    })).await;
+
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&json!({ "vectors": [] }))
@@ -61,10 +51,12 @@ async fn test_empty_vectors_array() {
 #[tokio::test]
 async fn test_empty_delete_ids_array() {
     let (base_url, harness) = common::server::start_test_server().await;
-    let ns = common::server::api_ns(&harness, "empty-del");
-    create_test_namespace(&base_url, &ns).await;
-
     let client = reqwest::Client::new();
+    let ns = create_ns_api_with(&client, &base_url, json!({
+        "dimensions": 4,
+        "distance_metric": "euclidean"
+    })).await;
+
     let resp = client
         .delete(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&json!({ "ids": [] }))
@@ -81,10 +73,12 @@ async fn test_empty_delete_ids_array() {
 #[tokio::test]
 async fn test_wrong_type_vector_values() {
     let (base_url, harness) = common::server::start_test_server().await;
-    let ns = common::server::api_ns(&harness, "wrong-type");
-    create_test_namespace(&base_url, &ns).await;
-
     let client = reqwest::Client::new();
+    let ns = create_ns_api_with(&client, &base_url, json!({
+        "dimensions": 4,
+        "distance_metric": "euclidean"
+    })).await;
+
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&json!({
@@ -106,10 +100,12 @@ async fn test_wrong_type_vector_values() {
 #[tokio::test]
 async fn test_query_both_vector_and_rank_by() {
     let (base_url, harness) = common::server::start_test_server().await;
-    let ns = common::server::api_ns(&harness, "both-query");
-    create_test_namespace(&base_url, &ns).await;
-
     let client = reqwest::Client::new();
+    let ns = create_ns_api_with(&client, &base_url, json!({
+        "dimensions": 4,
+        "distance_metric": "euclidean"
+    })).await;
+
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/query"))
         .json(&json!({
@@ -129,10 +125,12 @@ async fn test_query_both_vector_and_rank_by() {
 #[tokio::test]
 async fn test_query_neither_vector_nor_rank_by() {
     let (base_url, harness) = common::server::start_test_server().await;
-    let ns = common::server::api_ns(&harness, "neither-query");
-    create_test_namespace(&base_url, &ns).await;
-
     let client = reqwest::Client::new();
+    let ns = create_ns_api_with(&client, &base_url, json!({
+        "dimensions": 4,
+        "distance_metric": "euclidean"
+    })).await;
+
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/query"))
         .json(&json!({ "top_k": 10 }))
@@ -149,10 +147,12 @@ async fn test_query_neither_vector_nor_rank_by() {
 #[tokio::test]
 async fn test_invalid_vector_id_characters() {
     let (base_url, harness) = common::server::start_test_server().await;
-    let ns = common::server::api_ns(&harness, "bad-id");
-    create_test_namespace(&base_url, &ns).await;
-
     let client = reqwest::Client::new();
+    let ns = create_ns_api_with(&client, &base_url, json!({
+        "dimensions": 4,
+        "distance_metric": "euclidean"
+    })).await;
+
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .json(&json!({
@@ -174,10 +174,12 @@ async fn test_invalid_vector_id_characters() {
 #[tokio::test]
 async fn test_nprobe_exceeds_max() {
     let (base_url, harness) = common::server::start_test_server().await;
-    let ns = common::server::api_ns(&harness, "nprobe-max");
-    create_test_namespace(&base_url, &ns).await;
-
     let client = reqwest::Client::new();
+    let ns = create_ns_api_with(&client, &base_url, json!({
+        "dimensions": 4,
+        "distance_metric": "euclidean"
+    })).await;
+
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/query"))
         .json(&json!({
@@ -197,10 +199,12 @@ async fn test_nprobe_exceeds_max() {
 #[tokio::test]
 async fn test_top_k_zero() {
     let (base_url, harness) = common::server::start_test_server().await;
-    let ns = common::server::api_ns(&harness, "topk-zero");
-    create_test_namespace(&base_url, &ns).await;
-
     let client = reqwest::Client::new();
+    let ns = create_ns_api_with(&client, &base_url, json!({
+        "dimensions": 4,
+        "distance_metric": "euclidean"
+    })).await;
+
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/query"))
         .json(&json!({

@@ -1,6 +1,6 @@
 mod common;
 
-use common::server::{api_ns, cleanup_ns, start_test_server, start_test_server_with_config};
+use common::server::{cleanup_ns, create_ns_api, start_test_server, start_test_server_with_config};
 use common::vectors::random_vectors;
 
 use zeppelin::config::Config;
@@ -12,18 +12,7 @@ use zeppelin::wal::WalReader;
 async fn test_oversized_batch_400() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "harden-batch");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Upsert 10,001 vectors (exceeds default max_batch_size of 10,000)
     let vectors: Vec<serde_json::Value> = (0..10_001)
@@ -56,17 +45,7 @@ async fn test_oversized_batch_400() {
 async fn test_empty_batch_400() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "harden-empty");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
@@ -89,17 +68,7 @@ async fn test_empty_batch_400() {
 async fn test_top_k_too_large_400() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "harden-topk-big");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/query"))
@@ -125,17 +94,7 @@ async fn test_top_k_too_large_400() {
 async fn test_top_k_zero_400() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "harden-topk-zero");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/query"))
@@ -227,19 +186,9 @@ async fn test_metrics_endpoint() {
 async fn test_metrics_increment_after_query() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "harden-metrics-q");
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
-    // Create ns and upsert vectors
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
-
+    // Upsert vectors
     let vectors = vec![serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]})];
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
@@ -281,18 +230,7 @@ async fn test_request_timeout_applied() {
 
     let (base_url, harness, _cache, _dir) = start_test_server_with_config(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "harden-timeout");
-
-    // Create ns
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Normal query should complete successfully (validates middleware is wired)
     let vectors = vec![serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]})];
@@ -324,18 +262,7 @@ async fn test_request_timeout_applied() {
 async fn test_cache_populated_after_segment_query() {
     let (base_url, harness, cache, _cache_dir) = start_test_server_with_config(None).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "harden-cache");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 8,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 8).await;
 
     // Upsert vectors
     let vectors = random_vectors(50, 8);

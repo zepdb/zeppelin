@@ -86,7 +86,9 @@ paths:
     post:
       operationId: createNamespace
       summary: Create a namespace
-      description: Creates a new namespace with the specified dimensions and distance metric.
+      description: |
+        Creates a new namespace with the specified dimensions and distance metric.
+        The server generates a UUID v4 name for the namespace. Save the returned name — it cannot be recovered if lost.
       tags: [Namespaces]
       requestBody:
         required: true
@@ -100,26 +102,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/NamespaceResponse"
+                $ref: "#/components/schemas/CreateNamespaceResponse"
         "400":
           $ref: "#/components/responses/ValidationError"
-        "409":
-          $ref: "#/components/responses/ConflictError"
-
-    get:
-      operationId: listNamespaces
-      summary: List namespaces
-      description: Returns all namespaces.
-      tags: [Namespaces]
-      responses:
-        "200":
-          description: List of namespaces
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/NamespaceResponse"
 
   /v1/namespaces/{ns}:
     parameters:
@@ -257,12 +242,6 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     NotFoundError:
       description: Resource not found (404)
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-    ConflictError:
-      description: Resource conflict (409)
       content:
         application/json:
           schema:
@@ -598,11 +577,8 @@ components:
 
     CreateNamespaceRequest:
       type: object
-      required: [name, dimensions]
+      required: [dimensions]
       properties:
-        name:
-          type: string
-          description: Namespace name
         dimensions:
           type: integer
           minimum: 1
@@ -614,6 +590,18 @@ components:
           additionalProperties:
             $ref: "#/components/schemas/FtsFieldConfig"
           description: Per-field FTS configuration. Keys are attribute field names.
+
+    CreateNamespaceResponse:
+      description: Response from namespace creation, includes a warning to save the UUID name.
+      allOf:
+        - $ref: "#/components/schemas/NamespaceResponse"
+        - type: object
+          required: [warning]
+          properties:
+            warning:
+              type: string
+              description: Warning to save the namespace UUID — it cannot be recovered if lost.
+              example: "Save this namespace name. It cannot be recovered if lost."
 
     NamespaceResponse:
       type: object

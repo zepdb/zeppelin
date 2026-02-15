@@ -1,6 +1,6 @@
 mod common;
 
-use common::server::{api_ns, cleanup_ns, start_test_server, start_test_server_with_config};
+use common::server::{cleanup_ns, create_ns_api, start_test_server, start_test_server_with_config};
 use common::vectors::random_vectors;
 
 use zeppelin::wal::WalReader;
@@ -41,20 +41,9 @@ async fn test_http_request_metrics_incremented() {
 async fn test_s3_metrics_after_operations() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "obs-s3-metrics");
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
-    // Create namespace (triggers S3 operations)
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    // Upsert vectors (triggers more S3 operations)
+    // Upsert vectors (triggers S3 operations)
     let vectors = vec![serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]})];
     client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
@@ -96,18 +85,7 @@ async fn test_s3_metrics_after_operations() {
 async fn test_active_queries_returns_to_zero() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "obs-active-q");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Upsert a vector
     let vectors = vec![serde_json::json!({"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]})];
@@ -213,18 +191,7 @@ async fn test_request_id_passthrough() {
 async fn test_compaction_duration_metric() {
     let (base_url, harness, _cache, _dir) = start_test_server_with_config(None).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "obs-compact-dur");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 8,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 8).await;
 
     // Upsert vectors
     let vectors = random_vectors(50, 8);
