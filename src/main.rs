@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -42,9 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal)
+    .await?;
 
     tracing::info!("server stopped, shutting down background tasks");
     let _ = shutdown_tx.send(true);

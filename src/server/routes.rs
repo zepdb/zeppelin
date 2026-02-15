@@ -31,6 +31,10 @@ pub fn build_router(state: AppState) -> Router {
             )),
         )
         .layer(axum::middleware::from_fn(middleware::http_metrics))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit,
+        ))
         .layer(TimeoutLayer::new(timeout))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(RequestBodyLimitLayer::new(body_limit));
@@ -61,6 +65,10 @@ pub fn build_router(state: AppState) -> Router {
             post(vectors::upsert_vectors).delete(vectors::delete_vectors),
         )
         .layer(axum::middleware::from_fn(middleware::http_metrics))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit,
+        ))
         .layer(TimeoutLayer::new(timeout))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(RequestBodyLimitLayer::new(body_limit))

@@ -88,10 +88,22 @@ pub struct ServerConfig {
     /// Default `top_k` when the client omits it. Default: `10`.
     #[serde(default = "default_top_k")]
     pub default_top_k: usize,
+    /// Maximum sustained requests per second per IP. Default: `10`.
+    #[serde(default = "default_rate_limit_rps")]
+    pub rate_limit_rps: u32,
+    /// Maximum burst capacity per IP (token bucket size). Default: `20`.
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: u32,
 }
 
 fn default_top_k() -> usize {
     10
+}
+fn default_rate_limit_rps() -> u32 {
+    10
+}
+fn default_rate_limit_burst() -> u32 {
+    20
 }
 
 /// Supported object storage backends.
@@ -413,6 +425,8 @@ impl Default for ServerConfig {
             max_vector_id_length: default_max_vector_id_length(),
             max_request_body_mb: default_max_request_body_mb(),
             default_top_k: default_top_k(),
+            rate_limit_rps: default_rate_limit_rps(),
+            rate_limit_burst: default_rate_limit_burst(),
         }
     }
 }
@@ -629,6 +643,18 @@ impl Config {
             .and_then(|v| v.parse().ok())
         {
             self.server.default_top_k = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_RATE_LIMIT_RPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.rate_limit_rps = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_RATE_LIMIT_BURST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.rate_limit_burst = v;
         }
 
         // Storage
