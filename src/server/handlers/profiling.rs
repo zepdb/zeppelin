@@ -3,6 +3,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
+/// Query parameters for the CPU profiling endpoint.
 #[derive(Deserialize)]
 pub struct ProfileParams {
     /// Duration of CPU profiling in seconds (1-300).
