@@ -1,0 +1,41 @@
+version: "3.8"
+
+networks:
+  zeppelin-mon:
+    driver: bridge
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: zeppelin-prometheus
+    # No public port — Grafana reaches Prometheus over the zeppelin-mon network.
+    # To debug locally: docker exec zeppelin-prometheus wget -qO- http://localhost:9090/api/v1/status/config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - zeppelin-mon
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: zeppelin-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_AUTH_DISABLE_LOGIN_FORM=false
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - zeppelin-mon
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  grafana-data:
