@@ -229,6 +229,57 @@ pub fn api_ns(harness: &TestHarness, suffix: &str) -> String {
     format!("{}-{suffix}", harness.prefix)
 }
 
+/// Create a namespace via the API and return the server-generated UUID name.
+pub async fn create_ns_api(client: &reqwest::Client, base_url: &str, dimensions: usize) -> String {
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces"))
+        .json(&serde_json::json!({ "dimensions": dimensions }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create namespace failed");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body["name"].as_str().unwrap().to_string()
+}
+
+/// Create a namespace with FTS config via the API and return the UUID name.
+pub async fn create_ns_api_fts(
+    client: &reqwest::Client,
+    base_url: &str,
+    dimensions: usize,
+    fts: serde_json::Value,
+) -> String {
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces"))
+        .json(&serde_json::json!({
+            "dimensions": dimensions,
+            "full_text_search": fts,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create FTS namespace failed");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body["name"].as_str().unwrap().to_string()
+}
+
+/// Create a namespace with custom options via the API and return the UUID name.
+pub async fn create_ns_api_with(
+    client: &reqwest::Client,
+    base_url: &str,
+    body: serde_json::Value,
+) -> String {
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create namespace failed");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body["name"].as_str().unwrap().to_string()
+}
+
 /// Clean up all S3 objects under a namespace prefix.
 pub async fn cleanup_ns(store: &ZeppelinStore, ns: &str) {
     let prefix = format!("{ns}/");

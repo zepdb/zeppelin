@@ -1,7 +1,8 @@
 mod common;
 
 use common::server::{
-    api_ns, cleanup_ns, start_test_server_with_compaction, start_test_server_with_compactor,
+    cleanup_ns, create_ns_api_with, start_test_server_with_compaction,
+    start_test_server_with_compactor,
 };
 use common::vectors::{simple_attributes, with_attributes};
 
@@ -64,19 +65,12 @@ async fn test_e2e_write_compact_query_lifecycle() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-lifecycle");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 32,
-            "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({"dimensions": 32, "distance_metric": "euclidean"}),
+    )
+    .await;
 
     // Phase 1: Write 500 vectors with attributes
     let vectors = prefixed_vectors_with_attrs("life", 500, 32);
@@ -184,19 +178,12 @@ async fn test_e2e_background_compaction_triggers() {
     let (base_url, harness, _cache, _dir, shutdown_tx) =
         start_test_server_with_compaction(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-bgcompact");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 16,
-            "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({"dimensions": 16, "distance_metric": "euclidean"}),
+    )
+    .await;
 
     // Write 3 separate upsert calls (creates 3 WAL fragments, triggering threshold)
     for batch in 0..3 {
@@ -272,19 +259,12 @@ async fn test_e2e_incremental_compaction() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-incremental");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 16,
-            "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({"dimensions": 16, "distance_metric": "euclidean"}),
+    )
+    .await;
 
     // Batch 1: Upsert 100 vectors, compact
     let batch1 = prefixed_vectors("batch1", 100, 16);
@@ -386,19 +366,12 @@ async fn test_e2e_filtered_query_after_compaction() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-filter");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 16,
-            "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({"dimensions": 16, "distance_metric": "euclidean"}),
+    )
+    .await;
 
     // Upsert 300 vectors with attributes (category a/b/c round-robin, score 0..299)
     let vectors = prefixed_vectors_with_attrs("filt", 300, 16);
@@ -534,19 +507,12 @@ async fn test_e2e_delete_compact_verify_gone() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-delete");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 8,
-            "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({"dimensions": 8, "distance_metric": "euclidean"}),
+    )
+    .await;
 
     // Upsert 50 vectors
     let vectors = prefixed_vectors("del", 50, 8);
@@ -660,19 +626,12 @@ async fn test_e2e_strong_vs_eventual_consistency() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "e2e-consistency");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 16,
-            "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({"dimensions": 16, "distance_metric": "euclidean"}),
+    )
+    .await;
 
     // Upsert 200 vectors (will be compacted)
     let compacted_vecs = prefixed_vectors("compacted", 200, 16);

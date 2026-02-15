@@ -1,6 +1,6 @@
 mod common;
 
-use common::server::{api_ns, cleanup_ns, start_test_server_with_compactor};
+use common::server::{cleanup_ns, create_ns_api_fts, start_test_server_with_compactor};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,20 +45,15 @@ async fn test_fts_stress_concurrent_writers_readers() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = Arc::new(reqwest::Client::new());
-    let ns = api_ns(&harness, "fts-stress-rw");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "content": { "stemming": false, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "content": { "stemming": false, "remove_stopwords": false }
+        }),
+    )
+    .await;
 
     // Spawn 5 writers (each writes 20 vectors)
     let mut handles = Vec::new();
@@ -147,20 +142,15 @@ async fn test_fts_stress_large_batch() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-stress-batch");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "content": { "stemming": false, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "content": { "stemming": false, "remove_stopwords": false }
+        }),
+    )
+    .await;
 
     // Build 500 vectors with varied text content
     let words = [
@@ -236,20 +226,15 @@ async fn test_fts_stress_query_concurrency() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = Arc::new(reqwest::Client::new());
-    let ns = api_ns(&harness, "fts-stress-qc");
-
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": {
-                "content": { "stemming": false, "remove_stopwords": false }
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "content": { "stemming": false, "remove_stopwords": false }
+        }),
+    )
+    .await;
 
     // Seed with 50 docs
     let vectors: Vec<serde_json::Value> = (0..50)

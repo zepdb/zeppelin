@@ -38,15 +38,18 @@ This starts Zeppelin on port `8080` and MinIO on port `9000` with a pre-created 
 ### Create a namespace
 
 ```bash
+# Server generates a UUID name — save it!
 curl -s http://localhost:8080/v1/namespaces \
   -H "Content-Type: application/json" \
-  -d '{"name": "my-vectors", "dimensions": 384}' | jq
+  -d '{"dimensions": 384}' | jq
+# Response: {"name": "550e8400-e29b-41d4-a716-446655440000", "dimensions": 384, ..., "warning": "Save this namespace name..."}
 ```
 
 ### Upsert vectors
 
 ```bash
-curl -s http://localhost:8080/v1/namespaces/my-vectors/vectors \
+# Replace <ns> with the UUID from the create response
+curl -s http://localhost:8080/v1/namespaces/<ns>/vectors \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": [
@@ -82,8 +85,7 @@ curl -s -X DELETE http://localhost:8080/v1/namespaces/my-vectors/vectors \
 | `GET`    | `/healthz`                        | Liveness probe         |
 | `GET`    | `/readyz`                         | Readiness probe        |
 | `GET`    | `/metrics`                        | Prometheus metrics     |
-| `POST`   | `/v1/namespaces`                  | Create a namespace     |
-| `GET`    | `/v1/namespaces`                  | List namespaces        |
+| `POST`   | `/v1/namespaces`                  | Create a namespace (returns UUID) |
 | `GET`    | `/v1/namespaces/:ns`              | Get namespace metadata |
 | `DELETE` | `/v1/namespaces/:ns`              | Delete a namespace     |
 | `POST`   | `/v1/namespaces/:ns/vectors`      | Upsert vectors         |

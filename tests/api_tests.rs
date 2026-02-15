@@ -1,6 +1,6 @@
 mod common;
 
-use common::server::{api_ns, cleanup_ns, start_test_server};
+use common::server::{cleanup_ns, create_ns_api, start_test_server};
 use common::vectors::random_vectors;
 
 #[tokio::test]
@@ -17,26 +17,63 @@ async fn test_health_check() {
 }
 
 #[tokio::test]
-async fn test_namespace_crud() {
+async fn test_create_namespace_returns_uuid_and_warning() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "api-ns");
 
-    // Create
     let resp = client
         .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 64,
-            "distance_metric": "cosine"
-        }))
+        .json(&serde_json::json!({ "dimensions": 64 }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 201);
+
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["name"], ns);
+
+    // Name should be a valid UUID v4
+    let name = body["name"].as_str().unwrap();
+    assert!(
+        uuid::Uuid::parse_str(name).is_ok(),
+        "expected valid UUID, got: {name}"
+    );
+
+    // Warning should be present
+    let warning = body["warning"].as_str().unwrap();
+    assert!(
+        warning.contains("Save"),
+        "expected save warning, got: {warning}"
+    );
+
+    // Standard fields should be present
     assert_eq!(body["dimensions"], 64);
+    assert!(body["created_at"].is_string());
+
+    cleanup_ns(&harness.store, name).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_list_namespaces_disabled() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base_url}/v1/namespaces"))
+        .send()
+        .await
+        .unwrap();
+    // Only POST is routed on /v1/namespaces, GET should return 405
+    assert_eq!(resp.status(), 405);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_namespace_crud() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api(&client, &base_url, 64).await;
 
     // Get
     let resp = client
@@ -47,16 +84,7 @@ async fn test_namespace_crud() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["name"], ns);
-
-    // List
-    let resp = client
-        .get(format!("{base_url}/v1/namespaces"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Vec<serde_json::Value> = resp.json().await.unwrap();
-    assert!(body.iter().any(|n| n["name"] == ns));
+    assert_eq!(body["dimensions"], 64);
 
     // Delete
     let resp = client
@@ -74,38 +102,6 @@ async fn test_namespace_crud() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 
-    // DELETE handler already cleaned up S3 objects
-    harness.cleanup().await;
-}
-
-#[tokio::test]
-async fn test_duplicate_create_409() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "api-dup");
-
-    let body = serde_json::json!({
-        "name": ns,
-        "dimensions": 32,
-    });
-
-    let resp = client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
-
-    let resp = client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 409);
-
-    cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
 
@@ -113,18 +109,7 @@ async fn test_duplicate_create_409() {
 async fn test_vector_upsert() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "api-upsert");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 16,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 16).await;
 
     // Upsert vectors
     let vectors = random_vectors(5, 16);
@@ -147,18 +132,7 @@ async fn test_vector_upsert() {
 async fn test_dimension_mismatch_400() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "api-dim");
-
-    // Create namespace with dim=16
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 16,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 16).await;
 
     // Upsert with wrong dimension (32 instead of 16)
     let vectors = random_vectors(1, 32);
@@ -178,18 +152,7 @@ async fn test_dimension_mismatch_400() {
 async fn test_query_basic_wal_scan() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "api-query");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 8,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 8).await;
 
     // Upsert 10 vectors
     let vectors = random_vectors(10, 8);
@@ -228,18 +191,7 @@ async fn test_query_basic_wal_scan() {
 async fn test_query_with_filter() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "api-filter");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Upsert vectors with attributes
     let vectors = serde_json::json!({
@@ -285,18 +237,7 @@ async fn test_query_with_filter() {
 async fn test_query_empty_namespace() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "api-empty");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Query empty namespace
     let resp = client
@@ -322,18 +263,7 @@ async fn test_query_empty_namespace() {
 async fn test_query_dimension_mismatch() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "api-qdim");
-
-    // Create namespace with dim=4
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
+    let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Query with wrong dimension
     let resp = client

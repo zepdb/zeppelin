@@ -16,7 +16,8 @@ An S3-native vector search engine. Two services:
 ```bash
 curl -X POST http://44.242.236.80:8080/v1/namespaces \
   -H "Content-Type: application/json" \
-  -d '{"name": "my-notes", "dimensions": 384}'
+  -d '{"dimensions": 384}'
+# Response includes "name": "<uuid>" — SAVE THIS! It cannot be recovered if lost.
 ```
 
 ### 2. Embed your text
@@ -27,9 +28,9 @@ curl -X POST http://44.242.236.80:8090/v1/embed \
 ```
 Returns: `{"embeddings": [[0.023, ...384 floats], [...]], "model": "all-MiniLM-L6-v2", "dimensions": 384}`
 
-### 3. Upsert vectors (use the embeddings from step 2)
+### 3. Upsert vectors (use the embeddings from step 2, replace <uuid> with your namespace name)
 ```bash
-curl -X POST http://44.242.236.80:8080/v1/namespaces/my-notes/vectors \
+curl -X POST http://44.242.236.80:8080/v1/namespaces/<uuid>/vectors \
   -H "Content-Type: application/json" \
   -d '{
     "vectors": [
@@ -67,8 +68,7 @@ POST /v1/embed  {"texts": ["text1", "text2"]}
 
 **Namespaces:**
 ```
-POST   /v1/namespaces                    Create: {"name": "x", "dimensions": 384}
-GET    /v1/namespaces                    List all
+POST   /v1/namespaces                    Create: {"dimensions": 384} → returns UUID name
 GET    /v1/namespaces/:ns                Get info
 DELETE /v1/namespaces/:ns                Delete
 ```
@@ -112,9 +112,9 @@ pip install zeppelin-python
 from zeppelin import ZeppelinClient
 
 client = ZeppelinClient("http://44.242.236.80:8080")
-client.create_namespace("my-notes", dimensions=384)
-client.upsert("my-notes", vectors=[{"id": "doc1", "values": [...], "attributes": {"title": "hello"}}])
-results = client.query("my-notes", vector=[...], top_k=10)
+ns = client.create_namespace(dimensions=384)  # Returns UUID name — save it!
+client.upsert(ns["name"], vectors=[{"id": "doc1", "values": [...], "attributes": {"title": "hello"}}])
+results = client.query(ns["name"], vector=[...], top_k=10)
 ```
 
 **TypeScript:**
@@ -125,9 +125,9 @@ npm install zeppelin-typescript
 import { ZeppelinClient } from 'zeppelin-typescript';
 
 const client = new ZeppelinClient('http://44.242.236.80:8080');
-await client.createNamespace('my-notes', { dimensions: 384 });
-await client.upsert('my-notes', { vectors: [{ id: 'doc1', values: [...], attributes: { title: 'hello' } }] });
-const results = await client.query('my-notes', { vector: [...], topK: 10 });
+const ns = await client.createNamespace({ dimensions: 384 }); // Returns UUID name — save it!
+await client.upsert(ns.name, { vectors: [{ id: 'doc1', values: [...], attributes: { title: 'hello' } }] });
+const results = await client.query(ns.name, { vector: [...], topK: 10 });
 ```
 
 Both SDKs support: vector search, BM25 full-text search, composable filters, FTS config, typed errors.
@@ -144,7 +144,7 @@ curl http://44.242.236.80:8090/health      # Embed service health
 ## Important
 
 - Always create namespaces with **384 dimensions** to match the hosted embed model
+- **Namespace names are server-generated UUIDs** — save the name from the create response, it cannot be recovered
 - Use `"consistency": "strong"` when reading your own recently-written data
 - Attributes are optional key-value pairs attached to vectors (useful for filtering)
-- Namespace names: alphanumeric + hyphens/underscores, 1-255 chars
 - The embed endpoint is for encoding text only — upsert and query go through Zeppelin (port 8080)

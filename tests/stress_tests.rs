@@ -1,8 +1,8 @@
 mod common;
 
 use common::server::{
-    api_ns, cleanup_ns, start_test_server, start_test_server_with_compactor,
-    start_test_server_with_config,
+    cleanup_ns, create_ns_api, create_ns_api_with, start_test_server,
+    start_test_server_with_compactor, start_test_server_with_config,
 };
 use common::vectors::random_vectors;
 
@@ -54,20 +54,15 @@ async fn test_stress_concurrent_writers_same_namespace() {
     let start = Instant::now();
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "stress-writers");
-
-    // Create namespace (dims=16)
-    let resp = client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+        }),
+    )
+    .await;
 
     // Spawn 10 concurrent writers, each upserting 50 vectors
     let num_writers = 10;
@@ -143,19 +138,15 @@ async fn test_stress_concurrent_readers_during_writes() {
     let start = Instant::now();
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "stress-rw");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 8,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     // Upsert initial batch
     let initial = random_vectors(20, 8);
@@ -252,19 +243,15 @@ async fn test_stress_large_batch_upsert() {
     config.server.max_request_body_mb = 100;
     let (base_url, harness, _cache, _dir) = start_test_server_with_config(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "stress-large");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 32,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     // Generate 10,000 vectors
     let vectors = prefixed_vectors("bulk", 10_000, 32);
@@ -340,37 +327,22 @@ async fn test_stress_rapid_namespace_create_delete() {
     let client = reqwest::Client::new();
 
     let ns_count = 20;
-    let ns_names: Vec<String> = (0..ns_count)
-        .map(|i| api_ns(&harness, &format!("stress-ns-{i}")))
-        .collect();
 
-    // Create 20 namespaces sequentially
+    // Create 20 namespaces sequentially via API (server assigns UUID names)
+    let mut ns_names: Vec<String> = Vec::with_capacity(ns_count);
+    for _ in 0..ns_count {
+        let ns = create_ns_api(&client, &base_url, 4).await;
+        ns_names.push(ns);
+    }
+
+    // Verify each namespace is accessible via GET
     for ns in &ns_names {
         let resp = client
-            .post(format!("{base_url}/v1/namespaces"))
-            .json(&serde_json::json!({
-                "name": ns,
-                "dimensions": 4,
-            }))
+            .get(format!("{base_url}/v1/namespaces/{ns}"))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 201, "failed to create namespace {ns}");
-    }
-
-    // Verify list contains all 20
-    let resp = client
-        .get(format!("{base_url}/v1/namespaces"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Vec<serde_json::Value> = resp.json().await.unwrap();
-    for ns in &ns_names {
-        assert!(
-            body.iter().any(|n| n["name"] == *ns),
-            "namespace {ns} not found in list"
-        );
+        assert_eq!(resp.status(), 200, "namespace {ns} should be accessible");
     }
 
     // Delete all 20 concurrently
@@ -397,31 +369,22 @@ async fn test_stress_rapid_namespace_create_delete() {
         assert_eq!(*status, 204, "failed to delete namespace {ns}");
     }
 
-    // Verify list contains none
-    let resp = client
-        .get(format!("{base_url}/v1/namespaces"))
-        .send()
-        .await
-        .unwrap();
-    let body: Vec<serde_json::Value> = resp.json().await.unwrap();
+    // Verify each namespace is gone (GET returns 404)
     for ns in &ns_names {
-        assert!(
-            !body.iter().any(|n| n["name"] == *ns),
-            "namespace {ns} should be deleted"
+        let resp = client
+            .get(format!("{base_url}/v1/namespaces/{ns}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "namespace {ns} should be deleted (404)"
         );
     }
 
     // Re-create one to prove cleanup was complete
-    let resp = client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns_names[0],
-            "dimensions": 4,
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
+    let recreated_ns = create_ns_api(&client, &base_url, 4).await;
 
     let elapsed = start.elapsed();
     eprintln!(
@@ -430,7 +393,7 @@ async fn test_stress_rapid_namespace_create_delete() {
     );
     assert!(elapsed.as_secs() < 120, "test exceeded 120s timeout");
 
-    cleanup_ns(&harness.store, &ns_names[0]).await;
+    cleanup_ns(&harness.store, &recreated_ns).await;
     harness.cleanup().await;
 }
 
@@ -445,19 +408,15 @@ async fn test_stress_high_query_concurrency() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "stress-query");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     // Upsert 200 vectors
     let vectors = prefixed_vectors("seg", 200, 16);
@@ -546,19 +505,15 @@ async fn test_stress_concurrent_upsert_and_delete() {
     let start = Instant::now();
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "stress-upsdel");
-
-    // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 8,
             "distance_metric": "euclidean"
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     // Upsert 100 base vectors
     let base_vecs = prefixed_vectors("base", 100, 8);

@@ -1,6 +1,6 @@
 mod common;
 
-use common::server::{api_ns, cleanup_ns, start_test_server_with_compactor};
+use common::server::{cleanup_ns, create_ns_api_fts, start_test_server_with_compactor};
 
 use std::collections::HashMap;
 use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
@@ -72,31 +72,6 @@ fn content_fts_configs() -> HashMap<String, FtsFieldConfig> {
         },
     );
     m
-}
-
-/// Create an FTS-enabled namespace via the HTTP API.
-async fn create_fts_namespace(
-    client: &reqwest::Client,
-    base_url: &str,
-    ns: &str,
-    fts_fields: serde_json::Value,
-) {
-    let resp = client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
-            "dimensions": 4,
-            "full_text_search": fts_fields,
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        201,
-        "namespace creation failed: {}",
-        resp.text().await.unwrap()
-    );
 }
 
 /// Upsert vectors via the HTTP API.
@@ -174,12 +149,10 @@ async fn test_fts_wal_scan_basic() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-wal-basic");
-
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
         }),
@@ -254,12 +227,10 @@ async fn test_fts_wal_scan_with_deletes() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-wal-del");
-
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
         }),
@@ -311,12 +282,10 @@ async fn test_fts_segment_search_after_compaction() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-seg");
-
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
         }),
@@ -424,12 +393,10 @@ async fn test_fts_strong_consistency_wal_plus_segment() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-strong");
-
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
         }),
@@ -516,12 +483,10 @@ async fn test_fts_eventual_consistency() {
     let (base_url, harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-eventual");
-
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
         }),
@@ -592,12 +557,10 @@ async fn test_fts_multi_field_sum() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-sum");
-
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "title": {"language": "english", "stemming": true, "remove_stopwords": true},
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
@@ -684,12 +647,10 @@ async fn test_fts_product_weighted() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-product");
-
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "title": {"language": "english", "stemming": true, "remove_stopwords": true},
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
@@ -756,13 +717,11 @@ async fn test_fts_last_as_prefix() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-prefix");
-
     // Use stemming=false so we can test exact prefix matching without stemmer interference
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "content": {
                 "language": "english",
@@ -842,12 +801,10 @@ async fn test_fts_contains_all_tokens_filter() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-all-tokens");
-
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
         }),
@@ -909,12 +866,10 @@ async fn test_fts_contains_token_sequence_filter() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-token-seq");
-
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
         }),
@@ -976,12 +931,10 @@ async fn test_fts_empty_query() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-empty");
-
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
         }),
@@ -1028,13 +981,11 @@ async fn test_fts_field_not_configured_error() {
     let (base_url, harness, _cache, _dir, _compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-not-configured");
-
     // Create namespace with FTS only on "content" — NOT on "title"
-    create_fts_namespace(
+    let ns = create_ns_api_fts(
         &client,
         &base_url,
-        &ns,
+        4,
         serde_json::json!({
             "content": {"language": "english", "stemming": true, "remove_stopwords": true}
         }),

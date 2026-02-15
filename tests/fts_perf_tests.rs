@@ -1,6 +1,6 @@
 mod common;
 
-use common::server::{api_ns, start_test_server_with_compactor};
+use common::server::{create_ns_api_with, start_test_server_with_compactor};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -103,24 +103,22 @@ fn make_doc(id: &str, text: &str, dims: usize, rng: &mut StdRng) -> serde_json::
 #[tokio::test]
 async fn test_fts_perf_index_build_time() {
     let config = fts_perf_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, _harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-perf-build");
     let fts_config = default_fts_config();
 
     // Create namespace
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "cosine",
             "full_text_search": fts_config,
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     // Generate 1000 docs with 30-word text fields
     let mut rng = StdRng::seed_from_u64(42);
@@ -170,24 +168,22 @@ async fn test_fts_perf_index_build_time() {
 #[tokio::test]
 async fn test_fts_perf_query_latency() {
     let config = fts_perf_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, _harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-perf-lat");
     let fts_config = default_fts_config();
 
     // Create and populate
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 16,
             "distance_metric": "cosine",
             "full_text_search": fts_config,
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     let mut rng = StdRng::seed_from_u64(99);
     let docs: Vec<serde_json::Value> = (0..500)
@@ -265,24 +261,22 @@ async fn test_fts_perf_query_latency() {
 #[tokio::test]
 async fn test_fts_perf_wal_vs_segment() {
     let config = fts_perf_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, _harness, _cache, _dir, compactor) =
         start_test_server_with_compactor(Some(config)).await;
     let client = reqwest::Client::new();
-    let ns = api_ns(&harness, "fts-perf-compare");
     let fts_config = default_fts_config();
 
     // Create and populate
-    client
-        .post(format!("{base_url}/v1/namespaces"))
-        .json(&serde_json::json!({
-            "name": ns,
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
             "dimensions": 8,
             "distance_metric": "cosine",
             "full_text_search": fts_config,
-        }))
-        .send()
-        .await
-        .unwrap();
+        }),
+    )
+    .await;
 
     let mut rng = StdRng::seed_from_u64(123);
     let docs: Vec<serde_json::Value> = (0..200)
