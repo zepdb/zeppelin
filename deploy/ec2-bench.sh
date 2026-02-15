@@ -90,6 +90,18 @@ wait_for_ssh() {
     return 1
 }
 
+get_my_ip() {
+    local ip
+    ip=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null || \
+         curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || \
+         echo "")
+    if [ -z "$ip" ]; then
+        echo "ERROR: Could not determine your public IP. Check your internet connection." >&2
+        exit 1
+    fi
+    echo "$ip"
+}
+
 create_security_group() {
     local sg_id
     sg_id=$(aws ec2 describe-security-groups \
@@ -103,7 +115,10 @@ create_security_group() {
         return 0
     fi
 
-    echo "Creating security group: $SG_NAME" >&2
+    local my_ip
+    my_ip=$(get_my_ip)
+    echo "Creating security group: $SG_NAME (your IP: $my_ip)" >&2
+
     sg_id=$(aws ec2 create-security-group \
         --group-name "$SG_NAME" \
         --description "Zeppelin benchmark instance" \
@@ -111,23 +126,25 @@ create_security_group() {
         --query 'GroupId' \
         --region "$AWS_REGION")
 
-    # SSH
+    # SSH — deployer only
     aws ec2 authorize-security-group-ingress \
         --group-id "$sg_id" \
-        --protocol tcp --port 22 --cidr 0.0.0.0/0 \
+        --protocol tcp --port 22 --cidr "$my_ip/32" \
         --region "$AWS_REGION" > /dev/null
 
-    # Zeppelin API
+    # Zeppelin API — public (protected by app-level rate limiting)
     aws ec2 authorize-security-group-ingress \
         --group-id "$sg_id" \
         --protocol tcp --port 8080 --cidr 0.0.0.0/0 \
         --region "$AWS_REGION" > /dev/null
 
-    # Metrics
+    # Grafana — deployer only
     aws ec2 authorize-security-group-ingress \
         --group-id "$sg_id" \
-        --protocol tcp --port 9090 --cidr 0.0.0.0/0 \
+        --protocol tcp --port 3000 --cidr "$my_ip/32" \
         --region "$AWS_REGION" > /dev/null
+
+    # No Prometheus port — not exposed from Docker, no SG rule needed
 
     echo "$sg_id"
 }
