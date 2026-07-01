@@ -68,7 +68,7 @@ jobs:
           MINIO_ENDPOINT: http://localhost:9000
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin
-        run: cargo test --test storage_tests -- --nocapture
+        run: cargo test --tests -- --nocapture
 
   coverage:
     name: Code Coverage

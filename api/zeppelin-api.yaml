@@ -105,6 +105,10 @@ paths:
                 $ref: "#/components/schemas/CreateNamespaceResponse"
         "400":
           $ref: "#/components/responses/ValidationError"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
 
   /v1/namespaces/{ns}:
     parameters:
@@ -167,6 +171,10 @@ paths:
           $ref: "#/components/responses/ValidationError"
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
 
     delete:
       operationId: deleteVectors
@@ -180,19 +188,16 @@ paths:
             schema:
               $ref: "#/components/schemas/DeleteVectorsRequest"
       responses:
-        "200":
+        "204":
           description: Vectors deleted
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [deleted]
-                properties:
-                  deleted:
-                    type: integer
-                    example: 5
+        "400":
+          $ref: "#/components/responses/ValidationError"
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
 
   /v1/namespaces/{ns}/query:
     parameters:
@@ -246,6 +251,20 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    UnsupportedMediaType:
+      description: Missing or non-JSON Content-Type header (415). Plain-text body.
+      content:
+        text/plain:
+          schema:
+            type: string
+            example: "Expected request with `Content-Type: application/json`"
+    UnprocessableEntity:
+      description: Body is valid JSON but fails deserialization, e.g. missing required fields (422). Plain-text body.
+      content:
+        text/plain:
+          schema:
+            type: string
+            example: "Failed to deserialize the JSON body into the target type: vectors[0]: missing field `values`"
 
   schemas:
     ErrorResponse:
@@ -582,6 +601,7 @@ components:
         dimensions:
           type: integer
           minimum: 1
+          maximum: 65536
           description: Vector dimensionality
         distance_metric:
           $ref: "#/components/schemas/DistanceMetric"
@@ -637,6 +657,7 @@ components:
           items:
             $ref: "#/components/schemas/VectorEntry"
           minItems: 1
+          maxItems: 50000
 
     DeleteVectorsRequest:
       type: object
@@ -644,6 +665,7 @@ components:
       properties:
         ids:
           type: array
+          minItems: 1
           items:
             type: string
 
@@ -670,6 +692,7 @@ components:
           type: integer
           default: 10
           minimum: 1
+          maximum: 10000
           description: Number of results to return
         filter:
           $ref: "#/components/schemas/Filter"
@@ -678,6 +701,7 @@ components:
         nprobe:
           type: integer
           minimum: 1
+          maximum: 128
           description: Number of IVF clusters to probe (vector search only)
 
     QueryResponse:
