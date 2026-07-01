@@ -264,7 +264,7 @@ async fn test_all_metrics_registered() {
         .observe(0.0);
 
     let families = prometheus::gather();
-    let names: Vec<String> = families.iter().map(|f| f.get_name().to_string()).collect();
+    let names: Vec<String> = families.iter().map(|f| f.name().to_string()).collect();
 
     let expected = [
         "zeppelin_http_requests_total",

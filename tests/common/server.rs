@@ -19,6 +19,14 @@ use zeppelin::server::AppState;
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::{WalReader, WalWriter};
 
+fn configure_test_server_limits(config: &mut Config) {
+    // Integration tests share one loopback IP and often issue bursty setup or
+    // perf requests. Keep production defaults intact, but avoid unrelated 429s
+    // in tests that are not exercising rate limiting.
+    config.server.rate_limit_rps = 1_000_000;
+    config.server.rate_limit_burst = 1_000_000;
+}
+
 /// Start a test server with optional config override, returning (base_url, harness, cache, _cache_dir).
 /// The TempDir must be kept alive for the cache to function.
 pub async fn start_test_server_with_config(
@@ -28,7 +36,8 @@ pub async fn start_test_server_with_config(
     zeppelin::metrics::init();
 
     let harness = TestHarness::new().await;
-    let config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
+    let mut config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
+    configure_test_server_limits(&mut config);
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -91,7 +100,8 @@ pub async fn start_test_server_with_compactor(
     zeppelin::metrics::init();
 
     let harness = TestHarness::new().await;
-    let config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
+    let mut config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
+    configure_test_server_limits(&mut config);
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -104,6 +114,7 @@ pub async fn start_test_server_with_compactor(
         config.compaction.clone(),
         config.indexing.clone(),
     ));
+    let manifest_cache = Arc::new(ManifestCache::new(Duration::ZERO));
 
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.server.max_concurrent_queries,
@@ -116,7 +127,7 @@ pub async fn start_test_server_with_compactor(
         config: Arc::new(config),
         compactor: compactor.clone(),
         cache: cache.clone(),
-        manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
+        manifest_cache,
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         batch_wal_writer: None,
@@ -155,7 +166,8 @@ pub async fn start_test_server_with_compaction(
     zeppelin::metrics::init();
 
     let harness = TestHarness::new().await;
-    let config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
+    let mut config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
+    configure_test_server_limits(&mut config);
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -194,7 +206,7 @@ pub async fn start_test_server_with_compaction(
         config: Arc::new(config),
         compactor,
         cache: cache.clone(),
-        manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
+        manifest_cache,
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         batch_wal_writer: None,

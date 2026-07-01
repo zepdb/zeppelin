@@ -224,6 +224,38 @@ async fn test_local_backend_lifecycle() {
     assert!(!store.exists(&key).await.unwrap());
 }
 
+/// Test local backend supports atomic create semantics used by namespace creation.
+#[tokio::test]
+async fn test_local_backend_put_if_not_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StorageConfig {
+        backend: StorageBackend::Local,
+        bucket: dir.path().to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+    let store = ZeppelinStore::from_config(&config).expect("local backend should build");
+    let key = format!("test-local/{}", uuid::Uuid::new_v4());
+
+    store
+        .put_if_not_exists(&key, Bytes::from("first"), "test-ns")
+        .await
+        .expect("first create should succeed");
+
+    let result = store
+        .put_if_not_exists(&key, Bytes::from("second"), "test-ns")
+        .await;
+
+    match result {
+        Err(zeppelin::error::ZeppelinError::NamespaceAlreadyExists { namespace }) => {
+            assert_eq!(namespace, "test-ns")
+        }
+        other => panic!("expected NamespaceAlreadyExists, got: {other:?}"),
+    }
+
+    let data = store.get(&key).await.unwrap();
+    assert_eq!(data, Bytes::from("first"));
+}
+
 /// Test local backend creates non-existent directory (lines 54-56).
 #[tokio::test]
 async fn test_local_backend_creates_dir() {
