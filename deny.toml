@@ -1,12 +1,12 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+unmaintained = "all"
 yanked = "deny"
-notice = "warn"
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x is used for persisted internal binary formats; replacement requires a compatibility migration outside this stabilization pass." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is transitive through object_store 0.11; removing it requires a larger object_store/TLS stack upgrade." },
+]
 
 [licenses]
-unlicensed = "deny"
-copyleft = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -23,7 +23,7 @@ allow = [
 confidence-threshold = 0.8
 
 [[licenses.clarify]]
-name = "ring"
+crate = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
