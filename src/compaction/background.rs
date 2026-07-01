@@ -87,7 +87,7 @@ pub async fn compaction_loop(
                     {
                         Ok(result) => {
                             crate::metrics::COMPACTIONS_TOTAL
-                                .with_label_values(&[&ns.name, "success"])
+                                .with_label_values(&[ns.name.as_str(), "success"])
                                 .inc();
                             // Invalidate manifest cache so queries see new segment.
                             manifest_cache.invalidate(&ns.name);
@@ -100,7 +100,7 @@ pub async fn compaction_loop(
                         }
                         Err(e) => {
                             crate::metrics::COMPACTIONS_TOTAL
-                                .with_label_values(&[&ns.name, "failure"])
+                                .with_label_values(&[ns.name.as_str(), "failure"])
                                 .inc();
                             warn!(namespace = %ns.name, error = %e, "compaction failed");
                         }

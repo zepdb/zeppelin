@@ -37,10 +37,6 @@ impl ZeppelinStore {
                     if let Some(ref secret) = config.s3_secret_access_key {
                         builder = builder.with_secret_access_key(secret);
                     }
-                    if config.s3_allow_http {
-                        builder = builder.with_allow_http(true);
-                    }
-
                     // Enable conditional PUT (ETag-based CAS) — required for
                     // manifest conflict detection and lease CAS operations.
                     builder = builder.with_conditional_put(S3ConditionalPut::ETagMatch);
@@ -48,6 +44,7 @@ impl ZeppelinStore {
                     // Connection pool tuning: increase idle connections and timeouts
                     // to prevent 28% sustained throughput degradation observed in Run-007.
                     let client_options = ClientOptions::new()
+                        .with_allow_http(config.s3_allow_http)
                         .with_pool_max_idle_per_host(64)
                         .with_timeout(std::time::Duration::from_secs(30))
                         .with_connect_timeout(std::time::Duration::from_secs(10))

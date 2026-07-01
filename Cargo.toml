@@ -20,7 +20,6 @@ path = "src/main.rs"
 [dependencies]
 # HTTP server
 axum = { version = "0.7", features = ["macros"] }
-tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors", "timeout", "limit"] }
 
 # Async runtime
@@ -57,7 +56,7 @@ bytes = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Metrics
-prometheus = "0.13"
+prometheus = { version = "0.14", default-features = false }
 lazy_static = "1"
 
 # Config
@@ -65,9 +64,6 @@ dotenvy = "0.15"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
-
-# URL handling
-url = "2"
 
 # Async trait
 async-trait = "0.1"
@@ -89,7 +85,7 @@ unicode-segmentation = "1.11"
 rust-stemmers = "1.2"
 
 # CPU profiling (optional, behind "profiling" feature)
-pprof = { version = "0.14", features = ["flamegraph", "prost-codec"], optional = true }
+pprof = { version = "0.15", features = ["flamegraph", "prost-codec"], optional = true }
 
 [profile.release]
 debug = 1
