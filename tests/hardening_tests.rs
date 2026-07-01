@@ -1,21 +1,26 @@
 mod common;
 
-use common::server::{cleanup_ns, create_ns_api, start_test_server, start_test_server_with_config};
+use common::server::{
+    cleanup_ns, create_ns_api, start_test_server, start_test_server_with_compactor,
+    start_test_server_with_config,
+};
 use common::vectors::random_vectors;
 
 use zeppelin::config::Config;
-use zeppelin::wal::WalReader;
 
 // --- Test 1: Oversized batch returns 400 ---
 
 #[tokio::test]
 async fn test_oversized_batch_400() {
-    let (base_url, harness) = start_test_server().await;
+    let mut config = Config::load(None).unwrap();
+    config.server.max_batch_size = 10;
+
+    let (base_url, harness, _cache, _dir) = start_test_server_with_config(Some(config)).await;
     let client = reqwest::Client::new();
     let ns = create_ns_api(&client, &base_url, 4).await;
 
-    // Upsert 10,001 vectors (exceeds default max_batch_size of 10,000)
-    let vectors: Vec<serde_json::Value> = (0..10_001)
+    // Upsert 11 vectors (exceeds configured max_batch_size of 10)
+    let vectors: Vec<serde_json::Value> = (0..11)
         .map(|i| {
             serde_json::json!({
                 "id": format!("v_{i}"),
@@ -260,7 +265,8 @@ async fn test_request_timeout_applied() {
 
 #[tokio::test]
 async fn test_cache_populated_after_segment_query() {
-    let (base_url, harness, cache, _cache_dir) = start_test_server_with_config(None).await;
+    let (base_url, harness, cache, _cache_dir, compactor) =
+        start_test_server_with_compactor(None).await;
     let client = reqwest::Client::new();
     let ns = create_ns_api(&client, &base_url, 8).await;
 
@@ -273,13 +279,6 @@ async fn test_cache_populated_after_segment_query() {
         .await
         .unwrap();
 
-    // Trigger manual compaction
-    let compactor = zeppelin::compaction::Compactor::new(
-        harness.store.clone(),
-        WalReader::new(harness.store.clone()),
-        zeppelin::config::CompactionConfig::default(),
-        zeppelin::config::IndexingConfig::default(),
-    );
     let compact_result = compactor.compact(&ns).await;
 
     if let Ok(result) = compact_result {

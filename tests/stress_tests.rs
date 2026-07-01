@@ -376,11 +376,7 @@ async fn test_stress_rapid_namespace_create_delete() {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            404,
-            "namespace {ns} should be deleted (404)"
-        );
+        assert_eq!(resp.status(), 404, "namespace {ns} should be deleted (404)");
     }
 
     // Re-create one to prove cleanup was complete
