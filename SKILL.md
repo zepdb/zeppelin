@@ -5,7 +5,7 @@ description: Use the Zeppelin vector search engine to store and search text usin
 
 # Zeppelin Vector Search
 
-An S3-native vector search engine. Two services:
+An S3-native vector search engine. This repository implements the Zeppelin API (Rust, `src/`) and a small Embed API (Python, `embed_service/`). The hosted deployment exposes both:
 
 - **Zeppelin API**: `http://44.242.236.80:8080` — vector storage and search
 - **Embed API**: `http://44.242.236.80:8090` — text → vector encoding (all-MiniLM-L6-v2, 384-dim)
@@ -48,7 +48,7 @@ curl -X POST http://44.242.236.80:8090/v1/embed \
   -d '{"texts": ["protein structure prediction"]}'
 
 # Query with the resulting vector
-curl -X POST http://44.242.236.80:8080/v1/namespaces/my-notes/query \
+curl -X POST http://44.242.236.80:8080/v1/namespaces/<uuid>/query \
   -H "Content-Type: application/json" \
   -d '{"vector": [0.023, ...384 floats], "top_k": 5, "consistency": "strong"}'
 ```
@@ -82,7 +82,7 @@ DELETE /v1/namespaces/:ns/vectors        Delete: {"ids": ["id1", "id2"]}
 **Query:**
 ```
 POST   /v1/namespaces/:ns/query          Vector search: {"vector": [...], "top_k": 10}
-POST   /v1/namespaces/:ns/query          BM25 search:   {"rank_by": ["bm25", "field", "query"], "top_k": 10}
+POST   /v1/namespaces/:ns/query          BM25 search:   {"rank_by": ["field", "BM25", "query"], "top_k": 10}
 ```
 
 ## Filters
@@ -90,9 +90,9 @@ POST   /v1/namespaces/:ns/query          BM25 search:   {"rank_by": ["bm25", "fi
 Add `"filter"` to any query:
 ```json
 {"op": "eq", "field": "category", "value": "science"}
-{"op": "and", "filters": [{"op": "gte", "field": "score", "value": 0.8}, {"op": "eq", "field": "type", "value": "article"}]}
+{"op": "and", "filters": [{"op": "range", "field": "score", "gte": 0.8}, {"op": "eq", "field": "type", "value": "article"}]}
 ```
-Operators: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `contains`, `not`, `and`, `or`
+Operators: `eq`, `not_eq`, `range` (`gt`, `gte`, `lt`, `lte` fields), `in`, `not_in`, `contains`, `contains_all_tokens`, `contains_token_sequence`, `not`, `and`, `or`
 
 ## Rate Limits
 
@@ -100,38 +100,9 @@ Operators: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `contains`, `n
 - Embed API: 5 req/s per IP (CPU-intensive)
 - Returns HTTP 429 if exceeded
 
-## Client SDKs (Alternative to curl)
+## Client Generation
 
-Install the official SDK for a better developer experience:
-
-**Python:**
-```bash
-pip install zeppelin-python
-```
-```python
-from zeppelin import ZeppelinClient
-
-client = ZeppelinClient("http://44.242.236.80:8080")
-ns = client.create_namespace(dimensions=384)  # Returns UUID name — save it!
-client.upsert(ns["name"], vectors=[{"id": "doc1", "values": [...], "attributes": {"title": "hello"}}])
-results = client.query(ns["name"], vector=[...], top_k=10)
-```
-
-**TypeScript:**
-```bash
-npm install zeppelin-typescript
-```
-```typescript
-import { ZeppelinClient } from 'zeppelin-typescript';
-
-const client = new ZeppelinClient('http://44.242.236.80:8080');
-const ns = await client.createNamespace({ dimensions: 384 }); // Returns UUID name — save it!
-await client.upsert(ns.name, { vectors: [{ id: 'doc1', values: [...], attributes: { title: 'hello' } }] });
-const results = await client.query(ns.name, { vector: [...], topK: 10 });
-```
-
-Both SDKs support: vector search, BM25 full-text search, composable filters, FTS config, typed errors.
-Repos: [zepdb/zeppelin-py](https://github.com/zepdb/zeppelin-py) | [zepdb/zeppelin-typescript](https://github.com/zepdb/zeppelin-typescript)
+Use curl directly or generate a client from `api/zeppelin-api.yaml`. This repository does not maintain generated Python or TypeScript SDK packages.
 
 ## Health Check
 
