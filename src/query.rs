@@ -82,9 +82,10 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
     // a newer manifest whose fragments may have been deleted by compaction.
     // Short-circuit: skip WAL scan if no uncompacted fragments exist.
     let wal_start = std::time::Instant::now();
+    let mut wal_deleted_ids = HashSet::new();
     let wal_results = match consistency {
         ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
-            let (results, frag_count) = wal_scan(
+            let scan_result = wal_scan(
                 wal_reader,
                 namespace,
                 &manifest,
@@ -93,8 +94,9 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
                 distance_metric,
             )
             .await?;
-            scanned_fragments = frag_count;
-            results
+            scanned_fragments = scan_result.fragment_count;
+            wal_deleted_ids = scan_result.deleted_ids;
+            scan_result.results
         }
         _ => Vec::new(),
     };
@@ -143,9 +145,17 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         "query phase: segment search"
     );
 
-    // Merge results
+    // Merge results — pass WAL tombstones so segment results for deleted
+    // vectors are excluded (a delete of an already-compacted vector exists
+    // only as a WAL tombstone until the next compaction).
     let merge_start = std::time::Instant::now();
-    let results = merge_results(wal_results, segment_results, top_k, consistency);
+    let results = merge_results(
+        wal_results,
+        segment_results,
+        top_k,
+        consistency,
+        &wal_deleted_ids,
+    );
     let merge_duration = merge_start.elapsed();
     debug!(
         merge_duration_ms = merge_duration.as_millis() as u64,
@@ -160,6 +170,17 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
     })
 }
 
+/// Result of an ANN WAL scan.
+struct WalScanResult {
+    /// Scored search results, sorted ascending by distance.
+    results: Vec<SearchResult>,
+    /// Number of WAL fragments scanned.
+    fragment_count: usize,
+    /// IDs that were explicitly deleted in the WAL.
+    /// Used by the merge step to exclude these from segment results.
+    deleted_ids: HashSet<String>,
+}
+
 /// Scan all uncompacted WAL fragments, deduplicate, apply deletes, score, and filter.
 /// Reads fragments from the provided manifest snapshot (not re-reading manifest from S3).
 async fn wal_scan(
@@ -169,7 +190,7 @@ async fn wal_scan(
     query: &[f32],
     filter: Option<&Filter>,
     distance_metric: DistanceMetric,
-) -> Result<(Vec<SearchResult>, usize)> {
+) -> Result<WalScanResult> {
     let refs = manifest.uncompacted_fragments().to_vec();
     // Skip checksum validation on query reads — fragments were already
     // validated on write. Saves ~11% CPU on fragment deserialization.
@@ -179,7 +200,11 @@ async fn wal_scan(
     let frag_count = fragments.len();
 
     if fragments.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok(WalScanResult {
+            results: Vec::new(),
+            fragment_count: 0,
+            deleted_ids: HashSet::new(),
+        });
     }
 
     // Collect all delete tombstones
@@ -242,7 +267,11 @@ async fn wal_scan(
         "WAL scan complete"
     );
 
-    Ok((results, frag_count))
+    Ok(WalScanResult {
+        results,
+        fragment_count: frag_count,
+        deleted_ids,
+    })
 }
 
 /// Search a single segment via IVF-Flat or Hierarchical index.
@@ -865,21 +894,27 @@ fn merge_bm25_results(
 ///
 /// For Strong consistency: filter segment results to remove any IDs that were
 /// deleted or updated in the WAL, then merge both sorted lists and truncate to top_k.
+///
+/// `wal_deleted_ids` contains IDs explicitly deleted in the WAL — these must
+/// be excluded from segment results even though they produce no WAL result
+/// (a tombstone for an already-compacted vector has no live WAL entry).
 fn merge_results(
     wal_results: Vec<SearchResult>,
     segment_results: Vec<SearchResult>,
     top_k: usize,
     consistency: ConsistencyLevel,
+    wal_deleted_ids: &HashSet<String>,
 ) -> Vec<SearchResult> {
     match consistency {
         ConsistencyLevel::Strong => {
             // WAL results already have the latest state.
-            // Remove segment results whose IDs appear in WAL results (WAL is authoritative).
+            // Remove segment results whose IDs appear in WAL results (WAL is
+            // authoritative) or were deleted in the WAL.
             let wal_ids: HashSet<String> = wal_results.iter().map(|r| r.id.clone()).collect();
             let mut merged: Vec<SearchResult> = wal_results;
 
             for sr in segment_results {
-                if !wal_ids.contains(&sr.id) {
+                if !wal_ids.contains(&sr.id) && !wal_deleted_ids.contains(&sr.id) {
                     merged.push(sr);
                 }
             }
@@ -904,6 +939,71 @@ fn merge_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_result(id: &str, score: f32) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            score,
+            attributes: None,
+        }
+    }
+
+    #[test]
+    fn test_merge_strong_excludes_wal_deleted_segment_results() {
+        // Vector "compacted" lives only in the segment; its WAL tombstone
+        // produces no WAL result. The merge must still drop it.
+        let wal_results = vec![make_result("fresh", 0.1)];
+        let segment_results = vec![make_result("compacted", 0.2), make_result("kept", 0.3)];
+        let deleted: HashSet<String> = ["compacted".to_string()].into_iter().collect();
+
+        let merged = merge_results(
+            wal_results,
+            segment_results,
+            10,
+            ConsistencyLevel::Strong,
+            &deleted,
+        );
+
+        let ids: Vec<&str> = merged.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["fresh", "kept"]);
+    }
+
+    #[test]
+    fn test_merge_strong_wal_overrides_segment() {
+        // Same ID in WAL and segment: WAL version wins, no duplicate.
+        let wal_results = vec![make_result("v1", 0.5)];
+        let segment_results = vec![make_result("v1", 0.1)];
+
+        let merged = merge_results(
+            wal_results,
+            segment_results,
+            10,
+            ConsistencyLevel::Strong,
+            &HashSet::new(),
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "v1");
+        assert_eq!(merged[0].score, 0.5);
+    }
+
+    #[test]
+    fn test_merge_eventual_ignores_tombstones() {
+        // Eventual reads segments only; tombstones are not applied (documented
+        // staleness until next compaction).
+        let segment_results = vec![make_result("a", 0.1)];
+        let deleted: HashSet<String> = ["a".to_string()].into_iter().collect();
+
+        let merged = merge_results(
+            Vec::new(),
+            segment_results,
+            10,
+            ConsistencyLevel::Eventual,
+            &deleted,
+        );
+
+        assert_eq!(merged.len(), 1);
+    }
 
     fn make_segment_ref(cluster_count: usize, has_global_fts: bool) -> SegmentRef {
         SegmentRef {

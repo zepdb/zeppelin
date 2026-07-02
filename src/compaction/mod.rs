@@ -653,6 +653,63 @@ impl Compactor {
             }
         }
 
+        // Quantized artifacts: the SegmentRef records the configured
+        // quantization, so the search path will look for these — they must
+        // exist for every segment, incremental or not.
+        match self.indexing_config.quantization {
+            crate::index::quantization::QuantizationType::Scalar => {
+                use crate::index::quantization::sq::{
+                    serialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
+                };
+
+                let vec_refs: Vec<&[f32]> = vectors.iter().map(|e| e.values.as_slice()).collect();
+                let cal = SqCalibration::calibrate(&vec_refs, dim);
+                self.store
+                    .put(
+                        &sq_calibration_key(namespace, new_segment_id),
+                        cal.to_bytes(),
+                    )
+                    .await?;
+
+                for i in 0..num_clusters {
+                    let cluster_refs: Vec<&[f32]> =
+                        cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                    let codes = cal.encode_batch(&cluster_refs);
+                    let sq_data = serialize_sq_cluster(&cluster_ids[i], &codes, dim)?;
+                    payloads.push((sq_cluster_key(namespace, new_segment_id, i), sq_data));
+                }
+            }
+            crate::index::quantization::QuantizationType::Product => {
+                use crate::index::quantization::pq::{
+                    pq_cluster_key, pq_codebook_key, serialize_pq_cluster, PqCodebook,
+                };
+
+                // Reuse the old segment's codebook — retraining defeats the
+                // point of the incremental path. If it's missing, fail so the
+                // caller falls back to a full retrain.
+                let cb_data = self
+                    .store
+                    .get(&pq_codebook_key(namespace, old_segment_id))
+                    .await?;
+                let codebook = PqCodebook::from_bytes(&cb_data)?;
+                self.store
+                    .put(
+                        &pq_codebook_key(namespace, new_segment_id),
+                        codebook.to_bytes(),
+                    )
+                    .await?;
+
+                for i in 0..num_clusters {
+                    let cluster_refs: Vec<&[f32]> =
+                        cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                    let codes = codebook.encode_batch(&cluster_refs);
+                    let pq_data = serialize_pq_cluster(&cluster_ids[i], &codes, codebook.m)?;
+                    payloads.push((pq_cluster_key(namespace, new_segment_id, i), pq_data));
+                }
+            }
+            crate::index::quantization::QuantizationType::None => {}
+        }
+
         // I/O phase: write all in parallel
         let write_futs: Vec<_> = payloads
             .iter()

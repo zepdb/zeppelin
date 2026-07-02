@@ -536,6 +536,107 @@ async fn test_query_after_compaction() {
     harness.cleanup().await;
 }
 
+/// Regression: a delete of an already-compacted vector exists only as a WAL
+/// tombstone (no live WAL entry). Strong queries must not resurrect the
+/// vector from the segment before the next compaction.
+#[tokio::test]
+async fn test_delete_after_compaction_not_returned_strong() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("del-after-compact");
+    let store = &harness.store;
+    let writer = WalWriter::new(store.clone());
+    let wal_reader = WalReader::new(store.clone());
+
+    let manifest = Manifest::new();
+    manifest.write(store, &ns).await.unwrap();
+
+    // Upsert 50 vectors and compact them into a segment
+    let vecs = random_vectors(50, 16);
+    let target_id = vecs[0].id.clone();
+    let query_vec = vecs[0].values.clone();
+    writer.append(&ns, vecs, vec![]).await.unwrap();
+
+    let compactor = test_compactor(store);
+    compactor.compact(&ns).await.unwrap();
+
+    // Sanity: the vector is served from the segment
+    let before = execute_query(QueryParams {
+        store,
+        wal_reader: &wal_reader,
+        namespace: &ns,
+        query: &query_vec,
+        top_k: 5,
+        nprobe: 4,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Cosine,
+        oversample_factor: 3,
+        cache: None,
+        manifest_cache: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(before.results[0].id, target_id);
+    assert_eq!(before.scanned_fragments, 0);
+    assert_eq!(before.scanned_segments, 1);
+
+    // Delete the compacted vector — this lands as a tombstone-only WAL fragment
+    writer
+        .append(&ns, vec![], vec![target_id.clone()])
+        .await
+        .unwrap();
+
+    // Strong query must not return the deleted vector
+    let after = execute_query(QueryParams {
+        store,
+        wal_reader: &wal_reader,
+        namespace: &ns,
+        query: &query_vec,
+        top_k: 5,
+        nprobe: 4,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Cosine,
+        oversample_factor: 3,
+        cache: None,
+        manifest_cache: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        after.results.iter().all(|r| r.id != target_id),
+        "deleted vector {target_id} resurrected from segment in Strong query"
+    );
+    // Other vectors are still served
+    assert!(!after.results.is_empty());
+
+    // After the next compaction the tombstone is applied to the segment,
+    // so the vector stays gone at both consistency levels.
+    compactor.compact(&ns).await.unwrap();
+    let post_compact = execute_query(QueryParams {
+        store,
+        wal_reader: &wal_reader,
+        namespace: &ns,
+        query: &query_vec,
+        top_k: 5,
+        nprobe: 4,
+        filter: None,
+        consistency: ConsistencyLevel::Eventual,
+        distance_metric: DistanceMetric::Cosine,
+        oversample_factor: 3,
+        cache: None,
+        manifest_cache: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        post_compact.results.iter().all(|r| r.id != target_id),
+        "deleted vector {target_id} survived compaction"
+    );
+
+    harness.cleanup().await;
+}
+
 #[tokio::test]
 async fn test_compact_empty_namespace() {
     let harness = TestHarness::new().await;
