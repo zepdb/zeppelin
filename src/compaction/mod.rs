@@ -162,11 +162,14 @@ impl Compactor {
 
         let fragment_refs = manifest.uncompacted_fragments().to_vec();
         let fragments_removed = fragment_refs.len();
-        let last_fragment_id = fragment_refs
-            .iter()
-            .map(|f| f.id)
-            .max()
-            .ok_or_else(|| ZeppelinError::Index("no fragments to compact".into()))?;
+        // Exact set of fragment IDs in this compaction's snapshot. Manifest
+        // removal must use this set, not a max-ULID watermark: a fragment
+        // appended concurrently can sort <= the snapshot max (same-ms ULIDs
+        // or clock skew) and a watermark comparison would silently drop it.
+        let compacted_ids: HashSet<Ulid> = fragment_refs.iter().map(|f| f.id).collect();
+        if compacted_ids.is_empty() {
+            return Err(ZeppelinError::Index("no fragments to compact".into()));
+        }
 
         info!(fragment_count = fragments_removed, "starting compaction");
 
@@ -249,7 +252,7 @@ impl Compactor {
                     fresh_manifest.fencing_token = token;
                 }
 
-                fresh_manifest.remove_compacted_fragments(last_fragment_id);
+                fresh_manifest.remove_compacted_fragments(&compacted_ids);
                 fresh_manifest.pending_deletes = deferred_deletes.clone();
 
                 // Layer 2: CAS.
@@ -524,7 +527,7 @@ impl Compactor {
                 self.config.max_pending_deletes,
                 self.config.max_old_segments,
             );
-            fresh_manifest.remove_compacted_fragments(last_fragment_id);
+            fresh_manifest.remove_compacted_fragments(&compacted_ids);
             fresh_manifest.pending_deletes = deferred_deletes.clone();
 
             // Layer 2: CAS.

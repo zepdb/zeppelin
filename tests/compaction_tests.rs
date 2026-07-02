@@ -256,7 +256,7 @@ async fn test_compact_updates_manifest() {
     manifest.write(store, &ns).await.unwrap();
 
     // Append 2 fragments
-    let _f1 = writer
+    let (f1, _) = writer
         .append(&ns, random_vectors(20, 16), vec![])
         .await
         .unwrap();
@@ -272,10 +272,9 @@ async fn test_compact_updates_manifest() {
 
     assert_eq!(manifest.segments.len(), 1);
     assert!(manifest.active_segment.is_some());
-    assert_eq!(
-        manifest.compaction_watermark,
-        Some(f2.id) // watermark should be the last fragment's ULID
-    );
+    // Watermark records the max removed ULID. Use max(f1, f2), not f2:
+    // same-millisecond ULIDs are not monotonic.
+    assert_eq!(manifest.compaction_watermark, Some(f1.id.max(f2.id)));
     assert!(manifest.fragments.is_empty());
 
     harness.cleanup().await;

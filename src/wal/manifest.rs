@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -109,10 +111,26 @@ impl Manifest {
         self.updated_at = Utc::now();
     }
 
-    /// Remove compacted fragments (those <= watermark).
-    pub fn remove_compacted_fragments(&mut self, watermark: Ulid) {
-        self.fragments.retain(|f| f.id > watermark);
-        self.compaction_watermark = Some(watermark);
+    /// Remove exactly the fragments that were compacted (by ID).
+    ///
+    /// Removal must use the exact snapshot set, not a ULID watermark
+    /// inequality: ULIDs are not monotonic within the same millisecond (and
+    /// not across nodes with clock skew), so a fragment appended concurrently
+    /// with compaction can sort <= the snapshot's max ULID. A watermark
+    /// comparison would drop it from the manifest without its vectors being
+    /// in the segment — silent data loss (see UpsertDeleteCompactQuery.tla).
+    ///
+    /// `compaction_watermark` is still recorded (max removed ID) for
+    /// observability, but is never used to decide removal.
+    pub fn remove_compacted_fragments(&mut self, compacted_ids: &HashSet<Ulid>) {
+        self.fragments.retain(|f| !compacted_ids.contains(&f.id));
+        if let Some(max_id) = compacted_ids.iter().max() {
+            let watermark = match self.compaction_watermark {
+                Some(prev) => prev.max(*max_id),
+                None => *max_id,
+            };
+            self.compaction_watermark = Some(watermark);
+        }
         self.updated_at = Utc::now();
     }
 
@@ -289,6 +307,65 @@ mod tests {
             fts_fields: Vec::new(),
             has_global_fts: false,
         }
+    }
+
+    #[test]
+    fn test_remove_compacted_fragments_exact_set() {
+        // A fragment appended concurrently with compaction can have a ULID
+        // that sorts <= the snapshot's max (same-millisecond random bits).
+        // Removal by exact ID set must retain it.
+        let mut manifest = Manifest::new();
+        let snapshot_a = Ulid::from_parts(1000, 500);
+        let snapshot_b = Ulid::from_parts(1000, 900); // snapshot max
+        let concurrent = Ulid::from_parts(1000, 700); // sorts between a and b
+
+        for id in [snapshot_a, snapshot_b, concurrent] {
+            manifest.add_fragment(FragmentRef {
+                id,
+                vector_count: 1,
+                delete_count: 0,
+                sequence_number: 0,
+            });
+        }
+
+        let compacted: HashSet<Ulid> = [snapshot_a, snapshot_b].into_iter().collect();
+        manifest.remove_compacted_fragments(&compacted);
+
+        assert_eq!(manifest.fragments.len(), 1);
+        assert_eq!(
+            manifest.fragments[0].id, concurrent,
+            "concurrently appended fragment with ULID <= snapshot max must survive"
+        );
+        assert_eq!(manifest.compaction_watermark, Some(snapshot_b));
+    }
+
+    #[test]
+    fn test_watermark_never_regresses() {
+        let mut manifest = Manifest::new();
+        let newer = Ulid::from_parts(2000, 0);
+        let older = Ulid::from_parts(1000, 0);
+
+        manifest.add_fragment(FragmentRef {
+            id: newer,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+        });
+        manifest.remove_compacted_fragments(&[newer].into_iter().collect());
+        assert_eq!(manifest.compaction_watermark, Some(newer));
+
+        manifest.add_fragment(FragmentRef {
+            id: older,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+        });
+        manifest.remove_compacted_fragments(&[older].into_iter().collect());
+        assert_eq!(
+            manifest.compaction_watermark,
+            Some(newer),
+            "watermark is observability metadata and must not move backwards"
+        );
     }
 
     #[test]

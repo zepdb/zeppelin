@@ -332,15 +332,11 @@ async fn test_tla_cache_staleness_during_compaction() {
         "S3 manifest v3 should have 2 fragments"
     );
 
-    // Compactor adds a segment and removes the compacted fragments.
-    // Use max() not last() — ULIDs generated in the same millisecond have
-    // random ordering (Ulid::new() doesn't guarantee monotonicity).
-    let max_frag_id = compacted_manifest
-        .fragments
-        .iter()
-        .map(|f| f.id)
-        .max()
-        .unwrap();
+    // Compactor adds a segment and removes the compacted fragments by exact
+    // ID set (ULIDs generated in the same millisecond have random ordering,
+    // so a watermark comparison is unsafe).
+    let compacted_ids: std::collections::HashSet<ulid::Ulid> =
+        compacted_manifest.fragments.iter().map(|f| f.id).collect();
     compacted_manifest.add_segment(SegmentRef {
         id: "seg_compacted_001".to_string(),
         vector_count: 10,
@@ -351,7 +347,7 @@ async fn test_tla_cache_staleness_during_compaction() {
         fts_fields: vec![],
         has_global_fts: false,
     });
-    compacted_manifest.remove_compacted_fragments(max_frag_id);
+    compacted_manifest.remove_compacted_fragments(&compacted_ids);
     assert_eq!(
         compacted_manifest.segments.len(),
         1,
@@ -479,9 +475,11 @@ async fn test_tla_compaction_retry_starvation() {
     // the initial fragment ULIDs (ULID is not monotonic within the same ms).
     tokio::time::sleep(Duration::from_millis(2)).await;
 
-    // States 2-3: Compactor reads manifest snapshot and "builds index"
-    // Use max() instead of last() to handle ULID non-monotonicity (Bug 40 fix)
-    let last_frag_id = pre_manifest.fragments.iter().map(|f| f.id).max().unwrap();
+    // States 2-3: Compactor reads manifest snapshot and "builds index".
+    // Removal uses the exact snapshot ID set (ULID watermark comparison is
+    // unsafe for same-millisecond ULIDs).
+    let snapshot_ids: std::collections::HashSet<ulid::Ulid> =
+        pre_manifest.fragments.iter().map(|f| f.id).collect();
 
     // The segment the compactor would have built
     let compactor_segment = SegmentRef {
@@ -515,7 +513,7 @@ async fn test_tla_compaction_retry_starvation() {
 
         // Compactor tries to write its compacted manifest -- CONFLICT!
         fresh_manifest.add_segment(compactor_segment.clone());
-        fresh_manifest.remove_compacted_fragments(last_frag_id);
+        fresh_manifest.remove_compacted_fragments(&snapshot_ids);
 
         let cas_result = fresh_manifest.write_conditional(&store, ns, &version).await;
 
@@ -547,7 +545,7 @@ async fn test_tla_compaction_retry_starvation() {
         Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
 
     fresh_manifest.add_segment(compactor_segment.clone());
-    fresh_manifest.remove_compacted_fragments(last_frag_id);
+    fresh_manifest.remove_compacted_fragments(&snapshot_ids);
 
     let cas_result = fresh_manifest.write_conditional(&store, ns, &version).await;
 
