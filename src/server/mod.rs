@@ -14,7 +14,6 @@ use tokio::sync::Semaphore;
 
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
-use crate::compaction::Compactor;
 use crate::config::Config;
 use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::NamespaceManager;
@@ -35,8 +34,6 @@ pub struct AppState {
     pub wal_reader: Arc<WalReader>,
     /// Global server and indexing configuration.
     pub config: Arc<Config>,
-    /// Background WAL-to-segment compactor.
-    pub compactor: Arc<Compactor>,
     /// LRU disk cache for segment data.
     pub cache: Arc<DiskCache>,
     /// In-memory manifest cache with TTL.

@@ -44,13 +44,6 @@ pub async fn start_test_server_with_config(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
     );
 
-    let compactor = Arc::new(Compactor::new(
-        harness.store.clone(),
-        WalReader::new(harness.store.clone()),
-        config.compaction.clone(),
-        config.indexing.clone(),
-    ));
-
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.server.max_concurrent_queries,
     ));
@@ -60,7 +53,6 @@ pub async fn start_test_server_with_config(
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         config: Arc::new(config),
-        compactor,
         cache: cache.clone(),
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
         fts_cache: Arc::new(WalFtsCache::new()),
@@ -125,7 +117,6 @@ pub async fn start_test_server_with_compactor(
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         config: Arc::new(config),
-        compactor: compactor.clone(),
         cache: cache.clone(),
         manifest_cache,
         fts_cache: Arc::new(WalFtsCache::new()),
@@ -216,7 +207,6 @@ pub async fn start_test_server_with_compaction(
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         config: Arc::new(config),
-        compactor,
         cache: cache.clone(),
         manifest_cache,
         fts_cache: Arc::new(WalFtsCache::new()),

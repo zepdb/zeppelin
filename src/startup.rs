@@ -180,7 +180,6 @@ pub async fn build_app(
         wal_writer,
         wal_reader,
         config: Arc::new(config),
-        compactor,
         cache,
         manifest_cache,
         fts_cache,

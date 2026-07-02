@@ -16,7 +16,7 @@
 # max_request_body_mb = 512          # ZEPPELIN_MAX_REQUEST_BODY_MB
 
 [storage]
-# backend = "s3"                     # STORAGE_BACKEND — "s3", "gcs", "azure"
+# backend = "s3"                     # STORAGE_BACKEND — "s3" or "local" (gcs/azure planned)
 # bucket = "zeppelin"                # S3_BUCKET
 
 # S3 / MinIO / R2
@@ -26,17 +26,9 @@
 # s3_secret_access_key = ""          # AWS_SECRET_ACCESS_KEY
 # s3_allow_http = false              # S3_ALLOW_HTTP — "true" for local MinIO
 
-# GCS
-# gcs_service_account_path = ""      # GCS_SERVICE_ACCOUNT_PATH
-
-# Azure Blob Storage
-# azure_account = ""                 # AZURE_ACCOUNT
-# azure_access_key = ""              # AZURE_ACCESS_KEY
-
 [cache]
 # dir = "/var/cache/zeppelin"        # ZEPPELIN_CACHE_DIR
 # max_size_gb = 50                   # ZEPPELIN_CACHE_MAX_SIZE_GB
-# eviction = "lru"
 
 [indexing]
 # default_num_centroids = 256        # ZEPPELIN_DEFAULT_NUM_CENTROIDS
@@ -51,9 +43,6 @@
 # max_wal_fragments_before_compact = 1000
 # retrain_imbalance_threshold = 5.0
 # lease_duration_secs = 300          # per-namespace compaction lease (multi-node)
-
-[consistency]
-# default = "strong"                 # "strong" or "eventual"
 
 [logging]
 # level = "info"                     # RUST_LOG compatible

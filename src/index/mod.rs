@@ -5,7 +5,6 @@
 
 pub mod bitmap;
 pub mod distance;
-pub mod f16_storage;
 pub mod filter;
 pub mod hierarchical;
 pub mod ivf_flat;

@@ -23,7 +23,6 @@ fn hierarchical_test_config() -> IndexingConfig {
         default_num_centroids: 4,
         kmeans_max_iterations: 10,
         hierarchical: true,
-        beam_width: 4,
         leaf_size: Some(10),
         ..Default::default()
     }
@@ -85,7 +84,6 @@ async fn test_build_hierarchical_single_leaf() {
         default_num_centroids: 2,
         kmeans_max_iterations: 10,
         hierarchical: true,
-        beam_width: 2,
         leaf_size: Some(100), // large enough that all 8 vectors fit
         ..Default::default()
     };
@@ -293,7 +291,6 @@ async fn test_search_hierarchical_sq8() {
         default_num_centroids: 4,
         kmeans_max_iterations: 10,
         hierarchical: true,
-        beam_width: 4,
         leaf_size: Some(10),
         quantization: zeppelin::index::quantization::QuantizationType::Scalar,
         ..Default::default()
@@ -355,7 +352,6 @@ async fn test_search_hierarchical_pq() {
         default_num_centroids: 4,
         kmeans_max_iterations: 10,
         hierarchical: true,
-        beam_width: 4,
         leaf_size: Some(10),
         quantization: zeppelin::index::quantization::QuantizationType::Product,
         pq_m: 4,
@@ -452,7 +448,6 @@ async fn test_compact_hierarchical() {
         default_num_centroids: 4,
         kmeans_max_iterations: 10,
         hierarchical: true,
-        beam_width: 4,
         leaf_size: Some(10),
         ..Default::default()
     };
@@ -506,7 +501,6 @@ async fn test_query_hierarchical_detection() {
         default_num_centroids: 4,
         kmeans_max_iterations: 10,
         hierarchical: true,
-        beam_width: 4,
         leaf_size: Some(10),
         ..Default::default()
     };

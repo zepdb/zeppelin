@@ -230,18 +230,6 @@ impl NamespaceManager {
         Ok(())
     }
 
-    /// Update the vector count for a namespace.
-    pub async fn update_vector_count(&self, name: &str, count: u64) -> Result<()> {
-        let mut meta = self.get(name).await?;
-        meta.vector_count = count;
-        meta.updated_at = Utc::now();
-
-        let key = NamespaceMetadata::s3_key(name);
-        self.store.put(&key, meta.to_bytes()?).await?;
-        self.registry.insert(name.to_string(), meta);
-        Ok(())
-    }
-
     /// Scan S3 for existing namespaces and populate the registry.
     /// Used on startup to discover pre-existing data.
     #[instrument(skip(self))]
