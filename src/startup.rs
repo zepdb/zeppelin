@@ -19,10 +19,10 @@ use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget};
 use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::NamespaceManager;
-use crate::server::routes::build_router;
+use crate::server::build_router;
 use crate::server::AppState;
 use crate::storage::ZeppelinStore;
-use crate::wal::batch_writer::BatchWalWriter;
+use crate::wal::BatchWalWriter;
 use crate::wal::{LeaseManager, WalReader, WalWriter};
 
 /// Resolve the configuration file path.

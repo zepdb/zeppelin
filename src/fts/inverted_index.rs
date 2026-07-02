@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::bm25::{self, Bm25Params};
 use crate::fts::tokenizer::tokenize_text;
-use crate::fts::types::FtsFieldConfig;
+use crate::fts::FtsFieldConfig;
 use crate::types::AttributeValue;
 
 /// Magic bytes for FTS inverted index files.

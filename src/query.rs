@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use serde::Serialize;
 use tracing::{debug, instrument};
 
 use crate::cache::manifest_cache::ManifestCache;
@@ -10,19 +11,31 @@ use crate::fts::bm25::Bm25Params;
 use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
 use crate::fts::rank_by::{evaluate_rank_by, RankBy};
 use crate::fts::tokenizer::tokenize_text;
-use crate::fts::types::FtsFieldConfig;
 use crate::fts::wal_cache::WalFtsCache;
 use crate::fts::wal_scan::wal_bm25_scan;
+use crate::fts::FtsFieldConfig;
 use crate::index::distance::compute_distance;
 use crate::index::filter::evaluate_filter;
 use crate::index::HierarchicalIndex;
 use crate::index::IvfFlatIndex;
-use crate::server::handlers::query::QueryResponse;
 use crate::storage::ZeppelinStore;
 use crate::types::{ConsistencyLevel, DistanceMetric, Filter, SearchResult};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 use crate::wal::WalReader;
+
+/// Query result containing ranked search results and scan statistics.
+///
+/// Serialized directly as the HTTP query response body.
+#[derive(Debug, Serialize)]
+pub struct QueryResponse {
+    /// Ranked search results ordered by relevance.
+    pub results: Vec<SearchResult>,
+    /// Number of WAL fragments scanned during the query.
+    pub scanned_fragments: usize,
+    /// Number of compacted segments scanned during the query.
+    pub scanned_segments: usize,
+}
 
 /// Parameters for a vector query, grouped to avoid excessive function arguments.
 pub struct QueryParams<'a> {

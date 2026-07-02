@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
 use crate::error::{Result, ZeppelinError};
-use crate::fts::types::FtsFieldConfig;
+use crate::fts::FtsFieldConfig;
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, IndexType};
 

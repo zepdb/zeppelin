@@ -1,5 +1,3 @@
-/// Batched WAL writer for high-throughput ingestion.
-pub mod batch_writer;
 /// WAL fragment serialization and checksum validation.
 pub mod fragment;
 /// Namespace lease management (fencing tokens, expiry).
@@ -15,4 +13,4 @@ pub use fragment::WalFragment;
 pub use lease::{Lease, LeaseManager};
 pub use manifest::{Manifest, ManifestVersion};
 pub use reader::WalReader;
-pub use writer::WalWriter;
+pub use writer::{BatchWalWriter, WalWriter};

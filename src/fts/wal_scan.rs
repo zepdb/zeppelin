@@ -13,8 +13,8 @@ use tracing::debug;
 use crate::fts::bm25::{self, Bm25Params};
 use crate::fts::rank_by::{evaluate_rank_by, RankBy};
 use crate::fts::tokenizer::tokenize_text;
-use crate::fts::types::FtsFieldConfig;
 use crate::fts::wal_cache::WalFtsCache;
+use crate::fts::FtsFieldConfig;
 use crate::types::{AttributeValue, SearchResult};
 use crate::wal::fragment::WalFragment;
 

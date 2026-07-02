@@ -6,7 +6,7 @@ use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::error::ZeppelinError;
-use crate::fts::types::FtsFieldConfig;
+use crate::fts::FtsFieldConfig;
 use crate::namespace::manager::NamespaceMetadata;
 use crate::server::AppState;
 use crate::types::DistanceMetric;

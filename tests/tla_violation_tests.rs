@@ -316,8 +316,8 @@ async fn test_tla_namespace_delete_compaction_zombie() {
 /// deleted namespace instead of recreating the manifest from default.
 #[tokio::test]
 async fn test_tla_namespace_delete_batch_append_zombie() {
-    use zeppelin::wal::batch_writer::BatchWalWriter;
     use zeppelin::wal::fragment::WalFragment;
+    use zeppelin::wal::BatchWalWriter;
 
     let store = mem_store();
     let ns = "tla-zombie-batch-ns";

@@ -8,8 +8,7 @@ pub mod global_index;
 pub mod inverted_index;
 pub mod rank_by;
 pub mod tokenizer;
-pub mod types;
 pub mod wal_cache;
 pub mod wal_scan;
 
-pub use types::{FtsFieldConfig, FtsLanguage};
+pub use tokenizer::{FtsFieldConfig, FtsLanguage};

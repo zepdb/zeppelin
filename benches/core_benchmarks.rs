@@ -12,7 +12,7 @@ use rand::Rng;
 use zeppelin::fts::bm25::{self, Bm25Params};
 use zeppelin::fts::inverted_index::InvertedIndex;
 use zeppelin::fts::tokenizer::tokenize_text;
-use zeppelin::fts::types::FtsFieldConfig;
+use zeppelin::fts::FtsFieldConfig;
 use zeppelin::index::bitmap::build::build_cluster_bitmaps;
 use zeppelin::index::bitmap::evaluate::evaluate_filter_bitmap;
 use zeppelin::index::distance::{

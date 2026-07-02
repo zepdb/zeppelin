@@ -14,7 +14,7 @@ use zeppelin::compaction::Compactor;
 use zeppelin::config::Config;
 use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::NamespaceManager;
-use zeppelin::server::routes::build_router;
+use zeppelin::server::build_router;
 use zeppelin::server::AppState;
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::{WalReader, WalWriter};

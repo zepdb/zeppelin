@@ -25,11 +25,11 @@ fn fts_e2e_config() -> Config {
     config
 }
 
-fn fts_configs() -> HashMap<String, zeppelin::fts::types::FtsFieldConfig> {
+fn fts_configs() -> HashMap<String, zeppelin::fts::FtsFieldConfig> {
     let mut m = HashMap::new();
     m.insert(
         "content".to_string(),
-        zeppelin::fts::types::FtsFieldConfig {
+        zeppelin::fts::FtsFieldConfig {
             stemming: false,
             remove_stopwords: false,
             ..Default::default()
@@ -270,7 +270,7 @@ async fn test_fts_e2e_multi_field_with_compaction() {
     let mut fts = HashMap::new();
     fts.insert(
         "title".to_string(),
-        zeppelin::fts::types::FtsFieldConfig {
+        zeppelin::fts::FtsFieldConfig {
             stemming: false,
             remove_stopwords: false,
             ..Default::default()
@@ -278,7 +278,7 @@ async fn test_fts_e2e_multi_field_with_compaction() {
     );
     fts.insert(
         "body".to_string(),
-        zeppelin::fts::types::FtsFieldConfig {
+        zeppelin::fts::FtsFieldConfig {
             stemming: false,
             remove_stopwords: false,
             ..Default::default()

@@ -11,7 +11,7 @@ use ulid::Ulid;
 use crate::config::{CompactionConfig, IndexingConfig};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
-use crate::fts::types::FtsFieldConfig;
+use crate::fts::FtsFieldConfig;
 use crate::index::hierarchical::build::{build_hierarchical, load_hierarchical};
 use crate::index::ivf_flat::build::{
     attrs_key, build_ivf_flat, cluster_key, deserialize_attrs, deserialize_cluster,

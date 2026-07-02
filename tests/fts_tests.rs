@@ -4,7 +4,7 @@ use common::server::{cleanup_ns, create_ns_api_fts, start_test_server_with_compa
 
 use std::collections::HashMap;
 use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
-use zeppelin::fts::types::FtsFieldConfig;
+use zeppelin::fts::FtsFieldConfig;
 use zeppelin::types::{AttributeValue, VectorEntry};
 
 // ---------------------------------------------------------------------------

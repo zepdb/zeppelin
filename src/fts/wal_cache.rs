@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use ulid::Ulid;
 
 use crate::fts::tokenizer::tokenize_text;
-use crate::fts::types::FtsFieldConfig;
+use crate::fts::FtsFieldConfig;
 use crate::types::AttributeValue;
 use crate::wal::fragment::WalFragment;
 

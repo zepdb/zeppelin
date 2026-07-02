@@ -22,11 +22,11 @@ fn fts_stress_config() -> Config {
     config
 }
 
-fn fts_configs() -> HashMap<String, zeppelin::fts::types::FtsFieldConfig> {
+fn fts_configs() -> HashMap<String, zeppelin::fts::FtsFieldConfig> {
     let mut m = HashMap::new();
     m.insert(
         "content".to_string(),
-        zeppelin::fts::types::FtsFieldConfig {
+        zeppelin::fts::FtsFieldConfig {
             stemming: false,
             remove_stopwords: false,
             ..Default::default()

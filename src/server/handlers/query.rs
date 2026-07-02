@@ -1,13 +1,14 @@
 use axum::extract::{Path, State};
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::{info, instrument};
 
 use crate::error::ZeppelinError;
 use crate::fts::rank_by::RankBy;
 use crate::query;
+use crate::query::QueryResponse;
 use crate::server::AppState;
-use crate::types::{ConsistencyLevel, Filter, SearchResult};
+use crate::types::{ConsistencyLevel, Filter};
 
 use super::ApiError;
 
@@ -35,17 +36,6 @@ pub struct QueryRequest {
     /// Number of IVF clusters to probe (defaults to server config).
     #[serde(default)]
     pub nprobe: Option<usize>,
-}
-
-/// Response body containing ranked search results and scan statistics.
-#[derive(Debug, Serialize)]
-pub struct QueryResponse {
-    /// Ranked search results ordered by relevance.
-    pub results: Vec<SearchResult>,
-    /// Number of WAL fragments scanned during the query.
-    pub scanned_fragments: usize,
-    /// Number of compacted segments scanned during the query.
-    pub scanned_segments: usize,
 }
 
 /// Query handler using direct serde_json deserialization (skips Axum's

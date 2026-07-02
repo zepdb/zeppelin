@@ -96,7 +96,7 @@ pub fn evaluate_filter(filter: &Filter, attributes: &HashMap<String, AttributeVa
                 AttributeValue::String(s) => s.as_str(),
                 _ => return false,
             };
-            let config = crate::fts::types::FtsFieldConfig::default();
+            let config = crate::fts::FtsFieldConfig::default();
             let doc_tokens: std::collections::HashSet<String> =
                 crate::fts::tokenizer::tokenize_text(text, &config, false)
                     .into_iter()
@@ -116,7 +116,7 @@ pub fn evaluate_filter(filter: &Filter, attributes: &HashMap<String, AttributeVa
                 AttributeValue::String(s) => s.as_str(),
                 _ => return false,
             };
-            let config = crate::fts::types::FtsFieldConfig::default();
+            let config = crate::fts::FtsFieldConfig::default();
             let doc_tokens = crate::fts::tokenizer::tokenize_text(text, &config, false);
             let query_tokens: Vec<String> = tokens
                 .iter()

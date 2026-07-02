@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::IndexingConfig;
 use crate::error::Result;
 use crate::index::quantization::QuantizationType;
-use crate::index::traits::VectorIndex;
+use crate::index::VectorIndex;
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, Filter, SearchResult, VectorEntry};
 

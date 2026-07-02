@@ -11,8 +11,8 @@ use zeppelin::index::distance::{
 };
 use zeppelin::index::filter::evaluate_filter;
 use zeppelin::index::ivf_flat::build::centroids_key;
-use zeppelin::index::traits::VectorIndex;
 use zeppelin::index::IvfFlatIndex;
+use zeppelin::index::VectorIndex;
 use zeppelin::types::{AttributeValue, DistanceMetric, Filter};
 
 use std::collections::HashMap;

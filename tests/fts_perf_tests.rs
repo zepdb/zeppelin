@@ -7,7 +7,7 @@ use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 use std::time::Instant;
 use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
-use zeppelin::fts::types::FtsFieldConfig;
+use zeppelin::fts::FtsFieldConfig;
 
 fn fts_perf_config() -> Config {
     let mut config = Config::load(None).unwrap();
