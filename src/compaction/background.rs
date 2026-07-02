@@ -1,17 +1,175 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{debug, info, warn};
+use chrono::Utc;
+use tracing::{debug, error, info, warn};
 
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
-use crate::error::ZeppelinError;
+use crate::error::{Result, ZeppelinError};
+use crate::fts::FtsFieldConfig;
 use crate::namespace::NamespaceManager;
 use crate::storage::ZeppelinStore;
+use crate::wal::Lease;
 use crate::wal::LeaseManager;
 use crate::wal::Manifest;
 
-use super::Compactor;
+use super::{CompactionResult, Compactor};
+
+/// Lease-renewal heartbeat for a running compaction (Task 2 Phase A).
+///
+/// Renews the namespace lease at `lease_duration / 3` intervals so a
+/// compaction that outlasts the lease duration keeps its lease (invariant
+/// A1). Renewal goes through `LeaseManager::renew` — the existing CAS on
+/// the lease object; the fencing token is never bumped, only the expiry
+/// extends.
+///
+/// If a renewal fails because the lease was taken over (`LeaseExpired`),
+/// or the last successfully-renewed expiry has passed (we can no longer
+/// PROVE we hold the lease), the heartbeat flips `lease_lost` and stops.
+/// The compactor checks that flag before every manifest CAS attempt and
+/// aborts (invariant A2). Transient storage errors are retried at the next
+/// tick as long as the wall-clock expiry has not passed.
+struct LeaseHeartbeat {
+    lease_lost: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl LeaseHeartbeat {
+    fn spawn(lease_manager: Arc<LeaseManager>, namespace: String, lease: Lease) -> Self {
+        let lease_lost = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&lease_lost);
+        // Renew at <= lease_duration / 3: two consecutive renewal attempts
+        // still fit inside the remaining lease window, so a single missed
+        // tick (transient S3 error) does not lose the lease.
+        let interval = lease_manager.lease_duration() / 3;
+
+        let handle = tokio::spawn(async move {
+            let mut current = lease;
+            loop {
+                tokio::time::sleep(interval).await;
+
+                match lease_manager.renew(&namespace, &current).await {
+                    Ok(renewed) => {
+                        crate::metrics::COMPACTION_LEASE_RENEWALS_TOTAL
+                            .with_label_values(&[namespace.as_str()])
+                            .inc();
+                        debug!(
+                            namespace = %namespace,
+                            fencing_token = renewed.fencing_token,
+                            expires_at = %renewed.expires_at,
+                            "compaction lease renewed (heartbeat)"
+                        );
+                        current = renewed;
+                    }
+                    Err(ZeppelinError::LeaseExpired { .. }) => {
+                        // Lease stolen / expired-and-taken: signal abort.
+                        crate::metrics::COMPACTION_LEASE_LOST_TOTAL
+                            .with_label_values(&[namespace.as_str()])
+                            .inc();
+                        error!(
+                            namespace = %namespace,
+                            fencing_token = current.fencing_token,
+                            "compaction lease lost mid-flight (taken over by another node); \
+                             signaling compaction abort"
+                        );
+                        flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(e) => {
+                        // Transient renewal failure. If our last confirmed
+                        // expiry has passed we can no longer prove we hold
+                        // the lease — treat as lost (fail loud). Otherwise
+                        // retry at the next tick.
+                        if current.expires_at <= Utc::now() {
+                            crate::metrics::COMPACTION_LEASE_LOST_TOTAL
+                                .with_label_values(&[namespace.as_str()])
+                                .inc();
+                            error!(
+                                namespace = %namespace,
+                                error = %e,
+                                expires_at = %current.expires_at,
+                                "compaction lease renewal failed past expiry; \
+                                 signaling compaction abort"
+                            );
+                            flag.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        warn!(
+                            namespace = %namespace,
+                            error = %e,
+                            "compaction lease renewal failed (transient); retrying next tick"
+                        );
+                    }
+                }
+            }
+        });
+
+        Self { lease_lost, handle }
+    }
+
+    /// Stop the heartbeat. The compaction is done (committed or aborted);
+    /// the lease no longer needs extending.
+    fn stop(self) {
+        self.handle.abort();
+    }
+}
+
+/// Run one leased compaction cycle for a namespace.
+///
+/// This is the single production entry point for lease-protected
+/// compaction:
+/// 1. acquire the per-namespace lease,
+/// 2. start the lease-renewal heartbeat (invariant A1),
+/// 3. compact with the fencing token and the heartbeat's abort signal
+///    (invariant A2: renewal failure aborts before the final manifest CAS),
+/// 4. stop the heartbeat and release the lease (best-effort — never an
+///    error, and never deletes the lease object).
+///
+/// `LeaseHeld` from the acquire step propagates so the caller can skip
+/// quietly (another node is compacting this namespace).
+pub async fn compact_namespace_under_lease(
+    compactor: &Compactor,
+    lease_manager: &Arc<LeaseManager>,
+    namespace: &str,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+) -> Result<CompactionResult> {
+    let lease = lease_manager.acquire(namespace).await?;
+    info!(
+        namespace = %namespace,
+        fencing_token = lease.fencing_token,
+        lease_expires_at = %lease.expires_at,
+        "compaction lease acquired, starting compaction"
+    );
+
+    let heartbeat = LeaseHeartbeat::spawn(
+        Arc::clone(lease_manager),
+        namespace.to_string(),
+        lease.clone(),
+    );
+
+    let result = compactor
+        .compact_with_fts_signaled(
+            namespace,
+            Some(lease.fencing_token),
+            fts_configs,
+            Some(Arc::clone(&heartbeat.lease_lost)),
+        )
+        .await;
+
+    heartbeat.stop();
+
+    // Best-effort release; never blocks or fails the cycle. If the lease
+    // was taken over, release() detects the holder/token mismatch and
+    // returns Ok without touching the thief's lease.
+    if let Err(e) = lease_manager.release(namespace, &lease).await {
+        warn!(namespace = %namespace, error = %e, "lease release failed (best-effort)");
+    }
+
+    result
+}
 
 /// Eagerly warm the active segment's index metadata (IVF-Flat centroids or
 /// hierarchical tree_meta.json) into the tiered cache and pin it.
@@ -144,34 +302,24 @@ pub async fn compaction_loop(
         for ns in &namespaces {
             match compactor.should_compact(&ns.name).await {
                 Ok(true) => {
-                    // Acquire the per-namespace lease so only one node
-                    // compacts a namespace at a time. LeaseHeld means another
-                    // node is on it — skip quietly, it isn't a failure.
-                    let lease = match lease_manager.acquire(&ns.name).await {
-                        Ok(lease) => lease,
+                    // Compact under the per-namespace lease (acquire →
+                    // heartbeat → compact → release). LeaseHeld means
+                    // another node is on it — skip quietly, not a failure.
+                    match compact_namespace_under_lease(
+                        &compactor,
+                        &lease_manager,
+                        &ns.name,
+                        &ns.full_text_search,
+                    )
+                    .await
+                    {
                         Err(ZeppelinError::LeaseHeld { holder, .. }) => {
                             debug!(
                                 namespace = %ns.name,
                                 holder = %holder,
                                 "compaction lease held by another node, skipping"
                             );
-                            continue;
                         }
-                        Err(e) => {
-                            warn!(namespace = %ns.name, error = %e, "failed to acquire compaction lease");
-                            continue;
-                        }
-                    };
-
-                    info!(
-                        namespace = %ns.name,
-                        fencing_token = lease.fencing_token,
-                        "triggering compaction"
-                    );
-                    match compactor
-                        .compact_with_fts(&ns.name, Some(lease.fencing_token), &ns.full_text_search)
-                        .await
-                    {
                         Ok(result) => {
                             crate::metrics::COMPACTIONS_TOTAL
                                 .with_label_values(&[ns.name.as_str(), "success"])
@@ -204,11 +352,6 @@ pub async fn compaction_loop(
                                 .inc();
                             warn!(namespace = %ns.name, error = %e, "compaction failed");
                         }
-                    }
-
-                    // Best-effort release; never blocks the loop.
-                    if let Err(e) = lease_manager.release(&ns.name, &lease).await {
-                        warn!(namespace = %ns.name, error = %e, "lease release failed (best-effort)");
                     }
                 }
                 Ok(false) => {

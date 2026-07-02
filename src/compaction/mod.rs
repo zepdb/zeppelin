@@ -44,6 +44,11 @@ pub struct Compactor {
     wal_reader: WalReader,
     config: CompactionConfig,
     indexing_config: IndexingConfig,
+    /// Test-only hook: artificial delay injected after index build and
+    /// before the final manifest CAS loop, simulating a compaction whose
+    /// build phase outlasts the lease duration. Always `None` in production
+    /// (`Compactor::new` never sets it); only `set_test_pre_cas_delay` does.
+    test_pre_cas_delay: Option<Duration>,
 }
 
 impl Compactor {
@@ -59,7 +64,16 @@ impl Compactor {
             wal_reader,
             config,
             indexing_config,
+            test_pre_cas_delay: None,
         }
+    }
+
+    /// Test hook: inject an artificial delay between the index-build phase
+    /// and the final manifest CAS, so tests can hold a compaction in flight
+    /// longer than the lease duration. Not for production use.
+    #[doc(hidden)]
+    pub fn set_test_pre_cas_delay(&mut self, delay: Duration) {
+        self.test_pre_cas_delay = Some(delay);
     }
 
     /// Return a reference to the compaction configuration.
@@ -175,6 +189,28 @@ impl Compactor {
         namespace: &str,
         fencing_token: Option<u64>,
         fts_configs: &HashMap<String, FtsFieldConfig>,
+    ) -> Result<CompactionResult> {
+        self.compact_with_fts_signaled(namespace, fencing_token, fts_configs, None)
+            .await
+    }
+
+    /// Compact with an optional `lease_lost` abort signal.
+    ///
+    /// `lease_lost` is set by the lease-renewal heartbeat
+    /// (`background::LeaseHeartbeat`) when a mid-compaction renewal fails —
+    /// i.e. the lease was stolen or expired-and-taken. The flag is checked
+    /// before EVERY manifest CAS attempt: a compaction whose lease is gone
+    /// aborts with `LeaseExpired` instead of committing (invariant A2 —
+    /// this closes the TOCTOU window between the fencing check and the CAS
+    /// down to one heartbeat interval; the fencing+CAS layers remain the
+    /// backstop for the residual race).
+    #[instrument(skip(self, fts_configs, lease_lost), fields(namespace = namespace))]
+    pub async fn compact_with_fts_signaled(
+        &self,
+        namespace: &str,
+        fencing_token: Option<u64>,
+        fts_configs: &HashMap<String, FtsFieldConfig>,
+        lease_lost: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<CompactionResult> {
         let start = std::time::Instant::now();
 
@@ -333,6 +369,9 @@ impl Compactor {
             // Edge case: all vectors were deleted
             // CAS loop to update manifest
             for attempt in 0..MAX_CAS_RETRIES {
+                // Invariant A2: never commit after the heartbeat reported
+                // the lease lost.
+                check_lease_lost(namespace, lease_lost.as_deref())?;
                 // A missing manifest means the namespace was deleted mid-
                 // compaction. Recreating it from Manifest::default() would
                 // resurrect the namespace (unconditional PUT) — abort instead
@@ -600,8 +639,23 @@ impl Compactor {
             Vec::new()
         };
 
+        // Test-only slow-step injection (see `set_test_pre_cas_delay`):
+        // simulates an index-build phase that outlasts the lease duration.
+        if let Some(delay) = self.test_pre_cas_delay {
+            warn!(
+                delay_ms = delay.as_millis() as u64,
+                "test hook: delaying compaction before final CAS"
+            );
+            tokio::time::sleep(delay).await;
+        }
+
         // 9. CAS loop: re-read manifest, apply changes, write conditionally
         for attempt in 0..MAX_CAS_RETRIES {
+            // Invariant A2: a compaction whose lease-renewal heartbeat
+            // failed must abort BEFORE committing its manifest — the
+            // in-flight segment becomes an orphan (GC's problem), never
+            // a zombie commit.
+            check_lease_lost(namespace, lease_lost.as_deref())?;
             // A missing manifest means the namespace was deleted mid-
             // compaction. Recreating it from Manifest::default() would
             // resurrect the namespace (unconditional PUT) — abort instead
@@ -843,6 +897,31 @@ impl Compactor {
         let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
         Ok((num_clusters, bitmap_fields))
     }
+}
+
+/// Abort check for mid-compaction lease loss (invariant A2).
+///
+/// The lease-renewal heartbeat flips `lease_lost` to `true` when a renewal
+/// fails because another node took the lease over. Called before every
+/// manifest CAS attempt so a fenced-out compaction aborts with a clean
+/// `LeaseExpired` error instead of racing its stale commit.
+fn check_lease_lost(
+    namespace: &str,
+    lease_lost: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    if let Some(flag) = lease_lost {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            error!(
+                namespace = namespace,
+                "aborting compaction before manifest CAS: lease lost mid-compaction \
+                 (renewal failed — another node holds the lease)"
+            );
+            return Err(ZeppelinError::LeaseExpired {
+                namespace: namespace.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Age of a fragment in seconds, derived from its ULID timestamp.

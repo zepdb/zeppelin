@@ -86,6 +86,18 @@ mod inner {
             "Vectors with NaN/inf values skipped during compaction",
             &["namespace"]
         ).unwrap();
+
+        // Mid-compaction lease heartbeat (Task 2 Phase A).
+        pub static ref COMPACTION_LEASE_RENEWALS_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_compaction_lease_renewals_total",
+            "Successful mid-compaction lease renewals (heartbeat)",
+            &["namespace"]
+        ).unwrap();
+        pub static ref COMPACTION_LEASE_LOST_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_compaction_lease_lost_total",
+            "Compactions aborted because the lease was lost mid-flight",
+            &["namespace"]
+        ).unwrap();
     }
 }
 
@@ -123,4 +135,6 @@ pub fn init() {
     lazy_static::initialize(&RATE_LIMITED_TOTAL);
     lazy_static::initialize(&REQUESTS_BY_IP_TOTAL);
     lazy_static::initialize(&NON_FINITE_VECTORS_SKIPPED_TOTAL);
+    lazy_static::initialize(&COMPACTION_LEASE_RENEWALS_TOTAL);
+    lazy_static::initialize(&COMPACTION_LEASE_LOST_TOTAL);
 }

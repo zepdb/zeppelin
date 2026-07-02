@@ -50,6 +50,15 @@ impl LeaseManager {
         }
     }
 
+    /// The lease duration this manager grants and renews with.
+    ///
+    /// Heartbeats (e.g. the compaction lease renewal loop) derive their
+    /// renewal interval from this so the two can never drift apart.
+    #[must_use]
+    pub fn lease_duration(&self) -> Duration {
+        self.lease_duration
+    }
+
     /// Acquire the namespace lease.
     ///
     /// - If no lease exists: creates one with `fencing_token = 1`.

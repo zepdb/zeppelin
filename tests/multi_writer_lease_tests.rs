@@ -17,12 +17,18 @@ mod common;
 use common::harness::TestHarness;
 use common::vectors::random_vectors;
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use zeppelin::compaction::background::compact_namespace_under_lease;
+use zeppelin::compaction::Compactor;
+use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::error::ZeppelinError;
-use zeppelin::wal::lease::LeaseManager;
+use zeppelin::types::VectorEntry;
+use zeppelin::wal::lease::{Lease, LeaseManager};
 use zeppelin::wal::manifest::FragmentRef;
-use zeppelin::wal::{Manifest, WalFragment, WalWriter};
+use zeppelin::wal::{Manifest, WalFragment, WalReader, WalWriter};
 
 /// Test 1: Acquire and release roundtrip.
 /// Acquire a lease, verify the token is > 0, release it, acquire again
@@ -321,6 +327,230 @@ async fn test_fragment_orphan_on_lease_expiry() {
     assert!(
         !frag_ids.contains(&fragment.id),
         "Orphan fragment should NOT be in manifest"
+    );
+
+    harness.cleanup().await;
+}
+
+// ─── Task 2 Phase A: mid-compaction lease renewal ────────────────────────────
+
+/// Vectors with a unique ID prefix (random_vectors reuses both IDs and
+/// values across calls — see learnings rule 35).
+fn prefixed_vectors(prefix: &str, n: usize, dims: usize) -> Vec<VectorEntry> {
+    random_vectors(n, dims)
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut v)| {
+            v.id = format!("{prefix}_{i}");
+            // Perturb values so pools are distinct across fragments.
+            if let Some(x) = v.values.first_mut() {
+                *x += 0.001 * (i as f32 + 1.0);
+            }
+            v
+        })
+        .collect()
+}
+
+/// Compactor tuned for small test datasets, with an injected slow step
+/// between index build and the final manifest CAS.
+fn slow_compactor(store: &zeppelin::storage::ZeppelinStore, pre_cas_delay: Duration) -> Compactor {
+    let mut compactor = Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        CompactionConfig {
+            max_wal_fragments_before_compact: 1,
+            ..Default::default()
+        },
+        IndexingConfig {
+            default_num_centroids: 2,
+            kmeans_max_iterations: 5,
+            ..Default::default()
+        },
+    );
+    compactor.set_test_pre_cas_delay(pre_cas_delay);
+    compactor
+}
+
+/// Invariant A1: a compaction that outlasts the lease duration does not
+/// lose its lease mid-flight — the lease is renewed (heartbeat) at
+/// intervals <= lease_duration/3 while compaction runs.
+///
+/// Setup: 2s lease, compaction held for ~5s via an injected pre-CAS delay.
+/// Mid-delay (t≈3.5s, past the original expiry) the lease object on S3
+/// must still be valid (expires_at in the future), held by the same node,
+/// with the SAME fencing token (renewal extends expiry, never bumps the
+/// token). The compaction then completes successfully.
+///
+/// Current code: the lease is acquired once and never renewed — at t≈3.5s
+/// it is expired on S3 and this test fails for exactly that reason.
+#[tokio::test]
+async fn test_lease_renewed_during_long_compaction() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("lease-renew-long-compaction");
+    let store = harness.store.clone();
+
+    Manifest::new().write(&store, &ns).await.unwrap();
+    let writer = WalWriter::new(store.clone());
+    writer
+        .append(&ns, prefixed_vectors("renew_a", 20, 16), vec![])
+        .await
+        .unwrap();
+    writer
+        .append(&ns, prefixed_vectors("renew_b", 20, 16), vec![])
+        .await
+        .unwrap();
+
+    let lease_manager = Arc::new(LeaseManager::new(
+        store.clone(),
+        "compactor-node-1".to_string(),
+        Duration::from_secs(2), // tiny lease: compaction (~5s) outlasts it
+    ));
+    let compactor = Arc::new(slow_compactor(&store, Duration::from_secs(5)));
+
+    // Snapshot the initial lease token by peeking after acquire: run the
+    // compaction in a background task, then observe the lease from outside.
+    let compaction = {
+        let compactor = Arc::clone(&compactor);
+        let lease_manager = Arc::clone(&lease_manager);
+        let ns = ns.clone();
+        tokio::spawn(async move {
+            compact_namespace_under_lease(&compactor, &lease_manager, &ns, &HashMap::new()).await
+        })
+    };
+
+    // Let the compaction acquire the lease and enter the slow step, then
+    // read the initial lease state (t ≈ 1s, still within the 2s expiry).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let lease_key = format!("{ns}/lease.json");
+    let initial: Lease = serde_json::from_slice(&store.get(&lease_key).await.unwrap()).unwrap();
+    assert_eq!(initial.holder_id, "compactor-node-1");
+    let initial_token = initial.fencing_token;
+
+    // t ≈ 3.5s: well past the original 2s expiry, still inside the 5s slow
+    // step. A heartbeat renewing at <= lease_duration/3 (~666ms) intervals
+    // keeps the lease valid the whole time.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let mid: Lease = serde_json::from_slice(&store.get(&lease_key).await.unwrap()).unwrap();
+    assert_eq!(
+        mid.holder_id, "compactor-node-1",
+        "A1: lease must still be held by the compacting node mid-compaction"
+    );
+    assert_eq!(
+        mid.fencing_token, initial_token,
+        "A1: renewal must extend expiry WITHOUT bumping the fencing token"
+    );
+    assert!(
+        mid.expires_at > chrono::Utc::now(),
+        "A1 VIOLATED: lease expired mid-compaction (expires_at={} <= now={}) — \
+         the lease was never renewed while the compaction was still running",
+        mid.expires_at,
+        chrono::Utc::now()
+    );
+
+    // The long compaction must complete successfully.
+    let result = compaction.await.unwrap().unwrap();
+    assert_eq!(result.vectors_compacted, 40);
+    assert!(
+        result.segment_id.is_some(),
+        "compaction must produce a segment"
+    );
+
+    let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    assert!(manifest.fragments.is_empty(), "fragments must be compacted");
+    assert_eq!(manifest.segments.len(), 1);
+
+    harness.cleanup().await;
+}
+
+/// Invariant A2: a mid-compaction lease takeover aborts the compaction
+/// BEFORE its final manifest CAS — the loser must not commit.
+///
+/// Setup: 2s lease, compaction held ~6s. While it is paused in the slow
+/// step, "another node" takes over the lease (higher fencing token, new
+/// holder — written directly to the lease object, simulating the takeover
+/// path in `LeaseManager::acquire`). The first compaction's next renewal
+/// fails, which must flip its abort signal: the compaction returns a clean
+/// error (no panic) and the manifest is untouched — fragments still
+/// uncompacted, no segment committed.
+///
+/// Current code: nothing renews and nothing checks — the zombie compaction
+/// sails through the fencing check (the thief took the LEASE but has not
+/// yet bumped the MANIFEST token) and commits its CAS. This test fails for
+/// exactly that reason.
+#[tokio::test]
+async fn test_stolen_lease_aborts_compaction_before_cas() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("lease-stolen-abort");
+    let store = harness.store.clone();
+
+    Manifest::new().write(&store, &ns).await.unwrap();
+    let writer = WalWriter::new(store.clone());
+    let (frag, _) = writer
+        .append(&ns, prefixed_vectors("stolen", 20, 16), vec![])
+        .await
+        .unwrap();
+
+    let lease_manager = Arc::new(LeaseManager::new(
+        store.clone(),
+        "victim-node".to_string(),
+        Duration::from_secs(2),
+    ));
+    let compactor = Arc::new(slow_compactor(&store, Duration::from_secs(6)));
+
+    let compaction = {
+        let compactor = Arc::clone(&compactor);
+        let lease_manager = Arc::clone(&lease_manager);
+        let ns = ns.clone();
+        tokio::spawn(async move {
+            compact_namespace_under_lease(&compactor, &lease_manager, &ns, &HashMap::new()).await
+        })
+    };
+
+    // t ≈ 3s: compaction is inside the slow step. Another node takes over
+    // the lease: new holder, fencing token + 1 (exactly what
+    // LeaseManager::acquire does on expired-lease takeover).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let lease_key = format!("{ns}/lease.json");
+    let mut lease_json: serde_json::Value =
+        serde_json::from_slice(&store.get(&lease_key).await.unwrap()).unwrap();
+    let victim_token = lease_json["fencing_token"].as_u64().unwrap();
+    lease_json["holder_id"] = serde_json::Value::from("thief-node");
+    lease_json["fencing_token"] = serde_json::Value::from(victim_token + 1);
+    lease_json["expires_at"] =
+        serde_json::Value::from((chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339());
+    store
+        .put(
+            &lease_key,
+            bytes::Bytes::from(serde_json::to_vec(&lease_json).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    // The victim's compaction must abort with a clean error — never commit.
+    let result = compaction.await.expect("compaction task must not panic");
+    assert!(
+        result.is_err(),
+        "A2 VIOLATED: compaction committed its manifest CAS after its lease \
+         was stolen mid-flight — got {result:?}"
+    );
+    match result.unwrap_err() {
+        ZeppelinError::LeaseExpired { .. } | ZeppelinError::FencingTokenStale { .. } => {}
+        other => panic!("expected LeaseExpired/FencingTokenStale, got: {other}"),
+    }
+
+    // Manifest untouched by the loser: fragment still uncompacted, no segment.
+    let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    assert!(
+        manifest.fragments.iter().any(|f| f.id == frag.id),
+        "A2: aborted compaction must not have removed the WAL fragment from the manifest"
+    );
+    assert!(
+        manifest.segments.is_empty(),
+        "A2: aborted compaction must not have committed a segment"
+    );
+    assert!(
+        manifest.active_segment.is_none(),
+        "A2: aborted compaction must not have set an active segment"
     );
 
     harness.cleanup().await;
