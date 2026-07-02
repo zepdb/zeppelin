@@ -19,7 +19,7 @@ use crate::index::ivf_flat::build::{
 use crate::storage::ZeppelinStore;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
-use crate::wal::manifest::{Manifest, ManifestVersion, SegmentRef};
+use crate::wal::manifest::{Manifest, SegmentRef};
 use crate::wal::WalReader;
 
 /// Maximum CAS retry attempts for manifest updates.
@@ -120,7 +120,14 @@ impl Compactor {
     ) -> Result<CompactionResult> {
         let start = std::time::Instant::now();
 
-        // 0. GC: delete any pending_deletes from a previous compaction cycle
+        // 0. GC: delete any pending_deletes from a previous compaction cycle.
+        // Keys whose deletion fails are carried into this cycle's
+        // pending_deletes and retried next cycle — dropping them would leak
+        // the objects forever. NotFound counts as already deleted.
+        // `processed_deletes` records every key attempted here so the CAS
+        // step can distinguish them from keys enqueued concurrently.
+        let mut carryover_deletes: Vec<String> = Vec::new();
+        let mut processed_deletes: HashSet<String> = HashSet::new();
         {
             let manifest = Manifest::read(&self.store, namespace)
                 .await?
@@ -137,8 +144,14 @@ impl Compactor {
                     .collect();
                 let delete_results = futures::future::join_all(delete_futs).await;
                 for (key, result) in manifest.pending_deletes.iter().zip(delete_results) {
-                    if let Err(e) = result {
-                        warn!(key = %key, error = %e, "failed to delete deferred key");
+                    processed_deletes.insert(key.clone());
+                    match result {
+                        Ok(()) => {}
+                        Err(ZeppelinError::Storage(object_store::Error::NotFound { .. })) => {}
+                        Err(e) => {
+                            warn!(key = %key, error = %e, "failed to delete deferred key; retrying next cycle");
+                            carryover_deletes.push(key.clone());
+                        }
                     }
                 }
             }
@@ -162,11 +175,14 @@ impl Compactor {
 
         let fragment_refs = manifest.uncompacted_fragments().to_vec();
         let fragments_removed = fragment_refs.len();
-        let last_fragment_id = fragment_refs
-            .iter()
-            .map(|f| f.id)
-            .max()
-            .ok_or_else(|| ZeppelinError::Index("no fragments to compact".into()))?;
+        // Exact set of fragment IDs in this compaction's snapshot. Manifest
+        // removal must use this set, not a max-ULID watermark: a fragment
+        // appended concurrently can sort <= the snapshot max (same-ms ULIDs
+        // or clock skew) and a watermark comparison would silently drop it.
+        let compacted_ids: HashSet<Ulid> = fragment_refs.iter().map(|f| f.id).collect();
+        if compacted_ids.is_empty() {
+            return Err(ZeppelinError::Index("no fragments to compact".into()));
+        }
 
         info!(fragment_count = fragments_removed, "starting compaction");
 
@@ -215,26 +231,33 @@ impl Compactor {
         let vectors: Vec<VectorEntry> = latest_vectors.into_values().collect();
         let vectors_compacted = vectors.len();
 
-        // Collect keys for deferred deletion
-        let mut deferred_deletes: Vec<String> = Vec::new();
+        // Collect keys for deferred deletion, carrying over keys whose
+        // deletion failed in step 0 so they are retried next cycle.
+        let mut deferred_deletes: Vec<String> = carryover_deletes;
         for fref in &fragment_refs {
             deferred_deletes.push(WalFragment::s3_key(namespace, &fref.id));
         }
         if let Some(ref seg_id) = old_segment_id {
             let prefix = format!("{namespace}/segments/{seg_id}/");
-            if let Ok(keys) = self.store.list_prefix(&prefix).await {
-                deferred_deletes.extend(keys);
-            }
+            deferred_deletes.extend(self.store.list_prefix(&prefix).await?);
         }
 
         if vectors.is_empty() {
             // Edge case: all vectors were deleted
             // CAS loop to update manifest
             for attempt in 0..MAX_CAS_RETRIES {
+                // A missing manifest means the namespace was deleted mid-
+                // compaction. Recreating it from Manifest::default() would
+                // resurrect the namespace (unconditional PUT) — abort instead
+                // (NoZombieNamespace, same rule as WalWriter).
                 let (mut fresh_manifest, version) =
                     match Manifest::read_versioned(&self.store, namespace).await? {
                         Some(pair) => pair,
-                        None => (Manifest::default(), ManifestVersion(None)),
+                        None => {
+                            return Err(ZeppelinError::ManifestNotFound {
+                                namespace: namespace.to_string(),
+                            });
+                        }
                     };
 
                 // Layer 1: Fencing check.
@@ -249,8 +272,8 @@ impl Compactor {
                     fresh_manifest.fencing_token = token;
                 }
 
-                fresh_manifest.remove_compacted_fragments(last_fragment_id);
-                fresh_manifest.pending_deletes = deferred_deletes.clone();
+                fresh_manifest.remove_compacted_fragments(&compacted_ids);
+                merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
                 // Layer 2: CAS.
                 match fresh_manifest
@@ -397,13 +420,13 @@ impl Compactor {
             let segment_id_clone = segment_id.clone();
             let namespace_clone = namespace.to_string();
 
-            // Collect successful deserializations
+            // These attrs blobs were written by this compaction moments ago —
+            // a read failure is transient storage trouble. Skipping a cluster
+            // would permanently drop its documents from the FTS index, so
+            // fail the cycle and let the next one rebuild.
             let mut cluster_data: Vec<(usize, bytes::Bytes)> = Vec::new();
             for (cluster_idx, result) in read_results.into_iter().enumerate() {
-                match result {
-                    Ok(data) => cluster_data.push((cluster_idx, data)),
-                    Err(_) => continue,
-                }
+                cluster_data.push((cluster_idx, result?));
             }
 
             // Build inverted indexes in parallel using spawn_blocking.
@@ -492,10 +515,20 @@ impl Compactor {
 
         // 9. CAS loop: re-read manifest, apply changes, write conditionally
         for attempt in 0..MAX_CAS_RETRIES {
+            // A missing manifest means the namespace was deleted mid-
+            // compaction. Recreating it from Manifest::default() would
+            // resurrect the namespace (unconditional PUT) — abort instead
+            // (NoZombieNamespace, same rule as WalWriter). The freshly built
+            // segment objects become orphans; namespace delete_prefix or a
+            // future GC pass removes them.
             let (mut fresh_manifest, version) =
                 match Manifest::read_versioned(&self.store, namespace).await? {
                     Some(pair) => pair,
-                    None => (Manifest::default(), ManifestVersion(None)),
+                    None => {
+                        return Err(ZeppelinError::ManifestNotFound {
+                            namespace: namespace.to_string(),
+                        });
+                    }
                 };
 
             // Layer 1: Fencing check.
@@ -524,8 +557,8 @@ impl Compactor {
                 self.config.max_pending_deletes,
                 self.config.max_old_segments,
             );
-            fresh_manifest.remove_compacted_fragments(last_fragment_id);
-            fresh_manifest.pending_deletes = deferred_deletes.clone();
+            fresh_manifest.remove_compacted_fragments(&compacted_ids);
+            merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
             // Layer 2: CAS.
             match fresh_manifest
@@ -653,6 +686,63 @@ impl Compactor {
             }
         }
 
+        // Quantized artifacts: the SegmentRef records the configured
+        // quantization, so the search path will look for these — they must
+        // exist for every segment, incremental or not.
+        match self.indexing_config.quantization {
+            crate::index::quantization::QuantizationType::Scalar => {
+                use crate::index::quantization::sq::{
+                    serialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
+                };
+
+                let vec_refs: Vec<&[f32]> = vectors.iter().map(|e| e.values.as_slice()).collect();
+                let cal = SqCalibration::calibrate(&vec_refs, dim);
+                self.store
+                    .put(
+                        &sq_calibration_key(namespace, new_segment_id),
+                        cal.to_bytes(),
+                    )
+                    .await?;
+
+                for i in 0..num_clusters {
+                    let cluster_refs: Vec<&[f32]> =
+                        cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                    let codes = cal.encode_batch(&cluster_refs);
+                    let sq_data = serialize_sq_cluster(&cluster_ids[i], &codes, dim)?;
+                    payloads.push((sq_cluster_key(namespace, new_segment_id, i), sq_data));
+                }
+            }
+            crate::index::quantization::QuantizationType::Product => {
+                use crate::index::quantization::pq::{
+                    pq_cluster_key, pq_codebook_key, serialize_pq_cluster, PqCodebook,
+                };
+
+                // Reuse the old segment's codebook — retraining defeats the
+                // point of the incremental path. If it's missing, fail so the
+                // caller falls back to a full retrain.
+                let cb_data = self
+                    .store
+                    .get(&pq_codebook_key(namespace, old_segment_id))
+                    .await?;
+                let codebook = PqCodebook::from_bytes(&cb_data)?;
+                self.store
+                    .put(
+                        &pq_codebook_key(namespace, new_segment_id),
+                        codebook.to_bytes(),
+                    )
+                    .await?;
+
+                for i in 0..num_clusters {
+                    let cluster_refs: Vec<&[f32]> =
+                        cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                    let codes = codebook.encode_batch(&cluster_refs);
+                    let pq_data = serialize_pq_cluster(&cluster_ids[i], &codes, codebook.m)?;
+                    payloads.push((pq_cluster_key(namespace, new_segment_id, i), pq_data));
+                }
+            }
+            crate::index::quantization::QuantizationType::None => {}
+        }
+
         // I/O phase: write all in parallel
         let write_futs: Vec<_> = payloads
             .iter()
@@ -666,6 +756,30 @@ impl Compactor {
         let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
         Ok((num_clusters, bitmap_fields))
     }
+}
+
+/// Merge this cycle's deferred-delete keys into the manifest.
+///
+/// The fresh manifest re-read inside the CAS loop may contain
+/// `pending_deletes` entries added by a concurrent writer since our step-0
+/// GC ran. Wholesale replacement would drop those keys and leak the objects.
+/// Keep any entry we did not process in step 0, then append this cycle's
+/// keys (deduplicated).
+fn merge_pending_deletes(
+    manifest: &mut Manifest,
+    deferred_deletes: &[String],
+    processed_deletes: &HashSet<String>,
+) {
+    manifest
+        .pending_deletes
+        .retain(|k| !processed_deletes.contains(k));
+    let existing: HashSet<&String> = manifest.pending_deletes.iter().collect();
+    let new_keys: Vec<String> = deferred_deletes
+        .iter()
+        .filter(|k| !existing.contains(k))
+        .cloned()
+        .collect();
+    manifest.pending_deletes.extend(new_keys);
 }
 
 /// Load all vectors from an existing IVF-Flat segment on S3.
@@ -702,13 +816,16 @@ async fn load_segment_vectors(
     .await;
 
     // Sequential deserialization (CPU-bound, no I/O)
+    //
+    // Attrs errors must propagate: every segment build writes an attrs blob
+    // per cluster, so a failed read is transient storage trouble, not a
+    // missing artifact. Substituting None here would commit a segment with
+    // the cluster's attributes stripped — filtered queries would then
+    // permanently exclude those vectors.
     let mut vectors = Vec::new();
     for (_i, cluster_res, attrs_res) in cluster_results {
         let cluster = deserialize_cluster(&cluster_res?)?;
-        let attrs = match attrs_res {
-            Ok(data) => deserialize_attrs(&data)?,
-            Err(_) => vec![None; cluster.ids.len()],
-        };
+        let attrs = deserialize_attrs(&attrs_res?)?;
 
         for (j, id) in cluster.ids.into_iter().enumerate() {
             vectors.push(VectorEntry {
@@ -726,4 +843,38 @@ async fn load_segment_vectors(
     );
 
     Ok(vectors)
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_pending_deletes_keeps_concurrent_keys() {
+        // Keys added to pending_deletes by another writer after our step-0
+        // GC must survive the merge; keys we processed must be removed;
+        // this cycle's keys are appended without duplicates.
+        let mut manifest = Manifest::new();
+        manifest.pending_deletes = vec![
+            "ns/wal/old_a.wal".to_string(),      // processed in step 0
+            "ns/wal/concurrent.wal".to_string(), // added by concurrent writer
+        ];
+
+        let processed: HashSet<String> = ["ns/wal/old_a.wal".to_string()].into_iter().collect();
+        let deferred = vec![
+            "ns/wal/new_1.wal".to_string(),
+            "ns/wal/concurrent.wal".to_string(), // dedup against existing
+        ];
+
+        merge_pending_deletes(&mut manifest, &deferred, &processed);
+
+        assert_eq!(
+            manifest.pending_deletes,
+            vec![
+                "ns/wal/concurrent.wal".to_string(),
+                "ns/wal/new_1.wal".to_string(),
+            ]
+        );
+    }
 }

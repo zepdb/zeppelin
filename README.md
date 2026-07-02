@@ -3,7 +3,7 @@
 </p>
 <h1 align="center">Zeppelin</h1>
 <p align="center">
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.84+-DEA584?logo=rust&logoColor=white" alt="Rust: 1.84+"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.85+-DEA584?logo=rust&logoColor=white" alt="Rust: 1.85+"></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="https://github.com/zepdb/zeppelin/actions/workflows/ci.yml"><img src="https://github.com/zepdb/zeppelin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://codecov.io/gh/zepdb/zeppelin"><img src="https://codecov.io/gh/zepdb/zeppelin/branch/main/graph/badge.svg" alt="codecov"></a>
@@ -19,10 +19,10 @@
 - **S3-native** -- Object storage is the single source of truth
 - **Stateless nodes** -- Any node can serve any query
 - **IVF indexing** -- IVF-Flat, IVF-SQ8 (4x compression), IVF-PQ (16-32x), and Hierarchical ANN
-- **BM25 full-text search** -- Inverted indexes with configurable tokenization, stemming, and multi-field `rank_by` expressions
+- **BM25 full-text search** -- Inverted indexes with configurable tokenization, stemming, and multi-field `rank_by` expressions (opt-in, see below)
 - **Bitmap pre-filters** -- RoaringBitmap indexes for sub-millisecond attribute filtering
 - **Write-ahead log** -- Durable writes with compaction into indexed segments
-- **Strong & eventual consistency** -- Choose per-query
+- **Strong & eventual consistency** -- Choose per-query (see [Consistency semantics](#consistency-semantics))
 - **Object storage** -- S3, MinIO, and S3-compatible backends. GCS and Azure planned
 
 ## Quick Start
@@ -62,7 +62,7 @@ curl -s http://localhost:8080/v1/namespaces/<ns>/vectors \
 ### Query
 
 ```bash
-curl -s http://localhost:8080/v1/namespaces/my-vectors/query \
+curl -s http://localhost:8080/v1/namespaces/<ns>/query \
   -H "Content-Type: application/json" \
   -d '{
     "vector": [0.1, 0.2, 0.3, "...384 dims..."],
@@ -73,7 +73,7 @@ curl -s http://localhost:8080/v1/namespaces/my-vectors/query \
 ### Delete vectors
 
 ```bash
-curl -s -X DELETE http://localhost:8080/v1/namespaces/my-vectors/vectors \
+curl -s -X DELETE http://localhost:8080/v1/namespaces/<ns>/vectors \
   -H "Content-Type: application/json" \
   -d '{"ids": ["vec-1"]}' | jq
 ```
@@ -92,31 +92,15 @@ curl -s -X DELETE http://localhost:8080/v1/namespaces/my-vectors/vectors \
 | `DELETE` | `/v1/namespaces/:ns/vectors`      | Delete vectors         |
 | `POST`   | `/v1/namespaces/:ns/query`        | Query nearest neighbors|
 
-## Client SDKs
+## API Clients
 
-Official client libraries for Zeppelin:
-
-| SDK | Package | Install | Repo |
-|-----|---------|---------|------|
-| Python | `zeppelin-python` | `pip install zeppelin-python` | [zepdb/zeppelin-py](https://github.com/zepdb/zeppelin-py) |
-| TypeScript | `zeppelin-typescript` | `npm install zeppelin-typescript` | [zepdb/zeppelin-typescript](https://github.com/zepdb/zeppelin-typescript) |
-
-Both SDKs cover all 9 API endpoints with full support for:
-- Vector similarity search (ANN) with filters
-- BM25 full-text search with `rank_by` S-expressions
-- Composable filter builders (eq, range, in, contains, and/or/not, ...)
-- FTS namespace configuration (`FtsFieldConfig`)
-- Typed error hierarchy (Validation, NotFound, Conflict, Server)
-
-The Python SDK also provides an async client (`AsyncZeppelinClient`).
-
-An [OpenAPI 3.1 spec](api/zeppelin-api.yaml) is available as the canonical API reference.
+Use the HTTP API directly or generate a client from the canonical [OpenAPI 3.1 spec](api/zeppelin-api.yaml). This repository does not maintain generated client SDK packages.
 
 ## Development
 
 ### Prerequisites
 
-- [Rust 1.84+](https://www.rust-lang.org/tools/install)
+- [Rust 1.85+](https://www.rust-lang.org/tools/install)
 - [Docker](https://docs.docker.com/get-docker/) (for MinIO in tests)
 
 ### Build
@@ -127,14 +111,25 @@ cargo build
 
 ### Run tests
 
-Start MinIO for the test suite, then run tests:
+Run the default in-memory test suite:
+
+```bash
+cargo test
+```
+
+For the MinIO-backed integration pass:
 
 ```bash
 docker compose -f docker-compose.test.yml up -d
-TEST_BACKEND=minio cargo test
+TEST_BACKEND=minio \
+TEST_S3_BUCKET=stormcrow-test \
+MINIO_ENDPOINT=http://localhost:9000 \
+MINIO_ACCESS_KEY=minioadmin \
+MINIO_SECRET_KEY=minioadmin \
+cargo test --tests
 ```
 
-### Run locally (without Docker)
+### Run locally against MinIO
 
 ```bash
 # Start MinIO
@@ -142,7 +137,7 @@ docker compose -f docker-compose.test.yml up -d
 
 # Run Zeppelin against local MinIO
 STORAGE_BACKEND=s3 \
-S3_BUCKET=zeppelin \
+S3_BUCKET=stormcrow-test \
 S3_ENDPOINT=http://localhost:9000 \
 AWS_ACCESS_KEY_ID=minioadmin \
 AWS_SECRET_ACCESS_KEY=minioadmin \
@@ -154,7 +149,7 @@ cargo run
 ### Lint and format
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy -- -D warnings
 ```
 
@@ -172,6 +167,41 @@ src/
 ```
 
 Writes land in the WAL as immutable fragments. Background compaction merges fragments into indexed segments (IVF, bitmap pre-filters, BM25 inverted indexes). Queries probe the closest centroids and merge results from any un-compacted WAL fragments.
+
+### Consistency semantics
+
+Consistency is selected per-query via the `consistency` field:
+
+- **`strong`** scans un-compacted WAL fragments in addition to indexed
+  segments, so it always reflects writes committed to S3 — with one caveat:
+  each node caches the namespace manifest for up to 500 ms. A write through
+  node A is immediately visible to strong queries on node A (write-through
+  cache), but a strong query on node B may miss it for up to the cache TTL.
+  In other words: **same-node read-your-writes; cross-node bounded staleness
+  (≤ 500 ms)**. Single-node deployments get true strong consistency. If you
+  need cross-node read-your-writes, sticky-route each client to one node.
+- **`eventual`** reads indexed segments only. Writes and deletes become
+  visible after the next compaction cycle. Fastest option; use it when
+  freshness within one compaction interval doesn't matter.
+
+### Multi-node coordination
+
+Writes are safe under concurrency without any coordinator: every manifest
+commit is an ETag-guarded compare-and-swap, so concurrent upserts from
+multiple nodes serialize correctly. Background compaction additionally
+acquires a per-namespace lease (`compaction.lease_duration_secs`, default
+300 s) so only one node compacts a namespace at a time; a fencing token +
+CAS make even an expired-lease holder unable to commit stale state.
+
+### Full-text search (opt-in)
+
+BM25 `rank_by` queries work out of the box against un-compacted WAL data.
+For segment data, per-cluster and global inverted indexes are built during
+compaction only when `indexing.fts_index = true` (or `ZEPPELIN_FTS_INDEX=true`)
+— it is **off by default** because it adds compaction cost for namespaces
+that never use FTS. Without it, segment BM25 falls back to a full scan,
+which is rejected above `bm25_max_full_scan_clusters` (default 500) to
+protect latency. Enable `fts_index` if you use `rank_by` at scale.
 
 ## License
 

@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
 use crate::wal::fragment::WalFragment;
-use crate::wal::manifest::{FragmentRef, Manifest, ManifestVersion};
+use crate::wal::manifest::{FragmentRef, Manifest};
 
 /// Maximum CAS retry attempts for batched manifest updates.
 const MAX_CAS_RETRIES: u32 = 5;
@@ -155,10 +155,24 @@ async fn flush_loop(
                 }
                 Err(e) => {
                     warn!(namespace = %namespace, error = %e, "batch manifest flush failed");
+                    // Preserve typed variants so the HTTP layer maps them
+                    // correctly (409 for conflict, 404 for missing namespace)
+                    // instead of collapsing everything to a 500.
                     for req in requests {
-                        let _ = req.reply.send(Err(ZeppelinError::Index(format!(
-                            "batch flush failed: {e}"
-                        ))));
+                        let err = match e {
+                            ZeppelinError::ManifestConflict { namespace } => {
+                                ZeppelinError::ManifestConflict {
+                                    namespace: namespace.clone(),
+                                }
+                            }
+                            ZeppelinError::ManifestNotFound { namespace } => {
+                                ZeppelinError::ManifestNotFound {
+                                    namespace: namespace.clone(),
+                                }
+                            }
+                            other => ZeppelinError::Index(format!("batch flush failed: {other}")),
+                        };
+                        let _ = req.reply.send(Err(err));
                     }
                 }
             }
@@ -173,9 +187,18 @@ async fn flush_namespace(
     requests: &[WriteRequest],
 ) -> Result<Manifest> {
     for attempt in 0..MAX_CAS_RETRIES {
+        // A missing manifest means the namespace was deleted (or never
+        // created) — namespace creation always writes an initial manifest.
+        // Falling back to Manifest::default() would unconditionally PUT and
+        // resurrect a deleted namespace (NoZombieNamespace invariant, same
+        // as WalWriter::append_with_lease).
         let (mut manifest, version) = match Manifest::read_versioned(store, namespace).await? {
             Some(pair) => pair,
-            None => (Manifest::default(), ManifestVersion(None)),
+            None => {
+                return Err(ZeppelinError::ManifestNotFound {
+                    namespace: namespace.to_string(),
+                });
+            }
         };
 
         for req in requests {

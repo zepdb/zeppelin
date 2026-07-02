@@ -20,9 +20,6 @@ pub struct Config {
     /// Background compaction schedule and thresholds.
     #[serde(default)]
     pub compaction: CompactionConfig,
-    /// Default consistency level for reads.
-    #[serde(default)]
-    pub consistency: ConsistencyConfig,
     /// Structured logging level and format.
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -158,28 +155,6 @@ pub struct StorageConfig {
     /// Allow plain HTTP (non-TLS) connections to S3. Default: `false`.
     #[serde(default)]
     pub s3_allow_http: bool,
-
-    // GCS
-    /// Path to a GCS service account JSON key file.
-    #[serde(default)]
-    pub gcs_service_account_path: Option<String>,
-
-    // Azure
-    /// Azure storage account name.
-    #[serde(default)]
-    pub azure_account: Option<String>,
-    /// Azure storage account access key.
-    #[serde(default)]
-    pub azure_access_key: Option<String>,
-}
-
-/// Cache eviction strategy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EvictionPolicy {
-    /// Least-recently-used eviction (default).
-    #[default]
-    Lru,
 }
 
 /// Local disk and in-memory cache settings.
@@ -191,9 +166,6 @@ pub struct CacheConfig {
     /// Maximum disk cache size in gigabytes. Default: `50`.
     #[serde(default = "default_max_size_gb")]
     pub max_size_gb: u64,
-    /// Eviction policy for the disk cache. Default: LRU.
-    #[serde(default)]
-    pub eviction: EvictionPolicy,
     /// Maximum memory cache size in MB. Set to 0 to disable.
     /// Default: 256 MB. Override via ZEPPELIN_MEMORY_CACHE_MAX_MB.
     #[serde(default = "default_memory_cache_max_mb")]
@@ -229,20 +201,11 @@ pub struct IndexingConfig {
     /// Must divide vector dimension evenly. Default: 8.
     #[serde(default = "default_pq_m")]
     pub pq_m: usize,
-    /// Reranking factor: how many candidates to fetch with approximate
-    /// distances before reranking with full-precision vectors.
-    /// Only used when quantization is enabled. Default: 4.
-    #[serde(default = "default_rerank_factor")]
-    pub rerank_factor: usize,
     /// Whether to use hierarchical (multi-level centroid tree) indexing.
     /// When true, build produces a hierarchical index instead of flat IVF.
     /// Default: false.
     #[serde(default)]
     pub hierarchical: bool,
-    /// Beam width for hierarchical search (candidates kept per level).
-    /// Higher = better recall but more S3 reads. Default: 10.
-    #[serde(default = "default_beam_width")]
-    pub beam_width: usize,
     /// Maximum vectors per leaf cluster in hierarchical index.
     /// When `None`, uses the default of 1000. Set to a small value
     /// (e.g., 5–10) in tests to force multi-level trees with small datasets.
@@ -282,14 +245,13 @@ pub struct CompactionConfig {
     /// Default: 10.
     #[serde(default = "default_max_old_segments")]
     pub max_old_segments: usize,
-}
-
-/// Read consistency defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ConsistencyConfig {
-    /// Default consistency level applied when the client does not specify one.
-    #[serde(default)]
-    pub default: crate::types::ConsistencyLevel,
+    /// Duration of the per-namespace compaction lease, in seconds.
+    /// Prevents multiple nodes from compacting the same namespace
+    /// concurrently. Must exceed the longest expected compaction cycle;
+    /// if it expires mid-cycle, the fencing token + CAS layers still
+    /// prevent a stale commit. Default: `300`.
+    #[serde(default = "default_compaction_lease_secs")]
+    pub lease_duration_secs: u64,
 }
 
 /// Structured logging configuration.
@@ -368,12 +330,6 @@ fn default_oversample_factor() -> usize {
 fn default_pq_m() -> usize {
     8
 }
-fn default_rerank_factor() -> usize {
-    4
-}
-fn default_beam_width() -> usize {
-    10
-}
 fn default_quantization() -> crate::index::quantization::QuantizationType {
     crate::index::quantization::QuantizationType::Scalar
 }
@@ -397,6 +353,9 @@ fn default_max_pending_deletes() -> usize {
 }
 fn default_max_old_segments() -> usize {
     10
+}
+fn default_compaction_lease_secs() -> u64 {
+    300
 }
 fn default_batch_manifest_size() -> usize {
     1 // disabled by default
@@ -441,9 +400,6 @@ impl Default for StorageConfig {
             s3_access_key_id: None,
             s3_secret_access_key: None,
             s3_allow_http: false,
-            gcs_service_account_path: None,
-            azure_account: None,
-            azure_access_key: None,
         }
     }
 }
@@ -453,7 +409,6 @@ impl Default for CacheConfig {
         Self {
             dir: default_cache_dir(),
             max_size_gb: default_max_size_gb(),
-            eviction: EvictionPolicy::default(),
             memory_cache_max_mb: default_memory_cache_max_mb(),
         }
     }
@@ -470,9 +425,7 @@ impl Default for IndexingConfig {
             oversample_factor: default_oversample_factor(),
             quantization: default_quantization(),
             pq_m: default_pq_m(),
-            rerank_factor: default_rerank_factor(),
             hierarchical: false,
-            beam_width: default_beam_width(),
             leaf_size: None,
             bitmap_index: default_bitmap_index(),
             fts_index: false,
@@ -489,6 +442,7 @@ impl Default for CompactionConfig {
             retrain_imbalance_threshold: default_retrain_threshold(),
             max_pending_deletes: default_max_pending_deletes(),
             max_old_segments: default_max_old_segments(),
+            lease_duration_secs: default_compaction_lease_secs(),
         }
     }
 }
@@ -685,24 +639,6 @@ impl Config {
         if let Ok(v) = std::env::var("S3_ALLOW_HTTP") {
             self.storage.s3_allow_http = v == "true";
         }
-        if let Some(v) = std::env::var("GCS_SERVICE_ACCOUNT_PATH")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
-            self.storage.gcs_service_account_path = Some(v);
-        }
-        if let Some(v) = std::env::var("AZURE_ACCOUNT")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
-            self.storage.azure_account = Some(v);
-        }
-        if let Some(v) = std::env::var("AZURE_ACCESS_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
-            self.storage.azure_access_key = Some(v);
-        }
 
         // Cache
         if let Ok(v) = std::env::var("ZEPPELIN_CACHE_DIR") {
@@ -767,12 +703,6 @@ impl Config {
         // Hierarchical indexing
         if let Ok(v) = std::env::var("ZEPPELIN_HIERARCHICAL") {
             self.indexing.hierarchical = v == "true";
-        }
-        if let Some(v) = std::env::var("ZEPPELIN_BEAM_WIDTH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
-            self.indexing.beam_width = v;
         }
         if let Some(v) = std::env::var("ZEPPELIN_LEAF_SIZE")
             .ok()

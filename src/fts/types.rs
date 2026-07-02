@@ -67,15 +67,6 @@ impl Default for FtsFieldConfig {
     }
 }
 
-/// Corpus-level statistics needed for BM25 scoring.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CorpusStats {
-    /// Total number of documents in the corpus.
-    pub doc_count: u32,
-    /// Average document length (in tokens) for each field.
-    pub avg_doc_length: f32,
-}
-
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
@@ -131,17 +122,5 @@ mod tests {
         assert_eq!(json, "\"english\"");
         let back: FtsLanguage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, FtsLanguage::English);
-    }
-
-    #[test]
-    fn test_corpus_stats_serde_roundtrip() {
-        let stats = CorpusStats {
-            doc_count: 100,
-            avg_doc_length: 25.5,
-        };
-        let json = serde_json::to_string(&stats).unwrap();
-        let back: CorpusStats = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.doc_count, 100);
-        assert!((back.avg_doc_length - 25.5).abs() < f32::EPSILON);
     }
 }

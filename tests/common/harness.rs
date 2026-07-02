@@ -42,9 +42,6 @@ impl TestHarness {
                     s3_access_key_id: None,
                     s3_secret_access_key: None,
                     s3_allow_http: false,
-                    gcs_service_account_path: None,
-                    azure_account: None,
-                    azure_access_key: None,
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
             }
@@ -60,9 +57,6 @@ impl TestHarness {
                         .ok()
                         .map(|v| v == "true")
                         .unwrap_or(false),
-                    gcs_service_account_path: None,
-                    azure_account: None,
-                    azure_access_key: None,
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
             }
@@ -84,9 +78,6 @@ impl TestHarness {
                             .unwrap_or_else(|_| "minioadmin".to_string()),
                     ),
                     s3_allow_http: true,
-                    gcs_service_account_path: None,
-                    azure_account: None,
-                    azure_access_key: None,
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
             }

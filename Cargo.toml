@@ -26,7 +26,7 @@ tower-http = { version = "0.5", features = ["trace", "cors", "timeout", "limit"]
 tokio = { version = "1", features = ["full"] }
 
 # Storage
-object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.11", features = ["aws"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -75,7 +75,6 @@ futures = "0.3"
 rand = "0.8"
 
 # Half-precision floats (f16)
-half = { version = "2", features = ["std", "serde"] }
 
 # Bitmap indexes (pre-filter)
 roaring = { version = "0.10", features = ["serde"] }

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -109,10 +111,26 @@ impl Manifest {
         self.updated_at = Utc::now();
     }
 
-    /// Remove compacted fragments (those <= watermark).
-    pub fn remove_compacted_fragments(&mut self, watermark: Ulid) {
-        self.fragments.retain(|f| f.id > watermark);
-        self.compaction_watermark = Some(watermark);
+    /// Remove exactly the fragments that were compacted (by ID).
+    ///
+    /// Removal must use the exact snapshot set, not a ULID watermark
+    /// inequality: ULIDs are not monotonic within the same millisecond (and
+    /// not across nodes with clock skew), so a fragment appended concurrently
+    /// with compaction can sort <= the snapshot's max ULID. A watermark
+    /// comparison would drop it from the manifest without its vectors being
+    /// in the segment — silent data loss (see UpsertDeleteCompactQuery.tla).
+    ///
+    /// `compaction_watermark` is still recorded (max removed ID) for
+    /// observability, but is never used to decide removal.
+    pub fn remove_compacted_fragments(&mut self, compacted_ids: &HashSet<Ulid>) {
+        self.fragments.retain(|f| !compacted_ids.contains(&f.id));
+        if let Some(max_id) = compacted_ids.iter().max() {
+            let watermark = match self.compaction_watermark {
+                Some(prev) => prev.max(*max_id),
+                None => *max_id,
+            };
+            self.compaction_watermark = Some(watermark);
+        }
         self.updated_at = Utc::now();
     }
 
@@ -137,15 +155,17 @@ impl Manifest {
 
     /// Prune the manifest to prevent unbounded growth at 1M+ scale.
     ///
-    /// - Caps `pending_deletes` to the most recent `max_pending_deletes` entries.
-    /// - Retains only the most recent `max_old_segments` non-active segments.
-    pub fn prune(&mut self, max_pending_deletes: usize, max_old_segments: usize) {
-        // Cap pending deletes (keep newest)
-        if self.pending_deletes.len() > max_pending_deletes {
-            let excess = self.pending_deletes.len() - max_pending_deletes;
-            self.pending_deletes.drain(..excess);
-        }
-
+    /// Retains only the most recent `max_old_segments` non-active segments.
+    /// Segment refs are safe to drop: a replaced segment's S3 files were
+    /// queued into `pending_deletes` when it was replaced, so pruning the
+    /// ref is metadata-only.
+    ///
+    /// `pending_deletes` is deliberately NOT capped here: every entry is an
+    /// S3 key that still needs deletion, and draining entries without
+    /// deleting the objects leaks them permanently. The list is bounded in
+    /// practice — it is rewritten each compaction cycle and cleared (or
+    /// carried over on failure) at the start of the next.
+    pub fn prune(&mut self, _max_pending_deletes: usize, max_old_segments: usize) {
         // Prune old segments: keep active + most recent max_old_segments
         if self.segments.len() > max_old_segments + 1 {
             let active_id = self.active_segment.as_deref();
@@ -292,16 +312,74 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_caps_pending_deletes() {
+    fn test_remove_compacted_fragments_exact_set() {
+        // A fragment appended concurrently with compaction can have a ULID
+        // that sorts <= the snapshot's max (same-millisecond random bits).
+        // Removal by exact ID set must retain it.
+        let mut manifest = Manifest::new();
+        let snapshot_a = Ulid::from_parts(1000, 500);
+        let snapshot_b = Ulid::from_parts(1000, 900); // snapshot max
+        let concurrent = Ulid::from_parts(1000, 700); // sorts between a and b
+
+        for id in [snapshot_a, snapshot_b, concurrent] {
+            manifest.add_fragment(FragmentRef {
+                id,
+                vector_count: 1,
+                delete_count: 0,
+                sequence_number: 0,
+            });
+        }
+
+        let compacted: HashSet<Ulid> = [snapshot_a, snapshot_b].into_iter().collect();
+        manifest.remove_compacted_fragments(&compacted);
+
+        assert_eq!(manifest.fragments.len(), 1);
+        assert_eq!(
+            manifest.fragments[0].id, concurrent,
+            "concurrently appended fragment with ULID <= snapshot max must survive"
+        );
+        assert_eq!(manifest.compaction_watermark, Some(snapshot_b));
+    }
+
+    #[test]
+    fn test_watermark_never_regresses() {
+        let mut manifest = Manifest::new();
+        let newer = Ulid::from_parts(2000, 0);
+        let older = Ulid::from_parts(1000, 0);
+
+        manifest.add_fragment(FragmentRef {
+            id: newer,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+        });
+        manifest.remove_compacted_fragments(&[newer].into_iter().collect());
+        assert_eq!(manifest.compaction_watermark, Some(newer));
+
+        manifest.add_fragment(FragmentRef {
+            id: older,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+        });
+        manifest.remove_compacted_fragments(&[older].into_iter().collect());
+        assert_eq!(
+            manifest.compaction_watermark,
+            Some(newer),
+            "watermark is observability metadata and must not move backwards"
+        );
+    }
+
+    #[test]
+    fn test_prune_never_drops_pending_deletes() {
+        // Every pending_deletes entry is an S3 key still awaiting deletion;
+        // draining entries without deleting the objects leaks them forever.
         let mut manifest = Manifest::new();
         for i in 0..10 {
             manifest.pending_deletes.push(format!("key_{i}"));
         }
         manifest.prune(5, 10);
-        assert_eq!(manifest.pending_deletes.len(), 5);
-        // Should keep the newest (tail) entries
-        assert_eq!(manifest.pending_deletes[0], "key_5");
-        assert_eq!(manifest.pending_deletes[4], "key_9");
+        assert_eq!(manifest.pending_deletes.len(), 10);
     }
 
     #[test]
@@ -321,13 +399,18 @@ mod tests {
     }
 
     #[test]
-    fn test_add_segment_with_limits_prunes() {
+    fn test_add_segment_with_limits_prunes_segments_only() {
         let mut manifest = Manifest::new();
         for i in 0..10 {
             manifest.pending_deletes.push(format!("key_{i}"));
         }
-        // Add segment with small limits
-        manifest.add_segment_with_limits(make_segment("seg_new"), 3, 2);
-        assert!(manifest.pending_deletes.len() <= 3);
+        for i in 0..6 {
+            manifest.add_segment_with_limits(make_segment(&format!("seg_{i}")), 3, 2);
+        }
+        // Segment refs are pruned (metadata only)...
+        assert_eq!(manifest.segments.len(), 3);
+        // ...but pending_deletes entries are never dropped (they are S3 keys
+        // still awaiting deletion).
+        assert_eq!(manifest.pending_deletes.len(), 10);
     }
 }

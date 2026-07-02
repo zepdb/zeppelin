@@ -254,6 +254,100 @@ async fn test_tla_namespace_delete_upsert_zombie() {
     );
 }
 
+/// # Test 2b: Namespace Delete + Compaction Race — NoZombieNamespace
+///
+/// Same invariant as Test 2, but for the *compactor*: a namespace deleted
+/// while a compaction is in flight must not be resurrected by the compactor's
+/// manifest CAS loop falling back to `Manifest::default()` + unconditional PUT.
+#[tokio::test]
+async fn test_tla_namespace_delete_compaction_zombie() {
+    use zeppelin::compaction::Compactor;
+    use zeppelin::config::{CompactionConfig, IndexingConfig};
+    use zeppelin::wal::WalReader;
+
+    let store = mem_store();
+    let ns = "tla-zombie-compact-ns";
+
+    let manager = NamespaceManager::new(store.clone());
+    manager
+        .create(ns, 16, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+
+    let writer = WalWriter::new(store.clone());
+    writer
+        .append(ns, random_vectors(20, 16), vec![])
+        .await
+        .unwrap();
+
+    // Delete the namespace: manifest first, then meta (production order)
+    let manifest_key = Manifest::s3_key(ns);
+    let meta_key = NamespaceMetadata::s3_key(ns);
+    store.delete(&manifest_key).await.unwrap();
+    store.delete(&meta_key).await.unwrap();
+
+    // Compactor runs against the deleted namespace. Its initial manifest
+    // read yields None → unwrap_or_default() sees no fragments → no-op.
+    // The dangerous window is the CAS loop after building a segment, which
+    // is covered by the empty-vectors and main CAS paths both returning
+    // ManifestNotFound now; a no-op result is also acceptable. What is NOT
+    // acceptable is manifest.json existing afterwards.
+    let compactor = Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        CompactionConfig::default(),
+        IndexingConfig {
+            default_num_centroids: 2,
+            kmeans_max_iterations: 5,
+            ..Default::default()
+        },
+    );
+    let _ = compactor.compact(ns).await;
+
+    assert!(
+        !store.exists(&manifest_key).await.unwrap(),
+        "compactor must not resurrect manifest.json of a deleted namespace"
+    );
+}
+
+/// # Test 2c: Namespace Delete + Batched Append Race — NoZombieNamespace
+///
+/// The BatchWalWriter's flush loop must also return `ManifestNotFound` for a
+/// deleted namespace instead of recreating the manifest from default.
+#[tokio::test]
+async fn test_tla_namespace_delete_batch_append_zombie() {
+    use zeppelin::wal::batch_writer::BatchWalWriter;
+    use zeppelin::wal::fragment::WalFragment;
+
+    let store = mem_store();
+    let ns = "tla-zombie-batch-ns";
+
+    let manager = NamespaceManager::new(store.clone());
+    manager
+        .create(ns, 16, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+
+    let manifest_key = Manifest::s3_key(ns);
+    let meta_key = NamespaceMetadata::s3_key(ns);
+    store.delete(&manifest_key).await.unwrap();
+    store.delete(&meta_key).await.unwrap();
+
+    // Batch writer flushes after 1 request or 10ms
+    let batch_writer = BatchWalWriter::new(store.clone(), 1, 10);
+    let fragment = WalFragment::new(random_vectors(3, 16), vec![]);
+    let result = batch_writer.append(&store, ns, fragment).await;
+
+    assert!(
+        matches!(result, Err(ZeppelinError::ManifestNotFound { .. })),
+        "batched append to a deleted namespace must fail with ManifestNotFound, got: {result:?}"
+    );
+    assert!(
+        !store.exists(&manifest_key).await.unwrap(),
+        "batch writer must not resurrect manifest.json of a deleted namespace"
+    );
+}
+
 /// # Test 3: Cache Staleness During Compaction — CacheBoundedStaleness (FIXED)
 ///
 /// ## TLA+ Spec
@@ -332,15 +426,11 @@ async fn test_tla_cache_staleness_during_compaction() {
         "S3 manifest v3 should have 2 fragments"
     );
 
-    // Compactor adds a segment and removes the compacted fragments.
-    // Use max() not last() — ULIDs generated in the same millisecond have
-    // random ordering (Ulid::new() doesn't guarantee monotonicity).
-    let max_frag_id = compacted_manifest
-        .fragments
-        .iter()
-        .map(|f| f.id)
-        .max()
-        .unwrap();
+    // Compactor adds a segment and removes the compacted fragments by exact
+    // ID set (ULIDs generated in the same millisecond have random ordering,
+    // so a watermark comparison is unsafe).
+    let compacted_ids: std::collections::HashSet<ulid::Ulid> =
+        compacted_manifest.fragments.iter().map(|f| f.id).collect();
     compacted_manifest.add_segment(SegmentRef {
         id: "seg_compacted_001".to_string(),
         vector_count: 10,
@@ -351,7 +441,7 @@ async fn test_tla_cache_staleness_during_compaction() {
         fts_fields: vec![],
         has_global_fts: false,
     });
-    compacted_manifest.remove_compacted_fragments(max_frag_id);
+    compacted_manifest.remove_compacted_fragments(&compacted_ids);
     assert_eq!(
         compacted_manifest.segments.len(),
         1,
@@ -479,9 +569,11 @@ async fn test_tla_compaction_retry_starvation() {
     // the initial fragment ULIDs (ULID is not monotonic within the same ms).
     tokio::time::sleep(Duration::from_millis(2)).await;
 
-    // States 2-3: Compactor reads manifest snapshot and "builds index"
-    // Use max() instead of last() to handle ULID non-monotonicity (Bug 40 fix)
-    let last_frag_id = pre_manifest.fragments.iter().map(|f| f.id).max().unwrap();
+    // States 2-3: Compactor reads manifest snapshot and "builds index".
+    // Removal uses the exact snapshot ID set (ULID watermark comparison is
+    // unsafe for same-millisecond ULIDs).
+    let snapshot_ids: std::collections::HashSet<ulid::Ulid> =
+        pre_manifest.fragments.iter().map(|f| f.id).collect();
 
     // The segment the compactor would have built
     let compactor_segment = SegmentRef {
@@ -515,7 +607,7 @@ async fn test_tla_compaction_retry_starvation() {
 
         // Compactor tries to write its compacted manifest -- CONFLICT!
         fresh_manifest.add_segment(compactor_segment.clone());
-        fresh_manifest.remove_compacted_fragments(last_frag_id);
+        fresh_manifest.remove_compacted_fragments(&snapshot_ids);
 
         let cas_result = fresh_manifest.write_conditional(&store, ns, &version).await;
 
@@ -547,7 +639,7 @@ async fn test_tla_compaction_retry_starvation() {
         Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
 
     fresh_manifest.add_segment(compactor_segment.clone());
-    fresh_manifest.remove_compacted_fragments(last_frag_id);
+    fresh_manifest.remove_compacted_fragments(&snapshot_ids);
 
     let cas_result = fresh_manifest.write_conditional(&store, ns, &version).await;
 

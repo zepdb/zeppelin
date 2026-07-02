@@ -26,22 +26,6 @@ pub struct CreateNamespaceRequest {
     pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
 }
 
-/// Legacy request body that includes a user-specified name (kept for rollback).
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct CreateNamespaceWithNameRequest {
-    /// Unique namespace name.
-    pub name: String,
-    /// Dimensionality of vectors stored in this namespace.
-    pub dimensions: usize,
-    /// Distance metric for similarity search (defaults to Cosine).
-    #[serde(default = "default_distance_metric")]
-    pub distance_metric: DistanceMetric,
-    /// Full-text search field configurations (empty map disables FTS).
-    #[serde(default)]
-    pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
-}
-
 fn default_distance_metric() -> DistanceMetric {
     DistanceMetric::Cosine
 }
@@ -126,36 +110,6 @@ pub async fn create_namespace(
             warning: "Save this namespace name. It cannot be recovered if lost.".to_string(),
         }),
     ))
-}
-
-/// Legacy handler: creates a namespace with a user-specified name (not routed, kept for rollback).
-#[allow(dead_code)]
-#[instrument(skip(state), fields(namespace = %req.name, dimensions = req.dimensions))]
-pub async fn create_namespace_with_name(
-    State(state): State<AppState>,
-    Json(req): Json<CreateNamespaceWithNameRequest>,
-) -> Result<(StatusCode, Json<NamespaceResponse>), ApiError> {
-    if req.dimensions == 0 || req.dimensions > state.config.server.max_dimensions {
-        return Err(ApiError(ZeppelinError::Validation(format!(
-            "dimensions {} must be between 1 and {}",
-            req.dimensions, state.config.server.max_dimensions
-        ))));
-    }
-
-    info!(namespace = %req.name, dimensions = req.dimensions, "creating namespace");
-    let meta = state
-        .namespace_manager
-        .create_with_fts(
-            &req.name,
-            req.dimensions,
-            req.distance_metric,
-            req.full_text_search,
-        )
-        .await
-        .map_err(ApiError::from)?;
-
-    info!(namespace = %req.name, "namespace created");
-    Ok((StatusCode::CREATED, Json(NamespaceResponse::from(meta))))
 }
 
 /// Lists all namespaces (not routed — disabled to prevent namespace enumeration).
