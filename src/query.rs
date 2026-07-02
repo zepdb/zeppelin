@@ -87,49 +87,50 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         None => Manifest::read(store, namespace).await?.unwrap_or_default(),
     };
 
-    let mut scanned_fragments = 0;
-    let mut scanned_segments = 0;
-
-    // WAL scan (always for Strong, never for Eventual)
-    // Uses the manifest we already read for snapshot consistency — avoids re-reading
-    // a newer manifest whose fragments may have been deleted by compaction.
-    // Short-circuit: skip WAL scan if no uncompacted fragments exist.
-    let wal_start = std::time::Instant::now();
-    let mut wal_deleted_ids = HashSet::new();
-    let wal_results = match consistency {
-        ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
-            let scan_result = wal_scan(
-                wal_reader,
-                namespace,
-                &manifest,
-                query,
-                filter,
-                distance_metric,
-            )
-            .await?;
-            scanned_fragments = scan_result.fragment_count;
-            wal_deleted_ids = scan_result.deleted_ids;
-            scan_result.results
-        }
-        _ => Vec::new(),
+    // WAL scan (always for Strong, never for Eventual) and segment search are
+    // independent — they share only the manifest snapshot — so run them
+    // concurrently. Using the same manifest for both preserves snapshot
+    // consistency: no re-read can observe fragments deleted by compaction.
+    let wal_future = async {
+        // Short-circuit: skip WAL scan if no uncompacted fragments exist.
+        let wal_start = std::time::Instant::now();
+        let scan_result = match consistency {
+            ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
+                wal_scan(
+                    wal_reader,
+                    namespace,
+                    &manifest,
+                    query,
+                    filter,
+                    distance_metric,
+                )
+                .await?
+            }
+            _ => WalScanResult {
+                results: Vec::new(),
+                fragment_count: 0,
+                deleted_ids: HashSet::new(),
+            },
+        };
+        debug!(
+            wal_duration_ms = wal_start.elapsed().as_millis() as u64,
+            fragments_scanned = scan_result.fragment_count,
+            "query phase: WAL scan"
+        );
+        Ok::<_, crate::error::ZeppelinError>(scan_result)
     };
-    let wal_duration = wal_start.elapsed();
-    debug!(
-        wal_duration_ms = wal_duration.as_millis() as u64,
-        fragments_scanned = scanned_fragments,
-        "query phase: WAL scan"
-    );
 
-    // Segment search
-    let segment_start = std::time::Instant::now();
-    let segment_results = if let Some(ref segment_id) = manifest.active_segment {
+    let segment_future = async {
+        let segment_start = std::time::Instant::now();
         // Look up the full SegmentRef from the manifest.
-        let segment_ref = manifest
-            .segments
-            .iter()
-            .find(|s| s.id == *segment_id)
-            .cloned();
-        if let Some(seg_ref) = segment_ref {
+        let segment_ref = manifest.active_segment.as_ref().and_then(|segment_id| {
+            manifest
+                .segments
+                .iter()
+                .find(|s| s.id == *segment_id)
+                .cloned()
+        });
+        let (results, scanned) = if let Some(seg_ref) = segment_ref {
             let results = segment_search(
                 store,
                 namespace,
@@ -143,20 +144,25 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
                 cache,
             )
             .await?;
-            scanned_segments = 1;
-            results
+            (results, 1)
         } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
+            (Vec::new(), 0)
+        };
+        debug!(
+            segment_duration_ms = segment_start.elapsed().as_millis() as u64,
+            segments_scanned = scanned,
+            "query phase: segment search"
+        );
+        Ok::<_, crate::error::ZeppelinError>((results, scanned))
     };
-    let segment_duration = segment_start.elapsed();
-    debug!(
-        segment_duration_ms = segment_duration.as_millis() as u64,
-        segments_scanned = scanned_segments,
-        "query phase: segment search"
-    );
+
+    let (wal_result, segment_result) = tokio::join!(wal_future, segment_future);
+    let WalScanResult {
+        results: wal_results,
+        fragment_count: scanned_fragments,
+        deleted_ids: wal_deleted_ids,
+    } = wal_result?;
+    let (segment_results, scanned_segments) = segment_result?;
 
     // Merge results — pass WAL tombstones so segment results for deleted
     // vectors are excluded (a delete of an already-compacted vector exists
@@ -388,60 +394,62 @@ pub async fn execute_bm25_query(
         cache.evict_compacted(&active_ids);
     }
 
-    let mut scanned_fragments = 0;
-    let mut scanned_segments = 0;
-
-    // WAL BM25 scan (always for Strong, never for Eventual)
-    // Short-circuit: skip WAL scan if no uncompacted fragments exist.
-    let wal_start = std::time::Instant::now();
-    let mut wal_deleted_ids = std::collections::HashSet::new();
-    let wal_results = match consistency {
-        ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
-            let refs = manifest.uncompacted_fragments().to_vec();
-            // Skip checksum validation — already validated on write.
-            let fragments = wal_reader
-                .read_fragments_from_refs_unchecked(namespace, &refs)
-                .await?;
-            let scan_result = wal_bm25_scan(
-                &fragments,
-                rank_by,
-                fts_configs,
-                last_as_prefix,
-                fts_cache.map(|c| c.as_ref()),
-                Some(top_k),
-            );
-            scanned_fragments = scan_result.fragment_count;
-            wal_deleted_ids = scan_result.deleted_ids;
-            // Apply post-filter to WAL results
-            let mut results = scan_result.results;
-            if let Some(f) = filter {
-                results.retain(|r| match &r.attributes {
-                    Some(attrs) => crate::index::filter::evaluate_filter(f, attrs),
-                    None => false,
-                });
+    // WAL BM25 scan (always for Strong, never for Eventual) and segment BM25
+    // search are independent — run them concurrently over the same manifest
+    // snapshot.
+    let wal_future = async {
+        // Short-circuit: skip WAL scan if no uncompacted fragments exist.
+        let wal_start = std::time::Instant::now();
+        let mut scanned_fragments = 0;
+        let mut wal_deleted_ids = std::collections::HashSet::new();
+        let wal_results = match consistency {
+            ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
+                let refs = manifest.uncompacted_fragments().to_vec();
+                // Skip checksum validation — already validated on write.
+                let fragments = wal_reader
+                    .read_fragments_from_refs_unchecked(namespace, &refs)
+                    .await?;
+                let scan_result = wal_bm25_scan(
+                    &fragments,
+                    rank_by,
+                    fts_configs,
+                    last_as_prefix,
+                    fts_cache.map(|c| c.as_ref()),
+                    Some(top_k),
+                );
+                scanned_fragments = scan_result.fragment_count;
+                wal_deleted_ids = scan_result.deleted_ids;
+                // Apply post-filter to WAL results
+                let mut results = scan_result.results;
+                if let Some(f) = filter {
+                    results.retain(|r| match &r.attributes {
+                        Some(attrs) => crate::index::filter::evaluate_filter(f, attrs),
+                        None => false,
+                    });
+                }
+                results
             }
-            results
-        }
-        _ => Vec::new(),
+            _ => Vec::new(),
+        };
+        debug!(
+            wal_duration_ms = wal_start.elapsed().as_millis() as u64,
+            fragments_scanned = scanned_fragments,
+            "BM25 query phase: WAL scan"
+        );
+        Ok::<_, crate::error::ZeppelinError>((wal_results, scanned_fragments, wal_deleted_ids))
     };
-    let wal_duration = wal_start.elapsed();
-    debug!(
-        wal_duration_ms = wal_duration.as_millis() as u64,
-        fragments_scanned = scanned_fragments,
-        "BM25 query phase: WAL scan"
-    );
 
-    // Segment BM25 search
-    let segment_start = std::time::Instant::now();
-    let segment_results = if let Some(ref segment_id) = manifest.active_segment {
-        let segment_ref = manifest
-            .segments
-            .iter()
-            .find(|s| s.id == *segment_id)
-            .cloned();
-
-        if let Some(seg_ref) = segment_ref {
-            if !seg_ref.fts_fields.is_empty() {
+    let segment_future = async {
+        let segment_start = std::time::Instant::now();
+        let segment_ref = manifest.active_segment.as_ref().and_then(|segment_id| {
+            manifest
+                .segments
+                .iter()
+                .find(|s| s.id == *segment_id)
+                .cloned()
+        });
+        let (results, scanned) = match segment_ref {
+            Some(seg_ref) if !seg_ref.fts_fields.is_empty() => {
                 let results = segment_bm25_search(
                     store,
                     namespace,
@@ -453,23 +461,21 @@ pub async fn execute_bm25_query(
                     max_full_scan_clusters,
                 )
                 .await?;
-                scanned_segments = 1;
-                results
-            } else {
-                Vec::new()
+                (results, 1)
             }
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
+            _ => (Vec::new(), 0),
+        };
+        debug!(
+            segment_duration_ms = segment_start.elapsed().as_millis() as u64,
+            segments_scanned = scanned,
+            "BM25 query phase: segment search"
+        );
+        Ok::<_, crate::error::ZeppelinError>((results, scanned))
     };
-    let segment_duration = segment_start.elapsed();
-    debug!(
-        segment_duration_ms = segment_duration.as_millis() as u64,
-        segments_scanned = scanned_segments,
-        "BM25 query phase: segment search"
-    );
+
+    let (wal_result, segment_result) = tokio::join!(wal_future, segment_future);
+    let (wal_results, scanned_fragments, wal_deleted_ids) = wal_result?;
+    let (segment_results, scanned_segments) = segment_result?;
 
     // Merge results — BM25 is higher-is-better
     // Pass deleted IDs so segment results for deleted docs are excluded
