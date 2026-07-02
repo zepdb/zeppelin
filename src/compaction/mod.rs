@@ -67,6 +67,11 @@ impl Compactor {
         &self.config
     }
 
+    /// Return a reference to the underlying store.
+    pub fn store(&self) -> &ZeppelinStore {
+        &self.store
+    }
+
     /// Check whether compaction should be triggered for a namespace.
     ///
     /// Three independent triggers, evaluated from the manifest alone (no
@@ -858,7 +863,8 @@ async fn load_segment_vectors(
     // Determine cluster count: hierarchical segments store it in tree_meta.json,
     // IVF-Flat segments store it in centroids.bin.
     let num_clusters = if is_hierarchical {
-        let h_index = load_hierarchical(store, namespace, segment_id).await?;
+        // Compaction reads the segment once; no query cache involved here.
+        let h_index = load_hierarchical(store, namespace, segment_id, None).await?;
         h_index.num_leaf_clusters()
     } else {
         use crate::index::IvfFlatIndex;

@@ -150,6 +150,7 @@ pub async fn build_app(
         cpu_budget.compaction_workers,
         manifest_cache.clone(),
         lease_manager,
+        cache.clone(),
     );
 
     // Initialize batch WAL writer (if batch_manifest_size > 1)

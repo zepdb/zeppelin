@@ -120,6 +120,48 @@ async fn test_cache_pin_survives_eviction() {
 }
 
 #[tokio::test]
+async fn test_cache_pin_scoped_rotates_on_new_key() {
+    let dir = TempDir::new().unwrap();
+    let cache = test_cache(dir.path(), 100);
+
+    // Pin seg1 centroids under the namespace scope.
+    cache
+        .put("ns/segments/seg1/centroids.bin", &Bytes::from(vec![1; 30]))
+        .await
+        .unwrap();
+    cache
+        .pin_scoped("ns", "ns/segments/seg1/centroids.bin")
+        .await;
+    assert!(cache.is_pinned("ns/segments/seg1/centroids.bin").await);
+
+    // Re-pinning the same key is a no-op.
+    cache
+        .pin_scoped("ns", "ns/segments/seg1/centroids.bin")
+        .await;
+    assert!(cache.is_pinned("ns/segments/seg1/centroids.bin").await);
+
+    // Segment rotation: pinning seg2 under the same scope unpins seg1.
+    cache
+        .put("ns/segments/seg2/centroids.bin", &Bytes::from(vec![2; 30]))
+        .await
+        .unwrap();
+    cache
+        .pin_scoped("ns", "ns/segments/seg2/centroids.bin")
+        .await;
+    assert!(cache.is_pinned("ns/segments/seg2/centroids.bin").await);
+    assert!(
+        !cache.is_pinned("ns/segments/seg1/centroids.bin").await,
+        "old segment's key must be unpinned when the scope rotates"
+    );
+
+    // Different scope does not disturb this scope's pin.
+    cache
+        .pin_scoped("other", "other/segments/segX/centroids.bin")
+        .await;
+    assert!(cache.is_pinned("ns/segments/seg2/centroids.bin").await);
+}
+
+#[tokio::test]
 async fn test_cache_invalidate() {
     let dir = TempDir::new().unwrap();
     let cache = test_cache(dir.path(), 1024 * 1024);

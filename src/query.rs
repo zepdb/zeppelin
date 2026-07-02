@@ -315,7 +315,7 @@ async fn segment_search(
 
     // Use manifest metadata to determine index type — no S3 probe needed.
     if segment_ref.hierarchical {
-        let mut index = HierarchicalIndex::load(store, namespace, segment_id).await?;
+        let mut index = HierarchicalIndex::load(store, namespace, segment_id, cache).await?;
         index.bitmap_fields = segment_ref.bitmap_fields.clone();
         use crate::index::hierarchical::search::search_hierarchical;
         let results = search_hierarchical(
@@ -340,6 +340,7 @@ async fn segment_search(
         segment_id,
         segment_ref.vector_count,
         segment_ref.quantization,
+        cache,
     )
     .await?;
     index.bitmap_fields = segment_ref.bitmap_fields.clone();
@@ -729,12 +730,14 @@ async fn segment_bm25_search_full_scan(
     let fts_fields = &segment_ref.fts_fields;
 
     // Load the IVF-Flat index using manifest metadata to skip cluster probing.
+    // BM25 full-scan is a cold fallback path — no cache handle is threaded here.
     let index = IvfFlatIndex::load_from_manifest(
         store,
         namespace,
         segment_id,
         segment_ref.vector_count,
         segment_ref.quantization,
+        None,
     )
     .await?;
     let num_clusters = index.num_clusters();

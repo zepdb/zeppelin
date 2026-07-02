@@ -235,8 +235,16 @@ impl HierarchicalIndex {
     }
 
     /// Load an existing hierarchical index from S3 (metadata only).
-    pub async fn load(store: &ZeppelinStore, namespace: &str, segment_id: &str) -> Result<Self> {
-        build::load_hierarchical(store, namespace, segment_id).await
+    ///
+    /// When `cache` is provided, tree_meta.json is served through the
+    /// tiered cache and pinned for the namespace's active segment.
+    pub async fn load(
+        store: &ZeppelinStore,
+        namespace: &str,
+        segment_id: &str,
+        cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
+    ) -> Result<Self> {
+        build::load_hierarchical(store, namespace, segment_id, cache).await
     }
 }
 

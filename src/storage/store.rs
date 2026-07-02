@@ -81,6 +81,13 @@ impl ZeppelinStore {
         Self { inner: store }
     }
 
+    /// Access the underlying `ObjectStore` (for test instrumentation such as
+    /// GET-counting wrappers). Production code above the storage layer must
+    /// not use this to bypass `ZeppelinStore`.
+    pub fn inner(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.inner)
+    }
+
     /// Put an object at the given key.
     #[instrument(skip(self, data), fields(key = key, size = data.len()))]
     pub async fn put(&self, key: &str, data: Bytes) -> Result<()> {

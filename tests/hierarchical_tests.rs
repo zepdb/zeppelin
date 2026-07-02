@@ -1,6 +1,7 @@
 mod common;
 
 use common::assertions::{assert_recall_at_k, assert_s3_object_exists};
+use common::counting::counting_store;
 use common::harness::TestHarness;
 use common::vectors::{clustered_vectors, simple_attributes, with_attributes};
 
@@ -543,6 +544,90 @@ async fn test_query_hierarchical_detection() {
 
 // ─── Test 10: Load hierarchical index ───
 
+// ─── Task 3: tree_meta caching (I1 for hierarchical) ───
+
+/// I1 (hierarchical): a repeat query against an unchanged hierarchical
+/// segment performs ZERO S3 GETs for tree_meta.json — served from cache.
+#[tokio::test]
+async fn test_repeat_query_zero_tree_meta_gets() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let ns = harness.key("h-tree-meta-zero-gets");
+    let writer = WalWriter::new(store.clone());
+    let wal_reader = WalReader::new(store.clone());
+
+    Manifest::new().write(&store, &ns).await.unwrap();
+    let (vectors, centroids) = clustered_vectors(4, 25, 16, 0.1);
+    writer.append(&ns, vectors, vec![]).await.unwrap();
+
+    let compactor = Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        CompactionConfig {
+            max_wal_fragments_before_compact: 3,
+            ..Default::default()
+        },
+        hierarchical_test_config(),
+    );
+    compactor.compact(&ns).await.unwrap();
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = std::sync::Arc::new(
+        zeppelin::cache::DiskCache::new_with_max_bytes(
+            cache_dir.path().to_path_buf(),
+            100 * 1024 * 1024,
+        )
+        .unwrap(),
+    );
+
+    fn params<'a>(
+        store: &'a zeppelin::storage::ZeppelinStore,
+        wal_reader: &'a WalReader,
+        ns: &'a str,
+        q: &'a [f32],
+        cache: &'a std::sync::Arc<zeppelin::cache::DiskCache>,
+    ) -> QueryParams<'a> {
+        QueryParams {
+            store,
+            wal_reader,
+            namespace: ns,
+            query: q,
+            top_k: 5,
+            nprobe: 4,
+            filter: None,
+            consistency: ConsistencyLevel::Eventual,
+            distance_metric: DistanceMetric::Euclidean,
+            oversample_factor: 3,
+            cache: Some(cache),
+            manifest_cache: None,
+        }
+    }
+
+    // Cold query: exactly one tree_meta GET.
+    execute_query(params(&store, &wal_reader, &ns, &centroids[0], &cache))
+        .await
+        .unwrap();
+    assert_eq!(
+        counter.gets_matching("tree_meta.json"),
+        1,
+        "cold hierarchical query must fetch tree_meta exactly once"
+    );
+
+    // Warm query: zero tree_meta GETs.
+    counter.reset();
+    let response = execute_query(params(&store, &wal_reader, &ns, &centroids[0], &cache))
+        .await
+        .unwrap();
+    assert!(!response.results.is_empty());
+    assert_eq!(
+        counter.gets_matching("tree_meta.json"),
+        0,
+        "repeat hierarchical query must perform ZERO S3 GETs for tree_meta.json"
+    );
+
+    harness.cleanup().await;
+}
+
 #[tokio::test]
 async fn test_load_hierarchical_index() {
     let harness = TestHarness::new().await;
@@ -557,7 +642,7 @@ async fn test_load_hierarchical_index() {
         .unwrap();
 
     // Load from S3.
-    let loaded = load_hierarchical(&harness.store, &ns, segment_id)
+    let loaded = load_hierarchical(&harness.store, &ns, segment_id, None)
         .await
         .unwrap();
 

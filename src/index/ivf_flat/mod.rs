@@ -62,16 +62,26 @@ impl IvfFlatIndex {
     /// Load an IVF-Flat index using pre-known metadata from the manifest.
     ///
     /// Only fetches centroids — skips cluster-count probing and quantization
-    /// detection, saving ~18 S3 GETs per query.
+    /// detection, saving ~18 S3 GETs per query. When `cache` is provided,
+    /// the centroids are served through the tiered cache and pinned for the
+    /// namespace's active segment.
     pub async fn load_from_manifest(
         store: &ZeppelinStore,
         namespace: &str,
         segment_id: &str,
         num_vectors: usize,
         quantization: crate::index::quantization::QuantizationType,
+        cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
     ) -> Result<Self> {
-        build::load_ivf_flat_from_manifest(store, namespace, segment_id, num_vectors, quantization)
-            .await
+        build::load_ivf_flat_from_manifest(
+            store,
+            namespace,
+            segment_id,
+            num_vectors,
+            quantization,
+            cache,
+        )
+        .await
     }
 }
 

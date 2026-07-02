@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 pub mod assertions;
 #[allow(dead_code)]
+pub mod counting;
+#[allow(dead_code)]
 pub mod harness;
 #[allow(dead_code)]
 pub mod server;

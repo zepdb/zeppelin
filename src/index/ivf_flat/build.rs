@@ -461,18 +461,34 @@ pub async fn build_ivf_flat(
 
 /// Load an IVF-Flat index using pre-known metadata from the manifest.
 ///
-/// Only fetches centroids from S3 — skips the cluster-count probe loop
-/// and quantization-type detection that `load_ivf_flat` performs, saving
+/// Only fetches centroids — skips the cluster-count probe loop and
+/// quantization-type detection that `load_ivf_flat` performs, saving
 /// ~18 S3 GETs per query.
+///
+/// When `cache` is provided, the centroids blob is served through the
+/// tiered cache (memory → disk → S3) and pinned for the namespace's
+/// active segment: `pin_scoped` keeps it safe from LRU eviction and
+/// automatically unpins the previous segment's centroids on rotation.
+/// Cache errors are NOT swallowed — a failed fetch fails the load.
 pub async fn load_ivf_flat_from_manifest(
     store: &ZeppelinStore,
     namespace: &str,
     segment_id: &str,
     num_vectors: usize,
     quantization: QuantizationType,
+    cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
 ) -> Result<IvfFlatIndex> {
     let ckey = centroids_key(namespace, segment_id);
-    let data = store.get(&ckey).await?;
+    let data = match cache {
+        Some(c) => {
+            let data = c.get_or_fetch(&ckey, || store.get(&ckey)).await?;
+            // This load path is only used for the manifest's active segment;
+            // pin its centroids (unpinning the previous segment's).
+            c.pin_scoped(namespace, &ckey).await;
+            data
+        }
+        None => store.get(&ckey).await?,
+    };
     let (centroids, dim) = deserialize_centroids(&data)?;
 
     info!(

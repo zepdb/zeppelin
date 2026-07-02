@@ -504,13 +504,26 @@ fn compute_centroid(vectors: &[VectorEntry], dim: usize) -> Vec<f32> {
 }
 
 /// Load an existing hierarchical index from S3 (metadata only).
+///
+/// When `cache` is provided, tree_meta.json is served through the tiered
+/// cache (memory → disk → S3) and pinned for the namespace's active
+/// segment via `pin_scoped` (unpinned automatically on segment rotation).
+/// Cache errors are NOT swallowed — a failed fetch fails the load.
 pub async fn load_hierarchical(
     store: &ZeppelinStore,
     namespace: &str,
     segment_id: &str,
+    cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
 ) -> Result<HierarchicalIndex> {
     let key = tree_meta_key(namespace, segment_id);
-    let data = store.get(&key).await?;
+    let data = match cache {
+        Some(c) => {
+            let data = c.get_or_fetch(&key, || store.get(&key)).await?;
+            c.pin_scoped(namespace, &key).await;
+            data
+        }
+        None => store.get(&key).await?,
+    };
     let meta: TreeMeta = serde_json::from_slice(&data)?;
 
     info!(

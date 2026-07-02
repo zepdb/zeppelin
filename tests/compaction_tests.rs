@@ -1,5 +1,6 @@
 mod common;
 
+use common::counting::counting_store;
 use common::harness::TestHarness;
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 
@@ -878,6 +879,441 @@ async fn test_bytes_trigger_uses_recorded_sizes() {
             .await
             .unwrap(),
         "total WAL bytes < threshold must not trigger compaction"
+    );
+
+    harness.cleanup().await;
+}
+
+// ─── Task 3: centroid caching invariants ───
+
+use std::sync::Arc;
+use std::time::Duration;
+use zeppelin::cache::DiskCache;
+use zeppelin::index::ivf_flat::build::centroids_key;
+
+/// Build a `QueryParams` for the Task 3 tests (Eventual → segment-only).
+#[allow(clippy::too_many_arguments)]
+fn segment_query_params<'a>(
+    store: &'a zeppelin::storage::ZeppelinStore,
+    wal_reader: &'a WalReader,
+    ns: &'a str,
+    query: &'a [f32],
+    cache: Option<&'a Arc<DiskCache>>,
+) -> QueryParams<'a> {
+    QueryParams {
+        store,
+        wal_reader,
+        namespace: ns,
+        query,
+        top_k: 5,
+        nprobe: 4,
+        filter: None,
+        consistency: ConsistencyLevel::Eventual,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 3,
+        cache,
+        manifest_cache: None,
+    }
+}
+
+/// I1: a repeat query against an unchanged segment performs ZERO S3 GETs
+/// for the centroids blob — it must be served from the cache.
+#[tokio::test]
+async fn test_repeat_query_zero_centroid_gets() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let ns = harness.key("centroid-zero-gets");
+    let writer = WalWriter::new(store.clone());
+    let wal_reader = WalReader::new(store.clone());
+
+    Manifest::new().write(&store, &ns).await.unwrap();
+    let vecs = random_vectors(100, 16);
+    let query_vec = vecs[0].values.clone();
+    writer.append(&ns, vecs, vec![]).await.unwrap();
+
+    let compactor = test_compactor(&store);
+    compactor.compact(&ns).await.unwrap();
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+
+    // Cold query: one centroid GET is allowed (and expected).
+    execute_query(segment_query_params(
+        &store,
+        &wal_reader,
+        &ns,
+        &query_vec,
+        Some(&cache),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        counter.gets_matching("centroids.bin"),
+        1,
+        "cold query must fetch centroids exactly once"
+    );
+
+    // Warm query: centroids must come from cache — zero S3 GETs.
+    counter.reset();
+    execute_query(segment_query_params(
+        &store,
+        &wal_reader,
+        &ns,
+        &query_vec,
+        Some(&cache),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        counter.gets_matching("centroids.bin"),
+        0,
+        "repeat query against an unchanged segment must perform ZERO S3 GETs for centroids"
+    );
+
+    harness.cleanup().await;
+}
+
+/// I2: cache keys embed segment identity — after a second compaction the
+/// query reflects the new segment's data and the new segment's centroids
+/// get their own cache entry (never served from the old segment's entry).
+#[tokio::test]
+async fn test_new_segment_never_serves_stale_centroids() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let ns = harness.key("centroid-seg-identity");
+    let writer = WalWriter::new(store.clone());
+    let wal_reader = WalReader::new(store.clone());
+
+    Manifest::new().write(&store, &ns).await.unwrap();
+    // random_vectors is fixed-seed: generate ONE pool and split it so the
+    // two batches have disjoint values (identical values ⇒ distance ties ⇒
+    // arbitrary winner).
+    let pool = random_vectors(100, 16);
+    let batch1: Vec<VectorEntry> = pool[..60]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| VectorEntry {
+            id: format!("one_{i}"),
+            values: v.values.clone(),
+            attributes: None,
+        })
+        .collect();
+    writer.append(&ns, batch1, vec![]).await.unwrap();
+
+    let compactor = test_compactor(&store);
+    compactor.compact(&ns).await.unwrap();
+    let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    let seg1 = manifest.active_segment.clone().unwrap();
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+
+    // Warm the cache against segment 1.
+    let probe = random_vectors(1, 16)[0].values.clone();
+    execute_query(segment_query_params(
+        &store,
+        &wal_reader,
+        &ns,
+        &probe,
+        Some(&cache),
+    ))
+    .await
+    .unwrap();
+
+    // New data → new segment (disjoint values from batch1, see pool split).
+    let batch2: Vec<VectorEntry> = pool[60..]
+        .iter()
+        .enumerate()
+        .map(|(i, v)| VectorEntry {
+            id: format!("two_{i}"),
+            values: v.values.clone(),
+            attributes: None,
+        })
+        .collect();
+    let target = batch2[0].clone();
+    writer.append(&ns, batch2, vec![]).await.unwrap();
+    compactor.compact(&ns).await.unwrap();
+    let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    let seg2 = manifest.active_segment.clone().unwrap();
+    assert_ne!(seg1, seg2, "second compaction must produce a new segment");
+
+    // Query for a batch-2 vector: results must reflect the NEW segment.
+    let result = execute_query(segment_query_params(
+        &store,
+        &wal_reader,
+        &ns,
+        &target.values,
+        Some(&cache),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        result.results[0].id, target.id,
+        "query after re-compaction must reflect the new segment's data"
+    );
+
+    // The new segment's centroids must have their OWN cache entry.
+    let seg2_key = centroids_key(&ns, &seg2);
+    assert!(
+        cache.get(&seg2_key).await.is_some(),
+        "new segment's centroids must be cached under their own key ({seg2_key})"
+    );
+
+    harness.cleanup().await;
+}
+
+/// I3: the active segment's centroids are pinned — they survive LRU
+/// eviction pressure and are still served without an S3 GET. On segment
+/// rotation, the old segment's pin is released and the new one pinned.
+#[tokio::test]
+async fn test_pinned_centroids_survive_eviction_pressure() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let ns = harness.key("centroid-pin");
+    let writer = WalWriter::new(store.clone());
+    let wal_reader = WalReader::new(store.clone());
+
+    Manifest::new().write(&store, &ns).await.unwrap();
+    let vecs = random_vectors(100, 16);
+    let query_vec = vecs[0].values.clone();
+    writer.append(&ns, vecs, vec![]).await.unwrap();
+
+    let compactor = test_compactor(&store);
+    compactor.compact(&ns).await.unwrap();
+    let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    let seg1 = manifest.active_segment.clone().unwrap();
+    let seg1_ckey = centroids_key(&ns, &seg1);
+
+    // Tiny cache: cluster-sized junk entries will force LRU eviction.
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache =
+        Arc::new(DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 32 * 1024).unwrap());
+
+    // Populate + pin via a query.
+    execute_query(segment_query_params(
+        &store,
+        &wal_reader,
+        &ns,
+        &query_vec,
+        Some(&cache),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        cache.is_pinned(&seg1_ckey).await,
+        "active segment's centroids must be pinned after a query"
+    );
+
+    // Fill the cache well past capacity with cluster-sized entries.
+    for i in 0..40 {
+        cache
+            .put(
+                &format!("{ns}/junk/blob_{i}"),
+                &bytes::Bytes::from(vec![0u8; 4 * 1024]),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Pinned centroids survive: still served with zero S3 GETs.
+    assert!(
+        cache.get(&seg1_ckey).await.is_some(),
+        "pinned centroids entry must survive LRU eviction pressure"
+    );
+    counter.reset();
+    execute_query(segment_query_params(
+        &store,
+        &wal_reader,
+        &ns,
+        &query_vec,
+        Some(&cache),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        counter.gets_matching("centroids.bin"),
+        0,
+        "query under eviction pressure must serve pinned centroids without a GET"
+    );
+
+    // Segment rotation: new compaction → old pin released, new key pinned.
+    writer
+        .append(&ns, random_vectors(20, 16), vec![])
+        .await
+        .unwrap();
+    compactor.compact(&ns).await.unwrap();
+    let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    let seg2 = manifest.active_segment.clone().unwrap();
+    assert_ne!(seg1, seg2);
+    let seg2_ckey = centroids_key(&ns, &seg2);
+
+    execute_query(segment_query_params(
+        &store,
+        &wal_reader,
+        &ns,
+        &query_vec,
+        Some(&cache),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        cache.is_pinned(&seg2_ckey).await,
+        "new active segment's centroids must be pinned"
+    );
+    assert!(
+        !cache.is_pinned(&seg1_ckey).await,
+        "old segment's centroids must be unpinned after rotation"
+    );
+
+    harness.cleanup().await;
+}
+
+/// I4: after the background compaction loop produces a new segment, the
+/// new segment's centroids are warmed into the cache eagerly — BEFORE any
+/// query arrives.
+#[tokio::test]
+async fn test_compaction_warms_new_segment_centroids() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    // Top-level namespace (no '/') so NamespaceManager can register it and
+    // the compaction loop discovers it. Cleaned up manually below.
+    let ns = format!("{}-warm", harness.prefix);
+    let writer = WalWriter::new(store.clone());
+
+    let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
+    namespace_manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    writer
+        .append(&ns, random_vectors(50, 16), vec![])
+        .await
+        .unwrap();
+
+    let compaction_config = CompactionConfig {
+        interval_secs: 1,
+        max_wal_fragments_before_compact: 100,
+        max_wal_age_before_compact_secs: 1,
+        max_wal_bytes_before_compact: u64::MAX,
+        ..Default::default()
+    };
+    let indexing_config = IndexingConfig {
+        default_num_centroids: 4,
+        kmeans_max_iterations: 10,
+        ..Default::default()
+    };
+    let compactor = Arc::new(Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        compaction_config.clone(),
+        indexing_config,
+    ));
+    let manifest_cache = Arc::new(zeppelin::cache::manifest_cache::ManifestCache::new(
+        Duration::from_millis(500),
+    ));
+    let lease_manager = Arc::new(zeppelin::wal::LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(compaction_config.lease_duration_secs),
+    ));
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    {
+        let compactor = compactor.clone();
+        let namespace_manager = namespace_manager.clone();
+        let manifest_cache = manifest_cache.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            zeppelin::compaction::background::compaction_loop(
+                compactor,
+                namespace_manager,
+                shutdown_rx,
+                manifest_cache,
+                lease_manager,
+                cache,
+            )
+            .await;
+        });
+    }
+
+    // Wait for the loop to compact (age trigger ~1s, interval 1s), then
+    // assert the NEW segment's centroids appear in the cache without any
+    // query having been issued.
+    let mut warmed_key: Option<String> = None;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+        if let Some(seg_id) = &manifest.active_segment {
+            let ckey = centroids_key(&ns, seg_id);
+            if cache.get(&ckey).await.is_some() {
+                warmed_key = Some(ckey);
+                break;
+            }
+        }
+    }
+    let _ = shutdown_tx.send(true);
+
+    let warmed_key = warmed_key.expect(
+        "post-compaction hook must warm the new segment's centroids into the cache \
+         before any query arrives",
+    );
+    assert!(
+        cache.is_pinned(&warmed_key).await,
+        "warmed centroids must be pinned for the active segment"
+    );
+
+    let _ = store.delete_prefix(&format!("{ns}/")).await;
+    harness.cleanup().await;
+}
+
+/// I5 (fail-loud half): caching must never convert a query-path error into
+/// silent degradation — a missing centroids blob during an actual query is
+/// still an error, warm cache infrastructure or not.
+#[tokio::test]
+async fn test_query_path_stays_fail_loud_with_cache() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let ns = harness.key("centroid-fail-loud");
+    let writer = WalWriter::new(store.clone());
+    let wal_reader = WalReader::new(store.clone());
+
+    Manifest::new().write(&store, &ns).await.unwrap();
+    writer
+        .append(&ns, random_vectors(50, 16), vec![])
+        .await
+        .unwrap();
+    let compactor = test_compactor(&store);
+    compactor.compact(&ns).await.unwrap();
+    let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    let seg = manifest.active_segment.clone().unwrap();
+
+    // Sabotage: remove the centroids blob out from under the segment.
+    store.delete(&centroids_key(&ns, &seg)).await.unwrap();
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+    let probe = random_vectors(1, 16)[0].values.clone();
+    let result = execute_query(segment_query_params(
+        &store,
+        &wal_reader,
+        &ns,
+        &probe,
+        Some(&cache),
+    ))
+    .await;
+    assert!(
+        result.is_err(),
+        "a failed centroid fetch during an actual query must remain an error"
     );
 
     harness.cleanup().await;

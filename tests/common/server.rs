@@ -186,6 +186,7 @@ pub async fn start_test_server_with_compaction(
         let compactor = compactor.clone();
         let namespace_manager = namespace_manager.clone();
         let manifest_cache = manifest_cache.clone();
+        let cache = cache.clone();
         tokio::spawn(async move {
             compaction_loop(
                 compactor,
@@ -193,6 +194,7 @@ pub async fn start_test_server_with_compaction(
                 shutdown_rx,
                 manifest_cache,
                 lease_manager,
+                cache,
             )
             .await;
         });

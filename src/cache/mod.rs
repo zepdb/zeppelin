@@ -47,6 +47,11 @@ pub struct DiskCache {
     max_size_bytes: u64,
     entries: DashMap<String, CacheEntry>,
     pinned: RwLock<HashSet<String>>,
+    /// One pinned key per scope (namespace): pinning a new key for a scope
+    /// unpins the scope's previous key. Used for active-segment index
+    /// metadata (centroids / tree meta) that must survive LRU pressure but
+    /// release automatically on segment rotation.
+    scoped_pins: DashMap<String, String>,
     total_size: AtomicU64,
     /// Optional in-memory tier sitting above disk.
     memory: Option<MemoryCache>,
@@ -86,6 +91,7 @@ impl DiskCache {
             max_size_bytes,
             entries: DashMap::new(),
             pinned: RwLock::new(HashSet::new()),
+            scoped_pins: DashMap::new(),
             total_size: AtomicU64::new(0),
             memory,
         };
@@ -288,6 +294,38 @@ impl DiskCache {
     pub async fn unpin(&self, key: &str) {
         let mut pinned = self.pinned.write().await;
         pinned.remove(key);
+    }
+
+    /// Pin `key` under `scope`, unpinning the scope's previously pinned key.
+    ///
+    /// A scope (namespace) has at most one pinned key at a time. This keeps
+    /// the active segment's index metadata (centroids / tree meta) safe from
+    /// LRU eviction while automatically releasing the old segment's entry
+    /// when the active segment rotates after compaction.
+    pub async fn pin_scoped(&self, scope: &str, key: &str) {
+        // Fast path: already pinned for this scope — one lock-free map read
+        // plus a shared-lock membership check on the hot query path.
+        if let Some(current) = self.scoped_pins.get(scope) {
+            if current.value() == key && self.pinned.read().await.contains(key) {
+                return;
+            }
+        }
+
+        let old = self.scoped_pins.insert(scope.to_string(), key.to_string());
+        let mut pinned = self.pinned.write().await;
+        if let Some(old_key) = old {
+            if old_key != key {
+                pinned.remove(&old_key);
+                debug!(scope = scope, key = %old_key, "unpinned rotated cache key");
+            }
+        }
+        pinned.insert(key.to_string());
+        debug!(scope = scope, key = key, "pinned cache key for scope");
+    }
+
+    /// Whether a key is currently pinned.
+    pub async fn is_pinned(&self, key: &str) -> bool {
+        self.pinned.read().await.contains(key)
     }
 
     /// Invalidate (remove) a single key from both memory and disk tiers.
