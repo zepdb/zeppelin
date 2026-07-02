@@ -4,6 +4,8 @@ yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.x is used for persisted internal binary formats; replacement requires a compatibility migration outside this stabilization pass." },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is transitive through object_store 0.11; removing it requires a larger object_store/TLS stack upgrade." },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml is transitive through object_store (parses S3 XML from the configured, trusted storage endpoint) and the optional pprof profiling feature; the fix needs quick-xml >= 0.41 but even object_store 0.14 pins ^0.40.1, so no compatible patched release exists yet." },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml is transitive through object_store (parses S3 XML from the configured, trusted storage endpoint) and the optional pprof profiling feature; the fix needs quick-xml >= 0.41 but even object_store 0.14 pins ^0.40.1, so no compatible patched release exists yet." },
 ]
 
 [licenses]
@@ -21,6 +23,13 @@ allow = [
     "OpenSSL",
 ]
 confidence-threshold = 0.8
+
+# inferno (flamegraph rendering, pulled in by the optional pprof "profiling"
+# feature) is CDDL-1.0 — a weak file-level copyleft. Allowed for this crate
+# only; CDDL-1.0 stays out of the global allow-list.
+exceptions = [
+    { crate = "inferno", allow = ["CDDL-1.0"] },
+]
 
 [[licenses.clarify]]
 crate = "ring"

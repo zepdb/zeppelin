@@ -137,7 +137,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run loom tests
-        run: RUSTFLAGS="--cfg loom" cargo test --test loom_tests -- --nocapture
+        run: RUSTFLAGS="--cfg loom" cargo test --manifest-path loom-tests/Cargo.toml -- --nocapture
         env:
           LOOM_MAX_PREEMPTIONS: 3
 

@@ -1,0 +1,19 @@
+[package]
+name = "zeppelin-loom-tests"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[dependencies]
+loom = "0.7"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[test]]
+name = "loom_tests"
+path = "tests/loom_tests.rs"

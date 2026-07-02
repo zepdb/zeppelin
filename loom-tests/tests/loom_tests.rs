@@ -3,7 +3,7 @@
 //! These model simplified versions of the concurrent protocols using loom
 //! primitives to exhaustively test all possible interleavings.
 //!
-//! Run with: `RUSTFLAGS="--cfg loom" cargo test --test loom_tests -- --nocapture`
+//! Run with: `RUSTFLAGS="--cfg loom" cargo test --manifest-path loom-tests/Cargo.toml -- --nocapture`
 
 #[cfg(loom)]
 mod loom_tests {

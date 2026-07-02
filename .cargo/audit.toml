@@ -1,0 +1,8 @@
+# quick-xml DoS advisories (RUSTSEC-2026-0194, RUSTSEC-2026-0195): quick-xml is
+# transitive through object_store (parses S3 XML responses from the configured,
+# trusted storage endpoint — not attacker-controlled input) and the optional
+# pprof profiling feature. The fix requires quick-xml >= 0.41, but even the
+# newest object_store (0.14) pins ^0.40.1, so no compatible patched release
+# exists yet. Revisit when object_store allows quick-xml 0.41+.
+[advisories]
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]

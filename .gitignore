@@ -1,5 +1,9 @@
 # Rust
 /target
+fuzz/target/
+fuzz/Cargo.lock
+loom-tests/target/
+loom-tests/Cargo.lock
 **/*.rs.bk
 
 # Coverage
