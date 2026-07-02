@@ -35,10 +35,6 @@ __pycache__/
 dist/
 build/
 
-# Claude working files
-claude_files/
-CLAUDE.md
-
 # Task tracking (session state)
 tasks/
 
