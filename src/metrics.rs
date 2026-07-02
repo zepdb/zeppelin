@@ -78,6 +78,14 @@ mod inner {
             "zeppelin_requests_by_ip_total", "Requests by source IP",
             &["ip", "method", "path", "status"]
         ).unwrap();
+
+        // Data-quality defense in depth: pre-fix non-finite vectors found
+        // durable on S3 and skipped during compaction (Task 10 I4).
+        pub static ref NON_FINITE_VECTORS_SKIPPED_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_non_finite_vectors_skipped_total",
+            "Vectors with NaN/inf values skipped during compaction",
+            &["namespace"]
+        ).unwrap();
     }
 }
 
@@ -114,4 +122,5 @@ pub fn init() {
     lazy_static::initialize(&FTS_QUERIES_TOTAL);
     lazy_static::initialize(&RATE_LIMITED_TOTAL);
     lazy_static::initialize(&REQUESTS_BY_IP_TOTAL);
+    lazy_static::initialize(&NON_FINITE_VECTORS_SKIPPED_TOTAL);
 }

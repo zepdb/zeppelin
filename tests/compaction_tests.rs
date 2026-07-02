@@ -1319,6 +1319,89 @@ async fn test_query_path_stays_fail_loud_with_cache() {
     harness.cleanup().await;
 }
 
+/// Task 10 I4 (defense in depth): non-finite vectors already durable on S3
+/// (written before API validation existed, simulated here by writing directly
+/// via WalWriter, bypassing the HTTP boundary) must not poison centroid
+/// training. Compaction skips them with an ERROR log + metric and produces
+/// finite centroids; it must NOT fail — crashing compaction forever on one
+/// bad historical vector would brick the namespace.
+#[tokio::test]
+async fn test_compaction_skips_non_finite_prefix_data() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("compact-nonfinite");
+    let store = &harness.store;
+    let writer = WalWriter::new(store.clone());
+
+    Manifest::new().write(store, &ns).await.unwrap();
+
+    // 50 good vectors + 1 NaN vector + 1 inf vector, direct to the WAL
+    // (pre-fix data path; the API boundary now rejects these).
+    let mut vecs = random_vectors(50, 16);
+    let mut nan_values = vec![0.5f32; 16];
+    nan_values[3] = f32::NAN;
+    vecs.push(VectorEntry {
+        id: "poison-nan".to_string(),
+        values: nan_values,
+        attributes: None,
+    });
+    let mut inf_values = vec![0.5f32; 16];
+    inf_values[7] = f32::INFINITY;
+    vecs.push(VectorEntry {
+        id: "poison-inf".to_string(),
+        values: inf_values,
+        attributes: None,
+    });
+    writer.append(&ns, vecs, vec![]).await.unwrap();
+
+    let metric_before = zeppelin::metrics::NON_FINITE_VECTORS_SKIPPED_TOTAL
+        .with_label_values(&[&ns])
+        .get();
+
+    let compactor = test_compactor(store);
+    let result = compactor
+        .compact(&ns)
+        .await
+        .expect("compaction must succeed despite pre-existing non-finite vectors");
+
+    // The two poisoned vectors are skipped, not compacted.
+    assert_eq!(
+        result.vectors_compacted, 50,
+        "non-finite vectors must be excluded from the compacted segment"
+    );
+
+    // Centroids on S3 must be entirely finite.
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    let seg = manifest.active_segment.clone().unwrap();
+    let data = store
+        .get(&format!("{ns}/segments/{seg}/centroids.bin"))
+        .await
+        .unwrap();
+    // Layout: [num_centroids: u32][dim: u32][f32 * num * dim]
+    let num = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let dim = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    assert!(num > 0 && dim == 16);
+    for i in 0..num * dim {
+        let off = 8 + i * 4;
+        let val = f32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+        assert!(
+            val.is_finite(),
+            "centroid float #{i} is non-finite ({val}) — NaN/inf poisoned k-means"
+        );
+    }
+
+    // The sanctioned-degradation metric fired once per skipped vector.
+    let metric_after = zeppelin::metrics::NON_FINITE_VECTORS_SKIPPED_TOTAL
+        .with_label_values(&[&ns])
+        .get();
+    assert_eq!(
+        metric_after - metric_before,
+        2,
+        "skipping non-finite vectors must be observable via metric"
+    );
+
+    harness.cleanup().await;
+}
+
 #[tokio::test]
 async fn test_compact_attributes_preserved() {
     let harness = TestHarness::new().await;

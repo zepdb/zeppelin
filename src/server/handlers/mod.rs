@@ -18,6 +18,33 @@ use crate::server::AppState;
 /// Wrapper that converts `ZeppelinError` into an HTTP response.
 pub struct ApiError(pub ZeppelinError);
 
+/// Find the first non-finite value in a float slice.
+///
+/// Returns `(dimension_index, kind)` where kind is `"NaN"`, `"inf"`, or
+/// `"-inf"`. JSON cannot express NaN/inf literally, but serde_json overflows
+/// in-f64-range literals like `1e39` to +/-inf during the f64→f32 narrowing —
+/// without this check such values poison distance comparisons
+/// (`partial_cmp(..).unwrap_or(Equal)` makes orderings nondeterministic) and
+/// get baked into k-means centroids at compaction, permanently damaging
+/// recall for the namespace.
+///
+/// Cost: a single `is_finite()` pass over floats the handler has already
+/// deserialized — O(dims × batch), a tiny fraction of the JSON parse that
+/// preceded it. No perf guard needed.
+pub(crate) fn find_non_finite(values: &[f32]) -> Option<(usize, &'static str)> {
+    values.iter().position(|v| !v.is_finite()).map(|i| {
+        let v = values[i];
+        let kind = if v.is_nan() {
+            "NaN"
+        } else if v > 0.0 {
+            "inf"
+        } else {
+            "-inf"
+        };
+        (i, kind)
+    })
+}
+
 /// Converts a `ZeppelinError` into an `ApiError`.
 impl From<ZeppelinError> for ApiError {
     fn from(e: ZeppelinError) -> Self {

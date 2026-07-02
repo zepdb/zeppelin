@@ -139,6 +139,15 @@ pub async fn query_namespace(
                 actual: vector.len(),
             }));
         }
+        // Reject NaN/inf: non-finite query values make every distance
+        // comparison nondeterministic (partial_cmp falls back to Equal).
+        // Single is_finite() pass over an already-deserialized slice — keeps
+        // the direct-serde fast path intact.
+        if let Some((dim_idx, kind)) = super::find_non_finite(vector) {
+            return Err(ApiError(ZeppelinError::Validation(format!(
+                "query vector contains a non-finite value ({kind}) at dimension {dim_idx}"
+            ))));
+        }
 
         let nprobe = req.nprobe.unwrap_or(state.config.indexing.default_nprobe);
         if nprobe > state.config.indexing.max_nprobe {

@@ -51,6 +51,15 @@ pub fn train_kmeans(
         return Err(ZeppelinError::Index("k must be > 0".into()));
     }
 
+    // Non-finite inputs must never reach centroid math: a single NaN/inf
+    // silently corrupts every centroid it touches. The API boundary rejects
+    // them and compaction skips pre-fix bad data before calling us; this
+    // assert catches any future call path that forgets the guard.
+    debug_assert!(
+        vectors.iter().all(|v| v.iter().all(|x| x.is_finite())),
+        "train_kmeans received non-finite vector values; callers must filter these out"
+    );
+
     // If we have fewer points than centroids, just use the points as centroids.
     let effective_k = k.min(n);
     if effective_k < k {

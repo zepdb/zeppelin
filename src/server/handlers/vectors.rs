@@ -71,6 +71,14 @@ pub async fn upsert_vectors(
                 vec.id
             ))));
         }
+        // Reject NaN/inf before anything durable is written: one non-finite
+        // value poisons distance orderings and k-means centroids permanently.
+        if let Some((dim_idx, kind)) = super::find_non_finite(&vec.values) {
+            return Err(ApiError(ZeppelinError::Validation(format!(
+                "vector '{}' contains a non-finite value ({kind}) at dimension {dim_idx}",
+                vec.id
+            ))));
+        }
     }
 
     info!(count = req.vectors.len(), "upserting vectors");
@@ -84,10 +92,14 @@ pub async fn upsert_vectors(
 
     for vec in &req.vectors {
         if vec.values.len() != meta.dimensions {
-            return Err(ApiError(ZeppelinError::DimensionMismatch {
-                expected: meta.dimensions,
-                actual: vec.values.len(),
-            }));
+            // Name the offending vector: in a 50k-vector batch, "expected
+            // 128, got 64" alone leaves the client hunting for the bad entry.
+            return Err(ApiError(ZeppelinError::Validation(format!(
+                "vector '{}' has dimension mismatch: expected {}, got {}",
+                vec.id,
+                meta.dimensions,
+                vec.values.len()
+            ))));
         }
     }
 

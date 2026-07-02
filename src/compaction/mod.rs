@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use rand::Rng;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use ulid::Ulid;
 
 use crate::config::{CompactionConfig, IndexingConfig};
@@ -285,8 +285,37 @@ impl Compactor {
             }
         }
 
-        // 6. Collect surviving vectors
-        let vectors: Vec<VectorEntry> = latest_vectors.into_values().collect();
+        // 6. Collect surviving vectors, skipping any with non-finite values.
+        //
+        // Defense in depth (Task 10 I4): the API boundary now rejects
+        // NaN/inf, but data written BEFORE that fix may already be durable
+        // on S3. This skip is the ONE sanctioned degradation in the
+        // compactor: crashing here would fail every future compaction cycle
+        // for the namespace — one bad historical vector would brick it
+        // (WAL grows forever, deletes never resolve). Skipping is loud:
+        // ERROR-level structured log + metric per dropped vector. Note the
+        // vector remains visible to Strong queries via the WAL until this
+        // compaction's manifest lands; after that it is gone entirely.
+        let vectors: Vec<VectorEntry> = latest_vectors
+            .into_values()
+            .filter(|v| {
+                if let Some(bad_idx) = v.values.iter().position(|x| !x.is_finite()) {
+                    error!(
+                        vector_id = %v.id,
+                        dimension = bad_idx,
+                        value = %v.values[bad_idx],
+                        "skipping vector with non-finite value during compaction; \
+                         it will be dropped from the compacted segment"
+                    );
+                    crate::metrics::NON_FINITE_VECTORS_SKIPPED_TOTAL
+                        .with_label_values(&[namespace])
+                        .inc();
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         let vectors_compacted = vectors.len();
 
         // Collect keys for deferred deletion, carrying over keys whose
