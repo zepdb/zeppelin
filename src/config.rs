@@ -231,9 +231,22 @@ pub struct CompactionConfig {
     /// Polling interval between compaction checks, in seconds. Default: `30`.
     #[serde(default = "default_compaction_interval")]
     pub interval_secs: u64,
-    /// Trigger compaction when pending WAL fragments exceed this count. Default: `1000`.
+    /// Trigger compaction when pending WAL fragments reach this count. Default: `100`.
     #[serde(default = "default_max_wal_fragments")]
     pub max_wal_fragments_before_compact: usize,
+    /// Trigger compaction when the oldest uncompacted WAL fragment is at
+    /// least this many seconds old (age derived from the fragment's ULID
+    /// timestamp). Guarantees any namespace with pending WAL data converges
+    /// to a compacted state within a bounded window, regardless of fragment
+    /// count. Default: `300` (5 minutes).
+    #[serde(default = "default_max_wal_age_secs")]
+    pub max_wal_age_before_compact_secs: u64,
+    /// Trigger compaction when total uncompacted WAL bytes reach this
+    /// threshold, so few-but-large fragments don't linger under the count
+    /// trigger. Fragment sizes are recorded in the manifest at write time
+    /// (no extra S3 reads). Default: `67_108_864` (64 MB).
+    #[serde(default = "default_max_wal_bytes")]
+    pub max_wal_bytes_before_compact: u64,
     /// Ratio of new-to-existing vectors that triggers centroid retraining. Default: `5.0`.
     #[serde(default = "default_retrain_threshold")]
     pub retrain_imbalance_threshold: f64,
@@ -340,7 +353,13 @@ fn default_compaction_interval() -> u64 {
     30
 }
 fn default_max_wal_fragments() -> usize {
-    1000
+    100
+}
+fn default_max_wal_age_secs() -> u64 {
+    300
+}
+fn default_max_wal_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 fn default_retrain_threshold() -> f64 {
     5.0
@@ -439,6 +458,8 @@ impl Default for CompactionConfig {
         Self {
             interval_secs: default_compaction_interval(),
             max_wal_fragments_before_compact: default_max_wal_fragments(),
+            max_wal_age_before_compact_secs: default_max_wal_age_secs(),
+            max_wal_bytes_before_compact: default_max_wal_bytes(),
             retrain_imbalance_threshold: default_retrain_threshold(),
             max_pending_deletes: default_max_pending_deletes(),
             max_old_segments: default_max_old_segments(),
@@ -723,6 +744,18 @@ impl Config {
             .and_then(|v| v.parse().ok())
         {
             self.compaction.max_wal_fragments_before_compact = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_WAL_AGE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.compaction.max_wal_age_before_compact_secs = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_WAL_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.compaction.max_wal_bytes_before_compact = v;
         }
         if let Some(v) = std::env::var("ZEPPELIN_MAX_PENDING_DELETES")
             .ok()

@@ -96,6 +96,7 @@ impl WalWriter {
         // Write the fragment to S3
         let key = WalFragment::s3_key(namespace, &fragment.id);
         let data = fragment.to_bytes()?;
+        let size_bytes = data.len() as u64;
         self.store.put(&key, data).await?;
 
         debug!(
@@ -134,6 +135,7 @@ impl WalWriter {
                 vector_count: fragment.vectors.len(),
                 delete_count: fragment.deletes.len(),
                 sequence_number: 0, // assigned by add_fragment
+                size_bytes,
             });
 
             // Layer 2: CAS — catches TOCTOU gap between fencing check and write.
@@ -169,6 +171,8 @@ impl WalWriter {
 struct WriteRequest {
     namespace: String,
     fragment: WalFragment,
+    /// Serialized fragment size in bytes (known at PUT time).
+    size_bytes: u64,
     reply: oneshot::Sender<Result<Manifest>>,
 }
 
@@ -211,6 +215,7 @@ impl BatchWalWriter {
         // Write fragment to S3 immediately (durability)
         let key = WalFragment::s3_key(namespace, &fragment.id);
         let data = fragment.to_bytes()?;
+        let size_bytes = data.len() as u64;
         store.put(&key, data).await?;
 
         debug!(
@@ -226,6 +231,7 @@ impl BatchWalWriter {
             .send(WriteRequest {
                 namespace: namespace.to_string(),
                 fragment: fragment.clone(),
+                size_bytes,
                 reply: reply_tx,
             })
             .await
@@ -358,6 +364,7 @@ async fn flush_namespace(
                 vector_count: req.fragment.vectors.len(),
                 delete_count: req.fragment.deletes.len(),
                 sequence_number: 0, // assigned by add_fragment
+                size_bytes: req.size_bytes,
             });
         }
 
@@ -431,6 +438,7 @@ mod tests {
         let _req = WriteRequest {
             namespace: "test".to_string(),
             fragment: frag,
+            size_bytes: 0,
             reply: tx,
         };
     }

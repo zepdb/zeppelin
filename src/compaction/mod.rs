@@ -68,18 +68,71 @@ impl Compactor {
     }
 
     /// Check whether compaction should be triggered for a namespace.
+    ///
+    /// Three independent triggers, evaluated from the manifest alone (no
+    /// additional S3 reads):
+    /// - **count**: uncompacted fragments >= `max_wal_fragments_before_compact`
+    /// - **age**: oldest uncompacted fragment (from its ULID timestamp) is
+    ///   >= `max_wal_age_before_compact_secs` old — guarantees any namespace
+    ///   with pending WAL data converges within a bounded window
+    /// - **bytes**: total uncompacted WAL bytes (recorded at write time in
+    ///   `FragmentRef.size_bytes`) >= `max_wal_bytes_before_compact`
+    ///
+    /// A namespace with zero uncompacted fragments never triggers, regardless
+    /// of configuration.
     #[instrument(skip(self), fields(namespace = namespace))]
     pub async fn should_compact(&self, namespace: &str) -> Result<bool> {
         let manifest = Manifest::read(&self.store, namespace)
             .await?
             .unwrap_or_default();
-        let count = manifest.uncompacted_fragments().len();
+        let fragments = manifest.uncompacted_fragments();
+
+        // Idle namespace: nothing to compact, never trigger (no busy work,
+        // no S3 churn on quiet namespaces).
+        if fragments.is_empty() {
+            debug!("no uncompacted fragments, compaction not needed");
+            return Ok(false);
+        }
+
+        let count = fragments.len();
+        let total_bytes: u64 = fragments.iter().map(|f| f.size_bytes).sum();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| ZeppelinError::Index(format!("system clock before Unix epoch: {e}")))?
+            .as_millis() as u64;
+        let oldest_age_secs = fragments
+            .iter()
+            .map(|f| fragment_age_secs(&f.id, now_ms))
+            .max()
+            .unwrap_or(0);
+
+        let count_exceeded = count >= self.config.max_wal_fragments_before_compact;
+        let age_exceeded = oldest_age_secs >= self.config.max_wal_age_before_compact_secs;
+        let bytes_exceeded = total_bytes >= self.config.max_wal_bytes_before_compact;
+
+        if count_exceeded || age_exceeded || bytes_exceeded {
+            info!(
+                fragment_count = count,
+                total_wal_bytes = total_bytes,
+                oldest_fragment_age_secs = oldest_age_secs,
+                count_trigger = count_exceeded,
+                age_trigger = age_exceeded,
+                bytes_trigger = bytes_exceeded,
+                count_threshold = self.config.max_wal_fragments_before_compact,
+                age_threshold_secs = self.config.max_wal_age_before_compact_secs,
+                bytes_threshold = self.config.max_wal_bytes_before_compact,
+                "compaction triggered"
+            );
+            return Ok(true);
+        }
+
         debug!(
             fragment_count = count,
-            threshold = self.config.max_wal_fragments_before_compact,
-            "checking compaction trigger"
+            total_wal_bytes = total_bytes,
+            oldest_fragment_age_secs = oldest_age_secs,
+            "compaction not needed"
         );
-        Ok(count >= self.config.max_wal_fragments_before_compact)
+        Ok(false)
     }
 
     /// Compact all uncompacted WAL fragments into a new IVF-Flat segment.
@@ -758,6 +811,16 @@ impl Compactor {
     }
 }
 
+/// Age of a fragment in seconds, derived from its ULID timestamp.
+///
+/// ULIDs encode their creation time in the top 48 bits (milliseconds since
+/// the Unix epoch), so no extra timestamp field is needed on `FragmentRef`.
+/// Clock skew can make a fragment's ULID timestamp sit slightly in the
+/// future relative to this node; saturate to 0 rather than underflow.
+fn fragment_age_secs(id: &Ulid, now_ms: u64) -> u64 {
+    now_ms.saturating_sub(id.timestamp_ms()) / 1000
+}
+
 /// Merge this cycle's deferred-delete keys into the manifest.
 ///
 /// The fresh manifest re-read inside the CAS loop may contain
@@ -849,6 +912,165 @@ async fn load_segment_vectors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wal::manifest::FragmentRef;
+
+    fn mem_compactor(config: CompactionConfig) -> Compactor {
+        let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = ZeppelinStore::new(mem);
+        let wal_reader = WalReader::new(store.clone());
+        Compactor::new(store, wal_reader, config, IndexingConfig::default())
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    fn fragment_ref(id: Ulid, size_bytes: u64) -> FragmentRef {
+        FragmentRef {
+            id,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes,
+        }
+    }
+
+    async fn write_manifest(compactor: &Compactor, ns: &str, fragments: Vec<FragmentRef>) {
+        let mut manifest = Manifest::new();
+        for f in fragments {
+            manifest.add_fragment(f);
+        }
+        manifest.write(&compactor.store, ns).await.unwrap();
+    }
+
+    /// I1: a single old fragment must trigger compaction via the age
+    /// trigger even when the count threshold is far away.
+    #[tokio::test]
+    async fn test_should_compact_age_exceeded_single_fragment() {
+        let compactor = mem_compactor(CompactionConfig {
+            max_wal_fragments_before_compact: 1000,
+            max_wal_age_before_compact_secs: 60, // 1 minute
+            max_wal_bytes_before_compact: u64::MAX,
+            ..Default::default()
+        });
+        // Fragment written 1 hour ago (ULID encodes the timestamp).
+        let old_id = Ulid::from_parts(now_ms() - 3_600_000, 42);
+        write_manifest(&compactor, "ns-age", vec![fragment_ref(old_id, 100)]).await;
+
+        assert!(
+            compactor.should_compact("ns-age").await.unwrap(),
+            "1 fragment older than max_wal_age_before_compact_secs must trigger compaction"
+        );
+    }
+
+    /// A fresh fragment below all thresholds must NOT trigger.
+    #[tokio::test]
+    async fn test_should_compact_fresh_fragment_below_thresholds() {
+        let compactor = mem_compactor(CompactionConfig {
+            max_wal_fragments_before_compact: 1000,
+            max_wal_age_before_compact_secs: 3600,
+            max_wal_bytes_before_compact: u64::MAX,
+            ..Default::default()
+        });
+        let fresh_id = Ulid::from_parts(now_ms(), 42);
+        write_manifest(&compactor, "ns-fresh", vec![fragment_ref(fresh_id, 100)]).await;
+
+        assert!(
+            !compactor.should_compact("ns-fresh").await.unwrap(),
+            "fresh fragment below all thresholds must not trigger compaction"
+        );
+    }
+
+    /// I2: total uncompacted WAL bytes over the threshold must trigger,
+    /// so few-but-huge fragments don't linger under the count trigger.
+    #[tokio::test]
+    async fn test_should_compact_bytes_exceeded() {
+        let compactor = mem_compactor(CompactionConfig {
+            max_wal_fragments_before_compact: 1000,
+            max_wal_age_before_compact_secs: u64::MAX / 1000,
+            max_wal_bytes_before_compact: 64 * 1024 * 1024, // 64 MB
+            ..Default::default()
+        });
+        let now = now_ms();
+        write_manifest(
+            &compactor,
+            "ns-bytes",
+            vec![
+                fragment_ref(Ulid::from_parts(now, 1), 40 * 1024 * 1024),
+                fragment_ref(Ulid::from_parts(now, 2), 40 * 1024 * 1024),
+            ],
+        )
+        .await;
+
+        assert!(
+            compactor.should_compact("ns-bytes").await.unwrap(),
+            "80MB of WAL over a 64MB threshold must trigger compaction"
+        );
+    }
+
+    /// I4: zero uncompacted fragments never triggers compaction, no matter
+    /// how aggressive the configuration is.
+    #[tokio::test]
+    async fn test_should_compact_zero_fragments_never_triggers() {
+        let compactor = mem_compactor(CompactionConfig {
+            max_wal_fragments_before_compact: 0,
+            max_wal_age_before_compact_secs: 0,
+            max_wal_bytes_before_compact: 0,
+            ..Default::default()
+        });
+        write_manifest(&compactor, "ns-idle", vec![]).await;
+
+        assert!(
+            !compactor.should_compact("ns-idle").await.unwrap(),
+            "an idle namespace (0 fragments) must never be compacted"
+        );
+    }
+
+    /// I3: the count trigger keeps working (backward compat).
+    #[tokio::test]
+    async fn test_should_compact_count_trigger_preserved() {
+        let compactor = mem_compactor(CompactionConfig {
+            max_wal_fragments_before_compact: 3,
+            max_wal_age_before_compact_secs: u64::MAX / 1000,
+            max_wal_bytes_before_compact: u64::MAX,
+            ..Default::default()
+        });
+        let now = now_ms();
+        write_manifest(
+            &compactor,
+            "ns-count",
+            (0..3)
+                .map(|i| fragment_ref(Ulid::from_parts(now, i as u128), 10))
+                .collect(),
+        )
+        .await;
+
+        assert!(
+            compactor.should_compact("ns-count").await.unwrap(),
+            "reaching the fragment-count threshold must trigger compaction"
+        );
+    }
+
+    /// Fragment age is derived from the ULID's embedded millisecond
+    /// timestamp — no separate timestamp field needed.
+    #[test]
+    fn test_fragment_age_from_ulid_timestamp() {
+        let now = now_ms();
+        // Created 90 seconds ago.
+        let id = Ulid::from_parts(now - 90_000, 7);
+        assert_eq!(fragment_age_secs(&id, now), 90);
+
+        // Created "in the future" (clock skew): age saturates to 0.
+        let future = Ulid::from_parts(now + 5_000, 7);
+        assert_eq!(fragment_age_secs(&future, now), 0);
+
+        // Same millisecond: age 0.
+        let same = Ulid::from_parts(now, 7);
+        assert_eq!(fragment_age_secs(&same, now), 0);
+    }
 
     #[test]
     fn test_merge_pending_deletes_keeps_concurrent_keys() {

@@ -24,6 +24,19 @@ pub struct FragmentRef {
     /// Immune to clock skew — determines merge order instead of ULID.
     #[serde(default)]
     pub sequence_number: u64,
+    /// Serialized fragment size in bytes, recorded at PUT time.
+    ///
+    /// Used by the size-based compaction trigger so trigger evaluation
+    /// needs no S3 reads beyond the manifest itself. `0` on refs written
+    /// before this field existed (decoded via serde default) — those
+    /// fragments simply don't contribute to the bytes trigger; the age
+    /// and count triggers still cover them.
+    ///
+    /// NOTE: this field must stay LAST in the struct. MessagePack encodes
+    /// structs as arrays, so old manifests decode only if new fields are
+    /// trailing and `#[serde(default)]`.
+    #[serde(default)]
+    pub size_bytes: u64,
 }
 
 /// A reference to an IVF segment stored on S3.
@@ -327,6 +340,7 @@ mod tests {
                 vector_count: 1,
                 delete_count: 0,
                 sequence_number: 0,
+                size_bytes: 0,
             });
         }
 
@@ -352,6 +366,7 @@ mod tests {
             vector_count: 1,
             delete_count: 0,
             sequence_number: 0,
+            size_bytes: 0,
         });
         manifest.remove_compacted_fragments(&[newer].into_iter().collect());
         assert_eq!(manifest.compaction_watermark, Some(newer));
@@ -361,6 +376,7 @@ mod tests {
             vector_count: 1,
             delete_count: 0,
             sequence_number: 0,
+            size_bytes: 0,
         });
         manifest.remove_compacted_fragments(&[older].into_iter().collect());
         assert_eq!(
@@ -368,6 +384,88 @@ mod tests {
             Some(newer),
             "watermark is observability metadata and must not move backwards"
         );
+    }
+
+    /// Backward compat: manifests serialized BEFORE `FragmentRef.size_bytes`
+    /// existed must still decode, in both MessagePack (version byte 0x01,
+    /// structs encoded as arrays — new fields must be trailing + defaulted)
+    /// and legacy JSON.
+    #[test]
+    fn test_decode_manifest_without_size_bytes_field() {
+        // Replica of the pre-size_bytes wire shape.
+        #[derive(Serialize)]
+        struct OldFragmentRef {
+            id: Ulid,
+            vector_count: usize,
+            delete_count: usize,
+            sequence_number: u64,
+        }
+        #[derive(Serialize)]
+        struct OldManifest {
+            fragments: Vec<OldFragmentRef>,
+            segments: Vec<SegmentRef>,
+            compaction_watermark: Option<Ulid>,
+            active_segment: Option<String>,
+            next_sequence: u64,
+            pending_deletes: Vec<String>,
+            fencing_token: u64,
+            updated_at: DateTime<Utc>,
+        }
+
+        let frag_id = Ulid::new();
+        let old = OldManifest {
+            fragments: vec![OldFragmentRef {
+                id: frag_id,
+                vector_count: 42,
+                delete_count: 3,
+                sequence_number: 7,
+            }],
+            segments: vec![make_segment("seg_old")],
+            compaction_watermark: None,
+            active_segment: Some("seg_old".to_string()),
+            next_sequence: 8,
+            pending_deletes: vec!["ns/wal/x.wal".to_string()],
+            fencing_token: 2,
+            updated_at: Utc::now(),
+        };
+
+        // MessagePack with the 0x01 version byte (current on-S3 format).
+        let msgpack = rmp_serde::to_vec(&old).unwrap();
+        let mut data = vec![MANIFEST_FORMAT_MSGPACK];
+        data.extend_from_slice(&msgpack);
+        let decoded = Manifest::from_bytes(&data)
+            .expect("old msgpack manifest without size_bytes must decode");
+        assert_eq!(decoded.fragments.len(), 1);
+        assert_eq!(decoded.fragments[0].id, frag_id);
+        assert_eq!(decoded.fragments[0].vector_count, 42);
+        assert_eq!(decoded.fragments[0].sequence_number, 7);
+        assert_eq!(
+            decoded.fragments[0].size_bytes, 0,
+            "missing size_bytes decodes to the serde default (0)"
+        );
+
+        // Legacy JSON format (no version byte, starts with '{').
+        let json = serde_json::to_vec(&old).unwrap();
+        let decoded_json = Manifest::from_bytes(&json)
+            .expect("legacy JSON manifest without size_bytes must decode");
+        assert_eq!(decoded_json.fragments[0].id, frag_id);
+        assert_eq!(decoded_json.fragments[0].size_bytes, 0);
+    }
+
+    /// Round-trip: size_bytes survives serialize → deserialize.
+    #[test]
+    fn test_size_bytes_roundtrip() {
+        let mut manifest = Manifest::new();
+        manifest.add_fragment(FragmentRef {
+            id: Ulid::new(),
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 12_345,
+        });
+        let bytes = manifest.to_bytes().unwrap();
+        let decoded = Manifest::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.fragments[0].size_bytes, 12_345);
     }
 
     #[test]

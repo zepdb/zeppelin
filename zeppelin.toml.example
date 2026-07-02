@@ -40,7 +40,14 @@
 
 [compaction]
 # interval_secs = 30                 # ZEPPELIN_COMPACTION_INTERVAL_SECS
-# max_wal_fragments_before_compact = 1000
+# max_wal_fragments_before_compact = 100   # ZEPPELIN_MAX_WAL_FRAGMENTS — count trigger
+# max_wal_age_before_compact_secs = 300    # ZEPPELIN_MAX_WAL_AGE_SECS — age trigger:
+#                                          # compact when the oldest uncompacted WAL
+#                                          # fragment exceeds this age (bounded
+#                                          # convergence for quiet namespaces)
+# max_wal_bytes_before_compact = 67108864  # ZEPPELIN_MAX_WAL_BYTES — size trigger:
+#                                          # compact when total uncompacted WAL bytes
+#                                          # exceed this threshold (64 MB)
 # retrain_imbalance_threshold = 5.0
 # lease_duration_secs = 300          # per-namespace compaction lease (multi-node)
 

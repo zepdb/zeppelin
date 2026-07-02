@@ -697,6 +697,192 @@ async fn test_compact_trigger_by_fragment_count() {
     harness.cleanup().await;
 }
 
+/// I1: a quiet namespace with a small number of uncompacted fragments must
+/// converge to a compacted state within a bounded time window via the
+/// age-based trigger — regardless of the fragment-count threshold.
+///
+/// Drives the same decision path as the background loop (`should_compact`
+/// → `compact`) on a short interval, with `max_wal_age_before_compact_secs`
+/// set to ~2s and the count threshold far out of reach.
+#[tokio::test]
+async fn test_age_trigger_compacts_quiet_namespace() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("age-trigger");
+    let store = &harness.store;
+    let writer = WalWriter::new(store.clone());
+
+    let manifest = Manifest::new();
+    manifest.write(store, &ns).await.unwrap();
+
+    // 2 fragments — far below the count threshold of 100.
+    writer
+        .append(&ns, random_vectors(10, 16), vec![])
+        .await
+        .unwrap();
+    writer
+        .append(&ns, random_vectors(10, 16), vec![])
+        .await
+        .unwrap();
+
+    let wal_reader = WalReader::new(store.clone());
+    let compaction_config = CompactionConfig {
+        interval_secs: 1,
+        max_wal_fragments_before_compact: 100,
+        max_wal_age_before_compact_secs: 2,
+        max_wal_bytes_before_compact: u64::MAX,
+        ..Default::default()
+    };
+    let indexing_config = IndexingConfig {
+        default_num_centroids: 4,
+        kmeans_max_iterations: 10,
+        ..Default::default()
+    };
+    let compactor = Compactor::new(
+        store.clone(),
+        wal_reader,
+        compaction_config,
+        indexing_config,
+    );
+
+    // Mirror the background loop: poll every interval, compact when the
+    // trigger fires. The age trigger must fire within ~2s; give it a
+    // bounded number of intervals before declaring failure.
+    let mut compacted = false;
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if compactor.should_compact(&ns).await.unwrap() {
+            compactor.compact(&ns).await.unwrap();
+            compacted = true;
+            break;
+        }
+    }
+
+    assert!(
+        compacted,
+        "namespace with 2 fragments older than max_wal_age_before_compact_secs \
+         was never compacted — fragments stay uncompacted forever"
+    );
+
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    assert_eq!(manifest.segments.len(), 1, "expected a new segment");
+    assert!(manifest.active_segment.is_some());
+    assert!(
+        manifest.uncompacted_fragments().is_empty(),
+        "all fragments must be absorbed into the segment"
+    );
+
+    harness.cleanup().await;
+}
+
+/// I4: an idle namespace with ZERO uncompacted fragments is never touched,
+/// across several compaction intervals, even with maximally aggressive
+/// trigger thresholds — no busy work, no S3 churn on quiet namespaces.
+#[tokio::test]
+async fn test_idle_namespace_untouched_across_intervals() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("idle-untouched");
+    let store = &harness.store;
+
+    let manifest = Manifest::new();
+    manifest.write(store, &ns).await.unwrap();
+
+    let manifest_key = Manifest::s3_key(&ns);
+    let etag_before = store.head(&manifest_key).await.unwrap().e_tag;
+
+    let wal_reader = WalReader::new(store.clone());
+    let compaction_config = CompactionConfig {
+        interval_secs: 1,
+        max_wal_fragments_before_compact: 0,
+        max_wal_age_before_compact_secs: 0,
+        max_wal_bytes_before_compact: 0,
+        ..Default::default()
+    };
+    let compactor = Compactor::new(
+        store.clone(),
+        wal_reader,
+        compaction_config,
+        IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            ..Default::default()
+        },
+    );
+
+    // Several intervals: the trigger must never fire with 0 fragments.
+    for _ in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            !compactor.should_compact(&ns).await.unwrap(),
+            "idle namespace (0 fragments) must never trigger compaction"
+        );
+    }
+
+    let etag_after = store.head(&manifest_key).await.unwrap().e_tag;
+    assert_eq!(
+        etag_before, etag_after,
+        "idle namespace manifest must not be rewritten across intervals"
+    );
+
+    harness.cleanup().await;
+}
+
+/// I2: the size trigger fires from real recorded fragment sizes — the
+/// manifest carries `size_bytes` set at PUT time by the WAL writer.
+#[tokio::test]
+async fn test_bytes_trigger_uses_recorded_sizes() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("bytes-trigger");
+    let store = &harness.store;
+    let writer = WalWriter::new(store.clone());
+
+    let manifest = Manifest::new();
+    manifest.write(store, &ns).await.unwrap();
+
+    // One fragment with real payload — its serialized size is recorded in
+    // the manifest at write time.
+    writer
+        .append(&ns, random_vectors(50, 16), vec![])
+        .await
+        .unwrap();
+
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    assert_eq!(manifest.fragments.len(), 1);
+    let recorded = manifest.fragments[0].size_bytes;
+    assert!(
+        recorded > 0,
+        "WAL writer must record fragment size_bytes in the manifest"
+    );
+
+    // Threshold just below the recorded size → triggers.
+    let make_compactor = |max_bytes: u64| {
+        Compactor::new(
+            store.clone(),
+            WalReader::new(store.clone()),
+            CompactionConfig {
+                max_wal_fragments_before_compact: 100,
+                max_wal_age_before_compact_secs: 3600,
+                max_wal_bytes_before_compact: max_bytes,
+                ..Default::default()
+            },
+            IndexingConfig::default(),
+        )
+    };
+    assert!(
+        make_compactor(recorded).should_compact(&ns).await.unwrap(),
+        "total WAL bytes >= threshold must trigger compaction"
+    );
+    // Threshold above the recorded size → does not trigger.
+    assert!(
+        !make_compactor(recorded + 1)
+            .should_compact(&ns)
+            .await
+            .unwrap(),
+        "total WAL bytes < threshold must not trigger compaction"
+    );
+
+    harness.cleanup().await;
+}
+
 #[tokio::test]
 async fn test_compact_attributes_preserved() {
     let harness = TestHarness::new().await;

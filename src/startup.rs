@@ -96,6 +96,8 @@ pub async fn build_app(
         cache_max_size_gb = config.cache.max_size_gb,
         compaction_interval_secs = config.compaction.interval_secs,
         max_wal_fragments = config.compaction.max_wal_fragments_before_compact,
+        max_wal_age_secs = config.compaction.max_wal_age_before_compact_secs,
+        max_wal_bytes = config.compaction.max_wal_bytes_before_compact,
         "configuration loaded"
     );
 

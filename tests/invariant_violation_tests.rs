@@ -285,12 +285,14 @@ async fn test_sequence_numbers_override_ulid_ordering() {
         vector_count: 1,
         delete_count: 0,
         sequence_number: 0, // overwritten by add_fragment
+        size_bytes: 0,
     });
     manifest.add_fragment(FragmentRef {
         id: frag_a.id,
         vector_count: 1,
         delete_count: 0,
         sequence_number: 0, // overwritten by add_fragment
+        size_bytes: 0,
     });
     manifest.write(store, &ns).await.unwrap();
 
