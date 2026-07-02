@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zeppelin — An Engineering Primer</title>
+<link rel="stylesheet" href="style.css">
+<script src="nav.js" defer></script>
+</head>
+<body data-next="01-why-object-storage.html">
+
+<nav class="topbar">
+  <a class="wordmark" href="index.html">Zeppelin</a>
+  <span>An Engineering Primer</span>
+  <span class="chapter-tag">Contents</span>
+</nav>
+
+<main class="cover">
+  <p class="masthead">A field guide to an S3-native search engine</p>
+  <h1>Zeppelin</h1>
+  <p class="subtitle">Object storage is the source of truth. Nodes are stateless.</p>
+
+  <svg viewBox="0 0 560 120" role="img" aria-label="Zeppelin airship over an S3 bucket" style="max-width:560px;margin:0 auto;display:block">
+    <ellipse cx="280" cy="45" rx="150" ry="28" class="d-box" />
+    <path d="M 430 45 L 462 33 L 462 57 Z" class="d-box" />
+    <rect x="252" y="70" width="56" height="14" rx="3" class="d-box-hi" />
+    <line x1="262" y1="70" x2="248" y2="58" class="d-line" />
+    <line x1="298" y1="70" x2="312" y2="58" class="d-line" />
+    <text x="280" y="49" text-anchor="middle" class="d-tag">ZEPPELIN</text>
+    <path d="M 180 108 h 200" class="d-dash" />
+    <text x="280" y="104" text-anchor="middle" class="d-mono-s">s3://bucket/&#123;namespace&#125;/…</text>
+  </svg>
+
+  <div class="cover-rule">&#10022;</div>
+
+  <p style="max-width:600px;margin:0 auto 1rem;text-align:left">
+    This primer explains how <a href="https://github.com/zepdb/zeppelin">Zeppelin</a> — a vector and
+    full-text search engine written in Rust — stores everything it knows in an S3 bucket, coordinates
+    concurrent writers without a lock server, and answers nearest-neighbor queries in ~100&nbsp;ms.
+  </p>
+  <p style="max-width:600px;margin:0 auto;text-align:left">
+    It is written for a technically competent reader who is <em>not</em> a database specialist.
+    Every piece of jargon is defined the first time it appears, every claim links to the code that
+    implements it, and every borrowed idea links to the paper or engineering post it came from.
+  </p>
+
+  <div class="toc">
+    <ol>
+      <li><a href="01-why-object-storage.html"><span class="toc-no">01</span><span class="toc-title">Why Build a Database on S3?</span><span class="toc-desc">the economics and the latency tax</span></a></li>
+      <li><a href="02-anatomy.html"><span class="toc-no">02</span><span class="toc-title">Anatomy of a Namespace</span><span class="toc-desc">five kinds of objects in a bucket</span></a></li>
+      <li><a href="03-write-path.html"><span class="toc-no">03</span><span class="toc-title">The Write Path</span><span class="toc-desc">a lock-free log made of S3 objects</span></a></li>
+      <li><a href="04-query-path.html"><span class="toc-no">04</span><span class="toc-title">The Query Path</span><span class="toc-desc">cold reads, warm caches, and merging</span></a></li>
+      <li><a href="05-indexing.html"><span class="toc-no">05</span><span class="toc-title">Finding Needles: IVF &amp; Quantization</span><span class="toc-desc">how vector search actually works here</span></a></li>
+      <li><a href="06-search-features.html"><span class="toc-no">06</span><span class="toc-title">Filters &amp; Full-Text Search</span><span class="toc-desc">bitmaps, BM25, and rank_by</span></a></li>
+      <li><a href="07-compaction.html"><span class="toc-no">07</span><span class="toc-title">Compaction: The Engine Room</span><span class="toc-desc">leases, fencing tokens, zombie writers</span></a></li>
+      <li><a href="08-consistency.html"><span class="toc-no">08</span><span class="toc-title">Consistency, Honestly</span><span class="toc-desc">what “strong” really means here</span></a></li>
+      <li><a href="09-verification.html"><span class="toc-no">09</span><span class="toc-title">Proving It Correct</span><span class="toc-desc">TLA+, proptest, loom, fuzzing</span></a></li>
+      <li><a href="10-performance.html"><span class="toc-no">10</span><span class="toc-title">Performance &amp; Trade-offs</span><span class="toc-desc">the numbers, and what they cost</span></a></li>
+      <li><a href="11-limitations.html"><span class="toc-no">11</span><span class="toc-title">Limitations &amp; Roadmap</span><span class="toc-desc">what it doesn’t do (yet)</span></a></li>
+      <li><a href="12-references.html"><span class="toc-no">12</span><span class="toc-title">Reading List</span><span class="toc-desc">papers &amp; posts, with provenance</span></a></li>
+    </ol>
+  </div>
+</main>
+
+<nav class="pagenav">
+  <span class="pageno">Cover</span>
+  <a class="next" href="01-why-object-storage.html">01 · Why Build a Database on S3? →</a>
+</nav>
+<p class="kbd-hint">Navigate with <kbd>←</kbd> <kbd>→</kbd></p>
+
+</body>
+</html>

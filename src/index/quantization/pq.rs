@@ -261,7 +261,22 @@ impl PqCodebook {
             )));
         }
 
-        let expected = 12 + m * PQ_K * sub_dim * 4;
+        if m == 0 || sub_dim == 0 {
+            return Err(ZeppelinError::Index(format!(
+                "PQ codebook header has zero dimension: m={m}, sub_dim={sub_dim}"
+            )));
+        }
+
+        let expected = m
+            .checked_mul(PQ_K)
+            .and_then(|v| v.checked_mul(sub_dim))
+            .and_then(|v| v.checked_mul(4))
+            .and_then(|v| v.checked_add(12))
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "PQ codebook size overflows: m={m}, sub_dim={sub_dim}"
+                ))
+            })?;
         if data.len() < expected {
             return Err(ZeppelinError::Index(format!(
                 "PQ codebook blob size mismatch: expected {expected}, got {}",
@@ -514,6 +529,28 @@ mod tests {
     #[test]
     fn test_pq_codebook_from_bytes_too_small() {
         assert!(PqCodebook::from_bytes(&[0u8; 8]).is_err());
+    }
+
+    #[test]
+    fn test_pq_codebook_from_bytes_zero_sub_dim_huge_m() {
+        // Fuzz regression: sub_dim=0 makes the expected-size check pass with a
+        // huge m, which then drove a ~45 GB Vec::with_capacity.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x2bdf00e6u32.to_le_bytes()); // m (huge)
+        buf.extend_from_slice(&(PQ_K as u32).to_le_bytes()); // k
+        buf.extend_from_slice(&0u32.to_le_bytes()); // sub_dim = 0
+        buf.extend_from_slice(&[14, 223]);
+        assert!(PqCodebook::from_bytes(&buf).is_err());
+    }
+
+    #[test]
+    fn test_pq_codebook_from_bytes_size_overflow() {
+        // m * PQ_K * sub_dim * 4 overflows usize; must error, not wrap.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // m
+        buf.extend_from_slice(&(PQ_K as u32).to_le_bytes()); // k
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // sub_dim
+        assert!(PqCodebook::from_bytes(&buf).is_err());
     }
 
     #[test]

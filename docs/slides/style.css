@@ -1,0 +1,485 @@
+/* ==========================================================================
+   Zeppelin — An Engineering Primer
+   Aesthetic: mid-century technical journal / aviation field manual.
+   Warm paper, ink navy, oxide-red accent, hairline rules, numbered figures.
+   No external fonts, no frameworks — renders fully offline.
+   ========================================================================== */
+
+:root {
+  --paper: #f4efe3;
+  --paper-deep: #ece5d3;
+  --ink: #22303a;
+  --ink-soft: #4a5560;
+  --dim: #7a7259;
+  --accent: #b0512a;      /* oxide red */
+  --brass: #8f742f;
+  --line: #d5cab0;
+  --line-strong: #b9ac8c;
+  --card: #faf6ec;
+  --code-bg: #2b3540;
+  --code-ink: #e8e0cd;
+
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  --sans: "Avenir Next", Seravek, "Gill Sans", "Trebuchet MS", Verdana, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  /* faint paper grain via layered gradients — no images */
+  background-image:
+    radial-gradient(ellipse 80% 60% at 50% -10%, rgba(255, 252, 240, 0.8), transparent 70%),
+    repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(120, 100, 60, 0.012) 3px, rgba(120, 100, 60, 0.012) 4px);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 18px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- Top bar ------------------------------------------------------ */
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 1.25rem;
+  padding: 0.85rem 2rem;
+  border-bottom: 1px solid var(--line-strong);
+  box-shadow: 0 1px 0 var(--paper), 0 3px 0 -1px var(--line);
+  font-family: var(--sans);
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.topbar .wordmark {
+  font-family: var(--serif);
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  color: var(--ink);
+  text-decoration: none;
+  text-transform: uppercase;
+}
+
+.topbar .wordmark:hover { color: var(--accent); }
+
+.topbar .chapter-tag { margin-left: auto; color: var(--brass); }
+
+/* ---------- Layout ------------------------------------------------------- */
+
+main {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 3.5rem 1.5rem 4rem;
+}
+
+.chapter-head {
+  position: relative;
+  margin-bottom: 3rem;
+  padding-bottom: 2rem;
+  border-bottom: 3px double var(--line-strong);
+}
+
+.chapter-num {
+  font-family: var(--serif);
+  font-size: 6.5rem;
+  line-height: 1;
+  font-weight: 400;
+  color: transparent;
+  -webkit-text-stroke: 1.5px var(--accent);
+  opacity: 0.85;
+  margin-bottom: 0.5rem;
+}
+
+h1 {
+  font-family: var(--serif);
+  font-size: 2.6rem;
+  line-height: 1.15;
+  font-weight: 600;
+  margin: 0 0 1rem;
+  letter-spacing: -0.01em;
+}
+
+.lede {
+  font-size: 1.22rem;
+  line-height: 1.55;
+  color: var(--ink-soft);
+  font-style: italic;
+  margin: 0;
+}
+
+h2 {
+  font-family: var(--sans);
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 3rem 0 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+h2::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+h3 {
+  font-family: var(--serif);
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin: 2rem 0 0.6rem;
+}
+
+p { margin: 0 0 1.1rem; }
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a:hover { color: var(--ink); }
+
+strong { font-weight: 700; }
+
+ul, ol { padding-left: 1.4rem; margin: 0 0 1.2rem; }
+li { margin-bottom: 0.45rem; }
+li::marker { color: var(--brass); }
+
+code {
+  font-family: var(--mono);
+  font-size: 0.82em;
+  background: var(--paper-deep);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0.08em 0.35em;
+  white-space: nowrap;
+}
+
+pre {
+  background: var(--code-bg);
+  color: var(--code-ink);
+  border-radius: 6px;
+  padding: 1.1rem 1.3rem;
+  overflow-x: auto;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  margin: 1.4rem 0;
+  box-shadow: 3px 3px 0 var(--line);
+}
+
+pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  white-space: pre;
+  font-size: 1em;
+  color: inherit;
+}
+
+/* ---------- Jargon / definition callout ---------------------------------- */
+
+.term {
+  margin: 1.6rem 0;
+  padding: 0.9rem 1.2rem;
+  background: var(--card);
+  border-left: 3px solid var(--brass);
+  font-size: 0.92rem;
+}
+
+.term dt {
+  font-family: var(--sans);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--brass);
+  margin-bottom: 0.25rem;
+}
+
+.term dd { margin: 0 0 0.6rem; }
+.term dd:last-child { margin-bottom: 0; }
+
+/* ---------- Figures ------------------------------------------------------ */
+
+figure {
+  margin: 2.5rem -3rem;
+  padding: 1.8rem 2rem 1.2rem;
+  background: var(--card);
+  border-top: 1px solid var(--line-strong);
+  border-bottom: 1px solid var(--line-strong);
+}
+
+@media (max-width: 900px) {
+  figure { margin: 2.5rem -1.5rem; }
+}
+
+figure svg { display: block; width: 100%; height: auto; }
+
+figcaption {
+  margin-top: 1.1rem;
+  font-family: var(--sans);
+  font-size: 0.74rem;
+  letter-spacing: 0.06em;
+  color: var(--ink-soft);
+  border-top: 1px dashed var(--line-strong);
+  padding-top: 0.7rem;
+}
+
+figcaption .fig-no {
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-right: 0.6rem;
+}
+
+/* SVG diagram conventions (referenced by inline SVGs via CSS vars) */
+.d-box     { fill: var(--paper); stroke: var(--ink); stroke-width: 1.4; }
+.d-box-hi  { fill: #f3e2d6; stroke: var(--accent); stroke-width: 1.6; }
+.d-box-dim { fill: var(--paper-deep); stroke: var(--line-strong); stroke-width: 1.2; }
+.d-line    { stroke: var(--ink); stroke-width: 1.4; fill: none; }
+.d-line-hi { stroke: var(--accent); stroke-width: 1.6; fill: none; }
+.d-dash    { stroke: var(--ink-soft); stroke-width: 1.2; fill: none; stroke-dasharray: 5 4; }
+.d-dash-hi { stroke: var(--accent); stroke-width: 1.3; fill: none; stroke-dasharray: 5 4; }
+.d-label   { font-family: var(--sans); font-size: 12.5px; fill: var(--ink); }
+.d-label-b { font-family: var(--sans); font-size: 12.5px; font-weight: 700; fill: var(--ink); }
+.d-small   { font-family: var(--sans); font-size: 10.5px; fill: var(--ink-soft); }
+.d-tag     { font-family: var(--sans); font-size: 10px; font-weight: 700; letter-spacing: 0.12em; fill: var(--brass); }
+.d-mono    { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 11.5px; fill: var(--ink); }
+.d-mono-s  { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 10px; fill: var(--ink-soft); }
+.d-accent  { fill: var(--accent); }
+.d-ghost   { fill: none; stroke: var(--line-strong); stroke-width: 1; }
+
+/* ---------- Info boxes ---------------------------------------------------- */
+
+aside.code-links, aside.reading, aside.note {
+  margin: 2.2rem 0;
+  padding: 1.2rem 1.4rem;
+  background: var(--card);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  font-size: 0.92rem;
+  box-shadow: 3px 3px 0 var(--line);
+}
+
+aside h2, aside .box-title {
+  font-family: var(--sans);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  margin: 0 0 0.8rem;
+  display: block;
+}
+
+aside.code-links .box-title { color: var(--accent); }
+aside.reading .box-title { color: var(--brass); }
+aside.note { border-left: 3px solid var(--accent); }
+aside.note .box-title { color: var(--accent); }
+
+aside ul { margin: 0; padding-left: 1.2rem; }
+aside li { margin-bottom: 0.4rem; }
+aside li:last-child { margin-bottom: 0; }
+
+aside .path { font-family: var(--mono); font-size: 0.82em; }
+
+/* provenance tags on references page */
+.prov {
+  font-family: var(--sans);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 0.12em 0.5em;
+  border-radius: 2px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.prov.cited   { background: #dfe8d8; color: #3d5a2e; border: 1px solid #b5c7a8; }
+.prov.influence { background: #efe3c8; color: #7a5d16; border: 1px solid #d9c48e; }
+.prov.editorial { background: #ecdcd2; color: #8c421f; border: 1px solid #d5b49f; }
+
+/* ---------- Tables -------------------------------------------------------- */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.6rem 0;
+  font-size: 0.9rem;
+}
+
+th {
+  font-family: var(--sans);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  text-align: left;
+  padding: 0.5rem 0.8rem;
+  border-bottom: 2px solid var(--ink);
+}
+
+td {
+  padding: 0.55rem 0.8rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+tr:last-child td { border-bottom: none; }
+
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---------- Index (cover) page ------------------------------------------- */
+
+.cover { text-align: center; padding-top: 2rem; }
+
+.cover .masthead {
+  font-family: var(--sans);
+  font-size: 0.72rem;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--brass);
+  margin-bottom: 1.2rem;
+}
+
+.cover h1 {
+  font-size: 4.2rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 0.4rem;
+}
+
+.cover .subtitle {
+  font-style: italic;
+  font-size: 1.3rem;
+  color: var(--ink-soft);
+  margin-bottom: 2.4rem;
+}
+
+.cover-rule {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin: 2.2rem 0;
+  color: var(--brass);
+}
+.cover-rule::before, .cover-rule::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line-strong);
+}
+
+.toc { text-align: left; margin-top: 2.5rem; }
+
+.toc ol { list-style: none; padding: 0; margin: 0; counter-reset: toc; }
+
+.toc li {
+  counter-increment: toc;
+  border-bottom: 1px solid var(--line);
+  margin: 0;
+}
+
+.toc li a {
+  display: flex;
+  align-items: baseline;
+  gap: 1.1rem;
+  padding: 0.9rem 0.5rem;
+  text-decoration: none;
+  color: var(--ink);
+}
+
+.toc li a:hover { background: var(--card); }
+.toc li a:hover .toc-title { color: var(--accent); }
+
+.toc .toc-no {
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--accent);
+  min-width: 1.8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.toc .toc-title { font-size: 1.12rem; font-weight: 600; }
+
+.toc .toc-desc {
+  margin-left: auto;
+  text-align: right;
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  font-style: italic;
+  max-width: 46%;
+}
+
+@media (max-width: 640px) {
+  .toc .toc-desc { display: none; }
+  .cover h1 { font-size: 2.6rem; }
+}
+
+/* ---------- Footer nav ---------------------------------------------------- */
+
+.pagenav {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 1.4rem 1.5rem 3rem;
+  border-top: 3px double var(--line-strong);
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  font-family: var(--sans);
+  font-size: 0.82rem;
+}
+
+.pagenav a {
+  text-decoration: none;
+  color: var(--ink);
+  padding: 0.4rem 0.2rem;
+}
+
+.pagenav a:hover { color: var(--accent); }
+
+.pagenav .pageno {
+  margin: 0 auto;
+  font-size: 0.7rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.pagenav .next { margin-left: auto; text-align: right; }
+.pagenav .prev + .pageno + .next { margin-left: 0; }
+
+.kbd-hint {
+  text-align: center;
+  font-family: var(--sans);
+  font-size: 0.68rem;
+  color: var(--dim);
+  padding-bottom: 2rem;
+}
+
+.kbd-hint kbd {
+  font-family: var(--mono);
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  padding: 0.05em 0.4em;
+  background: var(--card);
+  font-size: 0.95em;
+}
+
+/* ---------- Print --------------------------------------------------------- */
+
+@media print {
+  .topbar, .pagenav, .kbd-hint { display: none; }
+  body { background: white; }
+}
