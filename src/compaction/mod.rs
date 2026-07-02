@@ -19,7 +19,7 @@ use crate::index::ivf_flat::build::{
 use crate::storage::ZeppelinStore;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
-use crate::wal::manifest::{Manifest, ManifestVersion, SegmentRef};
+use crate::wal::manifest::{Manifest, SegmentRef};
 use crate::wal::WalReader;
 
 /// Maximum CAS retry attempts for manifest updates.
@@ -234,10 +234,18 @@ impl Compactor {
             // Edge case: all vectors were deleted
             // CAS loop to update manifest
             for attempt in 0..MAX_CAS_RETRIES {
+                // A missing manifest means the namespace was deleted mid-
+                // compaction. Recreating it from Manifest::default() would
+                // resurrect the namespace (unconditional PUT) — abort instead
+                // (NoZombieNamespace, same rule as WalWriter).
                 let (mut fresh_manifest, version) =
                     match Manifest::read_versioned(&self.store, namespace).await? {
                         Some(pair) => pair,
-                        None => (Manifest::default(), ManifestVersion(None)),
+                        None => {
+                            return Err(ZeppelinError::ManifestNotFound {
+                                namespace: namespace.to_string(),
+                            });
+                        }
                     };
 
                 // Layer 1: Fencing check.
@@ -400,13 +408,13 @@ impl Compactor {
             let segment_id_clone = segment_id.clone();
             let namespace_clone = namespace.to_string();
 
-            // Collect successful deserializations
+            // These attrs blobs were written by this compaction moments ago —
+            // a read failure is transient storage trouble. Skipping a cluster
+            // would permanently drop its documents from the FTS index, so
+            // fail the cycle and let the next one rebuild.
             let mut cluster_data: Vec<(usize, bytes::Bytes)> = Vec::new();
             for (cluster_idx, result) in read_results.into_iter().enumerate() {
-                match result {
-                    Ok(data) => cluster_data.push((cluster_idx, data)),
-                    Err(_) => continue,
-                }
+                cluster_data.push((cluster_idx, result?));
             }
 
             // Build inverted indexes in parallel using spawn_blocking.
@@ -495,10 +503,20 @@ impl Compactor {
 
         // 9. CAS loop: re-read manifest, apply changes, write conditionally
         for attempt in 0..MAX_CAS_RETRIES {
+            // A missing manifest means the namespace was deleted mid-
+            // compaction. Recreating it from Manifest::default() would
+            // resurrect the namespace (unconditional PUT) — abort instead
+            // (NoZombieNamespace, same rule as WalWriter). The freshly built
+            // segment objects become orphans; namespace delete_prefix or a
+            // future GC pass removes them.
             let (mut fresh_manifest, version) =
                 match Manifest::read_versioned(&self.store, namespace).await? {
                     Some(pair) => pair,
-                    None => (Manifest::default(), ManifestVersion(None)),
+                    None => {
+                        return Err(ZeppelinError::ManifestNotFound {
+                            namespace: namespace.to_string(),
+                        });
+                    }
                 };
 
             // Layer 1: Fencing check.
@@ -762,13 +780,16 @@ async fn load_segment_vectors(
     .await;
 
     // Sequential deserialization (CPU-bound, no I/O)
+    //
+    // Attrs errors must propagate: every segment build writes an attrs blob
+    // per cluster, so a failed read is transient storage trouble, not a
+    // missing artifact. Substituting None here would commit a segment with
+    // the cluster's attributes stripped — filtered queries would then
+    // permanently exclude those vectors.
     let mut vectors = Vec::new();
     for (_i, cluster_res, attrs_res) in cluster_results {
         let cluster = deserialize_cluster(&cluster_res?)?;
-        let attrs = match attrs_res {
-            Ok(data) => deserialize_attrs(&data)?,
-            Err(_) => vec![None; cluster.ids.len()],
-        };
+        let attrs = deserialize_attrs(&attrs_res?)?;
 
         for (j, id) in cluster.ids.into_iter().enumerate() {
             vectors.push(VectorEntry {
