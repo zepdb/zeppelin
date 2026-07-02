@@ -4,7 +4,9 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::cache::manifest_cache::ManifestCache;
+use crate::error::ZeppelinError;
 use crate::namespace::NamespaceManager;
+use crate::wal::LeaseManager;
 
 use super::Compactor;
 
@@ -24,6 +26,7 @@ pub fn start_compaction_thread(
     shutdown: tokio::sync::watch::Receiver<bool>,
     compaction_workers: usize,
     manifest_cache: Arc<ManifestCache>,
+    lease_manager: Arc<LeaseManager>,
 ) -> std::thread::JoinHandle<()> {
     info!(compaction_workers, "starting compaction runtime");
     std::thread::Builder::new()
@@ -41,6 +44,7 @@ pub fn start_compaction_thread(
                 namespace_manager,
                 shutdown,
                 manifest_cache,
+                lease_manager,
             ));
         })
         .expect("failed to spawn compaction thread")
@@ -52,6 +56,7 @@ pub async fn compaction_loop(
     namespace_manager: Arc<NamespaceManager>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     manifest_cache: Arc<ManifestCache>,
+    lease_manager: Arc<LeaseManager>,
 ) {
     info!(
         interval_secs = compactor.config().interval_secs,
@@ -80,9 +85,32 @@ pub async fn compaction_loop(
         for ns in &namespaces {
             match compactor.should_compact(&ns.name).await {
                 Ok(true) => {
-                    info!(namespace = %ns.name, "triggering compaction");
+                    // Acquire the per-namespace lease so only one node
+                    // compacts a namespace at a time. LeaseHeld means another
+                    // node is on it — skip quietly, it isn't a failure.
+                    let lease = match lease_manager.acquire(&ns.name).await {
+                        Ok(lease) => lease,
+                        Err(ZeppelinError::LeaseHeld { holder, .. }) => {
+                            debug!(
+                                namespace = %ns.name,
+                                holder = %holder,
+                                "compaction lease held by another node, skipping"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(namespace = %ns.name, error = %e, "failed to acquire compaction lease");
+                            continue;
+                        }
+                    };
+
+                    info!(
+                        namespace = %ns.name,
+                        fencing_token = lease.fencing_token,
+                        "triggering compaction"
+                    );
                     match compactor
-                        .compact_with_fts(&ns.name, None, &ns.full_text_search)
+                        .compact_with_fts(&ns.name, Some(lease.fencing_token), &ns.full_text_search)
                         .await
                     {
                         Ok(result) => {
@@ -104,6 +132,11 @@ pub async fn compaction_loop(
                                 .inc();
                             warn!(namespace = %ns.name, error = %e, "compaction failed");
                         }
+                    }
+
+                    // Best-effort release; never blocks the loop.
+                    if let Err(e) = lease_manager.release(&ns.name, &lease).await {
+                        warn!(namespace = %ns.name, error = %e, "lease release failed (best-effort)");
                     }
                 }
                 Ok(false) => {

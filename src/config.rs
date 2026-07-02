@@ -282,6 +282,13 @@ pub struct CompactionConfig {
     /// Default: 10.
     #[serde(default = "default_max_old_segments")]
     pub max_old_segments: usize,
+    /// Duration of the per-namespace compaction lease, in seconds.
+    /// Prevents multiple nodes from compacting the same namespace
+    /// concurrently. Must exceed the longest expected compaction cycle;
+    /// if it expires mid-cycle, the fencing token + CAS layers still
+    /// prevent a stale commit. Default: `300`.
+    #[serde(default = "default_compaction_lease_secs")]
+    pub lease_duration_secs: u64,
 }
 
 /// Read consistency defaults.
@@ -398,6 +405,9 @@ fn default_max_pending_deletes() -> usize {
 fn default_max_old_segments() -> usize {
     10
 }
+fn default_compaction_lease_secs() -> u64 {
+    300
+}
 fn default_batch_manifest_size() -> usize {
     1 // disabled by default
 }
@@ -489,6 +499,7 @@ impl Default for CompactionConfig {
             retrain_imbalance_threshold: default_retrain_threshold(),
             max_pending_deletes: default_max_pending_deletes(),
             max_old_segments: default_max_old_segments(),
+            lease_duration_secs: default_compaction_lease_secs(),
         }
     }
 }

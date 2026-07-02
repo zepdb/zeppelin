@@ -50,6 +50,7 @@
 # interval_secs = 30                 # ZEPPELIN_COMPACTION_INTERVAL_SECS
 # max_wal_fragments_before_compact = 1000
 # retrain_imbalance_threshold = 5.0
+# lease_duration_secs = 300          # per-namespace compaction lease (multi-node)
 
 [consistency]
 # default = "strong"                 # "strong" or "eventual"

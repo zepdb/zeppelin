@@ -23,7 +23,7 @@ use crate::server::routes::build_router;
 use crate::server::AppState;
 use crate::storage::ZeppelinStore;
 use crate::wal::batch_writer::BatchWalWriter;
-use crate::wal::{WalReader, WalWriter};
+use crate::wal::{LeaseManager, WalReader, WalWriter};
 
 /// Resolve the configuration file path.
 ///
@@ -130,6 +130,15 @@ pub async fn build_app(
         config.indexing.clone(),
     ));
 
+    // Per-namespace compaction lease: only one node compacts a namespace at
+    // a time. The holder ID is unique per process; the fencing token from the
+    // lease is threaded into every compaction commit.
+    let lease_manager = Arc::new(LeaseManager::new(
+        store.clone(),
+        format!("zeppelin-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(config.compaction.lease_duration_secs),
+    ));
+
     // Spawn background compaction on a dedicated runtime (CPU isolation from queries)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let _compaction_handle = start_compaction_thread(
@@ -138,6 +147,7 @@ pub async fn build_app(
         shutdown_rx,
         cpu_budget.compaction_workers,
         manifest_cache.clone(),
+        lease_manager,
     );
 
     // Initialize batch WAL writer (if batch_manifest_size > 1)
