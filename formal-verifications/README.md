@@ -12,13 +12,9 @@ formal-verifications/
     QueryReadConsistency.tla + .cfg # P1: Query + Compactor 404 race
     NamespaceDeletion.tla + .cfg    # P2: Non-atomic namespace deletion
     ULIDOrdering.tla + .cfg        # P3: ULID ordering under clock skew
-  proptest/                         # Property-based test files (Rust)
-    merge_dedup.rs                  # Merge/dedup correctness vs reference
-    checksum_stability.rs           # WAL fragment round-trip checksum
-    filter_eval.rs                  # Filter tree evaluation vs simple evaluator
-    ivf_recall.rs                   # IVF-Flat recall vs brute-force
-    namespace_validation.rs         # Namespace name boundary cases
 ```
+
+Property-based tests live in the main test suite as `tests/proptest_*.rs` (see below).
 
 ## TLA+ Specifications
 
@@ -113,45 +109,33 @@ Candidate fixes included:
 
 ## Property-Based Tests (proptest)
 
-### Prerequisites
-
-Add `proptest` to dev-dependencies in `Cargo.toml`:
-
-```toml
-[dev-dependencies]
-proptest = "1"
-```
+The property-based tests live in `tests/` as `proptest_*.rs` and run as part of the normal test suite.
 
 ### Running
 
-Copy the proptest files to the `tests/` directory and run:
-
 ```bash
-# Copy all proptest files
-for f in formal-verifications/proptest/*.rs; do
-  cp "$f" "tests/proptest_$(basename "$f")"
-done
-
 # Run all property tests
 cargo test --test 'proptest_*'
 
 # Run a specific property test
 cargo test --test proptest_merge_dedup
-cargo test --test proptest_checksum
-cargo test --test proptest_filter
+cargo test --test proptest_checksum_stability
+cargo test --test proptest_filter_eval
 cargo test --test proptest_ivf_recall
-cargo test --test proptest_namespace
+cargo test --test proptest_namespace_validation
+cargo test --test proptest_multi_writer_lease
 ```
 
 ### What Each Test Verifies
 
 | Test File | What It Tests | Method |
 |-----------|--------------|--------|
-| `merge_dedup.rs` | WAL merge/dedup logic produces correct surviving vectors | Compare production merge vs HashMap reference impl |
-| `checksum_stability.rs` | WAL fragment checksums survive JSON round-trips | Serialize, deserialize, recompute checksum |
-| `filter_eval.rs` | Filter evaluation (Eq, Range, In, And) matches reference | Compare production evaluator vs simple boolean logic |
-| `ivf_recall.rs` | IVF-Flat search has acceptable recall vs brute-force | Build index, search, measure recall fraction |
-| `namespace_validation.rs` | Namespace name validation handles all edge cases | Compare byte-level validator vs char-level reference |
+| `tests/proptest_merge_dedup.rs` | WAL merge/dedup logic produces correct surviving vectors | Compare production merge vs HashMap reference impl |
+| `tests/proptest_checksum_stability.rs` | WAL fragment checksums survive JSON round-trips | Serialize, deserialize, recompute checksum |
+| `tests/proptest_filter_eval.rs` | Filter evaluation (Eq, Range, In, And) matches reference | Compare production evaluator vs simple boolean logic |
+| `tests/proptest_ivf_recall.rs` | IVF-Flat search has acceptable recall vs brute-force | Build index, search, measure recall fraction |
+| `tests/proptest_namespace_validation.rs` | Namespace name validation handles all edge cases | Compare byte-level validator vs char-level reference |
+| `tests/proptest_multi_writer_lease.rs` | Lease protocol state machine (acquire/renew/fence) | Random operation sequences vs protocol invariants |
 
 ### TLA+ vs proptest: When to Use Which
 

@@ -49,7 +49,19 @@ tests/fixtures/tmp/
 # Docker volumes
 minio_data/
 
-# Benchmarks and deploy (moved to ../zepdb/zeppelin-benchmark/)
+# Benchmarks and deploy (archived to ~/Documents/code/zep-temp/)
 benchmarks/
 deploy/
 demo/
+embed_service/
+
+# Local runtime config (use zeppelin.toml.example as template)
+zeppelin.toml
+
+# TLA+ model-checker artifacts
+formal-verifications/tla2tools.jar
+states/
+result_*.txt
+
+# Claude Code local settings
+.claude/
