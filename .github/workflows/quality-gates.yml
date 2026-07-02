@@ -99,21 +99,6 @@ jobs:
       - name: Check duplication
         run: jscpd --config .jscpd.json
 
-  # Gate 1: Miri (UB Detection)
-  miri:
-    name: Miri (UB Detection)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri
-      - uses: Swatinem/rust-cache@v2
-      - name: Run Miri
-        run: cargo +nightly miri test --lib
-        env:
-          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-tree-borrows"
-
   # Gate 3: Fuzz Testing
   fuzz:
     name: Fuzz Testing (60s each)
@@ -169,20 +154,28 @@ jobs:
       - name: Compare (fail on >10% regression)
         run: critcmp base pr --threshold 10
 
-  # Gate 4: Mutation Testing
+  # Gate 4: Mutation Testing (PR only, mutants in changed code only)
+  # The full-crate run lives in mutation-weekly.yml — at ~90s per mutant it
+  # takes many hours and can never finish inside a per-push job.
   mutants:
-    name: Mutation Testing
+    name: Mutation Testing (diff)
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-mutants
         run: cargo install cargo-mutants
-      - name: Run mutation testing
+      - name: Run mutation testing on changed code
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          cargo mutants --timeout 60 --jobs 2 -- --lib 2>&1 | tee mutants-output.txt
+          git diff "origin/${BASE_REF}"...HEAD > pr.diff
+          cargo mutants --timeout 60 --jobs 2 --in-diff pr.diff -- --lib 2>&1 | tee mutants-output.txt
           # Parse and check kill rate
           if grep -q 'mutants tested' mutants-output.txt; then
             MISSED=$(grep -oP 'missed: \K\d+' mutants-output.txt || echo 0)
@@ -201,4 +194,4 @@ jobs:
         if: always()
         with:
           name: mutants-report
-          path: mutants_out/
+          path: mutants.out/

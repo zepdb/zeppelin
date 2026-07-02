@@ -1,0 +1,44 @@
+name: Mutation Testing (weekly full run)
+
+on:
+  schedule:
+    # Sundays at 03:00 UTC
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants-full:
+    name: Mutation Testing (full crate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants
+      - name: Run mutation testing
+        run: |
+          cargo mutants --timeout 60 --jobs 2 -- --lib 2>&1 | tee mutants-output.txt
+          # Parse and check kill rate
+          if grep -q 'mutants tested' mutants-output.txt; then
+            MISSED=$(grep -oP 'missed: \K\d+' mutants-output.txt || echo 0)
+            CAUGHT=$(grep -oP 'caught: \K\d+' mutants-output.txt || echo 0)
+            TOTAL=$((CAUGHT + MISSED))
+            if [ "$TOTAL" -gt 0 ]; then
+              RATE=$((CAUGHT * 100 / TOTAL))
+              echo "Kill rate: $RATE% ($CAUGHT/$TOTAL)"
+              if [ "$RATE" -lt 80 ]; then
+                echo "::error::Mutation kill rate ($RATE%) below 80%"
+                exit 1
+              fi
+            fi
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-report
+          path: mutants.out/
