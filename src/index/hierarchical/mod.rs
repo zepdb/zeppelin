@@ -157,9 +157,7 @@ pub fn deserialize_tree_node(data: &[u8]) -> Result<TreeNode> {
         .and_then(|v| v.checked_add(n.checked_mul(4)?))
         .and_then(|v| v.checked_add(9))
         .ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "tree node header size overflows: n={n}, dim={dim}"
-            ))
+            ZeppelinError::Index(format!("tree node header size overflows: n={n}, dim={dim}"))
         })?;
     if min_size > data.len() {
         return Err(ZeppelinError::Index(format!(
