@@ -155,15 +155,17 @@ impl Manifest {
 
     /// Prune the manifest to prevent unbounded growth at 1M+ scale.
     ///
-    /// - Caps `pending_deletes` to the most recent `max_pending_deletes` entries.
-    /// - Retains only the most recent `max_old_segments` non-active segments.
-    pub fn prune(&mut self, max_pending_deletes: usize, max_old_segments: usize) {
-        // Cap pending deletes (keep newest)
-        if self.pending_deletes.len() > max_pending_deletes {
-            let excess = self.pending_deletes.len() - max_pending_deletes;
-            self.pending_deletes.drain(..excess);
-        }
-
+    /// Retains only the most recent `max_old_segments` non-active segments.
+    /// Segment refs are safe to drop: a replaced segment's S3 files were
+    /// queued into `pending_deletes` when it was replaced, so pruning the
+    /// ref is metadata-only.
+    ///
+    /// `pending_deletes` is deliberately NOT capped here: every entry is an
+    /// S3 key that still needs deletion, and draining entries without
+    /// deleting the objects leaks them permanently. The list is bounded in
+    /// practice — it is rewritten each compaction cycle and cleared (or
+    /// carried over on failure) at the start of the next.
+    pub fn prune(&mut self, _max_pending_deletes: usize, max_old_segments: usize) {
         // Prune old segments: keep active + most recent max_old_segments
         if self.segments.len() > max_old_segments + 1 {
             let active_id = self.active_segment.as_deref();
@@ -369,16 +371,15 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_caps_pending_deletes() {
+    fn test_prune_never_drops_pending_deletes() {
+        // Every pending_deletes entry is an S3 key still awaiting deletion;
+        // draining entries without deleting the objects leaks them forever.
         let mut manifest = Manifest::new();
         for i in 0..10 {
             manifest.pending_deletes.push(format!("key_{i}"));
         }
         manifest.prune(5, 10);
-        assert_eq!(manifest.pending_deletes.len(), 5);
-        // Should keep the newest (tail) entries
-        assert_eq!(manifest.pending_deletes[0], "key_5");
-        assert_eq!(manifest.pending_deletes[4], "key_9");
+        assert_eq!(manifest.pending_deletes.len(), 10);
     }
 
     #[test]
@@ -398,13 +399,18 @@ mod tests {
     }
 
     #[test]
-    fn test_add_segment_with_limits_prunes() {
+    fn test_add_segment_with_limits_prunes_segments_only() {
         let mut manifest = Manifest::new();
         for i in 0..10 {
             manifest.pending_deletes.push(format!("key_{i}"));
         }
-        // Add segment with small limits
-        manifest.add_segment_with_limits(make_segment("seg_new"), 3, 2);
-        assert!(manifest.pending_deletes.len() <= 3);
+        for i in 0..6 {
+            manifest.add_segment_with_limits(make_segment(&format!("seg_{i}")), 3, 2);
+        }
+        // Segment refs are pruned (metadata only)...
+        assert_eq!(manifest.segments.len(), 3);
+        // ...but pending_deletes entries are never dropped (they are S3 keys
+        // still awaiting deletion).
+        assert_eq!(manifest.pending_deletes.len(), 10);
     }
 }

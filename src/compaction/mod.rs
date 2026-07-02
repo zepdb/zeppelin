@@ -120,7 +120,14 @@ impl Compactor {
     ) -> Result<CompactionResult> {
         let start = std::time::Instant::now();
 
-        // 0. GC: delete any pending_deletes from a previous compaction cycle
+        // 0. GC: delete any pending_deletes from a previous compaction cycle.
+        // Keys whose deletion fails are carried into this cycle's
+        // pending_deletes and retried next cycle — dropping them would leak
+        // the objects forever. NotFound counts as already deleted.
+        // `processed_deletes` records every key attempted here so the CAS
+        // step can distinguish them from keys enqueued concurrently.
+        let mut carryover_deletes: Vec<String> = Vec::new();
+        let mut processed_deletes: HashSet<String> = HashSet::new();
         {
             let manifest = Manifest::read(&self.store, namespace)
                 .await?
@@ -137,8 +144,14 @@ impl Compactor {
                     .collect();
                 let delete_results = futures::future::join_all(delete_futs).await;
                 for (key, result) in manifest.pending_deletes.iter().zip(delete_results) {
-                    if let Err(e) = result {
-                        warn!(key = %key, error = %e, "failed to delete deferred key");
+                    processed_deletes.insert(key.clone());
+                    match result {
+                        Ok(()) => {}
+                        Err(ZeppelinError::Storage(object_store::Error::NotFound { .. })) => {}
+                        Err(e) => {
+                            warn!(key = %key, error = %e, "failed to delete deferred key; retrying next cycle");
+                            carryover_deletes.push(key.clone());
+                        }
                     }
                 }
             }
@@ -218,16 +231,15 @@ impl Compactor {
         let vectors: Vec<VectorEntry> = latest_vectors.into_values().collect();
         let vectors_compacted = vectors.len();
 
-        // Collect keys for deferred deletion
-        let mut deferred_deletes: Vec<String> = Vec::new();
+        // Collect keys for deferred deletion, carrying over keys whose
+        // deletion failed in step 0 so they are retried next cycle.
+        let mut deferred_deletes: Vec<String> = carryover_deletes;
         for fref in &fragment_refs {
             deferred_deletes.push(WalFragment::s3_key(namespace, &fref.id));
         }
         if let Some(ref seg_id) = old_segment_id {
             let prefix = format!("{namespace}/segments/{seg_id}/");
-            if let Ok(keys) = self.store.list_prefix(&prefix).await {
-                deferred_deletes.extend(keys);
-            }
+            deferred_deletes.extend(self.store.list_prefix(&prefix).await?);
         }
 
         if vectors.is_empty() {
@@ -261,7 +273,7 @@ impl Compactor {
                 }
 
                 fresh_manifest.remove_compacted_fragments(&compacted_ids);
-                fresh_manifest.pending_deletes = deferred_deletes.clone();
+                merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
                 // Layer 2: CAS.
                 match fresh_manifest
@@ -546,7 +558,7 @@ impl Compactor {
                 self.config.max_old_segments,
             );
             fresh_manifest.remove_compacted_fragments(&compacted_ids);
-            fresh_manifest.pending_deletes = deferred_deletes.clone();
+            merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
             // Layer 2: CAS.
             match fresh_manifest
@@ -746,6 +758,30 @@ impl Compactor {
     }
 }
 
+/// Merge this cycle's deferred-delete keys into the manifest.
+///
+/// The fresh manifest re-read inside the CAS loop may contain
+/// `pending_deletes` entries added by a concurrent writer since our step-0
+/// GC ran. Wholesale replacement would drop those keys and leak the objects.
+/// Keep any entry we did not process in step 0, then append this cycle's
+/// keys (deduplicated).
+fn merge_pending_deletes(
+    manifest: &mut Manifest,
+    deferred_deletes: &[String],
+    processed_deletes: &HashSet<String>,
+) {
+    manifest
+        .pending_deletes
+        .retain(|k| !processed_deletes.contains(k));
+    let existing: HashSet<&String> = manifest.pending_deletes.iter().collect();
+    let new_keys: Vec<String> = deferred_deletes
+        .iter()
+        .filter(|k| !existing.contains(k))
+        .cloned()
+        .collect();
+    manifest.pending_deletes.extend(new_keys);
+}
+
 /// Load all vectors from an existing IVF-Flat segment on S3.
 ///
 /// Fetches all clusters in parallel (2 S3 GETs per cluster) for ~15%
@@ -807,4 +843,38 @@ async fn load_segment_vectors(
     );
 
     Ok(vectors)
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_pending_deletes_keeps_concurrent_keys() {
+        // Keys added to pending_deletes by another writer after our step-0
+        // GC must survive the merge; keys we processed must be removed;
+        // this cycle's keys are appended without duplicates.
+        let mut manifest = Manifest::new();
+        manifest.pending_deletes = vec![
+            "ns/wal/old_a.wal".to_string(),      // processed in step 0
+            "ns/wal/concurrent.wal".to_string(), // added by concurrent writer
+        ];
+
+        let processed: HashSet<String> = ["ns/wal/old_a.wal".to_string()].into_iter().collect();
+        let deferred = vec![
+            "ns/wal/new_1.wal".to_string(),
+            "ns/wal/concurrent.wal".to_string(), // dedup against existing
+        ];
+
+        merge_pending_deletes(&mut manifest, &deferred, &processed);
+
+        assert_eq!(
+            manifest.pending_deletes,
+            vec![
+                "ns/wal/concurrent.wal".to_string(),
+                "ns/wal/new_1.wal".to_string(),
+            ]
+        );
+    }
 }
