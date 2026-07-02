@@ -149,6 +149,25 @@ pub fn deserialize_tree_node(data: &[u8]) -> Result<TreeNode> {
     ) as usize;
     let is_leaf = data[8] != 0;
 
+    // Validate the header against the actual blob size before allocating:
+    // n centroids of dim f32s plus n child-id length prefixes must fit.
+    let min_size = n
+        .checked_mul(dim)
+        .and_then(|v| v.checked_mul(4))
+        .and_then(|v| v.checked_add(n.checked_mul(4)?))
+        .and_then(|v| v.checked_add(9))
+        .ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "tree node header size overflows: n={n}, dim={dim}"
+            ))
+        })?;
+    if min_size > data.len() {
+        return Err(ZeppelinError::Index(format!(
+            "tree node blob too small: header claims n={n}, dim={dim} (needs >= {min_size} bytes), got {}",
+            data.len()
+        )));
+    }
+
     let mut offset = 9;
 
     // Read centroids.
@@ -304,6 +323,24 @@ mod tests {
     #[test]
     fn test_tree_node_deserialize_truncated() {
         let data = vec![0u8; 5]; // too small
+        assert!(deserialize_tree_node(&data).is_err());
+    }
+
+    #[test]
+    fn test_tree_node_deserialize_huge_header() {
+        // Fuzz regression: header claims ~4 billion centroids, which drove a
+        // ~96 GB Vec::with_capacity before any bounds check.
+        let data = [10, 0, 1, 239, 1, 0, 1, 239, 0, 0, 0];
+        assert!(deserialize_tree_node(&data).is_err());
+    }
+
+    #[test]
+    fn test_tree_node_deserialize_header_size_overflow() {
+        // n * dim * 4 overflows; must error, not wrap.
+        let mut data = Vec::new();
+        data.extend_from_slice(&u32::MAX.to_le_bytes()); // n
+        data.extend_from_slice(&u32::MAX.to_le_bytes()); // dim
+        data.push(0);
         assert!(deserialize_tree_node(&data).is_err());
     }
 
