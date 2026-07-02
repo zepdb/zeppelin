@@ -49,7 +49,7 @@ Only add dependencies listed in the plan. If you need something new, justify it.
 
 ## Learnings
 
-See `claude_files/claude_readme/learnings.md` for bugs encountered and patterns to avoid. Key rules:
+See `tasks/learnings.md` (local, gitignored) for the full list of bugs encountered and patterns to avoid — append new learnings there as work proceeds. Key rules:
 
 1. **No bincode with `#[serde(untagged)]` or `#[serde(skip_serializing_if)]`.** Any type in the serialization tree with these attributes must use a self-describing format (JSON, MessagePack, CBOR). Check nested types, not just top-level structs.
 2. **Check framework syntax against the pinned version.** Axum 0.7 uses `:param`, axum 0.8 uses `{param}`. If parameterized routes 404 but static routes work, suspect syntax mismatch.
