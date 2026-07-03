@@ -29,11 +29,37 @@ fn cas_backoff(attempt: u32) -> Duration {
     Duration::from_millis(base_ms + jitter_ms)
 }
 
-/// WAL writer with per-namespace mutexes to ensure single-writer semantics.
+/// One waiting writer's fragment ref plus the channel to hand back the
+/// manifest that ultimately references it. Enqueued after the fragment is
+/// durably PUT; drained by whichever append becomes the commit leader.
+struct PendingCommit {
+    fref: FragmentRef,
+    /// Fencing token this append carries (`None` for the common single-writer
+    /// path). The leader only folds in waiters whose token matches its own —
+    /// mixing tokens in one CAS would be unsafe. Same-token (incl. all-None)
+    /// is the only case that occurs under single-writer-per-namespace.
+    fencing_token: Option<u64>,
+    /// Reply with the committed manifest (Ok) or the failure (Err). A dropped
+    /// sender means the leader panicked; the waiter treats that as an error.
+    reply: oneshot::Sender<Result<Manifest>>,
+}
+
+/// Per-namespace group-commit state: a queue of fragment refs waiting to be
+/// folded into a single manifest CAS, plus the mutex that elects one leader.
+#[derive(Default)]
+struct GroupCommitState {
+    /// Fragment refs whose objects are durable and awaiting a manifest commit.
+    pending: std::sync::Mutex<Vec<PendingCommit>>,
+    /// Held by the current commit leader; serializes manifest CAS per namespace.
+    commit_lock: Mutex<()>,
+}
+
+/// WAL writer with per-namespace group commit to ensure single-writer
+/// semantics while coalescing concurrent appends into shared manifest updates.
 pub struct WalWriter {
     store: ZeppelinStore,
-    /// Per-namespace locks to serialize writes within a namespace.
-    locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Per-namespace group-commit state (pending queue + commit mutex).
+    groups: DashMap<String, Arc<GroupCommitState>>,
 }
 
 impl WalWriter {
@@ -41,28 +67,28 @@ impl WalWriter {
     pub fn new(store: ZeppelinStore) -> Self {
         Self {
             store,
-            locks: DashMap::new(),
+            groups: DashMap::new(),
         }
     }
 
-    /// Get or create the per-namespace lock.
-    fn namespace_lock(&self, namespace: &str) -> Arc<Mutex<()>> {
-        self.locks
+    /// Get or create the per-namespace group-commit state.
+    fn group(&self, namespace: &str) -> Arc<GroupCommitState> {
+        self.groups
             .entry(namespace.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(GroupCommitState::default()))
             .value()
             .clone()
     }
 
-    /// Remove the per-namespace lock entry. Called on namespace deletion.
+    /// Remove the per-namespace group-commit state. Called on namespace deletion.
     pub fn remove_lock(&self, namespace: &str) {
-        self.locks.remove(namespace);
+        self.groups.remove(namespace);
     }
 
-    /// Return the number of namespace locks held (for testing).
+    /// Return the number of namespace group states held (for testing).
     #[cfg(test)]
     pub fn lock_count(&self) -> usize {
-        self.locks.len()
+        self.groups.len()
     }
 
     /// Append vectors and deletes to the WAL for a namespace.
@@ -100,16 +126,14 @@ impl WalWriter {
         deletes: Vec<VectorId>,
         fencing_token: Option<u64>,
     ) -> Result<(WalFragment, Manifest)> {
-        let lock = self.namespace_lock(namespace);
-        let _guard = lock.lock().await;
-
         crate::metrics::WAL_APPENDS_TOTAL
             .with_label_values(&[namespace])
             .inc();
 
         let fragment = WalFragment::try_new(vectors, deletes)?;
 
-        // Write the fragment to S3
+        // 1. Write the fragment to S3 — OUTSIDE any manifest critical section,
+        //    so concurrent appends' PUTs run in parallel (I1).
         let key = WalFragment::s3_key(namespace, &fragment.id);
         let data = fragment.to_bytes()?;
         let size_bytes = data.len() as u64;
@@ -122,89 +146,206 @@ impl WalWriter {
             "wrote WAL fragment"
         );
 
-        // CAS retry loop for manifest update.
+        // 2. Enqueue our fragment ref for group commit and contend to lead.
+        let group = self.group(namespace);
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        {
+            // A poisoned lock means a prior leader panicked mid-commit; recover
+            // the guard and carry on rather than propagating the panic.
+            let mut pending = group
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending.push(PendingCommit {
+                fref: FragmentRef {
+                    id: fragment.id,
+                    vector_count: fragment.vectors.len(),
+                    delete_count: fragment.deletes.len(),
+                    sequence_number: 0, // assigned by add_fragment at commit
+                    size_bytes,
+                },
+                fencing_token,
+                reply: reply_tx,
+            });
+        }
+
+        // 3. Acquire the per-namespace commit lock. The holder is the leader:
+        //    it drains whatever is pending (folding many appends into one CAS)
+        //    and replies to every drained waiter. If a prior leader already
+        //    committed our ref while we waited, our oneshot is already
+        //    fulfilled — but we still lead a round for anyone who arrived
+        //    after that leader drained, so nobody is left uncommitted.
+        let _guard = group.commit_lock.lock().await;
+
+        // Fast path: a prior leader may have already handled us.
+        if let Ok(result) = reply_rx.try_recv() {
+            // Still drain any stragglers that queued behind us before we got
+            // the lock, so they don't wait for the next arriving writer.
+            self.commit_pending_group(namespace, &group).await;
+            return result.map(|manifest| (fragment, manifest));
+        }
+
+        // We are the leader for the current pending batch (which includes us).
+        self.commit_pending_group(namespace, &group).await;
+
+        // Our reply must now be fulfilled by the round we just led.
+        match reply_rx.await {
+            Ok(result) => result.map(|manifest| (fragment, manifest)),
+            Err(_) => Err(ZeppelinError::Index(format!(
+                "group commit dropped reply for namespace {namespace}"
+            ))),
+        }
+    }
+
+    /// Leader routine: drain the namespace's pending queue and fold every
+    /// same-fencing-token fragment ref into a SINGLE manifest CAS, then reply
+    /// to each drained waiter with the committed manifest (or the error).
+    ///
+    /// Must be called while holding `group.commit_lock`. Waiters whose token
+    /// differs from the batch leader's are left in the queue for a subsequent
+    /// leader (never mixed into one CAS — see `PendingCommit::fencing_token`).
+    async fn commit_pending_group(&self, namespace: &str, group: &GroupCommitState) {
+        // Drain the pending queue, partitioning by fencing token: the leader
+        // commits the token group of the OLDEST waiter (queue front) and puts
+        // any differing-token waiters back for the next leader.
+        let batch: Vec<PendingCommit> = {
+            let mut pending = group
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if pending.is_empty() {
+                return;
+            }
+            let leader_token = pending[0].fencing_token;
+            let mut batch = Vec::with_capacity(pending.len());
+            let mut deferred = Vec::new();
+            for item in pending.drain(..) {
+                if item.fencing_token == leader_token {
+                    batch.push(item);
+                } else {
+                    deferred.push(item);
+                }
+            }
+            *pending = deferred;
+            batch
+        };
+        if batch.is_empty() {
+            return;
+        }
+        let fencing_token = batch[0].fencing_token;
+
+        // CAS retry loop: one manifest update carrying ALL batched refs.
         //
-        // On a non-conflict error, or after exhausting retries, the fragment
-        // we PUT above is unreferenced by any manifest — an orphan. We
-        // best-effort delete it (I3) so a failed append leaves no dangling
-        // object; the manifest stays the source of truth for what exists.
-        // Deletion targets ONLY this fragment's exact WAL key — never a prefix
-        // and never a segment/cluster object (a carried cluster object is live
-        // under an older segment's key; see incremental compaction / Task 2B).
-        let mut last_err: Option<ZeppelinError> = None;
+        // On terminal failure every batched fragment is an orphan — best-effort
+        // delete each one's exact wal/ key (I3), never a prefix or a segment/
+        // cluster object (carried cluster objects live under old segment keys,
+        // Task 2B). Then reply Err to each waiter so no 200 is acked without a
+        // covering manifest (I4).
         for attempt in 0..MAX_CAS_RETRIES {
             let (mut manifest, version) =
                 match Manifest::read_versioned(&self.store, namespace).await {
                     Ok(Some(pair)) => pair,
                     Ok(None) => {
-                        self.cleanup_orphan_fragment(namespace, &key).await;
-                        return Err(ZeppelinError::ManifestNotFound {
+                        self.fail_batch(namespace, batch, |_| ZeppelinError::ManifestNotFound {
                             namespace: namespace.to_string(),
-                        });
+                        })
+                        .await;
+                        return;
                     }
                     Err(e) => {
-                        self.cleanup_orphan_fragment(namespace, &key).await;
-                        return Err(e);
+                        let msg = e.to_string();
+                        self.fail_batch(namespace, batch, |_| {
+                            ZeppelinError::Index(format!("manifest read failed: {msg}"))
+                        })
+                        .await;
+                        return;
                     }
                 };
 
-            // Layer 1: Fencing check — reject zombie writers.
+            // Layer 1: Fencing check — reject zombie writers before committing.
             if let Some(token) = fencing_token {
                 if manifest.fencing_token > token {
-                    self.cleanup_orphan_fragment(namespace, &key).await;
-                    return Err(ZeppelinError::FencingTokenStale {
+                    let mtoken = manifest.fencing_token;
+                    self.fail_batch(namespace, batch, |_| ZeppelinError::FencingTokenStale {
                         namespace: namespace.to_string(),
                         our_token: token,
-                        manifest_token: manifest.fencing_token,
-                    });
+                        manifest_token: mtoken,
+                    })
+                    .await;
+                    return;
                 }
                 manifest.fencing_token = token;
             }
 
-            manifest.add_fragment(FragmentRef {
-                id: fragment.id,
-                vector_count: fragment.vectors.len(),
-                delete_count: fragment.deletes.len(),
-                sequence_number: 0, // assigned by add_fragment
-                size_bytes,
-            });
+            // Fold every batched fragment ref into this one manifest.
+            for item in &batch {
+                manifest.add_fragment(item.fref.clone());
+            }
 
-            // Layer 2: CAS — catches TOCTOU gap between fencing check and write.
+            // Layer 2: CAS — catches TOCTOU between fencing check and write.
             match manifest
                 .write_conditional(&self.store, namespace, &version)
                 .await
             {
                 Ok(()) => {
                     debug!(
+                        batched = batch.len(),
                         fragment_count = manifest.fragments.len(),
-                        attempt, "updated manifest"
+                        attempt,
+                        "group commit updated manifest"
                     );
-                    return Ok((fragment, manifest));
+                    for item in batch {
+                        let _ = item.reply.send(Ok(manifest.clone()));
+                    }
+                    return;
                 }
                 Err(ZeppelinError::ManifestConflict { .. }) => {
                     warn!(
                         attempt,
-                        namespace, "manifest CAS conflict in writer, retrying with backoff"
+                        namespace,
+                        batched = batch.len(),
+                        "group commit CAS conflict, retrying with backoff"
                     );
-                    last_err = Some(ZeppelinError::ManifestConflict {
-                        namespace: namespace.to_string(),
-                    });
                     tokio::time::sleep(cas_backoff(attempt)).await;
                     continue;
                 }
                 Err(e) => {
-                    self.cleanup_orphan_fragment(namespace, &key).await;
-                    return Err(e);
+                    let msg = e.to_string();
+                    self.fail_batch(namespace, batch, |_| {
+                        ZeppelinError::Index(format!("manifest write failed: {msg}"))
+                    })
+                    .await;
+                    return;
                 }
             }
         }
 
-        // Retries exhausted under sustained contention: the fragment is an
-        // orphan. Clean it up so a client retry does not duplicate data.
-        self.cleanup_orphan_fragment(namespace, &key).await;
-        Err(last_err.unwrap_or(ZeppelinError::ManifestConflict {
+        // Retries exhausted under sustained contention: the only terminal error
+        // reachable here is a persistent CAS conflict (other errors return
+        // early above). Orphan every batched fragment and fail all waiters 409.
+        self.fail_batch(namespace, batch, |_| ZeppelinError::ManifestConflict {
             namespace: namespace.to_string(),
-        }))
+        })
+        .await;
+    }
+
+    /// Clean up every batched fragment object (orphans, I3) and reply Err to
+    /// each waiter. `make_err` produces a fresh error per waiter (errors aren't
+    /// `Clone`-friendly across all variants).
+    async fn fail_batch(
+        &self,
+        namespace: &str,
+        batch: Vec<PendingCommit>,
+        make_err: impl Fn(&PendingCommit) -> ZeppelinError,
+    ) {
+        for item in &batch {
+            let key = WalFragment::s3_key(namespace, &item.fref.id);
+            self.cleanup_orphan_fragment(namespace, &key).await;
+        }
+        for item in batch {
+            let err = make_err(&item);
+            let _ = item.reply.send(Err(err));
+        }
     }
 
     /// Best-effort delete of a fragment object that failed to be referenced by
@@ -214,7 +355,10 @@ impl WalWriter {
     async fn cleanup_orphan_fragment(&self, namespace: &str, key: &str) {
         match self.store.delete(key).await {
             Ok(()) => {
-                debug!(namespace, key, "cleaned up orphaned fragment after failed append");
+                debug!(
+                    namespace,
+                    key, "cleaned up orphaned fragment after failed append"
+                );
             }
             Err(e) => {
                 warn!(
@@ -466,9 +610,9 @@ mod tests {
         let store = crate::storage::ZeppelinStore::new(mem);
         let writer = WalWriter::new(store);
 
-        // Create locks by accessing namespace_lock
-        let _lock1 = writer.namespace_lock("ns1");
-        let _lock2 = writer.namespace_lock("ns2");
+        // Create per-namespace group state by accessing it
+        let _g1 = writer.group("ns1");
+        let _g2 = writer.group("ns2");
         assert_eq!(writer.lock_count(), 2);
 
         // Remove one lock

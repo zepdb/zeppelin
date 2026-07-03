@@ -67,7 +67,10 @@ async fn test_fencing_rejected_append_leaves_no_orphan() {
     );
     // Manifest must be untouched (no fragment ref added).
     let m = Manifest::read(store, &ns).await.unwrap().unwrap();
-    assert!(m.fragments.is_empty(), "rejected append must not touch the manifest");
+    assert!(
+        m.fragments.is_empty(),
+        "rejected append must not touch the manifest"
+    );
 
     harness.cleanup().await;
 }
@@ -97,9 +100,12 @@ async fn test_missing_manifest_append_leaves_no_orphan() {
     harness.cleanup().await;
 }
 
-/// I2: under moderate contention (two writers hammering the same namespace),
-/// backoff absorbs CAS conflicts — every append eventually succeeds, none
-/// surfaces a 409 to the caller.
+/// I2: under moderate contention, backoff absorbs CAS conflicts — every append
+/// eventually succeeds, none surfaces a 409 to the caller. Uses TWO SEPARATE
+/// WalWriter instances (independent group-commit state) on the same namespace,
+/// so they genuinely contend at the S3 manifest-CAS layer — group commit only
+/// coalesces WITHIN one writer, so cross-writer conflicts still exercise the
+/// backoff path.
 #[tokio::test]
 async fn test_concurrent_writers_backoff_absorbs_conflicts() {
     let harness = TestHarness::new().await;
@@ -107,13 +113,13 @@ async fn test_concurrent_writers_backoff_absorbs_conflicts() {
     let store = &harness.store;
     Manifest::new().write(store, &ns).await.unwrap();
 
-    let writer = Arc::new(WalWriter::new(store.clone()));
+    // Distinct writer instances = distinct group state = real S3 CAS contention.
     let n_per_task = 8;
-    let n_tasks = 3;
+    let n_writers = 3;
 
     let mut handles = Vec::new();
-    for t in 0..n_tasks {
-        let writer = writer.clone();
+    for t in 0..n_writers {
+        let writer = WalWriter::new(store.clone());
         let ns = ns.clone();
         handles.push(tokio::spawn(async move {
             let mut oks = 0;
@@ -137,13 +143,13 @@ async fn test_concurrent_writers_backoff_absorbs_conflicts() {
     for h in handles {
         total += h.await.unwrap();
     }
-    assert_eq!(total, n_per_task * n_tasks);
+    assert_eq!(total, n_per_task * n_writers);
 
     // Every fragment must be referenced by the manifest (I4: durable AND referenced).
     let m = Manifest::read(store, &ns).await.unwrap().unwrap();
     assert_eq!(
         m.fragments.len(),
-        n_per_task * n_tasks,
+        n_per_task * n_writers,
         "every successful append must be referenced in the manifest"
     );
 
@@ -155,9 +161,6 @@ async fn test_concurrent_writers_backoff_absorbs_conflicts() {
 /// into a shared manifest update. Pre-Task-5 code serializes: exactly N CAS
 /// PUTs (one per append, each under the per-namespace mutex).
 ///
-/// Ignored until Stage 2 (group commit) lands — RED against the serialized
-/// writer (asserts <= 8, gets 20). Un-ignored when group commit is implemented.
-#[ignore = "group commit not yet implemented (Task 5 stage 2)"]
 #[tokio::test]
 async fn test_group_commit_coalesces_manifest_puts() {
     let harness = TestHarness::new().await;
@@ -198,7 +201,11 @@ async fn test_group_commit_coalesces_manifest_puts() {
 
     // I4/I5: all N fragments referenced exactly once.
     let m = Manifest::read(&store, &ns).await.unwrap().unwrap();
-    assert_eq!(m.fragments.len(), n, "all appends referenced in the manifest");
+    assert_eq!(
+        m.fragments.len(),
+        n,
+        "all appends referenced in the manifest"
+    );
 
     harness.cleanup().await;
 }
@@ -225,7 +232,11 @@ async fn test_single_append_roundtrip_unchanged() {
         manifest.fragments.iter().any(|f| f.id == fragment.id),
         "append must return the manifest that includes its own fragment"
     );
-    assert_eq!(counter.puts_matching("/wal/"), 1, "exactly one fragment PUT");
+    assert_eq!(
+        counter.puts_matching("/wal/"),
+        1,
+        "exactly one fragment PUT"
+    );
     assert_eq!(
         counter.puts_matching("/manifest.json"),
         1,
