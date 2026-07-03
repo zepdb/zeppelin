@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::cache::DiskCache;
 use crate::error::{Result, ZeppelinError};
@@ -262,14 +262,9 @@ async fn scan_clusters_flat(
 
     // Phase 2: Sequential compute — CPU-bound, no I/O.
     let mut candidates = Vec::new();
-    for (cluster_idx, cluster_res, prefilter, attrs) in prefetched {
-        let cluster_data = match cluster_res {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(cluster = cluster_idx, error = %e, "failed to read cluster, skipping");
-                continue;
-            }
-        };
+    for (_cluster_idx, cluster_res, prefilter, attrs) in prefetched {
+        let cluster_data = cluster_res?;
+        let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
 
         for (j, vec) in cluster.vectors.iter().enumerate() {
@@ -346,7 +341,7 @@ async fn scan_clusters_sq(
                     if want_attr_filter {
                         load_attrs(index, cluster_idx, filter, store, cache).await
                     } else {
-                        None
+                        Ok(None)
                     }
                 },
             );
@@ -357,28 +352,8 @@ async fn scan_clusters_sq(
 
     let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
     for (cluster_idx, prefilter, sq_res, attrs) in coarse_prefetched {
-        let sq_data = match sq_res {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(cluster = cluster_idx, error = %e, "failed to read SQ cluster, falling back to flat");
-                let cvec_key = cluster_key(
-                    &index.namespace,
-                    index.cluster_owner(cluster_idx),
-                    cluster_idx,
-                );
-                if let Ok(data) = fetch_with_cache(cache, store, &cvec_key).await {
-                    let cluster = deserialize_cluster(&data)?;
-                    for (j, vec) in cluster.vectors.iter().enumerate() {
-                        if !coarse_row_passes(filter, &prefilter, &attrs, j) {
-                            continue;
-                        }
-                        let score = compute_distance(query, vec, distance_metric);
-                        coarse_candidates.push((cluster.ids[j].clone(), score, cluster_idx));
-                    }
-                }
-                continue;
-            }
-        };
+        let sq_data = sq_res?;
+        let attrs = attrs?;
         let sq_cluster = deserialize_sq_cluster(&sq_data)?;
 
         for (j, codes) in sq_cluster.codes.iter().enumerate() {
@@ -434,10 +409,8 @@ async fn scan_clusters_sq(
 
     let mut candidates = Vec::new();
     for (_, needed_ids, cluster_res, attrs) in rerank_prefetched {
-        let cluster_data = match cluster_res {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
+        let cluster_data = cluster_res?;
+        let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
 
         let needed_set: std::collections::HashSet<&str> =
@@ -511,7 +484,7 @@ async fn scan_clusters_pq(
                     if want_attr_filter {
                         load_attrs(index, cluster_idx, filter, store, cache).await
                     } else {
-                        None
+                        Ok(None)
                     }
                 },
             );
@@ -522,13 +495,8 @@ async fn scan_clusters_pq(
 
     let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
     for (cluster_idx, prefilter, pq_res, attrs) in coarse_prefetched {
-        let pq_data = match pq_res {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(cluster = cluster_idx, error = %e, "failed to read PQ cluster, skipping");
-                continue;
-            }
-        };
+        let pq_data = pq_res?;
+        let attrs = attrs?;
         let pq_cluster = deserialize_pq_cluster(&pq_data)?;
 
         for (j, codes) in pq_cluster.codes.iter().enumerate() {
@@ -580,10 +548,8 @@ async fn scan_clusters_pq(
 
     let mut candidates = Vec::new();
     for (needed_ids, cluster_res, attrs) in rerank_prefetched {
-        let cluster_data = match cluster_res {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
+        let cluster_data = cluster_res?;
+        let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
 
         let needed_set: std::collections::HashSet<&str> =
@@ -674,36 +640,17 @@ pub(crate) fn coarse_row_passes(
 async fn load_attrs(
     index: &IvfFlatIndex,
     cluster_idx: usize,
-    filter: Option<&Filter>,
+    _filter: Option<&Filter>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
-) -> Option<Vec<Option<HashMap<String, AttributeValue>>>> {
+) -> Result<Option<Vec<Option<HashMap<String, AttributeValue>>>>> {
     let akey = attrs_key(
         &index.namespace,
         index.cluster_owner(cluster_idx),
         cluster_idx,
     );
-    if filter.is_some() {
-        match fetch_with_cache(cache, store, &akey).await {
-            Ok(data) => match deserialize_attrs(&data) {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    warn!(cluster = cluster_idx, error = %e, "failed to parse attrs");
-                    None
-                }
-            },
-            Err(e) => {
-                warn!(cluster = cluster_idx, error = %e, "failed to read attrs");
-                None
-            }
-        }
-    } else {
-        // Load attrs for result enrichment even without filters.
-        match fetch_with_cache(cache, store, &akey).await {
-            Ok(data) => deserialize_attrs(&data).ok(),
-            Err(_) => None,
-        }
-    }
+    let data = fetch_with_cache(cache, store, &akey).await?;
+    Ok(Some(deserialize_attrs(&data)?))
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]

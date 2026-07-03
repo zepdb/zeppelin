@@ -98,6 +98,12 @@ mod inner {
             "Compactions aborted because the lease was lost mid-flight",
             &["namespace"]
         ).unwrap();
+
+        pub static ref WAL_FRAGMENT_GC_RACE_SKIPPED_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_wal_fragment_gc_race_skipped_total",
+            "WAL fragment NotFound reads skipped after a fresh manifest confirmed compaction removed the fragment",
+            &["namespace"]
+        ).unwrap();
     }
 }
 
@@ -137,4 +143,5 @@ pub fn init() {
     lazy_static::initialize(&NON_FINITE_VECTORS_SKIPPED_TOTAL);
     lazy_static::initialize(&COMPACTION_LEASE_RENEWALS_TOTAL);
     lazy_static::initialize(&COMPACTION_LEASE_LOST_TOTAL);
+    lazy_static::initialize(&WAL_FRAGMENT_GC_RACE_SKIPPED_TOTAL);
 }

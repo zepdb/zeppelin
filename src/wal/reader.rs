@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
@@ -50,7 +52,8 @@ impl WalReader {
     }
 
     /// Read specific fragments by their refs, preserving the caller's ordering.
-    /// Gracefully skips fragments that return NotFound (deferred deletion safety).
+    /// Skips NotFound only when a fresh manifest confirms compaction removed
+    /// that fragment ref.
     #[instrument(skip(self, refs), fields(namespace = namespace, ref_count = refs.len()))]
     pub async fn read_fragments_from_refs(
         &self,
@@ -64,21 +67,9 @@ impl WalReader {
         )
         .await;
 
-        // Process results in order — ordering is preserved by join_all.
-        let mut fragments = Vec::new();
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(fragment) => fragments.push(fragment),
-                Err(ZeppelinError::NotFound { key }) => {
-                    warn!(
-                        fragment_id = %refs[i].id,
-                        key = %key,
-                        "fragment not found (likely deferred deletion), skipping"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let fragments = self
+            .finish_fragment_results(namespace, refs, results)
+            .await?;
 
         debug!(fragment_count = fragments.len(), "read fragments from refs");
 
@@ -115,25 +106,69 @@ impl WalReader {
         )
         .await;
 
-        let mut fragments = Vec::new();
-        for (i, result) in results.into_iter().enumerate() {
-            match result {
-                Ok(fragment) => fragments.push(fragment),
-                Err(ZeppelinError::NotFound { key }) => {
-                    warn!(
-                        fragment_id = %refs[i].id,
-                        key = %key,
-                        "fragment not found (likely deferred deletion), skipping"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let fragments = self
+            .finish_fragment_results(namespace, refs, results)
+            .await?;
 
         debug!(
             fragment_count = fragments.len(),
             "read fragments from refs (unchecked)"
         );
+
+        Ok(fragments)
+    }
+
+    async fn finish_fragment_results(
+        &self,
+        namespace: &str,
+        refs: &[FragmentRef],
+        results: Vec<Result<WalFragment>>,
+    ) -> Result<Vec<WalFragment>> {
+        let mut fragments = Vec::new();
+        let mut missing = Vec::new();
+
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(fragment) => fragments.push(fragment),
+                Err(ZeppelinError::NotFound { key }) => {
+                    missing.push((refs[i].id, key));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if missing.is_empty() {
+            return Ok(fragments);
+        }
+
+        let fresh_manifest = Manifest::read(&self.store, namespace).await?;
+        let Some(fresh_manifest) = fresh_manifest else {
+            let (_, key) = missing.remove(0);
+            return Err(ZeppelinError::NotFound { key });
+        };
+        let live_fragment_ids: HashSet<Ulid> = fresh_manifest
+            .uncompacted_fragments()
+            .iter()
+            .map(|fref| fref.id)
+            .collect();
+
+        for (fragment_id, key) in &missing {
+            if live_fragment_ids.contains(fragment_id) {
+                return Err(ZeppelinError::NotFound { key: key.clone() });
+            }
+        }
+
+        for (fragment_id, key) in missing {
+            warn!(
+                namespace = %namespace,
+                fragment_id = %fragment_id,
+                key = %key,
+                "WAL fragment not found; fresh manifest no longer references it, treating as compaction GC race"
+            );
+            crate::metrics::WAL_FRAGMENT_GC_RACE_SKIPPED_TOTAL
+                .with_label_values(&[namespace])
+                .inc();
+        }
 
         Ok(fragments)
     }

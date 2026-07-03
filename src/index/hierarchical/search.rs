@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::cache::DiskCache;
 use crate::error::{Result, ZeppelinError};
@@ -186,15 +186,9 @@ pub async fn search_hierarchical(
         }))
         .await;
 
-        for (node_id, node_res) in &node_results {
-            let node_data = match node_res {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!(node_id = %node_id, error = %e, "failed to load tree node, skipping");
-                    continue;
-                }
-            };
-            let node = deserialize_tree_node(node_data)?;
+        for (_, node_res) in node_results {
+            let node_data = node_res?;
+            let node = deserialize_tree_node(&node_data)?;
 
             for (c, child_id) in node.children.iter().enumerate() {
                 let dist = compute_distance(query, &node.centroids[c], distance_metric);
@@ -418,14 +412,9 @@ async fn scan_clusters_flat(
 
     // Phase 2: Sequential compute — CPU-bound, no I/O.
     let mut candidates = Vec::new();
-    for (cluster_idx, cluster_res, prefilter, attrs) in prefetched {
-        let cluster_data = match cluster_res {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(cluster = cluster_idx, error = %e, "failed to read cluster, skipping");
-                continue;
-            }
-        };
+    for (_cluster_idx, cluster_res, prefilter, attrs) in prefetched {
+        let cluster_data = cluster_res?;
+        let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
 
         for (j, vec) in cluster.vectors.iter().enumerate() {
@@ -495,7 +484,7 @@ async fn scan_clusters_sq(
                     if want_attr_filter {
                         load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
                     } else {
-                        None
+                        Ok(None)
                     }
                 },
             );
@@ -506,31 +495,15 @@ async fn scan_clusters_sq(
 
     let mut coarse: Vec<(String, f32, usize)> = Vec::new();
     for (cluster_idx, prefilter, sq_res, attrs) in coarse_prefetched {
-        match sq_res {
-            Ok(sq_data) => {
-                let sq_cluster = deserialize_sq_cluster(&sq_data)?;
-                for (j, codes) in sq_cluster.codes.iter().enumerate() {
-                    if !coarse_row_passes(filter, &prefilter, &attrs, j) {
-                        continue;
-                    }
-                    let approx = calibration.asymmetric_distance(query, codes, distance_metric);
-                    coarse.push((sq_cluster.ids[j].clone(), approx, cluster_idx));
-                }
+        let sq_data = sq_res?;
+        let attrs = attrs?;
+        let sq_cluster = deserialize_sq_cluster(&sq_data)?;
+        for (j, codes) in sq_cluster.codes.iter().enumerate() {
+            if !coarse_row_passes(filter, &prefilter, &attrs, j) {
+                continue;
             }
-            Err(e) => {
-                warn!(cluster = cluster_idx, error = %e, "failed to read SQ cluster, falling back to flat");
-                let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
-                if let Ok(data) = fetch_with_cache(cache, store, &cvec_key).await {
-                    let cluster = deserialize_cluster(&data)?;
-                    for (j, vec) in cluster.vectors.iter().enumerate() {
-                        if !coarse_row_passes(filter, &prefilter, &attrs, j) {
-                            continue;
-                        }
-                        let score = compute_distance(query, vec, distance_metric);
-                        coarse.push((cluster.ids[j].clone(), score, cluster_idx));
-                    }
-                }
-            }
+            let approx = calibration.asymmetric_distance(query, codes, distance_metric);
+            coarse.push((sq_cluster.ids[j].clone(), approx, cluster_idx));
         }
     }
 
@@ -565,10 +538,8 @@ async fn scan_clusters_sq(
 
     let mut candidates = Vec::new();
     for (needed_ids, cluster_res, attrs) in rerank_prefetched {
-        let cluster_data = match cluster_res {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
+        let cluster_data = cluster_res?;
+        let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
         let needed_set: std::collections::HashSet<&str> =
             needed_ids.iter().map(|s| s.as_str()).collect();
@@ -636,7 +607,7 @@ async fn scan_clusters_pq(
                     if want_attr_filter {
                         load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
                     } else {
-                        None
+                        Ok(None)
                     }
                 },
             );
@@ -647,21 +618,15 @@ async fn scan_clusters_pq(
 
     let mut coarse: Vec<(String, f32, usize)> = Vec::new();
     for (cluster_idx, prefilter, pq_res, attrs) in coarse_prefetched {
-        match pq_res {
-            Ok(pq_data) => {
-                let pq_cluster = deserialize_pq_cluster(&pq_data)?;
-                for (j, codes) in pq_cluster.codes.iter().enumerate() {
-                    if !coarse_row_passes(filter, &prefilter, &attrs, j) {
-                        continue;
-                    }
-                    let approx = codebook.adc_distance(&adc_table, codes);
-                    coarse.push((pq_cluster.ids[j].clone(), approx, cluster_idx));
-                }
-            }
-            Err(e) => {
-                warn!(cluster = cluster_idx, error = %e, "failed to read PQ cluster, skipping");
+        let pq_data = pq_res?;
+        let attrs = attrs?;
+        let pq_cluster = deserialize_pq_cluster(&pq_data)?;
+        for (j, codes) in pq_cluster.codes.iter().enumerate() {
+            if !coarse_row_passes(filter, &prefilter, &attrs, j) {
                 continue;
             }
+            let approx = codebook.adc_distance(&adc_table, codes);
+            coarse.push((pq_cluster.ids[j].clone(), approx, cluster_idx));
         }
     }
 
@@ -696,10 +661,8 @@ async fn scan_clusters_pq(
 
     let mut candidates = Vec::new();
     for (needed_ids, cluster_res, attrs) in rerank_prefetched {
-        let cluster_data = match cluster_res {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
+        let cluster_data = cluster_res?;
+        let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
         let needed_set: std::collections::HashSet<&str> =
             needed_ids.iter().map(|s| s.as_str()).collect();
@@ -756,29 +719,11 @@ async fn load_attrs(
     namespace: &str,
     segment_id: &str,
     cluster_idx: usize,
-    filter: Option<&Filter>,
+    _filter: Option<&Filter>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
-) -> Option<Vec<Option<HashMap<String, AttributeValue>>>> {
+) -> Result<Option<Vec<Option<HashMap<String, AttributeValue>>>>> {
     let akey = attrs_key(namespace, segment_id, cluster_idx);
-    if filter.is_some() {
-        match fetch_with_cache(cache, store, &akey).await {
-            Ok(data) => match deserialize_attrs(&data) {
-                Ok(a) => Some(a),
-                Err(e) => {
-                    warn!(cluster = cluster_idx, error = %e, "failed to parse attrs");
-                    None
-                }
-            },
-            Err(e) => {
-                warn!(cluster = cluster_idx, error = %e, "failed to read attrs");
-                None
-            }
-        }
-    } else {
-        match fetch_with_cache(cache, store, &akey).await {
-            Ok(data) => deserialize_attrs(&data).ok(),
-            Err(_) => None,
-        }
-    }
+    let data = fetch_with_cache(cache, store, &akey).await?;
+    Ok(Some(deserialize_attrs(&data)?))
 }
