@@ -167,48 +167,75 @@ impl WalWriter {
         }
 
         // 3. Acquire the per-namespace commit lock. The holder is the leader:
-        //    it drains whatever is pending (folding many appends into one CAS)
-        //    and replies to every drained waiter. If a prior leader already
-        //    committed our ref while we waited, our oneshot is already
-        //    fulfilled — but we still lead a round for anyone who arrived
-        //    after that leader drained, so nobody is left uncommitted.
+        //    it commits rounds (each folding one fencing-token group into a
+        //    single CAS) until ITS OWN oneshot is resolved, then releases the
+        //    lock. Looping until self-resolved is what prevents the deadlock
+        //    where a leader defers its own ref (its token differs from the
+        //    queue front) and then blocks on its own reply while still holding
+        //    the lock — nobody else could ever acquire it. If a prior leader
+        //    already committed our ref before we got the lock, `try_recv`
+        //    short-circuits; we still lead one round to sweep any stragglers.
         let _guard = group.commit_lock.lock().await;
 
-        // Fast path: a prior leader may have already handled us.
         if let Ok(result) = reply_rx.try_recv() {
-            // Still drain any stragglers that queued behind us before we got
-            // the lock, so they don't wait for the next arriving writer.
+            // A prior leader handled us. Sweep any stragglers that queued
+            // behind us so they don't wait for the next arriving writer.
             self.commit_pending_group(namespace, &group).await;
             return result.map(|manifest| (fragment, manifest));
         }
 
-        // We are the leader for the current pending batch (which includes us).
-        self.commit_pending_group(namespace, &group).await;
-
-        // Our reply must now be fulfilled by the round we just led.
-        match reply_rx.await {
-            Ok(result) => result.map(|manifest| (fragment, manifest)),
-            Err(_) => Err(ZeppelinError::Index(format!(
-                "group commit dropped reply for namespace {namespace}"
-            ))),
+        // Lead rounds until our own reply lands. Each round commits the
+        // oldest-token group; deferred groups are picked up by our next
+        // iteration (we hold the lock the whole time), so our own ref is
+        // guaranteed to be committed before we exit — no self-deadlock.
+        loop {
+            let committed_any = self.commit_pending_group(namespace, &group).await;
+            match reply_rx.try_recv() {
+                Ok(result) => return result.map(|manifest| (fragment, manifest)),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    return Err(ZeppelinError::Index(format!(
+                        "group commit dropped reply for namespace {namespace}"
+                    )));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    // Our ref wasn't committed yet. It must still be pending
+                    // (a leader only drains under the same lock we hold), so
+                    // another round will reach it. `committed_any == false`
+                    // with our reply still empty would be a logic bug — guard
+                    // against a spin by asserting progress in debug builds.
+                    debug_assert!(
+                        committed_any,
+                        "group commit made no progress but our ref is uncommitted"
+                    );
+                    if !committed_any {
+                        // Defensive: avoid a hot spin in release builds if the
+                        // invariant is ever violated.
+                        return Err(ZeppelinError::Index(format!(
+                            "group commit stalled for namespace {namespace}"
+                        )));
+                    }
+                }
+            }
         }
     }
 
-    /// Leader routine: drain the namespace's pending queue and fold every
-    /// same-fencing-token fragment ref into a SINGLE manifest CAS, then reply
-    /// to each drained waiter with the committed manifest (or the error).
+    /// Leader routine: commit ONE fencing-token group from the pending queue
+    /// (the oldest waiter's token group) in a SINGLE manifest CAS, then reply
+    /// to each committed waiter with the manifest (or the error). Returns
+    /// `true` if a group was committed, `false` if the queue was empty.
     ///
-    /// Must be called while holding `group.commit_lock`. Waiters whose token
-    /// differs from the batch leader's are left in the queue for a subsequent
-    /// leader (never mixed into one CAS — see `PendingCommit::fencing_token`).
-    async fn commit_pending_group(&self, namespace: &str, group: &GroupCommitState) {
-        // Drain the pending queue, partitioning by fencing token: the leader
-        // commits the token group of the OLDEST waiter (queue front) and puts
-        // any differing-token waiters back for the next leader.
+    /// Must be called while holding `group.commit_lock`. Differing-token
+    /// waiters are left in the queue; the SAME leader picks them up on its
+    /// next call (the caller loops until its own ref is committed), so no
+    /// waiter is ever stranded waiting for a future lock holder.
+    async fn commit_pending_group(&self, namespace: &str, group: &GroupCommitState) -> bool {
+        // Drain the pending queue, partitioning by fencing token: commit the
+        // token group of the OLDEST waiter (queue front) and put any
+        // differing-token waiters back for the leader's next round.
         let batch: Vec<PendingCommit> = {
             let mut pending = group.pending.lock().unwrap_or_else(|e| e.into_inner());
             if pending.is_empty() {
-                return;
+                return false;
             }
             let leader_token = pending[0].fencing_token;
             let mut batch = Vec::with_capacity(pending.len());
@@ -224,7 +251,7 @@ impl WalWriter {
             batch
         };
         if batch.is_empty() {
-            return;
+            return false;
         }
         let fencing_token = batch[0].fencing_token;
 
@@ -244,7 +271,7 @@ impl WalWriter {
                             namespace: namespace.to_string(),
                         })
                         .await;
-                        return;
+                        return true;
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -252,7 +279,7 @@ impl WalWriter {
                             ZeppelinError::Index(format!("manifest read failed: {msg}"))
                         })
                         .await;
-                        return;
+                        return true;
                     }
                 };
 
@@ -266,7 +293,7 @@ impl WalWriter {
                         manifest_token: mtoken,
                     })
                     .await;
-                    return;
+                    return true;
                 }
                 manifest.fencing_token = token;
             }
@@ -291,7 +318,7 @@ impl WalWriter {
                     for item in batch {
                         let _ = item.reply.send(Ok(manifest.clone()));
                     }
-                    return;
+                    return true;
                 }
                 Err(ZeppelinError::ManifestConflict { .. }) => {
                     warn!(
@@ -309,7 +336,7 @@ impl WalWriter {
                         ZeppelinError::Index(format!("manifest write failed: {msg}"))
                     })
                     .await;
-                    return;
+                    return true;
                 }
             }
         }
@@ -321,6 +348,7 @@ impl WalWriter {
             namespace: namespace.to_string(),
         })
         .await;
+        true
     }
 
     /// Clean up every batched fragment object (orphans, I3) and reply Err to

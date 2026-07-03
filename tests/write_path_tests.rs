@@ -34,6 +34,68 @@ async fn wal_fragment_count(store: &zeppelin::storage::ZeppelinStore, ns: &str) 
         .count()
 }
 
+/// Group commit must not deadlock when concurrent appends carry DIFFERENT
+/// fencing tokens. A leader whose own token differs from the oldest queued
+/// waiter's must still commit its OWN ref and release the commit lock — never
+/// defer itself and then block on its own reply while holding the lock (which
+/// wedges the namespace's write path permanently).
+///
+/// Reproduces reliably against the buggy code (leader_token taken from
+/// `pending[0]` rather than the lock holder's own token) using an in-memory
+/// store: instant CAS → rapid leader handoff → the pending queue reliably
+/// holds mismatched tokens while a leader holds the commit lock. Two tasks
+/// race per iteration with DIFFERENT tokens that CLIMB (`iter*2+1`,
+/// `iter*2+2`), so the fencing check itself never rejects (the manifest token
+/// only ratchets up to what we set) — a hang is therefore unambiguously the
+/// deadlock, not a fencing rejection. The bug surfaces within a few thousand
+/// iterations; each iteration is guarded by a 10s timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_group_commit_mixed_fencing_tokens_no_deadlock() {
+    let mem = Arc::new(object_store::memory::InMemory::new());
+    let store = zeppelin::storage::ZeppelinStore::new(mem);
+    let ns = "mixed-token-deadlock";
+    Manifest::new().write(&store, ns).await.unwrap();
+
+    let writer = Arc::new(WalWriter::new(store.clone()));
+
+    // Per round, race SEVERAL tasks with DISTINCT climbing tokens. More
+    // concurrent pushers sharply raises the odds that a later-pushing task
+    // (whose token differs from the queue front) wins the commit lock first —
+    // the exact interleaving that wedges a leader that defers its own ref.
+    let racers = 6u64;
+    for iter in 0..600u64 {
+        let base = iter * racers;
+        let mut handles = Vec::with_capacity(racers as usize);
+        for r in 0..racers {
+            // Distinct, climbing tokens so the fencing check never rejects
+            // (manifest.fencing_token only ratchets up to what we set); the
+            // WITHIN-round mismatch is what exercises the deferral partition.
+            let token = base + r + 1;
+            let w = writer.clone();
+            handles.push(tokio::spawn(async move {
+                w.append_with_lease(ns, random_vectors(1, 8), vec![], Some(token))
+                    .await
+            }));
+        }
+
+        let all = async {
+            for h in handles {
+                let _ = h.await.unwrap();
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(10), all)
+            .await
+            .is_err()
+        {
+            panic!(
+                "DEADLOCK at iteration {iter}: mixed-token appends hung — a lock-holding \
+                 leader deferred its own ref (leader_token from pending[0], not self) and \
+                 awaits an oneshot nobody can fulfill while holding commit_lock"
+            );
+        }
+    }
+}
+
 /// I3: a fencing-stale append (rejected AFTER the fragment PUT) must not leave
 /// an orphaned fragment on S3. This is the deterministic orphan trigger — the
 /// fragment is written, then the fencing check fails, then the pre-Task-5 code
