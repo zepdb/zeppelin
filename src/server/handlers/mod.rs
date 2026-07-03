@@ -98,6 +98,63 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Build the canonical envelope for an error STATUS produced outside the
+/// handler layer — tower middleware (request timeout 408, body limit 413),
+/// the unmatched-route fallback (404), etc. (Task 11 I4). These never carry a
+/// `ZeppelinError`, so we synthesize `{code, error, status, request_id?,
+/// retryable}` from the status alone. Returns `None` for statuses we don't own
+/// (so success responses pass through untouched).
+pub fn envelope_for_status(status: StatusCode) -> Option<(&'static str, &'static str, bool)> {
+    // (code, client message, retryable)
+    match status {
+        StatusCode::REQUEST_TIMEOUT => Some((
+            "REQUEST_TIMEOUT",
+            "the request timed out; please retry",
+            true,
+        )),
+        StatusCode::PAYLOAD_TOO_LARGE => Some((
+            "PAYLOAD_TOO_LARGE",
+            "request body exceeds the configured size limit",
+            false,
+        )),
+        StatusCode::NOT_FOUND => Some(("NOT_FOUND", "no such route or resource", false)),
+        StatusCode::METHOD_NOT_ALLOWED => Some((
+            "METHOD_NOT_ALLOWED",
+            "the HTTP method is not allowed for this route",
+            false,
+        )),
+        _ => None,
+    }
+}
+
+/// Fallback handler for unmatched routes: canonical 404 envelope (I4).
+pub async fn not_found_fallback() -> Response {
+    render_status_envelope(StatusCode::NOT_FOUND)
+}
+
+/// Render the canonical envelope for a bare error status.
+pub fn render_status_envelope(status: StatusCode) -> Response {
+    let (code, message, retryable) =
+        envelope_for_status(status).unwrap_or(("ERROR", "request failed", false));
+    let mut body = json!({
+        "code": code,
+        "error": message,
+        "status": status.as_u16(),
+        "retryable": retryable,
+    });
+    if let Some(rid) = current_request_id() {
+        body["request_id"] = json!(rid);
+    }
+    let mut response = (status, Json(body)).into_response();
+    if status == StatusCode::REQUEST_TIMEOUT {
+        // Nudge clients to back off before retrying a timed-out request.
+        if let Ok(val) = "1".parse() {
+            response.headers_mut().insert("retry-after", val);
+        }
+    }
+    response
+}
+
 /// Liveness probe: returns 200 OK if the server process is running.
 pub async fn health_check() -> Json<Value> {
     Json(json!({"status": "ok"}))

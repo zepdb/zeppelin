@@ -25,8 +25,13 @@ async fn test_empty_body_upsert() {
         .await
         .unwrap();
 
-    // Missing `vectors` field should fail deserialization (422)
-    assert_eq!(resp.status().as_u16(), 422);
+    // Missing `vectors` field should fail deserialization. Task 11 I5: upsert
+    // now uses a custom rejection → 400 with the canonical envelope (was 422
+    // plain-text from axum's Json extractor; that acceptance is revoked).
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+    assert_eq!(body["status"], 400);
 
     harness.cleanup().await;
 }
@@ -111,8 +116,11 @@ async fn test_wrong_type_vector_values() {
         .await
         .unwrap();
 
-    // String instead of array should fail deserialization (422)
-    assert_eq!(resp.status().as_u16(), 422);
+    // String instead of array should fail deserialization. Task 11 I5: 400 +
+    // canonical envelope (was 422 plain-text).
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
 
     harness.cleanup().await;
 }

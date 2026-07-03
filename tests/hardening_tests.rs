@@ -37,6 +37,9 @@ async fn test_oversized_batch_400() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
+    // Task 11: clients key off the stable `code`, not the human message.
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+    assert_eq!(body["retryable"], false);
     let error_msg = body["error"].as_str().unwrap().to_lowercase();
     assert!(error_msg.contains("batch size"), "got: {error_msg}");
 
@@ -60,6 +63,7 @@ async fn test_empty_batch_400() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
     let error_msg = body["error"].as_str().unwrap().to_lowercase();
     assert!(error_msg.contains("empty"), "got: {error_msg}");
 
@@ -86,6 +90,7 @@ async fn test_top_k_too_large_400() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
     let error_msg = body["error"].as_str().unwrap().to_lowercase();
     assert!(error_msg.contains("top_k"), "got: {error_msg}");
 
@@ -112,6 +117,7 @@ async fn test_top_k_zero_400() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
     let error_msg = body["error"].as_str().unwrap().to_lowercase();
     assert!(error_msg.contains("top_k"), "got: {error_msg}");
 

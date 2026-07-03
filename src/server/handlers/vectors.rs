@@ -32,12 +32,22 @@ pub struct DeleteVectorsRequest {
 }
 
 /// Upserts a batch of vectors into the specified namespace via the WAL.
-#[instrument(skip(state, req), fields(namespace = %ns, vector_count = req.vectors.len()))]
+///
+/// Uses a raw-bytes + `serde_json` body (not axum's `Json` extractor) so
+/// malformed JSON returns a 400 with the canonical error envelope, matching
+/// the query handler — axum's `Json` rejection is a 422 plain-text body that
+/// bypasses our envelope (Task 11 I5).
+#[instrument(skip(state, body), fields(namespace = %ns))]
 pub async fn upsert_vectors(
     State(state): State<AppState>,
     Path(ns): Path<String>,
-    Json(req): Json<UpsertVectorsRequest>,
+    body: bytes::Bytes,
 ) -> Result<(StatusCode, Json<UpsertVectorsResponse>), ApiError> {
+    let req: UpsertVectorsRequest = serde_json::from_slice(&body).map_err(|e| {
+        ApiError(ZeppelinError::Validation(format!(
+            "invalid request body: {e}"
+        )))
+    })?;
     if req.vectors.is_empty() {
         return Err(ApiError(ZeppelinError::Validation(
             "vectors array cannot be empty".into(),
@@ -124,12 +134,17 @@ pub async fn upsert_vectors(
 }
 
 /// Deletes vectors by ID from the specified namespace via the WAL.
-#[instrument(skip(state, req), fields(namespace = %ns, delete_count = req.ids.len()))]
+#[instrument(skip(state, body), fields(namespace = %ns))]
 pub async fn delete_vectors(
     State(state): State<AppState>,
     Path(ns): Path<String>,
-    Json(req): Json<DeleteVectorsRequest>,
+    body: bytes::Bytes,
 ) -> Result<StatusCode, ApiError> {
+    let req: DeleteVectorsRequest = serde_json::from_slice(&body).map_err(|e| {
+        ApiError(ZeppelinError::Validation(format!(
+            "invalid request body: {e}"
+        )))
+    })?;
     if req.ids.is_empty() {
         return Err(ApiError(ZeppelinError::Validation(
             "ids array cannot be empty".into(),

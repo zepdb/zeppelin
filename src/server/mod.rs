@@ -138,6 +138,32 @@ pub async fn request_id(request: Request<axum::body::Body>, next: Next) -> Respo
         .await
 }
 
+/// Middleware that normalizes middleware/layer-produced error responses into
+/// the canonical JSON envelope (Task 11 I4).
+///
+/// Tower layers like `TimeoutLayer` (408) and `RequestBodyLimitLayer` (413)
+/// emit bare/plain-text bodies that never pass through a handler. This runs
+/// OUTERMOST and rewrites any response whose status we own but whose body is
+/// not already our JSON envelope (detected via `content-type`). Handler and
+/// `ApiError` responses are already `application/json`, so they pass through
+/// untouched — this only catches the layer-produced stragglers.
+pub async fn normalize_error_responses(request: Request<axum::body::Body>, next: Next) -> Response {
+    let response = next.run(request).await;
+    let status = response.status();
+    if handlers::envelope_for_status(status).is_none() {
+        return response; // not a status we own (incl. all 2xx/3xx)
+    }
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if is_json {
+        return response; // already enveloped by a handler / ApiError
+    }
+    handlers::render_status_envelope(status)
+}
+
 /// Middleware that limits concurrent query execution.
 ///
 /// Acquires a permit from the query semaphore before forwarding the request.
@@ -272,5 +298,13 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(axum::middleware::from_fn(request_id));
 
-    query_routes.merge(other_routes).with_state(state)
+    query_routes
+        .merge(other_routes)
+        // Unmatched routes → canonical 404 envelope (I4).
+        .fallback(handlers::not_found_fallback)
+        // Outermost: normalize any layer-produced bare error body (408/413/…)
+        // into the canonical envelope. Runs after all inner layers so it sees
+        // their responses; JSON envelopes from handlers pass through.
+        .layer(axum::middleware::from_fn(normalize_error_responses))
+        .with_state(state)
 }
