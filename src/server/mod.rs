@@ -148,6 +148,17 @@ pub async fn request_id(request: Request<axum::body::Body>, next: Next) -> Respo
 /// `ApiError` responses are already `application/json`, so they pass through
 /// untouched — this only catches the layer-produced stragglers.
 pub async fn normalize_error_responses(request: Request<axum::body::Body>, next: Next) -> Response {
+    // Capture the request's id BEFORE running downstream: this layer sits above
+    // the request_id middleware (and its REQUEST_ID scope), so when it rewrites
+    // a layer-produced error it must thread the id through explicitly or the
+    // 408/413 envelope would lose it. Prefer the response's x-request-id (set
+    // by the inner middleware, incl. a server-generated UUID) and fall back to
+    // the incoming request header.
+    let req_id_hdr = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     let response = next.run(request).await;
     let status = response.status();
     if handlers::envelope_for_status(status).is_none() {
@@ -161,7 +172,13 @@ pub async fn normalize_error_responses(request: Request<axum::body::Body>, next:
     if is_json {
         return response; // already enveloped by a handler / ApiError
     }
-    handlers::render_status_envelope(status)
+    let rid = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .or(req_id_hdr);
+    handlers::render_status_envelope(status, rid)
 }
 
 /// Middleware that limits concurrent query execution.

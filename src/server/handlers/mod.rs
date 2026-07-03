@@ -129,23 +129,36 @@ pub fn envelope_for_status(status: StatusCode) -> Option<(&'static str, &'static
 
 /// Fallback handler for unmatched routes: canonical 404 envelope (I4).
 pub async fn not_found_fallback() -> Response {
-    render_status_envelope(StatusCode::NOT_FOUND)
+    render_status_envelope(StatusCode::NOT_FOUND, None)
 }
 
 /// Render the canonical envelope for a bare error status.
-pub fn render_status_envelope(status: StatusCode) -> Response {
+///
+/// `request_id_override` lets a caller that runs OUTSIDE the `REQUEST_ID`
+/// task-local scope (e.g. the outermost `normalize_error_responses` layer,
+/// which sits above the request_id middleware) still stamp the id — it falls
+/// back to `current_request_id()` when `None`. When an id is resolved it is
+/// echoed in both the body and the `x-request-id` response header so a
+/// middleware-rewritten 408/413 stays correlatable.
+pub fn render_status_envelope(status: StatusCode, request_id_override: Option<String>) -> Response {
     let (code, message, retryable) =
         envelope_for_status(status).unwrap_or(("ERROR", "request failed", false));
+    let rid = request_id_override.or_else(current_request_id);
     let mut body = json!({
         "code": code,
         "error": message,
         "status": status.as_u16(),
         "retryable": retryable,
     });
-    if let Some(rid) = current_request_id() {
-        body["request_id"] = json!(rid);
+    if let Some(ref id) = rid {
+        body["request_id"] = json!(id);
     }
     let mut response = (status, Json(body)).into_response();
+    if let Some(id) = rid {
+        if let Ok(val) = id.parse() {
+            response.headers_mut().insert("x-request-id", val);
+        }
+    }
     if status == StatusCode::REQUEST_TIMEOUT {
         // Nudge clients to back off before retrying a timed-out request.
         if let Ok(val) = "1".parse() {
@@ -161,15 +174,28 @@ pub async fn health_check() -> Json<Value> {
 }
 
 /// Readiness probe: returns 200 OK when S3 connectivity is confirmed.
+///
+/// On failure the body carries only a generic reason — the underlying
+/// `object_store` error Display embeds the S3 endpoint URL, port, and bucket
+/// name, which must not be served to an unauthenticated caller (`/readyz` is
+/// exempt from rate limiting and auth). The full error goes to the logs
+/// instead (Task 11 I3).
 pub async fn readiness_check(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match state.store.list_prefix("__healthcheck__").await {
         Ok(_) => Ok(Json(json!({"status": "ready", "s3_connected": true}))),
-        Err(e) => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "not_ready", "s3_connected": false, "error": e.to_string()})),
-        )),
+        Err(e) => {
+            tracing::error!(error = %e, "readiness check failed: storage backend unreachable");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "not_ready",
+                    "s3_connected": false,
+                    "error": "storage backend is unreachable",
+                })),
+            ))
+        }
     }
 }
 

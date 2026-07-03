@@ -119,6 +119,53 @@ async fn test_envelope_unmatched_route() {
     harness.cleanup().await;
 }
 
+/// I4: a method not allowed for a route (POST to a GET-only endpoint) returns
+/// the canonical envelope via the normalize layer, not axum's empty body.
+#[tokio::test]
+async fn test_envelope_method_not_allowed() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base_url}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 405);
+    let body: Value = resp.json().await.unwrap();
+    assert_envelope(&body, "METHOD_NOT_ALLOWED", 405);
+
+    harness.cleanup().await;
+}
+
+/// The /readyz failure body must NOT leak the S3 endpoint URL or bucket name
+/// (Task 11 I3). Under a healthy test backend /readyz returns 200; assert the
+/// success shape and — as a guard against the old `e.to_string()` leak — that
+/// no URL scheme ever appears in the body regardless of status.
+#[tokio::test]
+async fn test_readyz_never_leaks_storage_detail() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base_url}/readyz"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let raw = resp.text().await.unwrap();
+    // Whether ready (200) or not_ready (503), the body must never carry an
+    // endpoint URL, bucket, or the raw object_store Display.
+    assert!(
+        !raw.contains("http://") && !raw.contains("https://") && !raw.contains("Generic"),
+        "/readyz body leaked storage detail (status {status}): {raw}"
+    );
+    let body: Value = serde_json::from_str(&raw).unwrap();
+    assert!(body["s3_connected"].is_boolean());
+
+    harness.cleanup().await;
+}
+
 /// I4: a body over the configured limit returns the canonical envelope (413)
 /// via the outer normalization layer, not the bare tower-http plain body.
 #[tokio::test]
@@ -134,13 +181,23 @@ async fn test_envelope_body_too_large() {
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
         .header("content-type", "application/json")
+        .header("x-request-id", "body-limit-req-99")
         .body(big)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 413);
+    // request_id must survive the normalize-layer rewrite of a middleware-
+    // produced error (echoed in both header and body).
+    assert_eq!(
+        resp.headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("body-limit-req-99")
+    );
     let body: Value = resp.json().await.unwrap();
     assert_envelope(&body, "PAYLOAD_TOO_LARGE", 413);
+    assert_eq!(body["request_id"], "body-limit-req-99");
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
