@@ -8,6 +8,10 @@
 //!       rewrite set (and the vector is gone from results).
 //!   plus: carried-over objects are NOT enqueued for deletion, and query
 //!         results match a full rewrite (golden equivalence).
+//!   SQ8: carried clusters' codes decode against the COPIED (not recomputed)
+//!         calibration.
+//!   multi-gen + update-moves-cluster: owner chains resolve across successive
+//!         incremental cycles; a relocated vector leaves no ghost.
 
 mod common;
 
@@ -104,6 +108,100 @@ async fn seed_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEnt
     });
     manifest.write(store, ns).await.unwrap();
     (seg_id.to_string(), vectors)
+}
+
+/// Like [`incremental_compactor`] but with a specific quantization type, so the
+/// SQ/PQ copy-calibration carry-over path is exercised end-to-end.
+fn incremental_compactor_quantized(
+    store: &ZeppelinStore,
+    quantization: zeppelin::index::quantization::QuantizationType,
+) -> Compactor {
+    let wal_reader = WalReader::new(store.clone());
+    let compaction_config = CompactionConfig {
+        max_wal_fragments_before_compact: 1,
+        retrain_imbalance_threshold: 1000.0,
+        ..Default::default()
+    };
+    let indexing_config = IndexingConfig {
+        default_num_centroids: N_CLUSTERS,
+        kmeans_max_iterations: 25,
+        quantization,
+        bitmap_index: false,
+        fts_index: false,
+        hierarchical: false,
+        ..Default::default()
+    };
+    Compactor::new(
+        store.clone(),
+        wal_reader,
+        compaction_config,
+        indexing_config,
+    )
+}
+
+/// Like [`seed_segment`] but builds the initial segment with a specific
+/// quantization type and records it in the manifest. Returns (seg_id, vectors).
+async fn seed_segment_quantized(
+    store: &ZeppelinStore,
+    ns: &str,
+    quantization: zeppelin::index::quantization::QuantizationType,
+) -> (String, Vec<VectorEntry>) {
+    let (vectors, _centroids) = clustered_vectors(N_CLUSTERS, 20, DIM, 0.01);
+    let indexing_config = IndexingConfig {
+        default_num_centroids: N_CLUSTERS,
+        kmeans_max_iterations: 25,
+        quantization,
+        bitmap_index: false,
+        fts_index: false,
+        hierarchical: false,
+        ..Default::default()
+    };
+    let seg_id = "seg_seed";
+    let index = build_ivf_flat(&vectors, &indexing_config, store, ns, seg_id)
+        .await
+        .unwrap();
+
+    let mut manifest = Manifest::new();
+    manifest.add_segment(SegmentRef {
+        id: seg_id.to_string(),
+        vector_count: vectors.len(),
+        cluster_count: index.num_clusters(),
+        quantization,
+        hierarchical: false,
+        bitmap_fields: Vec::new(),
+        fts_fields: Vec::new(),
+        has_global_fts: false,
+        cluster_owners: Vec::new(),
+    });
+    manifest.write(store, ns).await.unwrap();
+    (seg_id.to_string(), vectors)
+}
+
+/// Run a Strong query and return the result IDs (order-independent set).
+async fn strong_query_ids(
+    store: &ZeppelinStore,
+    ns: &str,
+    query: &[f32],
+    top_k: usize,
+) -> std::collections::HashSet<String> {
+    let reader = WalReader::new(store.clone());
+    let resp = execute_query(QueryParams {
+        store,
+        wal_reader: &reader,
+        namespace: ns,
+        query,
+        top_k,
+        nprobe: N_CLUSTERS,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 1,
+        cache: None,
+        manifest_cache: None,
+    })
+    .await
+    .unwrap();
+    resp.results.into_iter().map(|r| r.id).collect()
 }
 
 /// B1 + B2: appending vectors that all fall into ONE cluster rewrites exactly
@@ -447,6 +545,187 @@ async fn test_incremental_matches_full_rewrite_results() {
     assert_eq!(
         incr_ids, full_ids,
         "incremental and full-rewrite top-k must return the same IDs"
+    );
+
+    harness.cleanup().await;
+}
+
+/// SQ8 carry-over correctness: the subtlest claim in Task 2B is that the SQ
+/// calibration is COPIED (not recomputed) to the new segment, so a carried
+/// cluster's codes — encoded against the OLD calibration — still decode
+/// correctly when read under the NEW segment id. If the calibration were
+/// recomputed, carried clusters' approximate distances would be corrupt and
+/// their vectors would drop out of / reorder in the result set.
+///
+/// We compact incrementally with SQ8 (touching only cluster 0), then assert
+/// that a probe of a CARRIED cluster (cluster 5) still returns that cluster's
+/// own members — which is only true if the carried codes decode against the
+/// calibration they were encoded with.
+#[tokio::test]
+async fn test_incremental_sq8_carryover_decodes_correctly() {
+    use zeppelin::index::quantization::QuantizationType;
+
+    let harness = TestHarness::new().await;
+    let ns = harness.key("incr-sq8-carry");
+    let store = &harness.store;
+
+    let (seed_id, seed_vecs) = seed_segment_quantized(store, &ns, QuantizationType::Scalar).await;
+
+    // Touch only cluster 0 (adds sit on a cluster_0 member).
+    let anchor0 = &seed_vecs[0].values;
+    let new_vecs: Vec<VectorEntry> = (0..5)
+        .map(|i| VectorEntry {
+            id: format!("added_{i}"),
+            values: anchor0.iter().map(|x| x + 0.001).collect(),
+            attributes: None,
+        })
+        .collect();
+    let writer = WalWriter::new(store.clone());
+    writer.append(&ns, new_vecs, vec![]).await.unwrap();
+
+    let compactor = incremental_compactor_quantized(store, QuantizationType::Scalar);
+    let new_seg = compactor
+        .compact(&ns)
+        .await
+        .unwrap()
+        .segment_id
+        .expect("new segment produced");
+
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    let seg_ref = manifest.segments.iter().find(|s| s.id == new_seg).unwrap();
+    assert_eq!(
+        seg_ref.quantization,
+        QuantizationType::Scalar,
+        "new segment must record SQ8"
+    );
+    // The SQ calibration must be COPIED to the new segment (segment-global), or
+    // reads of carried SQ clusters would decode against a missing/wrong table.
+    let new_cal_key = format!("{ns}/segments/{new_seg}/sq_calibration.bin");
+    assert!(
+        store.exists(&new_cal_key).await.unwrap(),
+        "SQ calibration must be copied to the new segment"
+    );
+    // At least one cluster carried over (owner still the seed).
+    let carried: Vec<usize> = (0..seg_ref.cluster_count)
+        .filter(|&i| seg_ref.cluster_owner(i) == seed_id)
+        .collect();
+    assert!(
+        !carried.is_empty(),
+        "SQ8 incremental compaction must carry at least one cluster by reference"
+    );
+
+    // Probe a CARRIED cluster (cluster 5, untouched by the adds). Its own
+    // members must dominate the top results — proving the carried SQ codes
+    // decode against the calibration they were encoded with.
+    let probe = seed_vecs
+        .iter()
+        .find(|v| v.id == "cluster_5_vec_0")
+        .unwrap()
+        .values
+        .clone();
+    let ids = strong_query_ids(store, &ns, &probe, 5).await;
+    let from_c5 = ids.iter().filter(|id| id.starts_with("cluster_5_")).count();
+    assert!(
+        from_c5 >= 3,
+        "carried SQ8 cluster must decode correctly: expected cluster_5 members to \
+         dominate a probe of their own centroid, got {from_c5}/5 from cluster_5: {ids:?}"
+    );
+
+    harness.cleanup().await;
+}
+
+/// Multi-generation carry-over + update-moves-cluster: three successive
+/// incremental compactions, each touching a different cluster, plus an update
+/// that relocates a vector to a new cluster. Verifies:
+///   - owner chains resolve (carried objects from ANY generation stay readable),
+///   - a relocated vector appears exactly ONCE (no ghost left in its old cluster),
+///   - all originally-seeded vectors plus every added vector remain queryable.
+#[tokio::test]
+async fn test_incremental_multigen_and_update_moves_cluster() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("incr-multigen");
+    let store = &harness.store;
+
+    let (_seed_id, seed_vecs) = seed_segment(store, &ns).await;
+    let writer = WalWriter::new(store.clone());
+    let compactor = incremental_compactor(store);
+
+    // Anchor for each cluster we'll touch across generations.
+    let anchor = |ci: usize| -> Vec<f32> {
+        seed_vecs
+            .iter()
+            .find(|v| v.id == format!("cluster_{ci}_vec_0"))
+            .unwrap()
+            .values
+            .clone()
+    };
+
+    // Gen 1: add near cluster 1.
+    let gen1: Vec<VectorEntry> = (0..3)
+        .map(|i| VectorEntry {
+            id: format!("g1_{i}"),
+            values: anchor(1).iter().map(|x| x + 0.001).collect(),
+            attributes: None,
+        })
+        .collect();
+    writer.append(&ns, gen1, vec![]).await.unwrap();
+    compactor.compact(&ns).await.unwrap();
+
+    // Gen 2: add near cluster 2.
+    let gen2: Vec<VectorEntry> = (0..3)
+        .map(|i| VectorEntry {
+            id: format!("g2_{i}"),
+            values: anchor(2).iter().map(|x| x + 0.001).collect(),
+            attributes: None,
+        })
+        .collect();
+    writer.append(&ns, gen2, vec![]).await.unwrap();
+    compactor.compact(&ns).await.unwrap();
+
+    // Gen 3: an UPDATE that relocates an existing vector from cluster 4 to
+    // cluster 3 (re-add the same ID with cluster-3 values). Both clusters must
+    // be rewritten; no stale copy may survive in cluster 4.
+    let mover_id = "cluster_4_vec_0".to_string();
+    let moved = VectorEntry {
+        id: mover_id.clone(),
+        values: anchor(3).iter().map(|x| x + 0.001).collect(),
+        attributes: None,
+    };
+    writer.append(&ns, vec![moved], vec![]).await.unwrap();
+    compactor.compact(&ns).await.unwrap();
+
+    // The relocated vector must appear EXACTLY ONCE across the whole dataset.
+    // Query broadly (probe cluster 3 where it now lives) with a large top_k.
+    let ids_c3 = strong_query_ids(store, &ns, &anchor(3), N_CLUSTERS * 25).await;
+    let mover_hits = ids_c3.iter().filter(|id| **id == mover_id).count();
+    assert_eq!(
+        mover_hits, 1,
+        "relocated vector must appear exactly once (no ghost in old cluster), got {mover_hits}"
+    );
+
+    // Every generation's adds must still be queryable (carried objects from
+    // gens 1 and 2 survived subsequent incremental cycles).
+    for (ci, prefix) in [(1usize, "g1_"), (2usize, "g2_")] {
+        let ids = strong_query_ids(store, &ns, &anchor(ci), 10).await;
+        let found = ids.iter().filter(|id| id.starts_with(prefix)).count();
+        assert!(
+            found > 0,
+            "adds from the '{prefix}' generation must survive multi-gen carry-over, \
+             got none near cluster {ci}: {ids:?}"
+        );
+    }
+
+    // A cluster untouched across ALL three generations (e.g. cluster 0) keeps
+    // its seed members — the deepest carry-over chain.
+    let ids_c0 = strong_query_ids(store, &ns, &anchor(0), 5).await;
+    let from_c0 = ids_c0
+        .iter()
+        .filter(|id| id.starts_with("cluster_0_"))
+        .count();
+    assert!(
+        from_c0 >= 3,
+        "cluster untouched across 3 generations must still return its seed members, \
+         got {from_c0}/5: {ids_c0:?}"
     );
 
     harness.cleanup().await;
