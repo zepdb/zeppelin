@@ -310,17 +310,17 @@ async fn test_tla_namespace_delete_compaction_zombie() {
     );
 }
 
-/// # Test 2c: Namespace Delete + Batched Append Race — NoZombieNamespace
+/// # Test 2c: Namespace Delete + Group-Commit Append Race — NoZombieNamespace
 ///
-/// The BatchWalWriter's flush loop must also return `ManifestNotFound` for a
-/// deleted namespace instead of recreating the manifest from default.
+/// `WalWriter::append` (which now does group commit internally) must return
+/// `ManifestNotFound` for a deleted namespace instead of recreating the
+/// manifest from default — and must not leave an orphaned fragment behind.
 #[tokio::test]
-async fn test_tla_namespace_delete_batch_append_zombie() {
-    use zeppelin::wal::fragment::WalFragment;
-    use zeppelin::wal::BatchWalWriter;
+async fn test_tla_namespace_delete_group_append_zombie() {
+    use zeppelin::wal::WalWriter;
 
     let store = mem_store();
-    let ns = "tla-zombie-batch-ns";
+    let ns = "tla-zombie-group-ns";
 
     let manager = NamespaceManager::new(store.clone());
     manager
@@ -333,18 +333,22 @@ async fn test_tla_namespace_delete_batch_append_zombie() {
     store.delete(&manifest_key).await.unwrap();
     store.delete(&meta_key).await.unwrap();
 
-    // Batch writer flushes after 1 request or 10ms
-    let batch_writer = BatchWalWriter::new(store.clone(), 1, 10);
-    let fragment = WalFragment::new(random_vectors(3, 16), vec![]);
-    let result = batch_writer.append(&store, ns, fragment).await;
+    let writer = WalWriter::new(store.clone());
+    let result = writer.append(ns, random_vectors(3, 16), vec![]).await;
 
     assert!(
         matches!(result, Err(ZeppelinError::ManifestNotFound { .. })),
-        "batched append to a deleted namespace must fail with ManifestNotFound, got: {result:?}"
+        "append to a deleted namespace must fail with ManifestNotFound, got: {result:?}"
     );
     assert!(
         !store.exists(&manifest_key).await.unwrap(),
-        "batch writer must not resurrect manifest.json of a deleted namespace"
+        "writer must not resurrect manifest.json of a deleted namespace"
+    );
+    // I3: the fragment PUT before the failed CAS must not be left orphaned.
+    let wal_objects = store.list_prefix(&format!("{ns}/wal/")).await.unwrap();
+    assert!(
+        wal_objects.is_empty(),
+        "a failed append to a deleted namespace must leave no orphaned fragment, found: {wal_objects:?}"
     );
 }
 

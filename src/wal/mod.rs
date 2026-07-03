@@ -13,4 +13,4 @@ pub use fragment::WalFragment;
 pub use lease::{Lease, LeaseManager};
 pub use manifest::{Manifest, ManifestVersion};
 pub use reader::WalReader;
-pub use writer::{BatchWalWriter, WalWriter};
+pub use writer::WalWriter;

@@ -26,7 +26,6 @@ use crate::fts::wal_cache::WalFtsCache;
 use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL, REQUESTS_BY_IP_TOTAL};
 use crate::namespace::NamespaceManager;
 use crate::storage::ZeppelinStore;
-use crate::wal::BatchWalWriter;
 use crate::wal::{WalReader, WalWriter};
 
 use self::handlers::{namespace, query, vectors, ApiError};
@@ -52,8 +51,6 @@ pub struct AppState {
     pub fts_cache: Arc<WalFtsCache>,
     /// Semaphore that caps concurrent in-flight queries.
     pub query_semaphore: Arc<Semaphore>,
-    /// Optional batched WAL writer (enabled when batch_manifest_size > 1).
-    pub batch_wal_writer: Option<Arc<BatchWalWriter>>,
     /// Per-IP token bucket state for rate limiting.
     /// Maps IP → (available tokens, last refill time).
     pub rate_limiters: Arc<DashMap<IpAddr, (u64, Instant)>>,

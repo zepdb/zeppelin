@@ -57,7 +57,6 @@ pub async fn start_test_server_with_config(
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
-        batch_wal_writer: None,
         rate_limiters: Arc::new(DashMap::new()),
     };
 
@@ -121,7 +120,6 @@ pub async fn start_test_server_with_compactor(
         manifest_cache,
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
-        batch_wal_writer: None,
         rate_limiters: Arc::new(DashMap::new()),
     };
 
@@ -213,7 +211,6 @@ pub async fn start_test_server_with_compaction(
         manifest_cache,
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
-        batch_wal_writer: None,
         rate_limiters: Arc::new(DashMap::new()),
     };
 

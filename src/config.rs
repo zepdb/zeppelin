@@ -28,26 +28,15 @@ pub struct Config {
     pub wal: WalConfig,
 }
 
-/// WAL configuration for batched manifest updates.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WalConfig {
-    /// Number of fragment refs to batch before flushing manifest.
-    /// Set to 1 (default) to disable batching.
-    #[serde(default = "default_batch_manifest_size")]
-    pub batch_manifest_size: usize,
-    /// Maximum time (ms) to wait for a full batch before flushing.
-    #[serde(default = "default_batch_manifest_timeout_ms")]
-    pub batch_manifest_timeout_ms: u64,
-}
-
-impl Default for WalConfig {
-    fn default() -> Self {
-        Self {
-            batch_manifest_size: default_batch_manifest_size(),
-            batch_manifest_timeout_ms: default_batch_manifest_timeout_ms(),
-        }
-    }
-}
+/// WAL configuration.
+///
+/// Group commit (coalescing concurrent appends into a shared manifest CAS) is
+/// now unconditional in `WalWriter` — there is no batching knob to tune. The
+/// former `batch_manifest_size` / `batch_manifest_timeout_ms` fields are gone;
+/// old configs that still set them parse fine (unknown keys are ignored). The
+/// struct is retained as the home for future WAL settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WalConfig {}
 
 /// HTTP server configuration including bind address, timeouts, and request limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,12 +364,6 @@ fn default_max_old_segments() -> usize {
 }
 fn default_compaction_lease_secs() -> u64 {
     300
-}
-fn default_batch_manifest_size() -> usize {
-    1 // disabled by default
-}
-fn default_batch_manifest_timeout_ms() -> u64 {
-    100
 }
 fn default_log_level() -> String {
     "info".to_string()
