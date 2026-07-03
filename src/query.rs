@@ -87,10 +87,10 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         None => Manifest::read(store, namespace).await?.unwrap_or_default(),
     };
 
-    // WAL scan (always for Strong, never for Eventual) and segment search are
-    // independent — they share only the manifest snapshot — so run them
-    // concurrently. Using the same manifest for both preserves snapshot
-    // consistency: no re-read can observe fragments deleted by compaction.
+    // WAL work and segment search are independent — they share only the
+    // manifest snapshot — so run them concurrently. Strong scans and scores
+    // WAL vectors. Eventual skips WAL vector scoring but still reads
+    // tombstones, because deletes are correctness rather than freshness.
     let wal_future = async {
         // Short-circuit: skip WAL scan if no uncompacted fragments exist.
         let wal_start = std::time::Instant::now();
@@ -105,6 +105,19 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
                     distance_metric,
                 )
                 .await?
+            }
+            ConsistencyLevel::Eventual if !manifest.uncompacted_fragments().is_empty() => {
+                let deleted_ids = wal_reader
+                    .read_delete_ids_from_refs_unchecked(
+                        namespace,
+                        manifest.uncompacted_fragments(),
+                    )
+                    .await?;
+                WalScanResult {
+                    results: Vec::new(),
+                    fragment_count: 0,
+                    deleted_ids,
+                }
             }
             _ => WalScanResult {
                 results: Vec::new(),
@@ -396,9 +409,9 @@ pub async fn execute_bm25_query(
         cache.evict_compacted(&active_ids);
     }
 
-    // WAL BM25 scan (always for Strong, never for Eventual) and segment BM25
-    // search are independent — run them concurrently over the same manifest
-    // snapshot.
+    // WAL BM25 work and segment BM25 search are independent — run them
+    // concurrently over the same manifest snapshot. Strong scans and scores
+    // WAL docs; Eventual reads only WAL tombstones.
     let wal_future = async {
         // Short-circuit: skip WAL scan if no uncompacted fragments exist.
         let wal_start = std::time::Instant::now();
@@ -430,6 +443,15 @@ pub async fn execute_bm25_query(
                     });
                 }
                 results
+            }
+            ConsistencyLevel::Eventual if !manifest.uncompacted_fragments().is_empty() => {
+                wal_deleted_ids = wal_reader
+                    .read_delete_ids_from_refs_unchecked(
+                        namespace,
+                        manifest.uncompacted_fragments(),
+                    )
+                    .await?;
+                Vec::new()
             }
             _ => Vec::new(),
         };
@@ -908,7 +930,10 @@ fn merge_bm25_results(
             merged
         }
         ConsistencyLevel::Eventual => {
-            let mut results = segment_results;
+            let mut results: Vec<SearchResult> = segment_results
+                .into_iter()
+                .filter(|sr| !wal_deleted_ids.contains(&sr.id))
+                .collect();
             results.sort_by(|a, b| {
                 b.score
                     .partial_cmp(&a.score)
@@ -958,7 +983,10 @@ fn merge_results(
             merged
         }
         ConsistencyLevel::Eventual => {
-            let mut results = segment_results;
+            let mut results: Vec<SearchResult> = segment_results
+                .into_iter()
+                .filter(|sr| !wal_deleted_ids.contains(&sr.id))
+                .collect();
             results.truncate(top_k);
             results
         }
@@ -1018,10 +1046,10 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_eventual_ignores_tombstones() {
-        // Eventual reads segments only; tombstones are not applied (documented
-        // staleness until next compaction).
-        let segment_results = vec![make_result("a", 0.1)];
+    fn test_merge_eventual_applies_tombstones() {
+        // Eventual skips WAL vector scoring, but deletes are correctness:
+        // segment results with WAL tombstones must be excluded immediately.
+        let segment_results = vec![make_result("a", 0.1), make_result("b", 0.2)];
         let deleted: HashSet<String> = ["a".to_string()].into_iter().collect();
 
         let merged = merge_results(
@@ -1032,7 +1060,27 @@ mod tests {
             &deleted,
         );
 
-        assert_eq!(merged.len(), 1);
+        let ids: Vec<&str> = merged.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["b"]);
+    }
+
+    #[test]
+    fn test_merge_bm25_eventual_applies_tombstones() {
+        // Same invariant for BM25/rank_by: Eventual segment hits must not
+        // resurrect a document deleted in the WAL.
+        let segment_results = vec![make_result("a", 2.0), make_result("b", 1.0)];
+        let deleted: HashSet<String> = ["a".to_string()].into_iter().collect();
+
+        let merged = merge_bm25_results(
+            Vec::new(),
+            segment_results,
+            10,
+            ConsistencyLevel::Eventual,
+            &deleted,
+        );
+
+        let ids: Vec<&str> = merged.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["b"]);
     }
 
     fn make_segment_ref(cluster_count: usize, has_global_fts: bool) -> SegmentRef {

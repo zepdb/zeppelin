@@ -337,6 +337,11 @@ components:
 
     ConsistencyLevel:
       type: string
+      description: |
+        `strong` scans un-compacted WAL fragments and indexed segments.
+        `eventual` skips WAL vector/BM25 scoring for fresher upserts and updates,
+        but still applies WAL delete tombstones so deleted vectors do not appear
+        after a successful delete on the same node.
       enum: [strong, eventual]
       default: strong
 

@@ -180,9 +180,11 @@ Consistency is selected per-query via the `consistency` field:
   In other words: **same-node read-your-writes; cross-node bounded staleness
   (≤ 500 ms)**. Single-node deployments get true strong consistency. If you
   need cross-node read-your-writes, sticky-route each client to one node.
-- **`eventual`** reads indexed segments only. Writes and deletes become
-  visible after the next compaction cycle. Fastest option; use it when
-  freshness within one compaction interval doesn't matter.
+- **`eventual`** reads indexed segments and applies delete tombstones from
+  un-compacted WAL fragments, but skips WAL vector/BM25 scoring. Deletes are
+  hidden immediately on the same node after the delete returns. Recent upserts
+  and updates can still be stale until the next compaction cycle, so use it
+  when write freshness within one compaction interval does not matter.
 
 ### Multi-node coordination
 

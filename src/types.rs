@@ -166,7 +166,7 @@ pub enum ConsistencyLevel {
     /// Read from index + scan all uncompacted WAL fragments
     #[default]
     Strong,
-    /// Read from index only (faster, may miss recent writes)
+    /// Read from index plus WAL tombstones only (faster, may miss recent upserts/updates)
     Eventual,
 }
 

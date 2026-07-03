@@ -118,6 +118,56 @@ impl WalReader {
         Ok(fragments)
     }
 
+    /// Read only the effective delete tombstones from refs that advertise
+    /// `delete_count > 0`, preserving manifest order.
+    ///
+    /// Eventual queries use this to enforce delete correctness without fetching
+    /// delete-free WAL fragments or scoring WAL vectors. A vector upsert in a
+    /// fetched tombstone-bearing fragment cancels an older tombstone for the
+    /// same ID, matching the full WAL scan's ordering within the fetched set.
+    #[instrument(skip(self, refs), fields(namespace = namespace, ref_count = refs.len()))]
+    pub async fn read_delete_ids_from_refs_unchecked(
+        &self,
+        namespace: &str,
+        refs: &[FragmentRef],
+    ) -> Result<HashSet<String>> {
+        let delete_refs: Vec<FragmentRef> = refs
+            .iter()
+            .filter(|fref| fref.delete_count > 0)
+            .cloned()
+            .collect();
+
+        if delete_refs.is_empty() {
+            debug!(
+                tombstone_fragment_count = 0,
+                deleted_ids = 0,
+                "read WAL tombstones from refs"
+            );
+            return Ok(HashSet::new());
+        }
+
+        let fragments = self
+            .read_fragments_from_refs_unchecked(namespace, &delete_refs)
+            .await?;
+        let mut deleted_ids = HashSet::new();
+        for fragment in &fragments {
+            for del_id in &fragment.deletes {
+                deleted_ids.insert(del_id.clone());
+            }
+            for vec in &fragment.vectors {
+                deleted_ids.remove(&vec.id);
+            }
+        }
+
+        debug!(
+            tombstone_fragment_count = fragments.len(),
+            deleted_ids = deleted_ids.len(),
+            "read WAL tombstones from refs"
+        );
+
+        Ok(deleted_ids)
+    }
+
     async fn finish_fragment_results(
         &self,
         namespace: &str,
