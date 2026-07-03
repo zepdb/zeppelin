@@ -1,5 +1,7 @@
 use dashmap::DashMap;
+use rand::Rng;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, instrument, warn};
 
@@ -11,7 +13,21 @@ use super::fragment::WalFragment;
 use super::manifest::{FragmentRef, Manifest};
 
 /// Maximum CAS retry attempts for manifest updates.
-const MAX_CAS_RETRIES: u32 = 5;
+///
+/// The writer path previously used 5 attempts with ZERO backoff, so retries
+/// burned out in microseconds under contention and surfaced a 409 that a
+/// human-paced retry would have avoided. We now use more attempts spread over
+/// exponential backoff + jitter (see `cas_backoff`), matching the compactor.
+const MAX_CAS_RETRIES: u32 = 8;
+
+/// Backoff before CAS retry `attempt` (0-indexed): exponential base ~10ms,
+/// capped ~500ms, plus up to 10ms of jitter to de-synchronize contending
+/// writers. `10 * 2^attempt` → 10, 20, 40, 80, 160, 320, 500(cap)…
+fn cas_backoff(attempt: u32) -> Duration {
+    let base_ms = (10u64 << attempt.min(6)).min(500);
+    let jitter_ms = rand::thread_rng().gen_range(0..10);
+    Duration::from_millis(base_ms + jitter_ms)
+}
 
 /// WAL writer with per-namespace mutexes to ensure single-writer semantics.
 pub struct WalWriter {
@@ -106,21 +122,36 @@ impl WalWriter {
             "wrote WAL fragment"
         );
 
-        // CAS retry loop for manifest update
+        // CAS retry loop for manifest update.
+        //
+        // On a non-conflict error, or after exhausting retries, the fragment
+        // we PUT above is unreferenced by any manifest — an orphan. We
+        // best-effort delete it (I3) so a failed append leaves no dangling
+        // object; the manifest stays the source of truth for what exists.
+        // Deletion targets ONLY this fragment's exact WAL key — never a prefix
+        // and never a segment/cluster object (a carried cluster object is live
+        // under an older segment's key; see incremental compaction / Task 2B).
+        let mut last_err: Option<ZeppelinError> = None;
         for attempt in 0..MAX_CAS_RETRIES {
             let (mut manifest, version) =
-                match Manifest::read_versioned(&self.store, namespace).await? {
-                    Some(pair) => pair,
-                    None => {
+                match Manifest::read_versioned(&self.store, namespace).await {
+                    Ok(Some(pair)) => pair,
+                    Ok(None) => {
+                        self.cleanup_orphan_fragment(namespace, &key).await;
                         return Err(ZeppelinError::ManifestNotFound {
                             namespace: namespace.to_string(),
                         });
+                    }
+                    Err(e) => {
+                        self.cleanup_orphan_fragment(namespace, &key).await;
+                        return Err(e);
                     }
                 };
 
             // Layer 1: Fencing check — reject zombie writers.
             if let Some(token) = fencing_token {
                 if manifest.fencing_token > token {
+                    self.cleanup_orphan_fragment(namespace, &key).await;
                     return Err(ZeppelinError::FencingTokenStale {
                         namespace: namespace.to_string(),
                         our_token: token,
@@ -153,17 +184,47 @@ impl WalWriter {
                 Err(ZeppelinError::ManifestConflict { .. }) => {
                     warn!(
                         attempt,
-                        namespace, "manifest CAS conflict in writer, retrying"
+                        namespace, "manifest CAS conflict in writer, retrying with backoff"
                     );
+                    last_err = Some(ZeppelinError::ManifestConflict {
+                        namespace: namespace.to_string(),
+                    });
+                    tokio::time::sleep(cas_backoff(attempt)).await;
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.cleanup_orphan_fragment(namespace, &key).await;
+                    return Err(e);
+                }
             }
         }
 
-        Err(ZeppelinError::ManifestConflict {
+        // Retries exhausted under sustained contention: the fragment is an
+        // orphan. Clean it up so a client retry does not duplicate data.
+        self.cleanup_orphan_fragment(namespace, &key).await;
+        Err(last_err.unwrap_or(ZeppelinError::ManifestConflict {
             namespace: namespace.to_string(),
-        })
+        }))
+    }
+
+    /// Best-effort delete of a fragment object that failed to be referenced by
+    /// the manifest (I3). Never fatal — a delete failure just leaves an orphan
+    /// for the GC sweep (Task 19); the append error is what the caller sees.
+    /// Deletes exactly `key` (a `.../wal/<ulid>.wal` object), nothing else.
+    async fn cleanup_orphan_fragment(&self, namespace: &str, key: &str) {
+        match self.store.delete(key).await {
+            Ok(()) => {
+                debug!(namespace, key, "cleaned up orphaned fragment after failed append");
+            }
+            Err(e) => {
+                warn!(
+                    namespace,
+                    key,
+                    error = %e,
+                    "failed to clean up orphaned fragment (left for GC)"
+                );
+            }
+        }
     }
 }
 

@@ -17,10 +17,11 @@ use object_store::{
 };
 use zeppelin::storage::ZeppelinStore;
 
-/// Shared handle for inspecting GET counts recorded by a [`CountingStore`].
+/// Shared handle for inspecting GET/PUT counts recorded by a [`CountingStore`].
 #[derive(Clone, Debug, Default)]
 pub struct GetCounter {
     gets: Arc<DashMap<String, u64>>,
+    puts: Arc<DashMap<String, u64>>,
 }
 
 impl GetCounter {
@@ -33,9 +34,19 @@ impl GetCounter {
             .sum()
     }
 
+    /// Total number of PUTs whose key contains `substr`.
+    pub fn puts_matching(&self, substr: &str) -> u64 {
+        self.puts
+            .iter()
+            .filter(|r| r.key().contains(substr))
+            .map(|r| *r.value())
+            .sum()
+    }
+
     /// Reset all recorded counts.
     pub fn reset(&self) {
         self.gets.clear();
+        self.puts.clear();
     }
 }
 
@@ -81,6 +92,11 @@ impl ObjectStore for CountingStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> OsResult<PutResult> {
+        self.counter
+            .puts
+            .entry(location.to_string())
+            .and_modify(|v| *v += 1)
+            .or_insert(1);
         self.inner.put_opts(location, payload, opts).await
     }
 
