@@ -16,6 +16,7 @@ use crate::index::filter::{evaluate_filter, oversampled_k};
 use crate::index::ivf_flat::build::{
     attrs_key, cluster_key, deserialize_attrs, deserialize_cluster,
 };
+use crate::index::ivf_flat::search::coarse_row_passes;
 use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, DistanceMetric, Filter, SearchResult};
@@ -468,11 +469,18 @@ async fn scan_clusters_sq(
     let cal_data = fetch_with_cache(cache, store, &cal_key).await?;
     let calibration = SqCalibration::from_bytes(&cal_data)?;
 
-    // Phase 1: coarse ranking — parallel prefetch.
+    // Phase 1: coarse ranking — parallel prefetch. A non-bitmap attribute
+    // filter must be applied DURING this scan, before truncating to
+    // `rerank_count` — otherwise a selective filter's matches get truncated
+    // away by approximate-distance ranking and the query silently under-fills
+    // top_k (Task 6). Fetch attrs alongside the SQ codes whenever a filter is
+    // active; bitmap-resolved clusters keep their fast path and ignore attrs.
+    let want_attr_filter = filter.is_some();
+
     let coarse_prefetched = futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| {
         let sq_key = sq_cluster_key(namespace, segment_id, cluster_idx);
         async move {
-            let (prefilter, sq_res) = tokio::join!(
+            let (prefilter, sq_res, attrs) = tokio::join!(
                 try_bitmap_prefilter(
                     namespace,
                     segment_id,
@@ -483,22 +491,27 @@ async fn scan_clusters_sq(
                     cache,
                 ),
                 fetch_with_cache(cache, store, &sq_key),
+                async {
+                    if want_attr_filter {
+                        load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
+                    } else {
+                        None
+                    }
+                },
             );
-            (cluster_idx, prefilter, sq_res)
+            (cluster_idx, prefilter, sq_res, attrs)
         }
     }))
     .await;
 
     let mut coarse: Vec<(String, f32, usize)> = Vec::new();
-    for (cluster_idx, prefilter, sq_res) in coarse_prefetched {
+    for (cluster_idx, prefilter, sq_res, attrs) in coarse_prefetched {
         match sq_res {
             Ok(sq_data) => {
                 let sq_cluster = deserialize_sq_cluster(&sq_data)?;
                 for (j, codes) in sq_cluster.codes.iter().enumerate() {
-                    if let Some(ref bm) = prefilter {
-                        if !bm.contains(j as u32) {
-                            continue;
-                        }
+                    if !coarse_row_passes(filter, &prefilter, &attrs, j) {
+                        continue;
                     }
                     let approx = calibration.asymmetric_distance(query, codes, distance_metric);
                     coarse.push((sq_cluster.ids[j].clone(), approx, cluster_idx));
@@ -510,10 +523,8 @@ async fn scan_clusters_sq(
                 if let Ok(data) = fetch_with_cache(cache, store, &cvec_key).await {
                     let cluster = deserialize_cluster(&data)?;
                     for (j, vec) in cluster.vectors.iter().enumerate() {
-                        if let Some(ref bm) = prefilter {
-                            if !bm.contains(j as u32) {
-                                continue;
-                            }
+                        if !coarse_row_passes(filter, &prefilter, &attrs, j) {
+                            continue;
                         }
                         let score = compute_distance(query, vec, distance_metric);
                         coarse.push((cluster.ids[j].clone(), score, cluster_idx));
@@ -601,11 +612,16 @@ async fn scan_clusters_pq(
     let codebook = PqCodebook::from_bytes(&cb_data)?;
     let adc_table = codebook.build_adc_table(query, distance_metric);
 
-    // Phase 1: coarse ranking — parallel prefetch.
+    // Phase 1: coarse ranking — parallel prefetch. Apply a non-bitmap
+    // attribute filter DURING the coarse scan so a selective filter's matches
+    // survive truncation (Task 6). Fetch attrs alongside the PQ codes whenever
+    // a filter is active.
+    let want_attr_filter = filter.is_some();
+
     let coarse_prefetched = futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| {
         let pq_key = pq_cluster_key(namespace, segment_id, cluster_idx);
         async move {
-            let (prefilter, pq_res) = tokio::join!(
+            let (prefilter, pq_res, attrs) = tokio::join!(
                 try_bitmap_prefilter(
                     namespace,
                     segment_id,
@@ -616,22 +632,27 @@ async fn scan_clusters_pq(
                     cache,
                 ),
                 fetch_with_cache(cache, store, &pq_key),
+                async {
+                    if want_attr_filter {
+                        load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
+                    } else {
+                        None
+                    }
+                },
             );
-            (cluster_idx, prefilter, pq_res)
+            (cluster_idx, prefilter, pq_res, attrs)
         }
     }))
     .await;
 
     let mut coarse: Vec<(String, f32, usize)> = Vec::new();
-    for (cluster_idx, prefilter, pq_res) in coarse_prefetched {
+    for (cluster_idx, prefilter, pq_res, attrs) in coarse_prefetched {
         match pq_res {
             Ok(pq_data) => {
                 let pq_cluster = deserialize_pq_cluster(&pq_data)?;
                 for (j, codes) in pq_cluster.codes.iter().enumerate() {
-                    if let Some(ref bm) = prefilter {
-                        if !bm.contains(j as u32) {
-                            continue;
-                        }
+                    if !coarse_row_passes(filter, &prefilter, &attrs, j) {
+                        continue;
                     }
                     let approx = codebook.adc_distance(&adc_table, codes);
                     coarse.push((pq_cluster.ids[j].clone(), approx, cluster_idx));

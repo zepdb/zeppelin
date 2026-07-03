@@ -318,11 +318,20 @@ async fn scan_clusters_sq(
     // Phase 1: Coarse ranking with quantized distances — parallel prefetch.
     let has_bitmaps = !index.bitmap_fields.is_empty();
 
+    // When a filter is present but NOT resolved by a bitmap index, we must
+    // apply it DURING the coarse scan — before truncating to `rerank_count`.
+    // Otherwise a selective filter's matches get truncated away by
+    // approximate-distance ranking and the query silently under-fills top_k
+    // (Task 6). That needs the per-cluster attrs in the coarse phase, so fetch
+    // them alongside the SQ codes whenever a filter is active. Bitmap-resolved
+    // clusters (prefilter Some) keep their fast path and ignore attrs.
+    let want_attr_filter = filter.is_some();
+
     let coarse_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let owner = index.cluster_owner(cluster_idx);
         let sq_key = sq_cluster_key(&index.namespace, owner, cluster_idx);
         async move {
-            let (prefilter, sq_res) = tokio::join!(
+            let (prefilter, sq_res, attrs) = tokio::join!(
                 try_bitmap_prefilter(
                     &index.namespace,
                     owner,
@@ -333,14 +342,21 @@ async fn scan_clusters_sq(
                     cache,
                 ),
                 fetch_with_cache(cache, store, &sq_key),
+                async {
+                    if want_attr_filter {
+                        load_attrs(index, cluster_idx, filter, store, cache).await
+                    } else {
+                        None
+                    }
+                },
             );
-            (cluster_idx, prefilter, sq_res)
+            (cluster_idx, prefilter, sq_res, attrs)
         }
     }))
     .await;
 
     let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
-    for (cluster_idx, prefilter, sq_res) in coarse_prefetched {
+    for (cluster_idx, prefilter, sq_res, attrs) in coarse_prefetched {
         let sq_data = match sq_res {
             Ok(data) => data,
             Err(e) => {
@@ -353,10 +369,8 @@ async fn scan_clusters_sq(
                 if let Ok(data) = fetch_with_cache(cache, store, &cvec_key).await {
                     let cluster = deserialize_cluster(&data)?;
                     for (j, vec) in cluster.vectors.iter().enumerate() {
-                        if let Some(ref bm) = prefilter {
-                            if !bm.contains(j as u32) {
-                                continue;
-                            }
+                        if !coarse_row_passes(filter, &prefilter, &attrs, j) {
+                            continue;
                         }
                         let score = compute_distance(query, vec, distance_metric);
                         coarse_candidates.push((cluster.ids[j].clone(), score, cluster_idx));
@@ -368,10 +382,8 @@ async fn scan_clusters_sq(
         let sq_cluster = deserialize_sq_cluster(&sq_data)?;
 
         for (j, codes) in sq_cluster.codes.iter().enumerate() {
-            if let Some(ref bm) = prefilter {
-                if !bm.contains(j as u32) {
-                    continue;
-                }
+            if !coarse_row_passes(filter, &prefilter, &attrs, j) {
+                continue;
             }
             let approx_score = calibration.asymmetric_distance(query, codes, distance_metric);
             coarse_candidates.push((sq_cluster.ids[j].clone(), approx_score, cluster_idx));
@@ -381,8 +393,10 @@ async fn scan_clusters_sq(
     // Sort by approximate distance and take top candidates for reranking.
     coarse_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Rerank factor: take more candidates than needed for full-precision reranking.
-    let rerank_count = fetch_k * 4; // 4x reranking factor
+    // Rerank factor: take more candidates than needed for full-precision
+    // reranking. Truncation now happens AFTER filtering, so the survivors are
+    // real matches, not filtered-away noise (Task 6).
+    let rerank_count = fetch_k * 4;
     coarse_candidates.truncate(rerank_count);
 
     debug!(
@@ -473,11 +487,16 @@ async fn scan_clusters_pq(
     // Phase 1: Coarse ranking with PQ distances — parallel prefetch.
     let has_bitmaps = !index.bitmap_fields.is_empty();
 
+    // Apply a non-bitmap attribute filter DURING the coarse scan so a selective
+    // filter's matches survive truncation (Task 6). Fetch attrs alongside the
+    // PQ codes whenever a filter is active.
+    let want_attr_filter = filter.is_some();
+
     let coarse_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let owner = index.cluster_owner(cluster_idx);
         let pq_key = pq_cluster_key(&index.namespace, owner, cluster_idx);
         async move {
-            let (prefilter, pq_res) = tokio::join!(
+            let (prefilter, pq_res, attrs) = tokio::join!(
                 try_bitmap_prefilter(
                     &index.namespace,
                     owner,
@@ -488,14 +507,21 @@ async fn scan_clusters_pq(
                     cache,
                 ),
                 fetch_with_cache(cache, store, &pq_key),
+                async {
+                    if want_attr_filter {
+                        load_attrs(index, cluster_idx, filter, store, cache).await
+                    } else {
+                        None
+                    }
+                },
             );
-            (cluster_idx, prefilter, pq_res)
+            (cluster_idx, prefilter, pq_res, attrs)
         }
     }))
     .await;
 
     let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
-    for (cluster_idx, prefilter, pq_res) in coarse_prefetched {
+    for (cluster_idx, prefilter, pq_res, attrs) in coarse_prefetched {
         let pq_data = match pq_res {
             Ok(data) => data,
             Err(e) => {
@@ -506,10 +532,8 @@ async fn scan_clusters_pq(
         let pq_cluster = deserialize_pq_cluster(&pq_data)?;
 
         for (j, codes) in pq_cluster.codes.iter().enumerate() {
-            if let Some(ref bm) = prefilter {
-                if !bm.contains(j as u32) {
-                    continue;
-                }
+            if !coarse_row_passes(filter, &prefilter, &attrs, j) {
+                continue;
             }
             let approx_score = codebook.adc_distance(&adc_table, codes);
             coarse_candidates.push((pq_cluster.ids[j].clone(), approx_score, cluster_idx));
@@ -612,6 +636,38 @@ async fn try_bitmap_prefilter(
     };
 
     evaluate_filter_bitmap(filter, &bitmap_index)
+}
+
+/// Whether row `j` of a cluster survives filtering during the COARSE quantized
+/// scan (Task 6: filter before truncation, not after).
+///
+/// - A bitmap prefilter, when present, is authoritative (fast path, I2).
+/// - Otherwise a non-bitmap filter is evaluated against the row's attributes;
+///   a filtered row with no attributes cannot match.
+/// - No filter ⇒ always passes (unfiltered queries keep the old behavior, I3).
+///
+/// Shared with the hierarchical leaf scan, which has the same two-phase
+/// quantized structure and the same truncation hazard.
+pub(crate) fn coarse_row_passes(
+    filter: Option<&Filter>,
+    prefilter: &Option<roaring::RoaringBitmap>,
+    attrs: &Option<Vec<Option<HashMap<String, AttributeValue>>>>,
+    j: usize,
+) -> bool {
+    if let Some(bm) = prefilter {
+        return bm.contains(j as u32);
+    }
+    match filter {
+        None => true,
+        Some(f) => match attrs
+            .as_ref()
+            .and_then(|a| a.get(j))
+            .and_then(|a| a.as_ref())
+        {
+            Some(a) => evaluate_filter(f, a),
+            None => false,
+        },
+    }
 }
 
 /// Load attribute data for a cluster. Shared helper for all scan methods.
