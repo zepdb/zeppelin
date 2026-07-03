@@ -36,12 +36,34 @@ pub struct IvfFlatIndex {
     pub(crate) quantization: crate::index::quantization::QuantizationType,
     /// Fields that have bitmap indexes.
     pub(crate) bitmap_fields: Vec<String>,
+    /// Per-cluster owning segment IDs (incremental compaction carry-over).
+    ///
+    /// Mirrors `SegmentRef.cluster_owners`: `cluster_owners[i]` is the segment
+    /// ID under which cluster `i`'s per-cluster S3 objects live. EMPTY means
+    /// every cluster is owned by `segment_id` (legacy / full-rebuild layout).
+    /// Segment-global artifacts (centroids, SQ calibration, PQ codebook)
+    /// always live under `segment_id` and never consult this map.
+    pub(crate) cluster_owners: Vec<String>,
 }
 
 impl IvfFlatIndex {
     /// Number of clusters (centroids) in this index.
     pub fn num_clusters(&self) -> usize {
         self.centroids.len()
+    }
+
+    /// Segment ID that owns cluster `cluster_idx`'s per-cluster S3 objects.
+    ///
+    /// Resolves through `cluster_owners` (carried-over clusters keep an older
+    /// segment's keys); falls back to `segment_id` when the map is empty or
+    /// the index is out of range. Every per-cluster key builder in the search
+    /// path MUST route through this — a carried-over cluster's data lives
+    /// under a different segment ID than `self.segment_id`.
+    pub(crate) fn cluster_owner(&self, cluster_idx: usize) -> &str {
+        self.cluster_owners
+            .get(cluster_idx)
+            .map(String::as_str)
+            .unwrap_or(&self.segment_id)
     }
 
     /// The namespace this index is associated with.
@@ -65,12 +87,14 @@ impl IvfFlatIndex {
     /// detection, saving ~18 S3 GETs per query. When `cache` is provided,
     /// the centroids are served through the tiered cache and pinned for the
     /// namespace's active segment.
+    #[allow(clippy::too_many_arguments)]
     pub async fn load_from_manifest(
         store: &ZeppelinStore,
         namespace: &str,
         segment_id: &str,
         num_vectors: usize,
         quantization: crate::index::quantization::QuantizationType,
+        cluster_owners: Vec<String>,
         cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
     ) -> Result<Self> {
         build::load_ivf_flat_from_manifest(
@@ -79,6 +103,7 @@ impl IvfFlatIndex {
             segment_id,
             num_vectors,
             quantization,
+            cluster_owners,
             cache,
         )
         .await

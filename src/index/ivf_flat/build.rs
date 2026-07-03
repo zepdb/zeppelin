@@ -456,6 +456,8 @@ pub async fn build_ivf_flat(
         segment_id: segment_id.to_string(),
         quantization,
         bitmap_fields,
+        // Freshly built segment: every cluster owned by this segment.
+        cluster_owners: Vec::new(),
     })
 }
 
@@ -470,12 +472,14 @@ pub async fn build_ivf_flat(
 /// active segment: `pin_scoped` keeps it safe from LRU eviction and
 /// automatically unpins the previous segment's centroids on rotation.
 /// Cache errors are NOT swallowed — a failed fetch fails the load.
+#[allow(clippy::too_many_arguments)]
 pub async fn load_ivf_flat_from_manifest(
     store: &ZeppelinStore,
     namespace: &str,
     segment_id: &str,
     num_vectors: usize,
     quantization: QuantizationType,
+    cluster_owners: Vec<String>,
     cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
 ) -> Result<IvfFlatIndex> {
     let ckey = centroids_key(namespace, segment_id);
@@ -509,6 +513,7 @@ pub async fn load_ivf_flat_from_manifest(
         segment_id: segment_id.to_string(),
         quantization,
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
+        cluster_owners,
     })
 }
 
@@ -578,6 +583,9 @@ pub async fn load_ivf_flat(
         segment_id: segment_id.to_string(),
         quantization,
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
+        // Probing loader is used by compaction to read a segment it will fully
+        // rewrite, and by tests — legacy single-segment layout.
+        cluster_owners: Vec::new(),
     })
 }
 

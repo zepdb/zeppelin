@@ -111,7 +111,8 @@ pub async fn search_ivf_flat(
     if effective_nprobe < num_clusters {
         if let Some(&(next_cluster_idx, _)) = centroid_dists.get(effective_nprobe) {
             if let Some(c) = cache {
-                let cvec_key = cluster_key(&index.namespace, &index.segment_id, next_cluster_idx);
+                let cvec_key =
+                    cluster_key(&index.namespace, index.cluster_owner(next_cluster_idx), next_cluster_idx);
                 let cache_clone = c.clone();
                 let store_clone = store.clone();
                 tokio::spawn(async move {
@@ -235,13 +236,14 @@ async fn scan_clusters_flat(
 
     // Phase 1: Parallel prefetch — all S3 I/O fires concurrently.
     let prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
-        let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+        let owner = index.cluster_owner(cluster_idx);
+        let cvec_key = cluster_key(&index.namespace, owner, cluster_idx);
         async move {
             let (cluster_res, prefilter, attrs) = tokio::join!(
                 fetch_with_cache(cache, store, &cvec_key),
                 try_bitmap_prefilter(
                     &index.namespace,
-                    &index.segment_id,
+                    owner,
                     cluster_idx,
                     filter,
                     has_bitmaps,
@@ -314,12 +316,13 @@ async fn scan_clusters_sq(
     let has_bitmaps = !index.bitmap_fields.is_empty();
 
     let coarse_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
-        let sq_key = sq_cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+        let owner = index.cluster_owner(cluster_idx);
+        let sq_key = sq_cluster_key(&index.namespace, owner, cluster_idx);
         async move {
             let (prefilter, sq_res) = tokio::join!(
                 try_bitmap_prefilter(
                     &index.namespace,
-                    &index.segment_id,
+                    owner,
                     cluster_idx,
                     filter,
                     has_bitmaps,
@@ -339,7 +342,8 @@ async fn scan_clusters_sq(
             Ok(data) => data,
             Err(e) => {
                 warn!(cluster = cluster_idx, error = %e, "failed to read SQ cluster, falling back to flat");
-                let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+                let cvec_key =
+                    cluster_key(&index.namespace, index.cluster_owner(cluster_idx), cluster_idx);
                 if let Ok(data) = fetch_with_cache(cache, store, &cvec_key).await {
                     let cluster = deserialize_cluster(&data)?;
                     for (j, vec) in cluster.vectors.iter().enumerate() {
@@ -392,7 +396,8 @@ async fn scan_clusters_sq(
 
     let rerank_prefetched =
         futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
-            let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+            let cvec_key =
+                cluster_key(&index.namespace, index.cluster_owner(cluster_idx), cluster_idx);
             let needed_ids = needed_ids.clone();
             async move {
                 let (cluster_res, attrs) = tokio::join!(
@@ -460,12 +465,13 @@ async fn scan_clusters_pq(
     let has_bitmaps = !index.bitmap_fields.is_empty();
 
     let coarse_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
-        let pq_key = pq_cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+        let owner = index.cluster_owner(cluster_idx);
+        let pq_key = pq_cluster_key(&index.namespace, owner, cluster_idx);
         async move {
             let (prefilter, pq_res) = tokio::join!(
                 try_bitmap_prefilter(
                     &index.namespace,
-                    &index.segment_id,
+                    owner,
                     cluster_idx,
                     filter,
                     has_bitmaps,
@@ -523,7 +529,8 @@ async fn scan_clusters_pq(
 
     let rerank_prefetched =
         futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
-            let cvec_key = cluster_key(&index.namespace, &index.segment_id, cluster_idx);
+            let cvec_key =
+                cluster_key(&index.namespace, index.cluster_owner(cluster_idx), cluster_idx);
             let needed_ids = needed_ids.clone();
             async move {
                 let (cluster_res, attrs) = tokio::join!(
@@ -603,7 +610,7 @@ async fn load_attrs(
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
 ) -> Option<Vec<Option<HashMap<String, AttributeValue>>>> {
-    let akey = attrs_key(&index.namespace, &index.segment_id, cluster_idx);
+    let akey = attrs_key(&index.namespace, index.cluster_owner(cluster_idx), cluster_idx);
     if filter.is_some() {
         match fetch_with_cache(cache, store, &akey).await {
             Ok(data) => match deserialize_attrs(&data) {
@@ -641,6 +648,7 @@ mod tests {
             segment_id: "seg_001".to_string(),
             quantization: QuantizationType::None,
             bitmap_fields: Vec::new(),
+            cluster_owners: Vec::new(),
         }
     }
 

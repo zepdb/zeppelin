@@ -304,6 +304,14 @@ impl Compactor {
 
         // 5. If existing active_segment: load vectors from it, merge
         let old_segment_id = manifest.active_segment.clone();
+        // The old segment's per-cluster owner map: carried-over clusters live
+        // under an even-older segment's keys. `load_segment_vectors` must
+        // resolve through it (empty ⇒ legacy single-segment layout).
+        let old_cluster_owners: Vec<String> = old_segment_id
+            .as_ref()
+            .and_then(|seg_id| manifest.segments.iter().find(|s| s.id == *seg_id))
+            .map(|s| s.cluster_owners.clone())
+            .unwrap_or_default();
         if let Some(ref seg_id) = old_segment_id {
             let is_hierarchical = manifest
                 .segments
@@ -311,8 +319,14 @@ impl Compactor {
                 .find(|s| s.id == *seg_id)
                 .map(|s| s.hierarchical)
                 .unwrap_or(false);
-            let existing_vecs =
-                load_segment_vectors(&self.store, namespace, seg_id, is_hierarchical).await?;
+            let existing_vecs = load_segment_vectors(
+                &self.store,
+                namespace,
+                seg_id,
+                is_hierarchical,
+                &old_cluster_owners,
+            )
+            .await?;
             for vec in existing_vecs {
                 // WAL overrides: only insert if not already in latest_vectors and not deleted
                 if !latest_vectors.contains_key(&vec.id) && !deleted_ids.contains(&vec.id) {
@@ -989,23 +1003,39 @@ async fn load_segment_vectors(
     namespace: &str,
     segment_id: &str,
     is_hierarchical: bool,
+    cluster_owners: &[String],
 ) -> Result<Vec<VectorEntry>> {
+    // Resolve cluster `i`'s owning segment ID (carried-over clusters live
+    // under an older segment's keys; empty map ⇒ this segment owns all).
+    let owner = |i: usize| -> &str {
+        cluster_owners
+            .get(i)
+            .map(String::as_str)
+            .unwrap_or(segment_id)
+    };
     // Determine cluster count: hierarchical segments store it in tree_meta.json,
     // IVF-Flat segments store it in centroids.bin.
+    //
+    // For IVF-Flat we read the centroids blob DIRECTLY rather than via
+    // `IvfFlatIndex::load` — the probing loader issues a per-cluster GET under
+    // `segment_id` to sum vector counts, which would 404 on a segment whose
+    // clusters were carried over to other keys. Centroids are segment-global
+    // and always live under `segment_id`.
     let num_clusters = if is_hierarchical {
         // Compaction reads the segment once; no query cache involved here.
         let h_index = load_hierarchical(store, namespace, segment_id, None).await?;
         h_index.num_leaf_clusters()
     } else {
-        use crate::index::IvfFlatIndex;
-        let index = IvfFlatIndex::load(store, namespace, segment_id).await?;
-        index.num_clusters()
+        use crate::index::ivf_flat::build::{centroids_key, deserialize_centroids};
+        let centroids_data = store.get(&centroids_key(namespace, segment_id)).await?;
+        let (centroids, _dim) = deserialize_centroids(&centroids_data)?;
+        centroids.len()
     };
 
     // Parallel fetch: 2 GETs per cluster via tokio::join!
     let cluster_results = futures::future::join_all((0..num_clusters).map(|i| {
-        let cvec_key = cluster_key(namespace, segment_id, i);
-        let cattr_key = attrs_key(namespace, segment_id, i);
+        let cvec_key = cluster_key(namespace, owner(i), i);
+        let cattr_key = attrs_key(namespace, owner(i), i);
         async move {
             let (cluster_res, attrs_res) =
                 tokio::join!(store.get(&cvec_key), store.get(&cattr_key),);

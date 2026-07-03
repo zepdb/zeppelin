@@ -340,6 +340,7 @@ async fn segment_search(
         segment_id,
         segment_ref.vector_count,
         segment_ref.quantization,
+        segment_ref.cluster_owners.clone(),
         cache,
     )
     .await?;
@@ -615,11 +616,14 @@ async fn segment_bm25_search_global(
     // Identify which clusters we need to fetch attrs from
     let needed_clusters: HashSet<u16> = position_field_scores.keys().map(|(c, _)| *c).collect();
 
-    // Parallel fetch attrs only for matching clusters
+    // Parallel fetch attrs only for matching clusters. Per-cluster keys route
+    // through cluster_owner(): a carried-over cluster's objects live under an
+    // older segment's ID (incremental compaction).
     let cluster_attrs_results =
         futures::future::join_all(needed_clusters.iter().map(|&cluster_idx| {
-            let akey = attrs_key(namespace, segment_id, cluster_idx as usize);
-            let ckey = cluster_key(namespace, segment_id, cluster_idx as usize);
+            let owner = segment_ref.cluster_owner(cluster_idx as usize);
+            let akey = attrs_key(namespace, owner, cluster_idx as usize);
+            let ckey = cluster_key(namespace, owner, cluster_idx as usize);
             async move {
                 let (attrs_res, cluster_res) = tokio::join!(store.get(&akey), store.get(&ckey));
                 (cluster_idx, attrs_res, cluster_res)
@@ -737,6 +741,7 @@ async fn segment_bm25_search_full_scan(
         segment_id,
         segment_ref.vector_count,
         segment_ref.quantization,
+        segment_ref.cluster_owners.clone(),
         None,
     )
     .await?;
@@ -750,9 +755,12 @@ async fn segment_bm25_search_full_scan(
 
     // Parallel prefetch all cluster data (fts index, attrs, cluster vectors).
     let prefetched = futures::future::join_all((0..num_clusters).map(|cluster_idx| {
-        let fts_key = fts_index_key(namespace, segment_id, cluster_idx);
-        let akey = attrs_key(namespace, segment_id, cluster_idx);
-        let ckey = crate::index::ivf_flat::build::cluster_key(namespace, segment_id, cluster_idx);
+        // Per-cluster keys route through cluster_owner(): a carried-over
+        // cluster's objects live under an older segment's ID.
+        let owner = segment_ref.cluster_owner(cluster_idx);
+        let fts_key = fts_index_key(namespace, owner, cluster_idx);
+        let akey = attrs_key(namespace, owner, cluster_idx);
+        let ckey = crate::index::ivf_flat::build::cluster_key(namespace, owner, cluster_idx);
         async move {
             let (fts_res, attrs_res, cluster_res) =
                 tokio::join!(store.get(&fts_key), store.get(&akey), store.get(&ckey),);
