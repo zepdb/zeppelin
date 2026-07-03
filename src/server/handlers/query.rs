@@ -51,20 +51,15 @@ pub async fn query_namespace(
             "invalid request body: {e}"
         )))
     })?;
-    let start = std::time::Instant::now();
-    let ns_for_metrics = ns.clone();
-    let _duration_guard = DurationGuard {
-        start,
-        namespace: ns_for_metrics,
-    };
-    let top_k = req.top_k.unwrap_or(state.config.server.default_top_k);
-    crate::metrics::ACTIVE_QUERIES.inc();
-    let _guard = crate::metrics::GaugeGuard(&crate::metrics::ACTIVE_QUERIES);
-    crate::metrics::QUERIES_TOTAL
-        .with_label_values(&[&ns])
-        .inc();
 
-    // Exactly one of vector or rank_by must be provided
+    // ---- Phase 1: request-shape validation (NO I/O, needs no metadata) ----
+    // Runs BEFORE namespace resolution so a malformed request to a missing
+    // namespace is a 400 (bad request), not a 404 (Task 14 I2). Also runs
+    // BEFORE the query metrics increment so rejected requests aren't counted
+    // as queries (I3).
+    let top_k = req.top_k.unwrap_or(state.config.server.default_top_k);
+
+    // Exactly one of vector or rank_by must be provided.
     if req.vector.is_none() && req.rank_by.is_none() {
         return Err(ApiError(ZeppelinError::Validation(
             "exactly one of 'vector' or 'rank_by' must be provided".into(),
@@ -76,15 +71,10 @@ pub async fn query_namespace(
         )));
     }
 
-    let meta = state
-        .namespace_manager
-        .get(&ns)
-        .await
-        .map_err(ApiError::from)?;
-
+    // top_k bounds (api yaml: minimum 1, maximum max_top_k).
     if top_k == 0 {
         return Err(ApiError(ZeppelinError::Validation(
-            "top_k must be > 0".into(),
+            "top_k must be >= 1".into(),
         )));
     }
     if top_k > state.config.server.max_top_k {
@@ -93,6 +83,45 @@ pub async fn query_namespace(
             top_k, state.config.server.max_top_k
         ))));
     }
+
+    // nprobe bounds (api yaml: minimum 1, maximum max_nprobe). Vector-search
+    // only, but the bound is a request-shape property so it's validated here
+    // regardless of path: nprobe:0 previously slipped through and probed zero
+    // clusters, returning an empty 200 (Task 14 I1).
+    let nprobe = req.nprobe.unwrap_or(state.config.indexing.default_nprobe);
+    if let Some(requested) = req.nprobe {
+        if requested == 0 {
+            return Err(ApiError(ZeppelinError::Validation(
+                "nprobe must be >= 1".into(),
+            )));
+        }
+    }
+    if nprobe > state.config.indexing.max_nprobe {
+        return Err(ApiError(ZeppelinError::Validation(format!(
+            "nprobe {} exceeds maximum of {}",
+            nprobe, state.config.indexing.max_nprobe
+        ))));
+    }
+
+    // ---- Phase 2: metrics (only requests that passed shape validation) ----
+    let start = std::time::Instant::now();
+    let ns_for_metrics = ns.clone();
+    let _duration_guard = DurationGuard {
+        start,
+        namespace: ns_for_metrics,
+    };
+    crate::metrics::ACTIVE_QUERIES.inc();
+    let _guard = crate::metrics::GaugeGuard(&crate::metrics::ACTIVE_QUERIES);
+    crate::metrics::QUERIES_TOTAL
+        .with_label_values(&[&ns])
+        .inc();
+
+    // ---- Phase 3: namespace resolution, then metadata-dependent checks ----
+    let meta = state
+        .namespace_manager
+        .get(&ns)
+        .await
+        .map_err(ApiError::from)?;
 
     let result = if let Some(ref rank_by) = req.rank_by {
         // BM25 query path
@@ -149,14 +178,7 @@ pub async fn query_namespace(
             ))));
         }
 
-        let nprobe = req.nprobe.unwrap_or(state.config.indexing.default_nprobe);
-        if nprobe > state.config.indexing.max_nprobe {
-            return Err(ApiError(ZeppelinError::Validation(format!(
-                "nprobe {} exceeds maximum of {}",
-                nprobe, state.config.indexing.max_nprobe
-            ))));
-        }
-
+        // `nprobe` was validated (>= 1, <= max) in Phase 1.
         query::execute_query(query::QueryParams {
             store: &state.store,
             wal_reader: &state.wal_reader,

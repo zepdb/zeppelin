@@ -154,3 +154,98 @@ async fn test_vector_id_at_max_length_accepted() {
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
+
+// --- Task 14: documented request bounds enforced server-side ---
+
+/// I1: `nprobe: 0` is below the documented minimum (api yaml `minimum: 1`) and
+/// must be rejected with 400 — NOT silently accepted (which probes zero
+/// clusters and returns an empty 200).
+#[tokio::test]
+async fn test_nprobe_zero_rejected() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api(&client, &base_url, 4).await;
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "top_k": 10,
+            "nprobe": 0,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "nprobe:0 must be a 400, not an empty 200"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("nprobe"),
+        "got: {}",
+        body["error"]
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+/// I2: request-shape validation runs BEFORE namespace resolution — an invalid
+/// request to a nonexistent namespace is a 400 (bad request), not a 404. Here
+/// `nprobe: 0` on a namespace that does not exist.
+#[tokio::test]
+async fn test_invalid_request_missing_namespace_is_400_not_404() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/does-not-exist-xyz/query"))
+        .json(&serde_json::json!({
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "top_k": 0,
+            "nprobe": 0,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "an invalid request must be a 400 regardless of whether the namespace exists"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+
+    harness.cleanup().await;
+}
+
+/// I1: `top_k: 0` is below the documented minimum and must be 400. (Regression
+/// pin — already enforced, but assert the code + that it doesn't need the
+/// namespace to exist.)
+#[tokio::test]
+async fn test_top_k_zero_rejected_before_namespace() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/nope-xyz/query"))
+        .json(&serde_json::json!({
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "top_k": 0,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+
+    harness.cleanup().await;
+}
