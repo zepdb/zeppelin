@@ -171,10 +171,8 @@ paths:
           $ref: "#/components/responses/ValidationError"
         "404":
           $ref: "#/components/responses/NotFoundError"
-        "415":
-          $ref: "#/components/responses/UnsupportedMediaType"
-        "422":
-          $ref: "#/components/responses/UnprocessableEntity"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
 
     delete:
       operationId: deleteVectors
@@ -194,10 +192,8 @@ paths:
           $ref: "#/components/responses/ValidationError"
         "404":
           $ref: "#/components/responses/NotFoundError"
-        "415":
-          $ref: "#/components/responses/UnsupportedMediaType"
-        "422":
-          $ref: "#/components/responses/UnprocessableEntity"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
 
   /v1/namespaces/{ns}/query:
     parameters:
@@ -251,35 +247,88 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    PayloadTooLarge:
+      description: |
+        Request body exceeds the configured size limit (413). Canonical error
+        envelope with code `PAYLOAD_TOO_LARGE`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
     UnsupportedMediaType:
-      description: Missing or non-JSON Content-Type header (415). Plain-text body.
+      description: |
+        Missing or non-JSON Content-Type header (415), for endpoints that use
+        the JSON extractor (namespace create). Plain-text body.
       content:
         text/plain:
           schema:
             type: string
             example: "Expected request with `Content-Type: application/json`"
     UnprocessableEntity:
-      description: Body is valid JSON but fails deserialization, e.g. missing required fields (422). Plain-text body.
+      description: |
+        Body is valid JSON but fails deserialization on the namespace-create
+        endpoint (422). Plain-text body. NOTE: the vectors upsert/delete and
+        query endpoints instead return 400 with the canonical error envelope
+        (code VALIDATION_ERROR) for malformed bodies.
       content:
         text/plain:
           schema:
             type: string
-            example: "Failed to deserialize the JSON body into the target type: vectors[0]: missing field `values`"
+            example: "Failed to deserialize the JSON body into the target type: missing field `dimensions`"
 
   schemas:
     ErrorResponse:
       type: object
-      required: [error, status]
+      required: [code, error, status, retryable]
       properties:
+        code:
+          type: string
+          description: |
+            Stable, machine-readable error code. Clients should branch on this,
+            never on `error` (human text) or `status` alone. Every code is
+            enumerated below and is guaranteed stable across releases.
+          enum:
+            - VALIDATION_ERROR
+            - DIMENSION_MISMATCH
+            - NAMESPACE_NOT_FOUND
+            - NAMESPACE_ALREADY_EXISTS
+            - FTS_FIELD_NOT_CONFIGURED
+            - CONFLICT_RETRY
+            - RATE_LIMITED
+            - CONCURRENCY_LIMIT
+            - REQUEST_TIMEOUT
+            - PAYLOAD_TOO_LARGE
+            - NOT_FOUND
+            - METHOD_NOT_ALLOWED
+            - INTERNAL_DATA_MISSING
+            - DATA_CORRUPTION
+            - STORAGE_ERROR
+            - INTERNAL_ERROR
         error:
           type: string
-          description: Human-readable error message
+          description: Human-readable, client-safe message. Never contains internal S3 keys, endpoints, or tokens.
         status:
           type: integer
           description: HTTP status code
+        retryable:
+          type: boolean
+          description: |
+            Whether retrying the identical request may succeed. True for
+            conflicts (CONFLICT_RETRY), rate limits, concurrency, timeouts, and
+            transient storage errors; responses with `retryable: true` at 409/
+            429/503/408 also carry a `Retry-After` header.
+        request_id:
+          type: string
+          description: |
+            Echo of the request's `x-request-id` (or a server-generated UUID).
+            Present on routes that carry the request-id middleware; omitted on
+            the lightweight query hot path. Use it to correlate with server logs.
       example:
-        error: "namespace 'test' not found"
+        code: NAMESPACE_NOT_FOUND
+        error: "namespace not found: test"
         status: 404
+        retryable: false
+        request_id: "b3f1c2e4-..."
 
     DistanceMetric:
       type: string
