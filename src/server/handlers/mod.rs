@@ -13,7 +13,7 @@ use prometheus::{Encoder, TextEncoder};
 use serde_json::{json, Value};
 
 use crate::error::ZeppelinError;
-use crate::server::AppState;
+use crate::server::{current_request_id, AppState};
 
 /// Wrapper that converts `ZeppelinError` into an HTTP response.
 pub struct ApiError(pub ZeppelinError);
@@ -52,29 +52,49 @@ impl From<ZeppelinError> for ApiError {
     }
 }
 
-/// Maps `ApiError` to an HTTP response with a JSON body and appropriate status code.
+/// Build the canonical error envelope for a `ZeppelinError`. Single source of
+/// truth so middleware-produced errors (timeout, body-limit, unmatched route,
+/// concurrency) render identically to handler errors (Task 11 I1/I4).
+///
+/// Envelope: `{code, error, status, request_id?, retryable}`. The full
+/// `Display` (which may embed S3 keys / tokens / holder IDs) goes ONLY to the
+/// structured log; the body carries `client_message()` (I3).
+pub fn error_response(err: &ZeppelinError) -> Response {
+    let status = err.status_code();
+    let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let request_id = current_request_id();
+
+    // Log the FULL internal error (with its detail) keyed by request_id; the
+    // client body only ever sees the sanitized message.
+    if status_code.is_server_error() {
+        tracing::error!(error = %err, code = err.error_code(), status, request_id = ?request_id, "server error");
+    } else if status_code.is_client_error() {
+        tracing::warn!(error = %err, code = err.error_code(), status, request_id = ?request_id, "client error");
+    }
+
+    let mut body = json!({
+        "code": err.error_code(),
+        "error": err.client_message(),
+        "status": status,
+        "retryable": err.retryable(),
+    });
+    if let Some(rid) = request_id {
+        body["request_id"] = json!(rid);
+    }
+
+    let mut response = (status_code, axum::Json(body)).into_response();
+    if let Some(secs) = err.retry_after_secs() {
+        if let Ok(val) = secs.to_string().parse() {
+            response.headers_mut().insert("retry-after", val);
+        }
+    }
+    response
+}
+
+/// Maps `ApiError` to an HTTP response with the canonical error envelope.
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = self.0.status_code();
-        let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        if status_code.is_server_error() {
-            tracing::error!(error = %self.0, status, "server error");
-        } else if status_code.is_client_error() {
-            tracing::warn!(error = %self.0, status, "client error");
-        }
-        let body = json!({
-            "error": self.0.to_string(),
-            "status": status,
-        });
-        // Include Retry-After header for rate-limited responses.
-        if let ZeppelinError::RateLimitExceeded { retry_after_secs } = &self.0 {
-            let mut response = (status_code, axum::Json(body)).into_response();
-            if let Ok(val) = retry_after_secs.to_string().parse() {
-                response.headers_mut().insert("retry-after", val);
-            }
-            return response;
-        }
-        (status_code, axum::Json(body)).into_response()
+        error_response(&self.0)
     }
 }
 

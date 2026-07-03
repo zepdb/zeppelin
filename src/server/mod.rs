@@ -30,6 +30,20 @@ use crate::wal::{WalReader, WalWriter};
 
 use self::handlers::{namespace, query, vectors, ApiError};
 
+tokio::task_local! {
+    /// The current request's ID, set by the `request_id` middleware and read by
+    /// the error envelope (`handlers::error_response`) so error bodies can carry
+    /// `request_id` without threading it through every handler signature. The
+    /// lightweight query route intentionally skips this middleware (perf), so
+    /// query errors simply omit the field — the envelope treats it as optional.
+    static REQUEST_ID: String;
+}
+
+/// The current request's ID if inside a `REQUEST_ID` scope, else `None`.
+pub fn current_request_id() -> Option<String> {
+    REQUEST_ID.try_with(|id| id.clone()).ok()
+}
+
 /// Shared application state injected into all handlers via axum's State extractor.
 #[derive(Clone)]
 pub struct AppState {
@@ -110,15 +124,18 @@ pub async fn request_id(request: Request<axum::body::Body>, next: Next) -> Respo
         .map(String::from)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let rid = id.clone();
-    async move {
-        let mut response = next.run(request).await;
-        response
-            .headers_mut()
-            .insert("x-request-id", rid.parse().unwrap());
-        response
-    }
-    .instrument(tracing::info_span!("request", request_id = %id))
-    .await
+    // Run downstream inside the REQUEST_ID task-local scope so the error
+    // envelope can stamp `request_id` on any error produced below.
+    REQUEST_ID
+        .scope(id.clone(), async move {
+            let mut response = next.run(request).await;
+            response
+                .headers_mut()
+                .insert("x-request-id", rid.parse().unwrap());
+            response
+        })
+        .instrument(tracing::info_span!("request", request_id = %id))
+        .await
 }
 
 /// Middleware that limits concurrent query execution.
