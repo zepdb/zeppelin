@@ -454,8 +454,13 @@ impl Compactor {
 
         // 8. Build index (expensive, done once — NOT retried)
         // Choose hierarchical or flat based on config.
+        //
+        // `cluster_owners` maps each cluster index to the segment ID that owns
+        // its S3 objects. It is EMPTY for every full-rebuild path (all clusters
+        // owned by `segment_id`); only the incremental fast path populates it,
+        // carrying untouched clusters forward under the old segment's keys.
         let build_start = std::time::Instant::now();
-        let (cluster_count, is_hierarchical, bitmap_fields) =
+        let (cluster_count, is_hierarchical, bitmap_fields, cluster_owners) =
             if !should_retrain && old_segment_id.is_some() && !self.indexing_config.hierarchical {
                 // Incremental path: reuse existing centroids, just reassign vectors.
                 match self
@@ -466,15 +471,16 @@ impl Compactor {
                         })?,
                         &segment_id,
                         &vectors,
+                        &deleted_ids,
                     )
                     .await
                 {
-                    Ok((count, bf)) => {
+                    Ok((count, bf, owners)) => {
                         info!(
                             new_from_wal,
                             existing_count, "incremental compaction: reusing centroids"
                         );
-                        (count, false, bf)
+                        (count, false, bf, owners)
                     }
                     Err(e) => {
                         warn!(error = %e, "incremental build failed, falling back to full retrain");
@@ -487,7 +493,7 @@ impl Compactor {
                         )
                         .await?;
                         let bf = index.bitmap_fields.clone();
-                        (index.num_clusters(), false, bf)
+                        (index.num_clusters(), false, bf, Vec::new())
                     }
                 }
             } else if self.indexing_config.hierarchical {
@@ -500,7 +506,7 @@ impl Compactor {
                 )
                 .await?;
                 let bf = h_index.bitmap_fields.clone();
-                (h_index.num_leaf_clusters(), true, bf)
+                (h_index.num_leaf_clusters(), true, bf, Vec::new())
             } else {
                 let index = build_ivf_flat(
                     &vectors,
@@ -511,7 +517,7 @@ impl Compactor {
                 )
                 .await?;
                 let bf = index.bitmap_fields.clone();
-                (index.num_clusters(), false, bf)
+                (index.num_clusters(), false, bf, Vec::new())
             };
         let build_elapsed = build_start.elapsed();
         let index_type_label = if is_hierarchical {
@@ -694,6 +700,12 @@ impl Compactor {
                     bitmap_fields: bitmap_fields.clone(),
                     fts_fields: fts_fields.clone(),
                     has_global_fts,
+                    // Explicit per rule 15: a defaulted layout field has
+                    // mis-dispatched the query path before. `cluster_owners`
+                    // carries the incremental carry-over map; it is empty for
+                    // full rebuilds (every cluster owned by `segment_id`) and
+                    // populated only on the incremental fast path below.
+                    cluster_owners: cluster_owners.clone(),
                 },
                 self.config.max_pending_deletes,
                 self.config.max_old_segments,
@@ -752,14 +764,19 @@ impl Compactor {
     /// Incremental build: reuse centroids from old segment, assign all vectors
     /// to nearest centroid, write new cluster data without k-means training.
     ///
-    /// Returns (cluster_count, bitmap_fields) on success.
+    /// Returns `(cluster_count, bitmap_fields, cluster_owners)` on success.
+    /// `cluster_owners[i]` is the segment ID that owns cluster `i`'s S3
+    /// objects: `new_segment_id` for rewritten clusters, `old_segment_id`
+    /// for clusters carried over untouched. An empty vec means "all owned by
+    /// `new_segment_id`" (the full-rewrite fallback).
     async fn incremental_build(
         &self,
         namespace: &str,
         old_segment_id: &str,
         new_segment_id: &str,
         vectors: &[VectorEntry],
-    ) -> Result<(usize, Vec<String>)> {
+        deleted_ids: &HashSet<String>,
+    ) -> Result<(usize, Vec<String>, Vec<String>)> {
         use crate::index::distance::euclidean_distance;
         use crate::index::ivf_flat::build::{
             centroids_key, deserialize_centroids, serialize_attrs, serialize_centroids,
@@ -895,7 +912,12 @@ impl Compactor {
         }
 
         let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
-        Ok((num_clusters, bitmap_fields))
+        // Stage 1: full-rewrite behavior preserved — every cluster is written
+        // under `new_segment_id`, so no carry-over map. Stage 3 replaces this
+        // with per-cluster carry-over. `deleted_ids` is accepted now so the
+        // signature is stable across stages.
+        let _ = deleted_ids;
+        Ok((num_clusters, bitmap_fields, Vec::new()))
     }
 }
 

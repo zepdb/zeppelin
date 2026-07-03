@@ -1037,6 +1037,7 @@ mod tests {
             bitmap_fields: Vec::new(),
             fts_fields: vec!["text".to_string()],
             has_global_fts,
+            cluster_owners: Vec::new(),
         }
     }
 

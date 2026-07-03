@@ -64,6 +64,45 @@ pub struct SegmentRef {
     /// Whether this segment has a global FTS index.
     #[serde(default)]
     pub has_global_fts: bool,
+    /// Per-cluster owning segment IDs for incremental compaction.
+    ///
+    /// `cluster_owners[i]` is the segment ID under which cluster `i`'s S3
+    /// objects (`cluster_i.bin`, `attrs_i.bin`, `sq_cluster_i.bin`,
+    /// `pq_cluster_i.bin`, `bitmap_i.bin`, `fts_i.bin`) actually live.
+    /// Incremental compaction (Task 2 Phase B) carries UNTOUCHED clusters
+    /// forward by reference — they keep the object keys of an older segment
+    /// rather than being re-uploaded under this segment's ID. Only clusters
+    /// that gained/lost vectors are rewritten under `self.id`.
+    ///
+    /// EMPTY means the legacy layout: every cluster is owned by `self.id`
+    /// (`{self.id}/cluster_{i}.bin`). All full-retrain builds leave this
+    /// empty; `cluster_owner()` resolves an empty vec to `self.id`. Keeping
+    /// it empty for full rebuilds means the common path carries zero extra
+    /// bytes in the manifest and old manifests decode unchanged.
+    ///
+    /// NOTE: this field must stay LAST in the struct. MessagePack encodes
+    /// structs as arrays, so old manifests decode only if new fields are
+    /// trailing and `#[serde(default)]`.
+    #[serde(default)]
+    pub cluster_owners: Vec<String>,
+}
+
+impl SegmentRef {
+    /// Segment ID that owns cluster `cluster_idx`'s S3 objects.
+    ///
+    /// Returns the entry in `cluster_owners` when present (incremental
+    /// carry-over), otherwise falls back to `self.id` (legacy full-rewrite
+    /// layout, and any cluster written by this compaction). Every reader of
+    /// a per-cluster S3 key MUST resolve the owner through this method
+    /// rather than assuming `self.id` — carried-over clusters live under an
+    /// older segment's keys.
+    #[must_use]
+    pub fn cluster_owner(&self, cluster_idx: usize) -> &str {
+        self.cluster_owners
+            .get(cluster_idx)
+            .map(String::as_str)
+            .unwrap_or(&self.id)
+    }
 }
 
 /// The manifest is the single source of truth for what data exists
@@ -321,6 +360,7 @@ mod tests {
             bitmap_fields: Vec::new(),
             fts_fields: Vec::new(),
             has_global_fts: false,
+            cluster_owners: Vec::new(),
         }
     }
 
@@ -450,6 +490,123 @@ mod tests {
             .expect("legacy JSON manifest without size_bytes must decode");
         assert_eq!(decoded_json.fragments[0].id, frag_id);
         assert_eq!(decoded_json.fragments[0].size_bytes, 0);
+    }
+
+    /// Backward compat: manifests serialized BEFORE `SegmentRef.cluster_owners`
+    /// existed must still decode, in both MessagePack (structs as arrays — new
+    /// fields must be trailing + defaulted) and legacy JSON. A decoded old
+    /// segment must resolve every cluster to its own ID (legacy layout).
+    #[test]
+    fn test_decode_manifest_without_cluster_owners_field() {
+        // Replica of the pre-cluster_owners SegmentRef wire shape (has_global_fts
+        // was the last field).
+        #[derive(Serialize)]
+        struct OldSegmentRef {
+            id: String,
+            vector_count: usize,
+            cluster_count: usize,
+            quantization: crate::index::quantization::QuantizationType,
+            hierarchical: bool,
+            bitmap_fields: Vec<String>,
+            fts_fields: Vec<String>,
+            has_global_fts: bool,
+        }
+        #[derive(Serialize)]
+        struct MixedManifest {
+            fragments: Vec<FragmentRef>,
+            segments: Vec<OldSegmentRef>,
+            compaction_watermark: Option<Ulid>,
+            active_segment: Option<String>,
+            next_sequence: u64,
+            pending_deletes: Vec<String>,
+            fencing_token: u64,
+            updated_at: DateTime<Utc>,
+        }
+
+        let old = MixedManifest {
+            fragments: vec![],
+            segments: vec![OldSegmentRef {
+                id: "seg_legacy".to_string(),
+                vector_count: 100,
+                cluster_count: 4,
+                quantization: crate::index::quantization::QuantizationType::None,
+                hierarchical: false,
+                bitmap_fields: vec![],
+                fts_fields: vec![],
+                has_global_fts: false,
+            }],
+            compaction_watermark: None,
+            active_segment: Some("seg_legacy".to_string()),
+            next_sequence: 0,
+            pending_deletes: vec![],
+            fencing_token: 0,
+            updated_at: Utc::now(),
+        };
+
+        // MessagePack with the 0x01 version byte (current on-S3 format).
+        let msgpack = rmp_serde::to_vec(&old).unwrap();
+        let mut data = vec![MANIFEST_FORMAT_MSGPACK];
+        data.extend_from_slice(&msgpack);
+        let decoded = Manifest::from_bytes(&data)
+            .expect("old msgpack manifest without cluster_owners must decode");
+        assert_eq!(decoded.segments.len(), 1);
+        let seg = &decoded.segments[0];
+        assert_eq!(seg.id, "seg_legacy");
+        assert!(
+            seg.cluster_owners.is_empty(),
+            "missing cluster_owners decodes to the serde default (empty)"
+        );
+        // Empty cluster_owners ⇒ every cluster owned by the segment itself.
+        for i in 0..seg.cluster_count {
+            assert_eq!(
+                seg.cluster_owner(i),
+                "seg_legacy",
+                "legacy layout: cluster {i} must resolve to the segment's own ID"
+            );
+        }
+
+        // Legacy JSON format (no version byte, starts with '{').
+        let json = serde_json::to_vec(&old).unwrap();
+        let decoded_json = Manifest::from_bytes(&json)
+            .expect("legacy JSON manifest without cluster_owners must decode");
+        assert!(decoded_json.segments[0].cluster_owners.is_empty());
+        assert_eq!(decoded_json.segments[0].cluster_owner(3), "seg_legacy");
+    }
+
+    /// `cluster_owner()` returns carried-over owners where present and falls
+    /// back to the segment's own ID for indices beyond the map.
+    #[test]
+    fn test_cluster_owner_resolution() {
+        let mut seg = make_segment("seg_new");
+        seg.cluster_count = 4;
+        // Clusters 0 and 2 carried over from an older segment; 1 and 3 rewritten.
+        seg.cluster_owners = vec![
+            "seg_old".to_string(),
+            "seg_new".to_string(),
+            "seg_old".to_string(),
+            "seg_new".to_string(),
+        ];
+        assert_eq!(seg.cluster_owner(0), "seg_old");
+        assert_eq!(seg.cluster_owner(1), "seg_new");
+        assert_eq!(seg.cluster_owner(2), "seg_old");
+        assert_eq!(seg.cluster_owner(3), "seg_new");
+        // Out-of-range index falls back to the segment's own ID.
+        assert_eq!(seg.cluster_owner(99), "seg_new");
+    }
+
+    /// Round-trip: cluster_owners survives serialize → deserialize.
+    #[test]
+    fn test_cluster_owners_roundtrip() {
+        let mut manifest = Manifest::new();
+        let mut seg = make_segment("seg_rt");
+        seg.cluster_owners = vec!["seg_a".to_string(), "seg_rt".to_string()];
+        manifest.add_segment(seg);
+        let bytes = manifest.to_bytes().unwrap();
+        let decoded = Manifest::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded.segments[0].cluster_owners,
+            vec!["seg_a".to_string(), "seg_rt".to_string()]
+        );
     }
 
     /// Round-trip: size_bytes survives serialize → deserialize.
