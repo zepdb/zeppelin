@@ -111,8 +111,11 @@ pub async fn search_ivf_flat(
     if effective_nprobe < num_clusters {
         if let Some(&(next_cluster_idx, _)) = centroid_dists.get(effective_nprobe) {
             if let Some(c) = cache {
-                let cvec_key =
-                    cluster_key(&index.namespace, index.cluster_owner(next_cluster_idx), next_cluster_idx);
+                let cvec_key = cluster_key(
+                    &index.namespace,
+                    index.cluster_owner(next_cluster_idx),
+                    next_cluster_idx,
+                );
                 let cache_clone = c.clone();
                 let store_clone = store.clone();
                 tokio::spawn(async move {
@@ -342,8 +345,11 @@ async fn scan_clusters_sq(
             Ok(data) => data,
             Err(e) => {
                 warn!(cluster = cluster_idx, error = %e, "failed to read SQ cluster, falling back to flat");
-                let cvec_key =
-                    cluster_key(&index.namespace, index.cluster_owner(cluster_idx), cluster_idx);
+                let cvec_key = cluster_key(
+                    &index.namespace,
+                    index.cluster_owner(cluster_idx),
+                    cluster_idx,
+                );
                 if let Ok(data) = fetch_with_cache(cache, store, &cvec_key).await {
                     let cluster = deserialize_cluster(&data)?;
                     for (j, vec) in cluster.vectors.iter().enumerate() {
@@ -396,8 +402,11 @@ async fn scan_clusters_sq(
 
     let rerank_prefetched =
         futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
-            let cvec_key =
-                cluster_key(&index.namespace, index.cluster_owner(cluster_idx), cluster_idx);
+            let cvec_key = cluster_key(
+                &index.namespace,
+                index.cluster_owner(cluster_idx),
+                cluster_idx,
+            );
             let needed_ids = needed_ids.clone();
             async move {
                 let (cluster_res, attrs) = tokio::join!(
@@ -529,8 +538,11 @@ async fn scan_clusters_pq(
 
     let rerank_prefetched =
         futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
-            let cvec_key =
-                cluster_key(&index.namespace, index.cluster_owner(cluster_idx), cluster_idx);
+            let cvec_key = cluster_key(
+                &index.namespace,
+                index.cluster_owner(cluster_idx),
+                cluster_idx,
+            );
             let needed_ids = needed_ids.clone();
             async move {
                 let (cluster_res, attrs) = tokio::join!(
@@ -610,7 +622,11 @@ async fn load_attrs(
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
 ) -> Option<Vec<Option<HashMap<String, AttributeValue>>>> {
-    let akey = attrs_key(&index.namespace, index.cluster_owner(cluster_idx), cluster_idx);
+    let akey = attrs_key(
+        &index.namespace,
+        index.cluster_owner(cluster_idx),
+        cluster_idx,
+    );
     if filter.is_some() {
         match fetch_with_cache(cache, store, &akey).await {
             Ok(data) => match deserialize_attrs(&data) {

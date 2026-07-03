@@ -287,39 +287,53 @@ impl Compactor {
             .read_fragments_from_refs_unchecked(namespace, &fragment_refs)
             .await?;
 
-        // 4. Merge vectors: process in manifest order (sequence number), latest wins
+        // 4. Merge vectors: process in manifest order (sequence number), latest wins.
+        //
+        // `wal_touched_ids` is every vector ID that appeared in the WAL this
+        // cycle — as an add/update (`fragment.vectors`) OR a delete
+        // (`fragment.deletes`). An existing cluster is UNCHANGED iff none of
+        // its members (old or newly-assigned) is in this set, which is what
+        // the incremental fast path uses to decide carry-over vs rewrite.
         let mut latest_vectors: HashMap<String, VectorEntry> = HashMap::new();
         let mut deleted_ids: HashSet<String> = HashSet::new();
+        let mut wal_touched_ids: HashSet<String> = HashSet::new();
 
         for fragment in &fragments {
             for del_id in &fragment.deletes {
                 deleted_ids.insert(del_id.clone());
+                wal_touched_ids.insert(del_id.clone());
                 latest_vectors.remove(del_id);
             }
             for vec in &fragment.vectors {
                 deleted_ids.remove(&vec.id);
+                wal_touched_ids.insert(vec.id.clone());
                 latest_vectors.insert(vec.id.clone(), vec.clone());
             }
         }
 
         // 5. If existing active_segment: load vectors from it, merge
         let old_segment_id = manifest.active_segment.clone();
-        // The old segment's per-cluster owner map: carried-over clusters live
-        // under an even-older segment's keys. `load_segment_vectors` must
-        // resolve through it (empty ⇒ legacy single-segment layout).
-        let old_cluster_owners: Vec<String> = old_segment_id
+        // Snapshot of the old active segment's full SegmentRef — needed both
+        // to resolve its per-cluster owners (carried-over clusters live under
+        // an even-older segment's keys) and to enumerate the exact S3 objects
+        // it referenced when computing what is safe to delete.
+        let old_segment_ref: Option<SegmentRef> = old_segment_id
             .as_ref()
             .and_then(|seg_id| manifest.segments.iter().find(|s| s.id == *seg_id))
+            .cloned();
+        let old_cluster_owners: Vec<String> = old_segment_ref
+            .as_ref()
             .map(|s| s.cluster_owners.clone())
             .unwrap_or_default();
+        // Old-segment membership (id → cluster index), used by the incremental
+        // fast path to detect which clusters a WAL delete/update touched.
+        let mut old_id_to_cluster: HashMap<String, usize> = HashMap::new();
         if let Some(ref seg_id) = old_segment_id {
-            let is_hierarchical = manifest
-                .segments
-                .iter()
-                .find(|s| s.id == *seg_id)
+            let is_hierarchical = old_segment_ref
+                .as_ref()
                 .map(|s| s.hierarchical)
                 .unwrap_or(false);
-            let existing_vecs = load_segment_vectors(
+            let (existing_vecs, id_to_cluster) = load_segment_vectors(
                 &self.store,
                 namespace,
                 seg_id,
@@ -327,6 +341,7 @@ impl Compactor {
                 &old_cluster_owners,
             )
             .await?;
+            old_id_to_cluster = id_to_cluster;
             for vec in existing_vecs {
                 // WAL overrides: only insert if not already in latest_vectors and not deleted
                 if !latest_vectors.contains_key(&vec.id) && !deleted_ids.contains(&vec.id) {
@@ -369,17 +384,23 @@ impl Compactor {
         let vectors_compacted = vectors.len();
 
         // Collect keys for deferred deletion, carrying over keys whose
-        // deletion failed in step 0 so they are retried next cycle.
+        // deletion failed in step 0 so they are retried next cycle. The old
+        // segment's own S3 objects are added PER BRANCH below: the incremental
+        // fast path must EXCLUDE carried-over cluster objects (still referenced
+        // by the new segment) from deletion, whereas the all-deleted and full-
+        // rebuild branches delete every old object.
         let mut deferred_deletes: Vec<String> = carryover_deletes;
         for fref in &fragment_refs {
             deferred_deletes.push(WalFragment::s3_key(namespace, &fref.id));
         }
-        if let Some(ref seg_id) = old_segment_id {
-            let prefix = format!("{namespace}/segments/{seg_id}/");
-            deferred_deletes.extend(self.store.list_prefix(&prefix).await?);
-        }
 
         if vectors.is_empty() {
+            // No new segment is produced, so nothing is carried over — every
+            // old-segment object is safe to delete.
+            if let Some(ref seg_id) = old_segment_id {
+                let prefix = format!("{namespace}/segments/{seg_id}/");
+                deferred_deletes.extend(self.store.list_prefix(&prefix).await?);
+            }
             // Edge case: all vectors were deleted
             // CAS loop to update manifest
             for attempt in 0..MAX_CAS_RETRIES {
@@ -485,7 +506,21 @@ impl Compactor {
                         })?,
                         &segment_id,
                         &vectors,
-                        &deleted_ids,
+                        &wal_touched_ids,
+                        &old_id_to_cluster,
+                        &old_cluster_owners,
+                        old_segment_ref
+                            .as_ref()
+                            .map(|s| s.bitmap_fields.as_slice())
+                            .unwrap_or(&[]),
+                        // Carry-over is unsafe when FTS is configured: the FTS
+                        // pass below reads every cluster's attrs under the NEW
+                        // segment ID and rebuilds a per-segment global index,
+                        // which a carried cluster (attrs under an OLD ID) would
+                        // break. Centroid reuse still applies — only the
+                        // per-cluster carry-over is disabled. (Correctness over
+                        // cleverness; revisit when FTS learns carry-over.)
+                        fts_configs.is_empty(),
                     )
                     .await
                 {
@@ -547,6 +582,49 @@ impl Compactor {
             build_duration_ms = build_elapsed.as_millis() as u64,
             "index build phase complete"
         );
+
+        // 8a. Enqueue the old segment's now-superseded S3 objects for deletion.
+        //
+        // DATA-LOSS CLIFF: with incremental carry-over, some of the old
+        // segment's per-cluster objects are STILL REFERENCED by the new
+        // segment (`cluster_owners[i] == old_segment_id`). Those must NOT be
+        // deleted. We list everything under `{old_seg}/` and subtract the exact
+        // per-cluster keys the new segment still points at.
+        //
+        // Safety direction: we protect EVERY possible per-cluster key shape for
+        // each carried cluster owned directly by the old segment, whether or not
+        // that object happens to exist. Protecting a non-existent key is a
+        // harmless no-op (it won't be in the listing); failing to protect a
+        // referenced key destroys live data. Carried clusters owned by an even-
+        // older segment are not under `{old_seg}/` at all, so the listing never
+        // surfaces them. Under-deletion leaks objects (Task 19 GC), which is the
+        // safe failure mode.
+        if let Some(ref seg_id) = old_segment_id {
+            use crate::index::quantization::pq::pq_cluster_key;
+            use crate::index::quantization::sq::sq_cluster_key;
+
+            let mut referenced: HashSet<String> = HashSet::new();
+            for (i, owner) in cluster_owners.iter().enumerate() {
+                if owner == seg_id {
+                    referenced.insert(cluster_key(namespace, seg_id, i));
+                    referenced.insert(attrs_key(namespace, seg_id, i));
+                    referenced.insert(sq_cluster_key(namespace, seg_id, i));
+                    referenced.insert(pq_cluster_key(namespace, seg_id, i));
+                    referenced.insert(crate::index::bitmap::bitmap_key(namespace, seg_id, i));
+                    referenced.insert(fts_index_key(namespace, seg_id, i));
+                }
+            }
+
+            let prefix = format!("{namespace}/segments/{seg_id}/");
+            let old_keys = self.store.list_prefix(&prefix).await?;
+            let carried = old_keys.iter().filter(|k| referenced.contains(*k)).count();
+            deferred_deletes.extend(old_keys.into_iter().filter(|k| !referenced.contains(k)));
+            debug!(
+                old_segment = %seg_id,
+                carried_objects = carried,
+                "computed old-segment deletion set (carried objects retained)"
+            );
+        }
 
         // 8b. Build FTS inverted indexes (if FTS fields configured)
         let mut has_global_fts = false;
@@ -775,21 +853,47 @@ impl Compactor {
 }
 
 impl Compactor {
-    /// Incremental build: reuse centroids from old segment, assign all vectors
-    /// to nearest centroid, write new cluster data without k-means training.
+    /// Incremental build: reuse centroids from old segment, reassign vectors,
+    /// and rewrite ONLY the clusters a WAL add/update/delete touched. Untouched
+    /// clusters are carried forward by reference (their S3 objects keep their
+    /// old keys), bounding per-cycle write I/O to O(touched clusters) instead
+    /// of O(dataset).
     ///
-    /// Returns `(cluster_count, bitmap_fields, cluster_owners)` on success.
-    /// `cluster_owners[i]` is the segment ID that owns cluster `i`'s S3
-    /// objects: `new_segment_id` for rewritten clusters, `old_segment_id`
-    /// for clusters carried over untouched. An empty vec means "all owned by
-    /// `new_segment_id`" (the full-rewrite fallback).
+    /// Returns `(cluster_count, bitmap_fields, cluster_owners)`. `cluster_owners[i]`
+    /// is the segment ID that owns cluster `i`'s per-cluster S3 objects:
+    /// `new_segment_id` for rewritten clusters, the old segment's resolved
+    /// owner for carried-over ones. An empty vec would mean "all owned by
+    /// `new_segment_id`", but this fn always returns a full-length map when it
+    /// carries anything; it returns empty only if every cluster is rewritten.
+    ///
+    /// # Touched-cluster detection (correctness)
+    /// A cluster `i` must be rewritten if EITHER:
+    /// - a WAL-touched ID is newly assigned to it (add/update landing in `i`), OR
+    /// - a WAL-touched ID was an OLD member of it (`old_id_to_cluster[id] == i`) —
+    ///   this catches deletes (member removed) and updates that move a vector to
+    ///   a different cluster (stale copy must be dropped from `i`). B3.
+    ///
+    /// Everything not in the touched set is byte-identical to the old segment,
+    /// so it is carried by reference.
+    ///
+    /// `bitmap_fields` reflects the UNION across rewritten clusters only; when
+    /// nothing forces a field's bitmap into a rewritten cluster it can be
+    /// dropped from the reported set. To keep the segment's advertised bitmap
+    /// fields stable (a carried cluster may still have bitmaps under its old
+    /// key), we seed the set with the old segment's fields — see the caller,
+    /// which is why `old_bitmap_fields` is passed in.
+    #[allow(clippy::too_many_arguments)]
     async fn incremental_build(
         &self,
         namespace: &str,
         old_segment_id: &str,
         new_segment_id: &str,
         vectors: &[VectorEntry],
-        deleted_ids: &HashSet<String>,
+        wal_touched_ids: &HashSet<String>,
+        old_id_to_cluster: &HashMap<String, usize>,
+        old_cluster_owners: &[String],
+        old_bitmap_fields: &[String],
+        allow_carryover: bool,
     ) -> Result<(usize, Vec<String>, Vec<String>)> {
         use crate::index::distance::euclidean_distance;
         use crate::index::ivf_flat::build::{
@@ -804,11 +908,15 @@ impl Compactor {
         let (centroids, dim) = deserialize_centroids(&centroids_data)?;
         let num_clusters = centroids.len();
 
-        // Assign ALL vectors to nearest centroid
+        // Assign ALL surviving vectors to nearest centroid.
         let mut cluster_ids: Vec<Vec<String>> = vec![Vec::new(); num_clusters];
         let mut cluster_vecs: Vec<Vec<Vec<f32>>> = vec![Vec::new(); num_clusters];
         let mut cluster_attrs: Vec<Vec<Option<HashMap<String, crate::types::AttributeValue>>>> =
             vec![Vec::new(); num_clusters];
+
+        // A cluster is "touched" (must be rewritten) if a WAL-touched vector is
+        // assigned to it now, or was an old member of it.
+        let mut touched: Vec<bool> = vec![false; num_clusters];
 
         for entry in vectors {
             let mut best_dist = f32::MAX;
@@ -820,22 +928,81 @@ impl Compactor {
                     best_cluster = c;
                 }
             }
+            if wal_touched_ids.contains(&entry.id) {
+                touched[best_cluster] = true;
+            }
             cluster_ids[best_cluster].push(entry.id.clone());
             cluster_vecs[best_cluster].push(entry.values.clone());
             cluster_attrs[best_cluster].push(entry.attributes.clone());
         }
+        // Deletes and cross-cluster moves: any WAL-touched ID that used to live
+        // in cluster `i` forces `i` to be rewritten even if nothing landed in
+        // it this cycle (B3).
+        for id in wal_touched_ids {
+            if let Some(&old_cluster) = old_id_to_cluster.get(id) {
+                if old_cluster < num_clusters {
+                    touched[old_cluster] = true;
+                }
+            }
+        }
 
-        // Write centroids (copy to new segment path)
+        // If carry-over is disabled (FTS configured, or no usable old owner
+        // map), fall back to rewriting everything — still cheaper than a full
+        // retrain because centroids are reused, matching prior behavior.
+        let carry_over = allow_carryover;
+        if !carry_over {
+            for t in touched.iter_mut() {
+                *t = true;
+            }
+        }
+
+        // Resolve the owning segment ID for cluster `i` when carried over: the
+        // old segment's own resolved owner (chain-compresses across
+        // generations so we never point at a segment that itself only holds a
+        // reference).
+        let resolve_old_owner = |i: usize| -> String {
+            old_cluster_owners
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| old_segment_id.to_string())
+        };
+
+        // Build cluster_owners: rewritten → new_segment_id, carried → old owner.
+        let mut cluster_owners: Vec<String> = Vec::with_capacity(num_clusters);
+        for (i, is_touched) in touched.iter().enumerate() {
+            if *is_touched {
+                cluster_owners.push(new_segment_id.to_string());
+            } else {
+                cluster_owners.push(resolve_old_owner(i));
+            }
+        }
+        let rewritten_count = touched.iter().filter(|t| **t).count();
+
+        // Write centroids (segment-global — always under the new segment).
         let new_ckey = centroids_key(namespace, new_segment_id);
         let new_centroids_data = serialize_centroids(&centroids, dim)?;
         self.store.put(&new_ckey, new_centroids_data).await?;
 
-        // CPU phase: pre-serialize all cluster payloads
+        // CPU phase: pre-serialize payloads for REWRITTEN clusters only.
+        //
+        // Seed the reported bitmap fields with the OLD segment's set: a field
+        // whose bitmaps live only in carried clusters (under old keys, still
+        // owner-resolved at query time) must stay advertised, or the query
+        // path would stop offering its prefilter. When carry-over is disabled
+        // every cluster is rewritten, so this seed is a harmless superset that
+        // the rewritten-cluster scan reproduces anyway.
         let mut bitmap_fields_set: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+            if carry_over && self.indexing_config.bitmap_index {
+                old_bitmap_fields.iter().cloned().collect()
+            } else {
+                std::collections::HashSet::new()
+            };
         let mut payloads: Vec<(String, Bytes)> = Vec::new();
 
         for i in 0..num_clusters {
+            if !touched[i] {
+                continue; // carried over by reference
+            }
             let cvec_data = serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?;
             let cvec_key = cluster_key(namespace, new_segment_id, i);
 
@@ -858,25 +1025,34 @@ impl Compactor {
             }
         }
 
-        // Quantized artifacts: the SegmentRef records the configured
-        // quantization, so the search path will look for these — they must
-        // exist for every segment, incremental or not.
+        // Quantized artifacts. The calibration/codebook is SEGMENT-GLOBAL and
+        // MUST be reused (not recomputed): carried clusters' codes were encoded
+        // against the old calibration, and the search path reads the
+        // calibration under the NEW segment ID. Recomputing it would silently
+        // corrupt every carried cluster's approximate distances. So we COPY the
+        // old calibration/codebook to the new segment and re-encode only the
+        // rewritten clusters against it.
         match self.indexing_config.quantization {
             crate::index::quantization::QuantizationType::Scalar => {
                 use crate::index::quantization::sq::{
                     serialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
                 };
 
-                let vec_refs: Vec<&[f32]> = vectors.iter().map(|e| e.values.as_slice()).collect();
-                let cal = SqCalibration::calibrate(&vec_refs, dim);
+                // Reuse the old calibration; if it's missing, fail so the caller
+                // falls back to a full retrain (symmetric with PQ below).
+                let cal_data = self
+                    .store
+                    .get(&sq_calibration_key(namespace, old_segment_id))
+                    .await?;
+                let cal = SqCalibration::from_bytes(&cal_data)?;
                 self.store
-                    .put(
-                        &sq_calibration_key(namespace, new_segment_id),
-                        cal.to_bytes(),
-                    )
+                    .put(&sq_calibration_key(namespace, new_segment_id), cal_data)
                     .await?;
 
                 for i in 0..num_clusters {
+                    if !touched[i] {
+                        continue;
+                    }
                     let cluster_refs: Vec<&[f32]> =
                         cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
                     let codes = cal.encode_batch(&cluster_refs);
@@ -905,6 +1081,9 @@ impl Compactor {
                     .await?;
 
                 for i in 0..num_clusters {
+                    if !touched[i] {
+                        continue;
+                    }
                     let cluster_refs: Vec<&[f32]> =
                         cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
                     let codes = codebook.encode_batch(&cluster_refs);
@@ -915,7 +1094,7 @@ impl Compactor {
             crate::index::quantization::QuantizationType::None => {}
         }
 
-        // I/O phase: write all in parallel
+        // I/O phase: write all rewritten-cluster payloads in parallel.
         let write_futs: Vec<_> = payloads
             .iter()
             .map(|(key, data)| self.store.put(key, data.clone()))
@@ -925,13 +1104,23 @@ impl Compactor {
             result?;
         }
 
+        info!(
+            num_clusters,
+            rewritten_clusters = rewritten_count,
+            carried_clusters = num_clusters - rewritten_count,
+            "incremental build: rewrote touched clusters, carried the rest by reference"
+        );
+
         let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
-        // Stage 1: full-rewrite behavior preserved — every cluster is written
-        // under `new_segment_id`, so no carry-over map. Stage 3 replaces this
-        // with per-cluster carry-over. `deleted_ids` is accepted now so the
-        // signature is stable across stages.
-        let _ = deleted_ids;
-        Ok((num_clusters, bitmap_fields, Vec::new()))
+        // If every cluster was rewritten, return an empty owner map (equivalent
+        // to "all owned by new_segment_id") so the common full-rewrite case
+        // carries zero extra bytes in the manifest.
+        let owners_out = if rewritten_count == num_clusters {
+            Vec::new()
+        } else {
+            cluster_owners
+        };
+        Ok((num_clusters, bitmap_fields, owners_out))
     }
 }
 
@@ -998,13 +1187,21 @@ fn merge_pending_deletes(
 ///
 /// Fetches all clusters in parallel (2 S3 GETs per cluster) for ~15%
 /// compaction speedup vs sequential loading.
+///
+/// Returns the flattened vectors AND a map from vector ID to its cluster
+/// index in this segment. The map drives incremental compaction's
+/// touched-cluster detection (a WAL delete/update of an old member must
+/// mark that member's cluster for rewrite) — it includes IDs that a later
+/// merge step will drop, since the segment on S3 still contains them.
+/// The map is empty for hierarchical segments (incremental carry-over is
+/// IVF-Flat only).
 async fn load_segment_vectors(
     store: &ZeppelinStore,
     namespace: &str,
     segment_id: &str,
     is_hierarchical: bool,
     cluster_owners: &[String],
-) -> Result<Vec<VectorEntry>> {
+) -> Result<(Vec<VectorEntry>, HashMap<String, usize>)> {
     // Resolve cluster `i`'s owning segment ID (carried-over clusters live
     // under an older segment's keys; empty map ⇒ this segment owns all).
     let owner = |i: usize| -> &str {
@@ -1052,11 +1249,13 @@ async fn load_segment_vectors(
     // the cluster's attributes stripped — filtered queries would then
     // permanently exclude those vectors.
     let mut vectors = Vec::new();
-    for (_i, cluster_res, attrs_res) in cluster_results {
+    let mut id_to_cluster: HashMap<String, usize> = HashMap::new();
+    for (i, cluster_res, attrs_res) in cluster_results {
         let cluster = deserialize_cluster(&cluster_res?)?;
         let attrs = deserialize_attrs(&attrs_res?)?;
 
         for (j, id) in cluster.ids.into_iter().enumerate() {
+            id_to_cluster.insert(id.clone(), i);
             vectors.push(VectorEntry {
                 id,
                 values: cluster.vectors[j].clone(),
@@ -1071,7 +1270,7 @@ async fn load_segment_vectors(
         "loaded vectors from existing segment"
     );
 
-    Ok(vectors)
+    Ok((vectors, id_to_cluster))
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
