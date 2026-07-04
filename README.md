@@ -207,4 +207,8 @@ protect latency. Enable `fts_index` if you use `rank_by` at scale.
 
 ## License
 
-[Apache-2.0](https://opensource.org/licenses/Apache-2.0)
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright 2026 Anup Ghatage. See [NOTICE](NOTICE) — redistributions and
+derivative works must retain the attribution notices it contains, per
+Section 4(d) of the license.

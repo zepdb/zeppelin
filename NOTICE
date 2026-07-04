@@ -1,0 +1,12 @@
+Zeppelin
+Copyright 2026 Anup Ghatage
+
+This product includes software developed as part of the Zeppelin project
+(https://github.com/zepdb/zeppelin), an S3-native vector search engine.
+
+Portions of this software's design — including the write-ahead log of
+immutable fragments on object storage, the CAS-committed manifest as the
+single source of truth, lease-based single-writer fencing, and IVF-Flat
+segment/cluster layout on object storage — originate with this project.
+Redistributions and derivative works must retain this notice per
+Section 4(d) of the Apache License, Version 2.0.
