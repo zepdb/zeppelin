@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::error::Result;
 use crate::storage::ZeppelinStore;
-use crate::wal::Manifest;
+use crate::wal::{Manifest, ManifestVersion};
 
 /// In-memory manifest cache with per-namespace TTL and singleflight.
 ///
@@ -30,7 +30,9 @@ pub struct ManifestCache {
 
 struct CachedManifest {
     manifest: Manifest,
+    version: ManifestVersion,
     fetched_at: Instant,
+    verified_at: Option<Instant>,
 }
 
 impl ManifestCache {
@@ -42,6 +44,48 @@ impl ManifestCache {
             inflight: DashMap::new(),
             last_invalidated: DashMap::new(),
         }
+    }
+
+    fn inflight_lock(&self, namespace: &str) -> Arc<Mutex<()>> {
+        self.inflight
+            .entry(namespace.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value()
+            .clone()
+    }
+
+    fn cached_manifest(&self, namespace: &str) -> Option<(Manifest, ManifestVersion)> {
+        self.entries
+            .get(namespace)
+            .map(|entry| (entry.manifest.clone(), entry.version.clone()))
+    }
+
+    fn cached_verified_since(&self, namespace: &str, since: Instant) -> Option<Manifest> {
+        self.entries.get(namespace).and_then(|entry| {
+            entry
+                .verified_at
+                .filter(|verified_at| *verified_at >= since)
+                .map(|_| entry.manifest.clone())
+        })
+    }
+
+    async fn fetch_and_cache(&self, store: &ZeppelinStore, namespace: &str) -> Result<Manifest> {
+        let (manifest, version) = Manifest::read_versioned(store, namespace)
+            .await?
+            .unwrap_or_else(|| (Manifest::default(), ManifestVersion(None)));
+        let now = Instant::now();
+
+        self.entries.insert(
+            namespace.to_string(),
+            CachedManifest {
+                manifest: manifest.clone(),
+                version,
+                fetched_at: now,
+                verified_at: Some(now),
+            },
+        );
+
+        Ok(manifest)
     }
 
     /// Get the manifest for a namespace, using the cache if fresh.
@@ -59,12 +103,7 @@ impl ManifestCache {
         }
 
         // Singleflight: acquire per-namespace mutex so only one fetch proceeds.
-        let lock = self
-            .inflight
-            .entry(namespace.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .value()
-            .clone();
+        let lock = self.inflight_lock(namespace);
 
         let _guard = lock.lock().await;
 
@@ -76,17 +115,62 @@ impl ManifestCache {
         }
 
         // We won the race — fetch from S3.
-        let manifest = Manifest::read(store, namespace).await?.unwrap_or_default();
+        self.fetch_and_cache(store, namespace).await
+    }
 
-        self.entries.insert(
-            namespace.to_string(),
-            CachedManifest {
-                manifest: manifest.clone(),
-                fetched_at: Instant::now(),
-            },
-        );
+    /// Get the manifest for a strong read, verifying freshness against S3.
+    ///
+    /// Strong reads never trust the TTL alone. If the cache has an ETag, this
+    /// issues `If-None-Match`; unchanged manifests serve the cached value and
+    /// refresh the TTL, while changed manifests replace the cache. If the
+    /// cached entry has no ETag, this falls back to a full versioned read.
+    ///
+    /// Concurrent strong readers that arrive while a namespace freshness check
+    /// is in flight share that check's result.
+    pub async fn get_strong(&self, store: &ZeppelinStore, namespace: &str) -> Result<Manifest> {
+        let requested_at = Instant::now();
+        let lock = self.inflight_lock(namespace);
+        let _guard = lock.lock().await;
 
-        Ok(manifest)
+        if let Some(manifest) = self.cached_verified_since(namespace, requested_at) {
+            return Ok(manifest);
+        }
+
+        let Some((_, cached_version)) = self.cached_manifest(namespace) else {
+            return self.fetch_and_cache(store, namespace).await;
+        };
+
+        let Some(etag) = cached_version.0 else {
+            return self.fetch_and_cache(store, namespace).await;
+        };
+
+        let key = Manifest::s3_key(namespace);
+        match store.get_if_none_match(&key, &etag).await? {
+            Some((data, next_etag)) => {
+                let manifest = Manifest::from_bytes(&data)?;
+                let now = Instant::now();
+                self.entries.insert(
+                    namespace.to_string(),
+                    CachedManifest {
+                        manifest: manifest.clone(),
+                        version: ManifestVersion(next_etag),
+                        fetched_at: now,
+                        verified_at: Some(now),
+                    },
+                );
+                Ok(manifest)
+            }
+            None => {
+                let now = Instant::now();
+                if let Some(mut entry) = self.entries.get_mut(namespace) {
+                    entry.fetched_at = now;
+                    entry.verified_at = Some(now);
+                    Ok(entry.manifest.clone())
+                } else {
+                    self.fetch_and_cache(store, namespace).await
+                }
+            }
+        }
     }
 
     /// Insert a manifest directly into the cache (write-through).
@@ -116,7 +200,9 @@ impl ManifestCache {
             namespace.to_string(),
             CachedManifest {
                 manifest,
+                version: ManifestVersion(None),
                 fetched_at: Instant::now(),
+                verified_at: None,
             },
         );
     }

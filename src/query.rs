@@ -65,6 +65,21 @@ pub struct QueryParams<'a> {
     pub manifest_cache: Option<&'a Arc<ManifestCache>>,
 }
 
+async fn read_manifest_for_query(
+    store: &ZeppelinStore,
+    namespace: &str,
+    consistency: ConsistencyLevel,
+    manifest_cache: Option<&Arc<ManifestCache>>,
+) -> Result<Manifest> {
+    match manifest_cache {
+        Some(mc) => match consistency {
+            ConsistencyLevel::Strong => mc.get_strong(store, namespace).await,
+            ConsistencyLevel::Eventual => mc.get(store, namespace).await,
+        },
+        None => Ok(Manifest::read(store, namespace).await?.unwrap_or_default()),
+    }
+}
+
 /// Execute a query against a namespace, combining WAL scan and segment search.
 #[instrument(skip(params), fields(namespace = params.namespace))]
 pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
@@ -82,10 +97,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         cache,
         manifest_cache,
     } = params;
-    let manifest = match manifest_cache {
-        Some(mc) => mc.get(store, namespace).await?,
-        None => Manifest::read(store, namespace).await?.unwrap_or_default(),
-    };
+    let manifest = read_manifest_for_query(store, namespace, consistency, manifest_cache).await?;
 
     // WAL work and segment search are independent — they share only the
     // manifest snapshot — so run them concurrently. Strong scans and scores
@@ -394,10 +406,7 @@ pub async fn execute_bm25_query(
     fts_cache: Option<&Arc<WalFtsCache>>,
     max_full_scan_clusters: usize,
 ) -> Result<QueryResponse> {
-    let manifest = match manifest_cache {
-        Some(mc) => mc.get(store, namespace).await?,
-        None => Manifest::read(store, namespace).await?.unwrap_or_default(),
-    };
+    let manifest = read_manifest_for_query(store, namespace, consistency, manifest_cache).await?;
 
     // Evict compacted fragments from the FTS cache to prevent unbounded growth
     if let Some(cache) = fts_cache {

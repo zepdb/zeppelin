@@ -120,8 +120,11 @@ pub async fn build_app(
     // Initialize disk cache
     let cache = Arc::new(DiskCache::new(&config.cache)?);
 
-    // Initialize manifest cache (500ms TTL — drops ~27ms S3 GET per query)
-    let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(500)));
+    // Initialize manifest cache — drops one S3 GET from eventual queries while
+    // strong queries still verify freshness against S3.
+    let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(
+        config.cache.manifest_cache_ttl_ms,
+    )));
 
     // Initialize compactor
     let compactor = Arc::new(Compactor::new(

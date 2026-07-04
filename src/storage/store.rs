@@ -1,7 +1,9 @@
 use bytes::Bytes;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
-use object_store::{ClientOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{
+    ClientOptions, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion,
+};
 use std::sync::Arc;
 use tracing::{debug, instrument};
 
@@ -160,6 +162,68 @@ impl ZeppelinStore {
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
         Ok((bytes, etag))
+    }
+
+    /// Get an object only if its ETag differs from `etag`.
+    ///
+    /// Returns `Ok(None)` when storage reports the object has not changed
+    /// (`304 Not Modified`, surfaced by `object_store` as `NotModified`;
+    /// some S3-compatible stores surface this as `Precondition`).
+    #[instrument(skip(self), fields(key = key, etag = %etag))]
+    pub async fn get_if_none_match(
+        &self,
+        key: &str,
+        etag: &str,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
+        let start = std::time::Instant::now();
+        let path = Path::parse(key)?;
+        let options = GetOptions {
+            if_none_match: Some(etag.to_string()),
+            ..GetOptions::default()
+        };
+
+        let result = match self.inner.get_opts(&path, options).await {
+            Ok(result) => result,
+            Err(
+                object_store::Error::NotModified { .. } | object_store::Error::Precondition { .. },
+            ) => {
+                let elapsed = start.elapsed();
+                debug!(
+                    elapsed_ms = elapsed.as_millis(),
+                    etag = %etag,
+                    "s3 get_if_none_match not modified"
+                );
+                crate::metrics::S3_OPERATION_DURATION
+                    .with_label_values(&["get"])
+                    .observe(elapsed.as_secs_f64());
+                return Ok(None);
+            }
+            Err(e) => {
+                crate::metrics::S3_ERRORS_TOTAL
+                    .with_label_values(&["get"])
+                    .inc();
+                return Err(match e {
+                    object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
+                        key: path.to_string(),
+                    },
+                    other => ZeppelinError::Storage(other),
+                });
+            }
+        };
+
+        let next_etag = result.meta.e_tag.clone();
+        let bytes = result.bytes().await?;
+        let elapsed = start.elapsed();
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            size = bytes.len(),
+            etag = ?next_etag,
+            "s3 get_if_none_match modified"
+        );
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["get"])
+            .observe(elapsed.as_secs_f64());
+        Ok(Some((bytes, next_etag)))
     }
 
     /// Put an object only if the ETag matches (compare-and-swap).

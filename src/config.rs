@@ -159,6 +159,9 @@ pub struct CacheConfig {
     /// Default: 256 MB. Override via ZEPPELIN_MEMORY_CACHE_MAX_MB.
     #[serde(default = "default_memory_cache_max_mb")]
     pub memory_cache_max_mb: usize,
+    /// Manifest cache TTL in milliseconds. Default: `500`.
+    #[serde(default = "default_manifest_cache_ttl_ms")]
+    pub manifest_cache_ttl_ms: u64,
 }
 
 /// Vector indexing parameters controlling IVF-Flat, quantization, and hierarchical trees.
@@ -311,6 +314,9 @@ fn default_max_size_gb() -> u64 {
 fn default_memory_cache_max_mb() -> usize {
     256
 }
+fn default_manifest_cache_ttl_ms() -> u64 {
+    500
+}
 fn default_num_centroids() -> usize {
     256
 }
@@ -412,6 +418,7 @@ impl Default for CacheConfig {
             dir: default_cache_dir(),
             max_size_gb: default_max_size_gb(),
             memory_cache_max_mb: default_memory_cache_max_mb(),
+            manifest_cache_ttl_ms: default_manifest_cache_ttl_ms(),
         }
     }
 }
@@ -659,6 +666,12 @@ impl Config {
             .and_then(|v| v.parse().ok())
         {
             self.cache.memory_cache_max_mb = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MANIFEST_CACHE_TTL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.cache.manifest_cache_ttl_ms = v;
         }
 
         // Indexing
