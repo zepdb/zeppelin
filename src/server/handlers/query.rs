@@ -151,6 +151,7 @@ pub async fn query_namespace(
             req.last_as_prefix,
             Some(&state.manifest_cache),
             Some(&state.fts_cache),
+            Some(&state.cache),
             state.config.indexing.bm25_max_full_scan_clusters,
         )
         .await

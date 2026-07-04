@@ -115,6 +115,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
                     query,
                     filter,
                     distance_metric,
+                    cache,
                 )
                 .await?
             }
@@ -123,6 +124,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
                     .read_delete_ids_from_refs_unchecked(
                         namespace,
                         manifest.uncompacted_fragments(),
+                        cache,
                     )
                     .await?;
                 WalScanResult {
@@ -234,12 +236,13 @@ async fn wal_scan(
     query: &[f32],
     filter: Option<&Filter>,
     distance_metric: DistanceMetric,
+    cache: Option<&Arc<DiskCache>>,
 ) -> Result<WalScanResult> {
     let refs = manifest.uncompacted_fragments().to_vec();
     // Skip checksum validation on query reads — fragments were already
     // validated on write. Saves ~11% CPU on fragment deserialization.
     let fragments = wal_reader
-        .read_fragments_from_refs_unchecked(namespace, &refs)
+        .read_fragments_from_refs_unchecked(namespace, &refs, cache)
         .await?;
     let frag_count = fragments.len();
 
@@ -391,7 +394,19 @@ async fn segment_search(
 ///
 /// Combines WAL brute-force scan with segment inverted index search.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(store, wal_reader, rank_by, fts_configs, filter, manifest_cache, fts_cache), fields(namespace = namespace))]
+#[instrument(
+    skip(
+        store,
+        wal_reader,
+        rank_by,
+        fts_configs,
+        filter,
+        manifest_cache,
+        fts_cache,
+        cache
+    ),
+    fields(namespace = namespace)
+)]
 pub async fn execute_bm25_query(
     store: &ZeppelinStore,
     wal_reader: &WalReader,
@@ -404,6 +419,7 @@ pub async fn execute_bm25_query(
     last_as_prefix: bool,
     manifest_cache: Option<&Arc<ManifestCache>>,
     fts_cache: Option<&Arc<WalFtsCache>>,
+    cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
 ) -> Result<QueryResponse> {
     let manifest = read_manifest_for_query(store, namespace, consistency, manifest_cache).await?;
@@ -431,7 +447,7 @@ pub async fn execute_bm25_query(
                 let refs = manifest.uncompacted_fragments().to_vec();
                 // Skip checksum validation — already validated on write.
                 let fragments = wal_reader
-                    .read_fragments_from_refs_unchecked(namespace, &refs)
+                    .read_fragments_from_refs_unchecked(namespace, &refs, cache)
                     .await?;
                 let scan_result = wal_bm25_scan(
                     &fragments,
@@ -458,6 +474,7 @@ pub async fn execute_bm25_query(
                     .read_delete_ids_from_refs_unchecked(
                         namespace,
                         manifest.uncompacted_fragments(),
+                        cache,
                     )
                     .await?;
                 Vec::new()

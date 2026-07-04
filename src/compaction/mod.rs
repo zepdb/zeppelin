@@ -284,7 +284,7 @@ impl Compactor {
         // Uses unchecked read — fragments were validated on write.
         let fragments = self
             .wal_reader
-            .read_fragments_from_refs_unchecked(namespace, &fragment_refs)
+            .read_fragments_from_refs_unchecked(namespace, &fragment_refs, None)
             .await?;
 
         // 4. Merge vectors: process in manifest order (sequence number), latest wins.
