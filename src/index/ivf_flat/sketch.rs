@@ -1,10 +1,10 @@
 //! Resident coarse sketch for IVF-Flat segments.
 //!
 //! The sketch is a small immutable segment artifact built during compaction
-//! from corpus vectors only. It stores packed 4-bit product-quantization codes
-//! for every vector, ordered by IVF cluster. Query-time code scans this
-//! resident data inside the requested `nprobe` centroid set, selects a small
-//! cluster set, and the normal cluster reader performs exact rerank.
+//! from corpus vectors only. It stores product-quantization codes for every
+//! vector, ordered by IVF cluster. Query-time code scans this resident data
+//! inside the requested `nprobe` centroid set, selects a small cluster set,
+//! and the normal cluster reader performs exact rerank.
 
 use std::collections::HashMap;
 
@@ -16,17 +16,43 @@ use crate::types::{AttributeValue, DistanceMetric};
 use crate::wal::manifest::SketchRef;
 
 const SKETCH_MAGIC: &[u8; 4] = b"ZSK1";
-const SKETCH_VERSION: u32 = 2;
-const SKETCH_MAX_SUBQUANTIZERS: usize = 96;
-const SKETCH_K: usize = 16;
+const SKETCH_VERSION: u32 = 3;
+const SKETCH_V2_VERSION: u32 = 2;
+const SKETCH_V2_K: usize = 16;
+const SKETCH_V3_K: usize = 256;
+const SKETCH_MAX_SUBQUANTIZERS: usize = 64;
+const SKETCH_K: usize = SKETCH_V3_K;
 const SKETCH_TRAIN_SAMPLE: usize = 4096;
 const SKETCH_TRAIN_ITERS: usize = 6;
-const SKETCH_CLUSTER_SCORE_TOP_M: usize = 4;
+const SKETCH_CLUSTER_SCORE_TOP_M: usize = 2;
+const SKETCH_CENTROID_ANCHORS: usize = 2;
+const SKETCH_CODE_WIDTH: SketchCodeWidth = SketchCodeWidth::EightBit;
 
 /// S3 key for the resident coarse sketch.
 #[must_use]
 pub fn sketch_key(namespace: &str, segment_id: &str) -> String {
     format!("{namespace}/segments/{segment_id}/coarse_sketch.bin")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SketchCodeWidth {
+    FourBit,
+    EightBit,
+}
+
+impl SketchCodeWidth {
+    fn packed_code_bytes(self, subquantizers: usize) -> usize {
+        match self {
+            Self::FourBit => subquantizers.div_ceil(2),
+            Self::EightBit => subquantizers,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SketchFormat {
+    codebook_size: usize,
+    code_width: SketchCodeWidth,
 }
 
 /// In-memory resident sketch loaded from the immutable segment artifact.
@@ -36,10 +62,12 @@ pub(crate) struct ResidentSketch {
     subquantizers: usize,
     cluster_count: usize,
     codebook: Vec<f32>,
+    codebook_size: usize,
     cluster_offsets: Vec<(usize, usize)>,
     codes: Bytes,
     cluster_has_attrs: Vec<bool>,
     packed_code_bytes: usize,
+    code_width: SketchCodeWidth,
 }
 
 impl ResidentSketch {
@@ -55,11 +83,7 @@ impl ResidentSketch {
         }
 
         let version = read_u32(data, 4, "coarse sketch version")?;
-        if version != SKETCH_VERSION {
-            return Err(ZeppelinError::Index(format!(
-                "unsupported coarse sketch version: {version}"
-            )));
-        }
+        let format = sketch_format(version)?;
         let dim = read_u32(data, 8, "coarse sketch dim")? as usize;
         let subquantizers = read_u32(data, 12, "coarse sketch subquantizers")? as usize;
         let cluster_count = read_u32(data, 16, "coarse sketch cluster_count")? as usize;
@@ -79,7 +103,7 @@ impl ResidentSketch {
             ));
         }
 
-        let codebook_floats = dim.checked_mul(SKETCH_K).ok_or_else(|| {
+        let codebook_floats = dim.checked_mul(format.codebook_size).ok_or_else(|| {
             ZeppelinError::Index(format!("coarse sketch codebook overflows: dim={dim}"))
         })?;
         let codebook_bytes = codebook_floats.checked_mul(4).ok_or_else(|| {
@@ -93,7 +117,7 @@ impl ResidentSketch {
                 "coarse sketch cluster counts overflows: clusters={cluster_count}"
             ))
         })?;
-        let packed_code_bytes = packed_code_bytes(subquantizers);
+        let packed_code_bytes = format.code_width.packed_code_bytes(subquantizers);
         let all_codes_bytes = vector_count.checked_mul(packed_code_bytes).ok_or_else(|| {
             ZeppelinError::Index(format!(
                 "coarse sketch code section overflows: vectors={vector_count}, bytes_per_code={packed_code_bytes}"
@@ -164,10 +188,12 @@ impl ResidentSketch {
             subquantizers,
             cluster_count,
             codebook,
+            codebook_size: format.codebook_size,
             cluster_offsets,
             codes: Bytes::copy_from_slice(&data[codes_offset..expected]),
             cluster_has_attrs,
             packed_code_bytes,
+            code_width: format.code_width,
         })
     }
 
@@ -258,11 +284,23 @@ impl ResidentSketch {
                 })
         });
 
-        let mut selected: Vec<usize> = ranked_clusters
-            .into_iter()
-            .take(cluster_budget.min(probe_clusters.len()))
-            .map(|score| score.cluster_idx)
-            .collect();
+        let mut selected = Vec::with_capacity(cluster_budget.min(probe_clusters.len()));
+        let anchor_budget = centroid_anchor_budget(cluster_budget, probe_clusters.len());
+        for &cluster_idx in probe_clusters.iter().take(anchor_budget) {
+            let (start, end) = self.cluster_offsets[cluster_idx];
+            if start != end {
+                selected.push(cluster_idx);
+            }
+        }
+
+        for score in ranked_clusters {
+            if selected.len() >= cluster_budget || selected.len() >= probe_clusters.len() {
+                break;
+            }
+            if !selected.contains(&score.cluster_idx) {
+                selected.push(score.cluster_idx);
+            }
+        }
 
         for &cluster_idx in probe_clusters {
             if selected.len() >= cluster_budget || selected.len() >= probe_clusters.len() {
@@ -276,14 +314,15 @@ impl ResidentSketch {
     }
 
     fn build_adc_table(&self, query: &[f32], distance_metric: DistanceMetric) -> Vec<f32> {
-        let mut table = vec![0.0f32; self.subquantizers * SKETCH_K];
+        let mut table = vec![0.0f32; self.subquantizers * self.codebook_size];
         for subq in 0..self.subquantizers {
             let (start, end) = chunk_range(self.dim, self.subquantizers, subq);
-            for code in 0..SKETCH_K {
-                let centroid_offset = codebook_offset(self.dim, self.subquantizers, subq, code);
+            for code in 0..self.codebook_size {
+                let centroid_offset =
+                    codebook_offset(self.dim, self.subquantizers, self.codebook_size, subq, code);
                 let centroid = &self.codebook[centroid_offset..centroid_offset + (end - start)];
                 let q = &query[start..end];
-                table[subq * SKETCH_K + code] = match distance_metric {
+                table[subq * self.codebook_size + code] = match distance_metric {
                     DistanceMetric::DotProduct => -dot(q, centroid),
                     DistanceMetric::Cosine | DistanceMetric::Euclidean => sq_l2(q, centroid),
                 };
@@ -296,8 +335,8 @@ impl ResidentSketch {
     fn adc_score(&self, adc_table: &[f32], packed_codes: &[u8]) -> f32 {
         let mut score = 0.0;
         for subq in 0..self.subquantizers {
-            let code = unpack_nibble(packed_codes, subq) as usize;
-            score += adc_table[subq * SKETCH_K + code];
+            let code = unpack_code(packed_codes, subq, self.code_width) as usize;
+            score += adc_table[subq * self.codebook_size + code];
         }
         score
     }
@@ -332,7 +371,8 @@ pub(crate) fn build_resident_sketch(
     }
 
     let subquantizers = SKETCH_MAX_SUBQUANTIZERS.min(dim).max(1);
-    let packed_code_bytes = packed_code_bytes(subquantizers);
+    let code_width = SKETCH_CODE_WIDTH;
+    let packed_code_bytes = code_width.packed_code_bytes(subquantizers);
     let all_vectors: Vec<&[f32]> = cluster_vecs
         .iter()
         .flat_map(|cluster| cluster.iter().map(Vec::as_slice))
@@ -382,9 +422,15 @@ pub(crate) fn build_resident_sketch(
             let mut packed = vec![0u8; packed_code_bytes];
             for subq in 0..subquantizers {
                 let (start, end) = chunk_range(dim, subquantizers, subq);
-                let code =
-                    encode_subvector(&codebook, dim, subquantizers, subq, &vector[start..end]);
-                pack_nibble(&mut packed, subq, code);
+                let code = encode_subvector(
+                    &codebook,
+                    dim,
+                    subquantizers,
+                    SKETCH_K,
+                    subq,
+                    &vector[start..end],
+                );
+                pack_code(&mut packed, subq, code, code_width);
             }
             codes.extend_from_slice(&packed);
         }
@@ -486,20 +532,38 @@ fn sample_indices(vector_count: usize, sample_count: usize) -> Vec<usize> {
         .collect()
 }
 
+fn sketch_format(version: u32) -> Result<SketchFormat> {
+    match version {
+        SKETCH_V2_VERSION => Ok(SketchFormat {
+            codebook_size: SKETCH_V2_K,
+            code_width: SketchCodeWidth::FourBit,
+        }),
+        SKETCH_VERSION => Ok(SketchFormat {
+            codebook_size: SKETCH_V3_K,
+            code_width: SketchCodeWidth::EightBit,
+        }),
+        _ => Err(ZeppelinError::Index(format!(
+            "unsupported coarse sketch version: {version}"
+        ))),
+    }
+}
+
 #[inline]
 fn encode_subvector(
     codebook: &[f32],
     dim: usize,
     subquantizers: usize,
+    codebook_size: usize,
     subq: usize,
     vector: &[f32],
 ) -> u8 {
     let (start, end) = chunk_range(dim, subquantizers, subq);
     debug_assert_eq!(vector.len(), end - start);
+    debug_assert!(codebook_size <= u8::MAX as usize + 1);
     let mut best_code = 0u8;
     let mut best_dist = f32::INFINITY;
-    for code in 0..SKETCH_K {
-        let offset = codebook_offset(dim, subquantizers, subq, code);
+    for code in 0..codebook_size {
+        let offset = codebook_offset(dim, subquantizers, codebook_size, subq, code);
         let centroid = &codebook[offset..offset + vector.len()];
         let dist = sq_l2(vector, centroid);
         if dist < best_dist {
@@ -510,11 +574,17 @@ fn encode_subvector(
     best_code
 }
 
-fn codebook_offset(dim: usize, subquantizers: usize, subq: usize, code: usize) -> usize {
+fn codebook_offset(
+    dim: usize,
+    subquantizers: usize,
+    codebook_size: usize,
+    subq: usize,
+    code: usize,
+) -> usize {
     let mut offset = 0usize;
     for prev in 0..subq {
         let (start, end) = chunk_range(dim, subquantizers, prev);
-        offset += SKETCH_K * (end - start);
+        offset += codebook_size * (end - start);
     }
     let (start, end) = chunk_range(dim, subquantizers, subq);
     offset + code * (end - start)
@@ -526,8 +596,32 @@ fn chunk_range(dim: usize, chunks: usize, chunk: usize) -> (usize, usize) {
     (start, end)
 }
 
+#[cfg(test)]
 fn packed_code_bytes(subquantizers: usize) -> usize {
-    subquantizers.div_ceil(2)
+    SKETCH_CODE_WIDTH.packed_code_bytes(subquantizers)
+}
+
+fn centroid_anchor_budget(cluster_budget: usize, probe_count: usize) -> usize {
+    if cluster_budget < SKETCH_CENTROID_ANCHORS * 3 {
+        return 0;
+    }
+    SKETCH_CENTROID_ANCHORS.min(cluster_budget).min(probe_count)
+}
+
+fn pack_code(bytes: &mut [u8], index: usize, value: u8, code_width: SketchCodeWidth) {
+    match code_width {
+        SketchCodeWidth::FourBit => pack_nibble(bytes, index, value),
+        SketchCodeWidth::EightBit => {
+            bytes[index] = value;
+        }
+    }
+}
+
+fn unpack_code(bytes: &[u8], index: usize, code_width: SketchCodeWidth) -> u8 {
+    match code_width {
+        SketchCodeWidth::FourBit => unpack_nibble(bytes, index),
+        SketchCodeWidth::EightBit => bytes[index],
+    }
 }
 
 fn pack_nibble(bytes: &mut [u8], index: usize, value: u8) {
@@ -650,7 +744,7 @@ mod tests {
         let mut code_bytes = Vec::new();
         for code in [0u8, 4, 4, 4, 1, 1, 1, 1] {
             let mut packed = vec![0u8; 1];
-            pack_nibble(&mut packed, 0, code);
+            pack_code(&mut packed, 0, code, SKETCH_CODE_WIDTH);
             code_bytes.extend_from_slice(&packed);
         }
 
@@ -659,10 +753,12 @@ mod tests {
             subquantizers: 1,
             cluster_count: 2,
             codebook,
+            codebook_size: SKETCH_K,
             cluster_offsets: vec![(0, 4), (4, 8)],
             codes: Bytes::from(code_bytes),
             cluster_has_attrs: vec![false, false],
             packed_code_bytes: 1,
+            code_width: SKETCH_CODE_WIDTH,
         };
 
         let selected = sketch
@@ -670,5 +766,81 @@ mod tests {
             .unwrap();
 
         assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn sketch_code_bytes_stay_within_resident_fence() {
+        assert_eq!(packed_code_bytes(SKETCH_MAX_SUBQUANTIZERS), 64);
+    }
+
+    #[test]
+    fn cluster_selection_anchors_nearest_centroid_clusters() {
+        let mut codebook = Vec::with_capacity(SKETCH_K);
+        for value in 0..SKETCH_K {
+            codebook.push(value as f32);
+        }
+
+        let mut code_bytes = Vec::new();
+        for code in [15u8, 0, 0, 0, 0, 0, 0, 0] {
+            let mut packed = vec![0u8; 1];
+            pack_code(&mut packed, 0, code, SKETCH_CODE_WIDTH);
+            code_bytes.extend_from_slice(&packed);
+        }
+
+        let sketch = ResidentSketch {
+            dim: 1,
+            subquantizers: 1,
+            cluster_count: 8,
+            codebook,
+            codebook_size: SKETCH_K,
+            cluster_offsets: (0..8).map(|row| (row, row + 1)).collect(),
+            codes: Bytes::from(code_bytes),
+            cluster_has_attrs: vec![false; 8],
+            packed_code_bytes: 1,
+            code_width: SKETCH_CODE_WIDTH,
+        };
+
+        let selected = sketch
+            .select_clusters(
+                &[0.0],
+                DistanceMetric::Euclidean,
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                6,
+            )
+            .unwrap();
+
+        assert!(selected.contains(&0));
+        assert!(selected.contains(&1));
+        assert_eq!(selected.len(), 6);
+    }
+
+    #[test]
+    fn v2_four_bit_sketch_still_decodes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SKETCH_MAGIC);
+        bytes.extend_from_slice(&SKETCH_V2_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // dim
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // subquantizers
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // cluster_count
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // vector_count
+
+        for value in 0..SKETCH_V2_K {
+            bytes.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        bytes.push(0); // attr bits
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // cluster 0 count
+        let mut code = vec![0u8; 1];
+        pack_nibble(&mut code, 0, 1);
+        bytes.extend_from_slice(&code);
+
+        let sketch = ResidentSketch::from_bytes(&bytes).unwrap();
+        assert_eq!(sketch.codebook_size, SKETCH_V2_K);
+        assert_eq!(sketch.code_width, SketchCodeWidth::FourBit);
+        assert_eq!(sketch.packed_code_bytes, 1);
+
+        let selected = sketch
+            .select_clusters(&[0.0], DistanceMetric::Euclidean, &[0], 1)
+            .unwrap();
+        assert_eq!(selected, vec![0]);
     }
 }
