@@ -210,11 +210,26 @@ impl WalReader {
             return self.store.get(&s3_key).await;
         };
 
+        // A cache HIT serves the immutable fragment without S3. On a MISS we
+        // fetch from S3 (the consumed read — its failure must propagate) and
+        // then populate the cache BEST-EFFORT: caching is an optimization, so a
+        // cache-write failure (e.g. disk full, or a torn-down cache dir) must
+        // never fail a query that already has the bytes. Degrade to
+        // served-from-S3-uncached, log, and move on.
         let cache_key = Self::fragment_cache_key(fragment_id);
-        let store = self.store.clone();
-        cache
-            .get_or_fetch(&cache_key, move || async move { store.get(&s3_key).await })
-            .await
+        if let Some(data) = cache.get(&cache_key).await {
+            return Ok(data);
+        }
+        let data = self.store.get(&s3_key).await?;
+        if let Err(e) = cache.put(&cache_key, &data).await {
+            warn!(
+                namespace = namespace,
+                fragment_id = %fragment_id,
+                error = %e,
+                "WAL fragment cache write failed; serving from S3 uncached"
+            );
+        }
+        Ok(data)
     }
 
     #[must_use]

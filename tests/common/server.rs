@@ -233,7 +233,14 @@ pub async fn start_test_server_with_compaction(
 
 /// Start a test server with default config, returning (base_url, harness).
 pub async fn start_test_server() -> (String, TestHarness) {
-    let (url, harness, _cache, _dir) = start_test_server_with_config(None).await;
+    let (url, harness, _cache, dir) = start_test_server_with_config(None).await;
+    // The DiskCache lives in `dir`. This helper's caller does not receive the
+    // TempDir handle, so if we let it drop here the cache directory is deleted
+    // out from under the still-running server — every cache write then fails
+    // (learnings rule 6: keep TempDir alive for the lifetime of anything using
+    // its path). Disarm the auto-delete so the dir survives for the test
+    // process; the OS reclaims the temp space afterwards.
+    let _ = dir.keep();
     (url, harness)
 }
 
