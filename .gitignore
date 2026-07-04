@@ -65,3 +65,7 @@ result_*.txt
 
 # Claude Code local settings
 .claude/
+
+# Local worktrees and session artifacts
+.ext-worktrees/
+.tokensave/
