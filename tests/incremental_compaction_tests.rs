@@ -15,12 +15,14 @@
 
 mod common;
 
+use bytes::Bytes;
 use common::harness::TestHarness;
 use common::vectors::clustered_vectors;
 
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::index::ivf_flat::build::build_ivf_flat;
+use zeppelin::index::quantization::sq::{serialize_sq_cluster, SqCalibration};
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
@@ -139,34 +141,75 @@ fn incremental_compactor_quantized(
     )
 }
 
-/// Like [`seed_segment`] but builds the initial segment with a specific
-/// quantization type and records it in the manifest. Returns (seg_id, vectors).
-async fn seed_segment_quantized(
-    store: &ZeppelinStore,
-    ns: &str,
-    quantization: zeppelin::index::quantization::QuantizationType,
-) -> (String, Vec<VectorEntry>) {
-    let (vectors, _centroids) = clustered_vectors(N_CLUSTERS, 20, DIM, 0.01);
-    let indexing_config = IndexingConfig {
-        default_num_centroids: N_CLUSTERS,
-        kmeans_max_iterations: 25,
-        quantization,
-        bitmap_index: false,
-        fts_index: false,
-        hierarchical: false,
-        ..Default::default()
-    };
+/// Seed a pre-C.0b SQ8 segment in the legacy physical layout:
+/// centroids.bin without magic, cluster_i.bin full vectors, sq_cluster_i.bin
+/// sidecars, and sq_calibration.bin. This fixture proves incremental
+/// compaction can carry old-format clusters into a new-format active segment.
+async fn seed_legacy_sq8_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEntry>) {
+    let (vectors, centroids) = clustered_vectors(N_CLUSTERS, 20, DIM, 0.01);
     let seg_id = "seg_seed";
-    let index = build_ivf_flat(&vectors, &indexing_config, store, ns, seg_id)
+
+    let refs: Vec<&[f32]> = vectors.iter().map(|v| v.values.as_slice()).collect();
+    let calibration = SqCalibration::calibrate(&refs, DIM);
+    store
+        .put(
+            &format!("{ns}/segments/{seg_id}/centroids.bin"),
+            legacy_centroids_bytes(&centroids, DIM),
+        )
         .await
         .unwrap();
+    store
+        .put(
+            &format!("{ns}/segments/{seg_id}/sq_calibration.bin"),
+            calibration.to_bytes(),
+        )
+        .await
+        .unwrap();
+
+    for cluster_idx in 0..N_CLUSTERS {
+        let prefix = format!("cluster_{cluster_idx}_");
+        let cluster: Vec<&VectorEntry> = vectors
+            .iter()
+            .filter(|vector| vector.id.starts_with(&prefix))
+            .collect();
+        let ids: Vec<String> = cluster.iter().map(|vector| vector.id.clone()).collect();
+        let values: Vec<Vec<f32>> = cluster.iter().map(|vector| vector.values.clone()).collect();
+        let attrs: Vec<_> = cluster
+            .iter()
+            .map(|vector| vector.attributes.clone())
+            .collect();
+        let cluster_refs: Vec<&[f32]> = values.iter().map(|values| values.as_slice()).collect();
+        let codes = calibration.encode_batch(&cluster_refs);
+
+        store
+            .put(
+                &format!("{ns}/segments/{seg_id}/cluster_{cluster_idx}.bin"),
+                legacy_cluster_bytes(&ids, &values, DIM),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &format!("{ns}/segments/{seg_id}/attrs_{cluster_idx}.bin"),
+                Bytes::from(serde_json::to_vec(&attrs).unwrap()),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &format!("{ns}/segments/{seg_id}/sq_cluster_{cluster_idx}.bin"),
+                serialize_sq_cluster(&ids, &codes, DIM).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
 
     let mut manifest = Manifest::new();
     manifest.add_segment(SegmentRef {
         id: seg_id.to_string(),
         vector_count: vectors.len(),
-        cluster_count: index.num_clusters(),
-        quantization,
+        cluster_count: N_CLUSTERS,
+        quantization: zeppelin::index::quantization::QuantizationType::Scalar,
         hierarchical: false,
         bitmap_fields: Vec::new(),
         fts_fields: Vec::new(),
@@ -175,6 +218,33 @@ async fn seed_segment_quantized(
     });
     manifest.write(store, ns).await.unwrap();
     (seg_id.to_string(), vectors)
+}
+
+fn legacy_centroids_bytes(centroids: &[Vec<f32>], dim: usize) -> Bytes {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(centroids.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(dim as u32).to_le_bytes());
+    for centroid in centroids {
+        for value in centroid {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    Bytes::from(buf)
+}
+
+fn legacy_cluster_bytes(ids: &[String], vectors: &[Vec<f32>], dim: usize) -> Bytes {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(dim as u32).to_le_bytes());
+    for (id, vector) in ids.iter().zip(vectors) {
+        let id_bytes = id.as_bytes();
+        buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(id_bytes);
+        for value in vector {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    Bytes::from(buf)
 }
 
 /// Run a Strong query and return the result IDs (order-independent set).
@@ -569,7 +639,7 @@ async fn test_incremental_sq8_carryover_decodes_correctly() {
     let ns = harness.key("incr-sq8-carry");
     let store = &harness.store;
 
-    let (seed_id, seed_vecs) = seed_segment_quantized(store, &ns, QuantizationType::Scalar).await;
+    let (seed_id, seed_vecs) = seed_legacy_sq8_segment(store, &ns).await;
 
     // Touch only cluster 0 (adds sit on a cluster_0 member).
     let anchor0 = &seed_vecs[0].values;
@@ -600,10 +670,32 @@ async fn test_incremental_sq8_carryover_decodes_correctly() {
     );
     // The SQ calibration must be COPIED to the new segment (segment-global), or
     // reads of carried SQ clusters would decode against a missing/wrong table.
+    // Phase C.0b stores that copied payload inside centroids.bin instead of a
+    // separate sq_calibration.bin sidecar.
+    let centroids_key = format!("{ns}/segments/{new_seg}/centroids.bin");
+    let centroids = store.get(&centroids_key).await.unwrap();
+    assert!(
+        centroids.starts_with(b"ZCT2"),
+        "new segment centroids must use the v2 format"
+    );
+    let num_centroids = u32::from_le_bytes(centroids[4..8].try_into().unwrap()) as usize;
+    let dim = u32::from_le_bytes(centroids[8..12].try_into().unwrap()) as usize;
+    let cal_len_offset = 12 + num_centroids * dim * 4;
+    let cal_len = u64::from_le_bytes(
+        centroids[cal_len_offset..cal_len_offset + 8]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    assert!(cal_len > 0, "SQ calibration must be embedded in centroids");
+    assert_eq!(
+        centroids.len(),
+        cal_len_offset + 8 + cal_len,
+        "embedded SQ calibration length must match centroids blob size"
+    );
     let new_cal_key = format!("{ns}/segments/{new_seg}/sq_calibration.bin");
     assert!(
-        store.exists(&new_cal_key).await.unwrap(),
-        "SQ calibration must be copied to the new segment"
+        !store.exists(&new_cal_key).await.unwrap(),
+        "new SQ8 segments must not write a separate calibration sidecar"
     );
     // At least one cluster carried over (owner still the seed).
     let carried: Vec<usize> = (0..seg_ref.cluster_count)

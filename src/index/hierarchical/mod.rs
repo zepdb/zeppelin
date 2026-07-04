@@ -40,6 +40,12 @@ pub struct TreeMeta {
     pub num_leaf_clusters: usize,
     /// Quantization type used at the leaf level.
     pub quantization: QuantizationType,
+    /// Embedded legacy SQ calibration bytes for new scalar-quantized segments.
+    ///
+    /// Older tree metadata omits this field and scalar search falls back to
+    /// `sq_calibration.bin`.
+    #[serde(default)]
+    pub sq_calibration: Option<Vec<u8>>,
 }
 
 /// A single node in the centroid tree, stored as a binary blob on S3.
@@ -360,6 +366,7 @@ mod tests {
             root_node_id: "root".to_string(),
             num_leaf_clusters: 10_000,
             quantization: QuantizationType::None,
+            sq_calibration: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: TreeMeta = serde_json::from_str(&json).unwrap();

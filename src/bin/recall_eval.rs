@@ -15,6 +15,7 @@ use zeppelin::compaction::Compactor;
 use zeppelin::config::{Config, StorageBackend, StorageConfig};
 use zeppelin::error::ZeppelinError;
 use zeppelin::index::distance::compute_distance;
+use zeppelin::index::ivf_flat::build::centroids_key;
 use zeppelin::index::quantization::sq::{sq_calibration_key, sq_cluster_key, SqCalibration};
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::manager::NamespaceManager;
@@ -1037,19 +1038,86 @@ async fn verify_compacted_sq8_segment(
         ));
     }
 
-    let calibration_key = sq_calibration_key(namespace, active_segment_id);
-    let calibration = store.get(&calibration_key).await?;
-    let parsed = SqCalibration::from_bytes(&calibration)?;
+    let centroids = store
+        .get(&centroids_key(namespace, active_segment_id))
+        .await?;
+    let parsed =
+        if centroids.starts_with(b"ZCT2") {
+            if centroids.len() < 20 {
+                return Err(RecallEvalError::Integrity(
+                    "v2 centroids blob too small for SQ calibration".into(),
+                ));
+            }
+            let num_centroids =
+                u32::from_le_bytes(centroids[4..8].try_into().map_err(|_| {
+                    RecallEvalError::Integrity("v2 centroids count parse error".into())
+                })?) as usize;
+            let dim = u32::from_le_bytes(centroids[8..12].try_into().map_err(|_| {
+                RecallEvalError::Integrity("v2 centroids dimension parse error".into())
+            })?) as usize;
+            let cal_len_offset = 12usize
+                .checked_add(
+                    num_centroids
+                        .checked_mul(dim)
+                        .and_then(|v| v.checked_mul(4))
+                        .ok_or_else(|| {
+                            RecallEvalError::Integrity(format!(
+                            "v2 centroids float section overflows: n={num_centroids}, dim={dim}"
+                        ))
+                        })?,
+                )
+                .ok_or_else(|| RecallEvalError::Integrity("v2 centroids offset overflow".into()))?;
+            if centroids.len() < cal_len_offset + 8 {
+                return Err(RecallEvalError::Integrity(
+                    "v2 centroids blob truncated before SQ calibration length".into(),
+                ));
+            }
+            let cal_len = u64::from_le_bytes(
+                centroids[cal_len_offset..cal_len_offset + 8]
+                    .try_into()
+                    .map_err(|_| {
+                        RecallEvalError::Integrity("v2 SQ calibration length parse error".into())
+                    })?,
+            ) as usize;
+            if cal_len == 0 {
+                return Err(RecallEvalError::Integrity(
+                    "v2 SQ8 segment has no embedded SQ calibration".into(),
+                ));
+            }
+            let cal_start = cal_len_offset + 8;
+            let cal_end = cal_start
+                .checked_add(cal_len)
+                .ok_or_else(|| RecallEvalError::Integrity("v2 SQ calibration overflow".into()))?;
+            if centroids.len() != cal_end {
+                return Err(RecallEvalError::Integrity(
+                    "v2 centroids SQ calibration length does not match object size".into(),
+                ));
+            }
+            SqCalibration::from_bytes(&centroids[cal_start..cal_end])?
+        } else {
+            let calibration_key = sq_calibration_key(namespace, active_segment_id);
+            let calibration = store.get(&calibration_key).await?;
+            SqCalibration::from_bytes(&calibration)?
+        };
     if parsed.dim == 0 {
         return Err(RecallEvalError::Integrity(
             "SQ calibration has zero dimensions".into(),
         ));
     }
     let cluster_zero_key = sq_cluster_key(namespace, segment.cluster_owner(0), 0);
-    let sq_cluster_zero_present = store.exists(&cluster_zero_key).await?;
+    let colocated_cluster_zero_key = format!(
+        "{namespace}/segments/{}/cluster_0.bin",
+        segment.cluster_owner(0)
+    );
+    let colocated_cluster_zero_present = match store.get(&colocated_cluster_zero_key).await {
+        Ok(data) => data.starts_with(b"ZCL2"),
+        Err(_) => false,
+    };
+    let sq_cluster_zero_present =
+        colocated_cluster_zero_present || store.exists(&cluster_zero_key).await?;
     if !sq_cluster_zero_present {
         return Err(RecallEvalError::Integrity(format!(
-            "missing SQ8 cluster artifact {cluster_zero_key}"
+            "missing SQ8 cluster artifact {cluster_zero_key} or co-located {colocated_cluster_zero_key}"
         )));
     }
 

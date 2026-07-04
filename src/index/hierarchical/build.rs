@@ -13,8 +13,11 @@ use ulid::Ulid;
 use crate::config::IndexingConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::index::distance;
-use crate::index::ivf_flat::build::{attrs_key, cluster_key, serialize_attrs, serialize_cluster};
+use crate::index::ivf_flat::build::{
+    attrs_key, cluster_key, serialize_attrs, serialize_cluster, serialize_colocated_sq_cluster,
+};
 use crate::index::ivf_flat::kmeans::train_kmeans;
+use crate::index::quantization::sq::SqCalibration;
 use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, VectorEntry};
@@ -72,6 +75,12 @@ pub async fn build_hierarchical(
         .leaf_size
         .unwrap_or(DEFAULT_LEAF_SIZE)
         .max(branching_factor * 2);
+    let vec_refs: Vec<&[f32]> = vectors.iter().map(|v| v.values.as_slice()).collect();
+    let sq_calibration = if matches!(config.quantization, QuantizationType::Scalar) {
+        Some(SqCalibration::calibrate(&vec_refs, dim))
+    } else {
+        None
+    };
 
     info!(
         n = vectors.len(),
@@ -92,6 +101,7 @@ pub async fn build_hierarchical(
         store,
         namespace,
         segment_id,
+        sq_calibration.as_ref(),
         &mut next_cluster_idx,
         1, // current depth
         &mut num_levels,
@@ -144,6 +154,9 @@ pub async fn build_hierarchical(
         root_node_id: root_node_id.clone(),
         num_leaf_clusters: next_cluster_idx,
         quantization: config.quantization,
+        sq_calibration: sq_calibration
+            .as_ref()
+            .map(|calibration| calibration.to_bytes().to_vec()),
     };
 
     // Write tree metadata.
@@ -198,6 +211,7 @@ async fn build_subtree(
     store: &ZeppelinStore,
     namespace: &str,
     segment_id: &str,
+    sq_calibration: Option<&SqCalibration>,
     next_cluster_idx: &mut usize,
     depth: usize,
     max_depth: &mut usize,
@@ -217,6 +231,7 @@ async fn build_subtree(
             store,
             namespace,
             segment_id,
+            sq_calibration,
             config.bitmap_index,
         )
         .await?;
@@ -283,6 +298,7 @@ async fn build_subtree(
             store,
             namespace,
             segment_id,
+            sq_calibration,
             next_cluster_idx,
             depth + 1,
             max_depth,
@@ -330,6 +346,7 @@ async fn build_subtree(
 }
 
 /// Write a leaf cluster's data (vectors + attributes) in IVF-Flat format.
+#[allow(clippy::too_many_arguments)]
 async fn write_leaf_cluster(
     vectors: &[VectorEntry],
     dim: usize,
@@ -337,6 +354,7 @@ async fn write_leaf_cluster(
     store: &ZeppelinStore,
     namespace: &str,
     segment_id: &str,
+    sq_calibration: Option<&SqCalibration>,
     bitmap_index_enabled: bool,
 ) -> Result<()> {
     let ids: Vec<String> = vectors.iter().map(|v| v.id.clone()).collect();
@@ -345,7 +363,13 @@ async fn write_leaf_cluster(
         vectors.iter().map(|v| v.attributes.clone()).collect();
 
     // CPU phase: serialize all payloads.
-    let cvec_data = serialize_cluster(&ids, &vecs, dim)?;
+    let cvec_data = if let Some(calibration) = sq_calibration {
+        let vec_refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
+        let codes = calibration.encode_batch(&vec_refs);
+        serialize_colocated_sq_cluster(&ids, &vecs, &codes, dim)?
+    } else {
+        serialize_cluster(&ids, &vecs, dim)?
+    };
     let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
 
     let cattr_data = serialize_attrs(&attrs)?;
@@ -395,47 +419,7 @@ async fn write_quantized_artifacts(
 ) -> Result<()> {
     match config.quantization {
         QuantizationType::Scalar => {
-            use crate::index::quantization::sq::{
-                serialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
-            };
-
-            // Calibrate on all vectors globally.
-            let vec_refs: Vec<&[f32]> = vectors.iter().map(|v| v.values.as_slice()).collect();
-            let cal = SqCalibration::calibrate(&vec_refs, dim);
-            store
-                .put(&sq_calibration_key(namespace, segment_id), cal.to_bytes())
-                .await?;
-            debug!("wrote SQ8 calibration");
-
-            // Phase 1: Parallel reads of all leaf clusters.
-            let read_keys: Vec<String> = (0..num_clusters)
-                .map(|i| cluster_key(namespace, segment_id, i))
-                .collect();
-            let read_futs: Vec<_> = read_keys.iter().map(|k| store.get(k)).collect();
-            let read_results = futures::future::join_all(read_futs).await;
-
-            // Phase 2: CPU — deserialize, encode, serialize.
-            let mut sq_payloads: Vec<(String, Bytes)> = Vec::with_capacity(num_clusters);
-            for (i, result) in read_results.into_iter().enumerate() {
-                let cluster_data = result?;
-                let cluster = crate::index::ivf_flat::build::deserialize_cluster(&cluster_data)?;
-                let cluster_refs: Vec<&[f32]> =
-                    cluster.vectors.iter().map(|v| v.as_slice()).collect();
-                let codes = cal.encode_batch(&cluster_refs);
-                let sq_data = serialize_sq_cluster(&cluster.ids, &codes, dim)?;
-                sq_payloads.push((sq_cluster_key(namespace, segment_id, i), sq_data));
-            }
-
-            // Phase 3: Parallel writes of all SQ8 clusters.
-            let write_futs: Vec<_> = sq_payloads
-                .iter()
-                .map(|(key, data)| store.put(key, data.clone()))
-                .collect();
-            let write_results = futures::future::join_all(write_futs).await;
-            for result in write_results {
-                result?;
-            }
-            info!("wrote SQ8 quantized clusters for hierarchical index");
+            info!("wrote SQ8 co-located leaf clusters for hierarchical index");
         }
         QuantizationType::Product => {
             use crate::index::quantization::pq::{

@@ -15,6 +15,7 @@ use crate::index::distance::compute_distance;
 use crate::index::filter::{evaluate_filter, oversampled_k};
 use crate::index::ivf_flat::build::{
     attrs_key, cluster_key, deserialize_attrs, deserialize_cluster,
+    deserialize_colocated_sq_cluster,
 };
 use crate::index::ivf_flat::search::coarse_row_passes;
 use crate::index::quantization::QuantizationType;
@@ -285,6 +286,7 @@ async fn scan_leaf_clusters(
                 distance_metric,
                 filter,
                 fetch_k,
+                index.meta.sq_calibration.as_deref(),
                 has_bitmaps,
                 store,
                 cache,
@@ -435,17 +437,21 @@ async fn scan_clusters_sq(
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
     fetch_k: usize,
+    sq_calibration: Option<&[u8]>,
     has_bitmaps: bool,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
-    use crate::index::quantization::sq::{
-        deserialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
-    };
+    use crate::index::quantization::sq::{sq_calibration_key, SqCalibration};
 
-    let cal_key = sq_calibration_key(namespace, segment_id);
-    let cal_data = fetch_with_cache(cache, store, &cal_key).await?;
-    let calibration = SqCalibration::from_bytes(&cal_data)?;
+    let calibration = if let Some(calibration) = sq_calibration {
+        SqCalibration::from_bytes(calibration)?
+    } else {
+        let cal_key = sq_calibration_key(namespace, segment_id);
+        let cal_data = fetch_with_cache(cache, store, &cal_key).await?;
+        SqCalibration::from_bytes(&cal_data)?
+    };
+    let prefer_colocated_clusters = sq_calibration.is_some();
 
     // Phase 1: coarse ranking — parallel prefetch. A non-bitmap attribute
     // filter must be applied DURING this scan, before truncating to
@@ -455,9 +461,8 @@ async fn scan_clusters_sq(
     // active; bitmap-resolved clusters keep their fast path and ignore attrs.
     let want_attr_filter = filter.is_some();
 
-    let coarse_prefetched = futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| {
-        let sq_key = sq_cluster_key(namespace, segment_id, cluster_idx);
-        async move {
+    let coarse_prefetched =
+        futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| async move {
             let (prefilter, sq_res, attrs) = tokio::join!(
                 try_bitmap_prefilter(
                     namespace,
@@ -468,7 +473,14 @@ async fn scan_clusters_sq(
                     store,
                     cache,
                 ),
-                fetch_with_cache(cache, store, &sq_key),
+                load_sq_cluster_for_coarse(
+                    namespace,
+                    segment_id,
+                    cluster_idx,
+                    prefer_colocated_clusters,
+                    store,
+                    cache,
+                ),
                 async {
                     if want_attr_filter {
                         load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
@@ -478,15 +490,17 @@ async fn scan_clusters_sq(
                 },
             );
             (cluster_idx, prefilter, sq_res, attrs)
-        }
-    }))
-    .await;
+        }))
+        .await;
 
     let mut coarse: Vec<(String, f32, usize)> = Vec::new();
+    let mut prefetched_clusters: HashMap<usize, bytes::Bytes> = HashMap::new();
     for (cluster_idx, prefilter, sq_res, attrs) in coarse_prefetched {
-        let sq_data = sq_res?;
+        let (sq_cluster, cluster_data) = sq_res?;
+        if let Some(cluster_data) = cluster_data {
+            prefetched_clusters.insert(cluster_idx, cluster_data);
+        }
         let attrs = attrs?;
-        let sq_cluster = deserialize_sq_cluster(&sq_data)?;
         for (j, codes) in sq_cluster.codes.iter().enumerate() {
             if !coarse_row_passes(filter, &prefilter, &attrs, j) {
                 continue;
@@ -514,18 +528,24 @@ async fn scan_clusters_sq(
     let want_rerank_attrs = filter.is_some();
     let rerank_prefetched =
         futures::future::join_all(by_cluster.iter().map(|(&cluster_idx, needed_ids)| {
+            let prefetched_cluster = prefetched_clusters.get(&cluster_idx).cloned();
             let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
             let needed_ids = needed_ids.clone();
             async move {
-                let (cluster_res, attrs) =
-                    tokio::join!(fetch_with_cache(cache, store, &cvec_key), async {
-                        if want_rerank_attrs {
-                            load_attrs(namespace, segment_id, cluster_idx, filter, store, cache)
-                                .await
-                        } else {
-                            Ok(None)
-                        }
-                    },);
+                let cluster_fetch = async {
+                    if let Some(cluster_data) = prefetched_cluster {
+                        Ok(cluster_data)
+                    } else {
+                        fetch_with_cache(cache, store, &cvec_key).await
+                    }
+                };
+                let (cluster_res, attrs) = tokio::join!(cluster_fetch, async {
+                    if want_rerank_attrs {
+                        load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
+                    } else {
+                        Ok(None)
+                    }
+                },);
                 (cluster_idx, needed_ids, cluster_res, attrs)
             }
         }))
@@ -554,6 +574,38 @@ async fn scan_clusters_sq(
     }
 
     Ok(candidates)
+}
+
+async fn load_sq_cluster_for_coarse(
+    namespace: &str,
+    segment_id: &str,
+    cluster_idx: usize,
+    prefer_colocated: bool,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Result<(
+    crate::index::quantization::sq::SqClusterData,
+    Option<bytes::Bytes>,
+)> {
+    use crate::index::quantization::sq::{deserialize_sq_cluster, sq_cluster_key};
+
+    if prefer_colocated {
+        let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
+        let cluster_data = fetch_with_cache(cache, store, &cvec_key).await?;
+        if let Some(sq_cluster) = deserialize_colocated_sq_cluster(&cluster_data)? {
+            return Ok((sq_cluster, Some(cluster_data)));
+        }
+
+        let sq_key = sq_cluster_key(namespace, segment_id, cluster_idx);
+        let sq_data = fetch_with_cache(cache, store, &sq_key).await?;
+        let sq_cluster = deserialize_sq_cluster(&sq_data)?;
+        return Ok((sq_cluster, Some(cluster_data)));
+    }
+
+    let sq_key = sq_cluster_key(namespace, segment_id, cluster_idx);
+    let sq_data = fetch_with_cache(cache, store, &sq_key).await?;
+    let sq_cluster = deserialize_sq_cluster(&sq_data)?;
+    Ok((sq_cluster, None))
 }
 
 /// PQ two-phase scan of leaf clusters.

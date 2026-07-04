@@ -1,12 +1,13 @@
 //! H1 — deterministic GET-count benchmark for core vector query paths.
 //!
 //! This suite intentionally measures object GET operations, not logical
-//! roundtrip phases. The cold SQ8 vector path currently needs more than the
-//! thesis-level "2 sequential S3 roundtrips" because it reads separate
-//! manifest, centroid, SQ sidecar, full-precision cluster, and attrs objects.
+//! roundtrip phases. New SQ8 segments co-locate SQ sidecars with full clusters
+//! and embed calibration in centroids; legacy fixtures remain pinned so the
+//! backwards-compatibility boundary stays measurable.
 
 mod common;
 
+use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,10 +19,12 @@ use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
+use zeppelin::index::quantization::sq::{serialize_sq_cluster, SqCalibration};
+use zeppelin::index::quantization::QuantizationType;
 use zeppelin::query::{execute_query, QueryParams, QueryResponse};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
-use zeppelin::wal::manifest::Manifest;
+use zeppelin::wal::manifest::{Manifest, SegmentRef};
 use zeppelin::wal::{WalReader, WalWriter};
 
 const DIM: usize = 4;
@@ -54,6 +57,12 @@ struct BenchFixture {
     wal_reader: WalReader,
     manifest_cache: Arc<ManifestCache>,
     query: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SqFixtureLayout {
+    Legacy,
+    Colocated,
 }
 
 fn indexing_config() -> IndexingConfig {
@@ -124,6 +133,168 @@ async fn compacted_fixture(label: &str) -> BenchFixture {
     }
 }
 
+async fn manual_sq_fixture(label: &str, layout: SqFixtureLayout) -> BenchFixture {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let namespace = harness.key(label);
+    let segment_id = "seg_manual_sq";
+    let vectors = bench_vectors();
+    let query = vectors[0].values.clone();
+    let centroids: Vec<Vec<f32>> = vectors.iter().map(|vector| vector.values.clone()).collect();
+    let refs: Vec<&[f32]> = vectors
+        .iter()
+        .map(|vector| vector.values.as_slice())
+        .collect();
+    let calibration = SqCalibration::calibrate(&refs, DIM);
+    let calibration_bytes = calibration.to_bytes();
+
+    let centroids_bytes = match layout {
+        SqFixtureLayout::Legacy => legacy_centroids_bytes(&centroids, DIM),
+        SqFixtureLayout::Colocated => v2_centroids_bytes(&centroids, DIM, &calibration_bytes),
+    };
+    store
+        .put(
+            &format!("{namespace}/segments/{segment_id}/centroids.bin"),
+            centroids_bytes,
+        )
+        .await
+        .unwrap();
+
+    if matches!(layout, SqFixtureLayout::Legacy) {
+        store
+            .put(
+                &format!("{namespace}/segments/{segment_id}/sq_calibration.bin"),
+                calibration_bytes.clone(),
+            )
+            .await
+            .unwrap();
+    }
+
+    for (cluster_idx, vector) in vectors.iter().enumerate() {
+        let ids = vec![vector.id.clone()];
+        let full_vectors = vec![vector.values.clone()];
+        let attrs = vec![vector.attributes.clone()];
+        let cluster_refs = vec![vector.values.as_slice()];
+        let codes = calibration.encode_batch(&cluster_refs);
+        let full_cluster = legacy_cluster_bytes(&ids, &full_vectors, DIM);
+        let sq_cluster = serialize_sq_cluster(&ids, &codes, DIM).unwrap();
+        let cluster_bytes = match layout {
+            SqFixtureLayout::Legacy => full_cluster,
+            SqFixtureLayout::Colocated => v2_cluster_bytes(&sq_cluster, &full_cluster),
+        };
+
+        store
+            .put(
+                &format!("{namespace}/segments/{segment_id}/cluster_{cluster_idx}.bin"),
+                cluster_bytes,
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &format!("{namespace}/segments/{segment_id}/attrs_{cluster_idx}.bin"),
+                Bytes::from(serde_json::to_vec(&attrs).unwrap()),
+            )
+            .await
+            .unwrap();
+        if matches!(layout, SqFixtureLayout::Legacy) {
+            store
+                .put(
+                    &format!("{namespace}/segments/{segment_id}/sq_cluster_{cluster_idx}.bin"),
+                    sq_cluster,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let mut manifest = Manifest::new();
+    manifest.add_segment(SegmentRef {
+        id: segment_id.to_string(),
+        vector_count: vectors.len(),
+        cluster_count: vectors.len(),
+        quantization: QuantizationType::Scalar,
+        hierarchical: false,
+        bitmap_fields: Vec::new(),
+        fts_fields: Vec::new(),
+        has_global_fts: false,
+        cluster_owners: Vec::new(),
+    });
+    manifest.write(&store, &namespace).await.unwrap();
+
+    let manifest_cache = Arc::new(ManifestCache::new(Duration::from_secs(60)));
+    warm_manifest_cache(&store, &namespace, &manifest_cache, 0).await;
+    counter.reset();
+
+    BenchFixture {
+        harness,
+        store: store.clone(),
+        counter,
+        namespace,
+        wal_reader: WalReader::new(store),
+        manifest_cache,
+        query,
+    }
+}
+
+fn legacy_centroids_bytes(centroids: &[Vec<f32>], dim: usize) -> Bytes {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(centroids.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(dim as u32).to_le_bytes());
+    for centroid in centroids {
+        for value in centroid {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    Bytes::from(buf)
+}
+
+fn v2_centroids_bytes(centroids: &[Vec<f32>], dim: usize, calibration: &[u8]) -> Bytes {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"ZCT2");
+    buf.extend_from_slice(&(centroids.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(dim as u32).to_le_bytes());
+    for centroid in centroids {
+        for value in centroid {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    buf.extend_from_slice(&(calibration.len() as u64).to_le_bytes());
+    buf.extend_from_slice(calibration);
+    Bytes::from(buf)
+}
+
+fn legacy_cluster_bytes(ids: &[String], vectors: &[Vec<f32>], dim: usize) -> Bytes {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(dim as u32).to_le_bytes());
+    for (id, vector) in ids.iter().zip(vectors) {
+        let id_bytes = id.as_bytes();
+        buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(id_bytes);
+        for value in vector {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    Bytes::from(buf)
+}
+
+fn v2_cluster_bytes(sq_cluster: &[u8], full_cluster: &[u8]) -> Bytes {
+    let sq_offset = 36u64;
+    let sq_len = sq_cluster.len() as u64;
+    let full_offset = sq_offset + sq_len;
+    let full_len = full_cluster.len() as u64;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"ZCL2");
+    buf.extend_from_slice(&sq_offset.to_le_bytes());
+    buf.extend_from_slice(&sq_len.to_le_bytes());
+    buf.extend_from_slice(&full_offset.to_le_bytes());
+    buf.extend_from_slice(&full_len.to_le_bytes());
+    buf.extend_from_slice(sq_cluster);
+    buf.extend_from_slice(full_cluster);
+    Bytes::from(buf)
+}
+
 async fn warm_manifest_cache(
     store: &ZeppelinStore,
     namespace: &str,
@@ -187,6 +358,15 @@ fn assert_get_profile(counter: &GetCounter, expected: ExpectedGets) {
     assert_eq!(counter.total_gets(), expected.total());
 }
 
+fn assert_same_results(left: &QueryResponse, right: &QueryResponse) {
+    assert_eq!(left.results.len(), right.results.len());
+    for (left, right) in left.results.iter().zip(&right.results) {
+        assert_eq!(left.id, right.id);
+        assert_eq!(left.score.to_bits(), right.score.to_bits());
+        assert_eq!(left.attributes, right.attributes);
+    }
+}
+
 async fn append_uncompacted_vector(store: &ZeppelinStore, namespace: &str) {
     let writer = WalWriter::new(store.clone());
     writer
@@ -214,18 +394,50 @@ async fn cold_strong_vector_query_pins_sq8_get_profile() {
 
     print_profile("cold strong vector query, SQ8, nprobe=4", &fixture.counter);
 
-    // H1 cold strong profile, with only the manifest cache preloaded:
+    // H1 cold strong profile for the v2 SQ8 storage layout, with only the
+    // manifest cache preloaded:
     // - manifest=1: Task 13 strong If-None-Match freshness GET.
-    // - centroids=1: active segment IVF centroid blob.
-    // - sq=5: SQ8 calibration plus one SQ cluster sidecar per probed cluster.
-    // - cluster=4: full-precision cluster blobs for SQ8 rerank.
+    // - centroids=1: active segment IVF centroid blob, including SQ calibration.
+    // - sq=0: no SQ calibration or per-cluster SQ sidecars for v2 segments.
+    // - cluster=4: one co-located cluster blob per probed cluster; those same
+    //   bytes are reused for SQ8 rerank.
     // - attrs=4: lazy final-result enrichment still needs all four attrs
     //   blobs in this fixture because top_k=4 returns one vector from each
     //   one-vector cluster. attrs_laziness_tests pins the reduced top_k=1
     //   profile where only the winning cluster's attrs are fetched.
-    // - total=15: honest object GET count, not the thesis-level "2".
+    // - total=10: honest object GET count, not the thesis-level "2".
     assert_get_profile(
         &fixture.counter,
+        ExpectedGets {
+            manifest: 1,
+            centroids: 1,
+            sq: 0,
+            cluster: 4,
+            attrs: 4,
+            wal: 0,
+        },
+    );
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn cold_strong_profiles_pin_legacy_and_colocated_sq8_layouts() {
+    let legacy = manual_sq_fixture("h1-legacy-sq8", SqFixtureLayout::Legacy).await;
+    let colocated = manual_sq_fixture("h1-colocated-sq8", SqFixtureLayout::Colocated).await;
+
+    let legacy_response = run_query(&legacy, ConsistencyLevel::Strong, ALL_CLUSTERS, None).await;
+    let colocated_response =
+        run_query(&colocated, ConsistencyLevel::Strong, ALL_CLUSTERS, None).await;
+
+    assert_same_results(&legacy_response, &colocated_response);
+
+    print_profile(
+        "legacy cold strong vector query, SQ8, nprobe=4",
+        &legacy.counter,
+    );
+    assert_get_profile(
+        &legacy.counter,
         ExpectedGets {
             manifest: 1,
             centroids: 1,
@@ -236,7 +448,28 @@ async fn cold_strong_vector_query_pins_sq8_get_profile() {
         },
     );
 
-    fixture.harness.cleanup().await;
+    print_profile(
+        "co-located cold strong vector query, SQ8, nprobe=4",
+        &colocated.counter,
+    );
+    assert_get_profile(
+        &colocated.counter,
+        ExpectedGets {
+            manifest: 1,
+            centroids: 1,
+            sq: 0,
+            cluster: 4,
+            attrs: 4,
+            wal: 0,
+        },
+    );
+    assert!(
+        colocated.counter.total_gets() < legacy.counter.total_gets(),
+        "co-located v2 layout must perform fewer cold GETs than legacy layout"
+    );
+
+    legacy.harness.cleanup().await;
+    colocated.harness.cleanup().await;
 }
 
 #[tokio::test]
@@ -268,7 +501,7 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
         ExpectedGets {
             manifest: 0,
             centroids: 1,
-            sq: 5,
+            sq: 0,
             cluster: 4,
             attrs: 4,
             wal: 0,
@@ -292,7 +525,7 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
         ExpectedGets {
             manifest: 1,
             centroids: 1,
-            sq: 5,
+            sq: 0,
             cluster: 4,
             attrs: 4,
             wal: 1,
@@ -300,8 +533,8 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
     );
     let strong_total = fixture.counter.total_gets();
 
-    assert_eq!(eventual_total, 14);
-    assert_eq!(strong_total, 16);
+    assert_eq!(eventual_total, 9);
+    assert_eq!(strong_total, 11);
     assert_eq!(
         strong_total - eventual_total,
         2,
@@ -324,7 +557,7 @@ async fn cluster_gets_scale_exactly_with_nprobe() {
         ExpectedGets {
             manifest: 1,
             centroids: 1,
-            sq: 2,
+            sq: 0,
             cluster: 1,
             attrs: 1,
             wal: 0,
@@ -342,7 +575,7 @@ async fn cluster_gets_scale_exactly_with_nprobe() {
         ExpectedGets {
             manifest: 1,
             centroids: 1,
-            sq: 5,
+            sq: 0,
             cluster: 4,
             attrs: 4,
             wal: 0,
@@ -382,7 +615,7 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
         ExpectedGets {
             manifest: 1,
             centroids: 1,
-            sq: 5,
+            sq: 0,
             cluster: 4,
             attrs: 4,
             wal: 0,
@@ -417,7 +650,7 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
     );
     let warm_total = fixture.counter.total_gets();
 
-    assert_eq!(cold_total, 15);
+    assert_eq!(cold_total, 10);
     assert_eq!(warm_total, 1);
     assert!(
         warm_total < cold_total,
