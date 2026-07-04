@@ -219,6 +219,7 @@ async fn manual_sq_fixture(label: &str, layout: SqFixtureLayout) -> BenchFixture
         fts_fields: Vec::new(),
         has_global_fts: false,
         cluster_owners: Vec::new(),
+        sketch: None,
     });
     manifest.write(&store, &namespace).await.unwrap();
 

@@ -405,6 +405,7 @@ async fn test_compact_with_existing_segment() {
         fts_fields: Vec::new(),
         has_global_fts: false,
         cluster_owners: Vec::new(),
+        sketch: None,
     });
     manifest.write(store, &ns).await.unwrap();
 

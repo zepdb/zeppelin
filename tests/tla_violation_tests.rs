@@ -445,6 +445,7 @@ async fn test_tla_cache_staleness_during_compaction() {
         fts_fields: vec![],
         has_global_fts: false,
         cluster_owners: vec![],
+        sketch: None,
     });
     compacted_manifest.remove_compacted_fragments(&compacted_ids);
     assert_eq!(
@@ -591,6 +592,7 @@ async fn test_tla_compaction_retry_starvation() {
         fts_fields: vec![],
         has_global_fts: false,
         cluster_owners: vec![],
+        sketch: None,
     };
 
     // Simulate the old MAX_CAS_RETRIES=5 worth of interfering writes.

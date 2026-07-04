@@ -37,10 +37,7 @@ fn test_classify_real_key_patterns() {
         ("ns/segments/seg1/fts_index_2.bin", ArtifactClass::Fts),
         ("ns/segments/seg1/fts_meta.json", ArtifactClass::Fts),
         // src/wal/fragment.rs
-        (
-            "ns/wal/01J0000000000000000000000A.wal",
-            ArtifactClass::Wal,
-        ),
+        ("ns/wal/01J0000000000000000000000A.wal", ArtifactClass::Wal),
         // src/wal/manifest.rs
         ("ns/manifest.json", ArtifactClass::Manifest),
         // Everything else

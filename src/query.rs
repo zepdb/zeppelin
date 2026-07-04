@@ -369,6 +369,7 @@ async fn segment_search(
         segment_ref.vector_count,
         segment_ref.quantization,
         segment_ref.cluster_owners.clone(),
+        segment_ref.sketch.clone(),
         cache,
     )
     .await?;
@@ -791,6 +792,7 @@ async fn segment_bm25_search_full_scan(
         segment_ref.quantization,
         segment_ref.cluster_owners.clone(),
         None,
+        None,
     )
     .await?;
     let num_clusters = index.num_clusters();
@@ -1120,6 +1122,7 @@ mod tests {
             fts_fields: vec!["text".to_string()],
             has_global_fts,
             cluster_owners: Vec::new(),
+            sketch: None,
         }
     }
 

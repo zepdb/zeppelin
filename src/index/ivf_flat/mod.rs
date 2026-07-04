@@ -7,6 +7,7 @@
 pub mod build;
 pub mod kmeans;
 pub mod search;
+pub mod sketch;
 
 use async_trait::async_trait;
 
@@ -46,6 +47,11 @@ pub struct IvfFlatIndex {
     /// Segment-global artifacts (centroids, SQ calibration, PQ codebook)
     /// always live under `segment_id` and never consult this map.
     pub(crate) cluster_owners: Vec<String>,
+    /// Resident coarse sketch loaded from the segment artifact, when present.
+    pub(crate) resident_sketch: Option<sketch::ResidentSketch>,
+    /// Manifest reference for the resident sketch artifact, when this handle
+    /// came from a build path that created one.
+    pub(crate) sketch_ref: Option<crate::wal::manifest::SketchRef>,
 }
 
 impl IvfFlatIndex {
@@ -66,6 +72,15 @@ impl IvfFlatIndex {
             .get(cluster_idx)
             .map(String::as_str)
             .unwrap_or(&self.segment_id)
+    }
+
+    /// Whether the cluster may contain non-null attributes.
+    #[must_use]
+    pub(crate) fn cluster_may_have_attrs(&self, cluster_idx: usize) -> bool {
+        self.resident_sketch
+            .as_ref()
+            .map(|sketch| sketch.cluster_has_attrs(cluster_idx))
+            .unwrap_or(true)
     }
 
     /// The namespace this index is associated with.
@@ -97,6 +112,7 @@ impl IvfFlatIndex {
         num_vectors: usize,
         quantization: crate::index::quantization::QuantizationType,
         cluster_owners: Vec<String>,
+        sketch_ref: Option<crate::wal::manifest::SketchRef>,
         cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
     ) -> Result<Self> {
         build::load_ivf_flat_from_manifest(
@@ -106,6 +122,7 @@ impl IvfFlatIndex {
             num_vectors,
             quantization,
             cluster_owners,
+            sketch_ref,
             cache,
         )
         .await

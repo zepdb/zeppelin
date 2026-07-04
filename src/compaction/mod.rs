@@ -496,7 +496,7 @@ impl Compactor {
         // owned by `segment_id`); only the incremental fast path populates it,
         // carrying untouched clusters forward under the old segment's keys.
         let build_start = std::time::Instant::now();
-        let (cluster_count, is_hierarchical, bitmap_fields, cluster_owners) =
+        let (cluster_count, is_hierarchical, bitmap_fields, cluster_owners, sketch_ref) =
             if !should_retrain && old_segment_id.is_some() && !self.indexing_config.hierarchical {
                 // Incremental path: reuse existing centroids, just reassign vectors.
                 match self
@@ -525,12 +525,12 @@ impl Compactor {
                     )
                     .await
                 {
-                    Ok((count, bf, owners)) => {
+                    Ok((count, bf, owners, sketch_ref)) => {
                         info!(
                             new_from_wal,
                             existing_count, "incremental compaction: reusing centroids"
                         );
-                        (count, false, bf, owners)
+                        (count, false, bf, owners, Some(sketch_ref))
                     }
                     Err(e) => {
                         warn!(error = %e, "incremental build failed, falling back to full retrain");
@@ -543,7 +543,13 @@ impl Compactor {
                         )
                         .await?;
                         let bf = index.bitmap_fields.clone();
-                        (index.num_clusters(), false, bf, Vec::new())
+                        (
+                            index.num_clusters(),
+                            false,
+                            bf,
+                            Vec::new(),
+                            index.sketch_ref.clone(),
+                        )
                     }
                 }
             } else if self.indexing_config.hierarchical {
@@ -556,7 +562,7 @@ impl Compactor {
                 )
                 .await?;
                 let bf = h_index.bitmap_fields.clone();
-                (h_index.num_leaf_clusters(), true, bf, Vec::new())
+                (h_index.num_leaf_clusters(), true, bf, Vec::new(), None)
             } else {
                 let index = build_ivf_flat(
                     &vectors,
@@ -567,7 +573,13 @@ impl Compactor {
                 )
                 .await?;
                 let bf = index.bitmap_fields.clone();
-                (index.num_clusters(), false, bf, Vec::new())
+                (
+                    index.num_clusters(),
+                    false,
+                    bf,
+                    Vec::new(),
+                    index.sketch_ref.clone(),
+                )
             };
         let build_elapsed = build_start.elapsed();
         let index_type_label = if is_hierarchical {
@@ -799,6 +811,7 @@ impl Compactor {
                     // full rebuilds (every cluster owned by `segment_id`) and
                     // populated only on the incremental fast path below.
                     cluster_owners: cluster_owners.clone(),
+                    sketch: sketch_ref.clone(),
                 },
                 self.config.max_pending_deletes,
                 self.config.max_old_segments,
@@ -860,7 +873,7 @@ impl Compactor {
     /// old keys), bounding per-cycle write I/O to O(touched clusters) instead
     /// of O(dataset).
     ///
-    /// Returns `(cluster_count, bitmap_fields, cluster_owners)`. `cluster_owners[i]`
+    /// Returns `(cluster_count, bitmap_fields, cluster_owners, sketch_ref)`. `cluster_owners[i]`
     /// is the segment ID that owns cluster `i`'s per-cluster S3 objects:
     /// `new_segment_id` for rewritten clusters, the old segment's resolved
     /// owner for carried-over ones. An empty vec would mean "all owned by
@@ -895,13 +908,19 @@ impl Compactor {
         old_cluster_owners: &[String],
         old_bitmap_fields: &[String],
         allow_carryover: bool,
-    ) -> Result<(usize, Vec<String>, Vec<String>)> {
+    ) -> Result<(
+        usize,
+        Vec<String>,
+        Vec<String>,
+        crate::wal::manifest::SketchRef,
+    )> {
         use crate::index::distance::euclidean_distance;
         use crate::index::ivf_flat::build::{
             centroids_key, deserialize_centroids_data, serialize_attrs,
             serialize_centroids_with_sq_calibration, serialize_cluster,
             serialize_colocated_sq_cluster,
         };
+        use crate::index::ivf_flat::sketch::build_resident_sketch;
         use bytes::Bytes;
 
         // Load existing centroids
@@ -1024,6 +1043,15 @@ impl Compactor {
             };
         let mut payloads: Vec<(String, Bytes)> = Vec::new();
 
+        let (sketch_ref, sketch_data, _resident_sketch) = build_resident_sketch(
+            namespace,
+            new_segment_id,
+            dim,
+            &cluster_vecs,
+            &cluster_attrs,
+        )?;
+        payloads.push((sketch_ref.key.clone(), sketch_data));
+
         for i in 0..num_clusters {
             if !touched[i] {
                 continue; // carried over by reference
@@ -1130,7 +1158,7 @@ impl Compactor {
         } else {
             cluster_owners
         };
-        Ok((num_clusters, bitmap_fields, owners_out))
+        Ok((num_clusters, bitmap_fields, owners_out, sketch_ref))
     }
 }
 
