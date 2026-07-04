@@ -21,6 +21,7 @@ const SKETCH_MAX_SUBQUANTIZERS: usize = 96;
 const SKETCH_K: usize = 16;
 const SKETCH_TRAIN_SAMPLE: usize = 4096;
 const SKETCH_TRAIN_ITERS: usize = 6;
+const SKETCH_CLUSTER_SCORE_TOP_M: usize = 4;
 
 /// S3 key for the resident coarse sketch.
 #[must_use]
@@ -226,24 +227,22 @@ impl ResidentSketch {
                 continue;
             }
 
-            let mut best_score = f32::INFINITY;
+            let mut top_scores = TopSketchScores::new();
             for row in start..end {
                 let code_offset = row * self.packed_code_bytes;
                 let codes = &self.codes[code_offset..code_offset + self.packed_code_bytes];
                 let score = self.adc_score(&adc_table, codes);
-                if score < best_score {
-                    best_score = score;
-                }
+                top_scores.insert(score);
             }
             ranked_clusters.push(ClusterScore {
                 cluster_idx,
-                best_score,
+                aggregate_score: top_scores.mean(),
             });
         }
 
         ranked_clusters.sort_by(|a, b| {
-            a.best_score
-                .partial_cmp(&b.best_score)
+            a.aggregate_score
+                .partial_cmp(&b.aggregate_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| {
                     centroid_rank
@@ -433,7 +432,49 @@ pub(crate) fn build_resident_sketch(
 #[derive(Clone, Copy)]
 struct ClusterScore {
     cluster_idx: usize,
-    best_score: f32,
+    aggregate_score: f32,
+}
+
+struct TopSketchScores {
+    scores: [f32; SKETCH_CLUSTER_SCORE_TOP_M],
+    len: usize,
+}
+
+impl TopSketchScores {
+    fn new() -> Self {
+        Self {
+            scores: [f32::INFINITY; SKETCH_CLUSTER_SCORE_TOP_M],
+            len: 0,
+        }
+    }
+
+    fn insert(&mut self, score: f32) {
+        if self.len < SKETCH_CLUSTER_SCORE_TOP_M {
+            self.scores[self.len] = score;
+            self.len += 1;
+            self.bubble_up(self.len - 1);
+            return;
+        }
+
+        if score >= self.scores[SKETCH_CLUSTER_SCORE_TOP_M - 1] {
+            return;
+        }
+
+        self.scores[SKETCH_CLUSTER_SCORE_TOP_M - 1] = score;
+        self.bubble_up(SKETCH_CLUSTER_SCORE_TOP_M - 1);
+    }
+
+    fn mean(&self) -> f32 {
+        debug_assert!(self.len > 0);
+        self.scores[..self.len].iter().sum::<f32>() / self.len as f32
+    }
+
+    fn bubble_up(&mut self, mut idx: usize) {
+        while idx > 0 && self.scores[idx] < self.scores[idx - 1] {
+            self.scores.swap(idx, idx - 1);
+            idx -= 1;
+        }
+    }
 }
 
 fn sample_indices(vector_count: usize, sample_count: usize) -> Vec<usize> {
@@ -597,5 +638,37 @@ mod tests {
             .select_clusters(&[1.0, 0.0, 0.0], DistanceMetric::Cosine, &[0, 1], 1)
             .unwrap();
         assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn cluster_selection_uses_top_m_mean_not_single_best_row() {
+        let mut codebook = Vec::with_capacity(SKETCH_K);
+        for value in 0..SKETCH_K {
+            codebook.push(value as f32);
+        }
+
+        let mut code_bytes = Vec::new();
+        for code in [0u8, 4, 4, 4, 1, 1, 1, 1] {
+            let mut packed = vec![0u8; 1];
+            pack_nibble(&mut packed, 0, code);
+            code_bytes.extend_from_slice(&packed);
+        }
+
+        let sketch = ResidentSketch {
+            dim: 1,
+            subquantizers: 1,
+            cluster_count: 2,
+            codebook,
+            cluster_offsets: vec![(0, 4), (4, 8)],
+            codes: Bytes::from(code_bytes),
+            cluster_has_attrs: vec![false, false],
+            packed_code_bytes: 1,
+        };
+
+        let selected = sketch
+            .select_clusters(&[0.0], DistanceMetric::Euclidean, &[0, 1], 1)
+            .unwrap();
+
+        assert_eq!(selected, vec![1]);
     }
 }

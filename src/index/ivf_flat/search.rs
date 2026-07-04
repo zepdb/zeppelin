@@ -29,6 +29,10 @@ use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 
 type ClusterAttrs = Vec<Option<HashMap<String, AttributeValue>>>;
 
+const SKETCH_MIN_CLUSTERS: usize = 6;
+const SKETCH_CLUSTER_LINEAR_FRACTION: f32 = 0.3125;
+const SKETCH_CLUSTER_QUADRATIC_SCALE: f32 = 150.0;
+
 /// A candidate result during search, before final ranking.
 struct Candidate {
     id: String,
@@ -257,19 +261,11 @@ fn select_scan_clusters(
 }
 
 fn sketch_cluster_budget(effective_nprobe: usize) -> usize {
-    if effective_nprobe >= 128 {
-        // High-nprobe sentinel mode: do not reduce the probed cluster set.
-        // This keeps the sketch from hiding any cluster-level recall loss.
-        effective_nprobe
-    } else if effective_nprobe >= 16 {
-        7
-    } else if effective_nprobe >= 8 {
-        6
-    } else {
-        effective_nprobe
-    }
-    .min(effective_nprobe)
-    .max(1)
+    let nprobe = effective_nprobe as f32;
+    ((nprobe * SKETCH_CLUSTER_LINEAR_FRACTION + (nprobe * nprobe / SKETCH_CLUSTER_QUADRATIC_SCALE))
+        .ceil() as usize)
+        .max(SKETCH_MIN_CLUSTERS)
+        .min(effective_nprobe)
 }
 
 /// Scan clusters using full-precision vectors (no quantization).
@@ -928,5 +924,24 @@ mod tests {
             ))
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn sketch_cluster_budget_scales_monotonically() {
+        let mut prev = 0usize;
+        for nprobe in 1..=128 {
+            let budget = sketch_cluster_budget(nprobe);
+            assert!(
+                budget >= prev,
+                "budget must be monotonic: nprobe={nprobe} budget={budget} prev={prev}"
+            );
+            assert!(budget <= nprobe);
+            prev = budget;
+        }
+
+        assert_eq!(sketch_cluster_budget(8), 6);
+        assert_eq!(sketch_cluster_budget(16), 7);
+        assert!(sketch_cluster_budget(64) > 7);
+        assert_eq!(sketch_cluster_budget(128), 128);
     }
 }

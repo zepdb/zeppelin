@@ -32,6 +32,8 @@ fn test_classify_real_key_patterns() {
         ("ns/segments/seg1/pq_cluster_3.bin", ArtifactClass::Sq),
         // src/index/bitmap/mod.rs
         ("ns/segments/seg1/bitmap_0.bin", ArtifactClass::Bitmap),
+        // src/index/ivf_flat/sketch.rs
+        ("ns/segments/seg1/coarse_sketch.bin", ArtifactClass::Sketch),
         // src/fts/{global_index,inverted_index}.rs
         ("ns/segments/seg1/global_fts.bin", ArtifactClass::Fts),
         ("ns/segments/seg1/fts_index_2.bin", ArtifactClass::Fts),
@@ -121,6 +123,10 @@ async fn test_query_class_breakdown_is_sane() {
         counter.put_bytes_for(ArtifactClass::Centroids) > 0,
         "compaction must write centroids bytes"
     );
+    assert!(
+        counter.put_bytes_for(ArtifactClass::Sketch) > 0,
+        "compaction must write resident sketch bytes"
+    );
 
     // Fresh slate for the query-side breakdown.
     counter.reset();
@@ -161,6 +167,10 @@ async fn test_query_class_breakdown_is_sane() {
     assert!(
         counter.gets_for(ArtifactClass::Centroids) >= 1,
         "query must GET the centroids blob (no cache configured)"
+    );
+    assert!(
+        counter.gets_for(ArtifactClass::Sketch) >= 1,
+        "query must GET the resident sketch blob (no cache configured)"
     );
 
     // Bytes-per-class are non-zero for every class that was actually read.
