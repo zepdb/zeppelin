@@ -1,8 +1,10 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use tracing::{debug, instrument, warn};
 use ulid::Ulid;
 
+use crate::cache::DiskCache;
 use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
 
@@ -31,8 +33,9 @@ impl WalReader {
     /// Read a specific WAL fragment by its ULID.
     #[instrument(skip(self), fields(namespace = namespace, fragment_id = %fragment_id))]
     pub async fn read_fragment(&self, namespace: &str, fragment_id: &Ulid) -> Result<WalFragment> {
-        let key = WalFragment::s3_key(namespace, fragment_id);
-        let data = self.store.get(&key).await?;
+        let data = self
+            .read_fragment_bytes(namespace, fragment_id, None)
+            .await?;
         WalFragment::from_bytes(&data)
     }
 
@@ -48,22 +51,23 @@ impl WalReader {
         };
 
         let refs = manifest.uncompacted_fragments().to_vec();
-        self.read_fragments_from_refs(namespace, &refs).await
+        self.read_fragments_from_refs(namespace, &refs, None).await
     }
 
     /// Read specific fragments by their refs, preserving the caller's ordering.
     /// Skips NotFound only when a fresh manifest confirms compaction removed
     /// that fragment ref.
-    #[instrument(skip(self, refs), fields(namespace = namespace, ref_count = refs.len()))]
+    #[instrument(skip(self, refs, cache), fields(namespace = namespace, ref_count = refs.len(), cache_enabled = cache.is_some()))]
     pub async fn read_fragments_from_refs(
         &self,
         namespace: &str,
         refs: &[FragmentRef],
+        cache: Option<&Arc<DiskCache>>,
     ) -> Result<Vec<WalFragment>> {
         // Parallel prefetch all fragments concurrently.
         let results = futures::future::join_all(
             refs.iter()
-                .map(|fref| self.read_fragment(namespace, &fref.id)),
+                .map(|fref| self.read_fragment_with_cache(namespace, &fref.id, cache)),
         )
         .await;
 
@@ -85,8 +89,9 @@ impl WalReader {
         namespace: &str,
         fragment_id: &Ulid,
     ) -> Result<WalFragment> {
-        let key = WalFragment::s3_key(namespace, fragment_id);
-        let data = self.store.get(&key).await?;
+        let data = self
+            .read_fragment_bytes(namespace, fragment_id, None)
+            .await?;
         WalFragment::from_bytes_unchecked(&data)
     }
 
@@ -94,15 +99,16 @@ impl WalReader {
     ///
     /// Same as `read_fragments_from_refs()` but skips checksum validation
     /// for fragments already validated on write. Used by compaction.
-    #[instrument(skip(self, refs), fields(namespace = namespace, ref_count = refs.len()))]
+    #[instrument(skip(self, refs, cache), fields(namespace = namespace, ref_count = refs.len(), cache_enabled = cache.is_some()))]
     pub async fn read_fragments_from_refs_unchecked(
         &self,
         namespace: &str,
         refs: &[FragmentRef],
+        cache: Option<&Arc<DiskCache>>,
     ) -> Result<Vec<WalFragment>> {
         let results = futures::future::join_all(
             refs.iter()
-                .map(|fref| self.read_fragment_unchecked(namespace, &fref.id)),
+                .map(|fref| self.read_fragment_unchecked_with_cache(namespace, &fref.id, cache)),
         )
         .await;
 
@@ -125,11 +131,12 @@ impl WalReader {
     /// delete-free WAL fragments or scoring WAL vectors. A vector upsert in a
     /// fetched tombstone-bearing fragment cancels an older tombstone for the
     /// same ID, matching the full WAL scan's ordering within the fetched set.
-    #[instrument(skip(self, refs), fields(namespace = namespace, ref_count = refs.len()))]
+    #[instrument(skip(self, refs, cache), fields(namespace = namespace, ref_count = refs.len(), cache_enabled = cache.is_some()))]
     pub async fn read_delete_ids_from_refs_unchecked(
         &self,
         namespace: &str,
         refs: &[FragmentRef],
+        cache: Option<&Arc<DiskCache>>,
     ) -> Result<HashSet<String>> {
         let delete_refs: Vec<FragmentRef> = refs
             .iter()
@@ -147,7 +154,7 @@ impl WalReader {
         }
 
         let fragments = self
-            .read_fragments_from_refs_unchecked(namespace, &delete_refs)
+            .read_fragments_from_refs_unchecked(namespace, &delete_refs, cache)
             .await?;
         let mut deleted_ids = HashSet::new();
         for fragment in &fragments {
@@ -166,6 +173,53 @@ impl WalReader {
         );
 
         Ok(deleted_ids)
+    }
+
+    async fn read_fragment_with_cache(
+        &self,
+        namespace: &str,
+        fragment_id: &Ulid,
+        cache: Option<&Arc<DiskCache>>,
+    ) -> Result<WalFragment> {
+        let data = self
+            .read_fragment_bytes(namespace, fragment_id, cache)
+            .await?;
+        WalFragment::from_bytes(&data)
+    }
+
+    async fn read_fragment_unchecked_with_cache(
+        &self,
+        namespace: &str,
+        fragment_id: &Ulid,
+        cache: Option<&Arc<DiskCache>>,
+    ) -> Result<WalFragment> {
+        let data = self
+            .read_fragment_bytes(namespace, fragment_id, cache)
+            .await?;
+        WalFragment::from_bytes_unchecked(&data)
+    }
+
+    async fn read_fragment_bytes(
+        &self,
+        namespace: &str,
+        fragment_id: &Ulid,
+        cache: Option<&Arc<DiskCache>>,
+    ) -> Result<bytes::Bytes> {
+        let s3_key = WalFragment::s3_key(namespace, fragment_id);
+        let Some(cache) = cache else {
+            return self.store.get(&s3_key).await;
+        };
+
+        let cache_key = Self::fragment_cache_key(fragment_id);
+        let store = self.store.clone();
+        cache
+            .get_or_fetch(&cache_key, move || async move { store.get(&s3_key).await })
+            .await
+    }
+
+    #[must_use]
+    fn fragment_cache_key(fragment_id: &Ulid) -> String {
+        format!("wal_fragments/{fragment_id}.wal")
     }
 
     async fn finish_fragment_results(

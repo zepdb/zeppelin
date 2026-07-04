@@ -220,7 +220,7 @@ async fn test_wal_fragment_notfound_tolerated_only_after_manifest_reread_and_met
     let before = gc_race_metric_value(&ns);
     let reader = WalReader::new(harness.store.clone());
     let fragments = reader
-        .read_fragments_from_refs_unchecked(&ns, &old_refs)
+        .read_fragments_from_refs_unchecked(&ns, &old_refs, None)
         .await
         .unwrap();
     let after = gc_race_metric_value(&ns);
@@ -279,13 +279,15 @@ async fn test_wal_fragment_notfound_still_referenced_is_error_not_skip() {
     let reader = WalReader::new(harness.store.clone());
 
     // Unchecked path must error.
-    let unchecked = reader.read_fragments_from_refs_unchecked(&ns, &refs).await;
+    let unchecked = reader
+        .read_fragments_from_refs_unchecked(&ns, &refs, None)
+        .await;
     assert!(
         unchecked.is_err(),
         "a NotFound on a still-referenced fragment must ERROR (unchecked), got {unchecked:?}"
     );
     // Checked path must error too.
-    let checked = reader.read_fragments_from_refs(&ns, &refs).await;
+    let checked = reader.read_fragments_from_refs(&ns, &refs, None).await;
     assert!(
         checked.is_err(),
         "a NotFound on a still-referenced fragment must ERROR (checked), got {checked:?}"
