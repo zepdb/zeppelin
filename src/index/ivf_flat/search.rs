@@ -6,7 +6,7 @@
 //! 4. Apply post-filter with oversampling if a filter is present.
 //! 5. Return sorted top-k results.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -24,11 +24,15 @@ use super::IvfFlatIndex;
 use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
 use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 
+type ClusterAttrs = Vec<Option<HashMap<String, AttributeValue>>>;
+
 /// A candidate result during search, before final ranking.
 struct Candidate {
     id: String,
     score: f32,
     attributes: Option<HashMap<String, AttributeValue>>,
+    cluster_idx: usize,
+    row_idx: usize,
 }
 
 /// Fetch data from cache if available, otherwise from S3.
@@ -105,27 +109,6 @@ pub async fn search_ivf_flat(
         clusters = ?probe_clusters,
         "probing clusters"
     );
-
-    // Speculative prefetch: warm the cache for the next closest cluster beyond nprobe.
-    // This fires a background S3 GET so the next query with overlapping clusters hits cache.
-    if effective_nprobe < num_clusters {
-        if let Some(&(next_cluster_idx, _)) = centroid_dists.get(effective_nprobe) {
-            if let Some(c) = cache {
-                let cvec_key = cluster_key(
-                    &index.namespace,
-                    index.cluster_owner(next_cluster_idx),
-                    next_cluster_idx,
-                );
-                let cache_clone = c.clone();
-                let store_clone = store.clone();
-                tokio::spawn(async move {
-                    let _ = cache_clone
-                        .get_or_fetch(&cvec_key, || store_clone.get(&cvec_key))
-                        .await;
-                });
-            }
-        }
-    }
 
     // --- Step 2: Determine fetch size (oversample if filtering) ---
     let fetch_k = if filter.is_some() {
@@ -209,15 +192,8 @@ pub async fn search_ivf_flat(
             })
             .collect()
     } else {
-        sorted
-            .into_iter()
-            .take(top_k)
-            .map(|c| SearchResult {
-                id: c.id,
-                score: c.score,
-                attributes: c.attributes,
-            })
-            .collect()
+        let top_candidates: Vec<Candidate> = sorted.into_iter().take(top_k).collect();
+        enrich_unfiltered_results(index, top_candidates, store, cache).await?
     };
 
     debug!(returned = results.len(), top_k = top_k, "search complete");
@@ -238,6 +214,7 @@ async fn scan_clusters_flat(
     let has_bitmaps = !index.bitmap_fields.is_empty();
 
     // Phase 1: Parallel prefetch — all S3 I/O fires concurrently.
+    let want_attrs = filter.is_some();
     let prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let owner = index.cluster_owner(cluster_idx);
         let cvec_key = cluster_key(&index.namespace, owner, cluster_idx);
@@ -253,7 +230,13 @@ async fn scan_clusters_flat(
                     store,
                     cache,
                 ),
-                load_attrs(index, cluster_idx, filter, store, cache),
+                async {
+                    if want_attrs {
+                        load_attrs(index, cluster_idx, filter, store, cache).await
+                    } else {
+                        Ok(None)
+                    }
+                },
             );
             (cluster_idx, cluster_res, prefilter, attrs)
         }
@@ -262,7 +245,7 @@ async fn scan_clusters_flat(
 
     // Phase 2: Sequential compute — CPU-bound, no I/O.
     let mut candidates = Vec::new();
-    for (_cluster_idx, cluster_res, prefilter, attrs) in prefetched {
+    for (cluster_idx, cluster_res, prefilter, attrs) in prefetched {
         let cluster_data = cluster_res?;
         let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
@@ -281,6 +264,8 @@ async fn scan_clusters_flat(
                 id: cluster.ids[j].clone(),
                 score,
                 attributes: vector_attrs,
+                cluster_idx,
+                row_idx: j,
             });
         }
     }
@@ -389,6 +374,7 @@ async fn scan_clusters_sq(
             .push(id.clone());
     }
 
+    let want_rerank_attrs = filter.is_some();
     let rerank_prefetched =
         futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
             let cvec_key = cluster_key(
@@ -398,23 +384,26 @@ async fn scan_clusters_sq(
             );
             let needed_ids = needed_ids.clone();
             async move {
-                let (cluster_res, attrs) = tokio::join!(
-                    fetch_with_cache(cache, store, &cvec_key),
-                    load_attrs(index, cluster_idx, filter, store, cache),
-                );
+                let (cluster_res, attrs) =
+                    tokio::join!(fetch_with_cache(cache, store, &cvec_key), async {
+                        if want_rerank_attrs {
+                            load_attrs(index, cluster_idx, filter, store, cache).await
+                        } else {
+                            Ok(None)
+                        }
+                    },);
                 (cluster_idx, needed_ids, cluster_res, attrs)
             }
         }))
         .await;
 
     let mut candidates = Vec::new();
-    for (_, needed_ids, cluster_res, attrs) in rerank_prefetched {
+    for (cluster_idx, needed_ids, cluster_res, attrs) in rerank_prefetched {
         let cluster_data = cluster_res?;
         let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
 
-        let needed_set: std::collections::HashSet<&str> =
-            needed_ids.iter().map(|s| s.as_str()).collect();
+        let needed_set: HashSet<&str> = needed_ids.iter().map(|s| s.as_str()).collect();
 
         for (j, id) in cluster.ids.iter().enumerate() {
             if needed_set.contains(id.as_str()) {
@@ -424,6 +413,8 @@ async fn scan_clusters_sq(
                     id: id.clone(),
                     score,
                     attributes: vector_attrs,
+                    cluster_idx,
+                    row_idx: j,
                 });
             }
         }
@@ -528,6 +519,7 @@ async fn scan_clusters_pq(
             .push(id.clone());
     }
 
+    let want_rerank_attrs = filter.is_some();
     let rerank_prefetched =
         futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
             let cvec_key = cluster_key(
@@ -537,23 +529,26 @@ async fn scan_clusters_pq(
             );
             let needed_ids = needed_ids.clone();
             async move {
-                let (cluster_res, attrs) = tokio::join!(
-                    fetch_with_cache(cache, store, &cvec_key),
-                    load_attrs(index, cluster_idx, filter, store, cache),
-                );
-                (needed_ids, cluster_res, attrs)
+                let (cluster_res, attrs) =
+                    tokio::join!(fetch_with_cache(cache, store, &cvec_key), async {
+                        if want_rerank_attrs {
+                            load_attrs(index, cluster_idx, filter, store, cache).await
+                        } else {
+                            Ok(None)
+                        }
+                    },);
+                (cluster_idx, needed_ids, cluster_res, attrs)
             }
         }))
         .await;
 
     let mut candidates = Vec::new();
-    for (needed_ids, cluster_res, attrs) in rerank_prefetched {
+    for (cluster_idx, needed_ids, cluster_res, attrs) in rerank_prefetched {
         let cluster_data = cluster_res?;
         let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
 
-        let needed_set: std::collections::HashSet<&str> =
-            needed_ids.iter().map(|s| s.as_str()).collect();
+        let needed_set: HashSet<&str> = needed_ids.iter().map(|s| s.as_str()).collect();
 
         for (j, id) in cluster.ids.iter().enumerate() {
             if needed_set.contains(id.as_str()) {
@@ -563,6 +558,8 @@ async fn scan_clusters_pq(
                     id: id.clone(),
                     score,
                     attributes: vector_attrs,
+                    cluster_idx,
+                    row_idx: j,
                 });
             }
         }
@@ -636,6 +633,75 @@ pub(crate) fn coarse_row_passes(
     }
 }
 
+/// Enrich final unfiltered results by fetching attrs for only their clusters.
+async fn enrich_unfiltered_results(
+    index: &IvfFlatIndex,
+    candidates: Vec<Candidate>,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Result<Vec<SearchResult>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::new();
+    let mut cluster_indices = Vec::new();
+    for candidate in &candidates {
+        if seen.insert(candidate.cluster_idx) {
+            cluster_indices.push(candidate.cluster_idx);
+        }
+    }
+
+    let attrs_fetches =
+        futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| async move {
+            (
+                cluster_idx,
+                load_attrs(index, cluster_idx, None, store, cache).await,
+            )
+        }))
+        .await;
+
+    let mut attrs_by_cluster: HashMap<usize, Option<ClusterAttrs>> = HashMap::new();
+    for (cluster_idx, attrs) in attrs_fetches {
+        attrs_by_cluster.insert(cluster_idx, attrs?);
+    }
+
+    let mut results = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let cluster_attrs = attrs_by_cluster
+            .get(&candidate.cluster_idx)
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "missing attrs for final result cluster {}",
+                    candidate.cluster_idx
+                ))
+            })?
+            .as_ref()
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "attrs absent for final result cluster {}",
+                    candidate.cluster_idx
+                ))
+            })?;
+        let attributes = cluster_attrs
+            .get(candidate.row_idx)
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "attrs row {} missing in cluster {}",
+                    candidate.row_idx, candidate.cluster_idx
+                ))
+            })?
+            .clone();
+        results.push(SearchResult {
+            id: candidate.id,
+            score: candidate.score,
+            attributes,
+        });
+    }
+
+    Ok(results)
+}
+
 /// Load attribute data for a cluster. Shared helper for all scan methods.
 async fn load_attrs(
     index: &IvfFlatIndex,
@@ -643,7 +709,7 @@ async fn load_attrs(
     _filter: Option<&Filter>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
-) -> Result<Option<Vec<Option<HashMap<String, AttributeValue>>>>> {
+) -> Result<Option<ClusterAttrs>> {
     let akey = attrs_key(
         &index.namespace,
         index.cluster_owner(cluster_idx),

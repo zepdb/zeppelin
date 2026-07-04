@@ -4,7 +4,7 @@
 //! candidates at each level. At the leaf level, scans data clusters
 //! (identical to IVF-Flat scan) with optional quantized two-phase search.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tracing::debug;
@@ -26,11 +26,15 @@ use super::{deserialize_tree_node, tree_node_key, HierarchicalIndex};
 use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
 use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 
+type ClusterAttrs = Vec<Option<HashMap<String, AttributeValue>>>;
+
 /// A candidate result during search, before final ranking.
 struct Candidate {
     id: String,
     score: f32,
     attributes: Option<HashMap<String, AttributeValue>>,
+    cluster_idx: usize,
+    row_idx: usize,
 }
 
 /// Fetch data from cache or S3.
@@ -111,7 +115,7 @@ pub async fn search_hierarchical(
             .iter()
             .filter_map(|(id, _)| id.parse::<usize>().ok())
             .collect();
-        return scan_leaf_clusters(
+        let candidates = scan_leaf_clusters(
             index,
             &cluster_indices,
             query,
@@ -122,7 +126,8 @@ pub async fn search_hierarchical(
             oversample_factor,
             cache,
         )
-        .await;
+        .await?;
+        return finalize_candidates(ns, seg, candidates, top_k, filter, store, cache).await;
     }
 
     // Partition root beam into leaf clusters vs internal nodes.
@@ -141,7 +146,7 @@ pub async fn search_hierarchical(
         }
     }
 
-    let mut accumulated: Vec<SearchResult> = Vec::new();
+    let mut accumulated: Vec<Candidate> = Vec::new();
 
     // Scan any leaf clusters found at root level.
     if !root_leaf_clusters.is_empty() {
@@ -150,7 +155,7 @@ pub async fn search_hierarchical(
             internal_count = current_ids.len(),
             "root beam: partitioned into leaf clusters and internal nodes"
         );
-        let leaf_results = scan_leaf_clusters(
+        let leaf_candidates = scan_leaf_clusters(
             index,
             &root_leaf_clusters,
             query,
@@ -162,18 +167,12 @@ pub async fn search_hierarchical(
             cache,
         )
         .await?;
-        accumulated.extend(leaf_results);
+        accumulated.extend(leaf_candidates);
     }
 
     if current_ids.is_empty() {
         // All root beam entries were leaf clusters — return results.
-        accumulated.sort_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        accumulated.truncate(top_k);
-        return Ok(accumulated);
+        return finalize_candidates(ns, seg, accumulated, top_k, filter, store, cache).await;
     }
 
     loop {
@@ -226,7 +225,7 @@ pub async fn search_hierarchical(
 
         // Scan any leaf clusters found at this level.
         if !leaf_clusters.is_empty() {
-            let leaf_results = scan_leaf_clusters(
+            let leaf_candidates = scan_leaf_clusters(
                 index,
                 &leaf_clusters,
                 query,
@@ -238,18 +237,12 @@ pub async fn search_hierarchical(
                 cache,
             )
             .await?;
-            accumulated.extend(leaf_results);
+            accumulated.extend(leaf_candidates);
         }
 
         if internal_ids.is_empty() {
             // No more internal nodes to descend — return merged results.
-            accumulated.sort_by(|a, b| {
-                a.score
-                    .partial_cmp(&b.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            accumulated.truncate(top_k);
-            return Ok(accumulated);
+            return finalize_candidates(ns, seg, accumulated, top_k, filter, store, cache).await;
         }
 
         current_ids = internal_ids;
@@ -269,7 +262,7 @@ async fn scan_leaf_clusters(
     store: &ZeppelinStore,
     oversample_factor: usize,
     cache: Option<&Arc<DiskCache>>,
-) -> Result<Vec<SearchResult>> {
+) -> Result<Vec<Candidate>> {
     let fetch_k = if filter.is_some() {
         oversampled_k(top_k, oversample_factor)
     } else {
@@ -342,7 +335,7 @@ async fn scan_leaf_clusters(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let results: Vec<SearchResult> = if let Some(f) = filter {
+    let results: Vec<Candidate> = if let Some(f) = filter {
         sorted
             .into_iter()
             .filter(|c| match &c.attributes {
@@ -350,22 +343,9 @@ async fn scan_leaf_clusters(
                 None => false,
             })
             .take(top_k)
-            .map(|c| SearchResult {
-                id: c.id,
-                score: c.score,
-                attributes: c.attributes,
-            })
             .collect()
     } else {
-        sorted
-            .into_iter()
-            .take(top_k)
-            .map(|c| SearchResult {
-                id: c.id,
-                score: c.score,
-                attributes: c.attributes,
-            })
-            .collect()
+        sorted.into_iter().take(top_k).collect()
     };
 
     debug!(
@@ -389,6 +369,7 @@ async fn scan_clusters_flat(
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
     // Phase 1: Parallel prefetch — all S3 I/O fires concurrently.
+    let want_attrs = filter.is_some();
     let prefetched = futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| {
         let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
         async move {
@@ -403,7 +384,13 @@ async fn scan_clusters_flat(
                     store,
                     cache,
                 ),
-                load_attrs(namespace, segment_id, cluster_idx, filter, store, cache),
+                async {
+                    if want_attrs {
+                        load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
+                    } else {
+                        Ok(None)
+                    }
+                },
             );
             (cluster_idx, cluster_res, prefilter, attrs)
         }
@@ -412,7 +399,7 @@ async fn scan_clusters_flat(
 
     // Phase 2: Sequential compute — CPU-bound, no I/O.
     let mut candidates = Vec::new();
-    for (_cluster_idx, cluster_res, prefilter, attrs) in prefetched {
+    for (cluster_idx, cluster_res, prefilter, attrs) in prefetched {
         let cluster_data = cluster_res?;
         let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
@@ -429,6 +416,8 @@ async fn scan_clusters_flat(
                 id: cluster.ids[j].clone(),
                 score,
                 attributes: vector_attrs,
+                cluster_idx,
+                row_idx: j,
             });
         }
     }
@@ -522,27 +511,32 @@ async fn scan_clusters_sq(
         by_cluster.entry(*cidx).or_default().push(id.clone());
     }
 
+    let want_rerank_attrs = filter.is_some();
     let rerank_prefetched =
         futures::future::join_all(by_cluster.iter().map(|(&cluster_idx, needed_ids)| {
             let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
             let needed_ids = needed_ids.clone();
             async move {
-                let (cluster_res, attrs) = tokio::join!(
-                    fetch_with_cache(cache, store, &cvec_key),
-                    load_attrs(namespace, segment_id, cluster_idx, filter, store, cache),
-                );
-                (needed_ids, cluster_res, attrs)
+                let (cluster_res, attrs) =
+                    tokio::join!(fetch_with_cache(cache, store, &cvec_key), async {
+                        if want_rerank_attrs {
+                            load_attrs(namespace, segment_id, cluster_idx, filter, store, cache)
+                                .await
+                        } else {
+                            Ok(None)
+                        }
+                    },);
+                (cluster_idx, needed_ids, cluster_res, attrs)
             }
         }))
         .await;
 
     let mut candidates = Vec::new();
-    for (needed_ids, cluster_res, attrs) in rerank_prefetched {
+    for (cluster_idx, needed_ids, cluster_res, attrs) in rerank_prefetched {
         let cluster_data = cluster_res?;
         let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
-        let needed_set: std::collections::HashSet<&str> =
-            needed_ids.iter().map(|s| s.as_str()).collect();
+        let needed_set: HashSet<&str> = needed_ids.iter().map(|s| s.as_str()).collect();
 
         for (j, id) in cluster.ids.iter().enumerate() {
             if needed_set.contains(id.as_str()) {
@@ -552,6 +546,8 @@ async fn scan_clusters_sq(
                     id: id.clone(),
                     score,
                     attributes: vector_attrs,
+                    cluster_idx,
+                    row_idx: j,
                 });
             }
         }
@@ -645,27 +641,32 @@ async fn scan_clusters_pq(
         by_cluster.entry(*cidx).or_default().push(id.clone());
     }
 
+    let want_rerank_attrs = filter.is_some();
     let rerank_prefetched =
         futures::future::join_all(by_cluster.iter().map(|(&cluster_idx, needed_ids)| {
             let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
             let needed_ids = needed_ids.clone();
             async move {
-                let (cluster_res, attrs) = tokio::join!(
-                    fetch_with_cache(cache, store, &cvec_key),
-                    load_attrs(namespace, segment_id, cluster_idx, filter, store, cache),
-                );
-                (needed_ids, cluster_res, attrs)
+                let (cluster_res, attrs) =
+                    tokio::join!(fetch_with_cache(cache, store, &cvec_key), async {
+                        if want_rerank_attrs {
+                            load_attrs(namespace, segment_id, cluster_idx, filter, store, cache)
+                                .await
+                        } else {
+                            Ok(None)
+                        }
+                    },);
+                (cluster_idx, needed_ids, cluster_res, attrs)
             }
         }))
         .await;
 
     let mut candidates = Vec::new();
-    for (needed_ids, cluster_res, attrs) in rerank_prefetched {
+    for (cluster_idx, needed_ids, cluster_res, attrs) in rerank_prefetched {
         let cluster_data = cluster_res?;
         let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
-        let needed_set: std::collections::HashSet<&str> =
-            needed_ids.iter().map(|s| s.as_str()).collect();
+        let needed_set: HashSet<&str> = needed_ids.iter().map(|s| s.as_str()).collect();
 
         for (j, id) in cluster.ids.iter().enumerate() {
             if needed_set.contains(id.as_str()) {
@@ -675,12 +676,113 @@ async fn scan_clusters_pq(
                     id: id.clone(),
                     score,
                     attributes: vector_attrs,
+                    cluster_idx,
+                    row_idx: j,
                 });
             }
         }
     }
 
     Ok(candidates)
+}
+
+async fn finalize_candidates(
+    namespace: &str,
+    segment_id: &str,
+    mut candidates: Vec<Candidate>,
+    top_k: usize,
+    filter: Option<&Filter>,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Result<Vec<SearchResult>> {
+    candidates.sort_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(top_k);
+
+    if filter.is_some() {
+        return Ok(candidates
+            .into_iter()
+            .map(|candidate| SearchResult {
+                id: candidate.id,
+                score: candidate.score,
+                attributes: candidate.attributes,
+            })
+            .collect());
+    }
+
+    enrich_unfiltered_results(namespace, segment_id, candidates, store, cache).await
+}
+
+async fn enrich_unfiltered_results(
+    namespace: &str,
+    segment_id: &str,
+    candidates: Vec<Candidate>,
+    store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
+) -> Result<Vec<SearchResult>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::new();
+    let mut cluster_indices = Vec::new();
+    for candidate in &candidates {
+        if seen.insert(candidate.cluster_idx) {
+            cluster_indices.push(candidate.cluster_idx);
+        }
+    }
+
+    let attrs_fetches =
+        futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| async move {
+            (
+                cluster_idx,
+                load_attrs(namespace, segment_id, cluster_idx, None, store, cache).await,
+            )
+        }))
+        .await;
+
+    let mut attrs_by_cluster: HashMap<usize, Option<ClusterAttrs>> = HashMap::new();
+    for (cluster_idx, attrs) in attrs_fetches {
+        attrs_by_cluster.insert(cluster_idx, attrs?);
+    }
+
+    let mut results = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let cluster_attrs = attrs_by_cluster
+            .get(&candidate.cluster_idx)
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "missing attrs for final result cluster {}",
+                    candidate.cluster_idx
+                ))
+            })?
+            .as_ref()
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "attrs absent for final result cluster {}",
+                    candidate.cluster_idx
+                ))
+            })?;
+        let attributes = cluster_attrs
+            .get(candidate.row_idx)
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "attrs row {} missing in cluster {}",
+                    candidate.row_idx, candidate.cluster_idx
+                ))
+            })?
+            .clone();
+        results.push(SearchResult {
+            id: candidate.id,
+            score: candidate.score,
+            attributes,
+        });
+    }
+
+    Ok(results)
 }
 
 /// Try to load a cluster's bitmap index and evaluate the filter against it.
@@ -722,7 +824,7 @@ async fn load_attrs(
     _filter: Option<&Filter>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
-) -> Result<Option<Vec<Option<HashMap<String, AttributeValue>>>>> {
+) -> Result<Option<ClusterAttrs>> {
     let akey = attrs_key(namespace, segment_id, cluster_idx);
     let data = fetch_with_cache(cache, store, &akey).await?;
     Ok(Some(deserialize_attrs(&data)?))

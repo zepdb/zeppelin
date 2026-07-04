@@ -219,8 +219,10 @@ async fn cold_strong_vector_query_pins_sq8_get_profile() {
     // - centroids=1: active segment IVF centroid blob.
     // - sq=5: SQ8 calibration plus one SQ cluster sidecar per probed cluster.
     // - cluster=4: full-precision cluster blobs for SQ8 rerank.
-    // - attrs=4: current rerank path loads attrs for every reranked cluster,
-    //   even without a filter.
+    // - attrs=4: lazy final-result enrichment still needs all four attrs
+    //   blobs in this fixture because top_k=4 returns one vector from each
+    //   one-vector cluster. attrs_laziness_tests pins the reduced top_k=1
+    //   profile where only the winning cluster's attrs are fetched.
     // - total=15: honest object GET count, not the thesis-level "2".
     assert_get_profile(
         &fixture.counter,
