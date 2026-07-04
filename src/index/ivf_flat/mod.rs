@@ -34,6 +34,8 @@ pub struct IvfFlatIndex {
     pub(crate) segment_id: String,
     /// Quantization type used by this index.
     pub(crate) quantization: crate::index::quantization::QuantizationType,
+    /// SQ calibration loaded from the v2 centroids blob, when embedded.
+    pub(crate) sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
     /// Fields that have bitmap indexes.
     pub(crate) bitmap_fields: Vec<String>,
     /// Per-cluster owning segment IDs (incremental compaction carry-over).

@@ -1377,12 +1377,25 @@ async fn test_compaction_skips_non_finite_prefix_data() {
         .get(&format!("{ns}/segments/{seg}/centroids.bin"))
         .await
         .unwrap();
-    // Layout: [num_centroids: u32][dim: u32][f32 * num * dim]
-    let num = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    let dim = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    // Layouts:
+    // - legacy: [num_centroids: u32][dim: u32][f32 * num * dim]
+    // - v2:     [b"ZCT2"][num_centroids: u32][dim: u32][f32 * num * dim]...
+    let (num, dim, float_offset) = if data.starts_with(b"ZCT2") {
+        (
+            u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize,
+            u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize,
+            12usize,
+        )
+    } else {
+        (
+            u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize,
+            u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize,
+            8usize,
+        )
+    };
     assert!(num > 0 && dim == 16);
     for i in 0..num * dim {
-        let off = 8 + i * 4;
+        let off = float_offset + i * 4;
         let val = f32::from_le_bytes(data[off..off + 4].try_into().unwrap());
         assert!(
             val.is_finite(),

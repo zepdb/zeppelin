@@ -898,15 +898,35 @@ impl Compactor {
     ) -> Result<(usize, Vec<String>, Vec<String>)> {
         use crate::index::distance::euclidean_distance;
         use crate::index::ivf_flat::build::{
-            centroids_key, deserialize_centroids, serialize_attrs, serialize_centroids,
-            serialize_cluster,
+            centroids_key, deserialize_centroids_data, serialize_attrs,
+            serialize_centroids_with_sq_calibration, serialize_cluster,
+            serialize_colocated_sq_cluster,
         };
         use bytes::Bytes;
 
         // Load existing centroids
         let ckey = centroids_key(namespace, old_segment_id);
         let centroids_data = self.store.get(&ckey).await?;
-        let (centroids, dim) = deserialize_centroids(&centroids_data)?;
+        let decoded_centroids = deserialize_centroids_data(&centroids_data)?;
+        let centroids = decoded_centroids.centroids;
+        let dim = decoded_centroids.dim;
+        let mut sq_calibration_bytes = decoded_centroids.sq_calibration;
+        if matches!(
+            self.indexing_config.quantization,
+            crate::index::quantization::QuantizationType::Scalar
+        ) && sq_calibration_bytes.is_none()
+        {
+            use crate::index::quantization::sq::sq_calibration_key;
+            sq_calibration_bytes = Some(
+                self.store
+                    .get(&sq_calibration_key(namespace, old_segment_id))
+                    .await?,
+            );
+        }
+        let sq_calibration = sq_calibration_bytes
+            .as_ref()
+            .map(|bytes| crate::index::quantization::sq::SqCalibration::from_bytes(bytes))
+            .transpose()?;
         let num_clusters = centroids.len();
 
         // Assign ALL surviving vectors to nearest centroid.
@@ -981,7 +1001,11 @@ impl Compactor {
 
         // Write centroids (segment-global — always under the new segment).
         let new_ckey = centroids_key(namespace, new_segment_id);
-        let new_centroids_data = serialize_centroids(&centroids, dim)?;
+        let new_centroids_data = serialize_centroids_with_sq_calibration(
+            &centroids,
+            dim,
+            sq_calibration_bytes.as_ref().map(|bytes| bytes.as_ref()),
+        )?;
         self.store.put(&new_ckey, new_centroids_data).await?;
 
         // CPU phase: pre-serialize payloads for REWRITTEN clusters only.
@@ -1004,7 +1028,14 @@ impl Compactor {
             if !touched[i] {
                 continue; // carried over by reference
             }
-            let cvec_data = serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?;
+            let cvec_data = if let Some(calibration) = &sq_calibration {
+                let cluster_refs: Vec<&[f32]> =
+                    cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
+                let codes = calibration.encode_batch(&cluster_refs);
+                serialize_colocated_sq_cluster(&cluster_ids[i], &cluster_vecs[i], &codes, dim)?
+            } else {
+                serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?
+            };
             let cvec_key = cluster_key(namespace, new_segment_id, i);
 
             let cattr_data = serialize_attrs(&cluster_attrs[i])?;
@@ -1035,31 +1066,9 @@ impl Compactor {
         // rewritten clusters against it.
         match self.indexing_config.quantization {
             crate::index::quantization::QuantizationType::Scalar => {
-                use crate::index::quantization::sq::{
-                    serialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
-                };
-
-                // Reuse the old calibration; if it's missing, fail so the caller
-                // falls back to a full retrain (symmetric with PQ below).
-                let cal_data = self
-                    .store
-                    .get(&sq_calibration_key(namespace, old_segment_id))
-                    .await?;
-                let cal = SqCalibration::from_bytes(&cal_data)?;
-                self.store
-                    .put(&sq_calibration_key(namespace, new_segment_id), cal_data)
-                    .await?;
-
-                for i in 0..num_clusters {
-                    if !touched[i] {
-                        continue;
-                    }
-                    let cluster_refs: Vec<&[f32]> =
-                        cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
-                    let codes = cal.encode_batch(&cluster_refs);
-                    let sq_data = serialize_sq_cluster(&cluster_ids[i], &codes, dim)?;
-                    payloads.push((sq_cluster_key(namespace, new_segment_id, i), sq_data));
-                }
+                debug!(
+                    "incremental SQ8 build embedded calibration and co-located rewritten clusters"
+                );
             }
             crate::index::quantization::QuantizationType::Product => {
                 use crate::index::quantization::pq::{
