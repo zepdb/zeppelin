@@ -5,10 +5,11 @@
 //! real object storage — the wrapper only observes.
 //!
 //! F1/H12: in addition to per-key counts, every GET and PUT is attributed to
-//! an [`ArtifactClass`] bucket (cluster_/attrs_/sq_/bitmap_/fts/wal/manifest)
-//! with BOTH operation counts and byte counts per bucket. GET bytes are the
-//! actual returned payload size (`GetResult::range`), PUT bytes the actual
-//! request body size (`PutPayload::content_length`).
+//! an [`ArtifactClass`] bucket
+//! (cluster_/attrs_/sq_/bitmap_/coarse_sketch/fts/wal/manifest) with BOTH
+//! operation counts and byte counts per bucket. GET bytes are the actual
+//! returned payload size (`GetResult::range`), PUT bytes the actual request
+//! body size (`PutPayload::content_length`).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -41,6 +42,8 @@ pub enum ArtifactClass {
     Sq,
     /// `{ns}/segments/{seg}/bitmap_{i}.bin` — roaring bitmap pre-filter.
     Bitmap,
+    /// `{ns}/segments/{seg}/coarse_sketch.bin` — resident cluster-selection sketch.
+    Sketch,
     /// `global_fts.bin`, `fts_index_{i}.bin`, `fts_meta.json`.
     Fts,
     /// `{ns}/wal/{ulid}.wal` — WAL fragments.
@@ -53,12 +56,13 @@ pub enum ArtifactClass {
 }
 
 /// All classes, in display/index order. Index MUST match `as usize`.
-pub const ALL_CLASSES: [ArtifactClass; 9] = [
+pub const ALL_CLASSES: [ArtifactClass; 10] = [
     ArtifactClass::Cluster,
     ArtifactClass::Attrs,
     ArtifactClass::Centroids,
     ArtifactClass::Sq,
     ArtifactClass::Bitmap,
+    ArtifactClass::Sketch,
     ArtifactClass::Fts,
     ArtifactClass::Wal,
     ArtifactClass::Manifest,
@@ -81,6 +85,7 @@ impl ArtifactClass {
             ArtifactClass::Centroids => "centroids",
             ArtifactClass::Sq => "sq",
             ArtifactClass::Bitmap => "bitmap",
+            ArtifactClass::Sketch => "sketch",
             ArtifactClass::Fts => "fts",
             ArtifactClass::Wal => "wal",
             ArtifactClass::Manifest => "manifest",
@@ -102,6 +107,7 @@ impl fmt::Display for ArtifactClass {
 /// - `src/index/quantization/sq.rs`: `sq_calibration.bin`, `sq_cluster_{i}.bin`
 /// - `src/index/quantization/pq.rs`: `pq_codebook.bin`, `pq_cluster_{i}.bin`
 /// - `src/index/bitmap/mod.rs`: `bitmap_{i}.bin`
+/// - `src/index/ivf_flat/sketch.rs`: `coarse_sketch.bin`
 /// - `src/fts/global_index.rs` + `src/fts/inverted_index.rs`:
 ///   `global_fts.bin`, `fts_index_{i}.bin`, `fts_meta.json`
 /// - `src/wal/fragment.rs`: `{ns}/wal/{ulid}.wal`
@@ -119,6 +125,8 @@ pub fn classify(key: &str) -> ArtifactClass {
         ArtifactClass::Sq
     } else if filename.starts_with("bitmap_") {
         ArtifactClass::Bitmap
+    } else if filename == "coarse_sketch.bin" {
+        ArtifactClass::Sketch
     } else if filename == "global_fts.bin" || filename.starts_with("fts_") {
         ArtifactClass::Fts
     } else if filename.ends_with(".wal") {

@@ -40,12 +40,19 @@ struct ExpectedGets {
     sq: u64,
     cluster: u64,
     attrs: u64,
+    sketch: u64,
     wal: u64,
 }
 
 impl ExpectedGets {
     fn total(self) -> u64 {
-        self.manifest + self.centroids + self.sq + self.cluster + self.attrs + self.wal
+        self.manifest
+            + self.centroids
+            + self.sq
+            + self.cluster
+            + self.attrs
+            + self.sketch
+            + self.wal
     }
 }
 
@@ -348,6 +355,7 @@ fn assert_get_profile(counter: &GetCounter, expected: ExpectedGets) {
     assert_eq!(counter.gets_for(ArtifactClass::Sq), expected.sq);
     assert_eq!(counter.gets_for(ArtifactClass::Cluster), expected.cluster);
     assert_eq!(counter.gets_for(ArtifactClass::Attrs), expected.attrs);
+    assert_eq!(counter.gets_for(ArtifactClass::Sketch), expected.sketch);
     assert_eq!(counter.gets_for(ArtifactClass::Wal), expected.wal);
     assert_eq!(counter.gets_for(ArtifactClass::Bitmap), 0);
     assert_eq!(counter.gets_for(ArtifactClass::Fts), 0);
@@ -406,7 +414,9 @@ async fn cold_strong_vector_query_pins_sq8_get_profile() {
     //   blobs in this fixture because top_k=4 returns one vector from each
     //   one-vector cluster. attrs_laziness_tests pins the reduced top_k=1
     //   profile where only the winning cluster's attrs are fetched.
-    // - total=10: honest object GET count, not the thesis-level "2".
+    // - sketch=1: the resident coarse sketch is loaded with the segment handle
+    //   on a cold no-cache query. Cached query profiles pin the resident sketch.
+    // - total=11: honest object GET count, not the thesis-level "2".
     assert_get_profile(
         &fixture.counter,
         ExpectedGets {
@@ -415,6 +425,7 @@ async fn cold_strong_vector_query_pins_sq8_get_profile() {
             sq: 0,
             cluster: 4,
             attrs: 4,
+            sketch: 1,
             wal: 0,
         },
     );
@@ -445,6 +456,7 @@ async fn cold_strong_profiles_pin_legacy_and_colocated_sq8_layouts() {
             sq: 5,
             cluster: 4,
             attrs: 4,
+            sketch: 0,
             wal: 0,
         },
     );
@@ -461,6 +473,7 @@ async fn cold_strong_profiles_pin_legacy_and_colocated_sq8_layouts() {
             sq: 0,
             cluster: 4,
             attrs: 4,
+            sketch: 0,
             wal: 0,
         },
     );
@@ -505,6 +518,7 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
             sq: 0,
             cluster: 4,
             attrs: 4,
+            sketch: 1,
             wal: 0,
         },
     );
@@ -529,13 +543,14 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
             sq: 0,
             cluster: 4,
             attrs: 4,
+            sketch: 1,
             wal: 1,
         },
     );
     let strong_total = fixture.counter.total_gets();
 
-    assert_eq!(eventual_total, 9);
-    assert_eq!(strong_total, 11);
+    assert_eq!(eventual_total, 10);
+    assert_eq!(strong_total, 12);
     assert_eq!(
         strong_total - eventual_total,
         2,
@@ -561,6 +576,7 @@ async fn cluster_gets_scale_exactly_with_nprobe() {
             sq: 0,
             cluster: 1,
             attrs: 1,
+            sketch: 1,
             wal: 0,
         },
     );
@@ -579,6 +595,7 @@ async fn cluster_gets_scale_exactly_with_nprobe() {
             sq: 0,
             cluster: 4,
             attrs: 4,
+            sketch: 1,
             wal: 0,
         },
     );
@@ -619,6 +636,7 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
             sq: 0,
             cluster: 4,
             attrs: 4,
+            sketch: 1,
             wal: 0,
         },
     );
@@ -646,12 +664,13 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
             sq: 0,
             cluster: 0,
             attrs: 0,
+            sketch: 0,
             wal: 0,
         },
     );
     let warm_total = fixture.counter.total_gets();
 
-    assert_eq!(cold_total, 10);
+    assert_eq!(cold_total, 11);
     assert_eq!(warm_total, 1);
     assert!(
         warm_total < cold_total,
