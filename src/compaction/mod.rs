@@ -361,7 +361,7 @@ impl Compactor {
         // ERROR-level structured log + metric per dropped vector. Note the
         // vector remains visible to Strong queries via the WAL until this
         // compaction's manifest lands; after that it is gone entirely.
-        let vectors: Vec<VectorEntry> = latest_vectors
+        let mut vectors: Vec<VectorEntry> = latest_vectors
             .into_values()
             .filter(|v| {
                 if let Some(bad_idx) = v.values.iter().position(|x| !x.is_finite()) {
@@ -381,6 +381,7 @@ impl Compactor {
                 }
             })
             .collect();
+        vectors.sort_by(|a, b| a.id.cmp(&b.id));
         let vectors_compacted = vectors.len();
 
         // Collect keys for deferred deletion, carrying over keys whose

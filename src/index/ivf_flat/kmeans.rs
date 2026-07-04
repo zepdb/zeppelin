@@ -7,8 +7,9 @@
 //! Both modes use k-means++ initialization and are allocation-aware:
 //! centroid storage is pre-allocated and reused across iterations.
 
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use tracing::{debug, info, warn};
 
 use crate::error::{Result, ZeppelinError};
@@ -78,8 +79,11 @@ pub fn train_kmeans(
         "starting k-means++ initialization"
     );
 
+    let seed = deterministic_seed(vectors, dim, effective_k, max_iters, epsilon);
+    let mut rng = StdRng::seed_from_u64(seed);
+
     // --- k-means++ initialization ---
-    let centroids = kmeans_pp_init(vectors, dim, effective_k)?;
+    let centroids = kmeans_pp_init(vectors, dim, effective_k, &mut rng)?;
 
     // Choose training mode based on dataset size
     if n > MINI_BATCH_THRESHOLD {
@@ -88,7 +92,15 @@ pub fn train_kmeans(
             batch_size = DEFAULT_BATCH_SIZE,
             "using mini-batch k-means (dataset exceeds threshold)"
         );
-        train_mini_batch(vectors, dim, effective_k, max_iters, epsilon, centroids)
+        train_mini_batch(
+            vectors,
+            dim,
+            effective_k,
+            max_iters,
+            epsilon,
+            centroids,
+            &mut rng,
+        )
     } else {
         train_lloyds(vectors, dim, effective_k, max_iters, epsilon, centroids)
     }
@@ -199,10 +211,10 @@ fn train_mini_batch(
     max_iters: usize,
     epsilon: f64,
     mut centroids: Vec<Vec<f32>>,
+    rng: &mut StdRng,
 ) -> Result<Vec<Vec<f32>>> {
     let n = vectors.len();
     let batch_size = DEFAULT_BATCH_SIZE.min(n);
-    let mut rng = rand::thread_rng();
 
     // Per-centroid sample count (for learning rate decay)
     let mut centroid_counts = vec![0u64; k];
@@ -215,7 +227,7 @@ fn train_mini_batch(
 
     for iter in 0..max_iters {
         // Sample a mini-batch (shuffle and take first batch_size)
-        indices.shuffle(&mut rng);
+        indices.shuffle(rng);
         let batch = &indices[..batch_size];
 
         // Assign batch vectors to nearest centroids
@@ -287,9 +299,13 @@ fn train_mini_batch(
 
 /// k-means++ seeding: pick initial centroids with probability proportional
 /// to squared distance from the nearest already-chosen centroid.
-fn kmeans_pp_init(vectors: &[&[f32]], dim: usize, k: usize) -> Result<Vec<Vec<f32>>> {
+fn kmeans_pp_init(
+    vectors: &[&[f32]],
+    dim: usize,
+    k: usize,
+    rng: &mut StdRng,
+) -> Result<Vec<Vec<f32>>> {
     let n = vectors.len();
-    let mut rng = rand::thread_rng();
 
     let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(k);
 
@@ -355,6 +371,39 @@ fn kmeans_pp_init(vectors: &[&[f32]], dim: usize, k: usize) -> Result<Vec<Vec<f3
     debug_assert!(centroids.iter().all(|c| c.len() == dim));
 
     Ok(centroids)
+}
+
+#[must_use]
+fn deterministic_seed(
+    vectors: &[&[f32]],
+    dim: usize,
+    k: usize,
+    max_iters: usize,
+    epsilon: f64,
+) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn mix(hash: &mut u64, value: u64) {
+        for byte in value.to_le_bytes() {
+            *hash ^= u64::from(byte);
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    let mut hash = FNV_OFFSET;
+    mix(&mut hash, vectors.len() as u64);
+    mix(&mut hash, dim as u64);
+    mix(&mut hash, k as u64);
+    mix(&mut hash, max_iters as u64);
+    mix(&mut hash, epsilon.to_bits());
+    for vector in vectors {
+        mix(&mut hash, vector.len() as u64);
+        for &value in *vector {
+            mix(&mut hash, u64::from(value.to_bits()));
+        }
+    }
+    hash
 }
 
 /// Squared L2 distance between two vectors.
@@ -459,7 +508,8 @@ mod tests {
             vec![10.1, 10.1],
         ];
         let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
-        let centroids = kmeans_pp_init(&refs, 2, 2).unwrap();
+        let mut rng = StdRng::seed_from_u64(deterministic_seed(&refs, 2, 2, 100, 1e-6));
+        let centroids = kmeans_pp_init(&refs, 2, 2, &mut rng).unwrap();
         let result = train_lloyds(&refs, 2, 2, 100, 1e-6, centroids).unwrap();
         assert_eq!(result.len(), 2);
 
@@ -467,5 +517,23 @@ mod tests {
         let c1 = result[0][0].max(result[1][0]);
         assert!(c0 < 1.0, "lower centroid should be near 0, got {c0}");
         assert!(c1 > 9.0, "upper centroid should be near 10, got {c1}");
+    }
+
+    #[test]
+    fn test_train_kmeans_is_deterministic() {
+        let data = [
+            vec![0.0, 0.0],
+            vec![0.1, 0.0],
+            vec![10.0, 10.0],
+            vec![10.1, 10.0],
+            vec![20.0, 20.0],
+            vec![20.1, 20.0],
+        ];
+        let refs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
+
+        let first = train_kmeans(&refs, 2, 3, 25, 1e-4).unwrap();
+        let second = train_kmeans(&refs, 2, 3, 25, 1e-4).unwrap();
+
+        assert_eq!(first, second);
     }
 }
