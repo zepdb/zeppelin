@@ -82,7 +82,7 @@ case "$SUBSET" in
         ;;
     e2e)
         echo "Running end-to-end tests..."
-        cargo test --manifest-path "$PROJECT_ROOT/Cargo.toml" --test e2e_tests -- --nocapture
+        cargo test --manifest-path "$PROJECT_ROOT/Cargo.toml" --test e2e_perf_tests --test fts_e2e_tests -- --nocapture
         ;;
     unit)
         echo "Running unit tests only (no S3)..."

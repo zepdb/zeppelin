@@ -160,8 +160,11 @@ impl Default for ClassCounters {
 }
 
 impl ClassCounters {
-    fn record_get(&self, class: ArtifactClass, bytes: u64) {
+    fn record_get_attempt(&self, class: ArtifactClass) {
         self.get_ops[class.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_get_bytes(&self, class: ArtifactClass, bytes: u64) {
         self.get_bytes[class.index()].fetch_add(bytes, Ordering::Relaxed);
     }
 
@@ -347,10 +350,9 @@ impl ObjectStore for CountingStore {
             .entry(location.to_string())
             .and_modify(|v| *v += 1)
             .or_insert(1);
-        self.counter.classes.record_put(
-            classify(location.as_ref()),
-            payload.content_length() as u64,
-        );
+        self.counter
+            .classes
+            .record_put(classify(location.as_ref()), payload.content_length() as u64);
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -365,18 +367,20 @@ impl ObjectStore for CountingStore {
     // All GET variants funnel through get_opts (the trait's `get`,
     // `get_range`, and `get_ranges` default impls delegate here).
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        let class = classify(location.as_ref());
         self.counter
             .gets
             .entry(location.to_string())
             .and_modify(|v| *v += 1)
             .or_insert(1);
+        // Count attempts before the backend returns so conditional 304-style
+        // freshness checks are visible as GET ops with zero returned bytes.
+        self.counter.classes.record_get_attempt(class);
         let result = self.inner.get_opts(location, options).await?;
         // `GetResult::range` is the byte range actually returned (the whole
         // object for plain GETs, the requested slice for range GETs).
         let bytes = (result.range.end - result.range.start) as u64;
-        self.counter
-            .classes
-            .record_get(classify(location.as_ref()), bytes);
+        self.counter.classes.record_get_bytes(class, bytes);
         Ok(result)
     }
 
