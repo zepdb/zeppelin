@@ -107,6 +107,7 @@ async fn seed_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEnt
         fts_fields: Vec::new(),
         has_global_fts: false,
         cluster_owners: Vec::new(),
+        sketch: None,
     });
     manifest.write(store, ns).await.unwrap();
     (seg_id.to_string(), vectors)
@@ -215,6 +216,7 @@ async fn seed_legacy_sq8_segment(store: &ZeppelinStore, ns: &str) -> (String, Ve
         fts_fields: Vec::new(),
         has_global_fts: false,
         cluster_owners: Vec::new(),
+        sketch: None,
     });
     manifest.write(store, ns).await.unwrap();
     (seg_id.to_string(), vectors)
@@ -536,6 +538,7 @@ async fn test_incremental_matches_full_rewrite_results() {
         fts_fields: Vec::new(),
         has_global_fts: false,
         cluster_owners: Vec::new(),
+        sketch: None,
     });
     full_manifest.write(store, &ns_full).await.unwrap();
 

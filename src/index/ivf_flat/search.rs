@@ -106,10 +106,19 @@ pub async fn search_ivf_flat(
         .take(effective_nprobe)
         .map(|(idx, _)| *idx)
         .collect();
+    let scan_clusters = select_scan_clusters(
+        index,
+        query,
+        distance_metric,
+        filter,
+        &probe_clusters,
+        effective_nprobe,
+    )?;
 
     debug!(
         nprobe = effective_nprobe,
-        clusters = ?probe_clusters,
+        probe_clusters = ?probe_clusters,
+        scan_clusters = ?scan_clusters,
         "probing clusters"
     );
 
@@ -121,45 +130,60 @@ pub async fn search_ivf_flat(
     };
 
     // --- Step 3: Scan selected clusters ---
-    // Use quantized search path if quantization is available.
-    let candidates = match index.quantization {
-        QuantizationType::Scalar => {
-            scan_clusters_sq(
-                index,
-                &probe_clusters,
-                query,
-                distance_metric,
-                filter,
-                fetch_k,
-                store,
-                cache,
-            )
-            .await?
-        }
-        QuantizationType::Product => {
-            scan_clusters_pq(
-                index,
-                &probe_clusters,
-                query,
-                distance_metric,
-                filter,
-                fetch_k,
-                store,
-                cache,
-            )
-            .await?
-        }
-        QuantizationType::None => {
-            scan_clusters_flat(
-                index,
-                &probe_clusters,
-                query,
-                distance_metric,
-                filter,
-                store,
-                cache,
-            )
-            .await?
+    // Once the resident sketch has chosen a cluster subset, unfiltered queries
+    // scan every vector in those clusters with exact distances. The sketch is
+    // only allowed to decide which cluster objects to fetch.
+    let candidates = if index.resident_sketch.is_some() && filter.is_none() {
+        scan_clusters_flat(
+            index,
+            &scan_clusters,
+            query,
+            distance_metric,
+            filter,
+            store,
+            cache,
+        )
+        .await?
+    } else {
+        match index.quantization {
+            QuantizationType::Scalar => {
+                scan_clusters_sq(
+                    index,
+                    &scan_clusters,
+                    query,
+                    distance_metric,
+                    filter,
+                    fetch_k,
+                    store,
+                    cache,
+                )
+                .await?
+            }
+            QuantizationType::Product => {
+                scan_clusters_pq(
+                    index,
+                    &scan_clusters,
+                    query,
+                    distance_metric,
+                    filter,
+                    fetch_k,
+                    store,
+                    cache,
+                )
+                .await?
+            }
+            QuantizationType::None => {
+                scan_clusters_flat(
+                    index,
+                    &scan_clusters,
+                    query,
+                    distance_metric,
+                    filter,
+                    store,
+                    cache,
+                )
+                .await?
+            }
         }
     };
 
@@ -202,6 +226,50 @@ pub async fn search_ivf_flat(
     debug!(returned = results.len(), top_k = top_k, "search complete");
 
     Ok(results)
+}
+
+fn select_scan_clusters(
+    index: &IvfFlatIndex,
+    query: &[f32],
+    distance_metric: DistanceMetric,
+    filter: Option<&Filter>,
+    probe_clusters: &[usize],
+    effective_nprobe: usize,
+) -> Result<Vec<usize>> {
+    let Some(sketch) = &index.resident_sketch else {
+        return Ok(probe_clusters.to_vec());
+    };
+
+    // Attribute filters require exact per-row attrs during coarse pruning.
+    // The current resident sketch intentionally stores no attribute values, so
+    // filtered queries keep the legacy cluster set and preserve existing
+    // semantics. Unfiltered benchmark/query traffic uses the sketch path.
+    if filter.is_some() {
+        return Ok(probe_clusters.to_vec());
+    }
+
+    let cluster_budget = sketch_cluster_budget(effective_nprobe);
+    if cluster_budget >= probe_clusters.len() {
+        return Ok(probe_clusters.to_vec());
+    }
+
+    sketch.select_clusters(query, distance_metric, probe_clusters, cluster_budget)
+}
+
+fn sketch_cluster_budget(effective_nprobe: usize) -> usize {
+    if effective_nprobe >= 128 {
+        // High-nprobe sentinel mode: do not reduce the probed cluster set.
+        // This keeps the sketch from hiding any cluster-level recall loss.
+        effective_nprobe
+    } else if effective_nprobe >= 16 {
+        7
+    } else if effective_nprobe >= 8 {
+        6
+    } else {
+        effective_nprobe
+    }
+    .min(effective_nprobe)
+    .max(1)
 }
 
 /// Scan clusters using full-precision vectors (no quantization).
@@ -739,23 +807,19 @@ async fn enrich_unfiltered_results(
                     "missing attrs for final result cluster {}",
                     candidate.cluster_idx
                 ))
-            })?
-            .as_ref()
-            .ok_or_else(|| {
-                ZeppelinError::Index(format!(
-                    "attrs absent for final result cluster {}",
-                    candidate.cluster_idx
-                ))
             })?;
-        let attributes = cluster_attrs
-            .get(candidate.row_idx)
-            .ok_or_else(|| {
-                ZeppelinError::Index(format!(
-                    "attrs row {} missing in cluster {}",
-                    candidate.row_idx, candidate.cluster_idx
-                ))
-            })?
-            .clone();
+        let attributes = match cluster_attrs {
+            Some(cluster_attrs) => cluster_attrs
+                .get(candidate.row_idx)
+                .ok_or_else(|| {
+                    ZeppelinError::Index(format!(
+                        "attrs row {} missing in cluster {}",
+                        candidate.row_idx, candidate.cluster_idx
+                    ))
+                })?
+                .clone(),
+            None => None,
+        };
         results.push(SearchResult {
             id: candidate.id,
             score: candidate.score,
@@ -774,6 +838,9 @@ async fn load_attrs(
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<Option<ClusterAttrs>> {
+    if !index.cluster_may_have_attrs(cluster_idx) {
+        return Ok(None);
+    }
     let akey = attrs_key(
         &index.namespace,
         index.cluster_owner(cluster_idx),
@@ -799,6 +866,8 @@ mod tests {
             sq_calibration: None,
             bitmap_fields: Vec::new(),
             cluster_owners: Vec::new(),
+            resident_sketch: None,
+            sketch_ref: None,
         }
     }
 

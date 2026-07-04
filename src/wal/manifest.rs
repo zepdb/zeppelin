@@ -39,6 +39,21 @@ pub struct FragmentRef {
     pub size_bytes: u64,
 }
 
+/// A reference to a resident coarse sketch artifact stored on S3.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SketchRef {
+    /// S3 key for the immutable sketch artifact.
+    pub key: String,
+    /// Sketch format version.
+    pub version: u32,
+    /// Number of projection/code dimensions stored per vector.
+    pub code_dims: usize,
+    /// Resident bytes per vector, excluding fixed segment metadata.
+    pub bytes_per_vector: usize,
+    /// Serialized artifact size in bytes.
+    pub size_bytes: u64,
+}
+
 /// A reference to an IVF segment stored on S3.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SegmentRef {
@@ -80,11 +95,20 @@ pub struct SegmentRef {
     /// it empty for full rebuilds means the common path carries zero extra
     /// bytes in the manifest and old manifests decode unchanged.
     ///
+    #[serde(default)]
+    pub cluster_owners: Vec<String>,
+    /// Resident coarse sketch artifact for this segment.
+    ///
+    /// When present, the query path loads this immutable segment-global
+    /// artifact and uses it to choose a smaller set of clusters for exact
+    /// rerank. `None` means the segment predates sketches and must use the
+    /// legacy IVF path.
+    ///
     /// NOTE: this field must stay LAST in the struct. MessagePack encodes
     /// structs as arrays, so old manifests decode only if new fields are
     /// trailing and `#[serde(default)]`.
     #[serde(default)]
-    pub cluster_owners: Vec<String>,
+    pub sketch: Option<SketchRef>,
 }
 
 impl SegmentRef {
@@ -361,6 +385,7 @@ mod tests {
             fts_fields: Vec::new(),
             has_global_fts: false,
             cluster_owners: Vec::new(),
+            sketch: None,
         }
     }
 

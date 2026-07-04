@@ -59,6 +59,7 @@ use crate::types::{AttributeValue, VectorEntry};
 type ClusterPayload = (String, Bytes, String, Bytes, Option<(String, Bytes)>);
 
 use super::kmeans::train_kmeans;
+use super::sketch::{build_resident_sketch, ResidentSketch};
 use super::IvfFlatIndex;
 use crate::index::distance;
 
@@ -670,7 +671,19 @@ pub async fn build_ivf_flat(
     }
     debug!(num_clusters, "wrote all cluster data");
 
-    // --- Step 4: Write quantized artifacts (if configured) ---
+    // --- Step 4: Write resident coarse sketch ---
+    let (sketch_ref, sketch_data, resident_sketch) =
+        build_resident_sketch(namespace, segment_id, dim, &cluster_vecs, &cluster_attrs)?;
+    store.put(&sketch_ref.key, sketch_data).await?;
+    info!(
+        key = %sketch_ref.key,
+        code_dims = sketch_ref.code_dims,
+        bytes_per_vector = sketch_ref.bytes_per_vector,
+        size_bytes = sketch_ref.size_bytes,
+        "wrote resident coarse sketch"
+    );
+
+    // --- Step 5: Write quantized artifacts (if configured) ---
     match quantization {
         QuantizationType::Scalar => {
             info!("wrote SQ8 co-located clusters and embedded calibration");
@@ -734,6 +747,8 @@ pub async fn build_ivf_flat(
         bitmap_fields,
         // Freshly built segment: every cluster owned by this segment.
         cluster_owners: Vec::new(),
+        resident_sketch: Some(resident_sketch),
+        sketch_ref: Some(sketch_ref),
     })
 }
 
@@ -756,6 +771,7 @@ pub async fn load_ivf_flat_from_manifest(
     num_vectors: usize,
     quantization: QuantizationType,
     cluster_owners: Vec<String>,
+    sketch_ref: Option<crate::wal::manifest::SketchRef>,
     cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
 ) -> Result<IvfFlatIndex> {
     let ckey = centroids_key(namespace, segment_id);
@@ -764,7 +780,7 @@ pub async fn load_ivf_flat_from_manifest(
             let data = c.get_or_fetch(&ckey, || store.get(&ckey)).await?;
             // This load path is only used for the manifest's active segment;
             // pin its centroids (unpinning the previous segment's).
-            c.pin_scoped(namespace, &ckey).await;
+            c.pin_scoped(&format!("{namespace}:centroids"), &ckey).await;
             data
         }
         None => store.get(&ckey).await?,
@@ -777,6 +793,8 @@ pub async fn load_ivf_flat_from_manifest(
         .transpose()?;
     let centroids = centroids_data.centroids;
     let dim = centroids_data.dim;
+    let resident_sketch =
+        load_resident_sketch(store, namespace, sketch_ref.as_ref(), cache).await?;
 
     info!(
         namespace = namespace,
@@ -798,7 +816,42 @@ pub async fn load_ivf_flat_from_manifest(
         sq_calibration,
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
         cluster_owners,
+        resident_sketch,
+        sketch_ref,
     })
+}
+
+async fn load_resident_sketch(
+    store: &ZeppelinStore,
+    namespace: &str,
+    sketch_ref: Option<&crate::wal::manifest::SketchRef>,
+    cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
+) -> Result<Option<ResidentSketch>> {
+    let Some(sketch_ref) = sketch_ref else {
+        return Ok(None);
+    };
+
+    let data = match cache {
+        Some(c) => {
+            let data = c
+                .get_or_fetch(&sketch_ref.key, || store.get(&sketch_ref.key))
+                .await?;
+            c.pin_scoped(&format!("{namespace}:coarse_sketch"), &sketch_ref.key)
+                .await;
+            data
+        }
+        None => store.get(&sketch_ref.key).await?,
+    };
+    let sketch = ResidentSketch::from_bytes(&data)?;
+    if sketch_ref.size_bytes != data.len() as u64 {
+        return Err(ZeppelinError::Index(format!(
+            "coarse sketch size mismatch for {}: manifest={}, object={}",
+            sketch_ref.key,
+            sketch_ref.size_bytes,
+            data.len()
+        )));
+    }
+    Ok(Some(sketch))
 }
 
 /// Load an existing IVF-Flat index from S3 artifacts.
@@ -876,6 +929,8 @@ pub async fn load_ivf_flat(
         // Probing loader is used by compaction to read a segment it will fully
         // rewrite, and by tests — legacy single-segment layout.
         cluster_owners: Vec::new(),
+        resident_sketch: None,
+        sketch_ref: None,
     })
 }
 
