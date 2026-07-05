@@ -54,6 +54,7 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, info};
 
@@ -72,9 +73,12 @@ use crate::index::distance;
 const CENTROIDS_V2_MAGIC: &[u8; 4] = b"ZCT2";
 const CLUSTER_V2_MAGIC: &[u8; 4] = b"ZCL2";
 const CLUSTER_V2_HEADER_LEN: usize = 4 + 8 * 4;
-const CLUSTER_DATA_OBJECT_MAGIC: &[u8; 4] = b"ZBP1";
+const CLUSTER_DATA_OBJECT_V1_MAGIC: &[u8; 4] = b"ZBP1";
+const CLUSTER_DATA_OBJECT_MAGIC_PREFIX: &[u8; 3] = b"ZBP";
+const CLUSTER_DATA_OBJECT_V4_VERSION: u8 = 4;
 const CLUSTER_DATA_OBJECT_HEADER_LEN: usize = 8;
 const CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN: usize = 4 + 8 + 8;
+const CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN: usize = 4 + 8 + 8 + 8 + 8;
 const BOOTSTRAP_MAGIC: &[u8; 4] = b"ZBS1";
 const BOOTSTRAP_VERSION: u32 = 1;
 const BOOTSTRAP_SECTION_COUNT: usize = 2;
@@ -844,6 +848,17 @@ pub(crate) fn serialize_cluster_data_object(entries: &[(usize, Bytes)]) -> Resul
         }
     }
 
+    if entries
+        .iter()
+        .all(|(_, bytes)| bytes.starts_with(CLUSTER_V2_MAGIC))
+    {
+        return serialize_cluster_data_object_v4(entries);
+    }
+
+    serialize_cluster_data_object_v1(entries)
+}
+
+fn serialize_cluster_data_object_v1(entries: &[(usize, Bytes)]) -> Result<Bytes> {
     let directory_len = entries
         .len()
         .checked_mul(CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN)
@@ -864,7 +879,7 @@ pub(crate) fn serialize_cluster_data_object(entries: &[(usize, Bytes)]) -> Resul
         .ok_or_else(|| ZeppelinError::Index("cluster object size overflows".into()))?;
 
     let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(CLUSTER_DATA_OBJECT_MAGIC);
+    buf.extend_from_slice(CLUSTER_DATA_OBJECT_V1_MAGIC);
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
     let mut offset = payload_offset;
@@ -879,6 +894,101 @@ pub(crate) fn serialize_cluster_data_object(entries: &[(usize, Bytes)]) -> Resul
 
     for (_, bytes) in entries {
         buf.extend_from_slice(bytes);
+    }
+    debug_assert_eq!(buf.len(), total);
+
+    Ok(Bytes::from(buf))
+}
+
+fn serialize_cluster_data_object_v4(entries: &[(usize, Bytes)]) -> Result<Bytes> {
+    struct SplitSection<'a> {
+        cluster_idx: usize,
+        sq: &'a [u8],
+        full: &'a [u8],
+    }
+
+    let sections: Vec<SplitSection<'_>> = entries
+        .iter()
+        .map(|(cluster_idx, bytes)| {
+            let sections = colocated_cluster_sections(bytes)?;
+            Ok(SplitSection {
+                cluster_idx: *cluster_idx,
+                sq: sections.sq,
+                full: sections.full,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let directory_len = entries
+        .len()
+        .checked_mul(CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN)
+        .ok_or_else(|| ZeppelinError::Index("v4 cluster object directory overflows".into()))?;
+    let payload_offset = CLUSTER_DATA_OBJECT_HEADER_LEN
+        .checked_add(directory_len)
+        .ok_or_else(|| ZeppelinError::Index("v4 cluster object header overflows".into()))?;
+    let sq_total: usize =
+        sections
+            .iter()
+            .map(|section| section.sq.len())
+            .try_fold(0usize, |acc, len| {
+                acc.checked_add(len).ok_or_else(|| {
+                    ZeppelinError::Index("v4 cluster object SQ block overflows".into())
+                })
+            })?;
+    let full_total: usize =
+        sections
+            .iter()
+            .map(|section| section.full.len())
+            .try_fold(0usize, |acc, len| {
+                acc.checked_add(len).ok_or_else(|| {
+                    ZeppelinError::Index("v4 cluster object full block overflows".into())
+                })
+            })?;
+    let full_block_offset = payload_offset
+        .checked_add(sq_total)
+        .ok_or_else(|| ZeppelinError::Index("v4 cluster object SQ block end overflows".into()))?;
+    let total = full_block_offset
+        .checked_add(full_total)
+        .ok_or_else(|| ZeppelinError::Index("v4 cluster object size overflows".into()))?;
+
+    let mut sq_offsets = Vec::with_capacity(sections.len());
+    let mut offset = payload_offset;
+    for section in &sections {
+        sq_offsets.push(offset);
+        offset = offset
+            .checked_add(section.sq.len())
+            .ok_or_else(|| ZeppelinError::Index("v4 cluster object SQ section overflows".into()))?;
+    }
+    debug_assert_eq!(offset, full_block_offset);
+
+    let mut full_offsets = Vec::with_capacity(sections.len());
+    offset = full_block_offset;
+    for section in &sections {
+        full_offsets.push(offset);
+        offset = offset.checked_add(section.full.len()).ok_or_else(|| {
+            ZeppelinError::Index("v4 cluster object full section overflows".into())
+        })?;
+    }
+    debug_assert_eq!(offset, total);
+
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(CLUSTER_DATA_OBJECT_MAGIC_PREFIX);
+    buf.push(CLUSTER_DATA_OBJECT_V4_VERSION);
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+
+    for (idx, section) in sections.iter().enumerate() {
+        buf.extend_from_slice(&(section.cluster_idx as u32).to_le_bytes());
+        buf.extend_from_slice(&(sq_offsets[idx] as u64).to_le_bytes());
+        buf.extend_from_slice(&(section.sq.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(full_offsets[idx] as u64).to_le_bytes());
+        buf.extend_from_slice(&(section.full.len() as u64).to_le_bytes());
+    }
+
+    for section in &sections {
+        buf.extend_from_slice(section.sq);
+    }
+    for section in &sections {
+        buf.extend_from_slice(section.full);
     }
     debug_assert_eq!(buf.len(), total);
 
@@ -989,6 +1099,23 @@ pub(crate) fn deserialize_colocated_sq_cluster_from_object(
     data: &[u8],
     cluster_idx: usize,
 ) -> Result<Option<crate::index::quantization::sq::SqClusterData>> {
+    if is_cluster_data_object_v4(data) {
+        let layout = cluster_object_layout_v4(data)?;
+        let section = layout.section(cluster_idx).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing from v4 cluster data object"
+            ))
+        })?;
+        let sq = section.sq.as_ref().ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing SQ section in v4 cluster data object"
+            ))
+        })?;
+        validate_range_in_object(sq, data.len(), "v4 cluster SQ section")?;
+        let sq_cluster = crate::index::quantization::sq::deserialize_sq_cluster(&data[sq.clone()])?;
+        return Ok(Some(sq_cluster));
+    }
+
     let data = cluster_section_from_object(data, cluster_idx)?;
     deserialize_colocated_sq_cluster(data)
 }
@@ -1003,7 +1130,54 @@ pub(crate) struct ClusterObjectSection<'a> {
     pub data: &'a [u8],
 }
 
-/// Return all sections in a grouped cluster-data object.
+/// Absolute byte ranges for one cluster inside a grouped cluster-data object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClusterObjectRange {
+    pub cluster_idx: usize,
+    pub sq: Option<Range<usize>>,
+    pub full: Range<usize>,
+}
+
+/// Directory layout for a grouped cluster-data object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClusterObjectLayout {
+    pub sections: Vec<ClusterObjectRange>,
+}
+
+impl ClusterObjectLayout {
+    pub(crate) fn section(&self, cluster_idx: usize) -> Option<&ClusterObjectRange> {
+        self.sections
+            .iter()
+            .find(|section| section.cluster_idx == cluster_idx)
+    }
+}
+
+/// Number of leading bytes needed to parse either supported grouped-object
+/// directory for `entry_count` manifest entries. The returned range may include
+/// a few payload bytes for v1 objects; parsers ignore bytes beyond the actual
+/// directory.
+pub(crate) fn cluster_object_header_range_len(entry_count: usize) -> Result<usize> {
+    let directory_len = entry_count
+        .checked_mul(CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN)
+        .ok_or_else(|| ZeppelinError::Index("cluster object header range overflows".into()))?;
+    CLUSTER_DATA_OBJECT_HEADER_LEN
+        .checked_add(directory_len)
+        .ok_or_else(|| ZeppelinError::Index("cluster object header range overflows".into()))
+}
+
+/// Return the directory layout in a grouped cluster-data object. `data` only
+/// needs to contain the object header and directory.
+pub(crate) fn cluster_object_layout(data: &[u8]) -> Result<Option<ClusterObjectLayout>> {
+    if data.starts_with(CLUSTER_DATA_OBJECT_V1_MAGIC) {
+        return cluster_object_layout_v1(data).map(Some);
+    }
+    if is_cluster_data_object_v4(data) {
+        return cluster_object_layout_v4(data).map(Some);
+    }
+    Ok(None)
+}
+
+/// Return all full-vector sections in a grouped cluster-data object.
 ///
 /// `Ok(None)` means the bytes are a legacy per-cluster object, not a grouped
 /// object. Callers that already know they fetched a grouped key should treat
@@ -1011,26 +1185,27 @@ pub(crate) struct ClusterObjectSection<'a> {
 pub(crate) fn cluster_object_sections(
     data: &[u8],
 ) -> Result<Option<Vec<ClusterObjectSection<'_>>>> {
-    if !data.starts_with(CLUSTER_DATA_OBJECT_MAGIC) {
+    let Some(layout) = cluster_object_layout(data)? else {
         return Ok(None);
-    }
-    if data.len() < CLUSTER_DATA_OBJECT_HEADER_LEN {
-        return Err(ZeppelinError::Index(
-            "cluster data object too small for header".into(),
-        ));
-    }
-
-    let entry_count = u32::from_le_bytes(
-        data[4..8]
-            .try_into()
-            .map_err(|_| ZeppelinError::Index("cluster data object count parse error".into()))?,
-    ) as usize;
-    if entry_count == 0 {
-        return Err(ZeppelinError::Index(
-            "cluster data object has zero entries".into(),
-        ));
+    };
+    let mut sections = Vec::with_capacity(layout.sections.len());
+    for section in layout.sections {
+        validate_range_in_object(
+            &section.full,
+            data.len(),
+            "cluster data object full section",
+        )?;
+        sections.push(ClusterObjectSection {
+            cluster_idx: section.cluster_idx,
+            data: &data[section.full],
+        });
     }
 
+    Ok(Some(sections))
+}
+
+fn cluster_object_layout_v1(data: &[u8]) -> Result<ClusterObjectLayout> {
+    let entry_count = cluster_object_entry_count(data)?;
     let directory_len = entry_count
         .checked_mul(CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN)
         .ok_or_else(|| ZeppelinError::Index("cluster data object directory overflows".into()))?;
@@ -1070,19 +1245,114 @@ pub(crate) fn cluster_object_sections(
                 "cluster data object section overflows: offset={offset}, len={len}"
             ))
         })?;
-        if end > data.len() {
-            return Err(ZeppelinError::Index(format!(
-                "cluster data object section out of bounds: end={end}, len={}",
-                data.len()
-            )));
-        }
-        sections.push(ClusterObjectSection {
+        sections.push(ClusterObjectRange {
             cluster_idx,
-            data: &data[offset..end],
+            sq: None,
+            full: offset..end,
         });
     }
 
-    Ok(Some(sections))
+    Ok(ClusterObjectLayout { sections })
+}
+
+fn cluster_object_layout_v4(data: &[u8]) -> Result<ClusterObjectLayout> {
+    let entry_count = cluster_object_entry_count(data)?;
+    let directory_len = entry_count
+        .checked_mul(CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN)
+        .ok_or_else(|| ZeppelinError::Index("v4 cluster object directory overflows".into()))?;
+    let payload_start = CLUSTER_DATA_OBJECT_HEADER_LEN
+        .checked_add(directory_len)
+        .ok_or_else(|| ZeppelinError::Index("v4 cluster object header overflows".into()))?;
+    if data.len() < payload_start {
+        return Err(ZeppelinError::Index(format!(
+            "v4 cluster data object truncated directory: expected at least {payload_start}, got {}",
+            data.len()
+        )));
+    }
+
+    let mut sections = Vec::with_capacity(entry_count);
+    let mut seen = BTreeSet::new();
+    for entry_idx in 0..entry_count {
+        let base =
+            CLUSTER_DATA_OBJECT_HEADER_LEN + entry_idx * CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN;
+        let cluster_idx = u32::from_le_bytes(
+            data[base..base + 4]
+                .try_into()
+                .map_err(|_| ZeppelinError::Index("v4 cluster object index parse error".into()))?,
+        ) as usize;
+        if !seen.insert(cluster_idx) {
+            return Err(ZeppelinError::Index(format!(
+                "duplicate cluster {cluster_idx} in v4 cluster data object"
+            )));
+        }
+
+        let sq_offset = read_u64_usize(data, base + 4, "v4 cluster object SQ offset")?;
+        let sq_len = read_u64_usize(data, base + 12, "v4 cluster object SQ length")?;
+        let full_offset = read_u64_usize(data, base + 20, "v4 cluster object full offset")?;
+        let full_len = read_u64_usize(data, base + 28, "v4 cluster object full length")?;
+        if sq_offset < payload_start {
+            return Err(ZeppelinError::Index(format!(
+                "v4 cluster SQ section starts inside directory: offset={sq_offset}, payload_start={payload_start}"
+            )));
+        }
+        let sq_end = sq_offset.checked_add(sq_len).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "v4 cluster SQ section overflows: offset={sq_offset}, len={sq_len}"
+            ))
+        })?;
+        if full_offset < sq_end {
+            return Err(ZeppelinError::Index(format!(
+                "v4 cluster full section overlaps SQ section: full_offset={full_offset}, sq_end={sq_end}"
+            )));
+        }
+        let full_end = full_offset.checked_add(full_len).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "v4 cluster full section overflows: offset={full_offset}, len={full_len}"
+            ))
+        })?;
+        sections.push(ClusterObjectRange {
+            cluster_idx,
+            sq: Some(sq_offset..sq_end),
+            full: full_offset..full_end,
+        });
+    }
+
+    Ok(ClusterObjectLayout { sections })
+}
+
+fn cluster_object_entry_count(data: &[u8]) -> Result<usize> {
+    if data.len() < CLUSTER_DATA_OBJECT_HEADER_LEN {
+        return Err(ZeppelinError::Index(
+            "cluster data object too small for header".into(),
+        ));
+    }
+    let entry_count = u32::from_le_bytes(
+        data[4..8]
+            .try_into()
+            .map_err(|_| ZeppelinError::Index("cluster data object count parse error".into()))?,
+    ) as usize;
+    if entry_count == 0 {
+        return Err(ZeppelinError::Index(
+            "cluster data object has zero entries".into(),
+        ));
+    }
+    Ok(entry_count)
+}
+
+fn is_cluster_data_object_v4(data: &[u8]) -> bool {
+    data.len() >= 4
+        && &data[0..3] == CLUSTER_DATA_OBJECT_MAGIC_PREFIX
+        && data[3] == CLUSTER_DATA_OBJECT_V4_VERSION
+}
+
+fn validate_range_in_object(range: &Range<usize>, object_len: usize, label: &str) -> Result<()> {
+    if range.start > range.end || range.end > object_len {
+        return Err(ZeppelinError::Index(format!(
+            "{label} out of bounds: start={}, end={}, len={object_len}",
+            range.start, range.end
+        )));
+    }
+    Ok(())
 }
 
 fn cluster_section_from_object(data: &[u8], cluster_idx: usize) -> Result<&[u8]> {
@@ -1907,6 +2177,61 @@ mod tests {
         let cluster = deserialize_cluster(&data).unwrap();
         assert_eq!(cluster.ids, ids);
         assert_eq!(cluster.vectors, vecs);
+    }
+
+    #[test]
+    fn test_cluster_data_object_v4_exposes_sq_and_full_ranges() {
+        let ids0 = vec!["a".to_string(), "b".to_string()];
+        let vecs0 = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let codes0 = vec![vec![10, 20], vec![30, 40]];
+        let ids1 = vec!["c".to_string()];
+        let vecs1 = vec![vec![5.0, 6.0]];
+        let codes1 = vec![vec![50, 60]];
+
+        let section0 = serialize_colocated_sq_cluster(&ids0, &vecs0, &codes0, 2).unwrap();
+        let section1 = serialize_colocated_sq_cluster(&ids1, &vecs1, &codes1, 2).unwrap();
+        let object = serialize_cluster_data_object(&[(0, section0), (1, section1)]).unwrap();
+
+        assert_eq!(&object[0..3], b"ZBP");
+        assert_eq!(object[3], CLUSTER_DATA_OBJECT_V4_VERSION);
+
+        let layout = cluster_object_layout(&object).unwrap().unwrap();
+        assert_eq!(layout.sections.len(), 2);
+        assert!(layout.sections.iter().all(|section| section.sq.is_some()));
+
+        let header_len = cluster_object_header_range_len(2).unwrap();
+        let header_layout = cluster_object_layout(&object[..header_len])
+            .unwrap()
+            .unwrap();
+        assert_eq!(header_layout, layout);
+
+        let max_sq_end = layout
+            .sections
+            .iter()
+            .map(|section| section.sq.as_ref().unwrap().end)
+            .max()
+            .unwrap();
+        let min_full_start = layout
+            .sections
+            .iter()
+            .map(|section| section.full.start)
+            .min()
+            .unwrap();
+        assert!(max_sq_end <= min_full_start);
+
+        let sq0 = deserialize_colocated_sq_cluster_from_object(&object, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sq0.ids, ids0);
+        assert_eq!(sq0.codes, codes0);
+
+        let sections = cluster_object_sections(&object).unwrap().unwrap();
+        let cluster0 = deserialize_cluster(sections[0].data).unwrap();
+        let cluster1 = deserialize_cluster(sections[1].data).unwrap();
+        assert_eq!(cluster0.ids, ids0);
+        assert_eq!(cluster0.vectors, vecs0);
+        assert_eq!(cluster1.ids, ids1);
+        assert_eq!(cluster1.vectors, vecs1);
     }
 
     #[test]
