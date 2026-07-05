@@ -410,6 +410,29 @@ impl ZeppelinStore {
         Ok(keys)
     }
 
+    /// List immediate child prefixes under a prefix using the object-store delimiter.
+    #[instrument(skip(self), fields(prefix = prefix))]
+    pub async fn list_common_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
+        let start = std::time::Instant::now();
+        let path = Path::parse(prefix)?;
+        let result = self.inner.list_with_delimiter(Some(&path)).await?;
+        let prefixes: Vec<String> = result
+            .common_prefixes
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let elapsed = start.elapsed();
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            count = prefixes.len(),
+            "s3 list_common_prefixes"
+        );
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["list_common_prefixes"])
+            .observe(elapsed.as_secs_f64());
+        Ok(prefixes)
+    }
+
     /// Check if an object exists.
     #[instrument(skip(self), fields(key = key))]
     pub async fn exists(&self, key: &str) -> Result<bool> {

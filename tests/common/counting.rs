@@ -202,6 +202,8 @@ impl ClassCounters {
 pub struct GetCounter {
     gets: Arc<DashMap<String, u64>>,
     puts: Arc<DashMap<String, u64>>,
+    lists: Arc<DashMap<String, u64>>,
+    delimiter_lists: Arc<DashMap<String, u64>>,
     classes: Arc<ClassCounters>,
 }
 
@@ -222,6 +224,21 @@ impl GetCounter {
             .filter(|r| r.key().contains(substr))
             .map(|r| *r.value())
             .sum()
+    }
+
+    /// Total recursive list calls whose prefix exactly matches `prefix`.
+    #[must_use]
+    pub fn list_calls_for_prefix(&self, prefix: &str) -> u64 {
+        self.lists.get(prefix).map(|value| *value).unwrap_or(0)
+    }
+
+    /// Total delimiter list calls whose prefix exactly matches `prefix`.
+    #[must_use]
+    pub fn delimiter_list_calls_for_prefix(&self, prefix: &str) -> u64 {
+        self.delimiter_lists
+            .get(prefix)
+            .map(|value| *value)
+            .unwrap_or(0)
     }
 
     /// Number of GETs attributed to `class`.
@@ -313,6 +330,8 @@ impl GetCounter {
     pub fn reset(&self) {
         self.gets.clear();
         self.puts.clear();
+        self.lists.clear();
+        self.delimiter_lists.clear();
         self.classes.reset();
     }
 }
@@ -407,10 +426,22 @@ impl ObjectStore for CountingStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        let key = prefix.map(ToString::to_string).unwrap_or_default();
+        self.counter
+            .lists
+            .entry(key)
+            .and_modify(|v| *v += 1)
+            .or_insert(1);
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        let key = prefix.map(ToString::to_string).unwrap_or_default();
+        self.counter
+            .delimiter_lists
+            .entry(key)
+            .and_modify(|v| *v += 1)
+            .or_insert(1);
         self.inner.list_with_delimiter(prefix).await
     }
 

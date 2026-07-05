@@ -16,7 +16,9 @@ use zeppelin::config::{Config, StorageBackend, StorageConfig};
 use zeppelin::error::ZeppelinError;
 use zeppelin::index::distance::compute_distance;
 use zeppelin::index::ivf_flat::build::centroids_key;
-use zeppelin::index::quantization::sq::{sq_calibration_key, sq_cluster_key, SqCalibration};
+use zeppelin::index::quantization::sq::{
+    deserialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
+};
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::manager::NamespaceManager;
 use zeppelin::query::{execute_query, QueryParams};
@@ -1104,20 +1106,23 @@ async fn verify_compacted_sq8_segment(
             "SQ calibration has zero dimensions".into(),
         ));
     }
+    let manifest_cluster_zero_present =
+        manifest_sq_cluster_artifact_present(store, segment, 0).await?;
     let cluster_zero_key = sq_cluster_key(namespace, segment.cluster_owner(0), 0);
     let colocated_cluster_zero_key = format!(
         "{namespace}/segments/{}/cluster_0.bin",
         segment.cluster_owner(0)
     );
     let colocated_cluster_zero_present = match store.get(&colocated_cluster_zero_key).await {
-        Ok(data) => data.starts_with(b"ZCL2"),
+        Ok(data) => colocated_sq_cluster_present(&data)?,
         Err(_) => false,
     };
-    let sq_cluster_zero_present =
-        colocated_cluster_zero_present || store.exists(&cluster_zero_key).await?;
+    let sq_cluster_zero_present = manifest_cluster_zero_present
+        || colocated_cluster_zero_present
+        || store.exists(&cluster_zero_key).await?;
     if !sq_cluster_zero_present {
         return Err(RecallEvalError::Integrity(format!(
-            "missing SQ8 cluster artifact {cluster_zero_key} or co-located {colocated_cluster_zero_key}"
+            "missing SQ8 cluster artifact {cluster_zero_key}, co-located {colocated_cluster_zero_key}, or manifest cluster_objects entry for cluster 0"
         )));
     }
 
@@ -1250,6 +1255,209 @@ async fn cleanup_namespace(store: &ZeppelinStore, namespace: &str) -> Result<usi
     Ok(store.delete_prefix(&prefix).await?)
 }
 
+async fn manifest_sq_cluster_artifact_present(
+    store: &ZeppelinStore,
+    segment: &zeppelin::wal::manifest::SegmentRef,
+    cluster_idx: usize,
+) -> Result<bool> {
+    let mut matching_object = None;
+    for object_ref in &segment.cluster_objects {
+        if object_ref.clusters.contains(&cluster_idx)
+            && matching_object.replace(object_ref).is_some()
+        {
+            return Err(RecallEvalError::Integrity(format!(
+                "cluster {cluster_idx} appears in multiple manifest cluster_objects"
+            )));
+        }
+    }
+
+    let Some(object_ref) = matching_object else {
+        return Ok(false);
+    };
+    let data = store.get(&object_ref.key).await?;
+    if data.starts_with(b"ZBP") {
+        return grouped_sq_cluster_present(&data, cluster_idx);
+    }
+    if data.starts_with(b"ZCL2") {
+        return colocated_sq_cluster_present(&data);
+    }
+    Ok(false)
+}
+
+fn grouped_sq_cluster_present(data: &[u8], cluster_idx: usize) -> Result<bool> {
+    const HEADER_LEN: usize = 8;
+    const V4_DIR_ENTRY_LEN: usize = 36;
+
+    if !is_v4_cluster_data_object(data) {
+        return Ok(false);
+    }
+    if data.len() < HEADER_LEN {
+        return Err(RecallEvalError::Integrity(
+            "cluster data object too small for header".into(),
+        ));
+    }
+    let entry_count = read_u32_usize(data, 4, "cluster data object entry count")?;
+    if entry_count == 0 {
+        return Err(RecallEvalError::Integrity(
+            "cluster data object has zero entries".into(),
+        ));
+    }
+    let directory_len = entry_count.checked_mul(V4_DIR_ENTRY_LEN).ok_or_else(|| {
+        RecallEvalError::Integrity("v4 cluster data object directory overflows".into())
+    })?;
+    let payload_start = HEADER_LEN.checked_add(directory_len).ok_or_else(|| {
+        RecallEvalError::Integrity("v4 cluster data object header overflows".into())
+    })?;
+    if data.len() < payload_start {
+        return Err(RecallEvalError::Integrity(format!(
+            "v4 cluster data object truncated directory: expected at least {payload_start}, got {}",
+            data.len()
+        )));
+    }
+
+    let mut found = false;
+    for entry_idx in 0..entry_count {
+        let base = HEADER_LEN + entry_idx * V4_DIR_ENTRY_LEN;
+        let entry_cluster = read_u32_usize(data, base, "v4 cluster object index")?;
+        if entry_cluster != cluster_idx {
+            continue;
+        }
+        if found {
+            return Err(RecallEvalError::Integrity(format!(
+                "duplicate cluster {cluster_idx} in v4 cluster data object"
+            )));
+        }
+        found = true;
+
+        let sq_offset = read_u64_usize(data, base + 4, "v4 cluster object SQ offset")?;
+        let sq_len = read_u64_usize(data, base + 12, "v4 cluster object SQ length")?;
+        let full_offset = read_u64_usize(data, base + 20, "v4 cluster object full offset")?;
+        let full_len = read_u64_usize(data, base + 28, "v4 cluster object full length")?;
+        if sq_offset < payload_start {
+            return Err(RecallEvalError::Integrity(format!(
+                "v4 cluster SQ section starts inside directory: offset={sq_offset}, payload_start={payload_start}"
+            )));
+        }
+        let sq_end = sq_offset.checked_add(sq_len).ok_or_else(|| {
+            RecallEvalError::Integrity(format!(
+                "v4 cluster SQ section overflows: offset={sq_offset}, len={sq_len}"
+            ))
+        })?;
+        if full_offset < sq_end {
+            return Err(RecallEvalError::Integrity(format!(
+                "v4 cluster full section overlaps SQ section: full_offset={full_offset}, sq_end={sq_end}"
+            )));
+        }
+        let full_end = full_offset.checked_add(full_len).ok_or_else(|| {
+            RecallEvalError::Integrity(format!(
+                "v4 cluster full section overflows: offset={full_offset}, len={full_len}"
+            ))
+        })?;
+        validate_object_range(sq_offset, sq_end, data.len(), "v4 cluster SQ section")?;
+        validate_object_range(full_offset, full_end, data.len(), "v4 cluster full section")?;
+        deserialize_sq_cluster(&data[sq_offset..sq_end])?;
+    }
+
+    Ok(found)
+}
+
+fn colocated_sq_cluster_present(data: &[u8]) -> Result<bool> {
+    const HEADER_LEN: usize = 36;
+
+    if !data.starts_with(b"ZCL2") {
+        return Ok(false);
+    }
+    if data.len() < HEADER_LEN {
+        return Err(RecallEvalError::Integrity(
+            "v2 cluster blob too small for header".into(),
+        ));
+    }
+
+    let sq_offset = read_u64_usize(data, 4, "v2 cluster SQ offset")?;
+    let sq_len = read_u64_usize(data, 12, "v2 cluster SQ length")?;
+    let full_offset = read_u64_usize(data, 20, "v2 cluster full offset")?;
+    let full_len = read_u64_usize(data, 28, "v2 cluster full length")?;
+    if sq_offset != HEADER_LEN {
+        return Err(RecallEvalError::Integrity(format!(
+            "v2 cluster SQ offset mismatch: expected {HEADER_LEN}, got {sq_offset}"
+        )));
+    }
+    let sq_end = sq_offset.checked_add(sq_len).ok_or_else(|| {
+        RecallEvalError::Integrity(format!(
+            "v2 cluster SQ section overflows: offset={sq_offset}, len={sq_len}"
+        ))
+    })?;
+    if full_offset != sq_end {
+        return Err(RecallEvalError::Integrity(format!(
+            "v2 cluster full offset mismatch: expected {sq_end}, got {full_offset}"
+        )));
+    }
+    let full_end = full_offset.checked_add(full_len).ok_or_else(|| {
+        RecallEvalError::Integrity(format!(
+            "v2 cluster full section overflows: offset={full_offset}, len={full_len}"
+        ))
+    })?;
+    validate_object_range(sq_offset, sq_end, data.len(), "v2 cluster SQ section")?;
+    validate_object_range(full_offset, full_end, data.len(), "v2 cluster full section")?;
+    if full_end != data.len() {
+        return Err(RecallEvalError::Integrity(format!(
+            "v2 cluster blob size mismatch: expected {full_end}, got {}",
+            data.len()
+        )));
+    }
+    deserialize_sq_cluster(&data[sq_offset..sq_end])?;
+    Ok(true)
+}
+
+fn is_v4_cluster_data_object(data: &[u8]) -> bool {
+    data.len() >= 4 && &data[0..3] == b"ZBP" && data[3] == 4
+}
+
+fn read_u32_usize(data: &[u8], offset: usize, label: &str) -> Result<usize> {
+    let end = offset.checked_add(4).ok_or_else(|| {
+        RecallEvalError::Integrity(format!("{label} offset overflows: offset={offset}"))
+    })?;
+    if end > data.len() {
+        return Err(RecallEvalError::Integrity(format!(
+            "{label} out of bounds: offset={offset}, len={}",
+            data.len()
+        )));
+    }
+    Ok(u32::from_le_bytes(
+        data[offset..end]
+            .try_into()
+            .map_err(|_| RecallEvalError::Integrity(format!("{label} parse error")))?,
+    ) as usize)
+}
+
+fn read_u64_usize(data: &[u8], offset: usize, label: &str) -> Result<usize> {
+    let end = offset.checked_add(8).ok_or_else(|| {
+        RecallEvalError::Integrity(format!("{label} offset overflows: offset={offset}"))
+    })?;
+    if end > data.len() {
+        return Err(RecallEvalError::Integrity(format!(
+            "{label} out of bounds: offset={offset}, len={}",
+            data.len()
+        )));
+    }
+    let value = u64::from_le_bytes(
+        data[offset..end]
+            .try_into()
+            .map_err(|_| RecallEvalError::Integrity(format!("{label} parse error")))?,
+    );
+    usize::try_from(value)
+        .map_err(|_| RecallEvalError::Integrity(format!("{label} does not fit in usize: {value}")))
+}
+
+fn validate_object_range(start: usize, end: usize, object_len: usize, label: &str) -> Result<()> {
+    if start > end || end > object_len {
+        return Err(RecallEvalError::Integrity(format!(
+            "{label} out of bounds: start={start}, end={end}, len={object_len}"
+        )));
+    }
+    Ok(())
+}
+
 fn quantization_name(value: QuantizationType) -> &'static str {
     match value {
         QuantizationType::None => "None",
@@ -1289,5 +1497,117 @@ fn print_human_report(report: &Report) {
             "  {:<8} {:.6} ({} ms)",
             mode.mode, mode.recall_at_k, mode.elapsed_ms
         );
+    }
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
+    use zeppelin::index::ivf_flat::build::centroids_key;
+    use zeppelin::index::quantization::sq::{
+        serialize_sq_cluster, sq_calibration_key, SqCalibration,
+    };
+    use zeppelin::index::quantization::QuantizationType;
+    use zeppelin::storage::ZeppelinStore;
+    use zeppelin::wal::manifest::{ClusterDataObjectRef, Manifest, SegmentRef};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn verifier_accepts_grouped_sq8_cluster_artifact() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let namespace = "recall-eval-test";
+        let segment_id = "seg_grouped";
+        let group_key = format!("{namespace}/segments/{segment_id}/cluster_group_0.bin");
+
+        let mut manifest = Manifest::new();
+        manifest.add_segment(SegmentRef {
+            id: segment_id.to_string(),
+            vector_count: 1,
+            cluster_count: 1,
+            quantization: QuantizationType::Scalar,
+            hierarchical: false,
+            bitmap_fields: Vec::new(),
+            fts_fields: Vec::new(),
+            has_global_fts: false,
+            cluster_owners: Vec::new(),
+            sketch: None,
+            cluster_objects: vec![ClusterDataObjectRef {
+                key: group_key.clone(),
+                clusters: vec![0],
+                live_offset: 0,
+                live_len: 0,
+            }],
+            bootstrap: None,
+        });
+        manifest.write(&store, namespace).await.unwrap();
+
+        let calibration = SqCalibration::calibrate(&[&[0.0_f32, 1.0][..]], 2);
+        store
+            .put(
+                &centroids_key(namespace, segment_id),
+                legacy_centroids_blob(1, 2),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &sq_calibration_key(namespace, segment_id),
+                calibration.to_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let sq = serialize_sq_cluster(&["v0".to_string()], &[vec![0, 255]], 2).unwrap();
+        store
+            .put(&group_key, grouped_cluster_object(0, &sq))
+            .await
+            .unwrap();
+
+        let summary = verify_compacted_sq8_segment(&store, namespace, 1)
+            .await
+            .expect("grouped SQ8 cluster object should satisfy recall verifier");
+        assert!(summary.sq_cluster_zero_present);
+    }
+
+    fn legacy_centroids_blob(num_centroids: u32, dim: u32) -> Bytes {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&num_centroids.to_le_bytes());
+        bytes.extend_from_slice(&dim.to_le_bytes());
+        bytes.extend_from_slice(&[0_u8; 8]);
+        Bytes::from(bytes)
+    }
+
+    fn grouped_cluster_object(cluster_idx: u32, sq: &[u8]) -> Bytes {
+        const HEADER_LEN: usize = 8;
+        const DIR_ENTRY_LEN: usize = 36;
+
+        let sq_offset = (HEADER_LEN + DIR_ENTRY_LEN) as u64;
+        let sq_len = sq.len() as u64;
+        let full_offset = sq_offset + sq_len;
+        let full = legacy_empty_cluster_blob(2);
+        let full_len = full.len() as u64;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"ZBP\x04");
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&cluster_idx.to_le_bytes());
+        bytes.extend_from_slice(&sq_offset.to_le_bytes());
+        bytes.extend_from_slice(&sq_len.to_le_bytes());
+        bytes.extend_from_slice(&full_offset.to_le_bytes());
+        bytes.extend_from_slice(&full_len.to_le_bytes());
+        bytes.extend_from_slice(sq);
+        bytes.extend_from_slice(&full);
+        Bytes::from(bytes)
+    }
+
+    fn legacy_empty_cluster_blob(dim: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&dim.to_le_bytes());
+        bytes
     }
 }

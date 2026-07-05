@@ -1327,6 +1327,103 @@ async fn test_compaction_warms_new_segment_centroids() {
     harness.cleanup().await;
 }
 
+#[tokio::test]
+async fn test_background_compaction_does_not_recursively_list_bucket() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
+    let ns = format!("{}-registered-loop", harness.prefix);
+
+    namespace_manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    WalWriter::new(store.clone())
+        .append(&ns, random_vectors(25, 16), vec![])
+        .await
+        .unwrap();
+
+    let compaction_config = CompactionConfig {
+        interval_secs: 1,
+        max_wal_fragments_before_compact: 100,
+        max_wal_age_before_compact_secs: 1,
+        max_wal_bytes_before_compact: u64::MAX,
+        ..Default::default()
+    };
+    let compactor = Arc::new(Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        compaction_config.clone(),
+        IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            ..Default::default()
+        },
+    ));
+    let manifest_cache = Arc::new(zeppelin::cache::manifest_cache::ManifestCache::new(
+        Duration::from_millis(500),
+    ));
+    let lease_manager = Arc::new(zeppelin::wal::LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(compaction_config.lease_duration_secs),
+    ));
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+
+    counter.reset();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    {
+        let compactor = compactor.clone();
+        let namespace_manager = namespace_manager.clone();
+        let manifest_cache = manifest_cache.clone();
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            zeppelin::compaction::background::compaction_loop(
+                compactor,
+                namespace_manager,
+                shutdown_rx,
+                manifest_cache,
+                lease_manager,
+                cache,
+            )
+            .await;
+        });
+    }
+
+    let mut compacted = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let Some(manifest) = Manifest::read(&store, &ns).await.unwrap() else {
+            continue;
+        };
+        if manifest.active_segment.is_some() && manifest.uncompacted_fragments().is_empty() {
+            compacted = true;
+            break;
+        }
+    }
+    let _ = shutdown_tx.send(true);
+
+    assert!(
+        compacted,
+        "namespace should compact with delimiter-based bucket discovery"
+    );
+    assert_eq!(
+        counter.list_calls_for_prefix(""),
+        0,
+        "background compaction ticks must not recursively list the whole bucket"
+    );
+    assert!(
+        counter.delimiter_list_calls_for_prefix("") > 0,
+        "background compaction should use delimiter namespace discovery"
+    );
+
+    let _ = store.delete_prefix(&format!("{ns}/")).await;
+    harness.cleanup().await;
+}
+
 /// I5 (fail-loud half): caching must never convert a query-path error into
 /// silent degradation — a missing centroids blob during an actual query is
 /// still an error, warm cache infrastructure or not.

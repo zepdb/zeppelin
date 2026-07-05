@@ -3,10 +3,12 @@ mod common;
 use common::assertions::{assert_s3_object_exists, assert_s3_object_not_exists};
 use common::harness::TestHarness;
 
+use chrono::Utc;
 use zeppelin::error::ZeppelinError;
 use zeppelin::namespace::manager::NamespaceMetadata;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::types::DistanceMetric;
+use zeppelin::types::IndexType;
 use zeppelin::wal::Manifest;
 
 /// Create a URL-safe namespace name scoped to this test's prefix (no slashes).
@@ -115,6 +117,52 @@ async fn test_list_namespaces() {
 
     cleanup_ns(&harness.store, &ns1).await;
     cleanup_ns(&harness.store, &ns2).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_list_namespaces_ignores_nested_meta_objects() {
+    let harness = TestHarness::new().await;
+    let valid_ns = ns(&harness, "ns-list-delimited");
+    let nested_ns = format!("{}/segments/seg_cruft", harness.prefix);
+    let nested_meta_key = NamespaceMetadata::s3_key(&nested_ns);
+
+    let manager = NamespaceManager::new(harness.store.clone());
+    manager
+        .create(&valid_ns, 16, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let nested_meta = NamespaceMetadata {
+        name: nested_ns.clone(),
+        dimensions: 16,
+        distance_metric: DistanceMetric::Cosine,
+        index_type: IndexType::default(),
+        vector_count: 0,
+        created_at: now,
+        updated_at: now,
+        full_text_search: std::collections::HashMap::new(),
+    };
+    harness
+        .store
+        .put(&nested_meta_key, nested_meta.to_bytes().unwrap())
+        .await
+        .unwrap();
+
+    let namespaces = manager.list(None).await.unwrap();
+    let names: Vec<&str> = namespaces.iter().map(|m| m.name.as_str()).collect();
+    assert!(
+        names.contains(&valid_ns.as_str()),
+        "expected valid namespace {valid_ns} in {names:?}"
+    );
+    assert!(
+        !names.contains(&nested_ns.as_str()),
+        "recursive namespace listing must not treat nested metadata as a namespace: {names:?}"
+    );
+
+    cleanup_ns(&harness.store, &valid_ns).await;
+    let _ = harness.store.delete(&nested_meta_key).await;
     harness.cleanup().await;
 }
 

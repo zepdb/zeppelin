@@ -163,25 +163,40 @@ impl NamespaceManager {
         }
     }
 
+    async fn get_from_s3(&self, name: &str) -> Result<NamespaceMetadata> {
+        let key = NamespaceMetadata::s3_key(name);
+        match self.store.get(&key).await {
+            Ok(data) => {
+                let meta = NamespaceMetadata::from_bytes(&data)?;
+                self.registry.insert(name.to_string(), meta.clone());
+                Ok(meta)
+            }
+            Err(ZeppelinError::NotFound { .. }) => Err(ZeppelinError::NamespaceNotFound {
+                namespace: name.to_string(),
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
     /// List all namespaces, optionally filtered by prefix.
     #[instrument(skip(self))]
     pub async fn list(&self, prefix: Option<&str>) -> Result<Vec<NamespaceMetadata>> {
-        // List all top-level prefixes that have meta.json
+        // List immediate namespace prefixes that have meta.json. This must use
+        // delimiter listing: a recursive bucket walk would visit every WAL,
+        // segment, cluster, and nested meta.json object under every namespace.
         let list_prefix = prefix.unwrap_or("");
-        let keys = self.store.list_prefix(list_prefix).await?;
+        let namespace_prefixes = self.store.list_common_prefixes(list_prefix).await?;
 
         let mut namespaces = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        for key in &keys {
-            if key.ends_with("/meta.json") {
-                let ns_name = key.trim_end_matches("/meta.json");
-                if seen.insert(ns_name.to_string()) {
-                    match self.get(ns_name).await {
-                        Ok(meta) => namespaces.push(meta),
-                        Err(ZeppelinError::NamespaceNotFound { .. }) => continue,
-                        Err(e) => return Err(e),
-                    }
+        for prefix in &namespace_prefixes {
+            let ns_name = prefix.trim_end_matches('/');
+            if seen.insert(ns_name.to_string()) {
+                match self.get_from_s3(ns_name).await {
+                    Ok(meta) => namespaces.push(meta),
+                    Err(ZeppelinError::NamespaceNotFound { .. }) => continue,
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -234,23 +249,8 @@ impl NamespaceManager {
     /// Used on startup to discover pre-existing data.
     #[instrument(skip(self))]
     pub async fn scan_and_register(&self) -> Result<usize> {
-        let keys = self.store.list_prefix("").await?;
-        let mut count = 0;
-
-        for key in &keys {
-            if key.ends_with("/meta.json") {
-                let ns_name = key.trim_end_matches("/meta.json");
-                match self.store.get(key).await {
-                    Ok(data) => {
-                        if let Ok(meta) = NamespaceMetadata::from_bytes(&data) {
-                            self.registry.insert(ns_name.to_string(), meta);
-                            count += 1;
-                        }
-                    }
-                    Err(_) => continue,
-                }
-            }
-        }
+        let namespaces = self.list(None).await?;
+        let count = namespaces.len();
 
         info!(namespaces = count, "scanned and registered namespaces");
         Ok(count)
