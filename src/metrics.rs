@@ -50,6 +50,9 @@ mod inner {
         pub static ref ACTIVE_QUERIES: IntGauge = register_int_gauge!(
             "zeppelin_active_queries", "Number of in-flight queries"
         ).unwrap();
+        pub static ref RERANK_COALESCE_GAP_BYTES: IntGauge = register_int_gauge!(
+            "zeppelin_rerank_coalesce_gap_bytes", "Effective rerank coalesce gap in bytes"
+        ).unwrap();
         pub static ref INDEX_BUILD_DURATION: HistogramVec = register_histogram_vec!(
             "zeppelin_index_build_duration_seconds", "Index build duration",
             &["namespace", "index_type"],
@@ -135,6 +138,7 @@ pub fn init() {
     lazy_static::initialize(&CACHE_ENTRIES);
     lazy_static::initialize(&CACHE_EVICTIONS_TOTAL);
     lazy_static::initialize(&ACTIVE_QUERIES);
+    lazy_static::initialize(&RERANK_COALESCE_GAP_BYTES);
     lazy_static::initialize(&INDEX_BUILD_DURATION);
     lazy_static::initialize(&FTS_INDEX_BUILD_DURATION);
     lazy_static::initialize(&FTS_QUERIES_TOTAL);

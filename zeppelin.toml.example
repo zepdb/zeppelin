@@ -38,6 +38,10 @@
 # kmeans_convergence_epsilon = 0.0001
 # oversample_factor = 3
 
+[query]
+# rerank_coalesce_gap_bytes = 1048576      # ZEPPELIN_RERANK_COALESCE_GAP_BYTES
+# cost_latency_profile = "balanced"        # "low_cost", "balanced", or "low_latency"
+
 [compaction]
 # interval_secs = 30                 # ZEPPELIN_COMPACTION_INTERVAL_SECS
 # max_wal_fragments_before_compact = 100   # ZEPPELIN_MAX_WAL_FRAGMENTS — count trigger

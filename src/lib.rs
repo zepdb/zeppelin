@@ -21,6 +21,8 @@ pub mod metrics;
 pub mod namespace;
 /// Query execution: WAL scan, segment search, result merging.
 pub mod query;
+/// Runtime-mutable configuration snapshots.
+pub mod runtime_config;
 /// HTTP server (axum handlers and middleware).
 pub mod server;
 /// Startup and initialization routines.

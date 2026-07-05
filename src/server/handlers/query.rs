@@ -51,13 +51,14 @@ pub async fn query_namespace(
             "invalid request body: {e}"
         )))
     })?;
+    let knobs = state.runtime_query_config.snapshot();
 
     // ---- Phase 1: request-shape validation (NO I/O, needs no metadata) ----
     // Runs BEFORE namespace resolution so a malformed request to a missing
     // namespace is a 400 (bad request), not a 404 (Task 14 I2). Also runs
     // BEFORE the query metrics increment so rejected requests aren't counted
     // as queries (I3).
-    let top_k = req.top_k.unwrap_or(state.config.server.default_top_k);
+    let top_k = req.top_k.unwrap_or(knobs.default_top_k);
 
     // Exactly one of vector or rank_by must be provided.
     if req.vector.is_none() && req.rank_by.is_none() {
@@ -88,7 +89,7 @@ pub async fn query_namespace(
     // only, but the bound is a request-shape property so it's validated here
     // regardless of path: nprobe:0 previously slipped through and probed zero
     // clusters, returning an empty 200 (Task 14 I1).
-    let nprobe = req.nprobe.unwrap_or(state.config.indexing.default_nprobe);
+    let nprobe = req.nprobe.unwrap_or(knobs.default_nprobe);
     if let Some(requested) = req.nprobe {
         if requested == 0 {
             return Err(ApiError(ZeppelinError::Validation(
@@ -152,7 +153,7 @@ pub async fn query_namespace(
             Some(&state.manifest_cache),
             Some(&state.fts_cache),
             Some(&state.cache),
-            state.config.indexing.bm25_max_full_scan_clusters,
+            knobs.bm25_max_full_scan_clusters,
         )
         .await
         .map_err(ApiError::from)?
@@ -191,6 +192,7 @@ pub async fn query_namespace(
             consistency: req.consistency,
             distance_metric: meta.distance_metric,
             oversample_factor: state.config.indexing.oversample_factor,
+            rerank_coalesce_gap_bytes: knobs.rerank_coalesce_gap_bytes,
             cache: Some(&state.cache),
             manifest_cache: Some(&state.manifest_cache),
         })

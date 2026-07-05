@@ -2,6 +2,45 @@ use crate::error::{Result, ZeppelinError};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+const RERANK_COALESCE_GAP_ENV: &str = "ZEPPELIN_RERANK_COALESCE_GAP_BYTES";
+
+/// Default maximum gap, in bytes, between rerank f32 ranges that are merged
+/// into one physical GET.
+///
+/// `ZEPPELIN_RERANK_COALESCE_GAP_BYTES` is the throughput <-> request-cost
+/// dial for the two-phase fetch: rerank f32 ranges whose gap is smaller than
+/// this are merged into one physical GET. Recall is unaffected at any setting
+/// (the candidate set is identical; only the fetch plan changes).
+///
+/// The default is now 1 MiB. The 128 KiB "knee" below was measured on
+/// dbpedia100k np16 against loopback MinIO, so it is a Mac-loopback-MinIO
+/// local optimum. On real S3, GETs are the dominant query cost ($0.40 per
+/// million requests, in-region bytes free), so fewer, fatter GETs usually win.
+///
+/// Measured points (dbpedia100k np16, 8 workers; scale GETs ~2.3x for a 1M
+/// corpus):
+///
+///   gap        GETs/q   MB/q   QPS    ~$/M queries (S3 Standard)
+///   1 MiB       19.5    49.5    8.3     $7.80   <- default: cost-optimized
+///   512 KiB     30.6    41.4    9.8    $12.24
+///   256 KiB     50.4    34.1   11.6    $20.16
+///   128 KiB     79.9    28.6   13.4    $31.96   <- loopback throughput knee
+///   64 KiB     127.5    25.2    8.8    $51.00   <- past the knee; never use
+///
+/// Examples:
+///   ZEPPELIN_RERANK_COALESCE_GAP_BYTES=1048576  # 1 MiB: ~4x cheaper per
+///       query than 128 KiB at ~60% of its loopback QPS; right when request
+///       cost dominates (high query volume, S3 Standard).
+///   ZEPPELIN_RERANK_COALESCE_GAP_BYTES=131072   # 128 KiB: max QPS on this
+///       loopback bench; right when node count / latency dominates cost.
+///
+/// These numbers are from loopback MinIO (~410 MB/s wall). Real S3 has higher
+/// per-request latency but wider aggregate bandwidth, which pushes the optimal
+/// gap UP (fewer, fatter GETs); S3 Express One Zone halves request price and
+/// cuts first-byte latency, pushing it back DOWN. Re-run the gap sweep
+/// (qpsbench with this env var) on the target deployment before fixing a value.
+pub const DEFAULT_RERANK_COALESCE_GAP_BYTES: usize = 1024 * 1024;
+
 /// Top-level application configuration loaded from a TOML file, env vars, or defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -26,6 +65,174 @@ pub struct Config {
     /// Write-ahead log batching configuration.
     #[serde(default)]
     pub wal: WalConfig,
+    /// Query-time tuning knobs.
+    #[serde(default)]
+    pub query: QueryConfig,
+}
+
+/// Query-time configuration loaded at boot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueryConfig {
+    /// Maximum gap, in bytes, between rerank f32 ranges merged into one GET.
+    ///
+    /// `None` means the value was not set in TOML; `Config::load` resolves it
+    /// from `cost_latency_profile`, the environment override, or the default.
+    #[serde(default)]
+    pub rerank_coalesce_gap_bytes: Option<usize>,
+    /// Preset profile that resolves to `rerank_coalesce_gap_bytes` at load time.
+    #[serde(default)]
+    pub cost_latency_profile: Option<CostLatencyProfile>,
+}
+
+/// Preset tradeoff profiles for rerank range coalescing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostLatencyProfile {
+    /// Minimize S3 request cost by using fewer, larger rerank GETs.
+    LowCost,
+    /// Product default, currently equivalent to low cost.
+    Balanced,
+    /// Prefer loopback-benchmark throughput and lower single-query latency.
+    LowLatency,
+}
+
+/// Resolve a cost/latency profile to a concrete rerank coalesce gap.
+#[must_use]
+pub const fn rerank_coalesce_gap_bytes_for_profile(profile: CostLatencyProfile) -> usize {
+    match profile {
+        CostLatencyProfile::LowCost | CostLatencyProfile::Balanced => {
+            DEFAULT_RERANK_COALESCE_GAP_BYTES
+        }
+        CostLatencyProfile::LowLatency => 128 * 1024,
+    }
+}
+
+#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        original: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn clear() -> Self {
+            let original = std::env::var_os(RERANK_COALESCE_GAP_ENV);
+            std::env::remove_var(RERANK_COALESCE_GAP_ENV);
+            Self { original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(RERANK_COALESCE_GAP_ENV, value),
+                None => std::env::remove_var(RERANK_COALESCE_GAP_ENV),
+            }
+        }
+    }
+
+    fn load_toml(contents: &str) -> Result<Config> {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), contents).unwrap();
+        Config::load(Some(file.path().to_str().unwrap()))
+    }
+
+    #[test]
+    fn query_config_parses_explicit_gap_and_defaults_when_absent() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let explicit = load_toml(
+            r#"
+            [query]
+            rerank_coalesce_gap_bytes = 4096
+            "#,
+        )
+        .unwrap();
+        assert_eq!(explicit.effective_rerank_coalesce_gap_bytes(), 4096);
+
+        let absent = load_toml("").unwrap();
+        assert_eq!(
+            absent.effective_rerank_coalesce_gap_bytes(),
+            DEFAULT_RERANK_COALESCE_GAP_BYTES
+        );
+    }
+
+    #[test]
+    fn cost_latency_profiles_map_to_expected_gaps() {
+        assert_eq!(
+            rerank_coalesce_gap_bytes_for_profile(CostLatencyProfile::LowCost),
+            1_048_576
+        );
+        assert_eq!(
+            rerank_coalesce_gap_bytes_for_profile(CostLatencyProfile::Balanced),
+            1_048_576
+        );
+        assert_eq!(
+            rerank_coalesce_gap_bytes_for_profile(CostLatencyProfile::LowLatency),
+            131_072
+        );
+    }
+
+    #[test]
+    fn query_file_rejects_mutually_exclusive_gap_and_profile() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let err = load_toml(
+            r#"
+            [query]
+            rerank_coalesce_gap_bytes = 4096
+            cost_latency_profile = "low_latency"
+            "#,
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("query.rerank_coalesce_gap_bytes"));
+        assert!(message.contains("query.cost_latency_profile"));
+    }
+
+    #[test]
+    fn rerank_gap_env_overrides_file_and_rejects_malformed_value() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+        let contents = r#"
+            [query]
+            rerank_coalesce_gap_bytes = 4096
+        "#;
+
+        std::env::set_var(RERANK_COALESCE_GAP_ENV, "8192");
+        let overridden = load_toml(contents).unwrap();
+        assert_eq!(overridden.effective_rerank_coalesce_gap_bytes(), 8192);
+
+        std::env::set_var(RERANK_COALESCE_GAP_ENV, "not-a-number");
+        let err = load_toml(contents).unwrap_err();
+        assert!(matches!(err, ZeppelinError::Config(_)));
+        assert!(err.to_string().contains(RERANK_COALESCE_GAP_ENV));
+    }
+
+    #[test]
+    fn rerank_gap_zero_is_valid_at_load() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let config = load_toml(
+            r#"
+            [query]
+            rerank_coalesce_gap_bytes = 0
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.effective_rerank_coalesce_gap_bytes(), 0);
+    }
 }
 
 /// WAL configuration.
@@ -538,13 +745,45 @@ impl Config {
             }
             None => Config::default(),
         };
-        config.apply_env_overrides();
+        config.resolve_query_config()?;
+        config.apply_env_overrides()?;
         Ok(config)
+    }
+
+    fn resolve_query_config(&mut self) -> Result<()> {
+        if self.query.rerank_coalesce_gap_bytes.is_some()
+            && self.query.cost_latency_profile.is_some()
+        {
+            return Err(ZeppelinError::Config(
+                "query.rerank_coalesce_gap_bytes and query.cost_latency_profile are mutually exclusive; set exactly one".into(),
+            ));
+        }
+
+        let effective = self
+            .query
+            .rerank_coalesce_gap_bytes
+            .or_else(|| {
+                self.query
+                    .cost_latency_profile
+                    .map(rerank_coalesce_gap_bytes_for_profile)
+            })
+            .unwrap_or(DEFAULT_RERANK_COALESCE_GAP_BYTES);
+        self.query.rerank_coalesce_gap_bytes = Some(effective);
+        self.query.cost_latency_profile = None;
+        Ok(())
+    }
+
+    /// Resolved rerank coalesce gap after file/default/env processing.
+    #[must_use]
+    pub fn effective_rerank_coalesce_gap_bytes(&self) -> usize {
+        self.query
+            .rerank_coalesce_gap_bytes
+            .unwrap_or(DEFAULT_RERANK_COALESCE_GAP_BYTES)
     }
 
     /// Apply environment variable overrides on top of file/default values.
     /// This ensures env vars always take priority over TOML settings.
-    fn apply_env_overrides(&mut self) {
+    fn apply_env_overrides(&mut self) -> Result<()> {
         // Server
         if let Ok(v) = std::env::var("ZEPPELIN_HOST") {
             self.server.host = v;
@@ -770,5 +1009,25 @@ impl Config {
         if let Ok(v) = std::env::var("ZEPPELIN_LOG_FORMAT") {
             self.logging.format = v;
         }
+
+        // Query
+        match std::env::var(RERANK_COALESCE_GAP_ENV) {
+            Ok(v) => {
+                self.query.rerank_coalesce_gap_bytes = Some(v.parse::<usize>().map_err(|e| {
+                    ZeppelinError::Config(format!(
+                        "{RERANK_COALESCE_GAP_ENV} must be a non-negative integer byte count: {e}"
+                    ))
+                })?);
+                self.query.cost_latency_profile = None;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(e) => {
+                return Err(ZeppelinError::Config(format!(
+                    "failed to read {RERANK_COALESCE_GAP_ENV}: {e}"
+                )));
+            }
+        }
+
+        Ok(())
     }
 }

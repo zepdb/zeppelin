@@ -338,6 +338,7 @@ async fn run_query(
         consistency,
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache,
         manifest_cache: Some(&fixture.manifest_cache),
     })

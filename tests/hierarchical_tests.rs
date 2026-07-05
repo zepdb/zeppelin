@@ -527,6 +527,7 @@ async fn test_query_hierarchical_detection() {
         consistency: ConsistencyLevel::Eventual, // skip WAL scan, just segment search
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -598,6 +599,7 @@ async fn test_repeat_query_zero_tree_meta_gets() {
             consistency: ConsistencyLevel::Eventual,
             distance_metric: DistanceMetric::Euclidean,
             oversample_factor: 3,
+            rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
             cache: Some(cache),
             manifest_cache: None,
         }

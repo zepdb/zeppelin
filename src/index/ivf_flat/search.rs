@@ -58,42 +58,6 @@ const SKETCH_ADAPTIVE_THIN_RELATIVE_SCORE_MARGIN: f32 = 0.12;
 const SKETCH_ADAPTIVE_OBJECT_CAP_EXTRA: usize = 2;
 const SKETCH_SCAN_STATS_ENV: &str = "ZEPPELIN_SKETCH_SCAN_STATS";
 const SQ_BYTE_STATS_ENV: &str = "ZEPPELIN_SQ_BYTE_STATS";
-const RERANK_COALESCE_GAP_ENV: &str = "ZEPPELIN_RERANK_COALESCE_GAP_BYTES";
-// ZEPPELIN_RERANK_COALESCE_GAP_BYTES is the throughput <-> request-cost dial
-// for the two-phase fetch: rerank f32 ranges whose gap is smaller than this
-// are merged into one physical GET. Recall is unaffected at any setting (the
-// candidate set is identical; only the fetch plan changes).
-//
-// The default, 128 KiB, is the measured QPS knee on dbpedia100k np16 against
-// loopback MinIO: 13.4 QPS at ~80 ranged GETs/q. Larger gaps waste bandwidth
-// on merged-in dead bytes; smaller ones drown in per-request overhead (64 KiB
-// collapses to 8.8 QPS at ~128 GETs/q, and gap=0 exhausts connections).
-//
-// On S3, GETs are the dominant query cost ($0.40 per million requests,
-// in-region bytes free), so this knob sets $/million-queries directly.
-// Measured points (dbpedia100k np16, 8 workers; scale GETs ~2.3x for a 1M
-// corpus):
-//
-//   gap        GETs/q   MB/q   QPS    ~$/M queries (S3 Standard)
-//   1 MiB       19.5    49.5    8.3     $7.80   <- cost-optimized
-//   512 KiB     30.6    41.4    9.8    $12.24
-//   256 KiB     50.4    34.1   11.6    $20.16
-//   128 KiB     79.9    28.6   13.4    $31.96   <- default: throughput knee
-//   64 KiB     127.5    25.2    8.8    $51.00   <- past the knee; never use
-//
-// Examples:
-//   ZEPPELIN_RERANK_COALESCE_GAP_BYTES=1048576  # 1 MiB: ~4x cheaper per
-//       query than the default at ~60% of its QPS; right when request cost
-//       dominates (high query volume, S3 Standard).
-//   ZEPPELIN_RERANK_COALESCE_GAP_BYTES=131072   # 128 KiB: max QPS on this
-//       bench; right when node count / latency dominates cost.
-//
-// These numbers are from loopback MinIO (~410 MB/s wall). Real S3 has higher
-// per-request latency but wider aggregate bandwidth, which pushes the optimal
-// gap UP (fewer, fatter GETs); S3 Express One Zone halves request price and
-// cuts first-byte latency, pushing it back DOWN. Re-run the gap sweep
-// (qpsbench with this env var) on the target deployment before fixing a value.
-const DEFAULT_RERANK_COALESCE_GAP_BYTES: usize = 128 * 1024;
 
 /// A candidate result during search, before final ranking.
 struct Candidate {
@@ -375,6 +339,7 @@ fn emit_scan_stats(effective_nprobe: usize, objects: usize, clusters: usize, gro
 /// * `store`    - S3 store for reading cluster data.
 /// * `oversample_factor` - Oversampling multiplier when filters are active.
 /// * `cache`    - Optional disk cache for cluster data.
+/// * `rerank_coalesce_gap_bytes` - Max gap between rerank vector ranges to coalesce.
 #[allow(clippy::too_many_arguments)]
 pub async fn search_ivf_flat(
     index: &IvfFlatIndex,
@@ -386,6 +351,7 @@ pub async fn search_ivf_flat(
     store: &ZeppelinStore,
     oversample_factor: usize,
     cache: Option<&Arc<DiskCache>>,
+    rerank_coalesce_gap_bytes: usize,
 ) -> Result<Vec<SearchResult>> {
     // Validate query dimension.
     if query.len() != index.dim {
@@ -460,6 +426,7 @@ pub async fn search_ivf_flat(
                 store,
                 cache,
                 sq_byte_stats.clone(),
+                rerank_coalesce_gap_bytes,
             )
             .await?
         }
@@ -982,6 +949,7 @@ async fn scan_clusters_sq(
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
     byte_stats: Option<Arc<SqSearchByteStats>>,
+    rerank_coalesce_gap_bytes: usize,
 ) -> Result<Vec<Candidate>> {
     use crate::index::quantization::sq::{sq_calibration_key, SqCalibration};
 
@@ -1192,6 +1160,7 @@ async fn scan_clusters_sq(
                 store,
                 cache,
                 stats.as_deref(),
+                rerank_coalesce_gap_bytes,
             )
             .await
         }
@@ -1473,6 +1442,7 @@ async fn load_full_clusters_for_rerank(
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
     stats: Option<&SqSearchByteStats>,
+    rerank_coalesce_gap_bytes: usize,
 ) -> Result<Vec<RerankFetchedVector>> {
     let needed_clusters: Vec<usize> = object
         .clusters
@@ -1505,6 +1475,7 @@ async fn load_full_clusters_for_rerank(
                 index.dim,
                 store,
                 stats,
+                rerank_coalesce_gap_bytes,
             )
             .await;
         }
@@ -1539,6 +1510,7 @@ async fn fetch_rerank_vectors_by_range(
     dim: usize,
     store: &ZeppelinStore,
     stats: Option<&SqSearchByteStats>,
+    rerank_coalesce_gap_bytes: usize,
 ) -> Result<Vec<RerankFetchedVector>> {
     let mut requested = Vec::new();
     for &cluster_idx in clusters {
@@ -1566,8 +1538,7 @@ async fn fetch_rerank_vectors_by_range(
         acc.checked_add(len)
             .ok_or_else(|| ZeppelinError::Index("rerank logical byte count overflows".into()))
     })?;
-    let gap_bytes = configured_rerank_coalesce_gap_bytes()?;
-    let coalesced = coalesce_rerank_ranges(&requested, gap_bytes)?;
+    let coalesced = coalesce_rerank_ranges(&requested, rerank_coalesce_gap_bytes)?;
     let ranges: Vec<Range<usize>> = coalesced
         .iter()
         .map(|coalesced| coalesced.range.clone())
@@ -1576,7 +1547,7 @@ async fn fetch_rerank_vectors_by_range(
         object_key,
         logical_ranges = requested.len(),
         physical_ranges = ranges.len(),
-        gap_bytes,
+        gap_bytes = rerank_coalesce_gap_bytes,
         "coalesced rerank vector ranges"
     );
     let vector_bytes = futures::future::join_all(
@@ -1647,20 +1618,6 @@ async fn fetch_rerank_vectors_by_range(
             })
         })
         .collect()
-}
-
-fn configured_rerank_coalesce_gap_bytes() -> Result<usize> {
-    match std::env::var(RERANK_COALESCE_GAP_ENV) {
-        Ok(value) => value.parse::<usize>().map_err(|e| {
-            ZeppelinError::Index(format!(
-                "{RERANK_COALESCE_GAP_ENV} must be a non-negative integer byte count: {e}"
-            ))
-        }),
-        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_RERANK_COALESCE_GAP_BYTES),
-        Err(e) => Err(ZeppelinError::Index(format!(
-            "failed to read {RERANK_COALESCE_GAP_ENV}: {e}"
-        ))),
-    }
 }
 
 fn coalesce_rerank_ranges(
@@ -2214,6 +2171,7 @@ mod tests {
             &store,
             3,
             None,
+            crate::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         ));
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2247,6 +2205,7 @@ mod tests {
                 &store,
                 3,
                 None,
+                crate::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
             ))
             .unwrap();
         assert!(results.is_empty());

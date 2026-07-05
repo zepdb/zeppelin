@@ -1,3 +1,5 @@
+/// Runtime configuration handlers.
+pub mod config;
 /// Namespace CRUD handlers.
 pub mod namespace;
 /// Vector similarity and BM25 query handler.

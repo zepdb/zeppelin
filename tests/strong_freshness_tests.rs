@@ -71,6 +71,7 @@ async fn compact_baseline_and_cache_manifest(
         consistency: ConsistencyLevel::Strong,
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: Some(manifest_cache),
     })
@@ -116,6 +117,7 @@ async fn query_for_fresh_vector(
         consistency,
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: Some(manifest_cache),
     })

@@ -59,6 +59,8 @@ pub struct QueryParams<'a> {
     pub distance_metric: DistanceMetric,
     /// Oversample multiplier for filtered queries.
     pub oversample_factor: usize,
+    /// Maximum gap, in bytes, between rerank vector ranges merged into one GET.
+    pub rerank_coalesce_gap_bytes: usize,
     /// Optional disk cache for cluster data.
     pub cache: Option<&'a Arc<DiskCache>>,
     /// Optional manifest cache to avoid redundant S3 reads.
@@ -94,6 +96,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         consistency,
         distance_metric,
         oversample_factor,
+        rerank_coalesce_gap_bytes,
         cache,
         manifest_cache,
     } = params;
@@ -168,6 +171,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
                 filter,
                 distance_metric,
                 oversample_factor,
+                rerank_coalesce_gap_bytes,
                 cache,
             )
             .await?;
@@ -337,6 +341,7 @@ async fn segment_search(
     filter: Option<&Filter>,
     distance_metric: DistanceMetric,
     oversample_factor: usize,
+    rerank_coalesce_gap_bytes: usize,
     cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<SearchResult>> {
     let segment_id = &segment_ref.id;
@@ -387,6 +392,7 @@ async fn segment_search(
         store,
         oversample_factor,
         cache,
+        rerank_coalesce_gap_bytes,
     )
     .await?;
 

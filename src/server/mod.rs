@@ -25,10 +25,11 @@ use crate::error::ZeppelinError;
 use crate::fts::wal_cache::WalFtsCache;
 use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL, REQUESTS_BY_IP_TOTAL};
 use crate::namespace::NamespaceManager;
+use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::storage::ZeppelinStore;
 use crate::wal::{WalReader, WalWriter};
 
-use self::handlers::{namespace, query, vectors, ApiError};
+use self::handlers::{config as config_handler, namespace, query, vectors, ApiError};
 
 tokio::task_local! {
     /// The current request's ID, set by the `request_id` middleware and read by
@@ -57,6 +58,10 @@ pub struct AppState {
     pub wal_reader: Arc<WalReader>,
     /// Global server and indexing configuration.
     pub config: Arc<Config>,
+    /// Runtime-mutable query configuration snapshots.
+    pub runtime_query_config: Arc<RuntimeQueryConfig>,
+    /// Boot-time validation bounds for runtime query knob updates.
+    pub query_knob_bounds: QueryKnobBounds,
     /// LRU disk cache for segment data.
     pub cache: Arc<DiskCache>,
     /// In-memory manifest cache with TTL.
@@ -291,6 +296,12 @@ pub fn build_router(state: AppState) -> Router {
     }
 
     other_routes = other_routes
+        .route(
+            "/v1/config/query",
+            get(config_handler::get_query_config)
+                .patch(config_handler::update_query_config)
+                .put(config_handler::update_query_config),
+        )
         .route("/v1/namespaces", post(namespace::create_namespace))
         .route(
             "/v1/namespaces/:ns",

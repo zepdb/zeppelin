@@ -19,6 +19,7 @@ use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget};
 use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::NamespaceManager;
+use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::server::build_router;
 use crate::server::AppState;
 use crate::storage::ZeppelinStore;
@@ -158,6 +159,22 @@ pub async fn build_app(
     // Initialize WAL FTS cache (pre-tokenized BM25 data)
     let fts_cache = Arc::new(WalFtsCache::new());
 
+    // Runtime query config uses a std-only RwLock<Arc<_>> snapshot holder.
+    // Bounds remain boot-time values so mutable defaults cannot outgrow limits.
+    let runtime_query_config = Arc::new(RuntimeQueryConfig::from_config(&config));
+    let query_knob_bounds = QueryKnobBounds::from_config(&config);
+    let query_knobs = runtime_query_config.snapshot();
+    crate::metrics::RERANK_COALESCE_GAP_BYTES
+        .set(i64::try_from(query_knobs.rerank_coalesce_gap_bytes).unwrap_or(i64::MAX));
+    tracing::info!(
+        rerank_coalesce_gap_bytes = query_knobs.rerank_coalesce_gap_bytes,
+        default_nprobe = query_knobs.default_nprobe,
+        default_top_k = query_knobs.default_top_k,
+        bm25_max_full_scan_clusters = query_knobs.bm25_max_full_scan_clusters,
+        "effective runtime query config"
+    );
+    drop(query_knobs);
+
     // Build application state
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.server.max_concurrent_queries,
@@ -169,6 +186,8 @@ pub async fn build_app(
         wal_writer,
         wal_reader,
         config: Arc::new(config),
+        runtime_query_config,
+        query_knob_bounds,
         cache,
         manifest_cache,
         fts_cache,

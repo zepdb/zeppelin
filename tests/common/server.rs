@@ -14,6 +14,7 @@ use zeppelin::compaction::Compactor;
 use zeppelin::config::Config;
 use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::NamespaceManager;
+use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use zeppelin::server::build_router;
 use zeppelin::server::AppState;
 use zeppelin::storage::ZeppelinStore;
@@ -25,6 +26,13 @@ fn configure_test_server_limits(config: &mut Config) {
     // in tests that are not exercising rate limiting.
     config.server.rate_limit_rps = 1_000_000;
     config.server.rate_limit_burst = 1_000_000;
+}
+
+fn runtime_query_state(config: &Config) -> (Arc<RuntimeQueryConfig>, QueryKnobBounds) {
+    (
+        Arc::new(RuntimeQueryConfig::from_config(config)),
+        QueryKnobBounds::from_config(config),
+    )
 }
 
 /// Start a test server with optional config override, returning (base_url, harness, cache, _cache_dir).
@@ -47,12 +55,15 @@ pub async fn start_test_server_with_config(
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.server.max_concurrent_queries,
     ));
+    let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         config: Arc::new(config),
+        runtime_query_config,
+        query_knob_bounds,
         cache: cache.clone(),
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
         fts_cache: Arc::new(WalFtsCache::new()),
@@ -110,12 +121,15 @@ pub async fn start_test_server_with_compactor(
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.server.max_concurrent_queries,
     ));
+    let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         config: Arc::new(config),
+        runtime_query_config,
+        query_knob_bounds,
         cache: cache.clone(),
         manifest_cache,
         fts_cache: Arc::new(WalFtsCache::new()),
@@ -201,12 +215,15 @@ pub async fn start_test_server_with_compaction(
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.server.max_concurrent_queries,
     ));
+    let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager,
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         config: Arc::new(config),
+        runtime_query_config,
+        query_knob_bounds,
         cache: cache.clone(),
         manifest_cache,
         fts_cache: Arc::new(WalFtsCache::new()),

@@ -232,6 +232,7 @@ async fn test_compact_deduplication() {
         consistency: ConsistencyLevel::Eventual,
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -479,6 +480,7 @@ async fn test_query_after_compaction() {
         consistency: ConsistencyLevel::Strong,
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -504,6 +506,7 @@ async fn test_query_after_compaction() {
         consistency: ConsistencyLevel::Strong,
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -522,6 +525,7 @@ async fn test_query_after_compaction() {
         consistency: ConsistencyLevel::Eventual,
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -575,6 +579,7 @@ async fn test_delete_after_compaction_not_returned_strong() {
         consistency: ConsistencyLevel::Strong,
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -602,6 +607,7 @@ async fn test_delete_after_compaction_not_returned_strong() {
         consistency: ConsistencyLevel::Strong,
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -628,6 +634,7 @@ async fn test_delete_after_compaction_not_returned_strong() {
         consistency: ConsistencyLevel::Eventual,
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -915,6 +922,7 @@ fn segment_query_params<'a>(
         consistency: ConsistencyLevel::Eventual,
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache,
         manifest_cache: None,
     }
@@ -1455,6 +1463,7 @@ async fn test_compact_attributes_preserved() {
         consistency: ConsistencyLevel::Eventual,
         distance_metric: DistanceMetric::Cosine,
         oversample_factor: 3,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })

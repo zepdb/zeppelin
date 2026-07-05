@@ -272,6 +272,7 @@ async fn strong_query_ids(
         consistency: ConsistencyLevel::Strong,
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -426,6 +427,7 @@ async fn test_incremental_delete_forces_cluster_rewrite() {
         consistency: ConsistencyLevel::Strong,
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -595,6 +597,7 @@ async fn test_incremental_matches_full_rewrite_results() {
         consistency: ConsistencyLevel::Strong,
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })
@@ -611,6 +614,7 @@ async fn test_incremental_matches_full_rewrite_results() {
         consistency: ConsistencyLevel::Strong,
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
     })

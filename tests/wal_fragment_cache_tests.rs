@@ -46,6 +46,7 @@ async fn strong_query(
         consistency: ConsistencyLevel::Strong,
         distance_metric: DistanceMetric::Euclidean,
         oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: Some(cache),
         manifest_cache: None,
     })
