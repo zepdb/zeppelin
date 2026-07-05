@@ -37,6 +37,7 @@ const TOP_K_ALL: usize = 4;
 struct ExpectedGets {
     manifest: u64,
     centroids: u64,
+    bootstrap: u64,
     sq: u64,
     cluster: u64,
     attrs: u64,
@@ -48,6 +49,7 @@ impl ExpectedGets {
     fn total(self) -> u64 {
         self.manifest
             + self.centroids
+            + self.bootstrap
             + self.sq
             + self.cluster
             + self.attrs
@@ -354,6 +356,10 @@ fn assert_get_profile(counter: &GetCounter, expected: ExpectedGets) {
         counter.gets_for(ArtifactClass::Centroids),
         expected.centroids
     );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Bootstrap),
+        expected.bootstrap
+    );
     assert_eq!(counter.gets_for(ArtifactClass::Sq), expected.sq);
     assert_eq!(counter.gets_for(ArtifactClass::Cluster), expected.cluster);
     assert_eq!(counter.gets_for(ArtifactClass::Attrs), expected.attrs);
@@ -405,29 +411,28 @@ async fn cold_strong_vector_query_pins_sq8_get_profile() {
 
     print_profile("cold strong vector query, SQ8, nprobe=4", &fixture.counter);
 
-    // H1 cold strong profile for the v2 SQ8 storage layout, with only the
+    // Cold strong profile for the current SQ8 grouped layout, with only the
     // manifest cache preloaded:
     // - manifest=1: Task 13 strong If-None-Match freshness GET.
-    // - centroids=1: active segment IVF centroid blob, including SQ calibration.
+    // - bootstrap=1: active segment bootstrap blob, including centroids,
+    //   SQ calibration, and resident sketch.
     // - sq=0: no SQ calibration or per-cluster SQ sidecars for v2 segments.
-    // - cluster=4: one co-located cluster blob per probed cluster; those same
-    //   bytes are reused for SQ8 rerank.
+    // - cluster=2: two grouped cluster-data objects cover the four clusters.
     // - attrs=4: lazy final-result enrichment still needs all four attrs
     //   blobs in this fixture because top_k=4 returns one vector from each
     //   one-vector cluster. attrs_laziness_tests pins the reduced top_k=1
     //   profile where only the winning cluster's attrs are fetched.
-    // - sketch=1: the resident coarse sketch is loaded with the segment handle
-    //   on a cold no-cache query. Cached query profiles pin the resident sketch.
-    // - total=11: honest object GET count, not the thesis-level "2".
+    // - total=8: honest object GET count, not the thesis-level "2".
     assert_get_profile(
         &fixture.counter,
         ExpectedGets {
             manifest: 1,
-            centroids: 1,
+            centroids: 0,
+            bootstrap: 1,
             sq: 0,
-            cluster: 4,
+            cluster: 2,
             attrs: 4,
-            sketch: 1,
+            sketch: 0,
             wal: 0,
         },
     );
@@ -455,6 +460,7 @@ async fn cold_strong_profiles_pin_legacy_and_colocated_sq8_layouts() {
         ExpectedGets {
             manifest: 1,
             centroids: 1,
+            bootstrap: 0,
             sq: 5,
             cluster: 4,
             attrs: 4,
@@ -472,6 +478,7 @@ async fn cold_strong_profiles_pin_legacy_and_colocated_sq8_layouts() {
         ExpectedGets {
             manifest: 1,
             centroids: 1,
+            bootstrap: 0,
             sq: 0,
             cluster: 4,
             attrs: 4,
@@ -516,11 +523,12 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
         &fixture.counter,
         ExpectedGets {
             manifest: 0,
-            centroids: 1,
+            centroids: 0,
+            bootstrap: 1,
             sq: 0,
-            cluster: 4,
+            cluster: 2,
             attrs: 4,
-            sketch: 1,
+            sketch: 0,
             wal: 0,
         },
     );
@@ -541,18 +549,19 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
         &fixture.counter,
         ExpectedGets {
             manifest: 1,
-            centroids: 1,
+            centroids: 0,
+            bootstrap: 1,
             sq: 0,
-            cluster: 4,
+            cluster: 2,
             attrs: 4,
-            sketch: 1,
+            sketch: 0,
             wal: 1,
         },
     );
     let strong_total = fixture.counter.total_gets();
 
-    assert_eq!(eventual_total, 10);
-    assert_eq!(strong_total, 12);
+    assert_eq!(eventual_total, 7);
+    assert_eq!(strong_total, 9);
     assert_eq!(
         strong_total - eventual_total,
         2,
@@ -574,11 +583,12 @@ async fn cluster_gets_scale_exactly_with_nprobe() {
         &fixture.counter,
         ExpectedGets {
             manifest: 1,
-            centroids: 1,
+            centroids: 0,
+            bootstrap: 1,
             sq: 0,
             cluster: 1,
             attrs: 1,
-            sketch: 1,
+            sketch: 0,
             wal: 0,
         },
     );
@@ -593,18 +603,19 @@ async fn cluster_gets_scale_exactly_with_nprobe() {
         &fixture.counter,
         ExpectedGets {
             manifest: 1,
-            centroids: 1,
+            centroids: 0,
+            bootstrap: 1,
             sq: 0,
-            cluster: 4,
+            cluster: 2,
             attrs: 4,
-            sketch: 1,
+            sketch: 0,
             wal: 0,
         },
     );
     let cluster_gets_nprobe_4 = fixture.counter.gets_for(ArtifactClass::Cluster);
 
     assert_eq!(cluster_gets_nprobe_1, 1);
-    assert_eq!(cluster_gets_nprobe_4, cluster_gets_nprobe_1 * 4);
+    assert_eq!(cluster_gets_nprobe_4, 2);
 
     fixture.harness.cleanup().await;
 }
@@ -634,11 +645,12 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
         &fixture.counter,
         ExpectedGets {
             manifest: 1,
-            centroids: 1,
+            centroids: 0,
+            bootstrap: 1,
             sq: 0,
-            cluster: 4,
+            cluster: 2,
             attrs: 4,
-            sketch: 1,
+            sketch: 0,
             wal: 0,
         },
     );
@@ -663,6 +675,7 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
         ExpectedGets {
             manifest: 1,
             centroids: 0,
+            bootstrap: 0,
             sq: 0,
             cluster: 0,
             attrs: 0,
@@ -672,7 +685,7 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
     );
     let warm_total = fixture.counter.total_gets();
 
-    assert_eq!(cold_total, 11);
+    assert_eq!(cold_total, 8);
     assert_eq!(warm_total, 1);
     assert!(
         warm_total < cold_total,

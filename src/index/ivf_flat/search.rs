@@ -1255,7 +1255,7 @@ mod tests {
 
     fn make_index() -> IvfFlatIndex {
         IvfFlatIndex {
-            centroids: vec![vec![0.0, 0.0], vec![10.0, 10.0]],
+            centroids: std::sync::Arc::new(vec![vec![0.0, 0.0], vec![10.0, 10.0]]),
             num_vectors: 4,
             dim: 2,
             namespace: "test_ns".to_string(),

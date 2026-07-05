@@ -52,7 +52,9 @@
 //!   keeps `pq_codebook.bin` and `pq_cluster_i.bin` unchanged for this phase.
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, info};
 
 use crate::config::IndexingConfig;
@@ -80,6 +82,12 @@ const BOOTSTRAP_HEADER_LEN: usize = 4 + 4 + BOOTSTRAP_SECTION_COUNT * 16;
 const DEFAULT_MAX_CLUSTERS_PER_OBJECT: usize = 3;
 const MAX_CLUSTERS_PER_OBJECT_ENV: &str = "ZEPPELIN_MAX_CLUSTERS_PER_OBJECT";
 const CLUSTER_GROUP_STATS_ENV: &str = "ZEPPELIN_CLUSTER_GROUP_STATS";
+
+static BOOTSTRAP_DECODED_CACHE: OnceLock<DashMap<String, Arc<DecodedBootstrap>>> = OnceLock::new();
+
+fn bootstrap_decoded_cache() -> &'static DashMap<String, Arc<DecodedBootstrap>> {
+    BOOTSTRAP_DECODED_CACHE.get_or_init(DashMap::new)
+}
 
 // ---------------------------------------------------------------------------
 // Artifact paths
@@ -591,6 +599,24 @@ pub(crate) struct CentroidsData {
     pub dim: usize,
     /// Embedded legacy SQ calibration payload, present for new SQ segments.
     pub sq_calibration: Option<Bytes>,
+}
+
+#[derive(Debug)]
+struct LoadedIndexMetadata {
+    centroids: Arc<Vec<Vec<f32>>>,
+    dim: usize,
+    sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
+    resident_sketch: Option<Arc<ResidentSketch>>,
+}
+
+#[derive(Debug)]
+struct DecodedBootstrap {
+    bootstrap_size_bytes: u64,
+    sketch_size_bytes: u64,
+    centroids: Arc<Vec<Vec<f32>>>,
+    dim: usize,
+    sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
+    resident_sketch: Arc<ResidentSketch>,
 }
 
 /// Deserialize centroids from the binary format produced by `serialize_centroids`.
@@ -1421,7 +1447,7 @@ pub async fn build_ivf_flat(
 
     let cluster_object_by_cluster = build_cluster_object_lookup(num_clusters, &cluster_objects)?;
     Ok(IvfFlatIndex {
-        centroids,
+        centroids: Arc::new(centroids),
         num_vectors: vectors.len(),
         dim,
         namespace: namespace.to_string(),
@@ -1433,7 +1459,7 @@ pub async fn build_ivf_flat(
         cluster_owners: Vec::new(),
         cluster_objects,
         cluster_object_by_cluster,
-        resident_sketch: Some(resident_sketch),
+        resident_sketch: Some(Arc::new(resident_sketch)),
         sketch_ref: Some(sketch_ref),
         bootstrap_ref: Some(bootstrap_ref),
     })
@@ -1464,7 +1490,7 @@ pub async fn load_ivf_flat_from_manifest(
     bootstrap_ref: Option<BootstrapRef>,
     cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
 ) -> Result<IvfFlatIndex> {
-    let (centroids_data, resident_sketch) = match bootstrap_ref.as_ref() {
+    let metadata = match bootstrap_ref.as_ref() {
         Some(bootstrap_ref) => {
             load_bootstrap_artifacts(store, namespace, bootstrap_ref, sketch_ref.as_ref(), cache)
                 .await?
@@ -1483,43 +1509,47 @@ pub async fn load_ivf_flat_from_manifest(
                 None => store.get(&ckey).await?,
             };
             let centroids_data = deserialize_centroids_data(&data)?;
+            let sq_calibration = centroids_data
+                .sq_calibration
+                .as_ref()
+                .map(|bytes| crate::index::quantization::sq::SqCalibration::from_bytes(bytes))
+                .transpose()?;
             let resident_sketch =
                 load_resident_sketch(store, namespace, sketch_ref.as_ref(), cache).await?;
-            (centroids_data, resident_sketch)
+            LoadedIndexMetadata {
+                centroids: Arc::new(centroids_data.centroids),
+                dim: centroids_data.dim,
+                sq_calibration,
+                resident_sketch,
+            }
         }
     };
-    let sq_calibration = centroids_data
-        .sq_calibration
-        .as_ref()
-        .map(|bytes| crate::index::quantization::sq::SqCalibration::from_bytes(bytes))
-        .transpose()?;
-    let centroids = centroids_data.centroids;
-    let dim = centroids_data.dim;
-    let cluster_object_by_cluster = build_cluster_object_lookup(centroids.len(), &cluster_objects)?;
+    let cluster_object_by_cluster =
+        build_cluster_object_lookup(metadata.centroids.len(), &cluster_objects)?;
 
     info!(
         namespace = namespace,
         segment_id = segment_id,
         num_vectors = num_vectors,
-        num_clusters = centroids.len(),
-        dim = dim,
+        num_clusters = metadata.centroids.len(),
+        dim = metadata.dim,
         quantization = ?quantization,
         "loaded IVF-Flat index from manifest metadata"
     );
 
     Ok(IvfFlatIndex {
-        centroids,
+        centroids: metadata.centroids,
         num_vectors,
-        dim,
+        dim: metadata.dim,
         namespace: namespace.to_string(),
         segment_id: segment_id.to_string(),
         quantization,
-        sq_calibration,
+        sq_calibration: metadata.sq_calibration,
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
         cluster_owners,
         cluster_objects,
         cluster_object_by_cluster,
-        resident_sketch,
+        resident_sketch: metadata.resident_sketch,
         sketch_ref,
         bootstrap_ref,
     })
@@ -1531,7 +1561,7 @@ async fn load_bootstrap_artifacts(
     bootstrap_ref: &BootstrapRef,
     sketch_ref: Option<&crate::wal::manifest::SketchRef>,
     cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
-) -> Result<(CentroidsData, Option<ResidentSketch>)> {
+) -> Result<LoadedIndexMetadata> {
     let Some(sketch_ref) = sketch_ref else {
         return Err(ZeppelinError::Index(format!(
             "bootstrap {} present but segment is missing sketch ref",
@@ -1539,15 +1569,39 @@ async fn load_bootstrap_artifacts(
         )));
     };
 
+    if let Some(c) = cache {
+        if let Some(decoded) = c.get_decoded::<DecodedBootstrap>(&bootstrap_ref.key)? {
+            pin_bootstrap_metadata(c, namespace, &bootstrap_ref.key).await;
+            return metadata_from_decoded_bootstrap(
+                &bootstrap_ref.key,
+                decoded,
+                bootstrap_ref,
+                sketch_ref,
+            );
+        }
+    }
+    if let Some(decoded) = bootstrap_decoded_cache()
+        .get(&bootstrap_ref.key)
+        .map(|entry| Arc::clone(entry.value()))
+    {
+        if let Some(c) = cache {
+            c.insert_decoded(&bootstrap_ref.key, Arc::clone(&decoded));
+            pin_bootstrap_metadata(c, namespace, &bootstrap_ref.key).await;
+        }
+        return metadata_from_decoded_bootstrap(
+            &bootstrap_ref.key,
+            decoded,
+            bootstrap_ref,
+            sketch_ref,
+        );
+    }
+
     let data = match cache {
         Some(c) => {
             let data = c
                 .get_or_fetch(&bootstrap_ref.key, || store.get(&bootstrap_ref.key))
                 .await?;
-            c.unpin_scoped(&format!("{namespace}:centroids")).await;
-            c.unpin_scoped(&format!("{namespace}:coarse_sketch")).await;
-            c.pin_scoped(&format!("{namespace}:bootstrap"), &bootstrap_ref.key)
-                .await;
+            pin_bootstrap_metadata(c, namespace, &bootstrap_ref.key).await;
             data
         }
         None => store.get(&bootstrap_ref.key).await?,
@@ -1571,8 +1625,73 @@ async fn load_bootstrap_artifacts(
         )));
     }
     let centroids_data = deserialize_centroids_data(sections.centroids)?;
-    let sketch = ResidentSketch::from_bytes(sections.sketch)?;
-    Ok((centroids_data, Some(sketch)))
+    let sq_calibration = centroids_data
+        .sq_calibration
+        .as_ref()
+        .map(|bytes| crate::index::quantization::sq::SqCalibration::from_bytes(bytes))
+        .transpose()?;
+    let centroids = Arc::new(centroids_data.centroids);
+    let sketch = Arc::new(ResidentSketch::from_bytes(sections.sketch)?);
+
+    let decoded = Arc::new(DecodedBootstrap {
+        bootstrap_size_bytes: bootstrap_ref.size_bytes,
+        sketch_size_bytes: sketch_ref.size_bytes,
+        centroids: Arc::clone(&centroids),
+        dim: centroids_data.dim,
+        sq_calibration: sq_calibration.clone(),
+        resident_sketch: Arc::clone(&sketch),
+    });
+    bootstrap_decoded_cache().insert(bootstrap_ref.key.clone(), Arc::clone(&decoded));
+    if let Some(c) = cache {
+        c.insert_decoded(&bootstrap_ref.key, decoded);
+    }
+
+    Ok(LoadedIndexMetadata {
+        centroids,
+        dim: centroids_data.dim,
+        sq_calibration,
+        resident_sketch: Some(sketch),
+    })
+}
+
+fn metadata_from_decoded_bootstrap(
+    key: &str,
+    decoded: Arc<DecodedBootstrap>,
+    bootstrap_ref: &BootstrapRef,
+    sketch_ref: &crate::wal::manifest::SketchRef,
+) -> Result<LoadedIndexMetadata> {
+    if decoded.bootstrap_size_bytes != bootstrap_ref.size_bytes {
+        return Err(ZeppelinError::Index(format!(
+            "decoded bootstrap size mismatch for {key}: manifest={}, cached={}",
+            bootstrap_ref.size_bytes, decoded.bootstrap_size_bytes
+        )));
+    }
+    if decoded.sketch_size_bytes != sketch_ref.size_bytes {
+        return Err(ZeppelinError::Index(format!(
+            "decoded coarse sketch size mismatch inside bootstrap {key}: manifest={}, cached={}",
+            sketch_ref.size_bytes, decoded.sketch_size_bytes
+        )));
+    }
+    Ok(LoadedIndexMetadata {
+        centroids: Arc::clone(&decoded.centroids),
+        dim: decoded.dim,
+        sq_calibration: decoded.sq_calibration.clone(),
+        resident_sketch: Some(Arc::clone(&decoded.resident_sketch)),
+    })
+}
+
+async fn pin_bootstrap_metadata(
+    cache: &crate::cache::DiskCache,
+    namespace: &str,
+    bootstrap_key: &str,
+) {
+    cache.unpin_scoped(&format!("{namespace}:centroids")).await;
+    cache
+        .unpin_scoped(&format!("{namespace}:coarse_sketch"))
+        .await;
+    cache
+        .pin_scoped(&format!("{namespace}:bootstrap"), bootstrap_key)
+        .await;
 }
 
 async fn load_resident_sketch(
@@ -1580,10 +1699,18 @@ async fn load_resident_sketch(
     namespace: &str,
     sketch_ref: Option<&crate::wal::manifest::SketchRef>,
     cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
-) -> Result<Option<ResidentSketch>> {
+) -> Result<Option<Arc<ResidentSketch>>> {
     let Some(sketch_ref) = sketch_ref else {
         return Ok(None);
     };
+
+    if let Some(c) = cache {
+        if let Some(sketch) = c.get_decoded::<ResidentSketch>(&sketch_ref.key)? {
+            c.pin_scoped(&format!("{namespace}:coarse_sketch"), &sketch_ref.key)
+                .await;
+            return Ok(Some(sketch));
+        }
+    }
 
     let data = match cache {
         Some(c) => {
@@ -1596,7 +1723,7 @@ async fn load_resident_sketch(
         }
         None => store.get(&sketch_ref.key).await?,
     };
-    let sketch = ResidentSketch::from_bytes(&data)?;
+    let sketch = Arc::new(ResidentSketch::from_bytes(&data)?);
     if sketch_ref.size_bytes != data.len() as u64 {
         return Err(ZeppelinError::Index(format!(
             "coarse sketch size mismatch for {}: manifest={}, object={}",
@@ -1604,6 +1731,9 @@ async fn load_resident_sketch(
             sketch_ref.size_bytes,
             data.len()
         )));
+    }
+    if let Some(c) = cache {
+        c.insert_decoded(&sketch_ref.key, Arc::clone(&sketch));
     }
     Ok(Some(sketch))
 }
@@ -1709,7 +1839,7 @@ pub async fn load_ivf_flat(
     );
 
     Ok(IvfFlatIndex {
-        centroids,
+        centroids: Arc::new(centroids),
         num_vectors,
         dim,
         namespace: namespace.to_string(),
@@ -1889,8 +2019,8 @@ mod tests {
             QuantizationType::None,
             Vec::new(),
             Vec::new(),
-            Some(sketch_ref),
-            Some(bootstrap_ref),
+            Some(sketch_ref.clone()),
+            Some(bootstrap_ref.clone()),
             None,
         )
         .await
@@ -1898,6 +2028,88 @@ mod tests {
 
         assert_eq!(index.num_clusters(), 2);
         assert!(index.resident_sketch.is_some());
+
+        let second = load_ivf_flat_from_manifest(
+            &store,
+            namespace,
+            segment_id,
+            2,
+            QuantizationType::None,
+            Vec::new(),
+            Vec::new(),
+            Some(sketch_ref),
+            Some(bootstrap_ref),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&index.centroids, &second.centroids));
+        assert!(std::sync::Arc::ptr_eq(
+            index.resident_sketch.as_ref().unwrap(),
+            second.resident_sketch.as_ref().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_load_from_manifest_reuses_decoded_bootstrap() {
+        let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let namespace = "ns_bootstrap_decoded";
+        let segment_id = "seg_bootstrap_decoded";
+        let centroids = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
+        let centroids_data = serialize_centroids(&centroids, 2).unwrap();
+        let cluster_vecs = vec![vec![vec![0.1, 0.0]], vec![vec![9.9, 10.1]]];
+        let cluster_attrs = vec![vec![None], vec![None]];
+        let (sketch_ref, sketch_data, _) =
+            build_resident_sketch(namespace, segment_id, 2, &cluster_vecs, &cluster_attrs).unwrap();
+        let (bootstrap_ref, bootstrap_data) =
+            build_bootstrap_artifact(namespace, segment_id, &centroids_data, &sketch_data).unwrap();
+        store.put(&bootstrap_ref.key, bootstrap_data).await.unwrap();
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = std::sync::Arc::new(
+            crate::cache::DiskCache::new_with_max_bytes(
+                cache_dir.path().to_path_buf(),
+                100 * 1024 * 1024,
+            )
+            .unwrap(),
+        );
+
+        let first = load_ivf_flat_from_manifest(
+            &store,
+            namespace,
+            segment_id,
+            2,
+            QuantizationType::None,
+            Vec::new(),
+            Vec::new(),
+            Some(sketch_ref.clone()),
+            Some(bootstrap_ref.clone()),
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+        assert!(cache.has_decoded(&bootstrap_ref.key));
+
+        let second = load_ivf_flat_from_manifest(
+            &store,
+            namespace,
+            segment_id,
+            2,
+            QuantizationType::None,
+            Vec::new(),
+            Vec::new(),
+            Some(sketch_ref),
+            Some(bootstrap_ref),
+            Some(&cache),
+        )
+        .await
+        .unwrap();
+
+        assert!(std::sync::Arc::ptr_eq(&first.centroids, &second.centroids));
+        assert!(std::sync::Arc::ptr_eq(
+            first.resident_sketch.as_ref().unwrap(),
+            second.resident_sketch.as_ref().unwrap()
+        ));
     }
 
     #[tokio::test]

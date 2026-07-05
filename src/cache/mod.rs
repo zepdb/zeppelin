@@ -1,10 +1,12 @@
 /// Manifest-level TTL cache to avoid repeated S3 reads.
 pub mod manifest_cache;
 
+use std::any::Any;
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -53,6 +55,8 @@ pub struct DiskCache {
     /// release automatically on segment rotation.
     scoped_pins: DashMap<String, String>,
     total_size: AtomicU64,
+    /// Decoded immutable metadata keyed by the same S3 key as the bytes cache.
+    decoded: DashMap<String, Arc<dyn Any + Send + Sync>>,
     /// Optional in-memory tier sitting above disk.
     memory: Option<MemoryCache>,
 }
@@ -93,6 +97,7 @@ impl DiskCache {
             pinned: RwLock::new(HashSet::new()),
             scoped_pins: DashMap::new(),
             total_size: AtomicU64::new(0),
+            decoded: DashMap::new(),
             memory,
         };
 
@@ -283,10 +288,41 @@ impl DiskCache {
         Ok(data)
     }
 
+    /// Get a decoded immutable metadata entry from the in-process cache.
+    pub fn get_decoded<T>(&self, key: &str) -> Result<Option<Arc<T>>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let Some(entry) = self.decoded.get(key) else {
+            return Ok(None);
+        };
+        let decoded = Arc::clone(entry.value());
+        Arc::downcast::<T>(decoded)
+            .map(Some)
+            .map_err(|_| ZeppelinError::Cache(format!("decoded cache type mismatch for key {key}")))
+    }
+
+    /// Insert a decoded immutable metadata entry keyed by its authoritative S3 key.
+    pub fn insert_decoded<T>(&self, key: &str, decoded: Arc<T>)
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.decoded.insert(key.to_string(), decoded);
+    }
+
+    /// Whether a decoded metadata entry exists for `key`.
+    #[must_use]
+    pub fn has_decoded(&self, key: &str) -> bool {
+        self.decoded.contains_key(key)
+    }
+
     /// Pin a key so it won't be evicted.
     pub async fn pin(&self, key: &str) {
         let mut pinned = self.pinned.write().await;
         pinned.insert(key.to_string());
+        if let Some(ref mem) = self.memory {
+            mem.pin(key);
+        }
         debug!(key = key, "pinned cache key");
     }
 
@@ -294,6 +330,10 @@ impl DiskCache {
     pub async fn unpin(&self, key: &str) {
         let mut pinned = self.pinned.write().await;
         pinned.remove(key);
+        self.decoded.remove(key);
+        if let Some(ref mem) = self.memory {
+            mem.unpin(key);
+        }
     }
 
     /// Pin `key` under `scope`, unpinning the scope's previously pinned key.
@@ -307,6 +347,9 @@ impl DiskCache {
         // plus a shared-lock membership check on the hot query path.
         if let Some(current) = self.scoped_pins.get(scope) {
             if current.value() == key && self.pinned.read().await.contains(key) {
+                if let Some(ref mem) = self.memory {
+                    mem.pin(key);
+                }
                 return;
             }
         }
@@ -316,10 +359,17 @@ impl DiskCache {
         if let Some(old_key) = old {
             if old_key != key {
                 pinned.remove(&old_key);
+                self.decoded.remove(&old_key);
+                if let Some(ref mem) = self.memory {
+                    mem.unpin(&old_key);
+                }
                 debug!(scope = scope, key = %old_key, "unpinned rotated cache key");
             }
         }
         pinned.insert(key.to_string());
+        if let Some(ref mem) = self.memory {
+            mem.pin(key);
+        }
         debug!(scope = scope, key = key, "pinned cache key for scope");
     }
 
@@ -330,6 +380,10 @@ impl DiskCache {
         };
         let mut pinned = self.pinned.write().await;
         pinned.remove(&old_key);
+        self.decoded.remove(&old_key);
+        if let Some(ref mem) = self.memory {
+            mem.unpin(&old_key);
+        }
         debug!(scope = scope, key = %old_key, "unpinned scoped cache key");
     }
 
@@ -345,6 +399,7 @@ impl DiskCache {
         if let Some(ref mem) = self.memory {
             mem.invalidate(key);
         }
+        self.decoded.remove(key);
 
         if let Some((_, entry)) = self.entries.remove(key) {
             self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
@@ -367,6 +422,15 @@ impl DiskCache {
         // Invalidate memory tier
         if let Some(ref mem) = self.memory {
             mem.invalidate_prefix(prefix);
+        }
+        let decoded_keys: Vec<String> = self
+            .decoded
+            .iter()
+            .filter(|r| r.key().starts_with(prefix))
+            .map(|r| r.key().clone())
+            .collect();
+        for key in decoded_keys {
+            self.decoded.remove(&key);
         }
 
         // Collect matching keys first to avoid holding DashMap shards during I/O.
@@ -462,6 +526,7 @@ impl DiskCache {
 /// Eviction is approximate LRU via DashMap iteration when over capacity.
 pub struct MemoryCache {
     entries: DashMap<String, MemCacheEntry>,
+    pinned: DashMap<String, ()>,
     max_size_bytes: u64,
     total_size: AtomicU64,
 }
@@ -477,6 +542,7 @@ impl MemoryCache {
     pub fn new(max_size_bytes: u64) -> Self {
         Self {
             entries: DashMap::new(),
+            pinned: DashMap::new(),
             max_size_bytes,
             total_size: AtomicU64::new(0),
         }
@@ -510,11 +576,28 @@ impl MemoryCache {
         self.evict_if_needed();
     }
 
+    /// Pin a key so the memory tier does not evict it.
+    pub fn pin(&self, key: &str) {
+        self.pinned.insert(key.to_string(), ());
+    }
+
+    /// Unpin a key so it can be evicted normally.
+    pub fn unpin(&self, key: &str) {
+        self.pinned.remove(key);
+    }
+
+    /// Whether a key is pinned in the memory tier.
+    #[must_use]
+    pub fn is_pinned(&self, key: &str) -> bool {
+        self.pinned.contains_key(key)
+    }
+
     /// Invalidate a single key.
     pub fn invalidate(&self, key: &str) {
         if let Some((_, entry)) = self.entries.remove(key) {
             self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
         }
+        self.pinned.remove(key);
     }
 
     /// Invalidate all keys that start with the given prefix.
@@ -530,6 +613,7 @@ impl MemoryCache {
             if let Some((_, entry)) = self.entries.remove(&key) {
                 self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
             }
+            self.pinned.remove(&key);
         }
     }
 
@@ -544,6 +628,7 @@ impl MemoryCache {
             let victim = self
                 .entries
                 .iter()
+                .filter(|r| !self.pinned.contains_key(r.key()))
                 .take(EVICTION_SAMPLE_SIZE)
                 .min_by_key(|r| r.value().last_accessed)
                 .map(|r| r.key().clone());
@@ -623,10 +708,42 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_cache_pin_survives_eviction() {
+        let cache = MemoryCache::new(10);
+        cache.insert("metadata", Bytes::from_static(b"aaaaa"));
+        cache.pin("metadata");
+        cache.insert("k2", Bytes::from_static(b"bbbbb"));
+        cache.insert("k3", Bytes::from_static(b"ccccc"));
+
+        assert!(cache.get("metadata").is_some());
+        assert!(cache.is_pinned("metadata"));
+    }
+
+    #[test]
     fn test_memory_cache_total_size() {
         let cache = MemoryCache::new(1024 * 1024);
         cache.insert("k1", Bytes::from_static(b"abc"));
         cache.insert("k2", Bytes::from_static(b"defgh"));
         assert_eq!(cache.total_size(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_decoded_cache_type_checked_and_invalidated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new_with_max_bytes(dir.path().to_path_buf(), 1024).unwrap();
+        cache.insert_decoded("immutable.bin", Arc::new(String::from("decoded")));
+
+        let decoded = cache
+            .get_decoded::<String>("immutable.bin")
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.as_str(), "decoded");
+        assert!(cache.get_decoded::<u64>("immutable.bin").is_err());
+
+        cache.invalidate("immutable.bin").await.unwrap();
+        assert!(cache
+            .get_decoded::<String>("immutable.bin")
+            .unwrap()
+            .is_none());
     }
 }

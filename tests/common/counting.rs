@@ -6,7 +6,7 @@
 //!
 //! F1/H12: in addition to per-key counts, every GET and PUT is attributed to
 //! an [`ArtifactClass`] bucket
-//! (cluster_/attrs_/sq_/bitmap_/coarse_sketch/fts/wal/manifest) with BOTH
+//! (cluster_/attrs_/bootstrap/sq_/bitmap_/coarse_sketch/fts/wal/manifest) with BOTH
 //! operation counts and byte counts per bucket. GET bytes are the actual
 //! returned payload size (`GetResult::range`), PUT bytes the actual request
 //! body size (`PutPayload::content_length`).
@@ -37,6 +37,8 @@ pub enum ArtifactClass {
     Attrs,
     /// `{ns}/segments/{seg}/centroids.bin` — IVF centroid blob.
     Centroids,
+    /// `{ns}/segments/{seg}/bootstrap.bin` — immutable centroids + sketch blob.
+    Bootstrap,
     /// Quantization sidecars: `sq_calibration.bin`, `sq_cluster_{i}.bin`,
     /// `pq_codebook.bin`, `pq_cluster_{i}.bin`.
     Sq,
@@ -56,10 +58,11 @@ pub enum ArtifactClass {
 }
 
 /// All classes, in display/index order. Index MUST match `as usize`.
-pub const ALL_CLASSES: [ArtifactClass; 10] = [
+pub const ALL_CLASSES: [ArtifactClass; 11] = [
     ArtifactClass::Cluster,
     ArtifactClass::Attrs,
     ArtifactClass::Centroids,
+    ArtifactClass::Bootstrap,
     ArtifactClass::Sq,
     ArtifactClass::Bitmap,
     ArtifactClass::Sketch,
@@ -83,6 +86,7 @@ impl ArtifactClass {
             ArtifactClass::Cluster => "cluster",
             ArtifactClass::Attrs => "attrs",
             ArtifactClass::Centroids => "centroids",
+            ArtifactClass::Bootstrap => "bootstrap",
             ArtifactClass::Sq => "sq",
             ArtifactClass::Bitmap => "bitmap",
             ArtifactClass::Sketch => "sketch",
@@ -103,7 +107,7 @@ impl fmt::Display for ArtifactClass {
 /// Map an S3 key to its artifact class, based on the real key builders:
 ///
 /// - `src/index/ivf_flat/build.rs`: `cluster_{i}.bin`, `attrs_{i}.bin`,
-///   `centroids.bin`
+///   `centroids.bin`, `bootstrap.bin`
 /// - `src/index/quantization/sq.rs`: `sq_calibration.bin`, `sq_cluster_{i}.bin`
 /// - `src/index/quantization/pq.rs`: `pq_codebook.bin`, `pq_cluster_{i}.bin`
 /// - `src/index/bitmap/mod.rs`: `bitmap_{i}.bin`
@@ -121,6 +125,8 @@ pub fn classify(key: &str) -> ArtifactClass {
         ArtifactClass::Attrs
     } else if filename == "centroids.bin" {
         ArtifactClass::Centroids
+    } else if filename == "bootstrap.bin" {
+        ArtifactClass::Bootstrap
     } else if filename.starts_with("sq_") || filename.starts_with("pq_") {
         ArtifactClass::Sq
     } else if filename.starts_with("bitmap_") {
