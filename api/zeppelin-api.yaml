@@ -634,7 +634,7 @@ components:
 
     SearchResult:
       type: object
-      required: [id, score]
+      required: [id, score, attributes]
       properties:
         id:
           type: string
@@ -645,8 +645,10 @@ components:
           description: Distance (vector search, lower is better) or BM25 relevance score (higher is better)
         attributes:
           type: object
+          nullable: true
           additionalProperties:
             $ref: "#/components/schemas/AttributeValue"
+          description: Result attributes, or null when include_attributes is false.
 
     CreateNamespaceRequest:
       type: object
@@ -757,6 +759,13 @@ components:
           minimum: 1
           maximum: 128
           description: Number of IVF clusters to probe (vector search only)
+        include_attributes:
+          type: boolean
+          default: true
+          description: |
+            When false, result `attributes` are returned as null. Unfiltered
+            ANN queries skip final attribute enrichment, and unfiltered BM25
+            segment queries skip attribute-object reads.
 
     QueryResponse:
       type: object

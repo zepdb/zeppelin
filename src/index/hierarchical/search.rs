@@ -67,6 +67,7 @@ pub async fn search_hierarchical(
     store: &ZeppelinStore,
     oversample_factor: usize,
     cache: Option<&Arc<DiskCache>>,
+    include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
     if query.len() != index.meta.dim {
         return Err(ZeppelinError::DimensionMismatch {
@@ -128,7 +129,17 @@ pub async fn search_hierarchical(
             cache,
         )
         .await?;
-        return finalize_candidates(ns, seg, candidates, top_k, filter, store, cache).await;
+        return finalize_candidates(
+            ns,
+            seg,
+            candidates,
+            top_k,
+            filter,
+            store,
+            cache,
+            include_attributes,
+        )
+        .await;
     }
 
     // Partition root beam into leaf clusters vs internal nodes.
@@ -173,7 +184,17 @@ pub async fn search_hierarchical(
 
     if current_ids.is_empty() {
         // All root beam entries were leaf clusters — return results.
-        return finalize_candidates(ns, seg, accumulated, top_k, filter, store, cache).await;
+        return finalize_candidates(
+            ns,
+            seg,
+            accumulated,
+            top_k,
+            filter,
+            store,
+            cache,
+            include_attributes,
+        )
+        .await;
     }
 
     loop {
@@ -243,7 +264,17 @@ pub async fn search_hierarchical(
 
         if internal_ids.is_empty() {
             // No more internal nodes to descend — return merged results.
-            return finalize_candidates(ns, seg, accumulated, top_k, filter, store, cache).await;
+            return finalize_candidates(
+                ns,
+                seg,
+                accumulated,
+                top_k,
+                filter,
+                store,
+                cache,
+                include_attributes,
+            )
+            .await;
         }
 
         current_ids = internal_ids;
@@ -738,6 +769,7 @@ async fn scan_clusters_pq(
     Ok(candidates)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_candidates(
     namespace: &str,
     segment_id: &str,
@@ -746,6 +778,7 @@ async fn finalize_candidates(
     filter: Option<&Filter>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
+    include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
     candidates.sort_by(|a, b| {
         a.score
@@ -760,12 +793,27 @@ async fn finalize_candidates(
             .map(|candidate| SearchResult {
                 id: candidate.id,
                 score: candidate.score,
-                attributes: candidate.attributes,
+                attributes: if include_attributes {
+                    candidate.attributes
+                } else {
+                    None
+                },
             })
             .collect());
     }
 
-    enrich_unfiltered_results(namespace, segment_id, candidates, store, cache).await
+    if include_attributes {
+        enrich_unfiltered_results(namespace, segment_id, candidates, store, cache).await
+    } else {
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| SearchResult {
+                id: candidate.id,
+                score: candidate.score,
+                attributes: None,
+            })
+            .collect())
+    }
 }
 
 async fn enrich_unfiltered_results(

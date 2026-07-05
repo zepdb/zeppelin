@@ -144,6 +144,7 @@ async fn test_query_class_breakdown_is_sane() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();

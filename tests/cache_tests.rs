@@ -624,6 +624,7 @@ async fn test_concurrent_cold_index_searches_share_one_cluster_get() {
                 &store,
                 1,
                 Some(&cache),
+                true,
                 DEFAULT_RERANK_COALESCE_GAP_BYTES,
             )
             .await

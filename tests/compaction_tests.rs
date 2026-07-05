@@ -235,6 +235,7 @@ async fn test_compact_deduplication() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -483,6 +484,7 @@ async fn test_query_after_compaction() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -509,6 +511,7 @@ async fn test_query_after_compaction() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -528,6 +531,7 @@ async fn test_query_after_compaction() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -582,6 +586,7 @@ async fn test_delete_after_compaction_not_returned_strong() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -610,6 +615,7 @@ async fn test_delete_after_compaction_not_returned_strong() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -637,6 +643,7 @@ async fn test_delete_after_compaction_not_returned_strong() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -925,6 +932,7 @@ fn segment_query_params<'a>(
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache,
         manifest_cache: None,
+        include_attributes: true,
     }
 }
 
@@ -1216,12 +1224,18 @@ async fn test_pinned_centroids_survive_eviction_pressure() {
 async fn test_compaction_warms_new_segment_centroids() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
+    let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
+    for meta in namespace_manager.list(None).await.unwrap() {
+        if meta.name.ends_with("-warm") {
+            namespace_manager.delete(&meta.name).await.unwrap();
+        }
+    }
+
     // Top-level namespace (no '/') so NamespaceManager can register it and
     // the compaction loop discovers it. Cleaned up manually below.
     let ns = format!("{}-warm", harness.prefix);
     let writer = WalWriter::new(store.clone());
 
-    let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
     namespace_manager
         .create(&ns, 16, DistanceMetric::Euclidean)
         .await
@@ -1287,7 +1301,9 @@ async fn test_compaction_warms_new_segment_centroids() {
     let mut warmed_key: Option<String> = None;
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+        let Some(manifest) = Manifest::read(&store, &ns).await.unwrap() else {
+            continue;
+        };
         if let Some(seg_id) = &manifest.active_segment {
             let ckey = centroids_key(&ns, seg_id);
             if cache.get(&ckey).await.is_some() {
@@ -1494,6 +1510,7 @@ async fn test_compact_attributes_preserved() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();

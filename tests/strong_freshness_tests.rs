@@ -74,6 +74,7 @@ async fn compact_baseline_and_cache_manifest(
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: Some(manifest_cache),
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -120,6 +121,7 @@ async fn query_for_fresh_vector(
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: Some(manifest_cache),
+        include_attributes: true,
     })
     .await
     .unwrap()

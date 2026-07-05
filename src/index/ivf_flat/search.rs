@@ -339,6 +339,7 @@ fn emit_scan_stats(effective_nprobe: usize, objects: usize, clusters: usize, gro
 /// * `store`    - S3 store for reading cluster data.
 /// * `oversample_factor` - Oversampling multiplier when filters are active.
 /// * `cache`    - Optional disk cache for cluster data.
+/// * `include_attributes` - Whether result attributes should be returned.
 /// * `rerank_coalesce_gap_bytes` - Max gap between rerank vector ranges to coalesce.
 #[allow(clippy::too_many_arguments)]
 pub async fn search_ivf_flat(
@@ -351,6 +352,7 @@ pub async fn search_ivf_flat(
     store: &ZeppelinStore,
     oversample_factor: usize,
     cache: Option<&Arc<DiskCache>>,
+    include_attributes: bool,
     rerank_coalesce_gap_bytes: usize,
 ) -> Result<Vec<SearchResult>> {
     // Validate query dimension.
@@ -486,19 +488,34 @@ pub async fn search_ivf_flat(
             .map(|c| SearchResult {
                 id: c.id,
                 score: c.score,
-                attributes: c.attributes,
+                attributes: if include_attributes {
+                    c.attributes
+                } else {
+                    None
+                },
             })
             .collect()
     } else {
         let top_candidates: Vec<Candidate> = sorted.into_iter().take(top_k).collect();
-        enrich_unfiltered_results(
-            index,
-            top_candidates,
-            store,
-            cache,
-            sq_byte_stats.as_deref(),
-        )
-        .await?
+        if include_attributes {
+            enrich_unfiltered_results(
+                index,
+                top_candidates,
+                store,
+                cache,
+                sq_byte_stats.as_deref(),
+            )
+            .await?
+        } else {
+            top_candidates
+                .into_iter()
+                .map(|candidate| SearchResult {
+                    id: candidate.id,
+                    score: candidate.score,
+                    attributes: None,
+                })
+                .collect()
+        }
     };
 
     debug!(returned = results.len(), top_k = top_k, "search complete");
@@ -2171,6 +2188,7 @@ mod tests {
             &store,
             3,
             None,
+            true,
             crate::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         ));
         assert!(result.is_err());
@@ -2205,6 +2223,7 @@ mod tests {
                 &store,
                 3,
                 None,
+                true,
                 crate::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
             ))
             .unwrap();

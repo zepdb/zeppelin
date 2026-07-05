@@ -19,7 +19,7 @@ use crate::index::filter::evaluate_filter;
 use crate::index::HierarchicalIndex;
 use crate::index::IvfFlatIndex;
 use crate::storage::ZeppelinStore;
-use crate::types::{ConsistencyLevel, DistanceMetric, Filter, SearchResult};
+use crate::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 use crate::wal::WalReader;
@@ -65,6 +65,8 @@ pub struct QueryParams<'a> {
     pub cache: Option<&'a Arc<DiskCache>>,
     /// Optional manifest cache to avoid redundant S3 reads.
     pub manifest_cache: Option<&'a Arc<ManifestCache>>,
+    /// Whether attributes should be included in returned results.
+    pub include_attributes: bool,
 }
 
 async fn read_manifest_for_query(
@@ -99,6 +101,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         rerank_coalesce_gap_bytes,
         cache,
         manifest_cache,
+        include_attributes,
     } = params;
     let manifest = read_manifest_for_query(store, namespace, consistency, manifest_cache).await?;
 
@@ -119,6 +122,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
                     filter,
                     distance_metric,
                     cache,
+                    include_attributes,
                 )
                 .await?
             }
@@ -173,6 +177,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
                 oversample_factor,
                 rerank_coalesce_gap_bytes,
                 cache,
+                include_attributes,
             )
             .await?;
             (results, 1)
@@ -233,6 +238,7 @@ struct WalScanResult {
 
 /// Scan all uncompacted WAL fragments, deduplicate, apply deletes, score, and filter.
 /// Reads fragments from the provided manifest snapshot (not re-reading manifest from S3).
+#[allow(clippy::too_many_arguments)]
 async fn wal_scan(
     wal_reader: &WalReader,
     namespace: &str,
@@ -241,6 +247,7 @@ async fn wal_scan(
     filter: Option<&Filter>,
     distance_metric: DistanceMetric,
     cache: Option<&Arc<DiskCache>>,
+    include_attributes: bool,
 ) -> Result<WalScanResult> {
     let refs = manifest.uncompacted_fragments().to_vec();
     // Skip checksum validation on query reads — fragments were already
@@ -301,7 +308,7 @@ async fn wal_scan(
             SearchResult {
                 id,
                 score,
-                attributes,
+                attributes: if include_attributes { attributes } else { None },
             }
         })
         .collect();
@@ -343,6 +350,7 @@ async fn segment_search(
     oversample_factor: usize,
     rerank_coalesce_gap_bytes: usize,
     cache: Option<&Arc<DiskCache>>,
+    include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
     let segment_id = &segment_ref.id;
 
@@ -361,6 +369,7 @@ async fn segment_search(
             store,
             oversample_factor,
             cache,
+            include_attributes,
         )
         .await?;
         return Ok(results);
@@ -392,6 +401,7 @@ async fn segment_search(
         store,
         oversample_factor,
         cache,
+        include_attributes,
         rerank_coalesce_gap_bytes,
     )
     .await?;
@@ -430,6 +440,7 @@ pub async fn execute_bm25_query(
     fts_cache: Option<&Arc<WalFtsCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
+    include_attributes: bool,
 ) -> Result<QueryResponse> {
     let manifest = read_manifest_for_query(store, namespace, consistency, manifest_cache).await?;
 
@@ -476,6 +487,11 @@ pub async fn execute_bm25_query(
                         None => false,
                     });
                 }
+                if !include_attributes {
+                    for result in &mut results {
+                        result.attributes = None;
+                    }
+                }
                 results
             }
             ConsistencyLevel::Eventual if !manifest.uncompacted_fragments().is_empty() => {
@@ -518,6 +534,7 @@ pub async fn execute_bm25_query(
                     filter,
                     last_as_prefix,
                     max_full_scan_clusters,
+                    include_attributes,
                 )
                 .await?;
                 (results, 1)
@@ -538,13 +555,18 @@ pub async fn execute_bm25_query(
 
     // Merge results — BM25 is higher-is-better
     // Pass deleted IDs so segment results for deleted docs are excluded
-    let results = merge_bm25_results(
+    let mut results = merge_bm25_results(
         wal_results,
         segment_results,
         top_k,
         consistency,
         &wal_deleted_ids,
     );
+    if !include_attributes {
+        for result in &mut results {
+            result.attributes = None;
+        }
+    }
 
     Ok(QueryResponse {
         results,
@@ -570,6 +592,7 @@ async fn segment_bm25_search(
     filter: Option<&Filter>,
     last_as_prefix: bool,
     max_full_scan_clusters: usize,
+    include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
     if segment_ref.has_global_fts {
         return segment_bm25_search_global(
@@ -580,6 +603,7 @@ async fn segment_bm25_search(
             fts_configs,
             filter,
             last_as_prefix,
+            include_attributes,
         )
         .await;
     }
@@ -606,6 +630,7 @@ async fn segment_bm25_search(
         fts_configs,
         filter,
         last_as_prefix,
+        include_attributes,
     )
     .await
 }
@@ -620,13 +645,11 @@ async fn segment_bm25_search_global(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
     use crate::fts::bm25::Bm25Params;
     use crate::fts::global_index::{global_fts_key, GlobalInvertedIndex};
     use crate::fts::rank_by::evaluate_rank_by;
-    use crate::index::ivf_flat::build::{
-        attrs_key, cluster_key, deserialize_attrs, deserialize_cluster,
-    };
 
     let segment_id = &segment_ref.id;
 
@@ -673,41 +696,15 @@ async fn segment_bm25_search_global(
     // Identify which clusters we need to fetch attrs from
     let needed_clusters: HashSet<u16> = position_field_scores.keys().map(|(c, _)| *c).collect();
 
-    // Parallel fetch attrs only for matching clusters. Per-cluster keys route
-    // through cluster_owner(): a carried-over cluster's objects live under an
-    // older segment's ID (incremental compaction).
-    let cluster_attrs_results =
-        futures::future::join_all(needed_clusters.iter().map(|&cluster_idx| {
-            let owner = segment_ref.cluster_owner(cluster_idx as usize);
-            let akey = attrs_key(namespace, owner, cluster_idx as usize);
-            let ckey = cluster_key(namespace, owner, cluster_idx as usize);
-            async move {
-                let (attrs_res, cluster_res) = tokio::join!(store.get(&akey), store.get(&ckey));
-                (cluster_idx, attrs_res, cluster_res)
-            }
-        }))
-        .await;
-
-    // Build lookup: cluster_idx -> (attrs, cluster)
-    #[allow(clippy::type_complexity)]
-    let mut cluster_data: HashMap<
-        u16,
-        (
-            Vec<Option<HashMap<String, crate::types::AttributeValue>>>,
-            Vec<String>,
-        ),
-    > = HashMap::new();
-    for (cluster_idx, attrs_res, cluster_res) in cluster_attrs_results {
-        let attrs = match attrs_res {
-            Ok(data) => deserialize_attrs(&data)?,
-            Err(_) => continue,
-        };
-        let cluster = match cluster_res {
-            Ok(data) => deserialize_cluster(&data)?,
-            Err(_) => continue,
-        };
-        cluster_data.insert(cluster_idx, (attrs, cluster.ids));
-    }
+    let load_attrs = filter.is_some() || include_attributes;
+    let cluster_data = fetch_bm25_cluster_attrs_and_ids(
+        store,
+        namespace,
+        segment_ref,
+        &needed_clusters,
+        load_attrs,
+    )
+    .await?;
 
     // Collect results
     let mut all_results: HashMap<
@@ -732,7 +729,11 @@ async fn segment_bm25_search_global(
         }
 
         let id = ids[pos].clone();
-        let attr = attrs.get(pos).cloned().flatten();
+        let attr = attrs
+            .as_ref()
+            .and_then(|cluster_attrs| cluster_attrs.get(pos))
+            .cloned()
+            .flatten();
 
         // Apply post-filter
         if let Some(f) = filter {
@@ -746,9 +747,13 @@ async fn segment_bm25_search_global(
             }
         }
 
-        let entry = all_results.entry(id).or_insert((0.0, attr));
+        let response_attr = if include_attributes { attr } else { None };
+        let entry = all_results
+            .entry(id)
+            .or_insert((0.0, response_attr.clone()));
         if final_score > entry.0 {
             entry.0 = final_score;
+            entry.1 = response_attr;
         }
     }
 
@@ -770,6 +775,140 @@ async fn segment_bm25_search_global(
     Ok(results)
 }
 
+#[allow(clippy::type_complexity)]
+async fn fetch_bm25_cluster_attrs_and_ids(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_ref: &SegmentRef,
+    needed_clusters: &HashSet<u16>,
+    load_attrs: bool,
+) -> Result<
+    HashMap<
+        u16,
+        (
+            Option<Vec<Option<HashMap<String, AttributeValue>>>>,
+            Vec<String>,
+        ),
+    >,
+> {
+    use crate::index::ivf_flat::build::{
+        attrs_key, cluster_key, cluster_object_sections, deserialize_attrs, deserialize_cluster,
+        deserialize_cluster_from_object,
+    };
+
+    if segment_ref.cluster_objects.is_empty() {
+        let cluster_attrs_results =
+            futures::future::join_all(needed_clusters.iter().map(|&cluster_idx| {
+                let owner = segment_ref.cluster_owner(cluster_idx as usize);
+                let akey = attrs_key(namespace, owner, cluster_idx as usize);
+                let ckey = cluster_key(namespace, owner, cluster_idx as usize);
+                async move {
+                    if load_attrs {
+                        let (attrs_res, cluster_res) =
+                            tokio::join!(store.get(&akey), store.get(&ckey));
+                        (cluster_idx, Some(attrs_res), cluster_res)
+                    } else {
+                        (cluster_idx, None, store.get(&ckey).await)
+                    }
+                }
+            }))
+            .await;
+
+        let mut cluster_data = HashMap::new();
+        for (cluster_idx, attrs_res, cluster_res) in cluster_attrs_results {
+            let attrs = match attrs_res {
+                Some(Ok(data)) => Some(deserialize_attrs(&data)?),
+                Some(Err(_)) => continue,
+                None => None,
+            };
+            let cluster = match cluster_res {
+                Ok(data) => deserialize_cluster(&data)?,
+                Err(_) => continue,
+            };
+            cluster_data.insert(cluster_idx, (attrs, cluster.ids));
+        }
+        return Ok(cluster_data);
+    }
+
+    let mut attrs_by_cluster = HashMap::new();
+    if load_attrs {
+        let attrs_results = futures::future::join_all(needed_clusters.iter().map(|&cluster_idx| {
+            let owner = segment_ref.cluster_owner(cluster_idx as usize);
+            let akey = attrs_key(namespace, owner, cluster_idx as usize);
+            async move { (cluster_idx, store.get(&akey).await) }
+        }))
+        .await;
+        for (cluster_idx, attrs_res) in attrs_results {
+            let attrs = match attrs_res {
+                Ok(data) => deserialize_attrs(&data)?,
+                Err(_) => continue,
+            };
+            attrs_by_cluster.insert(cluster_idx, attrs);
+        }
+    }
+
+    let object_fetches = segment_ref.cluster_objects.iter().filter_map(|object_ref| {
+        let clusters: Vec<u16> = object_ref
+            .clusters
+            .iter()
+            .copied()
+            .filter_map(|cluster_idx| {
+                u16::try_from(cluster_idx)
+                    .ok()
+                    .filter(|idx| needed_clusters.contains(idx))
+            })
+            .collect();
+        (!clusters.is_empty()).then_some((object_ref.key.as_str(), clusters))
+    });
+
+    let object_results = futures::future::join_all(
+        object_fetches.map(|(key, clusters)| async move { (clusters, store.get(key).await) }),
+    )
+    .await;
+
+    let mut cluster_data = HashMap::new();
+    for (clusters, object_res) in object_results {
+        let object_data = match object_res {
+            Ok(data) => data,
+            Err(_) => continue,
+        };
+        if cluster_object_sections(&object_data)?.is_some() {
+            for cluster_idx in clusters {
+                let attrs = if load_attrs {
+                    let Some(attrs) = attrs_by_cluster.remove(&cluster_idx) else {
+                        continue;
+                    };
+                    Some(attrs)
+                } else {
+                    None
+                };
+                let cluster = deserialize_cluster_from_object(&object_data, cluster_idx as usize)?;
+                cluster_data.insert(cluster_idx, (attrs, cluster.ids));
+            }
+        } else {
+            if clusters.len() != 1 {
+                return Err(crate::error::ZeppelinError::Index(format!(
+                    "legacy cluster object must reference exactly one cluster, got {}",
+                    clusters.len()
+                )));
+            }
+            let cluster_idx = clusters[0];
+            let attrs = if load_attrs {
+                let Some(attrs) = attrs_by_cluster.remove(&cluster_idx) else {
+                    continue;
+                };
+                Some(attrs)
+            } else {
+                None
+            };
+            let cluster = deserialize_cluster(&object_data)?;
+            cluster_data.insert(cluster_idx, (attrs, cluster.ids));
+        }
+    }
+
+    Ok(cluster_data)
+}
+
 /// BM25 search using full per-cluster scan (backward compat fallback).
 ///
 /// At 1M scale this is O(N × clusters) and can take 15+ seconds.
@@ -784,6 +923,7 @@ async fn segment_bm25_search_full_scan(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
     use crate::index::ivf_flat::build::{attrs_key, deserialize_attrs};
 
@@ -808,10 +948,9 @@ async fn segment_bm25_search_full_scan(
     let num_clusters = index.num_clusters();
 
     let field_queries = rank_by.extract_field_queries();
-    let mut all_results: HashMap<
-        String,
-        (f32, Option<HashMap<String, crate::types::AttributeValue>>),
-    > = HashMap::new();
+    let load_attrs = filter.is_some() || include_attributes;
+    let mut all_results: HashMap<String, (f32, Option<HashMap<String, AttributeValue>>)> =
+        HashMap::new();
 
     // Parallel prefetch all cluster data (fts index, attrs, cluster vectors).
     let prefetched = futures::future::join_all((0..num_clusters).map(|cluster_idx| {
@@ -822,9 +961,14 @@ async fn segment_bm25_search_full_scan(
         let akey = attrs_key(namespace, owner, cluster_idx);
         let ckey = crate::index::ivf_flat::build::cluster_key(namespace, owner, cluster_idx);
         async move {
-            let (fts_res, attrs_res, cluster_res) =
-                tokio::join!(store.get(&fts_key), store.get(&akey), store.get(&ckey),);
-            (cluster_idx, fts_res, attrs_res, cluster_res)
+            if load_attrs {
+                let (fts_res, attrs_res, cluster_res) =
+                    tokio::join!(store.get(&fts_key), store.get(&akey), store.get(&ckey),);
+                (cluster_idx, fts_res, Some(attrs_res), cluster_res)
+            } else {
+                let (fts_res, cluster_res) = tokio::join!(store.get(&fts_key), store.get(&ckey),);
+                (cluster_idx, fts_res, None, cluster_res)
+            }
         }
     }))
     .await;
@@ -839,11 +983,11 @@ async fn segment_bm25_search_full_scan(
 
         let inv_index = InvertedIndex::from_bytes(&fts_data)?;
 
-        let attrs_data = match attrs_res {
-            Ok(data) => data,
-            Err(_) => continue,
+        let cluster_attrs = match attrs_res {
+            Some(Ok(data)) => Some(deserialize_attrs(&data)?),
+            Some(Err(_)) => continue,
+            None => None,
         };
-        let cluster_attrs = deserialize_attrs(&attrs_data)?;
 
         let cluster_data = match cluster_res {
             Ok(data) => data,
@@ -895,7 +1039,11 @@ async fn segment_bm25_search_full_scan(
             }
 
             let id = cluster.ids[pos_usize].clone();
-            let attrs = cluster_attrs.get(pos_usize).cloned().flatten();
+            let attrs = cluster_attrs
+                .as_ref()
+                .and_then(|cluster_attrs| cluster_attrs.get(pos_usize))
+                .cloned()
+                .flatten();
 
             // Apply post-filter
             if let Some(f) = filter {
@@ -910,9 +1058,13 @@ async fn segment_bm25_search_full_scan(
             }
 
             // Accumulate: same ID might appear in multiple clusters (shouldn't, but be safe)
-            let entry = all_results.entry(id.clone()).or_insert((0.0, attrs));
+            let response_attrs = if include_attributes { attrs } else { None };
+            let entry = all_results
+                .entry(id.clone())
+                .or_insert((0.0, response_attrs.clone()));
             if final_score > entry.0 {
                 entry.0 = final_score;
+                entry.1 = response_attrs;
             }
         }
     }
@@ -1149,8 +1301,18 @@ mod tests {
         let fts_configs = HashMap::new();
         let seg = make_segment_ref(600, false);
 
-        let result =
-            segment_bm25_search(&store, "ns", &seg, &rank_by, &fts_configs, None, false, 500).await;
+        let result = segment_bm25_search(
+            &store,
+            "ns",
+            &seg,
+            &rank_by,
+            &fts_configs,
+            None,
+            false,
+            500,
+            true,
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1176,8 +1338,18 @@ mod tests {
 
         // Under limit: should attempt the scan (will fail with NotFound on the index,
         // not with a Validation error)
-        let result =
-            segment_bm25_search(&store, "ns", &seg, &rank_by, &fts_configs, None, false, 500).await;
+        let result = segment_bm25_search(
+            &store,
+            "ns",
+            &seg,
+            &rank_by,
+            &fts_configs,
+            None,
+            false,
+            500,
+            true,
+        )
+        .await;
 
         // Should NOT be a Validation error (it'll be NotFound or similar from missing data)
         match &result {
@@ -1200,8 +1372,18 @@ mod tests {
         let seg = make_segment_ref(9999, false);
 
         // Limit=0 means disabled — should not reject
-        let result =
-            segment_bm25_search(&store, "ns", &seg, &rank_by, &fts_configs, None, false, 0).await;
+        let result = segment_bm25_search(
+            &store,
+            "ns",
+            &seg,
+            &rank_by,
+            &fts_configs,
+            None,
+            false,
+            0,
+            true,
+        )
+        .await;
 
         match &result {
             Err(crate::error::ZeppelinError::Validation(_)) => {

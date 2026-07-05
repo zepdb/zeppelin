@@ -1160,6 +1160,7 @@ async fn evaluate_modes(
                 rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
                 cache: None,
                 manifest_cache: None,
+                include_attributes: true,
             })
             .await?;
 

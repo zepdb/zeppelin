@@ -275,6 +275,7 @@ async fn strong_query_ids(
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -430,6 +431,7 @@ async fn test_incremental_delete_forces_cluster_rewrite() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -600,6 +602,7 @@ async fn test_incremental_matches_full_rewrite_results() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -617,6 +620,7 @@ async fn test_incremental_matches_full_rewrite_results() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();

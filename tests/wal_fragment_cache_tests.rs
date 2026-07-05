@@ -49,6 +49,7 @@ async fn strong_query(
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: Some(cache),
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap()

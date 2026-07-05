@@ -341,6 +341,7 @@ async fn run_query(
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache,
         manifest_cache: Some(&fixture.manifest_cache),
+        include_attributes: true,
     })
     .await
     .unwrap()

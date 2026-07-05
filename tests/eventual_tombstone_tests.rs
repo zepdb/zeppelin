@@ -340,6 +340,7 @@ async fn test_eventual_query_gets_only_delete_fragments_not_vector_wal_fragments
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -375,6 +376,7 @@ async fn test_eventual_query_gets_only_delete_fragments_not_vector_wal_fragments
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -465,6 +467,7 @@ async fn test_eventual_tombstone_ordering_across_fragments() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -508,6 +511,7 @@ async fn test_eventual_tombstone_ordering_across_fragments() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();
@@ -577,6 +581,7 @@ async fn test_eventual_query_may_return_stale_updated_segment_vector() {
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: None,
+        include_attributes: true,
     })
     .await
     .unwrap();

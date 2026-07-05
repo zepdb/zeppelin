@@ -66,7 +66,7 @@ pub struct SearchResult {
     /// Similarity or distance score for this result.
     pub score: f32,
     /// Optional attributes returned with the result.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub attributes: Option<HashMap<String, AttributeValue>>,
 }
 
@@ -374,7 +374,7 @@ mod tests {
             attributes: None,
         };
         let json = serde_json::to_string(&result).unwrap();
-        assert!(!json.contains("attributes"));
+        assert!(json.contains("\"attributes\":null"));
         let back: SearchResult = serde_json::from_str(&json).unwrap();
         assert!(back.attributes.is_none());
     }

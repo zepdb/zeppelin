@@ -36,6 +36,9 @@ pub struct QueryRequest {
     /// Number of IVF clusters to probe (defaults to server config).
     #[serde(default)]
     pub nprobe: Option<usize>,
+    /// Whether result attributes should be included. Defaults to true.
+    #[serde(default)]
+    pub include_attributes: Option<bool>,
 }
 
 /// Query handler using direct serde_json deserialization (skips Axum's
@@ -59,6 +62,7 @@ pub async fn query_namespace(
     // BEFORE the query metrics increment so rejected requests aren't counted
     // as queries (I3).
     let top_k = req.top_k.unwrap_or(knobs.default_top_k);
+    let include_attributes = req.include_attributes.unwrap_or(true);
 
     // Exactly one of vector or rank_by must be provided.
     if req.vector.is_none() && req.rank_by.is_none() {
@@ -154,6 +158,7 @@ pub async fn query_namespace(
             Some(&state.fts_cache),
             Some(&state.cache),
             knobs.bm25_max_full_scan_clusters,
+            include_attributes,
         )
         .await
         .map_err(ApiError::from)?
@@ -195,6 +200,7 @@ pub async fn query_namespace(
             rerank_coalesce_gap_bytes: knobs.rerank_coalesce_gap_bytes,
             cache: Some(&state.cache),
             manifest_cache: Some(&state.manifest_cache),
+            include_attributes,
         })
         .await
         .map_err(ApiError::from)?

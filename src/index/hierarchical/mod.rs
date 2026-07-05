@@ -286,6 +286,7 @@ impl VectorIndex for HierarchicalIndex {
             store,
             oversample_factor,
             None,
+            true,
         )
         .await
     }

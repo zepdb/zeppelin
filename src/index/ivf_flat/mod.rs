@@ -208,6 +208,7 @@ impl VectorIndex for IvfFlatIndex {
             store,
             oversample_factor,
             None,
+            true,
             crate::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         )
         .await
