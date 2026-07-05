@@ -6,7 +6,8 @@
 //! inside the requested `nprobe` centroid set, selects a small cluster set,
 //! and the normal cluster reader performs exact rerank.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
 use bytes::Bytes;
 
@@ -212,9 +213,11 @@ impl ResidentSketch {
         distance_metric: DistanceMetric,
         probe_clusters: &[usize],
         budget: AdaptiveClusterBudget,
+        mass_top_k: usize,
     ) -> Result<Vec<usize>> {
         budget.validate()?;
-        let ranked_clusters = self.rank_clusters(query, distance_metric, probe_clusters)?;
+        let ranked_clusters =
+            self.rank_clusters(query, distance_metric, probe_clusters, mass_top_k)?;
         if budget.max_clusters >= probe_clusters.len() {
             return Ok(probe_clusters.to_vec());
         }
@@ -232,6 +235,7 @@ impl ResidentSketch {
         query: &[f32],
         distance_metric: DistanceMetric,
         probe_clusters: &[usize],
+        mass_top_k: usize,
     ) -> Result<Vec<ClusterScore>> {
         if query.len() != self.dim {
             return Err(ZeppelinError::DimensionMismatch {
@@ -242,6 +246,11 @@ impl ResidentSketch {
         if probe_clusters.is_empty() {
             return Err(ZeppelinError::Index(
                 "coarse sketch received an empty probe set".into(),
+            ));
+        }
+        if mass_top_k == 0 {
+            return Err(ZeppelinError::Index(
+                "coarse sketch mass top-k is zero".into(),
             ));
         }
         for &cluster_idx in probe_clusters {
@@ -261,6 +270,7 @@ impl ResidentSketch {
             .map(|(rank, cluster_idx)| (cluster_idx, rank))
             .collect();
         let mut ranked_clusters = Vec::new();
+        let mut top_rows = BinaryHeap::with_capacity(mass_top_k);
         for &cluster_idx in probe_clusters {
             let (start, end) = self.cluster_offsets[cluster_idx];
             if start == end {
@@ -273,17 +283,35 @@ impl ResidentSketch {
                 let codes = &self.codes[code_offset..code_offset + self.packed_code_bytes];
                 let score = self.adc_score(&adc_table, codes);
                 top_scores.insert(score);
+                insert_top_mass_row(
+                    &mut top_rows,
+                    mass_top_k,
+                    SketchRowScore { score, cluster_idx },
+                );
             }
             ranked_clusters.push(ClusterScore {
                 cluster_idx,
                 aggregate_score: top_scores.mean(),
+                mass_count: 0,
             });
         }
 
+        let mut mass_counts = vec![0usize; self.cluster_count];
+        for row in top_rows {
+            mass_counts[row.cluster_idx] += 1;
+        }
+        for score in &mut ranked_clusters {
+            score.mass_count = mass_counts[score.cluster_idx];
+        }
+
         ranked_clusters.sort_by(|a, b| {
-            a.aggregate_score
-                .partial_cmp(&b.aggregate_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.mass_count
+                .cmp(&a.mass_count)
+                .then_with(|| {
+                    a.aggregate_score
+                        .partial_cmp(&b.aggregate_score)
+                        .unwrap_or(Ordering::Equal)
+                })
                 .then_with(|| {
                     centroid_rank
                         .get(&a.cluster_idx)
@@ -521,6 +549,55 @@ pub(crate) fn build_resident_sketch(
 pub(crate) struct ClusterScore {
     pub(crate) cluster_idx: usize,
     pub(crate) aggregate_score: f32,
+    pub(crate) mass_count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SketchRowScore {
+    score: f32,
+    cluster_idx: usize,
+}
+
+impl PartialEq for SketchRowScore {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits() && self.cluster_idx == other.cluster_idx
+    }
+}
+
+impl Eq for SketchRowScore {}
+
+impl PartialOrd for SketchRowScore {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SketchRowScore {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.cluster_idx.cmp(&other.cluster_idx))
+    }
+}
+
+fn insert_top_mass_row(
+    top_rows: &mut BinaryHeap<SketchRowScore>,
+    mass_top_k: usize,
+    row: SketchRowScore,
+) {
+    if top_rows.len() < mass_top_k {
+        top_rows.push(row);
+        return;
+    }
+
+    let Some(&worst) = top_rows.peek() else {
+        top_rows.push(row);
+        return;
+    };
+    if row.score.total_cmp(&worst.score).is_lt() {
+        top_rows.pop();
+        top_rows.push(row);
+    }
 }
 
 struct TopSketchScores {
@@ -576,13 +653,25 @@ fn adaptive_cluster_count(
         return max_clusters;
     }
 
-    let best_score = ranked_clusters[0].aggregate_score;
-    let cutoff = best_score + best_score.abs() * budget.relative_score_margin;
+    let mass_cutoff =
+        mass_score_cutoff(ranked_clusters[0].mass_count, budget.relative_score_margin);
     let mut count = floor_clusters;
-    while count < max_clusters && ranked_clusters[count].aggregate_score <= cutoff {
+    while count < max_clusters && ranked_clusters[count].mass_count >= mass_cutoff {
         count += 1;
     }
     count
+}
+
+pub(crate) fn mass_score_cutoff(best_mass: usize, relative_margin: f32) -> usize {
+    if best_mass == 0 {
+        return 0;
+    }
+    if relative_margin >= 1.0 {
+        return 1;
+    }
+    ((best_mass as f32) * (1.0 - relative_margin))
+        .ceil()
+        .max(1.0) as usize
 }
 
 fn sample_indices(vector_count: usize, sample_count: usize) -> Vec<usize> {
@@ -818,13 +907,14 @@ mod tests {
                 DistanceMetric::Cosine,
                 &[0, 1],
                 fixed_budget(1),
+                1,
             )
             .unwrap();
         assert_eq!(selected.len(), 1);
     }
 
     #[test]
-    fn cluster_selection_uses_top_m_mean_not_single_best_row() {
+    fn cluster_selection_prefers_global_top_k_mass() {
         let mut codebook = Vec::with_capacity(SKETCH_K);
         for value in 0..SKETCH_K {
             codebook.push(value as f32);
@@ -851,7 +941,53 @@ mod tests {
         };
 
         let selected = sketch
-            .select_clusters(&[0.0], DistanceMetric::Euclidean, &[0, 1], fixed_budget(1))
+            .select_clusters(
+                &[0.0],
+                DistanceMetric::Euclidean,
+                &[0, 1],
+                fixed_budget(1),
+                4,
+            )
+            .unwrap();
+
+        assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn cluster_selection_ties_mass_by_top_m_mean() {
+        let mut codebook = Vec::with_capacity(SKETCH_K);
+        for value in 0..SKETCH_K {
+            codebook.push(value as f32);
+        }
+
+        let mut code_bytes = Vec::new();
+        for code in [0u8, 4, 1, 1] {
+            let mut packed = vec![0u8; 1];
+            pack_code(&mut packed, 0, code, SKETCH_CODE_WIDTH);
+            code_bytes.extend_from_slice(&packed);
+        }
+
+        let sketch = ResidentSketch {
+            dim: 1,
+            subquantizers: 1,
+            cluster_count: 2,
+            codebook,
+            codebook_size: SKETCH_K,
+            cluster_offsets: vec![(0, 2), (2, 4)],
+            codes: Bytes::from(code_bytes),
+            cluster_has_attrs: vec![false, false],
+            packed_code_bytes: 1,
+            code_width: SKETCH_CODE_WIDTH,
+        };
+
+        let selected = sketch
+            .select_clusters(
+                &[0.0],
+                DistanceMetric::Euclidean,
+                &[0, 1],
+                fixed_budget(1),
+                2,
+            )
             .unwrap();
 
         assert_eq!(selected, vec![1]);
@@ -872,6 +1008,7 @@ mod tests {
                 DistanceMetric::Euclidean,
                 &[0, 1, 2, 3, 4, 5],
                 AdaptiveClusterBudget::new(1, 5, 0.08),
+                3,
             )
             .unwrap();
 
@@ -883,6 +1020,7 @@ mod tests {
                 DistanceMetric::Euclidean,
                 &[0, 1, 2, 3, 4, 5],
                 AdaptiveClusterBudget::new(4, 5, 0.01),
+                4,
             )
             .unwrap();
         assert_eq!(floor_selected, vec![0, 1, 2, 3]);
@@ -898,6 +1036,7 @@ mod tests {
                 DistanceMetric::Euclidean,
                 &[0, 1, 2, 3],
                 AdaptiveClusterBudget::new(1, 2, 0.50),
+                4,
             )
             .unwrap();
 
@@ -915,6 +1054,7 @@ mod tests {
                 DistanceMetric::Euclidean,
                 &probe_clusters,
                 AdaptiveClusterBudget::new(4, 8, 0.01),
+                8,
             )
             .unwrap();
 
@@ -946,7 +1086,7 @@ mod tests {
         assert_eq!(sketch.packed_code_bytes, 1);
 
         let selected = sketch
-            .select_clusters(&[0.0], DistanceMetric::Euclidean, &[0], fixed_budget(1))
+            .select_clusters(&[0.0], DistanceMetric::Euclidean, &[0], fixed_budget(1), 1)
             .unwrap();
         assert_eq!(selected, vec![0]);
     }
