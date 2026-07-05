@@ -20,7 +20,7 @@ use crate::index::ivf_flat::build::{
 use crate::storage::ZeppelinStore;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
-use crate::wal::manifest::{ClusterDataObjectRef, Manifest, SegmentRef};
+use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef, Manifest, SegmentRef};
 use crate::wal::WalReader;
 
 /// Maximum CAS retry attempts for manifest updates.
@@ -507,6 +507,7 @@ impl Compactor {
             bitmap_fields,
             cluster_owners,
             sketch_ref,
+            bootstrap_ref,
             cluster_objects,
         ) = if !should_retrain && old_segment_id.is_some() && !self.indexing_config.hierarchical {
             // Incremental path: reuse existing centroids, just reassign vectors.
@@ -540,12 +541,20 @@ impl Compactor {
                 )
                 .await
             {
-                Ok((count, bf, owners, sketch_ref, cluster_objects)) => {
+                Ok((count, bf, owners, sketch_ref, bootstrap_ref, cluster_objects)) => {
                     info!(
                         new_from_wal,
                         existing_count, "incremental compaction: reusing centroids"
                     );
-                    (count, false, bf, owners, Some(sketch_ref), cluster_objects)
+                    (
+                        count,
+                        false,
+                        bf,
+                        owners,
+                        Some(sketch_ref),
+                        Some(bootstrap_ref),
+                        cluster_objects,
+                    )
                 }
                 Err(e) => {
                     warn!(error = %e, "incremental build failed, falling back to full retrain");
@@ -564,6 +573,7 @@ impl Compactor {
                         bf,
                         Vec::new(),
                         index.sketch_ref.clone(),
+                        index.bootstrap_ref.clone(),
                         index.cluster_objects.clone(),
                     )
                 }
@@ -584,6 +594,7 @@ impl Compactor {
                 bf,
                 Vec::new(),
                 None,
+                None,
                 Vec::new(),
             )
         } else {
@@ -602,6 +613,7 @@ impl Compactor {
                 bf,
                 Vec::new(),
                 index.sketch_ref.clone(),
+                index.bootstrap_ref.clone(),
                 index.cluster_objects.clone(),
             )
         };
@@ -843,6 +855,7 @@ impl Compactor {
                     cluster_owners: cluster_owners.clone(),
                     sketch: sketch_ref.clone(),
                     cluster_objects: cluster_objects.clone(),
+                    bootstrap: bootstrap_ref.clone(),
                 },
                 self.config.max_pending_deletes,
                 self.config.max_old_segments,
@@ -904,7 +917,7 @@ impl Compactor {
     /// old keys), bounding per-cycle write I/O to O(touched clusters) instead
     /// of O(dataset).
     ///
-    /// Returns `(cluster_count, bitmap_fields, cluster_owners, sketch_ref, cluster_objects)`.
+    /// Returns `(cluster_count, bitmap_fields, cluster_owners, sketch_ref, bootstrap_ref, cluster_objects)`.
     /// `cluster_owners[i]` is the segment ID that owns cluster `i`'s per-cluster sidecars:
     /// `new_segment_id` for rewritten clusters, the old segment's resolved
     /// owner for carried-over ones. An empty vec would mean "all owned by
@@ -945,11 +958,12 @@ impl Compactor {
         Vec<String>,
         Vec<String>,
         crate::wal::manifest::SketchRef,
+        BootstrapRef,
         Vec<ClusterDataObjectRef>,
     )> {
         use crate::index::distance::euclidean_distance;
         use crate::index::ivf_flat::build::{
-            centroids_key, deserialize_centroids_data, serialize_attrs,
+            build_bootstrap_artifact, centroids_key, deserialize_centroids_data, serialize_attrs,
             serialize_centroids_with_sq_calibration, serialize_cluster,
             serialize_colocated_sq_cluster,
         };
@@ -1058,7 +1072,9 @@ impl Compactor {
             dim,
             sq_calibration_bytes.as_ref().map(|bytes| bytes.as_ref()),
         )?;
-        self.store.put(&new_ckey, new_centroids_data).await?;
+        self.store
+            .put(&new_ckey, new_centroids_data.clone())
+            .await?;
 
         // CPU phase: pre-serialize payloads for REWRITTEN clusters only.
         //
@@ -1083,7 +1099,10 @@ impl Compactor {
             &cluster_vecs,
             &cluster_attrs,
         )?;
+        let (bootstrap_ref, bootstrap_data) =
+            build_bootstrap_artifact(namespace, new_segment_id, &new_centroids_data, &sketch_data)?;
         payloads.push((sketch_ref.key.clone(), sketch_data));
+        payloads.push((bootstrap_ref.key.clone(), bootstrap_data));
 
         for i in 0..num_clusters {
             if !touched[i] {
@@ -1203,6 +1222,7 @@ impl Compactor {
             bitmap_fields,
             owners_out,
             sketch_ref,
+            bootstrap_ref,
             cluster_objects_out,
         ))
     }

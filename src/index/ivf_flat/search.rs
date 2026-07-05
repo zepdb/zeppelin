@@ -1268,6 +1268,7 @@ mod tests {
             cluster_object_by_cluster: Vec::new(),
             resident_sketch: None,
             sketch_ref: None,
+            bootstrap_ref: None,
         }
     }
 

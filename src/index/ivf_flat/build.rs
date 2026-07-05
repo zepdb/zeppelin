@@ -60,7 +60,7 @@ use crate::error::{Result, ZeppelinError};
 use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, VectorEntry};
-use crate::wal::manifest::ClusterDataObjectRef;
+use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef};
 
 use super::kmeans::train_kmeans;
 use super::sketch::{build_resident_sketch, ResidentSketch};
@@ -73,6 +73,10 @@ const CLUSTER_V2_HEADER_LEN: usize = 4 + 8 * 4;
 const CLUSTER_DATA_OBJECT_MAGIC: &[u8; 4] = b"ZBP1";
 const CLUSTER_DATA_OBJECT_HEADER_LEN: usize = 8;
 const CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN: usize = 4 + 8 + 8;
+const BOOTSTRAP_MAGIC: &[u8; 4] = b"ZBS1";
+const BOOTSTRAP_VERSION: u32 = 1;
+const BOOTSTRAP_SECTION_COUNT: usize = 2;
+const BOOTSTRAP_HEADER_LEN: usize = 4 + 4 + BOOTSTRAP_SECTION_COUNT * 16;
 const DEFAULT_MAX_CLUSTERS_PER_OBJECT: usize = 3;
 const MAX_CLUSTERS_PER_OBJECT_ENV: &str = "ZEPPELIN_MAX_CLUSTERS_PER_OBJECT";
 const CLUSTER_GROUP_STATS_ENV: &str = "ZEPPELIN_CLUSTER_GROUP_STATS";
@@ -84,6 +88,12 @@ const CLUSTER_GROUP_STATS_ENV: &str = "ZEPPELIN_CLUSTER_GROUP_STATS";
 /// S3 key for the centroids blob.
 pub fn centroids_key(namespace: &str, segment_id: &str) -> String {
     format!("{namespace}/segments/{segment_id}/centroids.bin")
+}
+
+/// S3 key for the segment bootstrap blob.
+#[must_use]
+pub fn bootstrap_key(namespace: &str, segment_id: &str) -> String {
+    format!("{namespace}/segments/{segment_id}/bootstrap.bin")
 }
 
 /// S3 key for the vector data of cluster `i`.
@@ -368,6 +378,168 @@ pub(crate) fn build_cluster_object_lookup(
 // ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
+
+/// Borrowed sections from a segment bootstrap artifact.
+pub(crate) struct BootstrapSections<'a> {
+    pub centroids: &'a [u8],
+    pub sketch: &'a [u8],
+}
+
+/// Serialize a segment bootstrap artifact from existing artifact bytes.
+///
+/// The centroid and sketch payloads are embedded verbatim. Their internal
+/// formats remain independently versioned by their existing decoders.
+pub(crate) fn serialize_bootstrap(centroids: &[u8], sketch: &[u8]) -> Result<Bytes> {
+    if centroids.is_empty() {
+        return Err(ZeppelinError::Index(
+            "bootstrap centroids section cannot be empty".into(),
+        ));
+    }
+    if sketch.is_empty() {
+        return Err(ZeppelinError::Index(
+            "bootstrap sketch section cannot be empty".into(),
+        ));
+    }
+
+    let centroids_offset = BOOTSTRAP_HEADER_LEN;
+    let sketch_offset = centroids_offset
+        .checked_add(centroids.len())
+        .ok_or_else(|| ZeppelinError::Index("bootstrap centroids section overflows".into()))?;
+    let total = sketch_offset
+        .checked_add(sketch.len())
+        .ok_or_else(|| ZeppelinError::Index("bootstrap sketch section overflows".into()))?;
+
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(BOOTSTRAP_MAGIC);
+    buf.extend_from_slice(&BOOTSTRAP_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(centroids_offset as u64).to_le_bytes());
+    buf.extend_from_slice(&(centroids.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&(sketch_offset as u64).to_le_bytes());
+    buf.extend_from_slice(&(sketch.len() as u64).to_le_bytes());
+    buf.extend_from_slice(centroids);
+    buf.extend_from_slice(sketch);
+    debug_assert_eq!(buf.len(), total);
+
+    Ok(Bytes::from(buf))
+}
+
+/// Build a manifest ref and bytes for the segment bootstrap artifact.
+pub(crate) fn build_bootstrap_artifact(
+    namespace: &str,
+    segment_id: &str,
+    centroids: &[u8],
+    sketch: &[u8],
+) -> Result<(BootstrapRef, Bytes)> {
+    let bytes = serialize_bootstrap(centroids, sketch)?;
+    let bootstrap_ref = BootstrapRef {
+        key: bootstrap_key(namespace, segment_id),
+        size_bytes: bytes.len() as u64,
+    };
+    Ok((bootstrap_ref, bytes))
+}
+
+/// Deserialize and validate a segment bootstrap artifact.
+pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>> {
+    if data.len() < BOOTSTRAP_HEADER_LEN {
+        return Err(ZeppelinError::Index(
+            "bootstrap blob too small for header".into(),
+        ));
+    }
+    if !data.starts_with(BOOTSTRAP_MAGIC) {
+        return Err(ZeppelinError::Index("bootstrap magic mismatch".into()));
+    }
+
+    let version = u32::from_le_bytes(
+        data[4..8]
+            .try_into()
+            .map_err(|_| ZeppelinError::Index("bootstrap version parse error".into()))?,
+    );
+    if version != BOOTSTRAP_VERSION {
+        return Err(ZeppelinError::Index(format!(
+            "unsupported bootstrap version: {version}"
+        )));
+    }
+
+    let centroids_offset = read_u64_usize(data, 8, "bootstrap centroids offset")?;
+    let centroids_len = read_u64_usize(data, 16, "bootstrap centroids length")?;
+    let sketch_offset = read_u64_usize(data, 24, "bootstrap sketch offset")?;
+    let sketch_len = read_u64_usize(data, 32, "bootstrap sketch length")?;
+    validate_bootstrap_section(
+        "centroids",
+        centroids_offset,
+        centroids_len,
+        BOOTSTRAP_HEADER_LEN,
+        data.len(),
+    )?;
+    let centroids_end = centroids_offset.checked_add(centroids_len).ok_or_else(|| {
+        ZeppelinError::Index(format!(
+            "bootstrap centroids section overflows: offset={centroids_offset}, len={centroids_len}"
+        ))
+    })?;
+    if centroids_offset != BOOTSTRAP_HEADER_LEN {
+        return Err(ZeppelinError::Index(format!(
+            "bootstrap centroids offset mismatch: expected {BOOTSTRAP_HEADER_LEN}, got {centroids_offset}"
+        )));
+    }
+    if sketch_offset != centroids_end {
+        return Err(ZeppelinError::Index(format!(
+            "bootstrap sketch offset mismatch: expected {centroids_end}, got {sketch_offset}"
+        )));
+    }
+    validate_bootstrap_section(
+        "sketch",
+        sketch_offset,
+        sketch_len,
+        BOOTSTRAP_HEADER_LEN,
+        data.len(),
+    )?;
+    let sketch_end = sketch_offset.checked_add(sketch_len).ok_or_else(|| {
+        ZeppelinError::Index(format!(
+            "bootstrap sketch section overflows: offset={sketch_offset}, len={sketch_len}"
+        ))
+    })?;
+    if sketch_end != data.len() {
+        return Err(ZeppelinError::Index(format!(
+            "bootstrap blob size mismatch: expected {sketch_end}, got {}",
+            data.len()
+        )));
+    }
+
+    Ok(BootstrapSections {
+        centroids: &data[centroids_offset..centroids_end],
+        sketch: &data[sketch_offset..sketch_end],
+    })
+}
+
+fn validate_bootstrap_section(
+    label: &str,
+    offset: usize,
+    len: usize,
+    min_offset: usize,
+    data_len: usize,
+) -> Result<()> {
+    if len == 0 {
+        return Err(ZeppelinError::Index(format!(
+            "bootstrap {label} section is empty"
+        )));
+    }
+    if offset < min_offset {
+        return Err(ZeppelinError::Index(format!(
+            "bootstrap {label} section starts inside header: offset={offset}, header={min_offset}"
+        )));
+    }
+    let end = offset.checked_add(len).ok_or_else(|| {
+        ZeppelinError::Index(format!(
+            "bootstrap {label} section overflows: offset={offset}, len={len}"
+        ))
+    })?;
+    if end > data_len {
+        return Err(ZeppelinError::Index(format!(
+            "bootstrap {label} section out of bounds: end={end}, len={data_len}"
+        )));
+    }
+    Ok(())
+}
 
 /// Header written before the centroid float array.
 ///
@@ -1100,7 +1272,7 @@ pub async fn build_ivf_flat(
         serialize_centroids(&centroids, dim)?
     };
     let ckey = centroids_key(namespace, segment_id);
-    store.put(&ckey, centroids_data).await?;
+    store.put(&ckey, centroids_data.clone()).await?;
     debug!(key = %ckey, "wrote centroids");
 
     // CPU phase: pre-serialize all cluster sections and sidecars.
@@ -1175,7 +1347,7 @@ pub async fn build_ivf_flat(
     // --- Step 4: Write resident coarse sketch ---
     let (sketch_ref, sketch_data, resident_sketch) =
         build_resident_sketch(namespace, segment_id, dim, &cluster_vecs, &cluster_attrs)?;
-    store.put(&sketch_ref.key, sketch_data).await?;
+    store.put(&sketch_ref.key, sketch_data.clone()).await?;
     info!(
         key = %sketch_ref.key,
         code_dims = sketch_ref.code_dims,
@@ -1184,7 +1356,17 @@ pub async fn build_ivf_flat(
         "wrote resident coarse sketch"
     );
 
-    // --- Step 5: Write quantized artifacts (if configured) ---
+    // --- Step 5: Write segment bootstrap artifact ---
+    let (bootstrap_ref, bootstrap_data) =
+        build_bootstrap_artifact(namespace, segment_id, &centroids_data, &sketch_data)?;
+    store.put(&bootstrap_ref.key, bootstrap_data).await?;
+    info!(
+        key = %bootstrap_ref.key,
+        size_bytes = bootstrap_ref.size_bytes,
+        "wrote segment bootstrap"
+    );
+
+    // --- Step 6: Write quantized artifacts (if configured) ---
     match quantization {
         QuantizationType::Scalar => {
             info!("wrote SQ8 co-located clusters and embedded calibration");
@@ -1253,19 +1435,21 @@ pub async fn build_ivf_flat(
         cluster_object_by_cluster,
         resident_sketch: Some(resident_sketch),
         sketch_ref: Some(sketch_ref),
+        bootstrap_ref: Some(bootstrap_ref),
     })
 }
 
 /// Load an IVF-Flat index using pre-known metadata from the manifest.
 ///
-/// Only fetches centroids — skips the cluster-count probe loop and
-/// quantization-type detection that `load_ivf_flat` performs, saving
+/// Fetches the bootstrap object when present, otherwise fetches legacy
+/// centroids plus resident sketch artifacts. It skips the cluster-count probe
+/// loop and quantization-type detection that `load_ivf_flat` performs, saving
 /// ~18 S3 GETs per query.
 ///
-/// When `cache` is provided, the centroids blob is served through the
-/// tiered cache (memory → disk → S3) and pinned for the namespace's
-/// active segment: `pin_scoped` keeps it safe from LRU eviction and
-/// automatically unpins the previous segment's centroids on rotation.
+/// When `cache` is provided, the bootstrap or legacy metadata blobs are served
+/// through the tiered cache (memory → disk → S3) and pinned for the
+/// namespace's active segment: `pin_scoped` keeps them safe from LRU eviction
+/// and automatically unpins the previous segment's key on rotation.
 /// Cache errors are NOT swallowed — a failed fetch fails the load.
 #[allow(clippy::too_many_arguments)]
 pub async fn load_ivf_flat_from_manifest(
@@ -1277,20 +1461,33 @@ pub async fn load_ivf_flat_from_manifest(
     cluster_owners: Vec<String>,
     cluster_objects: Vec<ClusterDataObjectRef>,
     sketch_ref: Option<crate::wal::manifest::SketchRef>,
+    bootstrap_ref: Option<BootstrapRef>,
     cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
 ) -> Result<IvfFlatIndex> {
-    let ckey = centroids_key(namespace, segment_id);
-    let data = match cache {
-        Some(c) => {
-            let data = c.get_or_fetch(&ckey, || store.get(&ckey)).await?;
-            // This load path is only used for the manifest's active segment;
-            // pin its centroids (unpinning the previous segment's).
-            c.pin_scoped(&format!("{namespace}:centroids"), &ckey).await;
-            data
+    let (centroids_data, resident_sketch) = match bootstrap_ref.as_ref() {
+        Some(bootstrap_ref) => {
+            load_bootstrap_artifacts(store, namespace, bootstrap_ref, sketch_ref.as_ref(), cache)
+                .await?
         }
-        None => store.get(&ckey).await?,
+        None => {
+            let ckey = centroids_key(namespace, segment_id);
+            let data = match cache {
+                Some(c) => {
+                    let data = c.get_or_fetch(&ckey, || store.get(&ckey)).await?;
+                    // This load path is only used for the manifest's active segment;
+                    // pin its centroids (unpinning the previous segment's).
+                    c.pin_scoped(&format!("{namespace}:centroids"), &ckey).await;
+                    c.unpin_scoped(&format!("{namespace}:bootstrap")).await;
+                    data
+                }
+                None => store.get(&ckey).await?,
+            };
+            let centroids_data = deserialize_centroids_data(&data)?;
+            let resident_sketch =
+                load_resident_sketch(store, namespace, sketch_ref.as_ref(), cache).await?;
+            (centroids_data, resident_sketch)
+        }
     };
-    let centroids_data = deserialize_centroids_data(&data)?;
     let sq_calibration = centroids_data
         .sq_calibration
         .as_ref()
@@ -1299,8 +1496,6 @@ pub async fn load_ivf_flat_from_manifest(
     let centroids = centroids_data.centroids;
     let dim = centroids_data.dim;
     let cluster_object_by_cluster = build_cluster_object_lookup(centroids.len(), &cluster_objects)?;
-    let resident_sketch =
-        load_resident_sketch(store, namespace, sketch_ref.as_ref(), cache).await?;
 
     info!(
         namespace = namespace,
@@ -1326,7 +1521,58 @@ pub async fn load_ivf_flat_from_manifest(
         cluster_object_by_cluster,
         resident_sketch,
         sketch_ref,
+        bootstrap_ref,
     })
+}
+
+async fn load_bootstrap_artifacts(
+    store: &ZeppelinStore,
+    namespace: &str,
+    bootstrap_ref: &BootstrapRef,
+    sketch_ref: Option<&crate::wal::manifest::SketchRef>,
+    cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
+) -> Result<(CentroidsData, Option<ResidentSketch>)> {
+    let Some(sketch_ref) = sketch_ref else {
+        return Err(ZeppelinError::Index(format!(
+            "bootstrap {} present but segment is missing sketch ref",
+            bootstrap_ref.key
+        )));
+    };
+
+    let data = match cache {
+        Some(c) => {
+            let data = c
+                .get_or_fetch(&bootstrap_ref.key, || store.get(&bootstrap_ref.key))
+                .await?;
+            c.unpin_scoped(&format!("{namespace}:centroids")).await;
+            c.unpin_scoped(&format!("{namespace}:coarse_sketch")).await;
+            c.pin_scoped(&format!("{namespace}:bootstrap"), &bootstrap_ref.key)
+                .await;
+            data
+        }
+        None => store.get(&bootstrap_ref.key).await?,
+    };
+    if bootstrap_ref.size_bytes != data.len() as u64 {
+        return Err(ZeppelinError::Index(format!(
+            "bootstrap size mismatch for {}: manifest={}, object={}",
+            bootstrap_ref.key,
+            bootstrap_ref.size_bytes,
+            data.len()
+        )));
+    }
+
+    let sections = deserialize_bootstrap(&data)?;
+    if sketch_ref.size_bytes != sections.sketch.len() as u64 {
+        return Err(ZeppelinError::Index(format!(
+            "coarse sketch size mismatch inside bootstrap {}: manifest={}, section={}",
+            bootstrap_ref.key,
+            sketch_ref.size_bytes,
+            sections.sketch.len()
+        )));
+    }
+    let centroids_data = deserialize_centroids_data(sections.centroids)?;
+    let sketch = ResidentSketch::from_bytes(sections.sketch)?;
+    Ok((centroids_data, Some(sketch)))
 }
 
 async fn load_resident_sketch(
@@ -1478,6 +1724,7 @@ pub async fn load_ivf_flat(
         cluster_object_by_cluster,
         resident_sketch: None,
         sketch_ref: None,
+        bootstrap_ref: None,
     })
 }
 
@@ -1493,6 +1740,33 @@ mod tests {
         let (decoded, dim) = deserialize_centroids(&data).unwrap();
         assert_eq!(dim, 3);
         assert_eq!(decoded, centroids);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_bootstrap_sections() {
+        let centroids = b"centroid-bytes";
+        let sketch = b"sketch-bytes";
+        let data = serialize_bootstrap(centroids, sketch).unwrap();
+        let sections = deserialize_bootstrap(&data).unwrap();
+        assert_eq!(sections.centroids, centroids);
+        assert_eq!(sections.sketch, sketch);
+    }
+
+    #[test]
+    fn test_deserialize_bootstrap_rejects_malformed_header() {
+        let data = serialize_bootstrap(b"centroids", b"sketch").unwrap();
+
+        let mut bad_magic = data.to_vec();
+        bad_magic[0] = b'X';
+        assert!(deserialize_bootstrap(&bad_magic).is_err());
+
+        let mut bad_version = data.to_vec();
+        bad_version[4..8].copy_from_slice(&99u32.to_le_bytes());
+        assert!(deserialize_bootstrap(&bad_version).is_err());
+
+        let mut bad_bounds = data.to_vec();
+        bad_bounds[32..40].copy_from_slice(&999u64.to_le_bytes());
+        assert!(deserialize_bootstrap(&bad_bounds).is_err());
     }
 
     #[test]
@@ -1590,5 +1864,76 @@ mod tests {
             ZeppelinError::Index(msg) => assert!(msg.contains("truncated"), "got: {msg}"),
             other => panic!("expected Index error, got: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_load_from_manifest_uses_bootstrap_when_present() {
+        let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let namespace = "ns_bootstrap";
+        let segment_id = "seg_bootstrap";
+        let centroids = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
+        let centroids_data = serialize_centroids(&centroids, 2).unwrap();
+        let cluster_vecs = vec![vec![vec![0.1, 0.0]], vec![vec![9.9, 10.1]]];
+        let cluster_attrs = vec![vec![None], vec![None]];
+        let (sketch_ref, sketch_data, _) =
+            build_resident_sketch(namespace, segment_id, 2, &cluster_vecs, &cluster_attrs).unwrap();
+        let (bootstrap_ref, bootstrap_data) =
+            build_bootstrap_artifact(namespace, segment_id, &centroids_data, &sketch_data).unwrap();
+        store.put(&bootstrap_ref.key, bootstrap_data).await.unwrap();
+
+        let index = load_ivf_flat_from_manifest(
+            &store,
+            namespace,
+            segment_id,
+            2,
+            QuantizationType::None,
+            Vec::new(),
+            Vec::new(),
+            Some(sketch_ref),
+            Some(bootstrap_ref),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(index.num_clusters(), 2);
+        assert!(index.resident_sketch.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_load_from_manifest_without_bootstrap_uses_legacy_artifacts() {
+        let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let namespace = "ns_legacy_bootstrap";
+        let segment_id = "seg_legacy_bootstrap";
+        let centroids = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
+        let centroids_data = serialize_centroids(&centroids, 2).unwrap();
+        store
+            .put(&centroids_key(namespace, segment_id), centroids_data)
+            .await
+            .unwrap();
+        let cluster_vecs = vec![vec![vec![0.1, 0.0]], vec![vec![9.9, 10.1]]];
+        let cluster_attrs = vec![vec![None], vec![None]];
+        let (sketch_ref, sketch_data, _) =
+            build_resident_sketch(namespace, segment_id, 2, &cluster_vecs, &cluster_attrs).unwrap();
+        store.put(&sketch_ref.key, sketch_data).await.unwrap();
+
+        let index = load_ivf_flat_from_manifest(
+            &store,
+            namespace,
+            segment_id,
+            2,
+            QuantizationType::None,
+            Vec::new(),
+            Vec::new(),
+            Some(sketch_ref),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(index.num_clusters(), 2);
+        assert!(index.resident_sketch.is_some());
+        assert!(index.bootstrap_ref.is_none());
     }
 }
