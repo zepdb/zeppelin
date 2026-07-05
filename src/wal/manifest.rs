@@ -119,11 +119,11 @@ pub struct SegmentRef {
     /// trailing and `#[serde(default)]`.
     #[serde(default)]
     pub sketch: Option<SketchRef>,
-    /// Immutable cluster-data object layout for paired cluster objects.
+    /// Immutable cluster-data object layout for grouped cluster objects.
     ///
     /// EMPTY means the legacy one-object-per-cluster layout:
     /// `{cluster_owner(i)}/cluster_i.bin`. New full IVF-Flat compactions write
-    /// buddy-paired cluster data and populate this list. Incremental
+    /// capped grouped cluster data and populate this list. Incremental
     /// compactions may contain mixed references: rewritten singleton objects
     /// under the new segment and carried objects under older segment keys.
     ///

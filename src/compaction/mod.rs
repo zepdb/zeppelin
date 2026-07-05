@@ -1251,7 +1251,7 @@ fn incremental_cluster_objects(
             old_object_by_cluster[cluster_idx]
                 .ok_or_else(|| {
                     ZeppelinError::Index(format!(
-                        "paired old segment missing object for carried cluster {cluster_idx}"
+                        "grouped old segment missing object for carried cluster {cluster_idx}"
                     ))
                 })?
                 .to_string()
@@ -1396,7 +1396,7 @@ async fn load_segment_vectors(
             let object_data = object_res?;
             let Some(sections) = cluster_object_sections(&object_data)? else {
                 return Err(ZeppelinError::Index(format!(
-                    "manifest cluster object {} did not contain paired cluster data",
+                    "manifest cluster object {} did not contain grouped cluster data",
                     object_ref.key
                 )));
             };

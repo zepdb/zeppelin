@@ -26,11 +26,12 @@
 //!   same `cluster_i.bin` key and gets a cache hit, then parses the full section.
 //!   The offset table is present now so a later range-GET implementation can
 //!   fetch only `[sq_offset, sq_offset + sq_len)` without changing the format.
-//! - New buddy-paired `cluster_pair_i.bin`: `[b"ZBP1"][entry_count:u32]`
+//! - New grouped `cluster_group_i.bin`: `[b"ZBP1"][entry_count:u32]`
 //!   followed by `[cluster_idx:u32][offset:u64][len:u64] * entry_count` and
-//!   then one or two cluster sections. Pair membership is stored in the
+//!   then one or more cluster sections. Group membership is stored in the
 //!   manifest's `cluster_objects` field; an empty field is an explicit legacy
-//!   per-cluster layout.
+//!   per-cluster layout. Cycle 7 `cluster_pair_i.bin` objects use the same
+//!   per-object directory and remain readable.
 //! - `attrs_i.bin` is unchanged and remains lazy-loaded.
 //! - `sq_cluster_i.bin` and `sq_calibration.bin` are legacy read-only keys.
 //!   New SQ segments do not write them. Old-format carried clusters continue
@@ -69,9 +70,12 @@ use crate::index::distance;
 const CENTROIDS_V2_MAGIC: &[u8; 4] = b"ZCT2";
 const CLUSTER_V2_MAGIC: &[u8; 4] = b"ZCL2";
 const CLUSTER_V2_HEADER_LEN: usize = 4 + 8 * 4;
-const BUDDY_CLUSTER_OBJECT_MAGIC: &[u8; 4] = b"ZBP1";
-const BUDDY_CLUSTER_OBJECT_HEADER_LEN: usize = 8;
-const BUDDY_CLUSTER_OBJECT_DIR_ENTRY_LEN: usize = 4 + 8 + 8;
+const CLUSTER_DATA_OBJECT_MAGIC: &[u8; 4] = b"ZBP1";
+const CLUSTER_DATA_OBJECT_HEADER_LEN: usize = 8;
+const CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN: usize = 4 + 8 + 8;
+const DEFAULT_MAX_CLUSTERS_PER_OBJECT: usize = 3;
+const MAX_CLUSTERS_PER_OBJECT_ENV: &str = "ZEPPELIN_MAX_CLUSTERS_PER_OBJECT";
+const CLUSTER_GROUP_STATS_ENV: &str = "ZEPPELIN_CLUSTER_GROUP_STATS";
 
 // ---------------------------------------------------------------------------
 // Artifact paths
@@ -87,9 +91,9 @@ pub(crate) fn cluster_key(namespace: &str, segment_id: &str, cluster_idx: usize)
     format!("{namespace}/segments/{segment_id}/cluster_{cluster_idx}.bin")
 }
 
-/// S3 key for buddy-paired cluster data object `pair_idx`.
-pub(crate) fn cluster_pair_key(namespace: &str, segment_id: &str, pair_idx: usize) -> String {
-    format!("{namespace}/segments/{segment_id}/cluster_pair_{pair_idx}.bin")
+/// S3 key for grouped cluster data object `group_idx`.
+pub(crate) fn cluster_group_key(namespace: &str, segment_id: &str, group_idx: usize) -> String {
+    format!("{namespace}/segments/{segment_id}/cluster_group_{group_idx}.bin")
 }
 
 /// S3 key for the attribute data of cluster `i`.
@@ -97,11 +101,62 @@ pub(crate) fn attrs_key(namespace: &str, segment_id: &str, cluster_idx: usize) -
     format!("{namespace}/segments/{segment_id}/attrs_{cluster_idx}.bin")
 }
 
-/// Greedy centroid-adjacent buddy pairing used for cluster-data objects.
-pub(crate) fn buddy_cluster_groups(
+fn configured_max_clusters_per_object() -> Result<usize> {
+    match std::env::var(MAX_CLUSTERS_PER_OBJECT_ENV) {
+        Ok(value) => {
+            let parsed = value.parse::<usize>().map_err(|e| {
+                ZeppelinError::Index(format!(
+                    "{MAX_CLUSTERS_PER_OBJECT_ENV} must be a positive integer: {e}"
+                ))
+            })?;
+            if parsed == 0 {
+                return Err(ZeppelinError::Index(format!(
+                    "{MAX_CLUSTERS_PER_OBJECT_ENV} must be greater than zero"
+                )));
+            }
+            Ok(parsed)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_MAX_CLUSTERS_PER_OBJECT),
+        Err(e) => Err(ZeppelinError::Index(format!(
+            "failed to read {MAX_CLUSTERS_PER_OBJECT_ENV}: {e}"
+        ))),
+    }
+}
+
+/// Capped density-adaptive centroid grouping used for cluster-data objects.
+///
+/// The only external bound is `max_clusters_per_object`. The merge cutoff is
+/// derived from the segment's own cap-neighbor centroid distance distribution,
+/// so it scales with the embedding space rather than baking in an absolute
+/// radius.
+pub(crate) fn density_cluster_groups(
     centroids: &[Vec<f32>],
     affinity: &[Vec<u32>],
-) -> Vec<Vec<usize>> {
+) -> Result<Vec<Vec<usize>>> {
+    let max_clusters_per_object = configured_max_clusters_per_object()?;
+    density_cluster_groups_with_cap(centroids, affinity, max_clusters_per_object)
+}
+
+pub(crate) fn density_cluster_groups_with_cap(
+    centroids: &[Vec<f32>],
+    affinity: &[Vec<u32>],
+    max_clusters_per_object: usize,
+) -> Result<Vec<Vec<usize>>> {
+    if max_clusters_per_object == 0 {
+        return Err(ZeppelinError::Index(
+            "max_clusters_per_object must be greater than zero".into(),
+        ));
+    }
+    if centroids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if max_clusters_per_object == 1 || centroids.len() == 1 {
+        return Ok((0..centroids.len()).map(|idx| vec![idx]).collect());
+    }
+
+    let distances = centroid_distances(centroids)?;
+    let cutoff =
+        cap_neighbor_distance_upper_quartile(&distances, centroids.len(), max_clusters_per_object)?;
     let mut edges = Vec::new();
     for left in 0..centroids.len() {
         for right in (left + 1)..centroids.len() {
@@ -110,46 +165,149 @@ pub(crate) fn buddy_cluster_groups(
                 .and_then(|row| row.get(right))
                 .copied()
                 .unwrap_or(0);
-            edges.push((
-                weight,
-                distance::euclidean_distance(&centroids[left], &centroids[right]),
-                left,
-                right,
-            ));
+            let dist = centroid_distance(&distances, centroids.len(), left, right);
+            if dist <= cutoff {
+                edges.push((dist, weight, left, right));
+            }
         }
     }
     edges.sort_by(
-        |(a_weight, a_dist, a_left, a_right), (b_weight, b_dist, b_left, b_right)| {
-            b_weight
-                .cmp(a_weight)
-                .then_with(|| {
-                    a_dist
-                        .partial_cmp(b_dist)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+        |(a_dist, a_weight, a_left, a_right), (b_dist, b_weight, b_left, b_right)| {
+            a_dist
+                .partial_cmp(b_dist)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b_weight.cmp(a_weight))
                 .then_with(|| a_left.cmp(b_left))
                 .then_with(|| a_right.cmp(b_right))
         },
     );
 
-    let mut matched = vec![false; centroids.len()];
-    let mut groups = Vec::with_capacity(centroids.len().div_ceil(2));
+    let mut cluster_to_group: Vec<usize> = (0..centroids.len()).collect();
+    let mut groups: Vec<Vec<usize>> = (0..centroids.len()).map(|idx| vec![idx]).collect();
     for (_, _, left, right) in edges {
-        if matched[left] || matched[right] {
+        let left_group = cluster_to_group[left];
+        let right_group = cluster_to_group[right];
+        if left_group == right_group {
             continue;
         }
-        matched[left] = true;
-        matched[right] = true;
-        groups.push(vec![left, right]);
+        let merged_len = groups[left_group].len() + groups[right_group].len();
+        if merged_len > max_clusters_per_object {
+            continue;
+        }
+        if !groups_within_cutoff(
+            &groups[left_group],
+            &groups[right_group],
+            &distances,
+            centroids.len(),
+            cutoff,
+        ) {
+            continue;
+        }
+
+        let moved = std::mem::take(&mut groups[right_group]);
+        let mut merged = std::mem::take(&mut groups[left_group]);
+        merged.extend(moved);
+        merged.sort_unstable();
+        for &cluster_idx in &merged {
+            cluster_to_group[cluster_idx] = left_group;
+        }
+        groups[left_group] = merged;
     }
-    for (cluster_idx, is_matched) in matched.into_iter().enumerate() {
-        if !is_matched {
-            groups.push(vec![cluster_idx]);
+
+    let mut groups: Vec<Vec<usize>> = groups
+        .into_iter()
+        .filter(|group| !group.is_empty())
+        .collect();
+    groups.sort_by_key(|group| group[0]);
+    emit_cluster_group_stats(max_clusters_per_object, cutoff, &groups);
+    Ok(groups)
+}
+
+fn centroid_distances(centroids: &[Vec<f32>]) -> Result<Vec<f32>> {
+    let n = centroids.len();
+    let total = n
+        .checked_mul(n)
+        .ok_or_else(|| ZeppelinError::Index("centroid distance matrix overflows".into()))?;
+    let mut distances = vec![0.0; total];
+    for left in 0..n {
+        for right in (left + 1)..n {
+            let dist = distance::euclidean_distance(&centroids[left], &centroids[right]);
+            distances[left * n + right] = dist;
+            distances[right * n + left] = dist;
         }
     }
-    groups.sort_by_key(|group| group[0]);
+    Ok(distances)
+}
 
-    groups
+fn centroid_distance(distances: &[f32], n: usize, left: usize, right: usize) -> f32 {
+    distances[left * n + right]
+}
+
+fn cap_neighbor_distance_upper_quartile(
+    distances: &[f32],
+    n: usize,
+    max_clusters_per_object: usize,
+) -> Result<f32> {
+    if n < 2 {
+        return Err(ZeppelinError::Index(
+            "cannot derive centroid merge cutoff from fewer than two centroids".into(),
+        ));
+    }
+    let neighbor_rank = max_clusters_per_object.saturating_sub(1).min(n - 1).max(1);
+    let mut cap_neighbor_distances = Vec::with_capacity(n);
+    for left in 0..n {
+        let mut row = Vec::with_capacity(n - 1);
+        for right in 0..n {
+            if left == right {
+                continue;
+            }
+            row.push(centroid_distance(distances, n, left, right));
+        }
+        row.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let dist = row[neighbor_rank - 1];
+        if !dist.is_finite() {
+            return Err(ZeppelinError::Index(format!(
+                "non-finite cap-neighbor centroid distance for cluster {left}"
+            )));
+        }
+        cap_neighbor_distances.push(dist);
+    }
+    cap_neighbor_distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = (cap_neighbor_distances.len() * 3) / 4;
+    Ok(cap_neighbor_distances[idx.min(cap_neighbor_distances.len() - 1)])
+}
+
+fn groups_within_cutoff(
+    left_group: &[usize],
+    right_group: &[usize],
+    distances: &[f32],
+    n: usize,
+    cutoff: f32,
+) -> bool {
+    left_group.iter().all(|&left| {
+        right_group
+            .iter()
+            .all(|&right| centroid_distance(distances, n, left, right) <= cutoff)
+    })
+}
+
+fn emit_cluster_group_stats(max_clusters_per_object: usize, cutoff: f32, groups: &[Vec<usize>]) {
+    if std::env::var_os(CLUSTER_GROUP_STATS_ENV).is_none() {
+        return;
+    }
+    let mut hist = std::collections::BTreeMap::new();
+    for group in groups {
+        *hist.entry(group.len()).or_insert(0usize) += 1;
+    }
+    let histogram = hist
+        .into_iter()
+        .map(|(size, count)| format!("{size}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "zeppelin_cluster_group_stats max_clusters_per_object={max_clusters_per_object} objects={} cutoff={cutoff:.6} group_size_histogram={histogram}",
+        groups.len()
+    );
 }
 
 pub(crate) fn build_cluster_object_lookup(
@@ -199,7 +357,7 @@ pub(crate) fn build_cluster_object_lookup(
     for (cluster_idx, object_idx) in lookup.iter().enumerate() {
         if *object_idx == usize::MAX {
             return Err(ZeppelinError::Index(format!(
-                "cluster {cluster_idx} missing from paired cluster object layout"
+                "cluster {cluster_idx} missing from cluster object layout"
             )));
         }
     }
@@ -490,9 +648,9 @@ pub(crate) fn serialize_cluster_data_object(entries: &[(usize, Bytes)]) -> Resul
 
     let directory_len = entries
         .len()
-        .checked_mul(BUDDY_CLUSTER_OBJECT_DIR_ENTRY_LEN)
+        .checked_mul(CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN)
         .ok_or_else(|| ZeppelinError::Index("cluster object directory overflows".into()))?;
-    let payload_offset = BUDDY_CLUSTER_OBJECT_HEADER_LEN
+    let payload_offset = CLUSTER_DATA_OBJECT_HEADER_LEN
         .checked_add(directory_len)
         .ok_or_else(|| ZeppelinError::Index("cluster object header overflows".into()))?;
     let payload_len: usize =
@@ -508,7 +666,7 @@ pub(crate) fn serialize_cluster_data_object(entries: &[(usize, Bytes)]) -> Resul
         .ok_or_else(|| ZeppelinError::Index("cluster object size overflows".into()))?;
 
     let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(BUDDY_CLUSTER_OBJECT_MAGIC);
+    buf.extend_from_slice(CLUSTER_DATA_OBJECT_MAGIC);
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
     let mut offset = payload_offset;
@@ -543,7 +701,7 @@ pub(crate) fn deserialize_cluster(data: &[u8]) -> Result<ClusterData> {
 }
 
 /// Deserialize one cluster section from either a legacy per-cluster object or
-/// a buddy-paired cluster-data object.
+/// a grouped cluster-data object.
 pub(crate) fn deserialize_cluster_from_object(
     data: &[u8],
     cluster_idx: usize,
@@ -628,7 +786,7 @@ pub(crate) fn deserialize_colocated_sq_cluster(
 }
 
 /// Deserialize the SQ section for one cluster in either a legacy per-cluster
-/// object or a buddy-paired cluster-data object.
+/// object or a grouped cluster-data object.
 pub(crate) fn deserialize_colocated_sq_cluster_from_object(
     data: &[u8],
     cluster_idx: usize,
@@ -647,43 +805,43 @@ pub(crate) struct ClusterObjectSection<'a> {
     pub data: &'a [u8],
 }
 
-/// Return all sections in a buddy-paired cluster-data object.
+/// Return all sections in a grouped cluster-data object.
 ///
-/// `Ok(None)` means the bytes are a legacy per-cluster object, not a paired
-/// object. Callers that already know they fetched a paired key should treat
+/// `Ok(None)` means the bytes are a legacy per-cluster object, not a grouped
+/// object. Callers that already know they fetched a grouped key should treat
 /// `None` as an error at that boundary.
 pub(crate) fn cluster_object_sections(
     data: &[u8],
 ) -> Result<Option<Vec<ClusterObjectSection<'_>>>> {
-    if !data.starts_with(BUDDY_CLUSTER_OBJECT_MAGIC) {
+    if !data.starts_with(CLUSTER_DATA_OBJECT_MAGIC) {
         return Ok(None);
     }
-    if data.len() < BUDDY_CLUSTER_OBJECT_HEADER_LEN {
+    if data.len() < CLUSTER_DATA_OBJECT_HEADER_LEN {
         return Err(ZeppelinError::Index(
-            "buddy cluster object too small for header".into(),
+            "cluster data object too small for header".into(),
         ));
     }
 
     let entry_count = u32::from_le_bytes(
         data[4..8]
             .try_into()
-            .map_err(|_| ZeppelinError::Index("buddy cluster object count parse error".into()))?,
+            .map_err(|_| ZeppelinError::Index("cluster data object count parse error".into()))?,
     ) as usize;
     if entry_count == 0 {
         return Err(ZeppelinError::Index(
-            "buddy cluster object has zero entries".into(),
+            "cluster data object has zero entries".into(),
         ));
     }
 
     let directory_len = entry_count
-        .checked_mul(BUDDY_CLUSTER_OBJECT_DIR_ENTRY_LEN)
-        .ok_or_else(|| ZeppelinError::Index("buddy cluster directory overflows".into()))?;
-    let payload_start = BUDDY_CLUSTER_OBJECT_HEADER_LEN
+        .checked_mul(CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN)
+        .ok_or_else(|| ZeppelinError::Index("cluster data object directory overflows".into()))?;
+    let payload_start = CLUSTER_DATA_OBJECT_HEADER_LEN
         .checked_add(directory_len)
-        .ok_or_else(|| ZeppelinError::Index("buddy cluster header overflows".into()))?;
+        .ok_or_else(|| ZeppelinError::Index("cluster data object header overflows".into()))?;
     if data.len() < payload_start {
         return Err(ZeppelinError::Index(format!(
-            "buddy cluster object truncated directory: expected at least {payload_start}, got {}",
+            "cluster data object truncated directory: expected at least {payload_start}, got {}",
             data.len()
         )));
     }
@@ -691,33 +849,32 @@ pub(crate) fn cluster_object_sections(
     let mut sections = Vec::with_capacity(entry_count);
     let mut seen = BTreeSet::new();
     for entry_idx in 0..entry_count {
-        let base = BUDDY_CLUSTER_OBJECT_HEADER_LEN + entry_idx * BUDDY_CLUSTER_OBJECT_DIR_ENTRY_LEN;
-        let cluster_idx = u32::from_le_bytes(
-            data[base..base + 4]
-                .try_into()
-                .map_err(|_| ZeppelinError::Index("buddy cluster index parse error".into()))?,
-        ) as usize;
+        let base = CLUSTER_DATA_OBJECT_HEADER_LEN + entry_idx * CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN;
+        let cluster_idx =
+            u32::from_le_bytes(data[base..base + 4].try_into().map_err(|_| {
+                ZeppelinError::Index("cluster data object index parse error".into())
+            })?) as usize;
         if !seen.insert(cluster_idx) {
             return Err(ZeppelinError::Index(format!(
-                "duplicate cluster {cluster_idx} in buddy cluster object"
+                "duplicate cluster {cluster_idx} in cluster data object"
             )));
         }
 
-        let offset = read_u64_usize(data, base + 4, "buddy cluster section offset")?;
-        let len = read_u64_usize(data, base + 12, "buddy cluster section length")?;
+        let offset = read_u64_usize(data, base + 4, "cluster data object section offset")?;
+        let len = read_u64_usize(data, base + 12, "cluster data object section length")?;
         if offset < payload_start {
             return Err(ZeppelinError::Index(format!(
-                "buddy cluster section starts inside directory: offset={offset}, payload_start={payload_start}"
+                "cluster data object section starts inside directory: offset={offset}, payload_start={payload_start}"
             )));
         }
         let end = offset.checked_add(len).ok_or_else(|| {
             ZeppelinError::Index(format!(
-                "buddy cluster section overflows: offset={offset}, len={len}"
+                "cluster data object section overflows: offset={offset}, len={len}"
             ))
         })?;
         if end > data.len() {
             return Err(ZeppelinError::Index(format!(
-                "buddy cluster section out of bounds: end={end}, len={}",
+                "cluster data object section out of bounds: end={end}, len={}",
                 data.len()
             )));
         }
@@ -740,7 +897,7 @@ fn cluster_section_from_object(data: &[u8], cluster_idx: usize) -> Result<&[u8]>
         .map(|section| section.data)
         .ok_or_else(|| {
             ZeppelinError::Index(format!(
-                "cluster {cluster_idx} missing from buddy cluster object"
+                "cluster {cluster_idx} missing from cluster data object"
             ))
         })
 }
@@ -980,7 +1137,7 @@ pub async fn build_ivf_flat(
 
     let mut cluster_objects = Vec::new();
     let mut cluster_object_payloads = Vec::new();
-    for (pair_idx, group) in buddy_cluster_groups(&centroids, &buddy_affinity)
+    for (group_idx, group) in density_cluster_groups(&centroids, &buddy_affinity)?
         .into_iter()
         .enumerate()
     {
@@ -988,7 +1145,7 @@ pub async fn build_ivf_flat(
             .iter()
             .map(|&cluster_idx| (cluster_idx, cluster_sections[cluster_idx].clone()))
             .collect();
-        let key = cluster_pair_key(namespace, segment_id, pair_idx);
+        let key = cluster_group_key(namespace, segment_id, group_idx);
         let data = serialize_cluster_data_object(&entries)?;
         cluster_objects.push(ClusterDataObjectRef {
             key: key.clone(),
@@ -1012,7 +1169,7 @@ pub async fn build_ivf_flat(
     debug!(
         num_clusters,
         cluster_objects = cluster_objects.len(),
-        "wrote all paired cluster data"
+        "wrote all grouped cluster data"
     );
 
     // --- Step 4: Write resident coarse sketch ---
@@ -1233,21 +1390,25 @@ pub async fn load_ivf_flat(
     let segment_prefix = format!("{namespace}/segments/{segment_id}/");
     let segment_keys = store.list_prefix(&segment_prefix).await?;
     let mut cluster_objects: Vec<ClusterDataObjectRef> = Vec::new();
-    let mut cluster_pair_keys: Vec<String> = segment_keys
+    let mut cluster_object_keys: Vec<String> = segment_keys
         .iter()
         .filter(|key| {
             key.rsplit('/')
                 .next()
-                .map(|filename| filename.starts_with("cluster_pair_"))
+                .map(|filename| {
+                    filename.starts_with("cluster_pair_") || filename.starts_with("cluster_group_")
+                })
                 .unwrap_or(false)
         })
         .cloned()
         .collect();
-    cluster_pair_keys.sort();
-    for key in cluster_pair_keys {
+    cluster_object_keys.sort();
+    for key in cluster_object_keys {
         let data = store.get(&key).await?;
         let sections = cluster_object_sections(&data)?.ok_or_else(|| {
-            ZeppelinError::Index(format!("cluster pair key {key} did not contain pair data"))
+            ZeppelinError::Index(format!(
+                "cluster object key {key} did not contain grouped data"
+            ))
         })?;
         for section in &sections {
             let cluster = deserialize_cluster(section.data)?;
@@ -1370,6 +1531,26 @@ mod tests {
     fn test_cluster_header_too_small() {
         let data = vec![0u8; 4];
         assert!(deserialize_cluster(&data).is_err());
+    }
+
+    #[test]
+    fn density_grouping_respects_cap_and_leaves_sparse_tail() {
+        let centroids = vec![
+            vec![0.0, 0.0],
+            vec![0.1, 0.0],
+            vec![0.2, 0.0],
+            vec![0.3, 0.0],
+            vec![10.0, 0.0],
+            vec![20.0, 0.0],
+        ];
+        let affinity = vec![vec![0; centroids.len()]; centroids.len()];
+
+        let groups = density_cluster_groups_with_cap(&centroids, &affinity, 4).unwrap();
+
+        assert!(groups.iter().all(|group| group.len() <= 4));
+        assert!(groups.iter().any(|group| group.as_slice() == &[0, 1, 2, 3]));
+        assert!(groups.iter().any(|group| group.as_slice() == &[4]));
+        assert!(groups.iter().any(|group| group.as_slice() == &[5]));
     }
 
     #[test]
