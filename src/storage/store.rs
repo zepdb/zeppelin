@@ -4,6 +4,7 @@ use object_store::path::Path;
 use object_store::{
     ClientOptions, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion,
 };
+use std::ops::Range;
 use std::sync::Arc;
 use tracing::{debug, instrument};
 
@@ -131,6 +132,47 @@ impl ZeppelinStore {
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
         Ok(bytes)
+    }
+
+    /// Get a byte range from an object by key.
+    #[instrument(skip(self), fields(key = key, range_start = range.start, range_end = range.end))]
+    pub async fn get_range(&self, key: &str, range: Range<usize>) -> Result<Bytes> {
+        if range.start >= range.end {
+            return Err(ZeppelinError::Storage(object_store::Error::Generic {
+                store: "zeppelin",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "invalid empty or reversed range for {key}: {}..{}",
+                        range.start, range.end
+                    ),
+                )),
+            }));
+        }
+
+        let start = std::time::Instant::now();
+        let path = Path::parse(key)?;
+        let result = self.inner.get_range(&path, range).await.map_err(|e| {
+            crate::metrics::S3_ERRORS_TOTAL
+                .with_label_values(&["get"])
+                .inc();
+            match e {
+                object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
+                    key: path.to_string(),
+                },
+                other => ZeppelinError::Storage(other),
+            }
+        })?;
+        let elapsed = start.elapsed();
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            size = result.len(),
+            "s3 get_range"
+        );
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["get"])
+            .observe(elapsed.as_secs_f64());
+        Ok(result)
     }
 
     /// Get an object by key, returning data along with the ETag for CAS operations.

@@ -1281,7 +1281,12 @@ fn incremental_cluster_objects(
 
     Ok(grouped
         .into_iter()
-        .map(|(key, clusters)| ClusterDataObjectRef { key, clusters })
+        .map(|(key, clusters)| ClusterDataObjectRef {
+            key,
+            clusters,
+            live_offset: 0,
+            live_len: 0,
+        })
         .collect())
 }
 
