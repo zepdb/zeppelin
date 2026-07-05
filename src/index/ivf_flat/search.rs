@@ -9,6 +9,7 @@
 use dashmap::DashMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::debug;
 
@@ -56,6 +57,7 @@ const SKETCH_THIN_OBJECT_MAX_ARITY: usize = 3;
 const SKETCH_ADAPTIVE_THIN_RELATIVE_SCORE_MARGIN: f32 = 0.12;
 const SKETCH_ADAPTIVE_OBJECT_CAP_EXTRA: usize = 2;
 const SKETCH_SCAN_STATS_ENV: &str = "ZEPPELIN_SKETCH_SCAN_STATS";
+const SQ_BYTE_STATS_ENV: &str = "ZEPPELIN_SQ_BYTE_STATS";
 const RERANK_COALESCE_GAP_ENV: &str = "ZEPPELIN_RERANK_COALESCE_GAP_BYTES";
 const DEFAULT_RERANK_COALESCE_GAP_BYTES: usize = 1024 * 1024;
 
@@ -76,6 +78,127 @@ struct ClusterFetchObject {
 
 static CLUSTER_OBJECT_LAYOUT_CACHE: OnceLock<DashMap<String, Arc<ClusterObjectLayout>>> =
     OnceLock::new();
+static SQ_BYTE_STATS_QUERY_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+enum SqBytePhase {
+    Sq,
+    Rerank,
+    Other,
+}
+
+struct SqSearchByteStats {
+    query_id: u64,
+    sq_gets: AtomicU64,
+    sq_bytes: AtomicU64,
+    sq_logical_bytes: AtomicU64,
+    rerank_gets: AtomicU64,
+    rerank_bytes: AtomicU64,
+    rerank_logical_bytes: AtomicU64,
+    other_gets: AtomicU64,
+    other_bytes: AtomicU64,
+    selected_clusters: AtomicU64,
+    sq_objects: AtomicU64,
+    coarse_candidates: AtomicU64,
+    rerank_candidates: AtomicU64,
+    rerank_clusters: AtomicU64,
+    rerank_objects: AtomicU64,
+    final_results: AtomicU64,
+}
+
+impl SqSearchByteStats {
+    fn new_if_enabled(enabled: bool) -> Option<Arc<Self>> {
+        if !enabled || std::env::var_os(SQ_BYTE_STATS_ENV).is_none() {
+            return None;
+        }
+        Some(Arc::new(Self {
+            query_id: SQ_BYTE_STATS_QUERY_ID.fetch_add(1, Ordering::Relaxed),
+            sq_gets: AtomicU64::new(0),
+            sq_bytes: AtomicU64::new(0),
+            sq_logical_bytes: AtomicU64::new(0),
+            rerank_gets: AtomicU64::new(0),
+            rerank_bytes: AtomicU64::new(0),
+            rerank_logical_bytes: AtomicU64::new(0),
+            other_gets: AtomicU64::new(0),
+            other_bytes: AtomicU64::new(0),
+            selected_clusters: AtomicU64::new(0),
+            sq_objects: AtomicU64::new(0),
+            coarse_candidates: AtomicU64::new(0),
+            rerank_candidates: AtomicU64::new(0),
+            rerank_clusters: AtomicU64::new(0),
+            rerank_objects: AtomicU64::new(0),
+            final_results: AtomicU64::new(0),
+        }))
+    }
+
+    fn record_get(&self, phase: SqBytePhase, bytes: usize) {
+        self.record_gets(phase, 1, bytes);
+    }
+
+    fn record_gets(&self, phase: SqBytePhase, gets: usize, bytes: usize) {
+        let gets = gets as u64;
+        let bytes = bytes as u64;
+        match phase {
+            SqBytePhase::Sq => {
+                self.sq_gets.fetch_add(gets, Ordering::Relaxed);
+                self.sq_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            SqBytePhase::Rerank => {
+                self.rerank_gets.fetch_add(gets, Ordering::Relaxed);
+                self.rerank_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+            SqBytePhase::Other => {
+                self.other_gets.fetch_add(gets, Ordering::Relaxed);
+                self.other_bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record_logical_sq_bytes(&self, bytes: usize) {
+        self.sq_logical_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn record_logical_rerank_bytes(&self, bytes: usize) {
+        self.rerank_logical_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn set_usize(field: &AtomicU64, value: usize) {
+        field.store(value as u64, Ordering::Relaxed);
+    }
+
+    fn emit(&self, effective_nprobe: usize, fetch_k: usize) {
+        let sq_gets = self.sq_gets.load(Ordering::Relaxed);
+        let sq_bytes = self.sq_bytes.load(Ordering::Relaxed);
+        let sq_logical_bytes = self.sq_logical_bytes.load(Ordering::Relaxed);
+        let rerank_gets = self.rerank_gets.load(Ordering::Relaxed);
+        let rerank_bytes = self.rerank_bytes.load(Ordering::Relaxed);
+        let rerank_logical_bytes = self.rerank_logical_bytes.load(Ordering::Relaxed);
+        let other_gets = self.other_gets.load(Ordering::Relaxed);
+        let other_bytes = self.other_bytes.load(Ordering::Relaxed);
+        let total_gets = sq_gets + rerank_gets + other_gets;
+        let total_bytes = sq_bytes + rerank_bytes + other_bytes;
+        eprintln!(
+            "zeppelin_sq_byte_stats query={} nprobe={effective_nprobe} fetch_k={fetch_k} \
+selected_clusters={} sq_objects={} coarse_candidates={} rerank_candidates={} rerank_clusters={} \
+rerank_objects={} final_results={} sq_gets={sq_gets} sq_bytes={sq_bytes} \
+sq_logical_bytes={sq_logical_bytes} sq_slack_bytes={} rerank_gets={rerank_gets} \
+rerank_bytes={rerank_bytes} rerank_logical_bytes={rerank_logical_bytes} rerank_slack_bytes={} \
+other_gets={other_gets} other_bytes={other_bytes} total_gets={total_gets} total_bytes={total_bytes}",
+            self.query_id,
+            self.selected_clusters.load(Ordering::Relaxed),
+            self.sq_objects.load(Ordering::Relaxed),
+            self.coarse_candidates.load(Ordering::Relaxed),
+            self.rerank_candidates.load(Ordering::Relaxed),
+            self.rerank_clusters.load(Ordering::Relaxed),
+            self.rerank_objects.load(Ordering::Relaxed),
+            self.final_results.load(Ordering::Relaxed),
+            sq_bytes.saturating_sub(sq_logical_bytes),
+            rerank_bytes.saturating_sub(rerank_logical_bytes),
+        );
+    }
+}
 
 fn cluster_object_layout_cache() -> &'static DashMap<String, Arc<ClusterObjectLayout>> {
     CLUSTER_OBJECT_LAYOUT_CACHE.get_or_init(DashMap::new)
@@ -91,6 +214,31 @@ async fn fetch_with_cache(
         c.get_or_fetch(key, || store.get(key)).await
     } else {
         store.get(key).await
+    }
+}
+
+async fn fetch_with_cache_counted(
+    cache: Option<&Arc<DiskCache>>,
+    store: &ZeppelinStore,
+    key: &str,
+    stats: Option<&SqSearchByteStats>,
+    phase: SqBytePhase,
+) -> Result<bytes::Bytes> {
+    if let Some(c) = cache {
+        c.get_or_fetch(key, || async {
+            let data = store.get(key).await?;
+            if let Some(stats) = stats {
+                stats.record_get(phase, data.len());
+            }
+            Ok(data)
+        })
+        .await
+    } else {
+        let data = store.get(key).await?;
+        if let Some(stats) = stats {
+            stats.record_get(phase, data.len());
+        }
+        Ok(data)
     }
 }
 
@@ -209,6 +357,8 @@ pub async fn search_ivf_flat(
     } else {
         top_k
     };
+    let sq_byte_stats =
+        SqSearchByteStats::new_if_enabled(matches!(index.quantization, QuantizationType::Scalar));
 
     let scan_clusters = select_scan_clusters(
         index,
@@ -242,6 +392,7 @@ pub async fn search_ivf_flat(
                 fetch_k,
                 store,
                 cache,
+                sq_byte_stats.clone(),
             )
             .await?
         }
@@ -305,10 +456,21 @@ pub async fn search_ivf_flat(
             .collect()
     } else {
         let top_candidates: Vec<Candidate> = sorted.into_iter().take(top_k).collect();
-        enrich_unfiltered_results(index, top_candidates, store, cache).await?
+        enrich_unfiltered_results(
+            index,
+            top_candidates,
+            store,
+            cache,
+            sq_byte_stats.as_deref(),
+        )
+        .await?
     };
 
     debug!(returned = results.len(), top_k = top_k, "search complete");
+    if let Some(stats) = &sq_byte_stats {
+        SqSearchByteStats::set_usize(&stats.final_results, results.len());
+        stats.emit(effective_nprobe, fetch_k);
+    }
 
     Ok(results)
 }
@@ -679,7 +841,7 @@ async fn scan_clusters_flat(
                         ),
                         async {
                             if want_attrs {
-                                load_attrs(index, cluster_idx, filter, store, cache).await
+                                load_attrs(index, cluster_idx, filter, store, cache, None).await
                             } else {
                                 Ok(None)
                             }
@@ -749,6 +911,7 @@ async fn scan_clusters_sq(
     fetch_k: usize,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
+    byte_stats: Option<Arc<SqSearchByteStats>>,
 ) -> Result<Vec<Candidate>> {
     use crate::index::quantization::sq::{sq_calibration_key, SqCalibration};
 
@@ -758,7 +921,14 @@ async fn scan_clusters_sq(
         calibration.clone()
     } else {
         let cal_key = sq_calibration_key(&index.namespace, &index.segment_id);
-        let cal_data = fetch_with_cache(cache, store, &cal_key).await?;
+        let cal_data = fetch_with_cache_counted(
+            cache,
+            store,
+            &cal_key,
+            byte_stats.as_deref(),
+            SqBytePhase::Other,
+        )
+        .await?;
         SqCalibration::from_bytes(&cal_data)?
     };
     let prefer_colocated_clusters = index.sq_calibration.is_some();
@@ -776,14 +946,29 @@ async fn scan_clusters_sq(
     let want_attr_filter = filter.is_some();
 
     let fetch_objects = cluster_fetch_objects(index, probe_clusters)?;
-    let sq_prefetched =
-        futures::future::join_all(fetch_objects.iter().cloned().map(|object| async move {
-            load_sq_object_for_coarse(index, object, prefer_colocated_clusters, store, cache).await
-        }))
-        .await;
+    if let Some(stats) = &byte_stats {
+        SqSearchByteStats::set_usize(&stats.selected_clusters, probe_clusters.len());
+        SqSearchByteStats::set_usize(&stats.sq_objects, fetch_objects.len());
+    }
+    let sq_prefetched = futures::future::join_all(fetch_objects.iter().cloned().map(|object| {
+        let stats = byte_stats.clone();
+        async move {
+            load_sq_object_for_coarse(
+                index,
+                object,
+                prefer_colocated_clusters,
+                store,
+                cache,
+                stats.as_deref(),
+            )
+            .await
+        }
+    }))
+    .await;
 
     let meta_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let owner = index.cluster_owner(cluster_idx);
+        let stats = byte_stats.clone();
         async move {
             let (prefilter, attrs) = tokio::join!(
                 try_bitmap_prefilter(
@@ -797,7 +982,7 @@ async fn scan_clusters_sq(
                 ),
                 async {
                     if want_attr_filter {
-                        load_attrs(index, cluster_idx, filter, store, cache).await
+                        load_attrs(index, cluster_idx, filter, store, cache, stats.as_deref()).await
                     } else {
                         Ok(None)
                     }
@@ -878,6 +1063,10 @@ async fn scan_clusters_sq(
     // real matches, not filtered-away noise (Task 6).
     let rerank_count = fetch_k * 4;
     coarse_candidates.truncate(rerank_count);
+    if let Some(stats) = &byte_stats {
+        SqSearchByteStats::set_usize(&stats.coarse_candidates, coarse_candidates.len());
+        SqSearchByteStats::set_usize(&stats.rerank_candidates, coarse_candidates.len());
+    }
 
     debug!(
         coarse_candidates = coarse_candidates.len(),
@@ -905,27 +1094,38 @@ async fn scan_clusters_sq(
     let want_rerank_attrs = filter.is_some();
     let rerank_cluster_ids: Vec<usize> = cluster_candidates.keys().copied().collect();
     let rerank_objects = cluster_fetch_objects(index, &rerank_cluster_ids)?;
-    let attrs_future =
-        futures::future::join_all(rerank_cluster_ids.iter().map(|&cluster_idx| async move {
+    if let Some(stats) = &byte_stats {
+        SqSearchByteStats::set_usize(&stats.rerank_clusters, rerank_cluster_ids.len());
+        SqSearchByteStats::set_usize(&stats.rerank_objects, rerank_objects.len());
+    }
+    let attrs_future = futures::future::join_all(rerank_cluster_ids.iter().map(|&cluster_idx| {
+        let stats = byte_stats.clone();
+        async move {
             let attrs = if want_rerank_attrs {
-                load_attrs(index, cluster_idx, filter, store, cache).await
+                load_attrs(index, cluster_idx, filter, store, cache, stats.as_deref()).await
             } else {
                 Ok(None)
             };
             (cluster_idx, attrs)
-        }));
-    let clusters_future =
-        futures::future::join_all(rerank_objects.iter().cloned().map(|object| async {
+        }
+    }));
+    let clusters_future = futures::future::join_all(rerank_objects.iter().cloned().map(|object| {
+        let stats = byte_stats.clone();
+        let cluster_candidates = &cluster_candidates;
+        let prefetched_objects = &prefetched_objects;
+        async move {
             load_full_clusters_for_rerank(
                 index,
                 object,
-                &cluster_candidates,
-                &prefetched_objects,
+                cluster_candidates,
+                prefetched_objects,
                 store,
                 cache,
+                stats.as_deref(),
             )
             .await
-        }));
+        }
+    }));
     let (attrs_prefetched, rerank_prefetched) = tokio::join!(attrs_future, clusters_future);
 
     let mut attrs_by_cluster = HashMap::new();
@@ -1007,6 +1207,7 @@ async fn load_sq_object_for_coarse(
     prefer_colocated: bool,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
+    stats: Option<&SqSearchByteStats>,
 ) -> Result<CoarseObjectSqFetch> {
     use crate::index::quantization::sq::{deserialize_sq_cluster, sq_cluster_key};
 
@@ -1018,7 +1219,11 @@ async fn load_sq_object_for_coarse(
                 index.cluster_owner(cluster_idx),
                 cluster_idx,
             );
-            let sq_data = fetch_with_cache(cache, store, &sq_key).await?;
+            let sq_data =
+                fetch_with_cache_counted(cache, store, &sq_key, stats, SqBytePhase::Sq).await?;
+            if let Some(stats) = stats {
+                stats.record_logical_sq_bytes(sq_data.len());
+            }
             sq_clusters.push((cluster_idx, deserialize_sq_cluster(&sq_data)?));
         }
         return Ok(CoarseObjectSqFetch {
@@ -1029,10 +1234,10 @@ async fn load_sq_object_for_coarse(
         });
     }
 
-    if let Some(layout) = load_cluster_object_layout(index, &object, store, cache).await? {
+    if let Some(layout) = load_cluster_object_layout(index, &object, store, cache, stats).await? {
         if layout.sections.iter().all(|section| section.sq.is_some()) {
             let sq_bytes =
-                fetch_object_sq_range(&object.key, &layout, &object.clusters, store).await?;
+                fetch_object_sq_range(&object.key, &layout, &object.clusters, store, stats).await?;
             let mut sq_clusters = Vec::with_capacity(object.clusters.len());
             let mut vector_ranges = Vec::with_capacity(object.clusters.len());
             for &cluster_idx in &object.clusters {
@@ -1069,12 +1274,19 @@ async fn load_sq_object_for_coarse(
         }
     }
 
-    let object_data = fetch_with_cache(cache, store, &object.key).await?;
+    let object_data =
+        fetch_with_cache_counted(cache, store, &object.key, stats, SqBytePhase::Sq).await?;
     let mut sq_clusters = Vec::with_capacity(object.clusters.len());
     for &cluster_idx in &object.clusters {
         if let Some(sq_cluster) =
             deserialize_colocated_sq_cluster_from_object(&object_data, cluster_idx)?
         {
+            if let Some(stats) = stats {
+                let sq_bytes: usize = sq_cluster.codes.iter().map(Vec::len).sum::<usize>()
+                    + sq_cluster.ids.iter().map(|id| 4 + id.len()).sum::<usize>()
+                    + 8;
+                stats.record_logical_sq_bytes(sq_bytes);
+            }
             sq_clusters.push((cluster_idx, sq_cluster));
             continue;
         }
@@ -1084,7 +1296,11 @@ async fn load_sq_object_for_coarse(
             index.cluster_owner(cluster_idx),
             cluster_idx,
         );
-        let sq_data = fetch_with_cache(cache, store, &sq_key).await?;
+        let sq_data =
+            fetch_with_cache_counted(cache, store, &sq_key, stats, SqBytePhase::Sq).await?;
+        if let Some(stats) = stats {
+            stats.record_logical_sq_bytes(sq_data.len());
+        }
         sq_clusters.push((cluster_idx, deserialize_sq_cluster(&sq_data)?));
     }
 
@@ -1106,9 +1322,11 @@ async fn fetch_object_sq_range(
     layout: &ClusterObjectLayout,
     clusters: &[usize],
     store: &ZeppelinStore,
+    stats: Option<&SqSearchByteStats>,
 ) -> Result<RangeBytes> {
     let mut start = usize::MAX;
     let mut end = 0usize;
+    let mut logical_bytes = 0usize;
     for &cluster_idx in clusters {
         let section = layout.section(cluster_idx).ok_or_else(|| {
             ZeppelinError::Index(format!(
@@ -1120,6 +1338,9 @@ async fn fetch_object_sq_range(
                 "cluster {cluster_idx} missing SQ range in {object_key}"
             ))
         })?;
+        logical_bytes = logical_bytes
+            .checked_add(sq.end - sq.start)
+            .ok_or_else(|| ZeppelinError::Index("SQ logical byte count overflows".into()))?;
         start = start.min(sq.start);
         end = end.max(sq.end);
     }
@@ -1129,6 +1350,10 @@ async fn fetch_object_sq_range(
         )));
     }
     let bytes = store.get_range(object_key, start..end).await?;
+    if let Some(stats) = stats {
+        stats.record_get(SqBytePhase::Sq, bytes.len());
+        stats.record_logical_sq_bytes(logical_bytes);
+    }
     Ok(RangeBytes {
         base_offset: start,
         bytes,
@@ -1177,6 +1402,7 @@ async fn load_full_clusters_for_rerank(
     prefetched_objects: &HashMap<String, bytes::Bytes>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
+    stats: Option<&SqSearchByteStats>,
 ) -> Result<Vec<RerankFetchedVector>> {
     let needed_clusters: Vec<usize> = object
         .clusters
@@ -1197,7 +1423,7 @@ async fn load_full_clusters_for_rerank(
         );
     }
 
-    if load_cluster_object_layout(index, &object, store, cache)
+    if load_cluster_object_layout(index, &object, store, cache, stats)
         .await?
         .is_some()
     {
@@ -1208,12 +1434,14 @@ async fn load_full_clusters_for_rerank(
                 cluster_candidates,
                 index.dim,
                 store,
+                stats,
             )
             .await;
         }
     }
 
-    let object_data = fetch_with_cache(cache, store, &object.key).await?;
+    let object_data =
+        fetch_with_cache_counted(cache, store, &object.key, stats, SqBytePhase::Rerank).await?;
     rerank_vectors_from_object(
         &object.key,
         &object_data,
@@ -1240,6 +1468,7 @@ async fn fetch_rerank_vectors_by_range(
     cluster_candidates: &HashMap<usize, Vec<RerankNeed>>,
     dim: usize,
     store: &ZeppelinStore,
+    stats: Option<&SqSearchByteStats>,
 ) -> Result<Vec<RerankFetchedVector>> {
     let mut requested = Vec::new();
     for &cluster_idx in clusters {
@@ -1262,6 +1491,11 @@ async fn fetch_rerank_vectors_by_range(
             });
         }
     }
+    let logical_bytes = requested.iter().try_fold(0usize, |acc, request| {
+        let len = request.range.end - request.range.start;
+        acc.checked_add(len)
+            .ok_or_else(|| ZeppelinError::Index("rerank logical byte count overflows".into()))
+    })?;
     let gap_bytes = configured_rerank_coalesce_gap_bytes()?;
     let coalesced = coalesce_rerank_ranges(&requested, gap_bytes)?;
     let ranges: Vec<Range<usize>> = coalesced
@@ -1275,7 +1509,28 @@ async fn fetch_rerank_vectors_by_range(
         gap_bytes,
         "coalesced rerank vector ranges"
     );
-    let vector_bytes = store.get_ranges(object_key, &ranges).await?;
+    let vector_bytes = futures::future::join_all(
+        ranges
+            .iter()
+            .cloned()
+            .map(|range| store.get_range(object_key, range)),
+    )
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+    if let Some(stats) = stats {
+        let physical_bytes =
+            vector_bytes
+                .iter()
+                .map(bytes::Bytes::len)
+                .try_fold(0usize, |acc, len| {
+                    acc.checked_add(len).ok_or_else(|| {
+                        ZeppelinError::Index("rerank physical byte count overflows".into())
+                    })
+                })?;
+        stats.record_gets(SqBytePhase::Rerank, ranges.len(), physical_bytes);
+        stats.record_logical_rerank_bytes(logical_bytes);
+    }
     if vector_bytes.len() != coalesced.len() {
         return Err(ZeppelinError::Index(format!(
             "range fetch count mismatch for {object_key}: requested={}, got={}",
@@ -1455,6 +1710,7 @@ async fn load_cluster_object_layout(
     object: &ClusterFetchObject,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
+    stats: Option<&SqSearchByteStats>,
 ) -> Result<Option<Arc<ClusterObjectLayout>>> {
     if !cluster_object_key_may_have_layout(&object.key, object.clusters.len()) {
         return Ok(None);
@@ -1477,6 +1733,9 @@ async fn load_cluster_object_layout(
 
     let header_len = cluster_object_header_range_len(object.clusters.len())?;
     let header = store.get_range(&object.key, 0..header_len).await?;
+    if let Some(stats) = stats {
+        stats.record_get(SqBytePhase::Other, header.len());
+    }
     let Some(layout) = cluster_object_layout(&header)? else {
         return Ok(None);
     };
@@ -1594,7 +1853,7 @@ async fn scan_clusters_pq(
                 fetch_with_cache(cache, store, &pq_key),
                 async {
                     if want_attr_filter {
-                        load_attrs(index, cluster_idx, filter, store, cache).await
+                        load_attrs(index, cluster_idx, filter, store, cache, None).await
                     } else {
                         Ok(None)
                     }
@@ -1652,7 +1911,7 @@ async fn scan_clusters_pq(
                 };
                 let (cluster_res, attrs) = tokio::join!(cluster_fetch, async {
                     if want_rerank_attrs {
-                        load_attrs(index, cluster_idx, filter, store, cache).await
+                        load_attrs(index, cluster_idx, filter, store, cache, None).await
                     } else {
                         Ok(None)
                     }
@@ -1759,6 +2018,7 @@ async fn enrich_unfiltered_results(
     candidates: Vec<Candidate>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
+    stats: Option<&SqSearchByteStats>,
 ) -> Result<Vec<SearchResult>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
@@ -1776,7 +2036,7 @@ async fn enrich_unfiltered_results(
         futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| async move {
             (
                 cluster_idx,
-                load_attrs(index, cluster_idx, None, store, cache).await,
+                load_attrs(index, cluster_idx, None, store, cache, stats).await,
             )
         }))
         .await;
@@ -1825,6 +2085,7 @@ async fn load_attrs(
     _filter: Option<&Filter>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
+    stats: Option<&SqSearchByteStats>,
 ) -> Result<Option<ClusterAttrs>> {
     if !index.cluster_may_have_attrs(cluster_idx) {
         return Ok(None);
@@ -1834,7 +2095,7 @@ async fn load_attrs(
         index.cluster_owner(cluster_idx),
         cluster_idx,
     );
-    let data = fetch_with_cache(cache, store, &akey).await?;
+    let data = fetch_with_cache_counted(cache, store, &akey, stats, SqBytePhase::Other).await?;
     Ok(Some(deserialize_attrs(&data)?))
 }
 
