@@ -323,6 +323,16 @@ impl DiskCache {
         debug!(scope = scope, key = key, "pinned cache key for scope");
     }
 
+    /// Remove the pinned key for `scope`, if any.
+    pub async fn unpin_scoped(&self, scope: &str) {
+        let Some((_, old_key)) = self.scoped_pins.remove(scope) else {
+            return;
+        };
+        let mut pinned = self.pinned.write().await;
+        pinned.remove(&old_key);
+        debug!(scope = scope, key = %old_key, "unpinned scoped cache key");
+    }
+
     /// Whether a key is currently pinned.
     pub async fn is_pinned(&self, key: &str) -> bool {
         self.pinned.read().await.contains(key)

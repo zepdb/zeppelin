@@ -16,7 +16,7 @@ use crate::error::Result;
 use crate::index::VectorIndex;
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, Filter, SearchResult, VectorEntry};
-use crate::wal::manifest::ClusterDataObjectRef;
+use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef};
 
 /// In-memory handle for a built IVF-Flat index.
 ///
@@ -58,6 +58,9 @@ pub struct IvfFlatIndex {
     /// Manifest reference for the resident sketch artifact, when this handle
     /// came from a build path that created one.
     pub(crate) sketch_ref: Option<crate::wal::manifest::SketchRef>,
+    /// Manifest reference for the segment bootstrap artifact, when this handle
+    /// came from a build path that created one.
+    pub(crate) bootstrap_ref: Option<BootstrapRef>,
 }
 
 impl IvfFlatIndex {
@@ -136,10 +139,11 @@ impl IvfFlatIndex {
 
     /// Load an IVF-Flat index using pre-known metadata from the manifest.
     ///
-    /// Only fetches centroids — skips cluster-count probing and quantization
-    /// detection, saving ~18 S3 GETs per query. When `cache` is provided,
-    /// the centroids are served through the tiered cache and pinned for the
-    /// namespace's active segment.
+    /// Fetches the bootstrap object when present, otherwise fetches legacy
+    /// centroids plus sketch artifacts. It skips cluster-count probing and
+    /// quantization detection, saving ~18 S3 GETs per query. When `cache` is
+    /// provided, the active segment metadata is served through the tiered cache
+    /// and pinned for the namespace's active segment.
     #[allow(clippy::too_many_arguments)]
     pub async fn load_from_manifest(
         store: &ZeppelinStore,
@@ -150,6 +154,7 @@ impl IvfFlatIndex {
         cluster_owners: Vec<String>,
         cluster_objects: Vec<ClusterDataObjectRef>,
         sketch_ref: Option<crate::wal::manifest::SketchRef>,
+        bootstrap_ref: Option<BootstrapRef>,
         cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
     ) -> Result<Self> {
         build::load_ivf_flat_from_manifest(
@@ -161,6 +166,7 @@ impl IvfFlatIndex {
             cluster_owners,
             cluster_objects,
             sketch_ref,
+            bootstrap_ref,
             cache,
         )
         .await

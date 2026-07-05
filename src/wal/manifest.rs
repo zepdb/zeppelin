@@ -54,6 +54,15 @@ pub struct SketchRef {
     pub size_bytes: u64,
 }
 
+/// A reference to an immutable segment bootstrap artifact stored on S3.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapRef {
+    /// S3 key for the immutable bootstrap artifact.
+    pub key: String,
+    /// Serialized artifact size in bytes.
+    pub size_bytes: u64,
+}
+
 /// A manifest reference to one immutable object containing one or more IVF
 /// cluster payloads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,9 +123,9 @@ pub struct SegmentRef {
     /// rerank. `None` means the segment predates sketches and must use the
     /// legacy IVF path.
     ///
-    /// NOTE: this field must stay LAST in the struct. MessagePack encodes
-    /// structs as arrays, so old manifests decode only if new fields are
-    /// trailing and `#[serde(default)]`.
+    /// NOTE: manifest schema additions must remain trailing in the struct.
+    /// MessagePack encodes structs as arrays, so old manifests decode only if
+    /// new fields are trailing and `#[serde(default)]`.
     #[serde(default)]
     pub sketch: Option<SketchRef>,
     /// Immutable cluster-data object layout for grouped cluster objects.
@@ -127,11 +136,24 @@ pub struct SegmentRef {
     /// compactions may contain mixed references: rewritten singleton objects
     /// under the new segment and carried objects under older segment keys.
     ///
-    /// NOTE: this field must stay LAST in the struct. MessagePack encodes
+    /// NOTE: manifest schema additions must remain trailing in the struct.
     /// structs as arrays, so old manifests decode only if new fields are
     /// trailing and `#[serde(default)]`.
     #[serde(default)]
     pub cluster_objects: Vec<ClusterDataObjectRef>,
+    /// Immutable bootstrap artifact containing centroids and resident sketch
+    /// bytes for this segment.
+    ///
+    /// When present, the vector query load path fetches this single object and
+    /// slices its sections into the existing centroids and sketch decoders.
+    /// `None` means the segment predates bootstrap artifacts and must load the
+    /// legacy `centroids.bin` and `coarse_sketch.bin` objects explicitly.
+    ///
+    /// NOTE: this field must stay LAST in the struct. MessagePack encodes
+    /// structs as arrays, so old manifests decode only if new fields are
+    /// trailing and `#[serde(default)]`.
+    #[serde(default)]
+    pub bootstrap: Option<BootstrapRef>,
 }
 
 impl SegmentRef {
@@ -410,6 +432,7 @@ mod tests {
             cluster_owners: Vec::new(),
             sketch: None,
             cluster_objects: Vec::new(),
+            bootstrap: None,
         }
     }
 

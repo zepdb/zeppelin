@@ -371,6 +371,7 @@ async fn segment_search(
         segment_ref.cluster_owners.clone(),
         segment_ref.cluster_objects.clone(),
         segment_ref.sketch.clone(),
+        segment_ref.bootstrap.clone(),
         cache,
     )
     .await?;
@@ -795,6 +796,7 @@ async fn segment_bm25_search_full_scan(
         segment_ref.cluster_objects.clone(),
         None,
         None,
+        None,
     )
     .await?;
     let num_clusters = index.num_clusters();
@@ -1126,6 +1128,7 @@ mod tests {
             cluster_owners: Vec::new(),
             sketch: None,
             cluster_objects: Vec::new(),
+            bootstrap: None,
         }
     }
 
