@@ -25,7 +25,6 @@ const SKETCH_K: usize = SKETCH_V3_K;
 const SKETCH_TRAIN_SAMPLE: usize = 4096;
 const SKETCH_TRAIN_ITERS: usize = 6;
 const SKETCH_CLUSTER_SCORE_TOP_M: usize = 2;
-const SKETCH_CENTROID_ANCHORS: usize = 2;
 const SKETCH_CODE_WIDTH: SketchCodeWidth = SketchCodeWidth::EightBit;
 
 /// S3 key for the resident coarse sketch.
@@ -212,7 +211,7 @@ impl ResidentSketch {
         query: &[f32],
         distance_metric: DistanceMetric,
         probe_clusters: &[usize],
-        cluster_budget: usize,
+        budget: AdaptiveClusterBudget,
     ) -> Result<Vec<usize>> {
         if query.len() != self.dim {
             return Err(ZeppelinError::DimensionMismatch {
@@ -220,15 +219,14 @@ impl ResidentSketch {
                 actual: query.len(),
             });
         }
-        if cluster_budget == 0 {
-            return Err(ZeppelinError::Index(
-                "coarse sketch cluster budget is zero".into(),
-            ));
-        }
         if probe_clusters.is_empty() {
             return Err(ZeppelinError::Index(
                 "coarse sketch received an empty probe set".into(),
             ));
+        }
+        budget.validate()?;
+        if budget.max_clusters >= probe_clusters.len() {
+            return Ok(probe_clusters.to_vec());
         }
         for &cluster_idx in probe_clusters {
             if cluster_idx >= self.cluster_count {
@@ -284,33 +282,12 @@ impl ResidentSketch {
                 })
         });
 
-        let mut selected = Vec::with_capacity(cluster_budget.min(probe_clusters.len()));
-        let anchor_budget = centroid_anchor_budget(cluster_budget, probe_clusters.len());
-        for &cluster_idx in probe_clusters.iter().take(anchor_budget) {
-            let (start, end) = self.cluster_offsets[cluster_idx];
-            if start != end {
-                selected.push(cluster_idx);
-            }
-        }
-
-        for score in ranked_clusters {
-            if selected.len() >= cluster_budget || selected.len() >= probe_clusters.len() {
-                break;
-            }
-            if !selected.contains(&score.cluster_idx) {
-                selected.push(score.cluster_idx);
-            }
-        }
-
-        for &cluster_idx in probe_clusters {
-            if selected.len() >= cluster_budget || selected.len() >= probe_clusters.len() {
-                break;
-            }
-            if !selected.contains(&cluster_idx) {
-                selected.push(cluster_idx);
-            }
-        }
-        Ok(selected)
+        let target_count = adaptive_cluster_count(&ranked_clusters, budget);
+        Ok(ranked_clusters
+            .into_iter()
+            .take(target_count)
+            .map(|score| score.cluster_idx)
+            .collect())
     }
 
     fn build_adc_table(&self, query: &[f32], distance_metric: DistanceMetric) -> Vec<f32> {
@@ -339,6 +316,60 @@ impl ResidentSketch {
             score += adc_table[subq * self.codebook_size + code];
         }
         score
+    }
+}
+
+/// Query-local cluster budget for resident-sketch selection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdaptiveClusterBudget {
+    floor_clusters: usize,
+    max_clusters: usize,
+    relative_score_margin: f32,
+}
+
+impl AdaptiveClusterBudget {
+    #[must_use]
+    pub(crate) fn new(
+        floor_clusters: usize,
+        max_clusters: usize,
+        relative_score_margin: f32,
+    ) -> Self {
+        Self {
+            floor_clusters,
+            max_clusters,
+            relative_score_margin,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn max_clusters(self) -> usize {
+        self.max_clusters
+    }
+
+    fn validate(self) -> Result<()> {
+        if self.max_clusters == 0 {
+            return Err(ZeppelinError::Index(
+                "coarse sketch max cluster budget is zero".into(),
+            ));
+        }
+        if self.floor_clusters == 0 {
+            return Err(ZeppelinError::Index(
+                "coarse sketch floor cluster budget is zero".into(),
+            ));
+        }
+        if self.floor_clusters > self.max_clusters {
+            return Err(ZeppelinError::Index(format!(
+                "coarse sketch floor budget {} exceeds max budget {}",
+                self.floor_clusters, self.max_clusters
+            )));
+        }
+        if !self.relative_score_margin.is_finite() || self.relative_score_margin < 0.0 {
+            return Err(ZeppelinError::Index(format!(
+                "coarse sketch invalid relative score margin: {}",
+                self.relative_score_margin
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -523,6 +554,26 @@ impl TopSketchScores {
     }
 }
 
+fn adaptive_cluster_count(
+    ranked_clusters: &[ClusterScore],
+    budget: AdaptiveClusterBudget,
+) -> usize {
+    debug_assert!(budget.validate().is_ok());
+    let max_clusters = budget.max_clusters.min(ranked_clusters.len());
+    let floor_clusters = budget.floor_clusters.min(max_clusters);
+    if floor_clusters == max_clusters || ranked_clusters.is_empty() {
+        return max_clusters;
+    }
+
+    let best_score = ranked_clusters[0].aggregate_score;
+    let cutoff = best_score + best_score.abs() * budget.relative_score_margin;
+    let mut count = floor_clusters;
+    while count < max_clusters && ranked_clusters[count].aggregate_score <= cutoff {
+        count += 1;
+    }
+    count
+}
+
 fn sample_indices(vector_count: usize, sample_count: usize) -> Vec<usize> {
     if sample_count >= vector_count {
         return (0..vector_count).collect();
@@ -599,13 +650,6 @@ fn chunk_range(dim: usize, chunks: usize, chunk: usize) -> (usize, usize) {
 #[cfg(test)]
 fn packed_code_bytes(subquantizers: usize) -> usize {
     SKETCH_CODE_WIDTH.packed_code_bytes(subquantizers)
-}
-
-fn centroid_anchor_budget(cluster_budget: usize, probe_count: usize) -> usize {
-    if cluster_budget < SKETCH_CENTROID_ANCHORS * 3 {
-        return 0;
-    }
-    SKETCH_CENTROID_ANCHORS.min(cluster_budget).min(probe_count)
 }
 
 fn pack_code(bytes: &mut [u8], index: usize, value: u8, code_width: SketchCodeWidth) {
@@ -706,6 +750,35 @@ fn read_f32(data: &[u8], offset: usize, label: &str) -> Result<f32> {
 mod tests {
     use super::*;
 
+    fn fixed_budget(cluster_budget: usize) -> AdaptiveClusterBudget {
+        AdaptiveClusterBudget::new(cluster_budget, cluster_budget, 0.0)
+    }
+
+    fn one_dim_sketch_with_scores(scores: &[f32]) -> ResidentSketch {
+        assert!(scores.len() <= SKETCH_K);
+        let mut codebook = vec![0.0; SKETCH_K];
+        let mut code_bytes = Vec::new();
+        for (code, &score) in scores.iter().enumerate() {
+            codebook[code] = score.sqrt();
+            let mut packed = vec![0u8; 1];
+            pack_code(&mut packed, 0, code as u8, SKETCH_CODE_WIDTH);
+            code_bytes.extend_from_slice(&packed);
+        }
+
+        ResidentSketch {
+            dim: 1,
+            subquantizers: 1,
+            cluster_count: scores.len(),
+            codebook,
+            codebook_size: SKETCH_K,
+            cluster_offsets: (0..scores.len()).map(|row| (row, row + 1)).collect(),
+            codes: Bytes::from(code_bytes),
+            cluster_has_attrs: vec![false; scores.len()],
+            packed_code_bytes: 1,
+            code_width: SKETCH_CODE_WIDTH,
+        }
+    }
+
     #[test]
     fn sketch_roundtrip_and_attr_bits() {
         let attrs = vec![
@@ -729,7 +802,12 @@ mod tests {
 
         let decoded = ResidentSketch::from_bytes(&bytes).unwrap();
         let selected = decoded
-            .select_clusters(&[1.0, 0.0, 0.0], DistanceMetric::Cosine, &[0, 1], 1)
+            .select_clusters(
+                &[1.0, 0.0, 0.0],
+                DistanceMetric::Cosine,
+                &[0, 1],
+                fixed_budget(1),
+            )
             .unwrap();
         assert_eq!(selected.len(), 1);
     }
@@ -762,7 +840,7 @@ mod tests {
         };
 
         let selected = sketch
-            .select_clusters(&[0.0], DistanceMetric::Euclidean, &[0, 1], 1)
+            .select_clusters(&[0.0], DistanceMetric::Euclidean, &[0, 1], fixed_budget(1))
             .unwrap();
 
         assert_eq!(selected, vec![1]);
@@ -774,44 +852,62 @@ mod tests {
     }
 
     #[test]
-    fn cluster_selection_anchors_nearest_centroid_clusters() {
-        let mut codebook = Vec::with_capacity(SKETCH_K);
-        for value in 0..SKETCH_K {
-            codebook.push(value as f32);
-        }
-
-        let mut code_bytes = Vec::new();
-        for code in [15u8, 0, 0, 0, 0, 0, 0, 0] {
-            let mut packed = vec![0u8; 1];
-            pack_code(&mut packed, 0, code, SKETCH_CODE_WIDTH);
-            code_bytes.extend_from_slice(&packed);
-        }
-
-        let sketch = ResidentSketch {
-            dim: 1,
-            subquantizers: 1,
-            cluster_count: 8,
-            codebook,
-            codebook_size: SKETCH_K,
-            cluster_offsets: (0..8).map(|row| (row, row + 1)).collect(),
-            codes: Bytes::from(code_bytes),
-            cluster_has_attrs: vec![false; 8],
-            packed_code_bytes: 1,
-            code_width: SKETCH_CODE_WIDTH,
-        };
+    fn adaptive_cluster_selection_uses_floor_and_score_gap() {
+        let sketch = one_dim_sketch_with_scores(&[1.0, 1.03, 1.07, 1.20, 1.21, 1.22]);
 
         let selected = sketch
             .select_clusters(
                 &[0.0],
                 DistanceMetric::Euclidean,
-                &[0, 1, 2, 3, 4, 5, 6, 7],
-                6,
+                &[0, 1, 2, 3, 4, 5],
+                AdaptiveClusterBudget::new(1, 5, 0.08),
             )
             .unwrap();
 
-        assert!(selected.contains(&0));
-        assert!(selected.contains(&1));
-        assert_eq!(selected.len(), 6);
+        assert_eq!(selected, vec![0, 1, 2]);
+
+        let floor_selected = sketch
+            .select_clusters(
+                &[0.0],
+                DistanceMetric::Euclidean,
+                &[0, 1, 2, 3, 4, 5],
+                AdaptiveClusterBudget::new(4, 5, 0.01),
+            )
+            .unwrap();
+        assert_eq!(floor_selected, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn adaptive_cluster_selection_respects_cap() {
+        let sketch = one_dim_sketch_with_scores(&[1.0, 1.01, 1.02, 1.03]);
+
+        let selected = sketch
+            .select_clusters(
+                &[0.0],
+                DistanceMetric::Euclidean,
+                &[0, 1, 2, 3],
+                AdaptiveClusterBudget::new(1, 2, 0.50),
+            )
+            .unwrap();
+
+        assert_eq!(selected, vec![0, 1]);
+    }
+
+    #[test]
+    fn adaptive_cluster_selection_no_ops_when_cap_covers_probe_set() {
+        let sketch = one_dim_sketch_with_scores(&[8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]);
+        let probe_clusters = vec![7, 6, 5, 4, 3, 2, 1, 0];
+
+        let selected = sketch
+            .select_clusters(
+                &[0.0],
+                DistanceMetric::Euclidean,
+                &probe_clusters,
+                AdaptiveClusterBudget::new(4, 8, 0.01),
+            )
+            .unwrap();
+
+        assert_eq!(selected, probe_clusters);
     }
 
     #[test]
@@ -839,7 +935,7 @@ mod tests {
         assert_eq!(sketch.packed_code_bytes, 1);
 
         let selected = sketch
-            .select_clusters(&[0.0], DistanceMetric::Euclidean, &[0], 1)
+            .select_clusters(&[0.0], DistanceMetric::Euclidean, &[0], fixed_budget(1))
             .unwrap();
         assert_eq!(selected, vec![0]);
     }

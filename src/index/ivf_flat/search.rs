@@ -22,6 +22,7 @@ use super::build::{
     attrs_key, cluster_key, deserialize_attrs, deserialize_cluster,
     deserialize_colocated_sq_cluster,
 };
+use super::sketch::AdaptiveClusterBudget;
 use super::IvfFlatIndex;
 
 use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
@@ -29,9 +30,20 @@ use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 
 type ClusterAttrs = Vec<Option<HashMap<String, AttributeValue>>>;
 
-const SKETCH_MIN_CLUSTERS: usize = 6;
+// Previous smooth fixed budget: keeps the cap monotonic in nprobe and makes
+// high-nprobe sentinel runs become a structural no-op when cap >= probe count.
+const SKETCH_BASE_MIN_CLUSTERS: usize = 6;
 const SKETCH_CLUSTER_LINEAR_FRACTION: f32 = 0.3125;
 const SKETCH_CLUSTER_QUADRATIC_SCALE: f32 = 150.0;
+// Always fetch a small sketch-ranked core so sharp/easy queries can spend less
+// than the old fixed budget without risking single-cluster brittleness.
+const SKETCH_ADAPTIVE_FLOOR_CLUSTERS: usize = 4;
+// Hard queries can borrow up to roughly twice the previous fixed budget while
+// the score-gap cutoff keeps the mean near the old operating point.
+const SKETCH_ADAPTIVE_MAX_MULTIPLIER: usize = 2;
+// Include extra clusters whose aggregate sketch distance is close to the best
+// cluster for this query; the cutoff uses no cross-query state.
+const SKETCH_ADAPTIVE_RELATIVE_SCORE_MARGIN: f32 = 0.13;
 
 /// A candidate result during search, before final ranking.
 struct Candidate {
@@ -252,19 +264,34 @@ fn select_scan_clusters(
         return Ok(probe_clusters.to_vec());
     }
 
-    let cluster_budget = sketch_cluster_budget(effective_nprobe);
-    if cluster_budget >= probe_clusters.len() {
+    let cluster_budget = adaptive_sketch_budget(effective_nprobe);
+    if cluster_budget.max_clusters() >= probe_clusters.len() {
         return Ok(probe_clusters.to_vec());
     }
 
     sketch.select_clusters(query, distance_metric, probe_clusters, cluster_budget)
 }
 
-fn sketch_cluster_budget(effective_nprobe: usize) -> usize {
+fn adaptive_sketch_budget(effective_nprobe: usize) -> AdaptiveClusterBudget {
+    let max_clusters = sketch_adaptive_cluster_cap(effective_nprobe);
+    AdaptiveClusterBudget::new(
+        SKETCH_ADAPTIVE_FLOOR_CLUSTERS.min(max_clusters),
+        max_clusters,
+        SKETCH_ADAPTIVE_RELATIVE_SCORE_MARGIN,
+    )
+}
+
+fn sketch_adaptive_cluster_cap(effective_nprobe: usize) -> usize {
+    sketch_base_cluster_budget(effective_nprobe)
+        .saturating_mul(SKETCH_ADAPTIVE_MAX_MULTIPLIER)
+        .min(effective_nprobe)
+}
+
+fn sketch_base_cluster_budget(effective_nprobe: usize) -> usize {
     let nprobe = effective_nprobe as f32;
     ((nprobe * SKETCH_CLUSTER_LINEAR_FRACTION + (nprobe * nprobe / SKETCH_CLUSTER_QUADRATIC_SCALE))
         .ceil() as usize)
-        .max(SKETCH_MIN_CLUSTERS)
+        .max(SKETCH_BASE_MIN_CLUSTERS)
         .min(effective_nprobe)
 }
 
@@ -927,21 +954,21 @@ mod tests {
     }
 
     #[test]
-    fn sketch_cluster_budget_scales_monotonically() {
+    fn adaptive_sketch_cap_scales_monotonically() {
         let mut prev = 0usize;
         for nprobe in 1..=128 {
-            let budget = sketch_cluster_budget(nprobe);
+            let budget = adaptive_sketch_budget(nprobe);
+            let cap = budget.max_clusters();
             assert!(
-                budget >= prev,
-                "budget must be monotonic: nprobe={nprobe} budget={budget} prev={prev}"
+                cap >= prev,
+                "budget cap must be monotonic: nprobe={nprobe} cap={cap} prev={prev}"
             );
-            assert!(budget <= nprobe);
-            prev = budget;
+            assert!(cap <= nprobe);
+            prev = cap;
         }
 
-        assert_eq!(sketch_cluster_budget(8), 6);
-        assert_eq!(sketch_cluster_budget(16), 7);
-        assert!(sketch_cluster_budget(64) > 7);
-        assert_eq!(sketch_cluster_budget(128), 128);
+        assert_eq!(adaptive_sketch_budget(8).max_clusters(), 8);
+        assert_eq!(adaptive_sketch_budget(16).max_clusters(), 14);
+        assert_eq!(adaptive_sketch_budget(128).max_clusters(), 128);
     }
 }
