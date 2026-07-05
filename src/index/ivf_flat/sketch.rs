@@ -213,6 +213,26 @@ impl ResidentSketch {
         probe_clusters: &[usize],
         budget: AdaptiveClusterBudget,
     ) -> Result<Vec<usize>> {
+        budget.validate()?;
+        let ranked_clusters = self.rank_clusters(query, distance_metric, probe_clusters)?;
+        if budget.max_clusters >= probe_clusters.len() {
+            return Ok(probe_clusters.to_vec());
+        }
+        let target_count = adaptive_cluster_count(&ranked_clusters, budget);
+        Ok(ranked_clusters
+            .into_iter()
+            .take(target_count)
+            .map(|score| score.cluster_idx)
+            .collect())
+    }
+
+    /// Rank clusters inside the requested centroid-probe set by sketch score.
+    pub(crate) fn rank_clusters(
+        &self,
+        query: &[f32],
+        distance_metric: DistanceMetric,
+        probe_clusters: &[usize],
+    ) -> Result<Vec<ClusterScore>> {
         if query.len() != self.dim {
             return Err(ZeppelinError::DimensionMismatch {
                 expected: self.dim,
@@ -223,10 +243,6 @@ impl ResidentSketch {
             return Err(ZeppelinError::Index(
                 "coarse sketch received an empty probe set".into(),
             ));
-        }
-        budget.validate()?;
-        if budget.max_clusters >= probe_clusters.len() {
-            return Ok(probe_clusters.to_vec());
         }
         for &cluster_idx in probe_clusters {
             if cluster_idx >= self.cluster_count {
@@ -282,12 +298,7 @@ impl ResidentSketch {
                 })
         });
 
-        let target_count = adaptive_cluster_count(&ranked_clusters, budget);
-        Ok(ranked_clusters
-            .into_iter()
-            .take(target_count)
-            .map(|score| score.cluster_idx)
-            .collect())
+        Ok(ranked_clusters)
     }
 
     fn build_adc_table(&self, query: &[f32], distance_metric: DistanceMetric) -> Vec<f32> {
@@ -507,9 +518,9 @@ pub(crate) fn build_resident_sketch(
 }
 
 #[derive(Clone, Copy)]
-struct ClusterScore {
-    cluster_idx: usize,
-    aggregate_score: f32,
+pub(crate) struct ClusterScore {
+    pub(crate) cluster_idx: usize,
+    pub(crate) aggregate_score: f32,
 }
 
 struct TopSketchScores {

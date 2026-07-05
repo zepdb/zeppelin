@@ -32,9 +32,9 @@ pub struct FragmentRef {
     /// fragments simply don't contribute to the bytes trigger; the age
     /// and count triggers still cover them.
     ///
-    /// NOTE: this field must stay LAST in the struct. MessagePack encodes
-    /// structs as arrays, so old manifests decode only if new fields are
-    /// trailing and `#[serde(default)]`.
+    /// NOTE: manifest schema additions must remain trailing in the struct.
+    /// MessagePack encodes structs as arrays, so old manifests decode only if
+    /// new fields are trailing and `#[serde(default)]`.
     #[serde(default)]
     pub size_bytes: u64,
 }
@@ -52,6 +52,16 @@ pub struct SketchRef {
     pub bytes_per_vector: usize,
     /// Serialized artifact size in bytes.
     pub size_bytes: u64,
+}
+
+/// A manifest reference to one immutable object containing one or more IVF
+/// cluster payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterDataObjectRef {
+    /// S3 key for the immutable cluster-data object.
+    pub key: String,
+    /// Logical cluster indexes whose current data lives in this object.
+    pub clusters: Vec<usize>,
 }
 
 /// A reference to an IVF segment stored on S3.
@@ -109,6 +119,19 @@ pub struct SegmentRef {
     /// trailing and `#[serde(default)]`.
     #[serde(default)]
     pub sketch: Option<SketchRef>,
+    /// Immutable cluster-data object layout for paired cluster objects.
+    ///
+    /// EMPTY means the legacy one-object-per-cluster layout:
+    /// `{cluster_owner(i)}/cluster_i.bin`. New full IVF-Flat compactions write
+    /// buddy-paired cluster data and populate this list. Incremental
+    /// compactions may contain mixed references: rewritten singleton objects
+    /// under the new segment and carried objects under older segment keys.
+    ///
+    /// NOTE: this field must stay LAST in the struct. MessagePack encodes
+    /// structs as arrays, so old manifests decode only if new fields are
+    /// trailing and `#[serde(default)]`.
+    #[serde(default)]
+    pub cluster_objects: Vec<ClusterDataObjectRef>,
 }
 
 impl SegmentRef {
@@ -386,6 +409,7 @@ mod tests {
             has_global_fts: false,
             cluster_owners: Vec::new(),
             sketch: None,
+            cluster_objects: Vec::new(),
         }
     }
 
