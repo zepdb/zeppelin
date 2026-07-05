@@ -191,6 +191,13 @@ pub async fn search_ivf_flat(
         .take(effective_nprobe)
         .map(|(idx, _)| *idx)
         .collect();
+    // --- Step 2: Determine fetch size (oversample if filtering) ---
+    let fetch_k = if filter.is_some() {
+        oversampled_k(top_k, oversample_factor)
+    } else {
+        top_k
+    };
+
     let scan_clusters = select_scan_clusters(
         index,
         query,
@@ -198,6 +205,7 @@ pub async fn search_ivf_flat(
         filter,
         &probe_clusters,
         effective_nprobe,
+        fetch_k,
     )?;
 
     debug!(
@@ -206,13 +214,6 @@ pub async fn search_ivf_flat(
         scan_clusters = ?scan_clusters,
         "probing clusters"
     );
-
-    // --- Step 2: Determine fetch size (oversample if filtering) ---
-    let fetch_k = if filter.is_some() {
-        oversampled_k(top_k, oversample_factor)
-    } else {
-        top_k
-    };
 
     // --- Step 3: Scan selected clusters ---
     // Once the resident sketch has chosen a cluster subset, unfiltered queries
@@ -320,6 +321,7 @@ fn select_scan_clusters(
     filter: Option<&Filter>,
     probe_clusters: &[usize],
     effective_nprobe: usize,
+    retrieval_top_k: usize,
 ) -> Result<Vec<usize>> {
     let Some(sketch) = &index.resident_sketch else {
         return expand_clusters_to_objects(index, probe_clusters);
@@ -347,7 +349,8 @@ fn select_scan_clusters(
     }
 
     if !index.cluster_objects.is_empty() {
-        let ranked_clusters = sketch.rank_clusters(query, distance_metric, probe_clusters)?;
+        let ranked_clusters =
+            sketch.rank_clusters(query, distance_metric, probe_clusters, retrieval_top_k)?;
         let selected = select_grouped_object_clusters(index, &ranked_clusters, effective_nprobe)?;
         emit_scan_stats(
             effective_nprobe,
@@ -358,7 +361,13 @@ fn select_scan_clusters(
         return Ok(selected.clusters);
     }
 
-    sketch.select_clusters(query, distance_metric, probe_clusters, cluster_budget)
+    sketch.select_clusters(
+        query,
+        distance_metric,
+        probe_clusters,
+        cluster_budget,
+        retrieval_top_k,
+    )
 }
 
 struct SelectedObjectClusters {
@@ -384,29 +393,59 @@ fn select_grouped_object_clusters(
         ));
     }
     let budget = adaptive_object_budget(index, effective_nprobe);
-    let best_score = ranked_clusters[0].aggregate_score;
-    let cutoff = best_score + best_score.abs() * budget.relative_score_margin;
-    let mut selected_objects = HashSet::new();
+    let mut object_candidates = Vec::new();
+    let mut candidate_keys = HashSet::new();
+    for score in ranked_clusters {
+        let object = cluster_fetch_object(index, score.cluster_idx)?;
+        if candidate_keys.insert(object.key.clone()) {
+            object_candidates.push(object);
+        }
+    }
+
+    let score_by_cluster: HashMap<usize, ClusterScore> = ranked_clusters
+        .iter()
+        .copied()
+        .map(|score| (score.cluster_idx, score))
+        .collect();
+    let rank_by_cluster: HashMap<usize, usize> = ranked_clusters
+        .iter()
+        .enumerate()
+        .map(|(rank, score)| (score.cluster_idx, rank))
+        .collect();
+    let mut selected_object_idxs = HashSet::new();
     let mut covered_clusters = HashSet::new();
     let mut clusters = Vec::new();
+    let best_distance_score = ranked_clusters
+        .iter()
+        .map(|score| score.aggregate_score)
+        .fold(f32::INFINITY, f32::min);
+    let distance_cutoff =
+        best_distance_score + best_distance_score.abs() * budget.relative_score_margin;
 
-    for score in ranked_clusters {
-        if covered_clusters.contains(&score.cluster_idx) {
-            continue;
-        }
-        if selected_objects.len() >= budget.max_objects {
+    while selected_object_idxs.len() < budget.max_objects {
+        let ranking = if selected_object_idxs.len() <= budget.floor_objects {
+            ObjectCandidateRanking::DistanceCore
+        } else {
+            ObjectCandidateRanking::MassExpansion
+        };
+        let Some(candidate) = best_object_candidate(
+            &object_candidates,
+            &score_by_cluster,
+            &rank_by_cluster,
+            &covered_clusters,
+            &selected_object_idxs,
+            ranking,
+            distance_cutoff,
+        ) else {
+            break;
+        };
+        let within_floor = selected_object_idxs.len() < budget.floor_objects;
+        if !within_floor && candidate.aggregate_score > distance_cutoff {
             break;
         }
-        let within_floor = selected_objects.len() < budget.floor_objects;
-        if !within_floor && score.aggregate_score > cutoff {
-            break;
-        }
 
-        let object = cluster_fetch_object(index, score.cluster_idx)?;
-        if !selected_objects.insert(object.key) {
-            continue;
-        }
-        for cluster_idx in object.clusters {
+        selected_object_idxs.insert(candidate.object_idx);
+        for &cluster_idx in &object_candidates[candidate.object_idx].clusters {
             if covered_clusters.insert(cluster_idx) {
                 clusters.push(cluster_idx);
             }
@@ -421,8 +460,122 @@ fn select_grouped_object_clusters(
 
     Ok(SelectedObjectClusters {
         clusters,
-        object_count: selected_objects.len(),
+        object_count: selected_object_idxs.len(),
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ObjectCandidateScore {
+    object_idx: usize,
+    mass_count: usize,
+    aggregate_score: f32,
+    best_rank: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ObjectCandidateRanking {
+    DistanceCore,
+    MassExpansion,
+}
+
+fn best_object_candidate(
+    object_candidates: &[ClusterFetchObject],
+    score_by_cluster: &HashMap<usize, ClusterScore>,
+    rank_by_cluster: &HashMap<usize, usize>,
+    covered_clusters: &HashSet<usize>,
+    selected_object_idxs: &HashSet<usize>,
+    ranking: ObjectCandidateRanking,
+    distance_cutoff: f32,
+) -> Option<ObjectCandidateScore> {
+    let mut best = None;
+    for (object_idx, object) in object_candidates.iter().enumerate() {
+        if selected_object_idxs.contains(&object_idx) {
+            continue;
+        }
+        let candidate = score_object_candidate(
+            object_idx,
+            object,
+            score_by_cluster,
+            rank_by_cluster,
+            covered_clusters,
+        );
+        if matches!(ranking, ObjectCandidateRanking::MassExpansion)
+            && candidate.aggregate_score > distance_cutoff
+        {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|best| object_candidate_better(&candidate, best, ranking))
+        {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+fn score_object_candidate(
+    object_idx: usize,
+    object: &ClusterFetchObject,
+    score_by_cluster: &HashMap<usize, ClusterScore>,
+    rank_by_cluster: &HashMap<usize, usize>,
+    covered_clusters: &HashSet<usize>,
+) -> ObjectCandidateScore {
+    let mut mass_count = 0usize;
+    let mut aggregate_score = f32::INFINITY;
+    let mut best_rank = usize::MAX;
+
+    for cluster_idx in &object.clusters {
+        if covered_clusters.contains(cluster_idx) {
+            continue;
+        }
+        let Some(score) = score_by_cluster.get(cluster_idx) else {
+            continue;
+        };
+        mass_count += score.mass_count;
+        if score.aggregate_score < aggregate_score {
+            aggregate_score = score.aggregate_score;
+        }
+        best_rank = best_rank.min(
+            rank_by_cluster
+                .get(cluster_idx)
+                .copied()
+                .unwrap_or(usize::MAX),
+        );
+    }
+
+    ObjectCandidateScore {
+        object_idx,
+        mass_count,
+        aggregate_score,
+        best_rank,
+    }
+}
+
+fn object_candidate_better(
+    candidate: &ObjectCandidateScore,
+    best: &ObjectCandidateScore,
+    ranking: ObjectCandidateRanking,
+) -> bool {
+    match ranking {
+        ObjectCandidateRanking::DistanceCore => best
+            .aggregate_score
+            .partial_cmp(&candidate.aggregate_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| candidate.mass_count.cmp(&best.mass_count))
+            .then_with(|| best.object_idx.cmp(&candidate.object_idx))
+            .is_gt(),
+        ObjectCandidateRanking::MassExpansion => candidate
+            .mass_count
+            .cmp(&best.mass_count)
+            .then_with(|| {
+                best.aggregate_score
+                    .partial_cmp(&candidate.aggregate_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| best.best_rank.cmp(&candidate.best_rank))
+            .is_gt(),
+    }
 }
 
 fn adaptive_object_budget(index: &IvfFlatIndex, effective_nprobe: usize) -> AdaptiveObjectBudget {
