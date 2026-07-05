@@ -10,6 +10,7 @@ pub mod search;
 pub mod sketch;
 
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use crate::config::IndexingConfig;
 use crate::error::Result;
@@ -25,7 +26,7 @@ use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef};
 #[derive(Debug, Clone)]
 pub struct IvfFlatIndex {
     /// Centroid vectors, one per cluster.  `centroids[i].len() == dim`.
-    pub(crate) centroids: Vec<Vec<f32>>,
+    pub(crate) centroids: Arc<Vec<Vec<f32>>>,
     /// Total number of vectors across all clusters.
     pub(crate) num_vectors: usize,
     /// Dimensionality of the vectors.
@@ -54,7 +55,7 @@ pub struct IvfFlatIndex {
     /// Lookup from logical cluster index to `cluster_objects` index.
     pub(crate) cluster_object_by_cluster: Vec<usize>,
     /// Resident coarse sketch loaded from the segment artifact, when present.
-    pub(crate) resident_sketch: Option<sketch::ResidentSketch>,
+    pub(crate) resident_sketch: Option<Arc<sketch::ResidentSketch>>,
     /// Manifest reference for the resident sketch artifact, when this handle
     /// came from a build path that created one.
     pub(crate) sketch_ref: Option<crate::wal::manifest::SketchRef>,
