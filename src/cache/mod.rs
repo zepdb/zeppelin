@@ -4,15 +4,17 @@ pub mod manifest_cache;
 use std::any::Any;
 use std::collections::HashSet;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::sync::RwLock;
-use tracing::{debug, instrument};
+use rand::Rng;
+use tokio::sync::{Mutex, RwLock};
+use tracing::{debug, error, instrument};
 
 use crate::config::CacheConfig;
 use crate::error::{Result, ZeppelinError};
@@ -47,18 +49,25 @@ struct CacheEntry {
 pub struct DiskCache {
     dir: PathBuf,
     max_size_bytes: u64,
-    entries: DashMap<String, CacheEntry>,
-    pinned: RwLock<HashSet<String>>,
+    entries: Arc<DashMap<String, CacheEntry>>,
+    pinned: Arc<RwLock<HashSet<String>>>,
     /// One pinned key per scope (namespace): pinning a new key for a scope
     /// unpins the scope's previous key. Used for active-segment index
     /// metadata (centroids / tree meta) that must survive LRU pressure but
     /// release automatically on segment rotation.
     scoped_pins: DashMap<String, String>,
-    total_size: AtomicU64,
+    total_size: Arc<AtomicU64>,
     /// Decoded immutable metadata keyed by the same S3 key as the bytes cache.
     decoded: DashMap<String, Arc<dyn Any + Send + Sync>>,
     /// Optional in-memory tier sitting above disk.
-    memory: Option<MemoryCache>,
+    memory: Option<Arc<MemoryCache>>,
+    /// Per-key mutexes that coalesce concurrent cold misses.
+    inflight: DashMap<String, Arc<Mutex<()>>>,
+    /// Guards the background eviction worker.
+    ///
+    /// Cache size may transiently exceed `max_size_bytes` by the size of
+    /// in-flight puts while this flag is set.
+    eviction_running: Arc<AtomicBool>,
 }
 
 impl DiskCache {
@@ -93,12 +102,14 @@ impl DiskCache {
         let cache = Self {
             dir,
             max_size_bytes,
-            entries: DashMap::new(),
-            pinned: RwLock::new(HashSet::new()),
+            entries: Arc::new(DashMap::new()),
+            pinned: Arc::new(RwLock::new(HashSet::new())),
             scoped_pins: DashMap::new(),
-            total_size: AtomicU64::new(0),
+            total_size: Arc::new(AtomicU64::new(0)),
             decoded: DashMap::new(),
-            memory,
+            memory: memory.map(Arc::new),
+            inflight: DashMap::new(),
+            eviction_running: Arc::new(AtomicBool::new(false)),
         };
 
         // Scan existing files to rebuild index
@@ -160,6 +171,20 @@ impl DiskCache {
 
     fn file_path(&self, key: &str) -> PathBuf {
         self.dir.join(Self::key_to_filename(key))
+    }
+
+    fn inflight_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        self.inflight
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .value()
+            .clone()
+    }
+
+    fn remove_idle_inflight_lock(&self, key: &str, lock: Arc<Mutex<()>>) {
+        drop(lock);
+        self.inflight
+            .remove_if(key, |_, current| Arc::strong_count(current) == 1);
     }
 
     /// Get a cached value by key.
@@ -262,8 +287,8 @@ impl DiskCache {
 
         debug!("cache put");
 
-        // Evict if over limit
-        self.evict_if_needed().await?;
+        // Evict in the background if over limit.
+        self.spawn_eviction_if_needed();
 
         Ok(())
     }
@@ -280,12 +305,32 @@ impl DiskCache {
             return Ok(data);
         }
 
-        crate::metrics::CACHE_HITS_TOTAL
-            .with_label_values(&["miss"])
-            .inc();
-        let data = fetch().await?;
-        self.put(key, &data).await?;
-        Ok(data)
+        let lock = self.inflight_lock(key);
+        let guard = lock.lock().await;
+
+        let result = async {
+            if let Some(data) = self.get(key).await {
+                return Ok(data);
+            }
+
+            crate::metrics::CACHE_HITS_TOTAL
+                .with_label_values(&["miss"])
+                .inc();
+            let data = fetch().await?;
+            if let Err(error) = self.put(key, &data).await {
+                error!(
+                    key = key,
+                    error = %error,
+                    "cache write failed after successful fetch"
+                );
+            }
+            Ok(data)
+        }
+        .await;
+
+        drop(guard);
+        self.remove_idle_inflight_lock(key, lock);
+        result
     }
 
     /// Get a decoded immutable metadata entry from the in-process cache.
@@ -472,48 +517,167 @@ impl DiskCache {
         self.total_size.load(Ordering::Relaxed)
     }
 
-    async fn evict_if_needed(&self) -> Result<()> {
-        loop {
-            let current = self.total_size.load(Ordering::Relaxed);
-            if current <= self.max_size_bytes {
-                break;
-            }
+    fn spawn_eviction_if_needed(&self) {
+        if self.total_size.load(Ordering::Relaxed) <= self.max_size_bytes {
+            return;
+        }
+        if self.eviction_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
 
-            let pinned = self.pinned.read().await;
+        let dir = self.dir.clone();
+        let max_size_bytes = self.max_size_bytes;
+        let entries = Arc::clone(&self.entries);
+        let pinned = Arc::clone(&self.pinned);
+        let total_size = Arc::clone(&self.total_size);
+        let memory = self.memory.clone();
+        let eviction_running = Arc::clone(&self.eviction_running);
 
-            // Sample EVICTION_SAMPLE_SIZE unpinned entries and evict the oldest.
-            let victim = self
-                .entries
-                .iter()
-                .filter(|r| !pinned.contains(r.key()))
-                .take(EVICTION_SAMPLE_SIZE)
-                .min_by_key(|r| r.value().last_accessed)
-                .map(|r| r.key().clone());
+        tokio::spawn(async move {
+            loop {
+                evict_if_needed_background(
+                    &dir,
+                    max_size_bytes,
+                    &entries,
+                    &pinned,
+                    &total_size,
+                    memory.as_deref(),
+                )
+                .await;
 
-            drop(pinned);
-
-            match victim {
-                Some(key) => {
-                    // Also evict from memory tier
-                    if let Some(ref mem) = self.memory {
-                        mem.invalidate(&key);
-                    }
-                    if let Some((_, entry)) = self.entries.remove(&key) {
-                        self.total_size.fetch_sub(entry.size, Ordering::Relaxed);
-                        crate::metrics::CACHE_ENTRIES.dec();
-                        crate::metrics::CACHE_EVICTIONS_TOTAL.inc();
-                        let path = self.dir.join(&entry.filename);
-                        let _ = tokio::fs::remove_file(&path).await;
-                        debug!(key = %key, size = entry.size, "evicted cache entry");
-                    }
+                eviction_running.store(false, Ordering::Release);
+                if total_size.load(Ordering::Relaxed) <= max_size_bytes {
+                    break;
                 }
-                None => {
-                    // All sampled entries are pinned, can't evict more
+                if eviction_running
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
                     break;
                 }
             }
+        });
+    }
+}
+
+fn sampled_disk_victim(
+    entries: &DashMap<String, CacheEntry>,
+    pinned: &HashSet<String>,
+) -> Option<String> {
+    let len = entries.len();
+    if len == 0 {
+        return None;
+    }
+
+    let start = rand::thread_rng().gen_range(0..len);
+    let mut sampled = 0usize;
+    let mut victim: Option<(String, Instant)> = None;
+
+    for entry in entries.iter().skip(start) {
+        if pinned.contains(entry.key()) {
+            continue;
         }
-        Ok(())
+        if victim
+            .as_ref()
+            .map(|(_, last_accessed)| entry.value().last_accessed < *last_accessed)
+            .unwrap_or(true)
+        {
+            victim = Some((entry.key().clone(), entry.value().last_accessed));
+        }
+        sampled += 1;
+        if sampled == EVICTION_SAMPLE_SIZE {
+            return victim.map(|(key, _)| key);
+        }
+    }
+
+    for entry in entries.iter() {
+        if pinned.contains(entry.key()) {
+            continue;
+        }
+        if victim
+            .as_ref()
+            .map(|(_, last_accessed)| entry.value().last_accessed < *last_accessed)
+            .unwrap_or(true)
+        {
+            victim = Some((entry.key().clone(), entry.value().last_accessed));
+        }
+        sampled += 1;
+        if sampled == EVICTION_SAMPLE_SIZE {
+            break;
+        }
+    }
+
+    victim.map(|(key, _)| key)
+}
+
+async fn evict_if_needed_background(
+    dir: &std::path::Path,
+    max_size_bytes: u64,
+    entries: &DashMap<String, CacheEntry>,
+    pinned: &RwLock<HashSet<String>>,
+    total_size: &AtomicU64,
+    memory: Option<&MemoryCache>,
+) {
+    loop {
+        let current = total_size.load(Ordering::Relaxed);
+        if current <= max_size_bytes {
+            break;
+        }
+
+        let pinned_keys = pinned.read().await;
+        let victim = sampled_disk_victim(entries, &pinned_keys);
+        drop(pinned_keys);
+
+        match victim {
+            Some(key) => {
+                if let Some(mem) = memory {
+                    mem.invalidate(&key);
+                }
+                let Some(entry) = entries.get(&key).map(|entry| CacheEntry {
+                    filename: entry.filename.clone(),
+                    size: entry.size,
+                    last_accessed: entry.last_accessed,
+                }) else {
+                    continue;
+                };
+                let path = dir.join(&entry.filename);
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {
+                        if let Some((_, removed)) = entries.remove(&key) {
+                            total_size.fetch_sub(removed.size, Ordering::Relaxed);
+                            crate::metrics::CACHE_ENTRIES.dec();
+                            crate::metrics::CACHE_EVICTIONS_TOTAL.inc();
+                            debug!(key = %key, size = removed.size, "evicted cache entry");
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        if let Some((_, removed)) = entries.remove(&key) {
+                            total_size.fetch_sub(removed.size, Ordering::Relaxed);
+                            crate::metrics::CACHE_ENTRIES.dec();
+                            crate::metrics::CACHE_EVICTIONS_TOTAL.inc();
+                            error!(
+                                key = %key,
+                                error = %error,
+                                "cache entry missing on disk during eviction"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        error!(
+                            key = %key,
+                            path = %path.display(),
+                            error = %error,
+                            "failed to evict cache entry"
+                        );
+                        break;
+                    }
+                }
+            }
+            None => {
+                // All sampled entries are pinned, can't evict more
+                break;
+            }
+        }
     }
 }
 
@@ -624,14 +788,7 @@ impl MemoryCache {
 
     fn evict_if_needed(&self) {
         while self.total_size.load(Ordering::Relaxed) > self.max_size_bytes {
-            // Sample EVICTION_SAMPLE_SIZE entries and evict the oldest.
-            let victim = self
-                .entries
-                .iter()
-                .filter(|r| !self.pinned.contains_key(r.key()))
-                .take(EVICTION_SAMPLE_SIZE)
-                .min_by_key(|r| r.value().last_accessed)
-                .map(|r| r.key().clone());
+            let victim = self.sampled_victim();
 
             match victim {
                 Some(key) => {
@@ -643,6 +800,53 @@ impl MemoryCache {
                 None => break,
             }
         }
+    }
+
+    fn sampled_victim(&self) -> Option<String> {
+        let len = self.entries.len();
+        if len == 0 {
+            return None;
+        }
+
+        let start = rand::thread_rng().gen_range(0..len);
+        let mut sampled = 0usize;
+        let mut victim: Option<(String, Instant)> = None;
+
+        for entry in self.entries.iter().skip(start) {
+            if self.pinned.contains_key(entry.key()) {
+                continue;
+            }
+            if victim
+                .as_ref()
+                .map(|(_, last_accessed)| entry.value().last_accessed < *last_accessed)
+                .unwrap_or(true)
+            {
+                victim = Some((entry.key().clone(), entry.value().last_accessed));
+            }
+            sampled += 1;
+            if sampled == EVICTION_SAMPLE_SIZE {
+                return victim.map(|(key, _)| key);
+            }
+        }
+
+        for entry in self.entries.iter() {
+            if self.pinned.contains_key(entry.key()) {
+                continue;
+            }
+            if victim
+                .as_ref()
+                .map(|(_, last_accessed)| entry.value().last_accessed < *last_accessed)
+                .unwrap_or(true)
+            {
+                victim = Some((entry.key().clone(), entry.value().last_accessed));
+            }
+            sampled += 1;
+            if sampled == EVICTION_SAMPLE_SIZE {
+                break;
+            }
+        }
+
+        victim.map(|(key, _)| key)
     }
 }
 

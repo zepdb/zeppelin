@@ -87,10 +87,10 @@ impl RuntimeQueryConfig {
     /// admin-API-only and rare; this is the std-only ArcSwap idiom.
     #[must_use]
     pub fn snapshot(&self) -> Arc<QueryKnobs> {
-        self.inner
-            .read()
-            .expect("runtime query config lock poisoned")
-            .clone()
+        match self.inner.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => panic!("runtime query config lock poisoned"),
+        }
     }
 
     /// Apply a validated partial update and return the new snapshot.
@@ -125,7 +125,7 @@ impl RuntimeQueryConfig {
         let mut guard = self
             .inner
             .write()
-            .expect("runtime query config lock poisoned");
+            .map_err(|_| ZeppelinError::Config("runtime query config lock poisoned".to_string()))?;
         let old = guard.as_ref();
         let mut new = old.clone();
 

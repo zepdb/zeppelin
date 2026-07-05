@@ -254,7 +254,7 @@ async fn test_internal_data_missing_is_500_no_key_leak() {
         .unwrap();
     compactor.compact(&ns).await.unwrap();
 
-    // Delete the segment's centroids object — an artifact the manifest
+    // Delete the segment's active metadata object — an artifact the manifest
     // references and the query path loads FAIL-LOUD (unlike per-cluster reads,
     // which the search currently warns-and-skips; that silent-partial behavior
     // is Task 9's concern, tracked separately). This simulates S3 corruption /
@@ -264,8 +264,17 @@ async fn test_internal_data_missing_is_500_no_key_leak() {
         .unwrap()
         .unwrap();
     let seg = manifest.active_segment.clone().unwrap();
-    let centroids_key = format!("{ns}/segments/{seg}/centroids.bin");
-    harness.store.delete(&centroids_key).await.unwrap();
+    let segment = manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == seg)
+        .expect("active segment must be present in manifest");
+    let metadata_key = segment
+        .bootstrap
+        .as_ref()
+        .map(|bootstrap| bootstrap.key.clone())
+        .unwrap_or_else(|| format!("{ns}/segments/{seg}/centroids.bin"));
+    harness.store.delete(&metadata_key).await.unwrap();
 
     // A strong query must now read that missing cluster.
     let resp = client
@@ -286,7 +295,7 @@ async fn test_internal_data_missing_is_500_no_key_leak() {
     // Must be a 500 data-missing, never a 404 "namespace gone".
     assert_eq!(
         status, 500,
-        "internal cluster miss must be 500, got {status}: {raw_body}"
+        "internal metadata miss must be 500, got {status}: {raw_body}"
     );
     // I3: the raw S3 key / prefix must not leak into the client body.
     assert!(

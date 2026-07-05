@@ -928,6 +928,26 @@ fn segment_query_params<'a>(
     }
 }
 
+fn active_segment_ref(manifest: &Manifest) -> &SegmentRef {
+    let active_segment = manifest
+        .active_segment
+        .as_ref()
+        .expect("manifest must have an active segment");
+    manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == *active_segment)
+        .expect("active segment must be present in manifest segments")
+}
+
+fn segment_index_meta_key(namespace: &str, segment: &SegmentRef) -> String {
+    segment
+        .bootstrap
+        .as_ref()
+        .map(|bootstrap| bootstrap.key.clone())
+        .unwrap_or_else(|| centroids_key(namespace, &segment.id))
+}
+
 /// I1: a repeat query against an unchanged segment performs ZERO S3 GETs
 /// for the centroids blob — it must be served from the cache.
 #[tokio::test]
@@ -945,6 +965,8 @@ async fn test_repeat_query_zero_centroid_gets() {
 
     let compactor = test_compactor(&store);
     compactor.compact(&ns).await.unwrap();
+    let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    let meta_key = segment_index_meta_key(&ns, active_segment_ref(&manifest));
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -962,12 +984,12 @@ async fn test_repeat_query_zero_centroid_gets() {
     .await
     .unwrap();
     assert_eq!(
-        counter.gets_matching("centroids.bin"),
+        counter.gets_matching(&meta_key),
         1,
-        "cold query must fetch centroids exactly once"
+        "cold query must fetch active segment metadata exactly once"
     );
 
-    // Warm query: centroids must come from cache — zero S3 GETs.
+    // Warm query: active segment metadata must come from cache — zero S3 GETs.
     counter.reset();
     execute_query(segment_query_params(
         &store,
@@ -979,9 +1001,9 @@ async fn test_repeat_query_zero_centroid_gets() {
     .await
     .unwrap();
     assert_eq!(
-        counter.gets_matching("centroids.bin"),
+        counter.gets_matching(&meta_key),
         0,
-        "repeat query against an unchanged segment must perform ZERO S3 GETs for centroids"
+        "repeat query against an unchanged segment must perform ZERO S3 GETs for active metadata"
     );
 
     harness.cleanup().await;
@@ -1017,7 +1039,7 @@ async fn test_new_segment_never_serves_stale_centroids() {
     let compactor = test_compactor(&store);
     compactor.compact(&ns).await.unwrap();
     let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
-    let seg1 = manifest.active_segment.clone().unwrap();
+    let seg1 = active_segment_ref(&manifest).id.clone();
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -1050,7 +1072,8 @@ async fn test_new_segment_never_serves_stale_centroids() {
     writer.append(&ns, batch2, vec![]).await.unwrap();
     compactor.compact(&ns).await.unwrap();
     let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
-    let seg2 = manifest.active_segment.clone().unwrap();
+    let seg2_ref = active_segment_ref(&manifest);
+    let seg2 = seg2_ref.id.clone();
     assert_ne!(seg1, seg2, "second compaction must produce a new segment");
 
     // Query for a batch-2 vector: results must reflect the NEW segment.
@@ -1069,10 +1092,10 @@ async fn test_new_segment_never_serves_stale_centroids() {
     );
 
     // The new segment's centroids must have their OWN cache entry.
-    let seg2_key = centroids_key(&ns, &seg2);
+    let seg2_key = segment_index_meta_key(&ns, seg2_ref);
     assert!(
         cache.get(&seg2_key).await.is_some(),
-        "new segment's centroids must be cached under their own key ({seg2_key})"
+        "new segment's index metadata must be cached under its own key ({seg2_key})"
     );
 
     harness.cleanup().await;
@@ -1097,8 +1120,9 @@ async fn test_pinned_centroids_survive_eviction_pressure() {
     let compactor = test_compactor(&store);
     compactor.compact(&ns).await.unwrap();
     let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
-    let seg1 = manifest.active_segment.clone().unwrap();
-    let seg1_ckey = centroids_key(&ns, &seg1);
+    let seg1_ref = active_segment_ref(&manifest);
+    let seg1 = seg1_ref.id.clone();
+    let seg1_ckey = segment_index_meta_key(&ns, seg1_ref);
 
     // Tiny cache: cluster-sized junk entries will force LRU eviction.
     let cache_dir = tempfile::TempDir::new().unwrap();
@@ -1117,7 +1141,7 @@ async fn test_pinned_centroids_survive_eviction_pressure() {
     .unwrap();
     assert!(
         cache.is_pinned(&seg1_ckey).await,
-        "active segment's centroids must be pinned after a query"
+        "active segment's index metadata must be pinned after a query"
     );
 
     // Fill the cache well past capacity with cluster-sized entries.
@@ -1134,7 +1158,7 @@ async fn test_pinned_centroids_survive_eviction_pressure() {
     // Pinned centroids survive: still served with zero S3 GETs.
     assert!(
         cache.get(&seg1_ckey).await.is_some(),
-        "pinned centroids entry must survive LRU eviction pressure"
+        "pinned index metadata entry must survive LRU eviction pressure"
     );
     counter.reset();
     execute_query(segment_query_params(
@@ -1147,9 +1171,9 @@ async fn test_pinned_centroids_survive_eviction_pressure() {
     .await
     .unwrap();
     assert_eq!(
-        counter.gets_matching("centroids.bin"),
+        counter.gets_matching(&seg1_ckey),
         0,
-        "query under eviction pressure must serve pinned centroids without a GET"
+        "query under eviction pressure must serve pinned index metadata without a GET"
     );
 
     // Segment rotation: new compaction → old pin released, new key pinned.
@@ -1159,9 +1183,10 @@ async fn test_pinned_centroids_survive_eviction_pressure() {
         .unwrap();
     compactor.compact(&ns).await.unwrap();
     let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
-    let seg2 = manifest.active_segment.clone().unwrap();
+    let seg2_ref = active_segment_ref(&manifest);
+    let seg2 = seg2_ref.id.clone();
     assert_ne!(seg1, seg2);
-    let seg2_ckey = centroids_key(&ns, &seg2);
+    let seg2_ckey = segment_index_meta_key(&ns, seg2_ref);
 
     execute_query(segment_query_params(
         &store,
@@ -1174,7 +1199,7 @@ async fn test_pinned_centroids_survive_eviction_pressure() {
     .unwrap();
     assert!(
         cache.is_pinned(&seg2_ckey).await,
-        "new active segment's centroids must be pinned"
+        "new active segment's index metadata must be pinned"
     );
     assert!(
         !cache.is_pinned(&seg1_ckey).await,
@@ -1305,10 +1330,13 @@ async fn test_query_path_stays_fail_loud_with_cache() {
     let compactor = test_compactor(&store);
     compactor.compact(&ns).await.unwrap();
     let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
-    let seg = manifest.active_segment.clone().unwrap();
+    let seg = active_segment_ref(&manifest);
 
-    // Sabotage: remove the centroids blob out from under the segment.
-    store.delete(&centroids_key(&ns, &seg)).await.unwrap();
+    // Sabotage: remove the active index-metadata blob out from under the segment.
+    store
+        .delete(&segment_index_meta_key(&ns, seg))
+        .await
+        .unwrap();
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(

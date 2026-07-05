@@ -165,13 +165,12 @@ async fn test_query_class_breakdown_is_sane() {
         counter.gets_for(ArtifactClass::Cluster) >= 1,
         "query must GET at least one cluster blob"
     );
+    let bootstrap_gets = counter.gets_for(ArtifactClass::Bootstrap);
+    let legacy_metadata_gets =
+        counter.gets_for(ArtifactClass::Centroids) + counter.gets_for(ArtifactClass::Sketch);
     assert!(
-        counter.gets_for(ArtifactClass::Centroids) >= 1,
-        "query must GET the centroids blob (no cache configured)"
-    );
-    assert!(
-        counter.gets_for(ArtifactClass::Sketch) >= 1,
-        "query must GET the resident sketch blob (no cache configured)"
+        bootstrap_gets >= 1 || legacy_metadata_gets >= 2,
+        "query must GET active index metadata: bootstrap or legacy centroids+sketch"
     );
 
     // Bytes-per-class are non-zero for every class that was actually read.

@@ -1,14 +1,68 @@
-use bytes::Bytes;
-use std::path::Path;
-use std::sync::Arc;
-use tempfile::TempDir;
+mod common;
 
-use zeppelin::cache::DiskCache;
+use bytes::Bytes;
+use common::counting::{counting_store, ArtifactClass};
+use common::harness::TestHarness;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::TempDir;
+use tokio::sync::Barrier;
+
+use zeppelin::cache::{DiskCache, MemoryCache};
+use zeppelin::config::{IndexingConfig, DEFAULT_RERANK_COALESCE_GAP_BYTES};
 use zeppelin::error::ZeppelinError;
+use zeppelin::index::ivf_flat::search::search_ivf_flat;
+use zeppelin::index::quantization::QuantizationType;
+use zeppelin::index::{IvfFlatIndex, VectorIndex};
+use zeppelin::types::{AttributeValue, DistanceMetric, VectorEntry};
 
 /// Create a test cache with a given max size in bytes.
 fn test_cache(dir: &Path, max_bytes: u64) -> DiskCache {
     DiskCache::new_with_max_bytes(dir.to_path_buf(), max_bytes).unwrap()
+}
+
+async fn wait_for_cache_size_at_most(cache: &DiskCache, max_bytes: u64) {
+    for _ in 0..100 {
+        if cache.total_size() <= max_bytes {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "cache size stayed above max: size={} max={}",
+        cache.total_size(),
+        max_bytes
+    );
+}
+
+fn single_cluster_config() -> IndexingConfig {
+    IndexingConfig {
+        default_num_centroids: 1,
+        kmeans_max_iterations: 4,
+        quantization: QuantizationType::None,
+        bitmap_index: false,
+        ..Default::default()
+    }
+}
+
+fn single_cluster_vectors(prefix: &str, count: usize) -> Vec<VectorEntry> {
+    (0..count)
+        .map(|i| {
+            let mut attributes = HashMap::new();
+            attributes.insert(
+                "tenant".to_string(),
+                AttributeValue::String(format!("{prefix}_tenant")),
+            );
+            VectorEntry {
+                id: format!("{prefix}_{i}"),
+                values: vec![i as f32 * 0.001, (i % 11) as f32 * 0.01, 1.0, 0.5],
+                attributes: Some(attributes),
+            }
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -62,6 +116,7 @@ async fn test_cache_eviction_lru() {
 
     // Put k3 (50 bytes) — total would be 150, so evict oldest (k1)
     cache.put("k3", &Bytes::from(vec![b'c'; 50])).await.unwrap();
+    wait_for_cache_size_at_most(&cache, 100).await;
 
     // k1 should be evicted
     assert_eq!(cache.get("k1").await, None);
@@ -110,6 +165,7 @@ async fn test_cache_pin_survives_eviction() {
         .put("data2", &Bytes::from(vec![b'E'; 40]))
         .await
         .unwrap();
+    wait_for_cache_size_at_most(&cache, 100).await;
 
     // Pinned "centroids" should survive
     assert!(cache.get("centroids").await.is_some());
@@ -310,4 +366,282 @@ async fn test_cache_concurrent_get_or_fetch() {
         cache.get("shared_key").await,
         Some(Bytes::from("shared_value"))
     );
+}
+
+#[tokio::test]
+async fn test_cache_get_or_fetch_singleflight_coalesces_concurrent_misses() {
+    const CONCURRENCY: usize = 32;
+
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(test_cache(dir.path(), 1024 * 1024));
+    let fetch_count = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(CONCURRENCY + 1));
+
+    let mut handles = Vec::with_capacity(CONCURRENCY);
+    for _ in 0..CONCURRENCY {
+        let cache = Arc::clone(&cache);
+        let fetch_count = Arc::clone(&fetch_count);
+        let start = Arc::clone(&start);
+        handles.push(tokio::spawn(async move {
+            start.wait().await;
+            cache
+                .get_or_fetch("singleflight_key", || {
+                    let fetch_count = Arc::clone(&fetch_count);
+                    async move {
+                        fetch_count.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok(Bytes::from_static(b"coalesced"))
+                    }
+                })
+                .await
+                .unwrap()
+        }));
+    }
+
+    start.wait().await;
+    let mut results = Vec::with_capacity(CONCURRENCY);
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+
+    assert!(results.iter().all(|result| result.as_ref() == b"coalesced"));
+    assert_eq!(
+        fetch_count.load(Ordering::SeqCst),
+        1,
+        "concurrent cache misses on one key must share one backend fetch"
+    );
+}
+
+#[tokio::test]
+async fn test_cache_get_or_fetch_retry_after_failed_fetch_is_not_poisoned() {
+    const CONCURRENCY: usize = 8;
+
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(test_cache(dir.path(), 1024 * 1024));
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let first = cache
+        .get_or_fetch("retry_key", || {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(ZeppelinError::Cache("first fetch failed".into()))
+            }
+        })
+        .await;
+    assert!(first.is_err());
+    assert_eq!(cache.get("retry_key").await, None);
+
+    let start = Arc::new(Barrier::new(CONCURRENCY + 1));
+    let mut handles = Vec::with_capacity(CONCURRENCY);
+    for _ in 0..CONCURRENCY {
+        let cache = Arc::clone(&cache);
+        let attempts = Arc::clone(&attempts);
+        let start = Arc::clone(&start);
+        handles.push(tokio::spawn(async move {
+            start.wait().await;
+            cache
+                .get_or_fetch("retry_key", || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(Bytes::from_static(b"eventual bytes"))
+                    }
+                })
+                .await
+                .unwrap()
+        }));
+    }
+
+    start.wait().await;
+    for handle in handles {
+        assert_eq!(handle.await.unwrap(), Bytes::from_static(b"eventual bytes"));
+    }
+    assert_eq!(
+        cache.get("retry_key").await,
+        Some(Bytes::from_static(b"eventual bytes"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_cache_get_or_fetch_returns_fetched_bytes_when_cache_write_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let cache = test_cache(dir.path(), 1024 * 1024);
+    let original_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = cache
+        .get_or_fetch("readonly_key", || async {
+            Ok(Bytes::from_static(b"uncached but returned"))
+        })
+        .await;
+    std::fs::set_permissions(dir.path(), original_permissions).unwrap();
+
+    assert_eq!(
+        result.unwrap(),
+        Bytes::from_static(b"uncached but returned")
+    );
+    assert_eq!(cache.get("readonly_key").await, None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_cache_put_does_not_evict_inline_on_capacity_overflow() {
+    let dir = TempDir::new().unwrap();
+    let cache = test_cache(dir.path(), 100);
+
+    cache.put("k1", &Bytes::from(vec![b'a'; 60])).await.unwrap();
+    assert_eq!(cache.total_size(), 60);
+
+    cache.put("k2", &Bytes::from(vec![b'b'; 60])).await.unwrap();
+    assert_eq!(
+        cache.total_size(),
+        120,
+        "put must return after indexing the new value, before eviction I/O runs"
+    );
+
+    wait_for_cache_size_at_most(&cache, 100).await;
+}
+
+#[tokio::test]
+async fn test_cache_pin_scoped_survives_capacity_pressure() {
+    let dir = TempDir::new().unwrap();
+    let cache = test_cache(dir.path(), 60);
+
+    cache
+        .put("ns/segments/seg1/centroids.bin", &Bytes::from(vec![1; 30]))
+        .await
+        .unwrap();
+    cache
+        .pin_scoped("ns", "ns/segments/seg1/centroids.bin")
+        .await;
+
+    for i in 0..10 {
+        cache
+            .put(&format!("cold_{i}"), &Bytes::from(vec![i as u8; 30]))
+            .await
+            .unwrap();
+        wait_for_cache_size_at_most(&cache, 60).await;
+        assert!(
+            cache.get("ns/segments/seg1/centroids.bin").await.is_some(),
+            "scoped pin was evicted under pressure"
+        );
+    }
+}
+
+#[test]
+fn test_memory_cache_pin_survives_capacity_pressure() {
+    let cache = MemoryCache::new(60);
+    cache.insert("metadata", Bytes::from(vec![1; 30]));
+    cache.pin("metadata");
+
+    for i in 0..10 {
+        cache.insert(&format!("cold_{i}"), Bytes::from(vec![i as u8; 30]));
+        assert!(
+            cache.get("metadata").is_some(),
+            "memory pinned key was evicted under pressure"
+        );
+    }
+}
+
+#[test]
+fn test_memory_cache_hot_set_survives_cold_insert_flood_statistically() {
+    const ROUNDS: usize = 32;
+    const HOT_KEYS: usize = 12;
+    const COLD_INSERTS: usize = 128;
+    const ENTRY_SIZE: usize = 8;
+
+    let mut hot_survivors = 0usize;
+    for round in 0..ROUNDS {
+        let cache = MemoryCache::new((HOT_KEYS * ENTRY_SIZE * 2) as u64);
+        for hot in 0..HOT_KEYS {
+            cache.insert(
+                &format!("hot_{round}_{hot}"),
+                Bytes::from(vec![b'h'; ENTRY_SIZE]),
+            );
+        }
+
+        for cold in 0..COLD_INSERTS {
+            for hot in 0..HOT_KEYS {
+                let _ = cache.get(&format!("hot_{round}_{hot}"));
+            }
+            cache.insert(
+                &format!("cold_{round}_{cold}"),
+                Bytes::from(vec![b'c'; ENTRY_SIZE]),
+            );
+        }
+
+        for hot in 0..HOT_KEYS {
+            if cache.get(&format!("hot_{round}_{hot}")).is_some() {
+                hot_survivors += 1;
+            }
+        }
+    }
+
+    let possible = ROUNDS * HOT_KEYS;
+    assert!(
+        hot_survivors * 100 >= possible * 75,
+        "hot set survival too low: survived {hot_survivors}/{possible}"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_cold_index_searches_share_one_cluster_get() {
+    const CONCURRENCY: usize = 16;
+
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let ns = harness.key("cache-singleflight-index");
+    let vectors = single_cluster_vectors("sf", 512);
+    let index = Arc::new(
+        IvfFlatIndex::build(&vectors, &single_cluster_config(), &store, &ns, "seg_sf")
+            .await
+            .unwrap(),
+    );
+    let cache_dir = TempDir::new().unwrap();
+    let cache = Arc::new(test_cache(cache_dir.path(), 100 * 1024 * 1024));
+    let start = Arc::new(Barrier::new(CONCURRENCY + 1));
+
+    counter.reset();
+    let mut handles = Vec::with_capacity(CONCURRENCY);
+    for _ in 0..CONCURRENCY {
+        let index = Arc::clone(&index);
+        let store = store.clone();
+        let cache = Arc::clone(&cache);
+        let query = vectors[0].values.clone();
+        let start = Arc::clone(&start);
+        handles.push(tokio::spawn(async move {
+            start.wait().await;
+            search_ivf_flat(
+                &index,
+                &query,
+                1,
+                1,
+                None,
+                DistanceMetric::Euclidean,
+                &store,
+                1,
+                Some(&cache),
+                DEFAULT_RERANK_COALESCE_GAP_BYTES,
+            )
+            .await
+            .unwrap()
+        }));
+    }
+
+    start.wait().await;
+    for handle in handles {
+        let results = handle.await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "sf_0");
+    }
+
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Cluster),
+        1,
+        "concurrent cold searches on one immutable cluster object must share one S3 GET"
+    );
+    harness.cleanup().await;
 }
