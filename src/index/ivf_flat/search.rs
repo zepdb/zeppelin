@@ -59,9 +59,40 @@ const SKETCH_ADAPTIVE_OBJECT_CAP_EXTRA: usize = 2;
 const SKETCH_SCAN_STATS_ENV: &str = "ZEPPELIN_SKETCH_SCAN_STATS";
 const SQ_BYTE_STATS_ENV: &str = "ZEPPELIN_SQ_BYTE_STATS";
 const RERANK_COALESCE_GAP_ENV: &str = "ZEPPELIN_RERANK_COALESCE_GAP_BYTES";
-// 128 KiB is the measured QPS knee on dbpedia100k np16: 13.1 QPS at ~80
-// ranged GETs/q; larger gaps waste bandwidth, smaller ones drown in
-// per-request overhead. Override via ZEPPELIN_RERANK_COALESCE_GAP_BYTES.
+// ZEPPELIN_RERANK_COALESCE_GAP_BYTES is the throughput <-> request-cost dial
+// for the two-phase fetch: rerank f32 ranges whose gap is smaller than this
+// are merged into one physical GET. Recall is unaffected at any setting (the
+// candidate set is identical; only the fetch plan changes).
+//
+// The default, 128 KiB, is the measured QPS knee on dbpedia100k np16 against
+// loopback MinIO: 13.4 QPS at ~80 ranged GETs/q. Larger gaps waste bandwidth
+// on merged-in dead bytes; smaller ones drown in per-request overhead (64 KiB
+// collapses to 8.8 QPS at ~128 GETs/q, and gap=0 exhausts connections).
+//
+// On S3, GETs are the dominant query cost ($0.40 per million requests,
+// in-region bytes free), so this knob sets $/million-queries directly.
+// Measured points (dbpedia100k np16, 8 workers; scale GETs ~2.3x for a 1M
+// corpus):
+//
+//   gap        GETs/q   MB/q   QPS    ~$/M queries (S3 Standard)
+//   1 MiB       19.5    49.5    8.3     $7.80   <- cost-optimized
+//   512 KiB     30.6    41.4    9.8    $12.24
+//   256 KiB     50.4    34.1   11.6    $20.16
+//   128 KiB     79.9    28.6   13.4    $31.96   <- default: throughput knee
+//   64 KiB     127.5    25.2    8.8    $51.00   <- past the knee; never use
+//
+// Examples:
+//   ZEPPELIN_RERANK_COALESCE_GAP_BYTES=1048576  # 1 MiB: ~4x cheaper per
+//       query than the default at ~60% of its QPS; right when request cost
+//       dominates (high query volume, S3 Standard).
+//   ZEPPELIN_RERANK_COALESCE_GAP_BYTES=131072   # 128 KiB: max QPS on this
+//       bench; right when node count / latency dominates cost.
+//
+// These numbers are from loopback MinIO (~410 MB/s wall). Real S3 has higher
+// per-request latency but wider aggregate bandwidth, which pushes the optimal
+// gap UP (fewer, fatter GETs); S3 Express One Zone halves request price and
+// cuts first-byte latency, pushing it back DOWN. Re-run the gap sweep
+// (qpsbench with this env var) on the target deployment before fixing a value.
 const DEFAULT_RERANK_COALESCE_GAP_BYTES: usize = 128 * 1024;
 
 /// A candidate result during search, before final ranking.
