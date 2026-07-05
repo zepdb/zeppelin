@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
@@ -71,6 +72,49 @@ pub struct ClusterDataObjectRef {
     pub key: String,
     /// Logical cluster indexes whose current data lives in this object.
     pub clusters: Vec<usize>,
+    /// Byte offset of the self-contained flat-scan live span.
+    ///
+    /// `0` with `live_len == 0` means no ranged flat-scan span is advertised
+    /// and readers must fetch the full object. This is the default for old
+    /// ZBP1 grouped objects and incremental singleton refs.
+    #[serde(default)]
+    pub live_offset: u64,
+    /// Byte length of the self-contained flat-scan live span.
+    ///
+    /// NOTE: manifest schema additions must remain trailing in the struct.
+    /// MessagePack encodes structs as arrays, so old manifests decode only if
+    /// new fields are trailing and `#[serde(default)]`.
+    #[serde(default)]
+    pub live_len: u64,
+}
+
+impl ClusterDataObjectRef {
+    /// Ranged GET span for the flat-scan live bytes, when this object
+    /// advertises one.
+    pub fn live_range(&self) -> Result<Option<Range<usize>>> {
+        if self.live_len == 0 {
+            return Ok(None);
+        }
+        let start = usize::try_from(self.live_offset).map_err(|_| {
+            ZeppelinError::Index(format!(
+                "cluster object {} live offset does not fit in usize: {}",
+                self.key, self.live_offset
+            ))
+        })?;
+        let len = usize::try_from(self.live_len).map_err(|_| {
+            ZeppelinError::Index(format!(
+                "cluster object {} live length does not fit in usize: {}",
+                self.key, self.live_len
+            ))
+        })?;
+        let end = start.checked_add(len).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster object {} live range overflows: offset={}, len={}",
+                self.key, self.live_offset, self.live_len
+            ))
+        })?;
+        Ok(Some(start..end))
+    }
 }
 
 /// A reference to an IVF segment stored on S3.
@@ -679,6 +723,92 @@ mod tests {
             decoded.segments[0].cluster_owners,
             vec!["seg_a".to_string(), "seg_rt".to_string()]
         );
+    }
+
+    #[test]
+    fn test_cluster_data_object_live_span_defaults_and_roundtrip() {
+        #[derive(Serialize)]
+        struct OldClusterDataObjectRef {
+            key: String,
+            clusters: Vec<usize>,
+        }
+        #[derive(Serialize)]
+        struct MixedSegmentRef {
+            id: String,
+            vector_count: usize,
+            cluster_count: usize,
+            quantization: crate::index::quantization::QuantizationType,
+            hierarchical: bool,
+            bitmap_fields: Vec<String>,
+            fts_fields: Vec<String>,
+            has_global_fts: bool,
+            cluster_owners: Vec<String>,
+            sketch: Option<SketchRef>,
+            cluster_objects: Vec<OldClusterDataObjectRef>,
+            bootstrap: Option<BootstrapRef>,
+        }
+        #[derive(Serialize)]
+        struct MixedManifest {
+            fragments: Vec<FragmentRef>,
+            segments: Vec<MixedSegmentRef>,
+            compaction_watermark: Option<Ulid>,
+            active_segment: Option<String>,
+            next_sequence: u64,
+            pending_deletes: Vec<String>,
+            fencing_token: u64,
+            updated_at: DateTime<Utc>,
+        }
+
+        let old = MixedManifest {
+            fragments: vec![],
+            segments: vec![MixedSegmentRef {
+                id: "seg_grouped".to_string(),
+                vector_count: 10,
+                cluster_count: 2,
+                quantization: crate::index::quantization::QuantizationType::Scalar,
+                hierarchical: false,
+                bitmap_fields: vec![],
+                fts_fields: vec![],
+                has_global_fts: false,
+                cluster_owners: vec![],
+                sketch: None,
+                cluster_objects: vec![OldClusterDataObjectRef {
+                    key: "ns/segments/seg_grouped/cluster_group_0.bin".to_string(),
+                    clusters: vec![0, 1],
+                }],
+                bootstrap: None,
+            }],
+            compaction_watermark: None,
+            active_segment: Some("seg_grouped".to_string()),
+            next_sequence: 0,
+            pending_deletes: vec![],
+            fencing_token: 0,
+            updated_at: Utc::now(),
+        };
+
+        let msgpack = rmp_serde::to_vec(&old).unwrap();
+        let mut data = vec![MANIFEST_FORMAT_MSGPACK];
+        data.extend_from_slice(&msgpack);
+        let decoded = Manifest::from_bytes(&data)
+            .expect("old cluster object refs without live spans must decode");
+        let object_ref = &decoded.segments[0].cluster_objects[0];
+        assert_eq!(object_ref.live_offset, 0);
+        assert_eq!(object_ref.live_len, 0);
+        assert!(object_ref.live_range().unwrap().is_none());
+
+        let mut manifest = Manifest::new();
+        let mut seg = make_segment("seg_live");
+        seg.cluster_objects = vec![ClusterDataObjectRef {
+            key: "ns/segments/seg_live/cluster_group_0.bin".to_string(),
+            clusters: vec![0, 1],
+            live_offset: 0,
+            live_len: 123,
+        }];
+        manifest.add_segment(seg);
+        let bytes = manifest.to_bytes().unwrap();
+        let decoded = Manifest::from_bytes(&bytes).unwrap();
+        let object_ref = &decoded.segments[0].cluster_objects[0];
+        assert_eq!(object_ref.live_range().unwrap(), Some(0..123));
     }
 
     /// Round-trip: size_bytes survives serialize → deserialize.

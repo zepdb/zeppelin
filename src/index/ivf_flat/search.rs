@@ -67,6 +67,7 @@ struct Candidate {
 struct ClusterFetchObject {
     key: String,
     clusters: Vec<usize>,
+    live_range: Option<std::ops::Range<usize>>,
 }
 
 /// Fetch data from cache if available, otherwise from S3.
@@ -84,9 +85,17 @@ async fn fetch_with_cache(
 
 fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<ClusterFetchObject> {
     if let Some(object_ref) = index.cluster_object(cluster_idx)? {
+        let live_range = object_ref.live_range()?;
+        if live_range.as_ref().is_some_and(|range| range.start != 0) {
+            return Err(ZeppelinError::Index(format!(
+                "cluster object {} advertised nonzero live offset; flat-scan range must be self-contained",
+                object_ref.key
+            )));
+        }
         return Ok(ClusterFetchObject {
             key: object_ref.key.clone(),
             clusters: object_ref.clusters.clone(),
+            live_range,
         });
     }
 
@@ -97,7 +106,31 @@ fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<Clus
             cluster_idx,
         ),
         clusters: vec![cluster_idx],
+        live_range: None,
     })
+}
+
+async fn fetch_cluster_object_for_flat_scan(
+    cache: Option<&Arc<DiskCache>>,
+    store: &ZeppelinStore,
+    object: &ClusterFetchObject,
+    use_live_range: bool,
+) -> Result<bytes::Bytes> {
+    if use_live_range {
+        if let Some(range) = object.live_range.clone() {
+            // A locally cached full object supersedes the ranged fetch; the
+            // live span is a prefix, so slicing preserves parse semantics.
+            if let Some(c) = cache {
+                if let Some(data) = c.get(&object.key).await {
+                    if data.len() >= range.end {
+                        return Ok(data.slice(range));
+                    }
+                }
+            }
+            return store.get_range(&object.key, range).await;
+        }
+    }
+    fetch_with_cache(cache, store, &object.key).await
 }
 
 fn cluster_fetch_objects(
@@ -228,6 +261,7 @@ pub async fn search_ivf_flat(
             filter,
             store,
             cache,
+            true,
         )
         .await?
     } else {
@@ -267,6 +301,7 @@ pub async fn search_ivf_flat(
                     filter,
                     store,
                     cache,
+                    false,
                 )
                 .await?
             }
@@ -654,6 +689,7 @@ async fn scan_clusters_flat(
     filter: Option<&Filter>,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
+    use_live_range: bool,
 ) -> Result<Vec<Candidate>> {
     let has_bitmaps = !index.bitmap_fields.is_empty();
 
@@ -664,7 +700,8 @@ async fn scan_clusters_flat(
         let object_key = object.key.clone();
         let object_clusters = object.clusters.clone();
         async move {
-            let object_res = fetch_with_cache(cache, store, &object_key).await;
+            let object_res =
+                fetch_cluster_object_for_flat_scan(cache, store, object, use_live_range).await;
             let cluster_meta =
                 futures::future::join_all(object_clusters.iter().map(|&cluster_idx| async move {
                     let owner = index.cluster_owner(cluster_idx);
