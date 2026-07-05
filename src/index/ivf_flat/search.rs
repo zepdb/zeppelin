@@ -44,11 +44,14 @@ const SKETCH_ADAPTIVE_MAX_MULTIPLIER: usize = 2;
 // Include extra clusters whose aggregate sketch distance is close to the best
 // cluster for this query; the cutoff uses no cross-query state.
 const SKETCH_ADAPTIVE_RELATIVE_SCORE_MARGIN: f32 = 0.13;
-// Buddy-paired cluster objects cover up to two logical clusters per S3 GET.
-// For low nprobe, halve the previous cluster cap into an object cap; when the
-// previous cap already covered the full probe set, keep the cap at nprobe so
-// high-nprobe sentinels fetch every object touching the probed clusters.
-const BUDDY_CLUSTER_OBJECT_ARITY: usize = 2;
+// Grouped cluster objects cover multiple logical clusters per S3 GET. The
+// object cap starts from the cluster cap, scales by actual manifest arity, and
+// keeps a small hard-query allowance for flat score distributions.
+const SKETCH_ADAPTIVE_FLOOR_OBJECTS: usize = 3;
+const SKETCH_ADAPTIVE_THIN_OBJECT_FLOOR: usize = 5;
+const SKETCH_THIN_OBJECT_MAX_ARITY: usize = 3;
+const SKETCH_ADAPTIVE_THIN_RELATIVE_SCORE_MARGIN: f32 = 0.12;
+const SKETCH_ADAPTIVE_OBJECT_CAP_EXTRA: usize = 2;
 const SKETCH_SCAN_STATS_ENV: &str = "ZEPPELIN_SKETCH_SCAN_STATS";
 
 /// A candidate result during search, before final ranking.
@@ -125,10 +128,10 @@ fn expand_clusters_to_objects(index: &IvfFlatIndex, clusters: &[usize]) -> Resul
     Ok(expanded)
 }
 
-fn emit_scan_stats(effective_nprobe: usize, objects: usize, clusters: usize, paired: bool) {
+fn emit_scan_stats(effective_nprobe: usize, objects: usize, clusters: usize, grouped: bool) {
     if std::env::var_os(SKETCH_SCAN_STATS_ENV).is_some() {
         eprintln!(
-            "zeppelin_scan_stats nprobe={effective_nprobe} object_gets={objects} clusters_covered={clusters} paired={paired}"
+            "zeppelin_scan_stats nprobe={effective_nprobe} object_gets={objects} clusters_covered={clusters} grouped={grouped}"
         );
     }
 }
@@ -345,7 +348,7 @@ fn select_scan_clusters(
 
     if !index.cluster_objects.is_empty() {
         let ranked_clusters = sketch.rank_clusters(query, distance_metric, probe_clusters)?;
-        let selected = select_buddy_object_clusters(index, &ranked_clusters, effective_nprobe)?;
+        let selected = select_grouped_object_clusters(index, &ranked_clusters, effective_nprobe)?;
         emit_scan_stats(
             effective_nprobe,
             selected.object_count,
@@ -358,17 +361,31 @@ fn select_scan_clusters(
     sketch.select_clusters(query, distance_metric, probe_clusters, cluster_budget)
 }
 
-struct SelectedBuddyClusters {
+struct SelectedObjectClusters {
     clusters: Vec<usize>,
     object_count: usize,
 }
 
-fn select_buddy_object_clusters(
+#[derive(Debug, Clone, Copy)]
+struct AdaptiveObjectBudget {
+    floor_objects: usize,
+    max_objects: usize,
+    relative_score_margin: f32,
+}
+
+fn select_grouped_object_clusters(
     index: &IvfFlatIndex,
     ranked_clusters: &[ClusterScore],
     effective_nprobe: usize,
-) -> Result<SelectedBuddyClusters> {
-    let object_cap = paired_object_cap(effective_nprobe);
+) -> Result<SelectedObjectClusters> {
+    if ranked_clusters.is_empty() {
+        return Err(ZeppelinError::Index(
+            "grouped object selection received no ranked clusters".into(),
+        ));
+    }
+    let budget = adaptive_object_budget(index, effective_nprobe);
+    let best_score = ranked_clusters[0].aggregate_score;
+    let cutoff = best_score + best_score.abs() * budget.relative_score_margin;
     let mut selected_objects = HashSet::new();
     let mut covered_clusters = HashSet::new();
     let mut clusters = Vec::new();
@@ -377,9 +394,14 @@ fn select_buddy_object_clusters(
         if covered_clusters.contains(&score.cluster_idx) {
             continue;
         }
-        if selected_objects.len() >= object_cap {
+        if selected_objects.len() >= budget.max_objects {
             break;
         }
+        let within_floor = selected_objects.len() < budget.floor_objects;
+        if !within_floor && score.aggregate_score > cutoff {
+            break;
+        }
+
         let object = cluster_fetch_object(index, score.cluster_idx)?;
         if !selected_objects.insert(object.key) {
             continue;
@@ -393,22 +415,57 @@ fn select_buddy_object_clusters(
 
     if clusters.is_empty() {
         return Err(ZeppelinError::Index(
-            "buddy object selection produced no clusters".into(),
+            "grouped object selection produced no clusters".into(),
         ));
     }
 
-    Ok(SelectedBuddyClusters {
+    Ok(SelectedObjectClusters {
         clusters,
         object_count: selected_objects.len(),
     })
 }
 
-fn paired_object_cap(effective_nprobe: usize) -> usize {
+fn adaptive_object_budget(index: &IvfFlatIndex, effective_nprobe: usize) -> AdaptiveObjectBudget {
+    let max_arity = max_cluster_object_arity(index);
+    let max_objects = grouped_object_cap_for_arity(max_arity, effective_nprobe);
+    let is_thin = max_arity <= SKETCH_THIN_OBJECT_MAX_ARITY;
+    let floor = if is_thin {
+        SKETCH_ADAPTIVE_THIN_OBJECT_FLOOR
+    } else {
+        SKETCH_ADAPTIVE_FLOOR_OBJECTS
+    };
+    let relative_score_margin = if is_thin {
+        SKETCH_ADAPTIVE_THIN_RELATIVE_SCORE_MARGIN
+    } else {
+        SKETCH_ADAPTIVE_RELATIVE_SCORE_MARGIN
+    };
+    AdaptiveObjectBudget {
+        floor_objects: floor.min(max_objects),
+        max_objects,
+        relative_score_margin,
+    }
+}
+
+fn max_cluster_object_arity(index: &IvfFlatIndex) -> usize {
+    index
+        .cluster_objects
+        .iter()
+        .map(|object_ref| object_ref.clusters.len().max(1))
+        .max()
+        .unwrap_or(1)
+}
+
+fn grouped_object_cap_for_arity(max_arity: usize, effective_nprobe: usize) -> usize {
     let cluster_cap = sketch_adaptive_cluster_cap(effective_nprobe);
     if cluster_cap >= effective_nprobe {
         effective_nprobe
     } else {
-        cluster_cap.div_ceil(BUDDY_CLUSTER_OBJECT_ARITY).max(1)
+        let legacy_pair_cap = cluster_cap.div_ceil(2).max(1);
+        cluster_cap
+            .div_ceil(max_arity)
+            .saturating_add(SKETCH_ADAPTIVE_OBJECT_CAP_EXTRA)
+            .min(legacy_pair_cap)
+            .max(SKETCH_ADAPTIVE_FLOOR_OBJECTS.min(effective_nprobe))
     }
 }
 
@@ -488,10 +545,10 @@ async fn scan_clusters_flat(
     let mut candidates = Vec::new();
     for (object_key, object_clusters, object_res, cluster_meta) in prefetched {
         let object_data = object_res?;
-        let paired_sections = cluster_object_sections(&object_data)?;
-        if paired_sections.is_some() && index.cluster_objects.is_empty() {
+        let grouped_sections = cluster_object_sections(&object_data)?;
+        if grouped_sections.is_some() && index.cluster_objects.is_empty() {
             return Err(ZeppelinError::Index(format!(
-                "legacy cluster key {object_key} contained paired cluster data"
+                "legacy cluster key {object_key} contained grouped cluster data"
             )));
         }
 
@@ -1137,7 +1194,7 @@ mod tests {
         assert_eq!(adaptive_sketch_budget(8).max_clusters(), 8);
         assert_eq!(adaptive_sketch_budget(16).max_clusters(), 14);
         assert_eq!(adaptive_sketch_budget(128).max_clusters(), 128);
-        assert_eq!(paired_object_cap(16), 7);
-        assert_eq!(paired_object_cap(128), 128);
+        assert_eq!(grouped_object_cap_for_arity(4, 16), 6);
+        assert_eq!(grouped_object_cap_for_arity(4, 128), 128);
     }
 }
