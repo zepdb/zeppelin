@@ -16,6 +16,7 @@ use crate::error::Result;
 use crate::index::VectorIndex;
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, Filter, SearchResult, VectorEntry};
+use crate::wal::manifest::ClusterDataObjectRef;
 
 /// In-memory handle for a built IVF-Flat index.
 ///
@@ -47,6 +48,11 @@ pub struct IvfFlatIndex {
     /// Segment-global artifacts (centroids, SQ calibration, PQ codebook)
     /// always live under `segment_id` and never consult this map.
     pub(crate) cluster_owners: Vec<String>,
+    /// Manifest-defined cluster-data objects. EMPTY means legacy
+    /// one-object-per-cluster layout through `cluster_owner()`.
+    pub(crate) cluster_objects: Vec<ClusterDataObjectRef>,
+    /// Lookup from logical cluster index to `cluster_objects` index.
+    pub(crate) cluster_object_by_cluster: Vec<usize>,
     /// Resident coarse sketch loaded from the segment artifact, when present.
     pub(crate) resident_sketch: Option<sketch::ResidentSketch>,
     /// Manifest reference for the resident sketch artifact, when this handle
@@ -74,6 +80,31 @@ impl IvfFlatIndex {
             .unwrap_or(&self.segment_id)
     }
 
+    /// Paired cluster-data object for a logical cluster, when this segment uses
+    /// the manifest-defined object layout.
+    pub(crate) fn cluster_object(
+        &self,
+        cluster_idx: usize,
+    ) -> Result<Option<&ClusterDataObjectRef>> {
+        if self.cluster_objects.is_empty() {
+            return Ok(None);
+        }
+        let object_idx = self
+            .cluster_object_by_cluster
+            .get(cluster_idx)
+            .copied()
+            .ok_or_else(|| {
+                crate::error::ZeppelinError::Index(format!(
+                    "cluster {cluster_idx} outside cluster object lookup"
+                ))
+            })?;
+        self.cluster_objects.get(object_idx).map(Some).ok_or_else(|| {
+            crate::error::ZeppelinError::Index(format!(
+                "cluster object lookup for cluster {cluster_idx} points to missing object {object_idx}"
+            ))
+        })
+    }
+
     /// Whether the cluster may contain non-null attributes.
     #[must_use]
     pub(crate) fn cluster_may_have_attrs(&self, cluster_idx: usize) -> bool {
@@ -91,6 +122,11 @@ impl IvfFlatIndex {
     /// The segment ID this index was built under.
     pub fn segment_id(&self) -> &str {
         &self.segment_id
+    }
+
+    /// Manifest cluster-data object refs for this built/loaded index.
+    pub fn cluster_objects(&self) -> &[ClusterDataObjectRef] {
+        &self.cluster_objects
     }
 
     /// Load an existing IVF-Flat index from S3 artifacts.
@@ -112,6 +148,7 @@ impl IvfFlatIndex {
         num_vectors: usize,
         quantization: crate::index::quantization::QuantizationType,
         cluster_owners: Vec<String>,
+        cluster_objects: Vec<ClusterDataObjectRef>,
         sketch_ref: Option<crate::wal::manifest::SketchRef>,
         cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
     ) -> Result<Self> {
@@ -122,6 +159,7 @@ impl IvfFlatIndex {
             num_vectors,
             quantization,
             cluster_owners,
+            cluster_objects,
             sketch_ref,
             cache,
         )

@@ -389,7 +389,7 @@ async fn test_compact_with_existing_segment() {
         ..Default::default()
     };
     let old_seg_id = "seg_old";
-    build_ivf_flat(&initial_vecs, &indexing_config, store, &ns, old_seg_id)
+    let old_index = build_ivf_flat(&initial_vecs, &indexing_config, store, &ns, old_seg_id)
         .await
         .unwrap();
 
@@ -406,6 +406,7 @@ async fn test_compact_with_existing_segment() {
         has_global_fts: false,
         cluster_owners: Vec::new(),
         sketch: None,
+        cluster_objects: old_index.cluster_objects().to_vec(),
     });
     manifest.write(store, &ns).await.unwrap();
 

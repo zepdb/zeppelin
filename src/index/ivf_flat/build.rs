@@ -18,7 +18,7 @@
 //!   centroids blob for embedded calibration; when absent they read the legacy
 //!   `sq_calibration.bin` key.
 //! - Old `cluster_i.bin`: `[num_vectors:u32][dim:u32] ... full-precision rows`.
-//! - New `cluster_i.bin`: `[b"ZCL2"][sq_offset:u64][sq_len:u64]
+//! - New scalar cluster sections: `[b"ZCL2"][sq_offset:u64][sq_len:u64]
 //!   [full_offset:u64][full_len:u64][sq_cluster bytes][full cluster bytes]`.
 //!   Section offsets are absolute byte offsets from the beginning of the
 //!   object. The coarse SQ path fetches this whole object through the normal
@@ -26,6 +26,11 @@
 //!   same `cluster_i.bin` key and gets a cache hit, then parses the full section.
 //!   The offset table is present now so a later range-GET implementation can
 //!   fetch only `[sq_offset, sq_offset + sq_len)` without changing the format.
+//! - New buddy-paired `cluster_pair_i.bin`: `[b"ZBP1"][entry_count:u32]`
+//!   followed by `[cluster_idx:u32][offset:u64][len:u64] * entry_count` and
+//!   then one or two cluster sections. Pair membership is stored in the
+//!   manifest's `cluster_objects` field; an empty field is an explicit legacy
+//!   per-cluster layout.
 //! - `attrs_i.bin` is unchanged and remains lazy-loaded.
 //! - `sq_cluster_i.bin` and `sq_calibration.bin` are legacy read-only keys.
 //!   New SQ segments do not write them. Old-format carried clusters continue
@@ -46,7 +51,7 @@
 //!   keeps `pq_codebook.bin` and `pq_cluster_i.bin` unchanged for this phase.
 
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use tracing::{debug, info};
 
 use crate::config::IndexingConfig;
@@ -54,9 +59,7 @@ use crate::error::{Result, ZeppelinError};
 use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, VectorEntry};
-
-/// Pre-serialized cluster payload: (vec_key, vec_data, attr_key, attr_data, optional bitmap).
-type ClusterPayload = (String, Bytes, String, Bytes, Option<(String, Bytes)>);
+use crate::wal::manifest::ClusterDataObjectRef;
 
 use super::kmeans::train_kmeans;
 use super::sketch::{build_resident_sketch, ResidentSketch};
@@ -66,6 +69,9 @@ use crate::index::distance;
 const CENTROIDS_V2_MAGIC: &[u8; 4] = b"ZCT2";
 const CLUSTER_V2_MAGIC: &[u8; 4] = b"ZCL2";
 const CLUSTER_V2_HEADER_LEN: usize = 4 + 8 * 4;
+const BUDDY_CLUSTER_OBJECT_MAGIC: &[u8; 4] = b"ZBP1";
+const BUDDY_CLUSTER_OBJECT_HEADER_LEN: usize = 8;
+const BUDDY_CLUSTER_OBJECT_DIR_ENTRY_LEN: usize = 4 + 8 + 8;
 
 // ---------------------------------------------------------------------------
 // Artifact paths
@@ -81,9 +87,124 @@ pub(crate) fn cluster_key(namespace: &str, segment_id: &str, cluster_idx: usize)
     format!("{namespace}/segments/{segment_id}/cluster_{cluster_idx}.bin")
 }
 
+/// S3 key for buddy-paired cluster data object `pair_idx`.
+pub(crate) fn cluster_pair_key(namespace: &str, segment_id: &str, pair_idx: usize) -> String {
+    format!("{namespace}/segments/{segment_id}/cluster_pair_{pair_idx}.bin")
+}
+
 /// S3 key for the attribute data of cluster `i`.
 pub(crate) fn attrs_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> String {
     format!("{namespace}/segments/{segment_id}/attrs_{cluster_idx}.bin")
+}
+
+/// Greedy centroid-adjacent buddy pairing used for cluster-data objects.
+pub(crate) fn buddy_cluster_groups(
+    centroids: &[Vec<f32>],
+    affinity: &[Vec<u32>],
+) -> Vec<Vec<usize>> {
+    let mut edges = Vec::new();
+    for left in 0..centroids.len() {
+        for right in (left + 1)..centroids.len() {
+            let weight = affinity
+                .get(left)
+                .and_then(|row| row.get(right))
+                .copied()
+                .unwrap_or(0);
+            edges.push((
+                weight,
+                distance::euclidean_distance(&centroids[left], &centroids[right]),
+                left,
+                right,
+            ));
+        }
+    }
+    edges.sort_by(
+        |(a_weight, a_dist, a_left, a_right), (b_weight, b_dist, b_left, b_right)| {
+            b_weight
+                .cmp(a_weight)
+                .then_with(|| {
+                    a_dist
+                        .partial_cmp(b_dist)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a_left.cmp(b_left))
+                .then_with(|| a_right.cmp(b_right))
+        },
+    );
+
+    let mut matched = vec![false; centroids.len()];
+    let mut groups = Vec::with_capacity(centroids.len().div_ceil(2));
+    for (_, _, left, right) in edges {
+        if matched[left] || matched[right] {
+            continue;
+        }
+        matched[left] = true;
+        matched[right] = true;
+        groups.push(vec![left, right]);
+    }
+    for (cluster_idx, is_matched) in matched.into_iter().enumerate() {
+        if !is_matched {
+            groups.push(vec![cluster_idx]);
+        }
+    }
+    groups.sort_by_key(|group| group[0]);
+
+    groups
+}
+
+pub(crate) fn build_cluster_object_lookup(
+    cluster_count: usize,
+    cluster_objects: &[ClusterDataObjectRef],
+) -> Result<Vec<usize>> {
+    if cluster_objects.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut lookup = vec![usize::MAX; cluster_count];
+    for (object_idx, object_ref) in cluster_objects.iter().enumerate() {
+        if object_ref.key.is_empty() {
+            return Err(ZeppelinError::Index(format!(
+                "cluster object {object_idx} has empty key"
+            )));
+        }
+        if object_ref.clusters.is_empty() {
+            return Err(ZeppelinError::Index(format!(
+                "cluster object {} has no clusters",
+                object_ref.key
+            )));
+        }
+        let mut seen_in_object = BTreeSet::new();
+        for &cluster_idx in &object_ref.clusters {
+            if cluster_idx >= cluster_count {
+                return Err(ZeppelinError::Index(format!(
+                    "cluster object {} references out-of-range cluster {cluster_idx} for count {cluster_count}",
+                    object_ref.key
+                )));
+            }
+            if !seen_in_object.insert(cluster_idx) {
+                return Err(ZeppelinError::Index(format!(
+                    "cluster object {} lists cluster {cluster_idx} twice",
+                    object_ref.key
+                )));
+            }
+            if lookup[cluster_idx] != usize::MAX {
+                return Err(ZeppelinError::Index(format!(
+                    "cluster {cluster_idx} appears in multiple cluster objects"
+                )));
+            }
+            lookup[cluster_idx] = object_idx;
+        }
+    }
+
+    for (cluster_idx, object_idx) in lookup.iter().enumerate() {
+        if *object_idx == usize::MAX {
+            return Err(ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing from paired cluster object layout"
+            )));
+        }
+    }
+
+    Ok(lookup)
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +463,72 @@ pub(crate) fn serialize_colocated_sq_cluster(
     Ok(Bytes::from(buf))
 }
 
+/// Serialize one immutable object containing one or more cluster payloads.
+///
+/// Each payload is a complete cluster section: either the legacy full-vector
+/// cluster format or the v2 SQ+full co-located format.
+pub(crate) fn serialize_cluster_data_object(entries: &[(usize, Bytes)]) -> Result<Bytes> {
+    if entries.is_empty() {
+        return Err(ZeppelinError::Index(
+            "cluster data object cannot be empty".into(),
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    for (cluster_idx, _) in entries {
+        if *cluster_idx > u32::MAX as usize {
+            return Err(ZeppelinError::Index(format!(
+                "cluster index does not fit in u32: {cluster_idx}"
+            )));
+        }
+        if !seen.insert(*cluster_idx) {
+            return Err(ZeppelinError::Index(format!(
+                "duplicate cluster {cluster_idx} in cluster data object"
+            )));
+        }
+    }
+
+    let directory_len = entries
+        .len()
+        .checked_mul(BUDDY_CLUSTER_OBJECT_DIR_ENTRY_LEN)
+        .ok_or_else(|| ZeppelinError::Index("cluster object directory overflows".into()))?;
+    let payload_offset = BUDDY_CLUSTER_OBJECT_HEADER_LEN
+        .checked_add(directory_len)
+        .ok_or_else(|| ZeppelinError::Index("cluster object header overflows".into()))?;
+    let payload_len: usize =
+        entries
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .try_fold(0usize, |acc, len| {
+                acc.checked_add(len)
+                    .ok_or_else(|| ZeppelinError::Index("cluster object payload overflows".into()))
+            })?;
+    let total = payload_offset
+        .checked_add(payload_len)
+        .ok_or_else(|| ZeppelinError::Index("cluster object size overflows".into()))?;
+
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(BUDDY_CLUSTER_OBJECT_MAGIC);
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+
+    let mut offset = payload_offset;
+    for (cluster_idx, bytes) in entries {
+        buf.extend_from_slice(&(*cluster_idx as u32).to_le_bytes());
+        buf.extend_from_slice(&(offset as u64).to_le_bytes());
+        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        offset = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| ZeppelinError::Index("cluster object section overflows".into()))?;
+    }
+
+    for (_, bytes) in entries {
+        buf.extend_from_slice(bytes);
+    }
+    debug_assert_eq!(buf.len(), total);
+
+    Ok(Bytes::from(buf))
+}
+
 /// Cluster data for a single cluster.
 #[derive(Debug)]
 pub(crate) struct ClusterData {
@@ -353,6 +540,16 @@ pub(crate) struct ClusterData {
 pub(crate) fn deserialize_cluster(data: &[u8]) -> Result<ClusterData> {
     let data = full_cluster_section(data)?;
     deserialize_legacy_cluster(data)
+}
+
+/// Deserialize one cluster section from either a legacy per-cluster object or
+/// a buddy-paired cluster-data object.
+pub(crate) fn deserialize_cluster_from_object(
+    data: &[u8],
+    cluster_idx: usize,
+) -> Result<ClusterData> {
+    let data = cluster_section_from_object(data, cluster_idx)?;
+    deserialize_cluster(data)
 }
 
 fn deserialize_legacy_cluster(data: &[u8]) -> Result<ClusterData> {
@@ -430,9 +627,122 @@ pub(crate) fn deserialize_colocated_sq_cluster(
     Ok(Some(sq_cluster))
 }
 
+/// Deserialize the SQ section for one cluster in either a legacy per-cluster
+/// object or a buddy-paired cluster-data object.
+pub(crate) fn deserialize_colocated_sq_cluster_from_object(
+    data: &[u8],
+    cluster_idx: usize,
+) -> Result<Option<crate::index::quantization::sq::SqClusterData>> {
+    let data = cluster_section_from_object(data, cluster_idx)?;
+    deserialize_colocated_sq_cluster(data)
+}
+
 struct ColocatedClusterSections<'a> {
     sq: &'a [u8],
     full: &'a [u8],
+}
+
+pub(crate) struct ClusterObjectSection<'a> {
+    pub cluster_idx: usize,
+    pub data: &'a [u8],
+}
+
+/// Return all sections in a buddy-paired cluster-data object.
+///
+/// `Ok(None)` means the bytes are a legacy per-cluster object, not a paired
+/// object. Callers that already know they fetched a paired key should treat
+/// `None` as an error at that boundary.
+pub(crate) fn cluster_object_sections(
+    data: &[u8],
+) -> Result<Option<Vec<ClusterObjectSection<'_>>>> {
+    if !data.starts_with(BUDDY_CLUSTER_OBJECT_MAGIC) {
+        return Ok(None);
+    }
+    if data.len() < BUDDY_CLUSTER_OBJECT_HEADER_LEN {
+        return Err(ZeppelinError::Index(
+            "buddy cluster object too small for header".into(),
+        ));
+    }
+
+    let entry_count = u32::from_le_bytes(
+        data[4..8]
+            .try_into()
+            .map_err(|_| ZeppelinError::Index("buddy cluster object count parse error".into()))?,
+    ) as usize;
+    if entry_count == 0 {
+        return Err(ZeppelinError::Index(
+            "buddy cluster object has zero entries".into(),
+        ));
+    }
+
+    let directory_len = entry_count
+        .checked_mul(BUDDY_CLUSTER_OBJECT_DIR_ENTRY_LEN)
+        .ok_or_else(|| ZeppelinError::Index("buddy cluster directory overflows".into()))?;
+    let payload_start = BUDDY_CLUSTER_OBJECT_HEADER_LEN
+        .checked_add(directory_len)
+        .ok_or_else(|| ZeppelinError::Index("buddy cluster header overflows".into()))?;
+    if data.len() < payload_start {
+        return Err(ZeppelinError::Index(format!(
+            "buddy cluster object truncated directory: expected at least {payload_start}, got {}",
+            data.len()
+        )));
+    }
+
+    let mut sections = Vec::with_capacity(entry_count);
+    let mut seen = BTreeSet::new();
+    for entry_idx in 0..entry_count {
+        let base = BUDDY_CLUSTER_OBJECT_HEADER_LEN + entry_idx * BUDDY_CLUSTER_OBJECT_DIR_ENTRY_LEN;
+        let cluster_idx = u32::from_le_bytes(
+            data[base..base + 4]
+                .try_into()
+                .map_err(|_| ZeppelinError::Index("buddy cluster index parse error".into()))?,
+        ) as usize;
+        if !seen.insert(cluster_idx) {
+            return Err(ZeppelinError::Index(format!(
+                "duplicate cluster {cluster_idx} in buddy cluster object"
+            )));
+        }
+
+        let offset = read_u64_usize(data, base + 4, "buddy cluster section offset")?;
+        let len = read_u64_usize(data, base + 12, "buddy cluster section length")?;
+        if offset < payload_start {
+            return Err(ZeppelinError::Index(format!(
+                "buddy cluster section starts inside directory: offset={offset}, payload_start={payload_start}"
+            )));
+        }
+        let end = offset.checked_add(len).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "buddy cluster section overflows: offset={offset}, len={len}"
+            ))
+        })?;
+        if end > data.len() {
+            return Err(ZeppelinError::Index(format!(
+                "buddy cluster section out of bounds: end={end}, len={}",
+                data.len()
+            )));
+        }
+        sections.push(ClusterObjectSection {
+            cluster_idx,
+            data: &data[offset..end],
+        });
+    }
+
+    Ok(Some(sections))
+}
+
+fn cluster_section_from_object(data: &[u8], cluster_idx: usize) -> Result<&[u8]> {
+    let Some(sections) = cluster_object_sections(data)? else {
+        return Ok(data);
+    };
+    sections
+        .into_iter()
+        .find(|section| section.cluster_idx == cluster_idx)
+        .map(|section| section.data)
+        .ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing from buddy cluster object"
+            ))
+        })
 }
 
 fn full_cluster_section(data: &[u8]) -> Result<&[u8]> {
@@ -581,16 +891,30 @@ pub async fn build_ivf_flat(
     let mut cluster_vecs: Vec<Vec<Vec<f32>>> = vec![Vec::new(); num_clusters];
     let mut cluster_attrs: Vec<Vec<Option<HashMap<String, AttributeValue>>>> =
         vec![Vec::new(); num_clusters];
+    let mut buddy_affinity: Vec<Vec<u32>> = vec![vec![0; num_clusters]; num_clusters];
 
     for entry in vectors {
         let mut best_dist = f32::MAX;
+        let mut second_dist = f32::MAX;
         let mut best_cluster = 0usize;
+        let mut second_cluster = 0usize;
         for (c, centroid) in centroids.iter().enumerate() {
             let d = distance::euclidean_distance(&entry.values, centroid);
             if d < best_dist {
+                second_dist = best_dist;
+                second_cluster = best_cluster;
                 best_dist = d;
                 best_cluster = c;
+            } else if d < second_dist {
+                second_dist = d;
+                second_cluster = c;
             }
+        }
+        if num_clusters > 1 && second_cluster != best_cluster {
+            buddy_affinity[best_cluster][second_cluster] =
+                buddy_affinity[best_cluster][second_cluster].saturating_add(1);
+            buddy_affinity[second_cluster][best_cluster] =
+                buddy_affinity[second_cluster][best_cluster].saturating_add(1);
         }
         cluster_ids[best_cluster].push(entry.id.clone());
         cluster_vecs[best_cluster].push(entry.values.clone());
@@ -622,9 +946,10 @@ pub async fn build_ivf_flat(
     store.put(&ckey, centroids_data).await?;
     debug!(key = %ckey, "wrote centroids");
 
-    // CPU phase: pre-serialize all cluster payloads.
+    // CPU phase: pre-serialize all cluster sections and sidecars.
     let mut bitmap_fields_set = std::collections::HashSet::new();
-    let mut cluster_payloads: Vec<ClusterPayload> = Vec::with_capacity(num_clusters);
+    let mut cluster_sections: Vec<Bytes> = Vec::with_capacity(num_clusters);
+    let mut sidecar_payloads: Vec<(String, Bytes)> = Vec::new();
     for i in 0..num_clusters {
         let cvec_data = if let Some(cal) = &sq_calibration {
             let cluster_refs: Vec<&[f32]> = cluster_vecs[i].iter().map(|v| v.as_slice()).collect();
@@ -633,12 +958,13 @@ pub async fn build_ivf_flat(
         } else {
             serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?
         };
-        let cvec_key = cluster_key(namespace, segment_id, i);
+        cluster_sections.push(cvec_data);
 
         let cattr_data = serialize_attrs(&cluster_attrs[i])?;
         let cattr_key = attrs_key(namespace, segment_id, i);
+        sidecar_payloads.push((cattr_key, cattr_data));
 
-        let bitmap = if config.bitmap_index {
+        if config.bitmap_index {
             let attr_refs: Vec<Option<&HashMap<String, AttributeValue>>> =
                 cluster_attrs[i].iter().map(|a| a.as_ref()).collect();
             let bitmap_index = crate::index::bitmap::build::build_cluster_bitmaps(&attr_refs);
@@ -647,29 +973,47 @@ pub async fn build_ivf_flat(
             }
             let bitmap_data = bitmap_index.to_bytes()?;
             let bkey = crate::index::bitmap::bitmap_key(namespace, segment_id, i);
-            Some((bkey, bitmap_data))
-        } else {
-            None
-        };
-
-        cluster_payloads.push((cvec_key, cvec_data, cattr_key, cattr_data, bitmap));
+            sidecar_payloads.push((bkey, bitmap_data));
+        }
     }
     let bitmap_fields: Vec<String> = bitmap_fields_set.into_iter().collect();
 
-    // I/O phase: write all cluster data in parallel.
+    let mut cluster_objects = Vec::new();
+    let mut cluster_object_payloads = Vec::new();
+    for (pair_idx, group) in buddy_cluster_groups(&centroids, &buddy_affinity)
+        .into_iter()
+        .enumerate()
+    {
+        let entries: Vec<(usize, Bytes)> = group
+            .iter()
+            .map(|&cluster_idx| (cluster_idx, cluster_sections[cluster_idx].clone()))
+            .collect();
+        let key = cluster_pair_key(namespace, segment_id, pair_idx);
+        let data = serialize_cluster_data_object(&entries)?;
+        cluster_objects.push(ClusterDataObjectRef {
+            key: key.clone(),
+            clusters: group,
+        });
+        cluster_object_payloads.push((key, data));
+    }
+
+    // I/O phase: write all cluster data and sidecars in parallel.
     let mut write_futs = Vec::new();
-    for (cvec_key, cvec_data, cattr_key, cattr_data, bitmap) in &cluster_payloads {
-        write_futs.push(store.put(cvec_key, cvec_data.clone()));
-        write_futs.push(store.put(cattr_key, cattr_data.clone()));
-        if let Some((bkey, bitmap_data)) = bitmap {
-            write_futs.push(store.put(bkey, bitmap_data.clone()));
-        }
+    for (key, data) in &cluster_object_payloads {
+        write_futs.push(store.put(key, data.clone()));
+    }
+    for (key, data) in &sidecar_payloads {
+        write_futs.push(store.put(key, data.clone()));
     }
     let results = futures::future::join_all(write_futs).await;
     for result in results {
         result?;
     }
-    debug!(num_clusters, "wrote all cluster data");
+    debug!(
+        num_clusters,
+        cluster_objects = cluster_objects.len(),
+        "wrote all paired cluster data"
+    );
 
     // --- Step 4: Write resident coarse sketch ---
     let (sketch_ref, sketch_data, resident_sketch) =
@@ -736,6 +1080,7 @@ pub async fn build_ivf_flat(
         "IVF-Flat index build complete"
     );
 
+    let cluster_object_by_cluster = build_cluster_object_lookup(num_clusters, &cluster_objects)?;
     Ok(IvfFlatIndex {
         centroids,
         num_vectors: vectors.len(),
@@ -747,6 +1092,8 @@ pub async fn build_ivf_flat(
         bitmap_fields,
         // Freshly built segment: every cluster owned by this segment.
         cluster_owners: Vec::new(),
+        cluster_objects,
+        cluster_object_by_cluster,
         resident_sketch: Some(resident_sketch),
         sketch_ref: Some(sketch_ref),
     })
@@ -771,6 +1118,7 @@ pub async fn load_ivf_flat_from_manifest(
     num_vectors: usize,
     quantization: QuantizationType,
     cluster_owners: Vec<String>,
+    cluster_objects: Vec<ClusterDataObjectRef>,
     sketch_ref: Option<crate::wal::manifest::SketchRef>,
     cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
 ) -> Result<IvfFlatIndex> {
@@ -793,6 +1141,7 @@ pub async fn load_ivf_flat_from_manifest(
         .transpose()?;
     let centroids = centroids_data.centroids;
     let dim = centroids_data.dim;
+    let cluster_object_by_cluster = build_cluster_object_lookup(centroids.len(), &cluster_objects)?;
     let resident_sketch =
         load_resident_sketch(store, namespace, sketch_ref.as_ref(), cache).await?;
 
@@ -816,6 +1165,8 @@ pub async fn load_ivf_flat_from_manifest(
         sq_calibration,
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
         cluster_owners,
+        cluster_objects,
+        cluster_object_by_cluster,
         resident_sketch,
         sketch_ref,
     })
@@ -879,12 +1230,45 @@ pub async fn load_ivf_flat(
     // Count total vectors by summing cluster sizes.
     let num_clusters = centroids.len();
     let mut num_vectors = 0usize;
-    for i in 0..num_clusters {
-        let cvec_key = cluster_key(namespace, segment_id, i);
-        let cluster_data = store.get(&cvec_key).await?;
-        let cluster = deserialize_cluster(&cluster_data)?;
-        num_vectors += cluster.ids.len();
+    let segment_prefix = format!("{namespace}/segments/{segment_id}/");
+    let segment_keys = store.list_prefix(&segment_prefix).await?;
+    let mut cluster_objects: Vec<ClusterDataObjectRef> = Vec::new();
+    let mut cluster_pair_keys: Vec<String> = segment_keys
+        .iter()
+        .filter(|key| {
+            key.rsplit('/')
+                .next()
+                .map(|filename| filename.starts_with("cluster_pair_"))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    cluster_pair_keys.sort();
+    for key in cluster_pair_keys {
+        let data = store.get(&key).await?;
+        let sections = cluster_object_sections(&data)?.ok_or_else(|| {
+            ZeppelinError::Index(format!("cluster pair key {key} did not contain pair data"))
+        })?;
+        for section in &sections {
+            let cluster = deserialize_cluster(section.data)?;
+            num_vectors += cluster.ids.len();
+        }
+        let clusters = sections
+            .into_iter()
+            .map(|section| section.cluster_idx)
+            .collect::<Vec<_>>();
+        cluster_objects.push(ClusterDataObjectRef { key, clusters });
     }
+
+    if cluster_objects.is_empty() {
+        for i in 0..num_clusters {
+            let cvec_key = cluster_key(namespace, segment_id, i);
+            let cluster_data = store.get(&cvec_key).await?;
+            let cluster = deserialize_cluster(&cluster_data)?;
+            num_vectors += cluster.ids.len();
+        }
+    }
+    let cluster_object_by_cluster = build_cluster_object_lookup(num_clusters, &cluster_objects)?;
 
     // Detect quantization: check for PQ codebook first, then embedded or
     // legacy SQ calibration.
@@ -929,6 +1313,8 @@ pub async fn load_ivf_flat(
         // Probing loader is used by compaction to read a segment it will fully
         // rewrite, and by tests — legacy single-segment layout.
         cluster_owners: Vec::new(),
+        cluster_objects,
+        cluster_object_by_cluster,
         resident_sketch: None,
         sketch_ref: None,
     })

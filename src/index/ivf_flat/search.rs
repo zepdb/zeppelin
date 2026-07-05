@@ -19,10 +19,10 @@ use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, DistanceMetric, Filter, SearchResult};
 
 use super::build::{
-    attrs_key, cluster_key, deserialize_attrs, deserialize_cluster,
-    deserialize_colocated_sq_cluster,
+    attrs_key, cluster_key, cluster_object_sections, deserialize_attrs,
+    deserialize_cluster_from_object, deserialize_colocated_sq_cluster_from_object,
 };
-use super::sketch::AdaptiveClusterBudget;
+use super::sketch::{AdaptiveClusterBudget, ClusterScore};
 use super::IvfFlatIndex;
 
 use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
@@ -44,6 +44,12 @@ const SKETCH_ADAPTIVE_MAX_MULTIPLIER: usize = 2;
 // Include extra clusters whose aggregate sketch distance is close to the best
 // cluster for this query; the cutoff uses no cross-query state.
 const SKETCH_ADAPTIVE_RELATIVE_SCORE_MARGIN: f32 = 0.13;
+// Buddy-paired cluster objects cover up to two logical clusters per S3 GET.
+// For low nprobe, halve the previous cluster cap into an object cap; when the
+// previous cap already covered the full probe set, keep the cap at nprobe so
+// high-nprobe sentinels fetch every object touching the probed clusters.
+const BUDDY_CLUSTER_OBJECT_ARITY: usize = 2;
+const SKETCH_SCAN_STATS_ENV: &str = "ZEPPELIN_SKETCH_SCAN_STATS";
 
 /// A candidate result during search, before final ranking.
 struct Candidate {
@@ -52,6 +58,12 @@ struct Candidate {
     attributes: Option<HashMap<String, AttributeValue>>,
     cluster_idx: usize,
     row_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ClusterFetchObject {
+    key: String,
+    clusters: Vec<usize>,
 }
 
 /// Fetch data from cache if available, otherwise from S3.
@@ -64,6 +76,60 @@ async fn fetch_with_cache(
         c.get_or_fetch(key, || store.get(key)).await
     } else {
         store.get(key).await
+    }
+}
+
+fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<ClusterFetchObject> {
+    if let Some(object_ref) = index.cluster_object(cluster_idx)? {
+        return Ok(ClusterFetchObject {
+            key: object_ref.key.clone(),
+            clusters: object_ref.clusters.clone(),
+        });
+    }
+
+    Ok(ClusterFetchObject {
+        key: cluster_key(
+            &index.namespace,
+            index.cluster_owner(cluster_idx),
+            cluster_idx,
+        ),
+        clusters: vec![cluster_idx],
+    })
+}
+
+fn cluster_fetch_objects(
+    index: &IvfFlatIndex,
+    clusters: &[usize],
+) -> Result<Vec<ClusterFetchObject>> {
+    let mut objects = Vec::new();
+    let mut seen_keys = HashSet::new();
+    for &cluster_idx in clusters {
+        let object = cluster_fetch_object(index, cluster_idx)?;
+        if seen_keys.insert(object.key.clone()) {
+            objects.push(object);
+        }
+    }
+    Ok(objects)
+}
+
+fn expand_clusters_to_objects(index: &IvfFlatIndex, clusters: &[usize]) -> Result<Vec<usize>> {
+    let mut expanded = Vec::new();
+    let mut seen_clusters = HashSet::new();
+    for object in cluster_fetch_objects(index, clusters)? {
+        for cluster_idx in object.clusters {
+            if seen_clusters.insert(cluster_idx) {
+                expanded.push(cluster_idx);
+            }
+        }
+    }
+    Ok(expanded)
+}
+
+fn emit_scan_stats(effective_nprobe: usize, objects: usize, clusters: usize, paired: bool) {
+    if std::env::var_os(SKETCH_SCAN_STATS_ENV).is_some() {
+        eprintln!(
+            "zeppelin_scan_stats nprobe={effective_nprobe} object_gets={objects} clusters_covered={clusters} paired={paired}"
+        );
     }
 }
 
@@ -253,7 +319,7 @@ fn select_scan_clusters(
     effective_nprobe: usize,
 ) -> Result<Vec<usize>> {
     let Some(sketch) = &index.resident_sketch else {
-        return Ok(probe_clusters.to_vec());
+        return expand_clusters_to_objects(index, probe_clusters);
     };
 
     // Attribute filters require exact per-row attrs during coarse pruning.
@@ -261,15 +327,89 @@ fn select_scan_clusters(
     // filtered queries keep the legacy cluster set and preserve existing
     // semantics. Unfiltered benchmark/query traffic uses the sketch path.
     if filter.is_some() {
-        return Ok(probe_clusters.to_vec());
+        return expand_clusters_to_objects(index, probe_clusters);
     }
 
     let cluster_budget = adaptive_sketch_budget(effective_nprobe);
     if cluster_budget.max_clusters() >= probe_clusters.len() {
-        return Ok(probe_clusters.to_vec());
+        let clusters = expand_clusters_to_objects(index, probe_clusters)?;
+        let objects = cluster_fetch_objects(index, probe_clusters)?.len();
+        emit_scan_stats(
+            effective_nprobe,
+            objects,
+            clusters.len(),
+            !index.cluster_objects.is_empty(),
+        );
+        return Ok(clusters);
+    }
+
+    if !index.cluster_objects.is_empty() {
+        let ranked_clusters = sketch.rank_clusters(query, distance_metric, probe_clusters)?;
+        let selected = select_buddy_object_clusters(index, &ranked_clusters, effective_nprobe)?;
+        emit_scan_stats(
+            effective_nprobe,
+            selected.object_count,
+            selected.clusters.len(),
+            true,
+        );
+        return Ok(selected.clusters);
     }
 
     sketch.select_clusters(query, distance_metric, probe_clusters, cluster_budget)
+}
+
+struct SelectedBuddyClusters {
+    clusters: Vec<usize>,
+    object_count: usize,
+}
+
+fn select_buddy_object_clusters(
+    index: &IvfFlatIndex,
+    ranked_clusters: &[ClusterScore],
+    effective_nprobe: usize,
+) -> Result<SelectedBuddyClusters> {
+    let object_cap = paired_object_cap(effective_nprobe);
+    let mut selected_objects = HashSet::new();
+    let mut covered_clusters = HashSet::new();
+    let mut clusters = Vec::new();
+
+    for score in ranked_clusters {
+        if covered_clusters.contains(&score.cluster_idx) {
+            continue;
+        }
+        if selected_objects.len() >= object_cap {
+            break;
+        }
+        let object = cluster_fetch_object(index, score.cluster_idx)?;
+        if !selected_objects.insert(object.key) {
+            continue;
+        }
+        for cluster_idx in object.clusters {
+            if covered_clusters.insert(cluster_idx) {
+                clusters.push(cluster_idx);
+            }
+        }
+    }
+
+    if clusters.is_empty() {
+        return Err(ZeppelinError::Index(
+            "buddy object selection produced no clusters".into(),
+        ));
+    }
+
+    Ok(SelectedBuddyClusters {
+        clusters,
+        object_count: selected_objects.len(),
+    })
+}
+
+fn paired_object_cap(effective_nprobe: usize) -> usize {
+    let cluster_cap = sketch_adaptive_cluster_cap(effective_nprobe);
+    if cluster_cap >= effective_nprobe {
+        effective_nprobe
+    } else {
+        cluster_cap.div_ceil(BUDDY_CLUSTER_OBJECT_ARITY).max(1)
+    }
 }
 
 fn adaptive_sketch_budget(effective_nprobe: usize) -> AdaptiveClusterBudget {
@@ -309,58 +449,79 @@ async fn scan_clusters_flat(
 
     // Phase 1: Parallel prefetch — all S3 I/O fires concurrently.
     let want_attrs = filter.is_some();
-    let prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
-        let owner = index.cluster_owner(cluster_idx);
-        let cvec_key = cluster_key(&index.namespace, owner, cluster_idx);
+    let fetch_objects = cluster_fetch_objects(index, probe_clusters)?;
+    let prefetched = futures::future::join_all(fetch_objects.iter().map(|object| {
+        let object_key = object.key.clone();
+        let object_clusters = object.clusters.clone();
         async move {
-            let (cluster_res, prefilter, attrs) = tokio::join!(
-                fetch_with_cache(cache, store, &cvec_key),
-                try_bitmap_prefilter(
-                    &index.namespace,
-                    owner,
-                    cluster_idx,
-                    filter,
-                    has_bitmaps,
-                    store,
-                    cache,
-                ),
-                async {
-                    if want_attrs {
-                        load_attrs(index, cluster_idx, filter, store, cache).await
-                    } else {
-                        Ok(None)
-                    }
-                },
-            );
-            (cluster_idx, cluster_res, prefilter, attrs)
+            let object_res = fetch_with_cache(cache, store, &object_key).await;
+            let cluster_meta =
+                futures::future::join_all(object_clusters.iter().map(|&cluster_idx| async move {
+                    let owner = index.cluster_owner(cluster_idx);
+                    let (prefilter, attrs) = tokio::join!(
+                        try_bitmap_prefilter(
+                            &index.namespace,
+                            owner,
+                            cluster_idx,
+                            filter,
+                            has_bitmaps,
+                            store,
+                            cache,
+                        ),
+                        async {
+                            if want_attrs {
+                                load_attrs(index, cluster_idx, filter, store, cache).await
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                    );
+                    (cluster_idx, prefilter, attrs)
+                }))
+                .await;
+            (object_key, object_clusters, object_res, cluster_meta)
         }
     }))
     .await;
 
     // Phase 2: Sequential compute — CPU-bound, no I/O.
     let mut candidates = Vec::new();
-    for (cluster_idx, cluster_res, prefilter, attrs) in prefetched {
-        let cluster_data = cluster_res?;
-        let attrs = attrs?;
-        let cluster = deserialize_cluster(&cluster_data)?;
+    for (object_key, object_clusters, object_res, cluster_meta) in prefetched {
+        let object_data = object_res?;
+        let paired_sections = cluster_object_sections(&object_data)?;
+        if paired_sections.is_some() && index.cluster_objects.is_empty() {
+            return Err(ZeppelinError::Index(format!(
+                "legacy cluster key {object_key} contained paired cluster data"
+            )));
+        }
 
-        for (j, vec) in cluster.vectors.iter().enumerate() {
-            if let Some(ref bm) = prefilter {
-                if !bm.contains(j as u32) {
-                    continue;
-                }
+        for (cluster_idx, prefilter, attrs) in cluster_meta {
+            if !object_clusters.contains(&cluster_idx) {
+                return Err(ZeppelinError::Index(format!(
+                    "cluster metadata mismatch for object {object_key}: cluster {cluster_idx}"
+                )));
             }
+            let attrs = attrs?;
+            let cluster = deserialize_cluster_from_object(&object_data, cluster_idx)?;
 
-            let score = compute_distance(query, vec, distance_metric);
-            let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
+            for (j, vec) in cluster.vectors.iter().enumerate() {
+                if let Some(ref bm) = prefilter {
+                    if !bm.contains(j as u32) {
+                        continue;
+                    }
+                }
 
-            candidates.push(Candidate {
-                id: cluster.ids[j].clone(),
-                score,
-                attributes: vector_attrs,
-                cluster_idx,
-                row_idx: j,
-            });
+                let score = compute_distance(query, vec, distance_metric);
+                let vector_attrs = attrs.as_ref().and_then(|a| a.get(j)).cloned().flatten();
+
+                candidates.push(Candidate {
+                    id: cluster.ids[j].clone(),
+                    score,
+                    attributes: vector_attrs,
+                    cluster_idx,
+                    row_idx: j,
+                });
+            }
         }
     }
 
@@ -419,8 +580,7 @@ async fn scan_clusters_sq(
                     cache,
                 ),
                 load_sq_cluster_for_coarse(
-                    &index.namespace,
-                    owner,
+                    index,
                     cluster_idx,
                     prefer_colocated_clusters,
                     store,
@@ -485,18 +645,15 @@ async fn scan_clusters_sq(
     let rerank_prefetched =
         futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
             let prefetched_cluster = prefetched_clusters.get(&cluster_idx).cloned();
-            let cvec_key = cluster_key(
-                &index.namespace,
-                index.cluster_owner(cluster_idx),
-                cluster_idx,
-            );
+            let cluster_object = cluster_fetch_object(index, cluster_idx);
             let needed_ids = needed_ids.clone();
             async move {
                 let cluster_fetch = async {
                     if let Some(cluster_data) = prefetched_cluster {
                         Ok(cluster_data)
                     } else {
-                        fetch_with_cache(cache, store, &cvec_key).await
+                        let object = cluster_object?;
+                        fetch_with_cache(cache, store, &object.key).await
                     }
                 };
                 let (cluster_res, attrs) = tokio::join!(cluster_fetch, async {
@@ -515,7 +672,7 @@ async fn scan_clusters_sq(
     for (cluster_idx, needed_ids, cluster_res, attrs) in rerank_prefetched {
         let cluster_data = cluster_res?;
         let attrs = attrs?;
-        let cluster = deserialize_cluster(&cluster_data)?;
+        let cluster = deserialize_cluster_from_object(&cluster_data, cluster_idx)?;
 
         let needed_set: HashSet<&str> = needed_ids.iter().map(|s| s.as_str()).collect();
 
@@ -547,8 +704,7 @@ async fn scan_clusters_sq(
 /// and we fall back to the legacy SQ sidecar while keeping the full cluster
 /// bytes for rerank.
 async fn load_sq_cluster_for_coarse(
-    namespace: &str,
-    owner: &str,
+    index: &IvfFlatIndex,
     cluster_idx: usize,
     prefer_colocated: bool,
     store: &ZeppelinStore,
@@ -560,19 +716,29 @@ async fn load_sq_cluster_for_coarse(
     use crate::index::quantization::sq::{deserialize_sq_cluster, sq_cluster_key};
 
     if prefer_colocated {
-        let cvec_key = cluster_key(namespace, owner, cluster_idx);
-        let cluster_data = fetch_with_cache(cache, store, &cvec_key).await?;
-        if let Some(sq_cluster) = deserialize_colocated_sq_cluster(&cluster_data)? {
+        let object = cluster_fetch_object(index, cluster_idx)?;
+        let cluster_data = fetch_with_cache(cache, store, &object.key).await?;
+        if let Some(sq_cluster) =
+            deserialize_colocated_sq_cluster_from_object(&cluster_data, cluster_idx)?
+        {
             return Ok((sq_cluster, Some(cluster_data)));
         }
 
-        let sq_key = sq_cluster_key(namespace, owner, cluster_idx);
+        let sq_key = sq_cluster_key(
+            &index.namespace,
+            index.cluster_owner(cluster_idx),
+            cluster_idx,
+        );
         let sq_data = fetch_with_cache(cache, store, &sq_key).await?;
         let sq_cluster = deserialize_sq_cluster(&sq_data)?;
         return Ok((sq_cluster, Some(cluster_data)));
     }
 
-    let sq_key = sq_cluster_key(namespace, owner, cluster_idx);
+    let sq_key = sq_cluster_key(
+        &index.namespace,
+        index.cluster_owner(cluster_idx),
+        cluster_idx,
+    );
     let sq_data = fetch_with_cache(cache, store, &sq_key).await?;
     let sq_cluster = deserialize_sq_cluster(&sq_data)?;
     Ok((sq_cluster, None))
@@ -677,21 +843,20 @@ async fn scan_clusters_pq(
     let want_rerank_attrs = filter.is_some();
     let rerank_prefetched =
         futures::future::join_all(cluster_candidates.iter().map(|(&cluster_idx, needed_ids)| {
-            let cvec_key = cluster_key(
-                &index.namespace,
-                index.cluster_owner(cluster_idx),
-                cluster_idx,
-            );
+            let cluster_object = cluster_fetch_object(index, cluster_idx);
             let needed_ids = needed_ids.clone();
             async move {
-                let (cluster_res, attrs) =
-                    tokio::join!(fetch_with_cache(cache, store, &cvec_key), async {
-                        if want_rerank_attrs {
-                            load_attrs(index, cluster_idx, filter, store, cache).await
-                        } else {
-                            Ok(None)
-                        }
-                    },);
+                let cluster_fetch = async {
+                    let object = cluster_object?;
+                    fetch_with_cache(cache, store, &object.key).await
+                };
+                let (cluster_res, attrs) = tokio::join!(cluster_fetch, async {
+                    if want_rerank_attrs {
+                        load_attrs(index, cluster_idx, filter, store, cache).await
+                    } else {
+                        Ok(None)
+                    }
+                },);
                 (cluster_idx, needed_ids, cluster_res, attrs)
             }
         }))
@@ -701,7 +866,7 @@ async fn scan_clusters_pq(
     for (cluster_idx, needed_ids, cluster_res, attrs) in rerank_prefetched {
         let cluster_data = cluster_res?;
         let attrs = attrs?;
-        let cluster = deserialize_cluster(&cluster_data)?;
+        let cluster = deserialize_cluster_from_object(&cluster_data, cluster_idx)?;
 
         let needed_set: HashSet<&str> = needed_ids.iter().map(|s| s.as_str()).collect();
 
@@ -889,6 +1054,8 @@ mod tests {
             sq_calibration: None,
             bitmap_fields: Vec::new(),
             cluster_owners: Vec::new(),
+            cluster_objects: Vec::new(),
+            cluster_object_by_cluster: Vec::new(),
             resident_sketch: None,
             sketch_ref: None,
         }
@@ -970,5 +1137,7 @@ mod tests {
         assert_eq!(adaptive_sketch_budget(8).max_clusters(), 8);
         assert_eq!(adaptive_sketch_budget(16).max_clusters(), 14);
         assert_eq!(adaptive_sketch_budget(128).max_clusters(), 128);
+        assert_eq!(paired_object_cap(16), 7);
+        assert_eq!(paired_object_cap(128), 128);
     }
 }

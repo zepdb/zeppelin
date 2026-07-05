@@ -108,6 +108,7 @@ async fn seed_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEnt
         has_global_fts: false,
         cluster_owners: Vec::new(),
         sketch: None,
+        cluster_objects: index.cluster_objects().to_vec(),
     });
     manifest.write(store, ns).await.unwrap();
     (seg_id.to_string(), vectors)
@@ -217,6 +218,7 @@ async fn seed_legacy_sq8_segment(store: &ZeppelinStore, ns: &str) -> (String, Ve
         has_global_fts: false,
         cluster_owners: Vec::new(),
         sketch: None,
+        cluster_objects: Vec::new(),
     });
     manifest.write(store, ns).await.unwrap();
     (seg_id.to_string(), vectors)
@@ -524,7 +526,7 @@ async fn test_incremental_matches_full_rewrite_results() {
         hierarchical: false,
         ..Default::default()
     };
-    build_ivf_flat(&seed_vecs, &indexing_config, store, &ns_full, "seg_seed")
+    let full_seed_index = build_ivf_flat(&seed_vecs, &indexing_config, store, &ns_full, "seg_seed")
         .await
         .unwrap();
     let mut full_manifest = Manifest::new();
@@ -539,6 +541,7 @@ async fn test_incremental_matches_full_rewrite_results() {
         has_global_fts: false,
         cluster_owners: Vec::new(),
         sketch: None,
+        cluster_objects: full_seed_index.cluster_objects().to_vec(),
     });
     full_manifest.write(store, &ns_full).await.unwrap();
 

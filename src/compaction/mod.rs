@@ -1,7 +1,7 @@
 /// Background compaction task management.
 pub mod background;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use rand::Rng;
@@ -14,12 +14,13 @@ use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
 use crate::fts::FtsFieldConfig;
 use crate::index::hierarchical::build::{build_hierarchical, load_hierarchical};
 use crate::index::ivf_flat::build::{
-    attrs_key, build_ivf_flat, cluster_key, deserialize_attrs, deserialize_cluster,
+    attrs_key, build_ivf_flat, cluster_key, cluster_object_sections, deserialize_attrs,
+    deserialize_cluster,
 };
 use crate::storage::ZeppelinStore;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
-use crate::wal::manifest::{Manifest, SegmentRef};
+use crate::wal::manifest::{ClusterDataObjectRef, Manifest, SegmentRef};
 use crate::wal::WalReader;
 
 /// Maximum CAS retry attempts for manifest updates.
@@ -339,6 +340,10 @@ impl Compactor {
                 seg_id,
                 is_hierarchical,
                 &old_cluster_owners,
+                old_segment_ref
+                    .as_ref()
+                    .map(|s| s.cluster_objects.as_slice())
+                    .unwrap_or(&[]),
             )
             .await?;
             old_id_to_cluster = id_to_cluster;
@@ -496,91 +501,110 @@ impl Compactor {
         // owned by `segment_id`); only the incremental fast path populates it,
         // carrying untouched clusters forward under the old segment's keys.
         let build_start = std::time::Instant::now();
-        let (cluster_count, is_hierarchical, bitmap_fields, cluster_owners, sketch_ref) =
-            if !should_retrain && old_segment_id.is_some() && !self.indexing_config.hierarchical {
-                // Incremental path: reuse existing centroids, just reassign vectors.
-                match self
-                    .incremental_build(
-                        namespace,
-                        old_segment_id.as_deref().ok_or_else(|| {
-                            ZeppelinError::Index("no old segment for incremental build".into())
-                        })?,
-                        &segment_id,
-                        &vectors,
-                        &wal_touched_ids,
-                        &old_id_to_cluster,
-                        &old_cluster_owners,
-                        old_segment_ref
-                            .as_ref()
-                            .map(|s| s.bitmap_fields.as_slice())
-                            .unwrap_or(&[]),
-                        // Carry-over is unsafe when FTS is configured: the FTS
-                        // pass below reads every cluster's attrs under the NEW
-                        // segment ID and rebuilds a per-segment global index,
-                        // which a carried cluster (attrs under an OLD ID) would
-                        // break. Centroid reuse still applies — only the
-                        // per-cluster carry-over is disabled. (Correctness over
-                        // cleverness; revisit when FTS learns carry-over.)
-                        fts_configs.is_empty(),
-                    )
-                    .await
-                {
-                    Ok((count, bf, owners, sketch_ref)) => {
-                        info!(
-                            new_from_wal,
-                            existing_count, "incremental compaction: reusing centroids"
-                        );
-                        (count, false, bf, owners, Some(sketch_ref))
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "incremental build failed, falling back to full retrain");
-                        let index = build_ivf_flat(
-                            &vectors,
-                            &self.indexing_config,
-                            &self.store,
-                            namespace,
-                            &segment_id,
-                        )
-                        .await?;
-                        let bf = index.bitmap_fields.clone();
-                        (
-                            index.num_clusters(),
-                            false,
-                            bf,
-                            Vec::new(),
-                            index.sketch_ref.clone(),
-                        )
-                    }
+        let (
+            cluster_count,
+            is_hierarchical,
+            bitmap_fields,
+            cluster_owners,
+            sketch_ref,
+            cluster_objects,
+        ) = if !should_retrain && old_segment_id.is_some() && !self.indexing_config.hierarchical {
+            // Incremental path: reuse existing centroids, just reassign vectors.
+            match self
+                .incremental_build(
+                    namespace,
+                    old_segment_id.as_deref().ok_or_else(|| {
+                        ZeppelinError::Index("no old segment for incremental build".into())
+                    })?,
+                    &segment_id,
+                    &vectors,
+                    &wal_touched_ids,
+                    &old_id_to_cluster,
+                    &old_cluster_owners,
+                    old_segment_ref
+                        .as_ref()
+                        .map(|s| s.cluster_objects.as_slice())
+                        .unwrap_or(&[]),
+                    old_segment_ref
+                        .as_ref()
+                        .map(|s| s.bitmap_fields.as_slice())
+                        .unwrap_or(&[]),
+                    // Carry-over is unsafe when FTS is configured: the FTS
+                    // pass below reads every cluster's attrs under the NEW
+                    // segment ID and rebuilds a per-segment global index,
+                    // which a carried cluster (attrs under an OLD ID) would
+                    // break. Centroid reuse still applies — only the
+                    // per-cluster carry-over is disabled. (Correctness over
+                    // cleverness; revisit when FTS learns carry-over.)
+                    fts_configs.is_empty(),
+                )
+                .await
+            {
+                Ok((count, bf, owners, sketch_ref, cluster_objects)) => {
+                    info!(
+                        new_from_wal,
+                        existing_count, "incremental compaction: reusing centroids"
+                    );
+                    (count, false, bf, owners, Some(sketch_ref), cluster_objects)
                 }
-            } else if self.indexing_config.hierarchical {
-                let h_index = build_hierarchical(
-                    &vectors,
-                    &self.indexing_config,
-                    &self.store,
-                    namespace,
-                    &segment_id,
-                )
-                .await?;
-                let bf = h_index.bitmap_fields.clone();
-                (h_index.num_leaf_clusters(), true, bf, Vec::new(), None)
-            } else {
-                let index = build_ivf_flat(
-                    &vectors,
-                    &self.indexing_config,
-                    &self.store,
-                    namespace,
-                    &segment_id,
-                )
-                .await?;
-                let bf = index.bitmap_fields.clone();
-                (
-                    index.num_clusters(),
-                    false,
-                    bf,
-                    Vec::new(),
-                    index.sketch_ref.clone(),
-                )
-            };
+                Err(e) => {
+                    warn!(error = %e, "incremental build failed, falling back to full retrain");
+                    let index = build_ivf_flat(
+                        &vectors,
+                        &self.indexing_config,
+                        &self.store,
+                        namespace,
+                        &segment_id,
+                    )
+                    .await?;
+                    let bf = index.bitmap_fields.clone();
+                    (
+                        index.num_clusters(),
+                        false,
+                        bf,
+                        Vec::new(),
+                        index.sketch_ref.clone(),
+                        index.cluster_objects.clone(),
+                    )
+                }
+            }
+        } else if self.indexing_config.hierarchical {
+            let h_index = build_hierarchical(
+                &vectors,
+                &self.indexing_config,
+                &self.store,
+                namespace,
+                &segment_id,
+            )
+            .await?;
+            let bf = h_index.bitmap_fields.clone();
+            (
+                h_index.num_leaf_clusters(),
+                true,
+                bf,
+                Vec::new(),
+                None,
+                Vec::new(),
+            )
+        } else {
+            let index = build_ivf_flat(
+                &vectors,
+                &self.indexing_config,
+                &self.store,
+                namespace,
+                &segment_id,
+            )
+            .await?;
+            let bf = index.bitmap_fields.clone();
+            (
+                index.num_clusters(),
+                false,
+                bf,
+                Vec::new(),
+                index.sketch_ref.clone(),
+                index.cluster_objects.clone(),
+            )
+        };
         let build_elapsed = build_start.elapsed();
         let index_type_label = if is_hierarchical {
             "hierarchical"
@@ -625,6 +649,12 @@ impl Compactor {
                     referenced.insert(pq_cluster_key(namespace, seg_id, i));
                     referenced.insert(crate::index::bitmap::bitmap_key(namespace, seg_id, i));
                     referenced.insert(fts_index_key(namespace, seg_id, i));
+                }
+            }
+            let old_prefix = format!("{namespace}/segments/{seg_id}/");
+            for object_ref in &cluster_objects {
+                if object_ref.key.starts_with(&old_prefix) {
+                    referenced.insert(object_ref.key.clone());
                 }
             }
 
@@ -812,6 +842,7 @@ impl Compactor {
                     // populated only on the incremental fast path below.
                     cluster_owners: cluster_owners.clone(),
                     sketch: sketch_ref.clone(),
+                    cluster_objects: cluster_objects.clone(),
                 },
                 self.config.max_pending_deletes,
                 self.config.max_old_segments,
@@ -873,8 +904,8 @@ impl Compactor {
     /// old keys), bounding per-cycle write I/O to O(touched clusters) instead
     /// of O(dataset).
     ///
-    /// Returns `(cluster_count, bitmap_fields, cluster_owners, sketch_ref)`. `cluster_owners[i]`
-    /// is the segment ID that owns cluster `i`'s per-cluster S3 objects:
+    /// Returns `(cluster_count, bitmap_fields, cluster_owners, sketch_ref, cluster_objects)`.
+    /// `cluster_owners[i]` is the segment ID that owns cluster `i`'s per-cluster sidecars:
     /// `new_segment_id` for rewritten clusters, the old segment's resolved
     /// owner for carried-over ones. An empty vec would mean "all owned by
     /// `new_segment_id`", but this fn always returns a full-length map when it
@@ -906,6 +937,7 @@ impl Compactor {
         wal_touched_ids: &HashSet<String>,
         old_id_to_cluster: &HashMap<String, usize>,
         old_cluster_owners: &[String],
+        old_cluster_objects: &[ClusterDataObjectRef],
         old_bitmap_fields: &[String],
         allow_carryover: bool,
     ) -> Result<(
@@ -913,6 +945,7 @@ impl Compactor {
         Vec<String>,
         Vec<String>,
         crate::wal::manifest::SketchRef,
+        Vec<ClusterDataObjectRef>,
     )> {
         use crate::index::distance::euclidean_distance;
         use crate::index::ivf_flat::build::{
@@ -1158,8 +1191,78 @@ impl Compactor {
         } else {
             cluster_owners
         };
-        Ok((num_clusters, bitmap_fields, owners_out, sketch_ref))
+        let cluster_objects_out = incremental_cluster_objects(
+            namespace,
+            new_segment_id,
+            num_clusters,
+            &touched,
+            old_cluster_objects,
+        )?;
+        Ok((
+            num_clusters,
+            bitmap_fields,
+            owners_out,
+            sketch_ref,
+            cluster_objects_out,
+        ))
     }
+}
+
+fn incremental_cluster_objects(
+    namespace: &str,
+    new_segment_id: &str,
+    num_clusters: usize,
+    touched: &[bool],
+    old_cluster_objects: &[ClusterDataObjectRef],
+) -> Result<Vec<ClusterDataObjectRef>> {
+    if old_cluster_objects.is_empty() {
+        return Ok(Vec::new());
+    }
+    if touched.len() != num_clusters {
+        return Err(ZeppelinError::Index(format!(
+            "touched length mismatch: expected {num_clusters}, got {}",
+            touched.len()
+        )));
+    }
+
+    let mut old_object_by_cluster: Vec<Option<&str>> = vec![None; num_clusters];
+    for object_ref in old_cluster_objects {
+        for &cluster_idx in &object_ref.clusters {
+            if cluster_idx >= num_clusters {
+                return Err(ZeppelinError::Index(format!(
+                    "old cluster object {} references out-of-range cluster {cluster_idx}",
+                    object_ref.key
+                )));
+            }
+            if old_object_by_cluster[cluster_idx].is_some() {
+                return Err(ZeppelinError::Index(format!(
+                    "old cluster {cluster_idx} appears in multiple cluster objects"
+                )));
+            }
+            old_object_by_cluster[cluster_idx] = Some(object_ref.key.as_str());
+        }
+    }
+
+    let mut grouped: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for cluster_idx in 0..num_clusters {
+        let key = if touched[cluster_idx] {
+            cluster_key(namespace, new_segment_id, cluster_idx)
+        } else {
+            old_object_by_cluster[cluster_idx]
+                .ok_or_else(|| {
+                    ZeppelinError::Index(format!(
+                        "paired old segment missing object for carried cluster {cluster_idx}"
+                    ))
+                })?
+                .to_string()
+        };
+        grouped.entry(key).or_default().push(cluster_idx);
+    }
+
+    Ok(grouped
+        .into_iter()
+        .map(|(key, clusters)| ClusterDataObjectRef { key, clusters })
+        .collect())
 }
 
 /// Abort check for mid-compaction lease loss (invariant A2).
@@ -1239,6 +1342,7 @@ async fn load_segment_vectors(
     segment_id: &str,
     is_hierarchical: bool,
     cluster_owners: &[String],
+    cluster_objects: &[ClusterDataObjectRef],
 ) -> Result<(Vec<VectorEntry>, HashMap<String, usize>)> {
     // Resolve cluster `i`'s owning segment ID (carried-over clusters live
     // under an older segment's keys; empty map ⇒ this segment owns all).
@@ -1267,17 +1371,55 @@ async fn load_segment_vectors(
         centroids.len()
     };
 
-    // Parallel fetch: 2 GETs per cluster via tokio::join!
-    let cluster_results = futures::future::join_all((0..num_clusters).map(|i| {
-        let cvec_key = cluster_key(namespace, owner(i), i);
-        let cattr_key = attrs_key(namespace, owner(i), i);
-        async move {
-            let (cluster_res, attrs_res) =
-                tokio::join!(store.get(&cvec_key), store.get(&cattr_key),);
-            (i, cluster_res, attrs_res)
+    let mut cluster_results = Vec::new();
+    if cluster_objects.is_empty() {
+        // Parallel fetch: 2 GETs per cluster via tokio::join!
+        cluster_results = futures::future::join_all((0..num_clusters).map(|i| {
+            let cvec_key = cluster_key(namespace, owner(i), i);
+            let cattr_key = attrs_key(namespace, owner(i), i);
+            async move {
+                let (cluster_res, attrs_res) =
+                    tokio::join!(store.get(&cvec_key), store.get(&cattr_key),);
+                (i, cluster_res, attrs_res)
+            }
+        }))
+        .await;
+    } else {
+        let object_results =
+            futures::future::join_all(cluster_objects.iter().map(|object_ref| async move {
+                let object_res = store.get(&object_ref.key).await;
+                (object_ref, object_res)
+            }))
+            .await;
+
+        for (object_ref, object_res) in object_results {
+            let object_data = object_res?;
+            let Some(sections) = cluster_object_sections(&object_data)? else {
+                return Err(ZeppelinError::Index(format!(
+                    "manifest cluster object {} did not contain paired cluster data",
+                    object_ref.key
+                )));
+            };
+            for &cluster_idx in &object_ref.clusters {
+                let section = sections
+                    .iter()
+                    .find(|section| section.cluster_idx == cluster_idx)
+                    .ok_or_else(|| {
+                        ZeppelinError::Index(format!(
+                            "cluster object {} missing cluster {cluster_idx}",
+                            object_ref.key
+                        ))
+                    })?;
+                let cattr_key = attrs_key(namespace, owner(cluster_idx), cluster_idx);
+                let attrs_res = store.get(&cattr_key).await;
+                cluster_results.push((
+                    cluster_idx,
+                    Ok(bytes::Bytes::copy_from_slice(section.data)),
+                    attrs_res,
+                ));
+            }
         }
-    }))
-    .await;
+    }
 
     // Sequential deserialization (CPU-bound, no I/O)
     //
