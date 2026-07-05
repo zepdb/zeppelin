@@ -6,6 +6,7 @@
 //! When a `WalFtsCache` is provided, pre-tokenized data is reused across
 //! queries instead of re-tokenizing every document on every query.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use tracing::debug;
@@ -15,11 +16,16 @@ use crate::fts::rank_by::{evaluate_rank_by, RankBy};
 use crate::fts::tokenizer::tokenize_text;
 use crate::fts::wal_cache::WalFtsCache;
 use crate::fts::FtsFieldConfig;
+use crate::index::topk::TopK;
 use crate::types::{AttributeValue, SearchResult};
 use crate::wal::fragment::WalFragment;
 
 /// Per-doc, per-field data: (doc_length, term→term_frequency).
 type DocFieldData = HashMap<String, HashMap<String, (u32, HashMap<String, u32>)>>;
+
+fn bm25_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
+    b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
+}
 
 /// Result of a WAL BM25 scan.
 pub struct WalBm25ScanResult {
@@ -225,6 +231,12 @@ pub fn wal_bm25_scan(
 
     // 6. Score each document
     let mut results: Vec<SearchResult> = Vec::new();
+    let mut top_results = top_k.map(|k| {
+        TopK::new(
+            k,
+            bm25_result_cmp as fn(&SearchResult, &SearchResult) -> Ordering,
+        )
+    });
 
     for (doc_id, attrs_opt) in &latest_vectors {
         let doc_data = doc_field_data.get(doc_id);
@@ -280,25 +292,25 @@ pub fn wal_bm25_scan(
 
         let final_score = evaluate_rank_by(rank_by, &field_scores);
         if final_score > 0.0 {
-            results.push(SearchResult {
+            let result = SearchResult {
                 id: doc_id.clone(),
                 score: final_score,
                 attributes: attrs_opt.clone(),
-            });
+            };
+            if let Some(top_results) = &mut top_results {
+                top_results.push(result);
+            } else {
+                results.push(result);
+            }
         }
     }
 
-    // Sort by score descending (higher = better for BM25)
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // Early termination: truncate to top_k if specified
-    if let Some(k) = top_k {
-        results.truncate(k);
-    }
+    let results = if let Some(top_results) = top_results {
+        top_results.into_sorted_vec()
+    } else {
+        results.sort_by(bm25_result_cmp);
+        results
+    };
 
     debug!(
         surviving_vectors = results.len(),

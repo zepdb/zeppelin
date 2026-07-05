@@ -4,6 +4,7 @@
 //! candidates at each level. At the leaf level, scans data clusters
 //! (identical to IVF-Flat scan) with optional quantized two-phase search.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -19,6 +20,7 @@ use crate::index::ivf_flat::build::{
 };
 use crate::index::ivf_flat::search::coarse_row_passes;
 use crate::index::quantization::QuantizationType;
+use crate::index::topk::partial_topk_by;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, DistanceMetric, Filter, SearchResult};
 
@@ -36,6 +38,14 @@ struct Candidate {
     attributes: Option<HashMap<String, AttributeValue>>,
     cluster_idx: usize,
     row_idx: usize,
+}
+
+fn candidate_distance_cmp(a: &Candidate, b: &Candidate) -> Ordering {
+    a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
+}
+
+fn coarse_candidate_cmp(a: &(String, f32, usize), b: &(String, f32, usize)) -> Ordering {
+    a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
 }
 
 /// Fetch data from cache or S3.
@@ -360,13 +370,13 @@ async fn scan_leaf_clusters(
         fetch_k, "scanned leaf clusters"
     );
 
-    // Sort and apply filter.
+    // Retain candidates and apply filter.
     let mut sorted = candidates;
-    sorted.sort_by(|a, b| {
-        a.score
-            .partial_cmp(&b.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    if filter.is_some() {
+        sorted.sort_by(candidate_distance_cmp);
+    } else {
+        partial_topk_by(&mut sorted, top_k, candidate_distance_cmp);
+    }
 
     let results: Vec<Candidate> = if let Some(f) = filter {
         sorted
@@ -541,9 +551,8 @@ async fn scan_clusters_sq(
         }
     }
 
-    coarse.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     let rerank_count = fetch_k * 4;
-    coarse.truncate(rerank_count);
+    partial_topk_by(&mut coarse, rerank_count, coarse_candidate_cmp);
 
     debug!(
         coarse_candidates = coarse.len(),
@@ -709,9 +718,8 @@ async fn scan_clusters_pq(
         }
     }
 
-    coarse.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     let rerank_count = fetch_k * 4;
-    coarse.truncate(rerank_count);
+    partial_topk_by(&mut coarse, rerank_count, coarse_candidate_cmp);
 
     debug!(
         coarse_candidates = coarse.len(),
@@ -780,12 +788,7 @@ async fn finalize_candidates(
     cache: Option<&Arc<DiskCache>>,
     include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
-    candidates.sort_by(|a, b| {
-        a.score
-            .partial_cmp(&b.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    candidates.truncate(top_k);
+    partial_topk_by(&mut candidates, top_k, candidate_distance_cmp);
 
     if filter.is_some() {
         return Ok(candidates

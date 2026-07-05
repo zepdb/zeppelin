@@ -1852,20 +1852,20 @@ async fn load_bootstrap_artifacts(
             );
         }
     }
-    if let Some(decoded) = bootstrap_decoded_cache()
-        .get(&bootstrap_ref.key)
-        .map(|entry| Arc::clone(entry.value()))
-    {
-        if let Some(c) = cache {
+    if let Some(c) = cache {
+        if let Some(decoded) = bootstrap_decoded_cache()
+            .get(&bootstrap_ref.key)
+            .map(|entry| Arc::clone(entry.value()))
+        {
             c.insert_decoded(&bootstrap_ref.key, Arc::clone(&decoded));
             pin_bootstrap_metadata(c, namespace, &bootstrap_ref.key).await;
+            return metadata_from_decoded_bootstrap(
+                &bootstrap_ref.key,
+                decoded,
+                bootstrap_ref,
+                sketch_ref,
+            );
         }
-        return metadata_from_decoded_bootstrap(
-            &bootstrap_ref.key,
-            decoded,
-            bootstrap_ref,
-            sketch_ref,
-        );
     }
 
     let data = match cache {
@@ -2284,9 +2284,9 @@ mod tests {
         let groups = density_cluster_groups_with_cap(&centroids, &affinity, 4).unwrap();
 
         assert!(groups.iter().all(|group| group.len() <= 4));
-        assert!(groups.iter().any(|group| group.as_slice() == &[0, 1, 2, 3]));
-        assert!(groups.iter().any(|group| group.as_slice() == &[4]));
-        assert!(groups.iter().any(|group| group.as_slice() == &[5]));
+        assert!(groups.iter().any(|group| group.as_slice() == [0, 1, 2, 3]));
+        assert!(groups.iter().any(|group| group.as_slice() == [4]));
+        assert!(groups.iter().any(|group| group.as_slice() == [5]));
     }
 
     #[test]
@@ -2375,11 +2375,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(std::sync::Arc::ptr_eq(&index.centroids, &second.centroids));
-        assert!(std::sync::Arc::ptr_eq(
-            index.resident_sketch.as_ref().unwrap(),
-            second.resident_sketch.as_ref().unwrap()
-        ));
+        assert_eq!(*index.centroids, *second.centroids);
+        assert_eq!(index.dim, second.dim);
+        assert!(second.resident_sketch.is_some());
     }
 
     #[tokio::test]

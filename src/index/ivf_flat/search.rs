@@ -7,6 +7,7 @@
 //! 5. Return sorted top-k results.
 
 use dashmap::DashMap;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +19,7 @@ use crate::error::{Result, ZeppelinError};
 use crate::index::distance::compute_distance;
 use crate::index::filter::{evaluate_filter, oversampled_k};
 use crate::index::quantization::QuantizationType;
+use crate::index::topk::partial_topk_by;
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, DistanceMetric, Filter, SearchResult};
 
@@ -66,6 +68,21 @@ struct Candidate {
     attributes: Option<HashMap<String, AttributeValue>>,
     cluster_idx: usize,
     row_idx: usize,
+}
+
+fn candidate_distance_cmp(a: &Candidate, b: &Candidate) -> CmpOrdering {
+    a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
+}
+
+fn coarse_sq_candidate_cmp(
+    a: &(String, f32, usize, usize),
+    b: &(String, f32, usize, usize),
+) -> CmpOrdering {
+    a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+}
+
+fn coarse_pq_candidate_cmp(a: &(String, f32, usize), b: &(String, f32, usize)) -> CmpOrdering {
+    a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
 }
 
 #[derive(Debug, Clone)]
@@ -296,27 +313,21 @@ fn cluster_fetch_objects(
     clusters: &[usize],
 ) -> Result<Vec<ClusterFetchObject>> {
     let mut objects = Vec::new();
-    let mut seen_keys = HashSet::new();
+    let mut object_positions = HashMap::new();
     for &cluster_idx in clusters {
-        let object = cluster_fetch_object(index, cluster_idx)?;
-        if seen_keys.insert(object.key.clone()) {
+        let mut object = cluster_fetch_object(index, cluster_idx)?;
+        if let Some(&position) = object_positions.get(&object.key) {
+            let existing: &mut ClusterFetchObject = &mut objects[position];
+            if !existing.clusters.contains(&cluster_idx) {
+                existing.clusters.push(cluster_idx);
+            }
+        } else {
+            object.clusters = vec![cluster_idx];
+            object_positions.insert(object.key.clone(), objects.len());
             objects.push(object);
         }
     }
     Ok(objects)
-}
-
-fn expand_clusters_to_objects(index: &IvfFlatIndex, clusters: &[usize]) -> Result<Vec<usize>> {
-    let mut expanded = Vec::new();
-    let mut seen_clusters = HashSet::new();
-    for object in cluster_fetch_objects(index, clusters)? {
-        for cluster_idx in object.clusters {
-            if seen_clusters.insert(cluster_idx) {
-                expanded.push(cluster_idx);
-            }
-        }
-    }
-    Ok(expanded)
 }
 
 fn emit_scan_stats(effective_nprobe: usize, objects: usize, clusters: usize, grouped: bool) {
@@ -466,13 +477,13 @@ pub async fn search_ivf_flat(
         "scanned clusters"
     );
 
-    // --- Step 4: Sort all candidates by distance ---
+    // --- Step 4: Retain candidates by distance ---
     let mut sorted = candidates;
-    sorted.sort_by(|a, b| {
-        a.score
-            .partial_cmp(&b.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    if filter.is_some() {
+        sorted.sort_by(candidate_distance_cmp);
+    } else {
+        partial_topk_by(&mut sorted, top_k, candidate_distance_cmp);
+    }
 
     // --- Step 5: Apply post-filter if present ---
     let results: Vec<SearchResult> = if let Some(f) = filter {
@@ -537,7 +548,7 @@ fn select_scan_clusters(
     retrieval_top_k: usize,
 ) -> Result<Vec<usize>> {
     let Some(sketch) = &index.resident_sketch else {
-        return expand_clusters_to_objects(index, probe_clusters);
+        return Ok(probe_clusters.to_vec());
     };
 
     // Attribute filters require exact per-row attrs during coarse pruning.
@@ -545,20 +556,19 @@ fn select_scan_clusters(
     // filtered queries keep the legacy cluster set and preserve existing
     // semantics. Unfiltered benchmark/query traffic uses the sketch path.
     if filter.is_some() {
-        return expand_clusters_to_objects(index, probe_clusters);
+        return Ok(probe_clusters.to_vec());
     }
 
     let cluster_budget = adaptive_sketch_budget(effective_nprobe);
     if cluster_budget.max_clusters() >= probe_clusters.len() {
-        let clusters = expand_clusters_to_objects(index, probe_clusters)?;
         let objects = cluster_fetch_objects(index, probe_clusters)?.len();
         emit_scan_stats(
             effective_nprobe,
             objects,
-            clusters.len(),
+            probe_clusters.len(),
             !index.cluster_objects.is_empty(),
         );
-        return Ok(clusters);
+        return Ok(probe_clusters.to_vec());
     }
 
     if !index.cluster_objects.is_empty() {
@@ -859,6 +869,7 @@ fn sketch_base_cluster_budget(effective_nprobe: usize) -> usize {
 }
 
 /// Scan clusters using full-precision vectors (no quantization).
+#[allow(clippy::too_many_arguments)]
 async fn scan_clusters_flat(
     index: &IvfFlatIndex,
     probe_clusters: &[usize],
@@ -1005,7 +1016,7 @@ async fn scan_clusters_sq(
         SqSearchByteStats::set_usize(&stats.selected_clusters, probe_clusters.len());
         SqSearchByteStats::set_usize(&stats.sq_objects, fetch_objects.len());
     }
-    let sq_prefetched = futures::future::join_all(fetch_objects.iter().cloned().map(|object| {
+    let sq_prefetched = futures::future::join_all(fetch_objects.iter().map(|object| {
         let stats = byte_stats.clone();
         async move {
             load_sq_object_for_coarse(
@@ -1110,14 +1121,15 @@ async fn scan_clusters_sq(
         }
     }
 
-    // Sort by approximate distance and take top candidates for reranking.
-    coarse_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
     // Rerank factor: take more candidates than needed for full-precision
     // reranking. Truncation now happens AFTER filtering, so the survivors are
     // real matches, not filtered-away noise (Task 6).
     let rerank_count = fetch_k * 4;
-    coarse_candidates.truncate(rerank_count);
+    partial_topk_by(
+        &mut coarse_candidates,
+        rerank_count,
+        coarse_sq_candidate_cmp,
+    );
     if let Some(stats) = &byte_stats {
         SqSearchByteStats::set_usize(&stats.coarse_candidates, coarse_candidates.len());
         SqSearchByteStats::set_usize(&stats.rerank_candidates, coarse_candidates.len());
@@ -1164,7 +1176,7 @@ async fn scan_clusters_sq(
             (cluster_idx, attrs)
         }
     }));
-    let clusters_future = futures::future::join_all(rerank_objects.iter().cloned().map(|object| {
+    let clusters_future = futures::future::join_all(rerank_objects.iter().map(|object| {
         let stats = byte_stats.clone();
         let cluster_candidates = &cluster_candidates;
         let prefetched_objects = &prefetched_objects;
@@ -1259,7 +1271,7 @@ struct RerankFetchedVector {
 /// sidecar behavior so existing immutable data remains readable.
 async fn load_sq_object_for_coarse(
     index: &IvfFlatIndex,
-    object: ClusterFetchObject,
+    object: &ClusterFetchObject,
     prefer_colocated: bool,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
@@ -1283,17 +1295,17 @@ async fn load_sq_object_for_coarse(
             sq_clusters.push((cluster_idx, deserialize_sq_cluster(&sq_data)?));
         }
         return Ok(CoarseObjectSqFetch {
-            object_key: object.key,
+            object_key: object.key.clone(),
             sq_clusters,
             vector_ranges: Vec::new(),
             full_object: None,
         });
     }
 
-    if let Some(layout) = load_cluster_object_layout(index, &object, store, cache, stats).await? {
+    let object_data =
+        fetch_with_cache_counted(cache, store, &object.key, stats, SqBytePhase::Sq).await?;
+    if let Some(layout) = cluster_object_layout(&object_data)? {
         if layout.sections.iter().all(|section| section.sq.is_some()) {
-            let sq_bytes =
-                fetch_object_sq_range(&object.key, &layout, &object.clusters, store, stats).await?;
             let mut sq_clusters = Vec::with_capacity(object.clusters.len());
             let mut vector_ranges = Vec::with_capacity(object.clusters.len());
             for &cluster_idx in &object.clusters {
@@ -1303,35 +1315,33 @@ async fn load_sq_object_for_coarse(
                         object.key
                     ))
                 })?;
-                let sq_range = section.sq.as_ref().ok_or_else(|| {
-                    ZeppelinError::Index(format!(
-                        "cluster {cluster_idx} missing SQ range in {}",
-                        object.key
-                    ))
-                })?;
-                let sq_slice = slice_relative_range(
-                    &sq_bytes.bytes,
-                    &sq_range.clone(),
-                    sq_bytes.base_offset,
-                    "SQ range",
-                    &object.key,
-                )?;
-                let sq_cluster = deserialize_sq_cluster(sq_slice)?;
+                let sq_cluster =
+                    deserialize_colocated_sq_cluster_from_object(&object_data, cluster_idx)?
+                        .ok_or_else(|| {
+                            ZeppelinError::Index(format!(
+                                "cluster {cluster_idx} missing co-located SQ data in {}",
+                                object.key
+                            ))
+                        })?;
+                if let Some(stats) = stats {
+                    let sq_bytes = sq_cluster.codes.iter().map(Vec::len).sum::<usize>()
+                        + sq_cluster.ids.iter().map(|id| 4 + id.len()).sum::<usize>()
+                        + 8;
+                    stats.record_logical_sq_bytes(sq_bytes);
+                }
                 let ranges = full_vector_ranges_from_sq_ids(section, &sq_cluster.ids, index.dim)?;
                 sq_clusters.push((cluster_idx, sq_cluster));
                 vector_ranges.push((cluster_idx, ranges));
             }
             return Ok(CoarseObjectSqFetch {
-                object_key: object.key,
+                object_key: object.key.clone(),
                 sq_clusters,
                 vector_ranges,
-                full_object: None,
+                full_object: Some(object_data),
             });
         }
     }
 
-    let object_data =
-        fetch_with_cache_counted(cache, store, &object.key, stats, SqBytePhase::Sq).await?;
     let mut sq_clusters = Vec::with_capacity(object.clusters.len());
     for &cluster_idx in &object.clusters {
         if let Some(sq_cluster) =
@@ -1361,58 +1371,10 @@ async fn load_sq_object_for_coarse(
     }
 
     Ok(CoarseObjectSqFetch {
-        object_key: object.key,
+        object_key: object.key.clone(),
         sq_clusters,
         vector_ranges: Vec::new(),
         full_object: Some(object_data),
-    })
-}
-
-struct RangeBytes {
-    base_offset: usize,
-    bytes: bytes::Bytes,
-}
-
-async fn fetch_object_sq_range(
-    object_key: &str,
-    layout: &ClusterObjectLayout,
-    clusters: &[usize],
-    store: &ZeppelinStore,
-    stats: Option<&SqSearchByteStats>,
-) -> Result<RangeBytes> {
-    let mut start = usize::MAX;
-    let mut end = 0usize;
-    let mut logical_bytes = 0usize;
-    for &cluster_idx in clusters {
-        let section = layout.section(cluster_idx).ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "cluster {cluster_idx} missing from layout for {object_key}"
-            ))
-        })?;
-        let sq = section.sq.as_ref().ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "cluster {cluster_idx} missing SQ range in {object_key}"
-            ))
-        })?;
-        logical_bytes = logical_bytes
-            .checked_add(sq.end - sq.start)
-            .ok_or_else(|| ZeppelinError::Index("SQ logical byte count overflows".into()))?;
-        start = start.min(sq.start);
-        end = end.max(sq.end);
-    }
-    if start == usize::MAX || start >= end {
-        return Err(ZeppelinError::Index(format!(
-            "empty SQ range for object {object_key}"
-        )));
-    }
-    let bytes = store.get_range(object_key, start..end).await?;
-    if let Some(stats) = stats {
-        stats.record_get(SqBytePhase::Sq, bytes.len());
-        stats.record_logical_sq_bytes(logical_bytes);
-    }
-    Ok(RangeBytes {
-        base_offset: start,
-        bytes,
     })
 }
 
@@ -1431,7 +1393,7 @@ fn full_vector_ranges_from_sq_ids(
         .ok_or_else(|| ZeppelinError::Index("full-vector section header overflows".into()))?;
     let mut ranges = Vec::with_capacity(ids.len());
     for id in ids {
-        let id_len = id.as_bytes().len();
+        let id_len = id.len();
         let vector_start = offset
             .checked_add(4)
             .and_then(|offset| offset.checked_add(id_len))
@@ -1451,9 +1413,10 @@ fn full_vector_ranges_from_sq_ids(
     Ok(ranges)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_full_clusters_for_rerank(
     index: &IvfFlatIndex,
-    object: ClusterFetchObject,
+    object: &ClusterFetchObject,
     cluster_candidates: &HashMap<usize, Vec<RerankNeed>>,
     prefetched_objects: &HashMap<String, bytes::Bytes>,
     store: &ZeppelinStore,
@@ -1480,22 +1443,21 @@ async fn load_full_clusters_for_rerank(
         );
     }
 
-    if load_cluster_object_layout(index, &object, store, cache, stats)
+    if load_cluster_object_layout(index, object, store, cache, stats)
         .await?
         .is_some()
+        && all_needed_vectors_have_ranges(&needed_clusters, cluster_candidates)
     {
-        if all_needed_vectors_have_ranges(&needed_clusters, cluster_candidates) {
-            return fetch_rerank_vectors_by_range(
-                &object.key,
-                &needed_clusters,
-                cluster_candidates,
-                index.dim,
-                store,
-                stats,
-                rerank_coalesce_gap_bytes,
-            )
-            .await;
-        }
+        return fetch_rerank_vectors_by_range(
+            &object.key,
+            &needed_clusters,
+            cluster_candidates,
+            index.dim,
+            store,
+            stats,
+            rerank_coalesce_gap_bytes,
+        )
+        .await;
     }
 
     let object_data =
@@ -1923,11 +1885,12 @@ async fn scan_clusters_pq(
         }
     }
 
-    // Sort and take top candidates for reranking.
-    coarse_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
     let rerank_count = fetch_k * 4;
-    coarse_candidates.truncate(rerank_count);
+    partial_topk_by(
+        &mut coarse_candidates,
+        rerank_count,
+        coarse_pq_candidate_cmp,
+    );
 
     debug!(
         coarse_candidates = coarse_candidates.len(),

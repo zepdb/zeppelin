@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use crate::fts::wal_scan::wal_bm25_scan;
 use crate::fts::FtsFieldConfig;
 use crate::index::distance::compute_distance;
 use crate::index::filter::evaluate_filter;
+use crate::index::topk::{partial_topk_by, TopK};
 use crate::index::HierarchicalIndex;
 use crate::index::IvfFlatIndex;
 use crate::storage::ZeppelinStore;
@@ -67,6 +69,14 @@ pub struct QueryParams<'a> {
     pub manifest_cache: Option<&'a Arc<ManifestCache>>,
     /// Whether attributes should be included in returned results.
     pub include_attributes: bool,
+}
+
+fn distance_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
+    a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
+}
+
+fn bm25_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
+    b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
 }
 
 async fn read_manifest_for_query(
@@ -313,11 +323,7 @@ async fn wal_scan(
         })
         .collect();
 
-    results.sort_by(|a, b| {
-        a.score
-            .partial_cmp(&b.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    results.sort_by(distance_result_cmp);
 
     debug!(
         surviving_vectors = results.len(),
@@ -525,6 +531,11 @@ pub async fn execute_bm25_query(
         });
         let (results, scanned) = match segment_ref {
             Some(seg_ref) if !seg_ref.fts_fields.is_empty() => {
+                let segment_top_k = if manifest.uncompacted_fragments().is_empty() {
+                    top_k
+                } else {
+                    usize::MAX
+                };
                 let results = segment_bm25_search(
                     store,
                     namespace,
@@ -534,6 +545,7 @@ pub async fn execute_bm25_query(
                     filter,
                     last_as_prefix,
                     max_full_scan_clusters,
+                    segment_top_k,
                     include_attributes,
                 )
                 .await?;
@@ -592,6 +604,7 @@ async fn segment_bm25_search(
     filter: Option<&Filter>,
     last_as_prefix: bool,
     max_full_scan_clusters: usize,
+    top_k: usize,
     include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
     if segment_ref.has_global_fts {
@@ -603,6 +616,7 @@ async fn segment_bm25_search(
             fts_configs,
             filter,
             last_as_prefix,
+            top_k,
             include_attributes,
         )
         .await;
@@ -630,6 +644,7 @@ async fn segment_bm25_search(
         fts_configs,
         filter,
         last_as_prefix,
+        top_k,
         include_attributes,
     )
     .await
@@ -645,6 +660,7 @@ async fn segment_bm25_search_global(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    top_k: usize,
     include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
     use crate::fts::bm25::Bm25Params;
@@ -766,11 +782,7 @@ async fn segment_bm25_search_global(
         })
         .collect();
 
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    partial_topk_by(&mut results, top_k, bm25_result_cmp);
 
     Ok(results)
 }
@@ -923,6 +935,7 @@ async fn segment_bm25_search_full_scan(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    top_k: usize,
     include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
     use crate::index::ivf_flat::build::{attrs_key, deserialize_attrs};
@@ -1078,12 +1091,7 @@ async fn segment_bm25_search_full_scan(
         })
         .collect();
 
-    // Sort descending by score
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    partial_topk_by(&mut results, top_k, bm25_result_cmp);
 
     Ok(results)
 }
@@ -1101,8 +1109,14 @@ fn merge_bm25_results(
     match consistency {
         ConsistencyLevel::Strong => {
             let wal_ids: HashSet<String> = wal_results.iter().map(|r| r.id.clone()).collect();
-            let mut merged: Vec<SearchResult> = wal_results;
+            let mut merged = TopK::new(
+                top_k,
+                bm25_result_cmp as fn(&SearchResult, &SearchResult) -> Ordering,
+            );
 
+            for sr in wal_results {
+                merged.push(sr);
+            }
             for sr in segment_results {
                 // Exclude if WAL has a newer version OR if explicitly deleted
                 if !wal_ids.contains(&sr.id) && !wal_deleted_ids.contains(&sr.id) {
@@ -1110,26 +1124,14 @@ fn merge_bm25_results(
                 }
             }
 
-            // Sort DESCENDING (higher BM25 score = more relevant)
-            merged.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            merged.truncate(top_k);
-            merged
+            merged.into_sorted_vec()
         }
         ConsistencyLevel::Eventual => {
             let mut results: Vec<SearchResult> = segment_results
                 .into_iter()
                 .filter(|sr| !wal_deleted_ids.contains(&sr.id))
                 .collect();
-            results.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            results.truncate(top_k);
+            partial_topk_by(&mut results, top_k, bm25_result_cmp);
             results
         }
     }
@@ -1156,28 +1158,28 @@ fn merge_results(
             // Remove segment results whose IDs appear in WAL results (WAL is
             // authoritative) or were deleted in the WAL.
             let wal_ids: HashSet<String> = wal_results.iter().map(|r| r.id.clone()).collect();
-            let mut merged: Vec<SearchResult> = wal_results;
+            let mut merged = TopK::new(
+                top_k,
+                distance_result_cmp as fn(&SearchResult, &SearchResult) -> Ordering,
+            );
 
+            for sr in wal_results {
+                merged.push(sr);
+            }
             for sr in segment_results {
                 if !wal_ids.contains(&sr.id) && !wal_deleted_ids.contains(&sr.id) {
                     merged.push(sr);
                 }
             }
 
-            merged.sort_by(|a, b| {
-                a.score
-                    .partial_cmp(&b.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            merged.truncate(top_k);
-            merged
+            merged.into_sorted_vec()
         }
         ConsistencyLevel::Eventual => {
             let mut results: Vec<SearchResult> = segment_results
                 .into_iter()
                 .filter(|sr| !wal_deleted_ids.contains(&sr.id))
                 .collect();
-            results.truncate(top_k);
+            partial_topk_by(&mut results, top_k, distance_result_cmp);
             results
         }
     }
@@ -1310,6 +1312,7 @@ mod tests {
             None,
             false,
             500,
+            10,
             true,
         )
         .await;
@@ -1347,6 +1350,7 @@ mod tests {
             None,
             false,
             500,
+            10,
             true,
         )
         .await;
@@ -1381,6 +1385,7 @@ mod tests {
             None,
             false,
             0,
+            10,
             true,
         )
         .await;

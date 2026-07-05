@@ -7,6 +7,7 @@
 //! [4 bytes: "ZFTS"] [1 byte: version] [JSON payload]
 //! ```
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
@@ -16,12 +17,23 @@ use crate::error::{Result, ZeppelinError};
 use crate::fts::bm25::{self, Bm25Params};
 use crate::fts::tokenizer::tokenize_text;
 use crate::fts::FtsFieldConfig;
+use crate::index::topk::partial_topk_by;
 use crate::types::AttributeValue;
 
 /// Magic bytes for FTS inverted index files.
 const ZFTS_MAGIC: &[u8; 4] = b"ZFTS";
 /// Current version of the FTS index format.
 const ZFTS_VERSION: u8 = 1;
+
+fn doc_score_cmp(a: &(u32, f32), b: &(u32, f32)) -> Ordering {
+    b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+}
+
+fn segment_doc_score_cmp(a: &(usize, u32, f32), b: &(usize, u32, f32)) -> Ordering {
+    b.2.total_cmp(&a.2)
+        .then_with(|| a.0.cmp(&b.0))
+        .then_with(|| a.1.cmp(&b.1))
+}
 
 /// Per-cluster inverted index covering all FTS-configured fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,7 +151,8 @@ impl InvertedIndex {
         }
 
         let mut results: Vec<(u32, f32)> = doc_scores.into_iter().collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let k = results.len();
+        partial_topk_by(&mut results, k, doc_score_cmp);
         results
     }
 
@@ -364,7 +377,8 @@ impl FtsSegmentMeta {
             }
         }
 
-        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let k = results.len();
+        partial_topk_by(&mut results, k, segment_doc_score_cmp);
         results
     }
 }

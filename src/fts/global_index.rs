@@ -7,6 +7,7 @@
 //!
 //! Serialized with `ZGFTS` magic bytes + MessagePack payload.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
@@ -15,11 +16,18 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::bm25::{self, Bm25Params};
 use crate::fts::inverted_index::InvertedIndex;
+use crate::index::topk::partial_topk_by;
 
 /// Magic bytes for global FTS index files.
 const ZGFTS_MAGIC: &[u8; 5] = b"ZGFTS";
 /// Current version of the global FTS index format.
 const ZGFTS_VERSION: u8 = 1;
+
+fn global_doc_score_cmp(a: &(u16, u32, f32), b: &(u16, u32, f32)) -> Ordering {
+    b.2.total_cmp(&a.2)
+        .then_with(|| a.0.cmp(&b.0))
+        .then_with(|| a.1.cmp(&b.1))
+}
 
 /// Per-segment global inverted index covering all FTS-configured fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,7 +175,8 @@ impl GlobalInvertedIndex {
 
         let mut results: Vec<(u16, u32, f32)> =
             scores.into_iter().map(|((c, p), s)| (c, p, s)).collect();
-        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let k = results.len();
+        partial_topk_by(&mut results, k, global_doc_score_cmp);
         results
     }
 
@@ -227,7 +236,8 @@ impl GlobalInvertedIndex {
 
         let mut results: Vec<(u16, u32, f32)> =
             scores.into_iter().map(|((c, p), s)| (c, p, s)).collect();
-        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let k = results.len();
+        partial_topk_by(&mut results, k, global_doc_score_cmp);
         results
     }
 

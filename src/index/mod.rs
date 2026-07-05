@@ -9,6 +9,7 @@ pub mod filter;
 pub mod hierarchical;
 pub mod ivf_flat;
 pub mod quantization;
+pub(crate) mod topk;
 
 // Re-export the IVF-Flat and hierarchical implementations at the module level
 // so callers can write `use crate::index::{VectorIndex, IvfFlatIndex}`.
