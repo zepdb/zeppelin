@@ -134,7 +134,7 @@ impl ZeppelinStore {
         Ok(bytes)
     }
 
-    /// Get a byte range from an object by key.
+    /// Get a byte range from an object by key. Returns NotFound if it doesn't exist.
     #[instrument(skip(self), fields(key = key, range_start = range.start, range_end = range.end))]
     pub async fn get_range(&self, key: &str, range: Range<usize>) -> Result<Bytes> {
         if range.start >= range.end {
@@ -168,6 +168,36 @@ impl ZeppelinStore {
             elapsed_ms = elapsed.as_millis(),
             size = result.len(),
             "s3 get_range"
+        );
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["get"])
+            .observe(elapsed.as_secs_f64());
+        Ok(result)
+    }
+
+    /// Get multiple byte ranges from an object by key. Returns NotFound if it doesn't exist.
+    #[instrument(skip(self, ranges), fields(key = key, ranges = ranges.len()))]
+    pub async fn get_ranges(&self, key: &str, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+        let start = std::time::Instant::now();
+        let path = Path::parse(key)?;
+        let result = self.inner.get_ranges(&path, ranges).await.map_err(|e| {
+            crate::metrics::S3_ERRORS_TOTAL
+                .with_label_values(&["get"])
+                .inc();
+            match e {
+                object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
+                    key: path.to_string(),
+                },
+                other => ZeppelinError::Storage(other),
+            }
+        })?;
+        let elapsed = start.elapsed();
+        let size: usize = result.iter().map(Bytes::len).sum();
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            size,
+            ranges = ranges.len(),
+            "s3 get_ranges"
         );
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["get"])
