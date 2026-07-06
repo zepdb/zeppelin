@@ -298,10 +298,16 @@ async fn fetch_cluster_object_for_flat_scan(
             if let Some(c) = cache {
                 if let Some(data) = c.get(&object.key).await {
                     if data.len() >= range.end {
+                        crate::metrics::RANGE_SOURCE_TOTAL
+                            .with_label_values(&["flat", "local"])
+                            .inc();
                         return Ok(data.slice(range));
                     }
                 }
             }
+            crate::metrics::RANGE_SOURCE_TOTAL
+                .with_label_values(&["flat", "s3"])
+                .inc();
             return store.get_range(&object.key, range).await;
         }
     }
@@ -1312,7 +1318,8 @@ async fn load_sq_object_for_coarse(
     if let Some(layout) = load_cluster_object_layout(index, object, store, cache, stats).await? {
         if layout.sections.iter().all(|section| section.sq.is_some()) {
             let sq_bytes =
-                fetch_object_sq_range(&object.key, &layout, &object.clusters, store, stats).await?;
+                fetch_object_sq_range(&object.key, &layout, &object.clusters, store, cache, stats)
+                    .await?;
             let mut sq_clusters = Vec::with_capacity(object.clusters.len());
             let mut vector_ranges = Vec::with_capacity(object.clusters.len());
             for &cluster_idx in &object.clusters {
@@ -1397,6 +1404,7 @@ async fn fetch_object_sq_range(
     layout: &ClusterObjectLayout,
     clusters: &[usize],
     store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
     stats: Option<&SqSearchByteStats>,
 ) -> Result<RangeBytes> {
     let mut start = usize::MAX;
@@ -1424,6 +1432,25 @@ async fn fetch_object_sq_range(
             "empty SQ range for object {object_key}"
         )));
     }
+    if let Some(c) = cache {
+        if let Some(data) = c.get(object_key).await {
+            if data.len() >= end {
+                crate::metrics::RANGE_SOURCE_TOTAL
+                    .with_label_values(&["sq", "local"])
+                    .inc();
+                if let Some(stats) = stats {
+                    stats.record_logical_sq_bytes(logical_bytes);
+                }
+                return Ok(RangeBytes {
+                    base_offset: start,
+                    bytes: data.slice(start..end),
+                });
+            }
+        }
+    }
+    crate::metrics::RANGE_SOURCE_TOTAL
+        .with_label_values(&["sq", "s3"])
+        .inc();
     let bytes = store.get_range(object_key, start..end).await?;
     if let Some(stats) = stats {
         stats.record_get(SqBytePhase::Sq, bytes.len());
@@ -1511,6 +1538,7 @@ async fn load_full_clusters_for_rerank(
             cluster_candidates,
             index.dim,
             store,
+            cache,
             stats,
             rerank_coalesce_gap_bytes,
         )
@@ -1539,12 +1567,14 @@ fn all_needed_vectors_have_ranges(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_rerank_vectors_by_range(
     object_key: &str,
     clusters: &[usize],
     cluster_candidates: &HashMap<usize, Vec<RerankNeed>>,
     dim: usize,
     store: &ZeppelinStore,
+    cache: Option<&Arc<DiskCache>>,
     stats: Option<&SqSearchByteStats>,
     rerank_coalesce_gap_bytes: usize,
 ) -> Result<Vec<RerankFetchedVector>> {
@@ -1586,28 +1616,81 @@ async fn fetch_rerank_vectors_by_range(
         gap_bytes = rerank_coalesce_gap_bytes,
         "coalesced rerank vector ranges"
     );
-    let vector_bytes = futures::future::join_all(
-        ranges
-            .iter()
-            .cloned()
-            .map(|range| store.get_range(object_key, range)),
-    )
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>>>()?;
-    if let Some(stats) = stats {
-        let physical_bytes =
-            vector_bytes
+    let local_full_object = if let Some(c) = cache {
+        c.get(object_key).await
+    } else {
+        None
+    };
+    let vector_bytes = if let Some(data) = local_full_object {
+        let needed_end = ranges.iter().map(|range| range.end).max().unwrap_or(0);
+        if data.len() >= needed_end {
+            crate::metrics::RANGE_SOURCE_TOTAL
+                .with_label_values(&["rerank", "local"])
+                .inc_by(ranges.len() as u64);
+            if let Some(stats) = stats {
+                stats.record_logical_rerank_bytes(logical_bytes);
+            }
+            ranges
                 .iter()
-                .map(bytes::Bytes::len)
-                .try_fold(0usize, |acc, len| {
-                    acc.checked_add(len).ok_or_else(|| {
-                        ZeppelinError::Index("rerank physical byte count overflows".into())
-                    })
-                })?;
-        stats.record_gets(SqBytePhase::Rerank, ranges.len(), physical_bytes);
-        stats.record_logical_rerank_bytes(logical_bytes);
-    }
+                .cloned()
+                .map(|range| data.slice(range))
+                .collect()
+        } else {
+            crate::metrics::RANGE_SOURCE_TOTAL
+                .with_label_values(&["rerank", "s3"])
+                .inc_by(ranges.len() as u64);
+            let vector_bytes = futures::future::join_all(
+                ranges
+                    .iter()
+                    .cloned()
+                    .map(|range| store.get_range(object_key, range)),
+            )
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+            if let Some(stats) = stats {
+                let physical_bytes =
+                    vector_bytes
+                        .iter()
+                        .map(bytes::Bytes::len)
+                        .try_fold(0usize, |acc, len| {
+                            acc.checked_add(len).ok_or_else(|| {
+                                ZeppelinError::Index("rerank physical byte count overflows".into())
+                            })
+                        })?;
+                stats.record_gets(SqBytePhase::Rerank, ranges.len(), physical_bytes);
+                stats.record_logical_rerank_bytes(logical_bytes);
+            }
+            vector_bytes
+        }
+    } else {
+        crate::metrics::RANGE_SOURCE_TOTAL
+            .with_label_values(&["rerank", "s3"])
+            .inc_by(ranges.len() as u64);
+        let vector_bytes = futures::future::join_all(
+            ranges
+                .iter()
+                .cloned()
+                .map(|range| store.get_range(object_key, range)),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+        if let Some(stats) = stats {
+            let physical_bytes =
+                vector_bytes
+                    .iter()
+                    .map(bytes::Bytes::len)
+                    .try_fold(0usize, |acc, len| {
+                        acc.checked_add(len).ok_or_else(|| {
+                            ZeppelinError::Index("rerank physical byte count overflows".into())
+                        })
+                    })?;
+            stats.record_gets(SqBytePhase::Rerank, ranges.len(), physical_bytes);
+            stats.record_logical_rerank_bytes(logical_bytes);
+        }
+        vector_bytes
+    };
     if vector_bytes.len() != coalesced.len() {
         return Err(ZeppelinError::Index(format!(
             "range fetch count mismatch for {object_key}: requested={}, got={}",
@@ -1795,10 +1878,43 @@ async fn load_cluster_object_layout(
     }
 
     let header_len = cluster_object_header_range_len(object.clusters.len())?;
-    let header = store.get_range(&object.key, 0..header_len).await?;
-    if let Some(stats) = stats {
-        stats.record_get(SqBytePhase::Other, header.len());
-    }
+    let header = if let Some(c) = cache {
+        if let Some(data) = c.get(&object.key).await {
+            if data.len() >= header_len {
+                crate::metrics::RANGE_SOURCE_TOTAL
+                    .with_label_values(&["header", "local"])
+                    .inc();
+                data.slice(0..header_len)
+            } else {
+                crate::metrics::RANGE_SOURCE_TOTAL
+                    .with_label_values(&["header", "s3"])
+                    .inc();
+                let header = store.get_range(&object.key, 0..header_len).await?;
+                if let Some(stats) = stats {
+                    stats.record_get(SqBytePhase::Other, header.len());
+                }
+                header
+            }
+        } else {
+            crate::metrics::RANGE_SOURCE_TOTAL
+                .with_label_values(&["header", "s3"])
+                .inc();
+            let header = store.get_range(&object.key, 0..header_len).await?;
+            if let Some(stats) = stats {
+                stats.record_get(SqBytePhase::Other, header.len());
+            }
+            header
+        }
+    } else {
+        crate::metrics::RANGE_SOURCE_TOTAL
+            .with_label_values(&["header", "s3"])
+            .inc();
+        let header = store.get_range(&object.key, 0..header_len).await?;
+        if let Some(stats) = stats {
+            stats.record_get(SqBytePhase::Other, header.len());
+        }
+        header
+    };
     let Some(layout) = cluster_object_layout(&header)? else {
         return Ok(None);
     };
