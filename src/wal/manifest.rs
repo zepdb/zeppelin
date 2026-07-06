@@ -328,8 +328,11 @@ impl Manifest {
         self.updated_at = Utc::now();
     }
 
-    /// Add a segment reference and prune old segments/pending_deletes
-    /// using the provided limits.
+    /// Add a segment reference and prune old segments using the provided limit.
+    ///
+    /// NOTE: `max_pending_deletes` is currently UNUSED — `pending_deletes` is
+    /// deliberately not capped (see `prune()`). The parameter is retained for
+    /// call-site compatibility; capping it would leak S3 objects.
     pub fn add_segment_with_limits(
         &mut self,
         sref: SegmentRef,
