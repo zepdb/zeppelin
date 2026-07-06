@@ -147,6 +147,38 @@ paths:
         "404":
           $ref: "#/components/responses/NotFoundError"
 
+  /v1/namespaces/{ns}/hydrate:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    post:
+      operationId: triggerNamespaceHydration
+      summary: Queue namespace hydration
+      description: |
+        Asynchronously queues the namespace's current active segment for
+        warm-set hydration. The response is returned after enqueueing; it does
+        not wait for segment objects to finish downloading into the local cache.
+
+        A `202` response means the request entered the hydrator pipeline. The
+        pipeline still applies incremental-segment and capacity safety gates.
+        Gate refusals also return `202` here and are observable through
+        `zeppelin_hydration_skipped_total`, `zeppelin_hydration_refused`, and
+        `zeppelin_hydration_required_bytes`.
+      tags: [Namespaces]
+      responses:
+        "202":
+          description: Hydration request accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HydrateNamespaceResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/HydrationDisabled"
+
   /v1/namespaces/{ns}/vectors:
     parameters:
       - $ref: "#/components/parameters/NamespacePath"
@@ -302,6 +334,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    HydrationDisabled:
+      description: Hydration is disabled by configuration (409)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
     PayloadTooLarge:
       description: |
         Request body exceeds the configured byte limit, or a logical request
@@ -359,6 +397,7 @@ components:
             - DIMENSION_MISMATCH
             - NAMESPACE_NOT_FOUND
             - NAMESPACE_ALREADY_EXISTS
+            - HYDRATION_DISABLED
             - FTS_FIELD_NOT_CONFIGURED
             - CONFLICT_RETRY
             - RATE_LIMITED
@@ -786,6 +825,17 @@ components:
           type: string
           enum: [deleting]
           description: Namespace deletion has been accepted and cleanup is resumable.
+
+    HydrateNamespaceResponse:
+      type: object
+      required: [namespace, segment_id]
+      properties:
+        namespace:
+          type: string
+          description: Namespace whose active segment was queued.
+        segment_id:
+          type: string
+          description: Active segment id queued into the hydrator pipeline.
 
     UpsertVectorsRequest:
       type: object

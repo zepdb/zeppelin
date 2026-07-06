@@ -167,6 +167,10 @@ pub enum ZeppelinError {
     #[error("cache error: {0}")]
     Cache(String),
 
+    /// Warm-set hydration was requested while disabled in configuration.
+    #[error("hydration is disabled by config")]
+    HydrationDisabled,
+
     // Full-text search errors
     /// A full-text search indexing or query error.
     #[error("full-text search error: {0}")]
@@ -222,7 +226,8 @@ impl ZeppelinError {
             | ZeppelinError::ManifestConflict { .. }
             | ZeppelinError::LeaseHeld { .. }
             | ZeppelinError::LeaseExpired { .. }
-            | ZeppelinError::FencingTokenStale { .. } => 409,
+            | ZeppelinError::FencingTokenStale { .. }
+            | ZeppelinError::HydrationDisabled => 409,
 
             ZeppelinError::DimensionMismatch { .. }
             | ZeppelinError::Validation(_)
@@ -273,6 +278,7 @@ impl ZeppelinError {
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
             ZeppelinError::Io(_) => "INTERNAL_ERROR",
             ZeppelinError::Cache(_) => "INTERNAL_ERROR",
+            ZeppelinError::HydrationDisabled => "HYDRATION_DISABLED",
             ZeppelinError::FullTextSearch(_) => "INTERNAL_ERROR",
             ZeppelinError::FtsFieldNotConfigured { .. } => "FTS_FIELD_NOT_CONFIGURED",
             ZeppelinError::QueryConcurrencyExhausted => "CONCURRENCY_LIMIT",
@@ -365,6 +371,7 @@ impl ZeppelinError {
             | ZeppelinError::DimensionMismatch { .. }
             | ZeppelinError::Validation(_)
             | ZeppelinError::PayloadTooLarge { .. }
+            | ZeppelinError::HydrationDisabled
             | ZeppelinError::FtsFieldNotConfigured { .. }
             | ZeppelinError::QueryConcurrencyExhausted
             | ZeppelinError::RateLimitExceeded { .. } => self.to_string(),
@@ -547,6 +554,7 @@ mod tests {
             },
             ZeppelinError::Config("c".into()),
             ZeppelinError::Cache("c".into()),
+            ZeppelinError::HydrationDisabled,
             ZeppelinError::FullTextSearch("f".into()),
             ZeppelinError::FtsFieldNotConfigured {
                 namespace: "n".into(),

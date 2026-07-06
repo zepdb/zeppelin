@@ -60,6 +60,15 @@ pub struct DeleteNamespaceResponse {
     pub state: &'static str,
 }
 
+/// Response body for an accepted admin hydration request.
+#[derive(Debug, Serialize)]
+pub struct HydrateNamespaceResponse {
+    /// Namespace whose active segment was queued for hydration.
+    pub namespace: String,
+    /// Active segment id queued into the hydrator pipeline.
+    pub segment_id: String,
+}
+
 /// Response body for namespace creation (includes warning about saving UUID).
 #[derive(Debug, Serialize)]
 pub struct CreateNamespaceResponse {
@@ -213,4 +222,58 @@ pub async fn delete_namespace(
         StatusCode::ACCEPTED,
         Json(DeleteNamespaceResponse { state: "deleting" }),
     ))
+}
+
+/// Enqueues warm-set hydration for the namespace's current active segment.
+#[instrument(skip(state), fields(namespace = %ns))]
+pub async fn trigger_hydration(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<(StatusCode, Json<HydrateNamespaceResponse>), ApiError> {
+    let hydrator = state
+        .hydrator
+        .as_ref()
+        .ok_or(ApiError(ZeppelinError::HydrationDisabled))?;
+
+    state
+        .namespace_manager
+        .get(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    let manifest = state
+        .manifest_cache
+        .get_strong(&state.store, &ns)
+        .await
+        .map_err(ApiError::from)?;
+    let segment = active_segment_snapshot(&manifest).ok_or_else(|| {
+        ApiError(ZeppelinError::Validation(format!(
+            "namespace {ns} has no active segment to hydrate"
+        )))
+    })?;
+    let segment_id = segment.id.clone();
+
+    hydrator.request_hydration(&ns, &segment);
+    info!(
+        namespace = %ns,
+        segment_id = %segment_id,
+        "namespace hydration accepted"
+    );
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(HydrateNamespaceResponse {
+            namespace: ns,
+            segment_id,
+        }),
+    ))
+}
+
+fn active_segment_snapshot(
+    manifest: &crate::wal::Manifest,
+) -> Option<crate::wal::manifest::SegmentRef> {
+    let active_segment = manifest.active_segment.as_ref()?;
+    manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == *active_segment)
+        .cloned()
 }
