@@ -1615,11 +1615,13 @@ pub async fn build_ivf_flat(
             .collect();
         let key = cluster_group_key(namespace, segment_id, group_idx);
         let data = serialize_cluster_data_object(&entries)?;
+        let size_bytes = data.len() as u64;
         cluster_objects.push(ClusterDataObjectRef {
             key: key.clone(),
             clusters: group,
             live_offset: 0,
             live_len: 0,
+            size_bytes,
         });
         cluster_object_payloads.push((key, data));
     }
@@ -2073,6 +2075,7 @@ pub async fn load_ivf_flat(
             clusters,
             live_offset: 0,
             live_len: 0,
+            size_bytes: data.len() as u64,
         });
     }
 

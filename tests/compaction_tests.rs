@@ -902,6 +902,41 @@ async fn test_bytes_trigger_uses_recorded_sizes() {
     harness.cleanup().await;
 }
 
+#[tokio::test]
+async fn test_compaction_populates_cluster_object_size_bytes() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("cluster-object-size-bytes");
+    let store = &harness.store;
+    let writer = WalWriter::new(store.clone());
+
+    Manifest::new().write(store, &ns).await.unwrap();
+    writer
+        .append(&ns, random_vectors(256, 32), vec![])
+        .await
+        .unwrap();
+
+    let compactor = test_compactor(store);
+    compactor.compact(&ns).await.unwrap();
+
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    let segment = active_segment_ref(&manifest);
+    assert!(
+        !segment.cluster_objects.is_empty(),
+        "compaction must write grouped cluster object refs"
+    );
+
+    for object in &segment.cluster_objects {
+        let actual_len = store.get(&object.key).await.unwrap().len() as u64;
+        assert_eq!(
+            object.size_bytes, actual_len,
+            "cluster object {} must record its exact S3 object length",
+            object.key
+        );
+    }
+
+    harness.cleanup().await;
+}
+
 // ─── Task 3: centroid caching invariants ───
 
 use std::sync::Arc;

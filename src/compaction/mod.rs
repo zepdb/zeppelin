@@ -1091,6 +1091,7 @@ impl Compactor {
                 std::collections::HashSet::new()
             };
         let mut payloads: Vec<(String, Bytes)> = Vec::new();
+        let mut cluster_object_sizes: HashMap<String, u64> = HashMap::new();
 
         let (sketch_ref, sketch_data, _resident_sketch) = build_resident_sketch(
             namespace,
@@ -1117,6 +1118,7 @@ impl Compactor {
                 serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?
             };
             let cvec_key = cluster_key(namespace, new_segment_id, i);
+            cluster_object_sizes.insert(cvec_key.clone(), cvec_data.len() as u64);
 
             let cattr_data = serialize_attrs(&cluster_attrs[i])?;
             let cattr_key = attrs_key(namespace, new_segment_id, i);
@@ -1216,6 +1218,7 @@ impl Compactor {
             num_clusters,
             &touched,
             old_cluster_objects,
+            &cluster_object_sizes,
         )?;
         Ok((
             num_clusters,
@@ -1234,6 +1237,7 @@ fn incremental_cluster_objects(
     num_clusters: usize,
     touched: &[bool],
     old_cluster_objects: &[ClusterDataObjectRef],
+    new_object_sizes: &HashMap<String, u64>,
 ) -> Result<Vec<ClusterDataObjectRef>> {
     if old_cluster_objects.is_empty() {
         return Ok(Vec::new());
@@ -1245,7 +1249,7 @@ fn incremental_cluster_objects(
         )));
     }
 
-    let mut old_object_by_cluster: Vec<Option<&str>> = vec![None; num_clusters];
+    let mut old_object_by_cluster: Vec<Option<&ClusterDataObjectRef>> = vec![None; num_clusters];
     for object_ref in old_cluster_objects {
         for &cluster_idx in &object_ref.clusters {
             if cluster_idx >= num_clusters {
@@ -1259,35 +1263,46 @@ fn incremental_cluster_objects(
                     "old cluster {cluster_idx} appears in multiple cluster objects"
                 )));
             }
-            old_object_by_cluster[cluster_idx] = Some(object_ref.key.as_str());
+            old_object_by_cluster[cluster_idx] = Some(object_ref);
         }
     }
 
     let mut grouped: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut size_by_key: HashMap<String, u64> = HashMap::new();
     for cluster_idx in 0..num_clusters {
         let key = if touched[cluster_idx] {
-            cluster_key(namespace, new_segment_id, cluster_idx)
+            let key = cluster_key(namespace, new_segment_id, cluster_idx);
+            let size = new_object_sizes.get(&key).copied().ok_or_else(|| {
+                ZeppelinError::Index(format!("missing size for rewritten cluster object {key}"))
+            })?;
+            size_by_key.insert(key.clone(), size);
+            key
         } else {
-            old_object_by_cluster[cluster_idx]
-                .ok_or_else(|| {
-                    ZeppelinError::Index(format!(
-                        "grouped old segment missing object for carried cluster {cluster_idx}"
-                    ))
-                })?
-                .to_string()
+            let object_ref = old_object_by_cluster[cluster_idx].ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "grouped old segment missing object for carried cluster {cluster_idx}"
+                ))
+            })?;
+            size_by_key.insert(object_ref.key.clone(), object_ref.size_bytes);
+            object_ref.key.clone()
         };
         grouped.entry(key).or_default().push(cluster_idx);
     }
 
-    Ok(grouped
-        .into_iter()
-        .map(|(key, clusters)| ClusterDataObjectRef {
+    let mut object_refs = Vec::with_capacity(grouped.len());
+    for (key, clusters) in grouped {
+        let size_bytes = size_by_key.remove(&key).ok_or_else(|| {
+            ZeppelinError::Index(format!("missing size for cluster object {key}"))
+        })?;
+        object_refs.push(ClusterDataObjectRef {
             key,
             clusters,
             live_offset: 0,
             live_len: 0,
-        })
-        .collect())
+            size_bytes,
+        });
+    }
+    Ok(object_refs)
 }
 
 /// Abort check for mid-compaction lease loss (invariant A2).

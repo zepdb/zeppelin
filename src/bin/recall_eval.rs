@@ -1540,6 +1540,7 @@ mod tests {
                 clusters: vec![0],
                 live_offset: 0,
                 live_len: 0,
+                size_bytes: 0,
             }],
             bootstrap: None,
         });

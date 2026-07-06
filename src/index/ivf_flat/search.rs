@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::cache::DiskCache;
 use crate::error::{Result, ZeppelinError};
@@ -90,6 +90,13 @@ struct ClusterFetchObject {
     key: String,
     clusters: Vec<usize>,
     live_range: Option<std::ops::Range<usize>>,
+    size_bytes: u64,
+}
+
+enum RangeCacheLookup {
+    Local(bytes::Bytes),
+    Miss,
+    CorruptEvicted,
 }
 
 static CLUSTER_OBJECT_LAYOUT_CACHE: OnceLock<DashMap<String, Arc<ClusterObjectLayout>>> =
@@ -258,6 +265,56 @@ async fn fetch_with_cache_counted(
     }
 }
 
+async fn cached_full_object_for_range(
+    cache: Option<&Arc<DiskCache>>,
+    key: &str,
+    size_bytes: u64,
+    needed_end: usize,
+    phase: &'static str,
+    range_count: u64,
+) -> Result<RangeCacheLookup> {
+    let Some(c) = cache else {
+        return Ok(RangeCacheLookup::Miss);
+    };
+    let Some(data) = c.get(key).await else {
+        return Ok(RangeCacheLookup::Miss);
+    };
+
+    if size_bytes == 0 {
+        if data.len() >= needed_end {
+            crate::metrics::RANGE_SOURCE_TOTAL
+                .with_label_values(&[phase, "local"])
+                .inc_by(range_count);
+            return Ok(RangeCacheLookup::Local(data));
+        }
+        return Ok(RangeCacheLookup::Miss);
+    }
+
+    let actual = data.len() as u64;
+    if actual != size_bytes {
+        c.invalidate(key).await?;
+        error!(
+            key,
+            expected = size_bytes,
+            actual,
+            "cached object length mismatch; evicting"
+        );
+        crate::metrics::RANGE_SOURCE_TOTAL
+            .with_label_values(&[phase, "s3_after_corrupt_evict"])
+            .inc_by(range_count);
+        return Ok(RangeCacheLookup::CorruptEvicted);
+    }
+
+    if data.len() >= needed_end {
+        crate::metrics::RANGE_SOURCE_TOTAL
+            .with_label_values(&[phase, "local"])
+            .inc_by(range_count);
+        return Ok(RangeCacheLookup::Local(data));
+    }
+
+    Ok(RangeCacheLookup::Miss)
+}
+
 fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<ClusterFetchObject> {
     if let Some(object_ref) = index.cluster_object(cluster_idx)? {
         let live_range = object_ref.live_range()?;
@@ -271,6 +328,7 @@ fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<Clus
             key: object_ref.key.clone(),
             clusters: object_ref.clusters.clone(),
             live_range,
+            size_bytes: object_ref.size_bytes,
         });
     }
 
@@ -282,6 +340,7 @@ fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<Clus
         ),
         clusters: vec![cluster_idx],
         live_range: None,
+        size_bytes: 0,
     })
 }
 
@@ -295,19 +354,24 @@ async fn fetch_cluster_object_for_flat_scan(
         if let Some(range) = object.live_range.clone() {
             // A locally cached full object supersedes the ranged fetch; the
             // live span is a prefix, so slicing preserves parse semantics.
-            if let Some(c) = cache {
-                if let Some(data) = c.get(&object.key).await {
-                    if data.len() >= range.end {
-                        crate::metrics::RANGE_SOURCE_TOTAL
-                            .with_label_values(&["flat", "local"])
-                            .inc();
-                        return Ok(data.slice(range));
-                    }
+            match cached_full_object_for_range(
+                cache,
+                &object.key,
+                object.size_bytes,
+                range.end,
+                "flat",
+                1,
+            )
+            .await?
+            {
+                RangeCacheLookup::Local(data) => return Ok(data.slice(range)),
+                RangeCacheLookup::Miss => {
+                    crate::metrics::RANGE_SOURCE_TOTAL
+                        .with_label_values(&["flat", "s3"])
+                        .inc();
                 }
+                RangeCacheLookup::CorruptEvicted => {}
             }
-            crate::metrics::RANGE_SOURCE_TOTAL
-                .with_label_values(&["flat", "s3"])
-                .inc();
             return store.get_range(&object.key, range).await;
         }
     }
@@ -1317,9 +1381,16 @@ async fn load_sq_object_for_coarse(
 
     if let Some(layout) = load_cluster_object_layout(index, object, store, cache, stats).await? {
         if layout.sections.iter().all(|section| section.sq.is_some()) {
-            let sq_bytes =
-                fetch_object_sq_range(&object.key, &layout, &object.clusters, store, cache, stats)
-                    .await?;
+            let sq_bytes = fetch_object_sq_range(
+                &object.key,
+                object.size_bytes,
+                &layout,
+                &object.clusters,
+                store,
+                cache,
+                stats,
+            )
+            .await?;
             let mut sq_clusters = Vec::with_capacity(object.clusters.len());
             let mut vector_ranges = Vec::with_capacity(object.clusters.len());
             for &cluster_idx in &object.clusters {
@@ -1401,6 +1472,7 @@ struct RangeBytes {
 
 async fn fetch_object_sq_range(
     object_key: &str,
+    object_size_bytes: u64,
     layout: &ClusterObjectLayout,
     clusters: &[usize],
     store: &ZeppelinStore,
@@ -1432,25 +1504,23 @@ async fn fetch_object_sq_range(
             "empty SQ range for object {object_key}"
         )));
     }
-    if let Some(c) = cache {
-        if let Some(data) = c.get(object_key).await {
-            if data.len() >= end {
-                crate::metrics::RANGE_SOURCE_TOTAL
-                    .with_label_values(&["sq", "local"])
-                    .inc();
-                if let Some(stats) = stats {
-                    stats.record_logical_sq_bytes(logical_bytes);
-                }
-                return Ok(RangeBytes {
-                    base_offset: start,
-                    bytes: data.slice(start..end),
-                });
+    match cached_full_object_for_range(cache, object_key, object_size_bytes, end, "sq", 1).await? {
+        RangeCacheLookup::Local(data) => {
+            if let Some(stats) = stats {
+                stats.record_logical_sq_bytes(logical_bytes);
             }
+            return Ok(RangeBytes {
+                base_offset: start,
+                bytes: data.slice(start..end),
+            });
         }
+        RangeCacheLookup::Miss => {
+            crate::metrics::RANGE_SOURCE_TOTAL
+                .with_label_values(&["sq", "s3"])
+                .inc();
+        }
+        RangeCacheLookup::CorruptEvicted => {}
     }
-    crate::metrics::RANGE_SOURCE_TOTAL
-        .with_label_values(&["sq", "s3"])
-        .inc();
     let bytes = store.get_range(object_key, start..end).await?;
     if let Some(stats) = stats {
         stats.record_get(SqBytePhase::Sq, bytes.len());
@@ -1534,6 +1604,7 @@ async fn load_full_clusters_for_rerank(
     {
         return fetch_rerank_vectors_by_range(
             &object.key,
+            object.size_bytes,
             &needed_clusters,
             cluster_candidates,
             index.dim,
@@ -1570,6 +1641,7 @@ fn all_needed_vectors_have_ranges(
 #[allow(clippy::too_many_arguments)]
 async fn fetch_rerank_vectors_by_range(
     object_key: &str,
+    object_size_bytes: u64,
     clusters: &[usize],
     cluster_candidates: &HashMap<usize, Vec<RerankNeed>>,
     dim: usize,
@@ -1616,81 +1688,80 @@ async fn fetch_rerank_vectors_by_range(
         gap_bytes = rerank_coalesce_gap_bytes,
         "coalesced rerank vector ranges"
     );
-    let local_full_object = if let Some(c) = cache {
-        c.get(object_key).await
-    } else {
-        None
-    };
-    let vector_bytes = if let Some(data) = local_full_object {
-        let needed_end = ranges.iter().map(|range| range.end).max().unwrap_or(0);
-        if data.len() >= needed_end {
-            crate::metrics::RANGE_SOURCE_TOTAL
-                .with_label_values(&["rerank", "local"])
-                .inc_by(ranges.len() as u64);
-            if let Some(stats) = stats {
-                stats.record_logical_rerank_bytes(logical_bytes);
-            }
-            ranges
-                .iter()
-                .cloned()
-                .map(|range| data.slice(range))
-                .collect()
-        } else {
-            crate::metrics::RANGE_SOURCE_TOTAL
-                .with_label_values(&["rerank", "s3"])
-                .inc_by(ranges.len() as u64);
-            let vector_bytes = futures::future::join_all(
+    let needed_end = ranges.iter().map(|range| range.end).max().unwrap_or(0);
+    let vector_bytes =
+        match cached_full_object_for_range(
+            cache,
+            object_key,
+            object_size_bytes,
+            needed_end,
+            "rerank",
+            ranges.len() as u64,
+        )
+        .await?
+        {
+            RangeCacheLookup::Local(data) => {
+                if let Some(stats) = stats {
+                    stats.record_logical_rerank_bytes(logical_bytes);
+                }
                 ranges
                     .iter()
                     .cloned()
-                    .map(|range| store.get_range(object_key, range)),
-            )
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-            if let Some(stats) = stats {
-                let physical_bytes =
-                    vector_bytes
+                    .map(|range| data.slice(range))
+                    .collect()
+            }
+            RangeCacheLookup::Miss => {
+                crate::metrics::RANGE_SOURCE_TOTAL
+                    .with_label_values(&["rerank", "s3"])
+                    .inc_by(ranges.len() as u64);
+                let vector_bytes = futures::future::join_all(
+                    ranges
                         .iter()
-                        .map(bytes::Bytes::len)
-                        .try_fold(0usize, |acc, len| {
+                        .cloned()
+                        .map(|range| store.get_range(object_key, range)),
+                )
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+                if let Some(stats) = stats {
+                    let physical_bytes = vector_bytes.iter().map(bytes::Bytes::len).try_fold(
+                        0usize,
+                        |acc, len| {
                             acc.checked_add(len).ok_or_else(|| {
                                 ZeppelinError::Index("rerank physical byte count overflows".into())
                             })
-                        })?;
-                stats.record_gets(SqBytePhase::Rerank, ranges.len(), physical_bytes);
-                stats.record_logical_rerank_bytes(logical_bytes);
-            }
-            vector_bytes
-        }
-    } else {
-        crate::metrics::RANGE_SOURCE_TOTAL
-            .with_label_values(&["rerank", "s3"])
-            .inc_by(ranges.len() as u64);
-        let vector_bytes = futures::future::join_all(
-            ranges
-                .iter()
-                .cloned()
-                .map(|range| store.get_range(object_key, range)),
-        )
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
-        if let Some(stats) = stats {
-            let physical_bytes =
+                        },
+                    )?;
+                    stats.record_gets(SqBytePhase::Rerank, ranges.len(), physical_bytes);
+                    stats.record_logical_rerank_bytes(logical_bytes);
+                }
                 vector_bytes
-                    .iter()
-                    .map(bytes::Bytes::len)
-                    .try_fold(0usize, |acc, len| {
-                        acc.checked_add(len).ok_or_else(|| {
-                            ZeppelinError::Index("rerank physical byte count overflows".into())
-                        })
-                    })?;
-            stats.record_gets(SqBytePhase::Rerank, ranges.len(), physical_bytes);
-            stats.record_logical_rerank_bytes(logical_bytes);
-        }
-        vector_bytes
-    };
+            }
+            RangeCacheLookup::CorruptEvicted => {
+                let vector_bytes = futures::future::join_all(
+                    ranges
+                        .iter()
+                        .cloned()
+                        .map(|range| store.get_range(object_key, range)),
+                )
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+                if let Some(stats) = stats {
+                    let physical_bytes = vector_bytes.iter().map(bytes::Bytes::len).try_fold(
+                        0usize,
+                        |acc, len| {
+                            acc.checked_add(len).ok_or_else(|| {
+                                ZeppelinError::Index("rerank physical byte count overflows".into())
+                            })
+                        },
+                    )?;
+                    stats.record_gets(SqBytePhase::Rerank, ranges.len(), physical_bytes);
+                    stats.record_logical_rerank_bytes(logical_bytes);
+                }
+                vector_bytes
+            }
+        };
     if vector_bytes.len() != coalesced.len() {
         return Err(ZeppelinError::Index(format!(
             "range fetch count mismatch for {object_key}: requested={}, got={}",
@@ -1878,24 +1949,18 @@ async fn load_cluster_object_layout(
     }
 
     let header_len = cluster_object_header_range_len(object.clusters.len())?;
-    let header = if let Some(c) = cache {
-        if let Some(data) = c.get(&object.key).await {
-            if data.len() >= header_len {
-                crate::metrics::RANGE_SOURCE_TOTAL
-                    .with_label_values(&["header", "local"])
-                    .inc();
-                data.slice(0..header_len)
-            } else {
-                crate::metrics::RANGE_SOURCE_TOTAL
-                    .with_label_values(&["header", "s3"])
-                    .inc();
-                let header = store.get_range(&object.key, 0..header_len).await?;
-                if let Some(stats) = stats {
-                    stats.record_get(SqBytePhase::Other, header.len());
-                }
-                header
-            }
-        } else {
+    let header = match cached_full_object_for_range(
+        cache,
+        &object.key,
+        object.size_bytes,
+        header_len,
+        "header",
+        1,
+    )
+    .await?
+    {
+        RangeCacheLookup::Local(data) => data.slice(0..header_len),
+        RangeCacheLookup::Miss => {
             crate::metrics::RANGE_SOURCE_TOTAL
                 .with_label_values(&["header", "s3"])
                 .inc();
@@ -1905,15 +1970,13 @@ async fn load_cluster_object_layout(
             }
             header
         }
-    } else {
-        crate::metrics::RANGE_SOURCE_TOTAL
-            .with_label_values(&["header", "s3"])
-            .inc();
-        let header = store.get_range(&object.key, 0..header_len).await?;
-        if let Some(stats) = stats {
-            stats.record_get(SqBytePhase::Other, header.len());
+        RangeCacheLookup::CorruptEvicted => {
+            let header = store.get_range(&object.key, 0..header_len).await?;
+            if let Some(stats) = stats {
+                stats.record_get(SqBytePhase::Other, header.len());
+            }
+            header
         }
-        header
     };
     let Some(layout) = cluster_object_layout(&header)? else {
         return Ok(None);
@@ -2403,12 +2466,14 @@ mod tests {
                 clusters: vec![0, 1],
                 live_offset: 0,
                 live_len: 0,
+                size_bytes: 0,
             },
             crate::wal::manifest::ClusterDataObjectRef {
                 key: "test_ns/segments/seg_001/cluster_group_1.bin".to_string(),
                 clusters: vec![2, 3],
                 live_offset: 0,
                 live_len: 0,
+                size_bytes: 0,
             },
         ];
         index.cluster_object_by_cluster = vec![0, 0, 1, 1];

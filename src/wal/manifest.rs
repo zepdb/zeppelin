@@ -86,6 +86,16 @@ pub struct ClusterDataObjectRef {
     /// new fields are trailing and `#[serde(default)]`.
     #[serde(default)]
     pub live_len: u64,
+    /// Total serialized object size in bytes.
+    ///
+    /// `0` means unknown for legacy manifests. Known sizes let warm range
+    /// serving distinguish a short cache entry from a complete cached object.
+    ///
+    /// NOTE: manifest schema additions must remain trailing in the struct.
+    /// MessagePack encodes structs as arrays, so old manifests decode only if
+    /// new fields are trailing and `#[serde(default)]`.
+    #[serde(default)]
+    pub size_bytes: u64,
 }
 
 impl ClusterDataObjectRef {
@@ -803,12 +813,93 @@ mod tests {
             clusters: vec![0, 1],
             live_offset: 0,
             live_len: 123,
+            size_bytes: 456,
         }];
         manifest.add_segment(seg);
         let bytes = manifest.to_bytes().unwrap();
         let decoded = Manifest::from_bytes(&bytes).unwrap();
         let object_ref = &decoded.segments[0].cluster_objects[0];
         assert_eq!(object_ref.live_range().unwrap(), Some(0..123));
+        assert_eq!(object_ref.size_bytes, 456);
+    }
+
+    #[test]
+    fn test_decode_cluster_ref_without_size_bytes_field() {
+        #[derive(Serialize)]
+        struct OldClusterDataObjectRef {
+            key: String,
+            clusters: Vec<usize>,
+            live_offset: u64,
+            live_len: u64,
+        }
+        #[derive(Serialize)]
+        struct MixedSegmentRef {
+            id: String,
+            vector_count: usize,
+            cluster_count: usize,
+            quantization: crate::index::quantization::QuantizationType,
+            hierarchical: bool,
+            bitmap_fields: Vec<String>,
+            fts_fields: Vec<String>,
+            has_global_fts: bool,
+            cluster_owners: Vec<String>,
+            sketch: Option<SketchRef>,
+            cluster_objects: Vec<OldClusterDataObjectRef>,
+            bootstrap: Option<BootstrapRef>,
+        }
+        #[derive(Serialize)]
+        struct MixedManifest {
+            fragments: Vec<FragmentRef>,
+            segments: Vec<MixedSegmentRef>,
+            compaction_watermark: Option<Ulid>,
+            active_segment: Option<String>,
+            next_sequence: u64,
+            pending_deletes: Vec<String>,
+            fencing_token: u64,
+            updated_at: DateTime<Utc>,
+        }
+
+        let old = MixedManifest {
+            fragments: vec![],
+            segments: vec![MixedSegmentRef {
+                id: "seg_grouped".to_string(),
+                vector_count: 10,
+                cluster_count: 2,
+                quantization: crate::index::quantization::QuantizationType::Scalar,
+                hierarchical: false,
+                bitmap_fields: vec![],
+                fts_fields: vec![],
+                has_global_fts: false,
+                cluster_owners: vec![],
+                sketch: None,
+                cluster_objects: vec![OldClusterDataObjectRef {
+                    key: "ns/segments/seg_grouped/cluster_group_0.bin".to_string(),
+                    clusters: vec![0, 1],
+                    live_offset: 0,
+                    live_len: 123,
+                }],
+                bootstrap: None,
+            }],
+            compaction_watermark: None,
+            active_segment: Some("seg_grouped".to_string()),
+            next_sequence: 0,
+            pending_deletes: vec![],
+            fencing_token: 0,
+            updated_at: Utc::now(),
+        };
+
+        let msgpack = rmp_serde::to_vec(&old).unwrap();
+        let mut data = vec![MANIFEST_FORMAT_MSGPACK];
+        data.extend_from_slice(&msgpack);
+        let decoded = Manifest::from_bytes(&data)
+            .expect("old cluster object refs without size_bytes must decode");
+        let object_ref = &decoded.segments[0].cluster_objects[0];
+        assert_eq!(object_ref.live_offset, 0);
+        assert_eq!(object_ref.live_len, 123);
+        assert_eq!(
+            object_ref.size_bytes, 0,
+            "missing cluster object size_bytes decodes to unknown"
+        );
     }
 
     /// Round-trip: size_bytes survives serialize → deserialize.

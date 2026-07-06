@@ -118,12 +118,20 @@ fn query_params<'a>(
     }
 }
 
-async fn run_query(fixture: &WarmRangeFixture, cache: Option<&Arc<DiskCache>>) {
+async fn run_query(
+    fixture: &WarmRangeFixture,
+    cache: Option<&Arc<DiskCache>>,
+) -> Vec<(String, u32)> {
     let wal_reader = WalReader::new(fixture.store.clone());
     let response = execute_query(query_params(fixture, &wal_reader, cache))
         .await
         .unwrap();
     assert!(!response.results.is_empty(), "query must return results");
+    response
+        .results
+        .into_iter()
+        .map(|result| (result.id, result.score.to_bits()))
+        .collect()
 }
 
 async fn cache_full_cluster_objects(fixture: &WarmRangeFixture, cache: &DiskCache) {
@@ -154,6 +162,26 @@ fn range_source_metric_value(phase: &str, source: &str) -> f64 {
                     phase_match && source_match
                 })
                 .map(|metric| metric.get_counter().get_value())
+        })
+        .unwrap_or(0.0)
+}
+
+fn range_source_metric_value_for_source(source: &str) -> f64 {
+    prometheus::gather()
+        .into_iter()
+        .find(|family| family.name() == "zeppelin_range_source_total")
+        .map(|family| {
+            family
+                .get_metric()
+                .iter()
+                .filter(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|label| label.name() == "source" && label.value() == source)
+                })
+                .map(|metric| metric.get_counter().get_value())
+                .sum()
         })
         .unwrap_or(0.0)
 }
@@ -245,6 +273,44 @@ async fn test_range_source_metric_records_s3_and_local_sources() {
         local_after > local_before,
         "warm SQ range reads must increment source=local metric"
     );
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_corrupt_cached_object_evicted_and_served_from_s3() {
+    zeppelin::metrics::init();
+    let fixture = warm_range_fixture("warm-range-corrupt").await;
+    let baseline = run_query(&fixture, None).await;
+    let (_cache_dir, cache) = test_cache();
+
+    for key in &fixture.cluster_keys {
+        cache
+            .put(key, &bytes::Bytes::from_static(b"truncated"))
+            .await
+            .unwrap();
+    }
+
+    let corrupt_before = range_source_metric_value_for_source("s3_after_corrupt_evict");
+    fixture.counter.reset();
+    let repaired = run_query(&fixture, Some(&cache)).await;
+    let corrupt_after = range_source_metric_value_for_source("s3_after_corrupt_evict");
+
+    assert_eq!(
+        repaired, baseline,
+        "corrupt cached objects must be repaired by serving the query from S3"
+    );
+    assert!(
+        corrupt_after > corrupt_before,
+        "known-size corrupt cached objects must meter s3_after_corrupt_evict"
+    );
+    for key in &fixture.cluster_keys {
+        assert_eq!(
+            cache.get(key).await,
+            None,
+            "corrupt cached object must be evicted for {key}"
+        );
+    }
 
     fixture.harness.cleanup().await;
 }
