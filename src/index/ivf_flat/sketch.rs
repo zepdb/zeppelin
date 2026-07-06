@@ -545,6 +545,194 @@ pub(crate) fn build_resident_sketch(
     Ok((sketch_ref, bytes, resident))
 }
 
+/// Result of attempting to stitch a resident sketch from a previous segment.
+pub(crate) enum ResidentSketchStitch {
+    /// The old sketch was compatible and the new sketch was stitched.
+    Stitched(SketchRef, Bytes, Box<ResidentSketch>),
+    /// The old sketch could not be reused; caller should rebuild the sketch.
+    Unavailable(&'static str),
+}
+
+/// Build a new resident sketch by reusing the old codebook and carried codes.
+///
+/// Untouched clusters copy their old code sections byte-for-byte. Touched
+/// clusters are re-encoded against the same old codebook, so the result is
+/// identical to a full re-encode of all surviving vectors against that
+/// codebook without paying to encode carried clusters again.
+#[must_use = "callers must use the stitched sketch or intentionally rebuild"]
+#[allow(clippy::type_complexity)]
+pub(crate) fn stitch_resident_sketch(
+    namespace: &str,
+    segment_id: &str,
+    dim: usize,
+    old: &ResidentSketch,
+    touched: &[bool],
+    cluster_vecs: &[Vec<Vec<f32>>],
+    cluster_attrs: &[Vec<Option<HashMap<String, AttributeValue>>>],
+) -> Result<ResidentSketchStitch> {
+    let cluster_count = cluster_vecs.len();
+    if cluster_count == 0 {
+        return Err(ZeppelinError::Index(
+            "cannot stitch coarse sketch with zero clusters".into(),
+        ));
+    }
+    if touched.len() != cluster_count {
+        return Err(ZeppelinError::Index(format!(
+            "coarse sketch touched length mismatch: expected {cluster_count}, got {}",
+            touched.len()
+        )));
+    }
+    if cluster_attrs.len() != cluster_count {
+        return Err(ZeppelinError::Index(format!(
+            "coarse sketch cluster_attrs length mismatch: expected {cluster_count}, got {}",
+            cluster_attrs.len()
+        )));
+    }
+
+    let expected_subquantizers = SKETCH_MAX_SUBQUANTIZERS.min(dim).max(1);
+    if old.dim != dim {
+        return Ok(ResidentSketchStitch::Unavailable("dim_mismatch"));
+    }
+    if old.subquantizers != expected_subquantizers {
+        return Ok(ResidentSketchStitch::Unavailable("subquantizer_mismatch"));
+    }
+    if old.cluster_count != cluster_count {
+        return Ok(ResidentSketchStitch::Unavailable("cluster_count_mismatch"));
+    }
+    if old.codebook_size != SKETCH_K || old.code_width != SKETCH_CODE_WIDTH {
+        return Ok(ResidentSketchStitch::Unavailable("format_mismatch"));
+    }
+
+    let mut counts = Vec::with_capacity(cluster_count);
+    let mut vector_count = 0usize;
+    let mut attr_bits = vec![0u8; bitset_len(cluster_count)];
+    let mut codes = Vec::new();
+    for cluster_idx in 0..cluster_count {
+        if touched[cluster_idx] {
+            let count = cluster_vecs[cluster_idx].len();
+            counts.push(count);
+            vector_count = vector_count.checked_add(count).ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "coarse sketch vector count overflows at cluster {cluster_idx}"
+                ))
+            })?;
+            if cluster_attrs[cluster_idx].iter().any(Option::is_some) {
+                set_bit(&mut attr_bits, cluster_idx);
+            }
+            for vector in &cluster_vecs[cluster_idx] {
+                if vector.len() != dim {
+                    return Err(ZeppelinError::DimensionMismatch {
+                        expected: dim,
+                        actual: vector.len(),
+                    });
+                }
+                let mut packed = vec![0u8; old.packed_code_bytes];
+                for subq in 0..old.subquantizers {
+                    let (start, end) = chunk_range(dim, old.subquantizers, subq);
+                    let code = encode_subvector(
+                        &old.codebook,
+                        dim,
+                        old.subquantizers,
+                        old.codebook_size,
+                        subq,
+                        &vector[start..end],
+                    );
+                    pack_code(&mut packed, subq, code, old.code_width);
+                }
+                codes.extend_from_slice(&packed);
+            }
+            continue;
+        }
+
+        let (row_start, row_end) = old.cluster_offsets[cluster_idx];
+        let count = row_end.checked_sub(row_start).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "coarse sketch invalid old offsets for cluster {cluster_idx}"
+            ))
+        })?;
+        if cluster_vecs[cluster_idx].len() != count {
+            return Err(ZeppelinError::Index(format!(
+                "untouched cluster {cluster_idx} vector count changed: old={count}, new={}",
+                cluster_vecs[cluster_idx].len()
+            )));
+        }
+        counts.push(count);
+        vector_count = vector_count.checked_add(count).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "coarse sketch vector count overflows at carried cluster {cluster_idx}"
+            ))
+        })?;
+        if old.cluster_has_attrs[cluster_idx] {
+            set_bit(&mut attr_bits, cluster_idx);
+        }
+        let byte_start = row_start
+            .checked_mul(old.packed_code_bytes)
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "coarse sketch carried code start overflows at cluster {cluster_idx}"
+                ))
+            })?;
+        let byte_end = row_end.checked_mul(old.packed_code_bytes).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "coarse sketch carried code end overflows at cluster {cluster_idx}"
+            ))
+        })?;
+        codes.extend_from_slice(&old.codes[byte_start..byte_end]);
+    }
+
+    if vector_count == 0 {
+        return Err(ZeppelinError::Index(
+            "cannot stitch coarse sketch from empty vector set".into(),
+        ));
+    }
+
+    let total = 28usize
+        .checked_add(old.codebook.len().checked_mul(4).ok_or_else(|| {
+            ZeppelinError::Index("coarse sketch codebook byte size overflows".into())
+        })?)
+        .and_then(|size| size.checked_add(attr_bits.len()))
+        .and_then(|size| size.checked_add(cluster_count.checked_mul(4)?))
+        .and_then(|size| size.checked_add(codes.len()))
+        .ok_or_else(|| ZeppelinError::Index("coarse sketch total size overflows".into()))?;
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(SKETCH_MAGIC);
+    buf.extend_from_slice(&SKETCH_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(dim as u32).to_le_bytes());
+    buf.extend_from_slice(&(old.subquantizers as u32).to_le_bytes());
+    buf.extend_from_slice(&(cluster_count as u32).to_le_bytes());
+    buf.extend_from_slice(&(vector_count as u64).to_le_bytes());
+    for value in &old.codebook {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+    buf.extend_from_slice(&attr_bits);
+    for count in counts {
+        let count = u32::try_from(count).map_err(|_| {
+            ZeppelinError::Index(format!(
+                "coarse sketch cluster has too many vectors: {count}"
+            ))
+        })?;
+        buf.extend_from_slice(&count.to_le_bytes());
+    }
+    buf.extend_from_slice(&codes);
+    debug_assert_eq!(buf.len(), total);
+
+    let key = sketch_key(namespace, segment_id);
+    let bytes = Bytes::from(buf);
+    let sketch_ref = SketchRef {
+        key,
+        version: SKETCH_VERSION,
+        code_dims: old.subquantizers,
+        bytes_per_vector: old.packed_code_bytes,
+        size_bytes: bytes.len() as u64,
+    };
+    let resident = ResidentSketch::from_bytes(&bytes)?;
+    Ok(ResidentSketchStitch::Stitched(
+        sketch_ref,
+        bytes,
+        Box::new(resident),
+    ))
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct ClusterScore {
     pub(crate) cluster_idx: usize,
@@ -911,6 +1099,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn stitch_reports_incompatible_dim_without_reencoding() {
+        let attrs = vec![vec![None], vec![None]];
+        let clusters = vec![vec![vec![1.0, 0.0, 0.0]], vec![vec![0.0, 1.0, 0.0]]];
+        let (_sketch_ref, _bytes, old) =
+            build_resident_sketch("ns", "old", 3, &clusters, &attrs).unwrap();
+
+        let new_attrs = vec![vec![None], vec![None]];
+        let new_clusters = vec![
+            vec![vec![1.0, 0.0, 0.0, 0.0]],
+            vec![vec![0.0, 1.0, 0.0, 0.0]],
+        ];
+        let result = stitch_resident_sketch(
+            "ns",
+            "new",
+            4,
+            &old,
+            &[true, false],
+            &new_clusters,
+            &new_attrs,
+        )
+        .unwrap();
+
+        match result {
+            ResidentSketchStitch::Unavailable(reason) => assert_eq!(reason, "dim_mismatch"),
+            ResidentSketchStitch::Stitched(_, _, _) => {
+                panic!("dim-mismatched old sketch must not be stitched")
+            }
+        }
     }
 
     #[test]

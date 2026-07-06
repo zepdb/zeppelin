@@ -32,6 +32,7 @@ const COMPACTION_READ_CLASS_CLUSTER: &str = "cluster";
 const COMPACTION_READ_CLASS_ATTRS: &str = "attrs";
 const COMPACTION_READ_CLASS_CENTROIDS: &str = "centroids";
 const COMPACTION_READ_CLASS_SQ: &str = "sq";
+const COMPACTION_READ_CLASS_SKETCH: &str = "sketch";
 
 async fn get_compaction_read(
     store: &ZeppelinStore,
@@ -570,6 +571,7 @@ impl Compactor {
                         .as_ref()
                         .map(|s| s.bitmap_fields.as_slice())
                         .unwrap_or(&[]),
+                    old_segment_ref.as_ref().and_then(|s| s.sketch.as_ref()),
                     // Carry-over is unsafe when FTS is configured: the FTS
                     // pass below reads every cluster's attrs under the NEW
                     // segment ID and rebuilds a per-segment global index,
@@ -1014,6 +1016,7 @@ impl Compactor {
         old_cluster_owners: &[String],
         old_cluster_objects: &[ClusterDataObjectRef],
         old_bitmap_fields: &[String],
+        old_sketch_ref: Option<&crate::wal::manifest::SketchRef>,
         allow_carryover: bool,
     ) -> Result<(
         usize,
@@ -1030,7 +1033,9 @@ impl Compactor {
             serialize_centroids_with_sq_calibration, serialize_cluster,
             serialize_cluster_data_object, serialize_colocated_sq_cluster,
         };
-        use crate::index::ivf_flat::sketch::build_resident_sketch;
+        use crate::index::ivf_flat::sketch::{
+            build_resident_sketch, stitch_resident_sketch, ResidentSketch, ResidentSketchStitch,
+        };
         use bytes::Bytes;
 
         // Load existing centroids
@@ -1166,13 +1171,77 @@ impl Compactor {
         let mut payloads: Vec<(String, Bytes)> = Vec::new();
         let mut cluster_object_sizes: HashMap<String, u64> = HashMap::new();
 
-        let (sketch_ref, sketch_data, _resident_sketch) = build_resident_sketch(
-            namespace,
-            new_segment_id,
-            dim,
-            &cluster_vecs,
-            &cluster_attrs,
-        )?;
+        let mut sketch_unavailable_reason = None;
+        let stitched_sketch = if let Some(old_sketch_ref) = old_sketch_ref {
+            match get_compaction_read(
+                &self.store,
+                namespace,
+                &old_sketch_ref.key,
+                COMPACTION_READ_CLASS_SKETCH,
+            )
+            .await
+            {
+                Ok(old_sketch_data) => match ResidentSketch::from_bytes(&old_sketch_data) {
+                    Ok(old_sketch) => match stitch_resident_sketch(
+                        namespace,
+                        new_segment_id,
+                        dim,
+                        &old_sketch,
+                        &touched,
+                        &cluster_vecs,
+                        &cluster_attrs,
+                    )? {
+                        ResidentSketchStitch::Stitched(sketch_ref, sketch_data, resident) => {
+                            Some((sketch_ref, sketch_data, *resident))
+                        }
+                        ResidentSketchStitch::Unavailable(reason) => {
+                            sketch_unavailable_reason = Some(reason);
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            key = %old_sketch_ref.key,
+                            "old resident sketch could not be decoded for stitching"
+                        );
+                        sketch_unavailable_reason = Some("old_sketch_decode_failed");
+                        None
+                    }
+                },
+                Err(ZeppelinError::NotFound { key }) => {
+                    warn!(
+                        key = %key,
+                        "old resident sketch missing for incremental stitching"
+                    );
+                    sketch_unavailable_reason = Some("old_sketch_missing");
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            sketch_unavailable_reason = Some("old_sketch_ref_missing");
+            None
+        };
+        let (sketch_ref, sketch_data, _resident_sketch) =
+            if let Some(stitched_sketch) = stitched_sketch {
+                stitched_sketch
+            } else {
+                crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
+                    .with_label_values(&[namespace, "sketch_stitch_unavailable"])
+                    .inc();
+                warn!(
+                    reason = sketch_unavailable_reason.unwrap_or("unknown"),
+                    "incremental resident sketch stitch unavailable, rebuilding sketch"
+                );
+                build_resident_sketch(
+                    namespace,
+                    new_segment_id,
+                    dim,
+                    &cluster_vecs,
+                    &cluster_attrs,
+                )?
+            };
         let (bootstrap_ref, bootstrap_data) =
             build_bootstrap_artifact(namespace, new_segment_id, &new_centroids_data, &sketch_data)?;
         let (membership_ref, membership_data) =
