@@ -313,21 +313,27 @@ fn cluster_fetch_objects(
     clusters: &[usize],
 ) -> Result<Vec<ClusterFetchObject>> {
     let mut objects = Vec::new();
-    let mut object_positions = HashMap::new();
+    let mut seen_keys = HashSet::new();
     for &cluster_idx in clusters {
-        let mut object = cluster_fetch_object(index, cluster_idx)?;
-        if let Some(&position) = object_positions.get(&object.key) {
-            let existing: &mut ClusterFetchObject = &mut objects[position];
-            if !existing.clusters.contains(&cluster_idx) {
-                existing.clusters.push(cluster_idx);
-            }
-        } else {
-            object.clusters = vec![cluster_idx];
-            object_positions.insert(object.key.clone(), objects.len());
+        let object = cluster_fetch_object(index, cluster_idx)?;
+        if seen_keys.insert(object.key.clone()) {
             objects.push(object);
         }
     }
     Ok(objects)
+}
+
+fn expand_clusters_to_objects(index: &IvfFlatIndex, clusters: &[usize]) -> Result<Vec<usize>> {
+    let mut expanded = Vec::new();
+    let mut seen_clusters = HashSet::new();
+    for object in cluster_fetch_objects(index, clusters)? {
+        for cluster_idx in object.clusters {
+            if seen_clusters.insert(cluster_idx) {
+                expanded.push(cluster_idx);
+            }
+        }
+    }
+    Ok(expanded)
 }
 
 fn emit_scan_stats(effective_nprobe: usize, objects: usize, clusters: usize, grouped: bool) {
@@ -548,7 +554,7 @@ fn select_scan_clusters(
     retrieval_top_k: usize,
 ) -> Result<Vec<usize>> {
     let Some(sketch) = &index.resident_sketch else {
-        return Ok(probe_clusters.to_vec());
+        return expand_clusters_to_objects(index, probe_clusters);
     };
 
     // Attribute filters require exact per-row attrs during coarse pruning.
@@ -556,19 +562,20 @@ fn select_scan_clusters(
     // filtered queries keep the legacy cluster set and preserve existing
     // semantics. Unfiltered benchmark/query traffic uses the sketch path.
     if filter.is_some() {
-        return Ok(probe_clusters.to_vec());
+        return expand_clusters_to_objects(index, probe_clusters);
     }
 
     let cluster_budget = adaptive_sketch_budget(effective_nprobe);
     if cluster_budget.max_clusters() >= probe_clusters.len() {
+        let clusters = expand_clusters_to_objects(index, probe_clusters)?;
         let objects = cluster_fetch_objects(index, probe_clusters)?.len();
         emit_scan_stats(
             effective_nprobe,
             objects,
-            probe_clusters.len(),
+            clusters.len(),
             !index.cluster_objects.is_empty(),
         );
-        return Ok(probe_clusters.to_vec());
+        return Ok(clusters);
     }
 
     if !index.cluster_objects.is_empty() {
@@ -2212,6 +2219,46 @@ mod tests {
         assert_eq!(adaptive_sketch_budget(128).max_clusters(), 128);
         assert_eq!(grouped_object_cap_for_arity(4, 16), 6);
         assert_eq!(grouped_object_cap_for_arity(4, 128), 128);
+    }
+
+    #[test]
+    fn select_scan_clusters_expands_touched_grouped_object_without_sketch() {
+        let mut index = make_index();
+        index.centroids = std::sync::Arc::new(vec![
+            vec![0.0, 0.0],
+            vec![1.0, 1.0],
+            vec![10.0, 10.0],
+            vec![11.0, 11.0],
+        ]);
+        index.num_vectors = 4;
+        index.cluster_objects = vec![
+            crate::wal::manifest::ClusterDataObjectRef {
+                key: "test_ns/segments/seg_001/cluster_group_0.bin".to_string(),
+                clusters: vec![0, 1],
+                live_offset: 0,
+                live_len: 0,
+            },
+            crate::wal::manifest::ClusterDataObjectRef {
+                key: "test_ns/segments/seg_001/cluster_group_1.bin".to_string(),
+                clusters: vec![2, 3],
+                live_offset: 0,
+                live_len: 0,
+            },
+        ];
+        index.cluster_object_by_cluster = vec![0, 0, 1, 1];
+
+        let scan_clusters = select_scan_clusters(
+            &index,
+            &[0.0, 0.0],
+            DistanceMetric::Euclidean,
+            None,
+            &[0],
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(scan_clusters, vec![0, 1]);
     }
 
     fn rerank_request(range: Range<usize>) -> RerankRangeRequest {
