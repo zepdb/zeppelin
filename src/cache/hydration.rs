@@ -11,8 +11,11 @@ use tracing::{error, warn};
 
 use crate::config::{CacheConfig, HydrationPolicyKind};
 use crate::error::{Result, ZeppelinError};
+use crate::fts::global_index::global_fts_key;
+use crate::index::bitmap::bitmap_key;
+use crate::index::ivf_flat::build::attrs_key;
 use crate::storage::ZeppelinStore;
-use crate::wal::manifest::{ClusterDataObjectRef, SegmentRef};
+use crate::wal::manifest::SegmentRef;
 
 use super::DiskCache;
 
@@ -113,6 +116,33 @@ struct HydrationJob {
     namespace: String,
     segment: SegmentRef,
     trigger: HydrationTrigger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HydrationObjectKind {
+    Cluster,
+    Attrs,
+    Bitmap,
+    Fts,
+}
+
+impl HydrationObjectKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cluster => "cluster",
+            Self::Attrs => "attrs",
+            Self::Bitmap => "bitmap",
+            Self::Fts => "fts",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HydrationItem {
+    key: String,
+    kind: HydrationObjectKind,
+    size_bytes: u64,
+    expected_size: Option<u64>,
 }
 
 /// Background worker that hydrates active segment objects into [`DiskCache`].
@@ -247,7 +277,8 @@ async fn hydrate_segment_once(
         return Ok(());
     }
 
-    let required_bytes = segment_cluster_object_bytes(&job.segment)?;
+    let items = plan_hydration_items(store, job).await?;
+    let required_bytes = hydration_items_bytes(&items, &job.segment)?;
     let capacity_limit = hydration_capacity_limit(cache.max_size_bytes(), config)?;
     if required_bytes > capacity_limit {
         crate::metrics::HYDRATION_SKIPPED_TOTAL
@@ -265,9 +296,8 @@ async fn hydrate_segment_once(
         return Ok(());
     }
 
-    let objects = job.segment.cluster_objects.clone();
-    let mut stream = futures::stream::iter(objects)
-        .map(|object| hydrate_cluster_object(store.clone(), Arc::clone(cache), object))
+    let mut stream = futures::stream::iter(items)
+        .map(|item| hydrate_item(store.clone(), Arc::clone(cache), item))
         .buffer_unordered(config.parallelism);
     while let Some(result) = stream.next().await {
         result?;
@@ -282,18 +312,68 @@ fn is_incremental_segment(segment: &SegmentRef) -> bool {
         .any(|owner| owner != &segment.id)
 }
 
-fn segment_cluster_object_bytes(segment: &SegmentRef) -> Result<u64> {
-    segment
+async fn plan_hydration_items(
+    store: &ZeppelinStore,
+    job: &HydrationJob,
+) -> Result<Vec<HydrationItem>> {
+    let mut items: Vec<HydrationItem> = job
+        .segment
         .cluster_objects
         .iter()
-        .try_fold(0u64, |acc, object| {
-            acc.checked_add(object.size_bytes).ok_or_else(|| {
-                ZeppelinError::Cache(format!(
-                    "hydration byte budget overflows for segment {}",
-                    segment.id
-                ))
-            })
+        .map(|object| HydrationItem {
+            key: object.key.clone(),
+            kind: HydrationObjectKind::Cluster,
+            size_bytes: object.size_bytes,
+            expected_size: (object.size_bytes != 0).then_some(object.size_bytes),
         })
+        .collect();
+
+    for (key, kind) in sidecar_keys(&job.namespace, &job.segment) {
+        let meta = store.head(&key).await?;
+        items.push(HydrationItem {
+            key,
+            kind,
+            size_bytes: meta.size as u64,
+            expected_size: None,
+        });
+    }
+
+    Ok(items)
+}
+
+fn sidecar_keys(namespace: &str, segment: &SegmentRef) -> Vec<(String, HydrationObjectKind)> {
+    let mut keys = Vec::with_capacity(segment.cluster_count * 2 + 1);
+    for cluster_idx in 0..segment.cluster_count {
+        let owner = segment.cluster_owner(cluster_idx);
+        keys.push((
+            attrs_key(namespace, owner, cluster_idx),
+            HydrationObjectKind::Attrs,
+        ));
+        if !segment.bitmap_fields.is_empty() {
+            keys.push((
+                bitmap_key(namespace, owner, cluster_idx),
+                HydrationObjectKind::Bitmap,
+            ));
+        }
+    }
+    if segment.has_global_fts {
+        keys.push((
+            global_fts_key(namespace, &segment.id),
+            HydrationObjectKind::Fts,
+        ));
+    }
+    keys
+}
+
+fn hydration_items_bytes(items: &[HydrationItem], segment: &SegmentRef) -> Result<u64> {
+    items.iter().try_fold(0u64, |acc, item| {
+        acc.checked_add(item.size_bytes).ok_or_else(|| {
+            ZeppelinError::Cache(format!(
+                "hydration byte budget overflows for segment {}",
+                segment.id
+            ))
+        })
+    })
 }
 
 fn hydration_capacity_limit(cache_max_size_bytes: u64, config: &HydrationConfig) -> Result<u64> {
@@ -306,12 +386,12 @@ fn hydration_capacity_limit(cache_max_size_bytes: u64, config: &HydrationConfig)
     Ok(limit.floor() as u64)
 }
 
-async fn hydrate_cluster_object(
+async fn hydrate_item(
     store: ZeppelinStore,
     cache: Arc<DiskCache>,
-    object: ClusterDataObjectRef,
+    item: HydrationItem,
 ) -> Result<()> {
-    let key = object.key.clone();
+    let key = item.key.clone();
     let fetch_key = key.clone();
     let bytes = cache
         .get_or_fetch(&key, move || {
@@ -320,18 +400,19 @@ async fn hydrate_cluster_object(
         })
         .await?;
     let actual = bytes.len() as u64;
-    if object.size_bytes != 0 && actual != object.size_bytes {
-        cache.invalidate(&key).await?;
-        return Err(ZeppelinError::Cache(format!(
-            "hydrated object length mismatch for {key}: expected={}, actual={actual}",
-            object.size_bytes
-        )));
+    if let Some(expected) = item.expected_size {
+        if actual != expected {
+            cache.invalidate(&key).await?;
+            return Err(ZeppelinError::Cache(format!(
+                "hydrated object length mismatch for {key}: expected={expected}, actual={actual}",
+            )));
+        }
     }
     crate::metrics::HYDRATION_OBJECTS_TOTAL
-        .with_label_values(&["cluster"])
+        .with_label_values(&[item.kind.as_str()])
         .inc();
     crate::metrics::HYDRATION_BYTES_TOTAL
-        .with_label_values(&["cluster"])
+        .with_label_values(&[item.kind.as_str()])
         .inc_by(actual);
     Ok(())
 }

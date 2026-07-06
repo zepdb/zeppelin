@@ -645,6 +645,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
                     fts_configs,
                     filter,
                     last_as_prefix,
+                    cache,
                     max_full_scan_clusters,
                     segment_top_k,
                     include_attributes,
@@ -689,6 +690,18 @@ pub(crate) async fn execute_bm25_query_with_manifest(
     })
 }
 
+async fn fetch_query_object(
+    cache: Option<&Arc<DiskCache>>,
+    store: &ZeppelinStore,
+    key: &str,
+) -> Result<bytes::Bytes> {
+    if let Some(cache) = cache {
+        cache.get_or_fetch(key, || store.get(key)).await
+    } else {
+        store.get(key).await
+    }
+}
+
 /// Search a segment's inverted indexes for a BM25 query.
 ///
 /// Uses the global FTS index when available (1 S3 GET instead of N),
@@ -705,6 +718,7 @@ async fn segment_bm25_search(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     top_k: usize,
     include_attributes: bool,
@@ -718,6 +732,7 @@ async fn segment_bm25_search(
             fts_configs,
             filter,
             last_as_prefix,
+            cache,
             top_k,
             include_attributes,
         )
@@ -746,6 +761,7 @@ async fn segment_bm25_search(
         fts_configs,
         filter,
         last_as_prefix,
+        cache,
         top_k,
         include_attributes,
     )
@@ -762,6 +778,7 @@ async fn segment_bm25_search_global(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    cache: Option<&Arc<DiskCache>>,
     top_k: usize,
     include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
@@ -773,7 +790,7 @@ async fn segment_bm25_search_global(
 
     // Load global FTS index (1 S3 GET, ~50KB)
     let gkey = global_fts_key(namespace, segment_id);
-    let global_data = store.get(&gkey).await?;
+    let global_data = fetch_query_object(cache, store, &gkey).await?;
     let global_index = GlobalInvertedIndex::from_bytes(&global_data)?;
 
     let field_queries = rank_by.extract_field_queries();
@@ -821,6 +838,7 @@ async fn segment_bm25_search_global(
         segment_ref,
         &needed_clusters,
         load_attrs,
+        cache,
     )
     .await?;
 
@@ -896,6 +914,7 @@ async fn fetch_bm25_cluster_attrs_and_ids(
     segment_ref: &SegmentRef,
     needed_clusters: &HashSet<u16>,
     load_attrs: bool,
+    cache: Option<&Arc<DiskCache>>,
 ) -> Result<
     HashMap<
         u16,
@@ -918,11 +937,17 @@ async fn fetch_bm25_cluster_attrs_and_ids(
                 let ckey = cluster_key(namespace, owner, cluster_idx as usize);
                 async move {
                     if load_attrs {
-                        let (attrs_res, cluster_res) =
-                            tokio::join!(store.get(&akey), store.get(&ckey));
+                        let (attrs_res, cluster_res) = tokio::join!(
+                            fetch_query_object(cache, store, &akey),
+                            fetch_query_object(cache, store, &ckey)
+                        );
                         (cluster_idx, Some(attrs_res), cluster_res)
                     } else {
-                        (cluster_idx, None, store.get(&ckey).await)
+                        (
+                            cluster_idx,
+                            None,
+                            fetch_query_object(cache, store, &ckey).await,
+                        )
                     }
                 }
             }))
@@ -949,7 +974,7 @@ async fn fetch_bm25_cluster_attrs_and_ids(
         let attrs_results = futures::future::join_all(needed_clusters.iter().map(|&cluster_idx| {
             let owner = segment_ref.cluster_owner(cluster_idx as usize);
             let akey = attrs_key(namespace, owner, cluster_idx as usize);
-            async move { (cluster_idx, store.get(&akey).await) }
+            async move { (cluster_idx, fetch_query_object(cache, store, &akey).await) }
         }))
         .await;
         for (cluster_idx, attrs_res) in attrs_results {
@@ -975,10 +1000,11 @@ async fn fetch_bm25_cluster_attrs_and_ids(
         (!clusters.is_empty()).then_some((object_ref.key.as_str(), clusters))
     });
 
-    let object_results = futures::future::join_all(
-        object_fetches.map(|(key, clusters)| async move { (clusters, store.get(key).await) }),
-    )
-    .await;
+    let object_results =
+        futures::future::join_all(object_fetches.map(|(key, clusters)| async move {
+            (clusters, fetch_query_object(cache, store, key).await)
+        }))
+        .await;
 
     let mut cluster_data = HashMap::new();
     for (clusters, object_res) in object_results {
@@ -1037,6 +1063,7 @@ async fn segment_bm25_search_full_scan(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    cache: Option<&Arc<DiskCache>>,
     top_k: usize,
     include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
@@ -1077,11 +1104,17 @@ async fn segment_bm25_search_full_scan(
         let ckey = crate::index::ivf_flat::build::cluster_key(namespace, owner, cluster_idx);
         async move {
             if load_attrs {
-                let (fts_res, attrs_res, cluster_res) =
-                    tokio::join!(store.get(&fts_key), store.get(&akey), store.get(&ckey),);
+                let (fts_res, attrs_res, cluster_res) = tokio::join!(
+                    fetch_query_object(cache, store, &fts_key),
+                    fetch_query_object(cache, store, &akey),
+                    fetch_query_object(cache, store, &ckey),
+                );
                 (cluster_idx, fts_res, Some(attrs_res), cluster_res)
             } else {
-                let (fts_res, cluster_res) = tokio::join!(store.get(&fts_key), store.get(&ckey),);
+                let (fts_res, cluster_res) = tokio::join!(
+                    fetch_query_object(cache, store, &fts_key),
+                    fetch_query_object(cache, store, &ckey),
+                );
                 (cluster_idx, fts_res, None, cluster_res)
             }
         }
@@ -1503,6 +1536,7 @@ mod tests {
             &fts_configs,
             None,
             false,
+            None,
             500,
             10,
             true,
@@ -1541,6 +1575,7 @@ mod tests {
             &fts_configs,
             None,
             false,
+            None,
             500,
             10,
             true,
@@ -1576,6 +1611,7 @@ mod tests {
             &fts_configs,
             None,
             false,
+            None,
             0,
             10,
             true,

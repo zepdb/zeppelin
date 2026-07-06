@@ -119,7 +119,7 @@ pub(crate) fn cluster_group_key(namespace: &str, segment_id: &str, group_idx: us
 }
 
 /// S3 key for the attribute data of cluster `i`.
-pub(crate) fn attrs_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> String {
+pub fn attrs_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> String {
     format!("{namespace}/segments/{segment_id}/attrs_{cluster_idx}.bin")
 }
 

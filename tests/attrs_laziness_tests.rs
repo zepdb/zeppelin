@@ -704,7 +704,7 @@ async fn api_filtered_ann_false_keeps_filtering_but_strips_attributes() {
 }
 
 #[tokio::test]
-async fn api_bm25_unfiltered_false_skips_attrs_gets_but_keeps_cluster_id_reads() {
+async fn api_bm25_unfiltered_false_skips_attrs_gets_and_reuses_cluster_id_reads() {
     let server = start_counting_api_server(api_fts_config()).await;
     let client = reqwest::Client::new();
     let ns = create_ns_api_fts(
@@ -764,8 +764,8 @@ async fn api_bm25_unfiltered_false_skips_attrs_gets_but_keeps_cluster_id_reads()
     );
     assert_eq!(
         server.counter.gets_for(ArtifactClass::Cluster),
-        default_cluster_gets,
-        "BM25 still needs the same cluster GETs to resolve ids"
+        0,
+        "BM25 should reuse cached cluster objects for id resolution after the default query warmed them; default_cluster_gets={default_cluster_gets}"
     );
 
     cleanup_ns(&server.harness.store, &ns).await;

@@ -1,12 +1,13 @@
 mod common;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use common::counting::{counting_store, ArtifactClass};
 use common::harness::TestHarness;
 use common::server::start_test_server_with_compactor;
-use common::vectors::random_vectors;
+use common::vectors::{random_vectors, simple_attributes, with_attributes};
 use serde_json::json;
 use tempfile::TempDir;
 use zeppelin::cache::hydration::{HydrationConfig, SegmentHydrator, SessionWindowPolicy};
@@ -15,8 +16,12 @@ use zeppelin::compaction::Compactor;
 use zeppelin::config::{
     CacheConfig, CompactionConfig, Config, IndexingConfig, DEFAULT_RERANK_COALESCE_GAP_BYTES,
 };
-use zeppelin::query::{execute_query, QueryParams};
-use zeppelin::types::{ConsistencyLevel, DistanceMetric};
+use zeppelin::fts::global_index::global_fts_key;
+use zeppelin::fts::rank_by::RankBy;
+use zeppelin::fts::FtsFieldConfig;
+use zeppelin::index::bitmap::bitmap_key;
+use zeppelin::query::{execute_bm25_query, execute_query, QueryParams};
+use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
 use zeppelin::wal::manifest::{Manifest, SegmentRef};
 use zeppelin::wal::{WalReader, WalWriter};
 
@@ -29,7 +34,18 @@ struct HydrationFixture {
     segment: SegmentRef,
 }
 
-fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
+fn base_indexing_config() -> IndexingConfig {
+    IndexingConfig {
+        default_num_centroids: 8,
+        kmeans_max_iterations: 10,
+        ..Default::default()
+    }
+}
+
+fn test_compactor_with(
+    store: &zeppelin::storage::ZeppelinStore,
+    indexing: IndexingConfig,
+) -> Compactor {
     Compactor::new(
         store.clone(),
         WalReader::new(store.clone()),
@@ -37,11 +53,7 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
             max_wal_fragments_before_compact: 1,
             ..Default::default()
         },
-        IndexingConfig {
-            default_num_centroids: 8,
-            kmeans_max_iterations: 10,
-            ..Default::default()
-        },
+        indexing,
     )
 }
 
@@ -58,18 +70,40 @@ fn active_segment_ref(manifest: &Manifest) -> &SegmentRef {
 }
 
 async fn hydration_fixture(name: &str) -> HydrationFixture {
+    hydration_fixture_with(
+        name,
+        random_vectors(256, 32),
+        base_indexing_config(),
+        &HashMap::new(),
+    )
+    .await
+}
+
+async fn hydration_fixture_with(
+    name: &str,
+    vectors: Vec<VectorEntry>,
+    indexing: IndexingConfig,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+) -> HydrationFixture {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
     let namespace = harness.key(name);
     Manifest::new().write(&store, &namespace).await.unwrap();
 
-    let vectors = random_vectors(256, 32);
     let query = vectors[0].values.clone();
     WalWriter::new(store.clone())
         .append(&namespace, vectors, vec![])
         .await
         .unwrap();
-    test_compactor(&store).compact(&namespace).await.unwrap();
+    let compactor = test_compactor_with(&store, indexing);
+    if fts_configs.is_empty() {
+        compactor.compact(&namespace).await.unwrap();
+    } else {
+        compactor
+            .compact_with_fts(&namespace, None, fts_configs)
+            .await
+            .unwrap();
+    }
 
     let manifest = Manifest::read(&store, &namespace).await.unwrap().unwrap();
     let segment = active_segment_ref(&manifest).clone();
@@ -86,6 +120,109 @@ async fn hydration_fixture(name: &str) -> HydrationFixture {
         query,
         segment,
     }
+}
+
+fn test_attrs_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> String {
+    format!("{namespace}/segments/{segment_id}/attrs_{cluster_idx}.bin")
+}
+
+fn attrs_keys(namespace: &str, segment: &SegmentRef) -> Vec<String> {
+    (0..segment.cluster_count)
+        .map(|cluster_idx| {
+            test_attrs_key(namespace, segment.cluster_owner(cluster_idx), cluster_idx)
+        })
+        .collect()
+}
+
+fn bitmap_keys(namespace: &str, segment: &SegmentRef) -> Vec<String> {
+    if segment.bitmap_fields.is_empty() {
+        return Vec::new();
+    }
+    (0..segment.cluster_count)
+        .map(|cluster_idx| bitmap_key(namespace, segment.cluster_owner(cluster_idx), cluster_idx))
+        .collect()
+}
+
+async fn wait_for_cached_keys(cache: &DiskCache, keys: &[String]) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if futures::future::join_all(keys.iter().map(|key| cache.get(key)))
+                .await
+                .into_iter()
+                .all(|entry| entry.is_some())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("sidecar keys should hydrate");
+}
+
+fn attributed_vectors() -> Vec<VectorEntry> {
+    with_attributes(random_vectors(256, 32), simple_attributes)
+}
+
+fn category_filter() -> Filter {
+    Filter::Eq {
+        field: "category".to_string(),
+        value: AttributeValue::String("a".to_string()),
+    }
+}
+
+fn fts_configs() -> HashMap<String, FtsFieldConfig> {
+    let mut configs = HashMap::new();
+    configs.insert(
+        "content".to_string(),
+        FtsFieldConfig {
+            stemming: true,
+            remove_stopwords: true,
+            ..Default::default()
+        },
+    );
+    configs
+}
+
+fn content_doc(id: &str, text: &str) -> VectorEntry {
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "content".to_string(),
+        AttributeValue::String(text.to_string()),
+    );
+    VectorEntry {
+        id: id.to_string(),
+        values: vec![0.1, 0.2, 0.3, 0.4],
+        attributes: Some(attrs),
+    }
+}
+
+fn fts_vectors() -> Vec<VectorEntry> {
+    vec![
+        content_doc("doc1", "Rust programming language is fast and memory safe"),
+        content_doc(
+            "doc2",
+            "Python programming language is interpreted and dynamic",
+        ),
+        content_doc("doc3", "Java programming language runs on the JVM"),
+        content_doc(
+            "doc4",
+            "Cooking delicious Italian pasta requires fresh ingredients",
+        ),
+        content_doc(
+            "doc5",
+            "Rust compiler ensures memory safety without garbage collection",
+        ),
+        content_doc(
+            "doc6",
+            "Go programming language is designed for concurrency",
+        ),
+        content_doc("doc7", "JavaScript runs in web browsers and Node"),
+        content_doc(
+            "doc8",
+            "Rust ownership model prevents data races at compile time",
+        ),
+    ]
 }
 
 fn test_cache(max_size_bytes: u64) -> (TempDir, Arc<DiskCache>) {
@@ -185,6 +322,20 @@ fn query_params<'a>(
     }
 }
 
+fn start_test_hydrator(
+    fixture: &HydrationFixture,
+    cache: Arc<DiskCache>,
+    max_segment_fraction: f64,
+) -> Arc<SegmentHydrator> {
+    let policy = Arc::new(SessionWindowPolicy::new(1, Duration::from_secs(60)).unwrap());
+    SegmentHydrator::start(
+        fixture.store.clone(),
+        cache,
+        policy,
+        test_hydration_config(max_segment_fraction),
+    )
+}
+
 #[tokio::test]
 async fn test_hot_namespace_hydrates_active_segment() {
     zeppelin::metrics::init();
@@ -213,6 +364,248 @@ async fn test_hot_namespace_hydrates_active_segment() {
         fixture.counter.gets_for(ArtifactClass::Cluster),
         0,
         "hydrated full cluster objects should eliminate cluster S3 GETs"
+    );
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_hydration_includes_attrs_sidecars() {
+    zeppelin::metrics::init();
+    let fixture = hydration_fixture_with(
+        "hydrate-attrs",
+        attributed_vectors(),
+        base_indexing_config(),
+        &HashMap::new(),
+    )
+    .await;
+    let (_cache_dir, cache) = test_cache(512 * 1024 * 1024);
+    let hydrator = start_test_hydrator(&fixture, cache.clone(), 0.5);
+    let attrs_keys = attrs_keys(&fixture.namespace, &fixture.segment);
+
+    hydrator.observe_query(&fixture.namespace, &fixture.segment);
+    wait_for_cached_segment(&cache, &fixture.segment).await;
+    let attrs_cached_before_query =
+        futures::future::join_all(attrs_keys.iter().map(|key| cache.get(key)))
+            .await
+            .into_iter()
+            .all(|entry| entry.is_some());
+
+    fixture.counter.reset();
+    let filter = category_filter();
+    let wal_reader = WalReader::new(fixture.store.clone());
+    let mut params = query_params(&fixture, &wal_reader, Some(&cache));
+    params.filter = Some(&filter);
+    let response = execute_query(params).await.unwrap();
+    assert!(!response.results.is_empty());
+    assert_eq!(
+        fixture.counter.gets_for(ArtifactClass::Attrs),
+        0,
+        "hydrated attrs sidecars should eliminate attrs S3 GETs"
+    );
+    assert!(
+        attrs_cached_before_query,
+        "hydrator must cache attrs sidecars before query traffic naturally does"
+    );
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_hydration_includes_bitmap_sidecars() {
+    zeppelin::metrics::init();
+    let mut indexing = base_indexing_config();
+    indexing.bitmap_index = true;
+    let fixture = hydration_fixture_with(
+        "hydrate-bitmap",
+        attributed_vectors(),
+        indexing,
+        &HashMap::new(),
+    )
+    .await;
+    assert!(
+        !fixture.segment.bitmap_fields.is_empty(),
+        "fixture must build bitmap sidecars"
+    );
+    let (_cache_dir, cache) = test_cache(512 * 1024 * 1024);
+    let hydrator = start_test_hydrator(&fixture, cache.clone(), 0.5);
+    let mut sidecar_keys = attrs_keys(&fixture.namespace, &fixture.segment);
+    let bitmap_keys = bitmap_keys(&fixture.namespace, &fixture.segment);
+    assert!(!bitmap_keys.is_empty(), "bitmap keys must be planned");
+    sidecar_keys.extend(bitmap_keys);
+
+    hydrator.observe_query(&fixture.namespace, &fixture.segment);
+    wait_for_cached_segment(&cache, &fixture.segment).await;
+    let sidecars_cached_before_query =
+        futures::future::join_all(sidecar_keys.iter().map(|key| cache.get(key)))
+            .await
+            .into_iter()
+            .all(|entry| entry.is_some());
+
+    fixture.counter.reset();
+    let filter = category_filter();
+    let wal_reader = WalReader::new(fixture.store.clone());
+    let mut params = query_params(&fixture, &wal_reader, Some(&cache));
+    params.filter = Some(&filter);
+    let response = execute_query(params).await.unwrap();
+    assert!(!response.results.is_empty());
+    assert_eq!(
+        fixture.counter.gets_for(ArtifactClass::Bitmap),
+        0,
+        "hydrated bitmap sidecars should eliminate bitmap S3 GETs"
+    );
+    assert_eq!(
+        fixture.counter.gets_for(ArtifactClass::Attrs),
+        0,
+        "bitmap-filtered warm queries should not re-fetch attrs from S3"
+    );
+    assert!(
+        sidecars_cached_before_query,
+        "hydrator must cache bitmap and attrs sidecars before query traffic naturally does"
+    );
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_hydration_includes_global_fts_index() {
+    zeppelin::metrics::init();
+    let mut indexing = base_indexing_config();
+    indexing.default_num_centroids = 4;
+    indexing.fts_index = true;
+    let fts_configs = fts_configs();
+    let fixture =
+        hydration_fixture_with("hydrate-fts", fts_vectors(), indexing, &fts_configs).await;
+    assert!(
+        fixture.segment.has_global_fts,
+        "fixture must build a global FTS sidecar"
+    );
+    let (_cache_dir, cache) = test_cache(512 * 1024 * 1024);
+    let hydrator = start_test_hydrator(&fixture, cache.clone(), 0.5);
+    let global_key = global_fts_key(&fixture.namespace, &fixture.segment.id);
+
+    hydrator.observe_query(&fixture.namespace, &fixture.segment);
+    wait_for_cached_segment(&cache, &fixture.segment).await;
+    let global_cached_before_query = cache.get(&global_key).await.is_some();
+
+    fixture.counter.reset();
+    let wal_reader = WalReader::new(fixture.store.clone());
+    let rank_by = RankBy::Bm25 {
+        field: "content".to_string(),
+        query: "rust programming".to_string(),
+    };
+    let response = execute_bm25_query(
+        &fixture.store,
+        &wal_reader,
+        &fixture.namespace,
+        &rank_by,
+        &fts_configs,
+        10,
+        None,
+        ConsistencyLevel::Eventual,
+        false,
+        None,
+        None,
+        Some(&cache),
+        0,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(!response.results.is_empty());
+    assert_eq!(
+        fixture.counter.gets_for(ArtifactClass::Fts),
+        0,
+        "hydrated global FTS sidecar should eliminate FTS S3 GETs"
+    );
+    assert!(
+        global_cached_before_query,
+        "hydrator must cache the global FTS sidecar before query traffic naturally does"
+    );
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_capacity_counts_sidecars() {
+    zeppelin::metrics::init();
+    let fixture = hydration_fixture_with(
+        "hydrate-capacity-sidecars",
+        attributed_vectors(),
+        base_indexing_config(),
+        &HashMap::new(),
+    )
+    .await;
+    let cluster_bytes: u64 = fixture
+        .segment
+        .cluster_objects
+        .iter()
+        .map(|object| object.size_bytes)
+        .sum();
+    let mut attrs_bytes = 0u64;
+    for key in attrs_keys(&fixture.namespace, &fixture.segment) {
+        attrs_bytes += fixture.store.get(&key).await.unwrap().len() as u64;
+    }
+    assert!(
+        attrs_bytes > 1,
+        "fixture must have attrs sidecar bytes for the capacity boundary"
+    );
+    let (_cache_dir, cache) = test_cache(cluster_bytes + attrs_bytes - 1);
+    let hydrator = start_test_hydrator(&fixture, cache.clone(), 1.0);
+
+    let before = metric_value(
+        "zeppelin_hydration_skipped_total",
+        &[("reason", "capacity")],
+    );
+    fixture.counter.reset();
+    hydrator.observe_query(&fixture.namespace, &fixture.segment);
+    wait_for_metric_increase(
+        "zeppelin_hydration_skipped_total",
+        &[("reason", "capacity")],
+        before,
+    )
+    .await;
+
+    assert_eq!(
+        fixture.counter.gets_for(ArtifactClass::Cluster),
+        0,
+        "sidecar-aware capacity refusal must not fetch cluster objects"
+    );
+    for object in &fixture.segment.cluster_objects {
+        assert_eq!(cache.get(&object.key).await, None);
+    }
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_no_sidecar_keys_hydrated_when_not_configured() {
+    zeppelin::metrics::init();
+    let fixture = hydration_fixture("hydrate-no-extra-sidecars").await;
+    assert!(fixture.segment.bitmap_fields.is_empty());
+    assert!(!fixture.segment.has_global_fts);
+    let (_cache_dir, cache) = test_cache(512 * 1024 * 1024);
+    let hydrator = start_test_hydrator(&fixture, cache.clone(), 0.5);
+    let mut expected_keys = fixture
+        .segment
+        .cluster_objects
+        .iter()
+        .map(|object| object.key.clone())
+        .collect::<Vec<_>>();
+    expected_keys.extend(attrs_keys(&fixture.namespace, &fixture.segment));
+
+    hydrator.observe_query(&fixture.namespace, &fixture.segment);
+    wait_for_cached_keys(&cache, &expected_keys).await;
+
+    assert_eq!(
+        bitmap_keys(&fixture.namespace, &fixture.segment),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        cache
+            .get(&global_fts_key(&fixture.namespace, &fixture.segment.id))
+            .await,
+        None
     );
 
     fixture.harness.cleanup().await;
