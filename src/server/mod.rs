@@ -52,6 +52,11 @@ pub struct AppState {
     pub store: ZeppelinStore,
     /// Manages namespace CRUD and metadata.
     pub namespace_manager: Arc<NamespaceManager>,
+    /// Optional prefix for server-generated namespace names.
+    ///
+    /// Production leaves this unset. Test servers use it to keep API-created
+    /// namespaces under the same random harness prefix as direct storage keys.
+    pub namespace_name_prefix: Option<String>,
     /// Writes WAL fragments to S3.
     pub wal_writer: Arc<WalWriter>,
     /// Reads WAL fragments from S3.

@@ -90,6 +90,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
     let app = build_router(AppState {
         store: store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
+        namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(store.clone())),
         wal_reader: Arc::new(WalReader::new(store.clone())),
         config: Arc::new(config),

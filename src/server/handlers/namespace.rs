@@ -88,7 +88,11 @@ pub async fn create_namespace(
         ))));
     }
 
-    let name = Uuid::new_v4().to_string();
+    let uuid = Uuid::new_v4().to_string();
+    let name = match &state.namespace_name_prefix {
+        Some(prefix) => format!("{prefix}-{uuid}"),
+        None => uuid,
+    };
 
     info!(namespace = %name, dimensions = req.dimensions, "creating namespace");
     let meta = state

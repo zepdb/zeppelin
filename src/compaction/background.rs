@@ -261,6 +261,7 @@ pub fn start_compaction_thread(
                 manifest_cache,
                 lease_manager,
                 cache,
+                None,
             ));
         })
         .expect("failed to spawn compaction thread")
@@ -274,9 +275,11 @@ pub async fn compaction_loop(
     manifest_cache: Arc<ManifestCache>,
     lease_manager: Arc<LeaseManager>,
     cache: Arc<DiskCache>,
+    namespace_prefix: Option<String>,
 ) {
     info!(
         interval_secs = compactor.config().interval_secs,
+        namespace_prefix = namespace_prefix.as_deref().unwrap_or("<all>"),
         "background compaction loop started"
     );
 
@@ -289,7 +292,7 @@ pub async fn compaction_loop(
             }
         }
 
-        let namespaces = match namespace_manager.list(None).await {
+        let namespaces = match namespace_manager.list(namespace_prefix.as_deref()).await {
             Ok(ns) => ns,
             Err(e) => {
                 warn!(error = %e, "failed to list namespaces for compaction");

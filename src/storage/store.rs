@@ -416,11 +416,21 @@ impl ZeppelinStore {
         let start = std::time::Instant::now();
         let path = Path::parse(prefix)?;
         let result = self.inner.list_with_delimiter(Some(&path)).await?;
-        let prefixes: Vec<String> = result
-            .common_prefixes
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let mut prefixes = std::collections::BTreeSet::new();
+        for common_prefix in &result.common_prefixes {
+            prefixes.insert(common_prefix.to_string());
+        }
+        for object in &result.objects {
+            let key = object.location.to_string();
+            let Some(remainder) = key.strip_prefix(prefix) else {
+                continue;
+            };
+            let Some(delimiter_idx) = remainder.find('/') else {
+                continue;
+            };
+            prefixes.insert(format!("{}{}", prefix, &remainder[..=delimiter_idx]));
+        }
+        let prefixes: Vec<String> = prefixes.into_iter().collect();
         let elapsed = start.elapsed();
         debug!(
             elapsed_ms = elapsed.as_millis(),

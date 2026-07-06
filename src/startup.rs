@@ -183,6 +183,7 @@ pub async fn build_app(
     let state = AppState {
         store,
         namespace_manager,
+        namespace_name_prefix: None,
         wal_writer,
         wal_reader,
         config: Arc::new(config),

@@ -1225,7 +1225,11 @@ async fn test_compaction_warms_new_segment_centroids() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();
     let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
-    for meta in namespace_manager.list(None).await.unwrap() {
+    for meta in namespace_manager
+        .list(Some(harness.prefix.as_str()))
+        .await
+        .unwrap()
+    {
         if meta.name.ends_with("-warm") {
             namespace_manager.delete(&meta.name).await.unwrap();
         }
@@ -1282,6 +1286,7 @@ async fn test_compaction_warms_new_segment_centroids() {
         let namespace_manager = namespace_manager.clone();
         let manifest_cache = manifest_cache.clone();
         let cache = cache.clone();
+        let namespace_prefix = Some(harness.prefix.clone());
         tokio::spawn(async move {
             zeppelin::compaction::background::compaction_loop(
                 compactor,
@@ -1290,6 +1295,7 @@ async fn test_compaction_warms_new_segment_centroids() {
                 manifest_cache,
                 lease_manager,
                 cache,
+                namespace_prefix,
             )
             .await;
         });
@@ -1328,25 +1334,34 @@ async fn test_compaction_warms_new_segment_centroids() {
 }
 
 #[tokio::test]
-async fn test_background_compaction_does_not_recursively_list_bucket() {
+async fn test_background_compaction_discovery_is_delimited_and_prefix_scoped() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
     let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
     let ns = format!("{}-registered-loop", harness.prefix);
+    let outside_ns = format!("outside-{}-registered-loop", uuid::Uuid::new_v4());
 
     namespace_manager
         .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    namespace_manager
+        .create(&outside_ns, 16, DistanceMetric::Euclidean)
         .await
         .unwrap();
     WalWriter::new(store.clone())
         .append(&ns, random_vectors(25, 16), vec![])
         .await
         .unwrap();
+    WalWriter::new(store.clone())
+        .append(&outside_ns, random_vectors(25, 16), vec![])
+        .await
+        .unwrap();
 
     let compaction_config = CompactionConfig {
         interval_secs: 1,
-        max_wal_fragments_before_compact: 100,
-        max_wal_age_before_compact_secs: 1,
+        max_wal_fragments_before_compact: 1,
+        max_wal_age_before_compact_secs: u64::MAX,
         max_wal_bytes_before_compact: u64::MAX,
         ..Default::default()
     };
@@ -1375,11 +1390,13 @@ async fn test_background_compaction_does_not_recursively_list_bucket() {
 
     counter.reset();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    {
+    let scoped_handle = {
         let compactor = compactor.clone();
         let namespace_manager = namespace_manager.clone();
         let manifest_cache = manifest_cache.clone();
         let cache = cache.clone();
+        let lease_manager = lease_manager.clone();
+        let namespace_prefix = Some(harness.prefix.clone());
         tokio::spawn(async move {
             zeppelin::compaction::background::compaction_loop(
                 compactor,
@@ -1388,10 +1405,11 @@ async fn test_background_compaction_does_not_recursively_list_bucket() {
                 manifest_cache,
                 lease_manager,
                 cache,
+                namespace_prefix,
             )
             .await;
-        });
-    }
+        })
+    };
 
     let mut compacted = false;
     for _ in 0..30 {
@@ -1405,22 +1423,85 @@ async fn test_background_compaction_does_not_recursively_list_bucket() {
         }
     }
     let _ = shutdown_tx.send(true);
+    scoped_handle.await.unwrap();
 
     assert!(
         compacted,
-        "namespace should compact with delimiter-based bucket discovery"
+        "namespace under the supplied prefix should compact"
+    );
+    let outside_manifest = Manifest::read(&store, &outside_ns).await.unwrap().unwrap();
+    assert!(
+        outside_manifest.active_segment.is_none(),
+        "prefix-scoped compaction must not discover outside namespaces"
+    );
+    assert_eq!(
+        outside_manifest.uncompacted_fragments().len(),
+        1,
+        "outside namespace WAL must remain untouched by prefix-scoped compaction"
     );
     assert_eq!(
         counter.list_calls_for_prefix(""),
         0,
-        "background compaction ticks must not recursively list the whole bucket"
+        "prefix-scoped background compaction must not recursively list the whole bucket"
+    );
+    assert!(
+        counter.delimiter_list_calls_for_prefix("") > 0
+            || counter.delimiter_list_calls_for_prefix(&harness.prefix) > 0,
+        "prefix-scoped background compaction should use delimiter namespace discovery"
+    );
+
+    counter.reset();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let unscoped_handle = {
+        let compactor = compactor.clone();
+        let namespace_manager = namespace_manager.clone();
+        let manifest_cache = manifest_cache.clone();
+        let cache = cache.clone();
+        let lease_manager = lease_manager.clone();
+        tokio::spawn(async move {
+            zeppelin::compaction::background::compaction_loop(
+                compactor,
+                namespace_manager,
+                shutdown_rx,
+                manifest_cache,
+                lease_manager,
+                cache,
+                None,
+            )
+            .await;
+        })
+    };
+
+    let mut outside_compacted = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let Some(manifest) = Manifest::read(&store, &outside_ns).await.unwrap() else {
+            continue;
+        };
+        if manifest.active_segment.is_some() && manifest.uncompacted_fragments().is_empty() {
+            outside_compacted = true;
+            break;
+        }
+    }
+    let _ = shutdown_tx.send(true);
+    unscoped_handle.await.unwrap();
+
+    assert!(
+        outside_compacted,
+        "unscoped compaction must still discover namespaces outside the harness prefix"
+    );
+    assert_eq!(
+        counter.list_calls_for_prefix(""),
+        0,
+        "unscoped background compaction must still avoid recursive root listing"
     );
     assert!(
         counter.delimiter_list_calls_for_prefix("") > 0,
-        "background compaction should use delimiter namespace discovery"
+        "unscoped background compaction should delimiter-list the root"
     );
 
     let _ = store.delete_prefix(&format!("{ns}/")).await;
+    let _ = store.delete_prefix(&format!("{outside_ns}/")).await;
     harness.cleanup().await;
 }
 

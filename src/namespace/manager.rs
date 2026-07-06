@@ -184,8 +184,18 @@ impl NamespaceManager {
         // List immediate namespace prefixes that have meta.json. This must use
         // delimiter listing: a recursive bucket walk would visit every WAL,
         // segment, cluster, and nested meta.json object under every namespace.
-        let list_prefix = prefix.unwrap_or("");
-        let namespace_prefixes = self.store.list_common_prefixes(list_prefix).await?;
+        //
+        // Namespace names are top-level path components, so a test prefix such
+        // as `test-<uuid>` is a partial component, not a directory. Some object
+        // store backends support delimiter listing with that partial prefix,
+        // while the memory backend does not. List top-level namespace prefixes
+        // and apply the namespace-name prefix before reading metadata.
+        let mut namespace_prefixes = self.store.list_common_prefixes("").await?;
+        if let Some(prefix) = prefix {
+            namespace_prefixes.retain(|namespace_prefix| {
+                namespace_prefix.trim_end_matches('/').starts_with(prefix)
+            });
+        }
 
         let mut namespaces = Vec::new();
         let mut seen = std::collections::HashSet::new();

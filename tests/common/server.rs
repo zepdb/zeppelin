@@ -59,6 +59,7 @@ pub async fn start_test_server_with_config(
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
+        namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         config: Arc::new(config),
@@ -125,6 +126,7 @@ pub async fn start_test_server_with_compactor(
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
+        namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         config: Arc::new(config),
@@ -199,6 +201,7 @@ pub async fn start_test_server_with_compaction(
         let namespace_manager = namespace_manager.clone();
         let manifest_cache = manifest_cache.clone();
         let cache = cache.clone();
+        let namespace_prefix = Some(harness.prefix.clone());
         tokio::spawn(async move {
             compaction_loop(
                 compactor,
@@ -207,6 +210,7 @@ pub async fn start_test_server_with_compaction(
                 manifest_cache,
                 lease_manager,
                 cache,
+                namespace_prefix,
             )
             .await;
         });
@@ -219,6 +223,7 @@ pub async fn start_test_server_with_compaction(
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager,
+        namespace_name_prefix: Some(harness.prefix.clone()),
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         config: Arc::new(config),
