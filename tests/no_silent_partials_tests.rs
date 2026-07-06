@@ -50,8 +50,21 @@ fn active_segment(manifest: &Manifest) -> &zeppelin::wal::manifest::SegmentRef {
     manifest.segments.iter().find(|s| s.id == *active).unwrap()
 }
 
-fn cluster_key(ns: &str, segment_id: &str, cluster_idx: usize) -> String {
-    format!("{ns}/segments/{segment_id}/cluster_{cluster_idx}.bin")
+fn cluster_data_key(
+    ns: &str,
+    segment: &zeppelin::wal::manifest::SegmentRef,
+    cluster_idx: usize,
+) -> String {
+    if let Some(object_ref) = segment
+        .cluster_objects
+        .iter()
+        .find(|object_ref| object_ref.clusters.contains(&cluster_idx))
+    {
+        return object_ref.key.clone();
+    }
+
+    let owner = segment.cluster_owner(cluster_idx);
+    format!("{ns}/segments/{owner}/cluster_{cluster_idx}.bin")
 }
 
 fn attrs_key(ns: &str, segment_id: &str, cluster_idx: usize) -> String {
@@ -78,8 +91,7 @@ async fn test_missing_cluster_blob_fails_query() {
 
     let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     let seg = active_segment(&manifest);
-    let owner = seg.cluster_owner(0);
-    let key = cluster_key(&ns, owner, 0);
+    let key = cluster_data_key(&ns, seg, 0);
     harness.store.delete(&key).await.unwrap();
 
     let resp = client

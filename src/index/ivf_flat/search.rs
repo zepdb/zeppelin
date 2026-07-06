@@ -120,6 +120,7 @@ struct SqSearchByteStats {
     rerank_logical_bytes: AtomicU64,
     other_gets: AtomicU64,
     other_bytes: AtomicU64,
+    local_bytes: AtomicU64,
     selected_clusters: AtomicU64,
     sq_objects: AtomicU64,
     coarse_candidates: AtomicU64,
@@ -144,6 +145,7 @@ impl SqSearchByteStats {
             rerank_logical_bytes: AtomicU64::new(0),
             other_gets: AtomicU64::new(0),
             other_bytes: AtomicU64::new(0),
+            local_bytes: AtomicU64::new(0),
             selected_clusters: AtomicU64::new(0),
             sq_objects: AtomicU64::new(0),
             coarse_candidates: AtomicU64::new(0),
@@ -187,6 +189,10 @@ impl SqSearchByteStats {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    fn record_local_bytes(&self, bytes: usize) {
+        self.local_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
     fn set_usize(field: &AtomicU64, value: usize) {
         field.store(value as u64, Ordering::Relaxed);
     }
@@ -200,6 +206,7 @@ impl SqSearchByteStats {
         let rerank_logical_bytes = self.rerank_logical_bytes.load(Ordering::Relaxed);
         let other_gets = self.other_gets.load(Ordering::Relaxed);
         let other_bytes = self.other_bytes.load(Ordering::Relaxed);
+        let local_bytes = self.local_bytes.load(Ordering::Relaxed);
         let total_gets = sq_gets + rerank_gets + other_gets;
         let total_bytes = sq_bytes + rerank_bytes + other_bytes;
         eprintln!(
@@ -208,7 +215,8 @@ selected_clusters={} sq_objects={} coarse_candidates={} rerank_candidates={} rer
 rerank_objects={} final_results={} sq_gets={sq_gets} sq_bytes={sq_bytes} \
 sq_logical_bytes={sq_logical_bytes} sq_slack_bytes={} rerank_gets={rerank_gets} \
 rerank_bytes={rerank_bytes} rerank_logical_bytes={rerank_logical_bytes} rerank_slack_bytes={} \
-other_gets={other_gets} other_bytes={other_bytes} total_gets={total_gets} total_bytes={total_bytes}",
+other_gets={other_gets} other_bytes={other_bytes} local_bytes={local_bytes} \
+total_gets={total_gets} total_bytes={total_bytes}",
             self.query_id,
             self.selected_clusters.load(Ordering::Relaxed),
             self.sq_objects.load(Ordering::Relaxed),
@@ -248,6 +256,12 @@ async fn fetch_with_cache_counted(
     phase: SqBytePhase,
 ) -> Result<bytes::Bytes> {
     if let Some(c) = cache {
+        if let Some(data) = c.get(key).await {
+            if let Some(stats) = stats {
+                stats.record_local_bytes(data.len());
+            }
+            return Ok(data);
+        }
         c.get_or_fetch(key, || async {
             let data = store.get(key).await?;
             if let Some(stats) = stats {
@@ -1507,6 +1521,7 @@ async fn fetch_object_sq_range(
     match cached_full_object_for_range(cache, object_key, object_size_bytes, end, "sq", 1).await? {
         RangeCacheLookup::Local(data) => {
             if let Some(stats) = stats {
+                stats.record_local_bytes(data.len());
                 stats.record_logical_sq_bytes(logical_bytes);
             }
             return Ok(RangeBytes {
@@ -1702,6 +1717,7 @@ async fn fetch_rerank_vectors_by_range(
         {
             RangeCacheLookup::Local(data) => {
                 if let Some(stats) = stats {
+                    stats.record_local_bytes(data.len());
                     stats.record_logical_rerank_bytes(logical_bytes);
                 }
                 ranges

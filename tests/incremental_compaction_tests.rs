@@ -59,7 +59,7 @@ fn incremental_compactor(store: &ZeppelinStore) -> Compactor {
     )
 }
 
-/// Snapshot (key -> ETag) for every per-cluster object under a segment prefix.
+/// Snapshot (key -> ETag) for every object under a segment prefix.
 async fn cluster_object_versions(
     store: &ZeppelinStore,
     ns: &str,
@@ -75,6 +75,19 @@ async fn cluster_object_versions(
         }
     }
     out
+}
+
+fn cluster_data_key(ns: &str, segment: &SegmentRef, cluster_idx: usize) -> String {
+    if let Some(object_ref) = segment
+        .cluster_objects
+        .iter()
+        .find(|object_ref| object_ref.clusters.contains(&cluster_idx))
+    {
+        return object_ref.key.clone();
+    }
+
+    let owner = segment.cluster_owner(cluster_idx);
+    format!("{ns}/segments/{owner}/cluster_{cluster_idx}.bin")
 }
 
 /// Build an initial IVF-Flat segment from well-separated clusters and register
@@ -349,7 +362,7 @@ async fn test_incremental_rewrites_only_touched_cluster() {
         }
         let owner = seg_ref.cluster_owner(i);
         assert_eq!(owner, seed_id, "cluster {i} must be carried from the seed");
-        let cvec_key = format!("{ns}/segments/{owner}/cluster_{i}.bin");
+        let cvec_key = cluster_data_key(&ns, seg_ref, i);
         let (_d, etag) = store.get_with_meta(&cvec_key).await.unwrap();
         assert_eq!(
             etag.as_deref(),
@@ -445,8 +458,7 @@ async fn test_incremental_delete_forces_cluster_rewrite() {
         if seg_ref.cluster_owner(i) == new_seg {
             continue;
         }
-        let owner = seg_ref.cluster_owner(i);
-        let cvec_key = format!("{ns}/segments/{owner}/cluster_{i}.bin");
+        let cvec_key = cluster_data_key(&ns, seg_ref, i);
         let (_d, etag) = store.get_with_meta(&cvec_key).await.unwrap();
         assert_eq!(
             etag.as_deref(),
@@ -491,7 +503,7 @@ async fn test_incremental_carried_objects_not_deleted() {
         if owner != seed_id {
             continue; // rewritten cluster, lives under the new segment
         }
-        let cvec_key = format!("{ns}/segments/{owner}/cluster_{i}.bin");
+        let cvec_key = cluster_data_key(&ns, seg_ref, i);
         // Still present on S3...
         assert!(
             store.exists(&cvec_key).await.unwrap(),

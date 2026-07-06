@@ -14,8 +14,8 @@ use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
 use crate::fts::FtsFieldConfig;
 use crate::index::hierarchical::build::{build_hierarchical, load_hierarchical};
 use crate::index::ivf_flat::build::{
-    attrs_key, build_ivf_flat, cluster_key, cluster_object_sections, deserialize_attrs,
-    deserialize_cluster,
+    attrs_key, build_ivf_flat, cluster_group_key, cluster_key, cluster_object_sections,
+    deserialize_attrs, deserialize_cluster,
 };
 use crate::storage::ZeppelinStore;
 use crate::types::VectorEntry;
@@ -965,7 +965,7 @@ impl Compactor {
         use crate::index::ivf_flat::build::{
             build_bootstrap_artifact, centroids_key, deserialize_centroids_data, serialize_attrs,
             serialize_centroids_with_sq_calibration, serialize_cluster,
-            serialize_colocated_sq_cluster,
+            serialize_cluster_data_object, serialize_colocated_sq_cluster,
         };
         use crate::index::ivf_flat::sketch::build_resident_sketch;
         use bytes::Bytes;
@@ -1117,13 +1117,19 @@ impl Compactor {
             } else {
                 serialize_cluster(&cluster_ids[i], &cluster_vecs[i], dim)?
             };
-            let cvec_key = cluster_key(namespace, new_segment_id, i);
-            cluster_object_sizes.insert(cvec_key.clone(), cvec_data.len() as u64);
+            let (cvec_key, cvec_payload) = if old_cluster_objects.is_empty() {
+                (cluster_key(namespace, new_segment_id, i), cvec_data)
+            } else {
+                let key = cluster_group_key(namespace, new_segment_id, i);
+                let data = serialize_cluster_data_object(&[(i, cvec_data)])?;
+                (key, data)
+            };
+            cluster_object_sizes.insert(cvec_key.clone(), cvec_payload.len() as u64);
 
             let cattr_data = serialize_attrs(&cluster_attrs[i])?;
             let cattr_key = attrs_key(namespace, new_segment_id, i);
 
-            payloads.push((cvec_key, cvec_data));
+            payloads.push((cvec_key, cvec_payload));
             payloads.push((cattr_key, cattr_data));
 
             if self.indexing_config.bitmap_index {
@@ -1271,7 +1277,7 @@ fn incremental_cluster_objects(
     let mut size_by_key: HashMap<String, u64> = HashMap::new();
     for cluster_idx in 0..num_clusters {
         let key = if touched[cluster_idx] {
-            let key = cluster_key(namespace, new_segment_id, cluster_idx);
+            let key = cluster_group_key(namespace, new_segment_id, cluster_idx);
             let size = new_object_sizes.get(&key).copied().ok_or_else(|| {
                 ZeppelinError::Index(format!("missing size for rewritten cluster object {key}"))
             })?;
