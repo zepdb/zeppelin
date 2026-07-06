@@ -1,3 +1,5 @@
+/// Warm-set hydration policy and worker support.
+pub mod hydration;
 /// Manifest-level TTL cache to avoid repeated S3 reads.
 pub mod manifest_cache;
 

@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const RERANK_COALESCE_GAP_ENV: &str = "ZEPPELIN_RERANK_COALESCE_GAP_BYTES";
+const HYDRATION_POLICY_ENV: &str = "ZEPPELIN_HYDRATION_POLICY";
+const HYDRATION_HEAT_QUERIES_ENV: &str = "ZEPPELIN_HYDRATION_HEAT_QUERIES";
+const HYDRATION_HEAT_WINDOW_SECS_ENV: &str = "ZEPPELIN_HYDRATION_HEAT_WINDOW_SECS";
 
 /// Default maximum gap, in bytes, between rerank f32 ranges that are merged
 /// into one physical GET.
@@ -117,22 +120,36 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
-        original: Option<OsString>,
+        original: Vec<(&'static str, Option<OsString>)>,
     }
 
     impl EnvGuard {
         fn clear() -> Self {
-            let original = std::env::var_os(RERANK_COALESCE_GAP_ENV);
-            std::env::remove_var(RERANK_COALESCE_GAP_ENV);
+            let env_names = [
+                RERANK_COALESCE_GAP_ENV,
+                HYDRATION_POLICY_ENV,
+                HYDRATION_HEAT_QUERIES_ENV,
+                HYDRATION_HEAT_WINDOW_SECS_ENV,
+            ];
+            let original = env_names
+                .into_iter()
+                .map(|name| {
+                    let value = std::env::var_os(name);
+                    std::env::remove_var(name);
+                    (name, value)
+                })
+                .collect();
             Self { original }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            match self.original.take() {
-                Some(value) => std::env::set_var(RERANK_COALESCE_GAP_ENV, value),
-                None => std::env::remove_var(RERANK_COALESCE_GAP_ENV),
+            for (name, value) in self.original.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
             }
         }
     }
@@ -232,6 +249,50 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.effective_rerank_coalesce_gap_bytes(), 0);
+    }
+
+    #[test]
+    fn test_unknown_policy_name_fails_boot() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let err = load_toml(
+            r#"
+            [cache]
+            hydration_policy = "bogus"
+            "#,
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("hydration_policy"));
+        assert!(message.contains("bogus"));
+    }
+
+    #[test]
+    fn hydration_policy_defaults_and_parses() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let defaulted = load_toml("").unwrap();
+        assert_eq!(
+            defaulted.cache.hydration_policy,
+            HydrationPolicyKind::SessionWindow
+        );
+        assert_eq!(defaulted.cache.hydration_heat_queries, 3);
+        assert_eq!(defaulted.cache.hydration_heat_window_secs, 60);
+
+        let explicit = load_toml(
+            r#"
+            [cache]
+            hydration_policy = "session_window"
+            hydration_heat_queries = 5
+            hydration_heat_window_secs = 90
+            "#,
+        )
+        .unwrap();
+        assert_eq!(explicit.cache.hydration_heat_queries, 5);
+        assert_eq!(explicit.cache.hydration_heat_window_secs, 90);
     }
 }
 
@@ -378,6 +439,27 @@ pub struct CacheConfig {
     /// Namespace metadata positive-cache TTL in milliseconds. Default: `5000`.
     #[serde(default = "default_namespace_registry_ttl_ms")]
     pub namespace_registry_ttl_ms: u64,
+    /// Boot-selected hydration heat policy.
+    ///
+    /// Per-namespace policy selection is intentionally deferred until real
+    /// traffic validates the need; adding it now would multiply the test
+    /// matrix before the policy surface has production feedback.
+    #[serde(default = "default_hydration_policy")]
+    pub hydration_policy: HydrationPolicyKind,
+    /// Query observations required inside the heat window before hydration.
+    #[serde(default = "default_hydration_heat_queries")]
+    pub hydration_heat_queries: u64,
+    /// Heat window length in seconds. Default: `60`.
+    #[serde(default = "default_hydration_heat_window_secs")]
+    pub hydration_heat_window_secs: u64,
+}
+
+/// Globally selected warm-set hydration heat policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HydrationPolicyKind {
+    /// Count queries in a per-namespace session window.
+    SessionWindow,
 }
 
 /// Vector indexing parameters controlling IVF-Flat, quantization, and hierarchical trees.
@@ -536,6 +618,15 @@ fn default_manifest_cache_ttl_ms() -> u64 {
 fn default_namespace_registry_ttl_ms() -> u64 {
     5000
 }
+fn default_hydration_policy() -> HydrationPolicyKind {
+    HydrationPolicyKind::SessionWindow
+}
+fn default_hydration_heat_queries() -> u64 {
+    3
+}
+fn default_hydration_heat_window_secs() -> u64 {
+    60
+}
 fn default_num_centroids() -> usize {
     256
 }
@@ -640,6 +731,9 @@ impl Default for CacheConfig {
             memory_cache_max_mb: default_memory_cache_max_mb(),
             manifest_cache_ttl_ms: default_manifest_cache_ttl_ms(),
             namespace_registry_ttl_ms: default_namespace_registry_ttl_ms(),
+            hydration_policy: default_hydration_policy(),
+            hydration_heat_queries: default_hydration_heat_queries(),
+            hydration_heat_window_secs: default_hydration_heat_window_secs(),
         }
     }
 }
@@ -761,7 +855,22 @@ impl Config {
         };
         config.resolve_query_config()?;
         config.apply_env_overrides()?;
+        config.validate_cache_config()?;
         Ok(config)
+    }
+
+    fn validate_cache_config(&self) -> Result<()> {
+        if self.cache.hydration_heat_queries == 0 {
+            return Err(ZeppelinError::Config(
+                "cache.hydration_heat_queries must be greater than zero".into(),
+            ));
+        }
+        if self.cache.hydration_heat_window_secs == 0 {
+            return Err(ZeppelinError::Config(
+                "cache.hydration_heat_window_secs must be greater than zero".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_query_config(&mut self) -> Result<()> {
@@ -938,6 +1047,30 @@ impl Config {
         {
             self.cache.namespace_registry_ttl_ms = v;
         }
+        match std::env::var(HYDRATION_POLICY_ENV) {
+            Ok(v) => {
+                self.cache.hydration_policy = match v.to_lowercase().as_str() {
+                    "session_window" => HydrationPolicyKind::SessionWindow,
+                    _ => {
+                        return Err(ZeppelinError::Config(format!(
+                            "{HYDRATION_POLICY_ENV} has unsupported hydration policy {v}; expected session_window"
+                        )));
+                    }
+                };
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => {
+                return Err(ZeppelinError::Config(format!(
+                    "failed to read {HYDRATION_POLICY_ENV}: {error}"
+                )));
+            }
+        }
+        if let Some(value) = read_u64_env(HYDRATION_HEAT_QUERIES_ENV)? {
+            self.cache.hydration_heat_queries = value;
+        }
+        if let Some(value) = read_u64_env(HYDRATION_HEAT_WINDOW_SECS_ENV)? {
+            self.cache.hydration_heat_window_secs = value;
+        }
 
         // Indexing
         if let Some(v) = std::env::var("ZEPPELIN_DEFAULT_NUM_CENTROIDS")
@@ -1055,5 +1188,17 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+fn read_u64_env(name: &'static str) -> Result<Option<u64>> {
+    match std::env::var(name) {
+        Ok(value) => value.parse::<u64>().map(Some).map_err(|error| {
+            ZeppelinError::Config(format!("{name} must be a non-negative integer: {error}"))
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(ZeppelinError::Config(format!(
+            "failed to read {name}: {error}"
+        ))),
     }
 }
