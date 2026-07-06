@@ -27,6 +27,26 @@ mod inner {
         pub static ref COMPACTIONS_TOTAL: IntCounterVec = register_int_counter_vec!(
             "zeppelin_compactions_total", "Compactions", &["namespace", "status"]
         ).unwrap();
+        pub static ref COMPACTION_READ_BYTES_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_compaction_read_bytes_total",
+            "Bytes read by compaction from immutable artifacts",
+            &["namespace", "class"]
+        ).unwrap();
+        pub static ref COMPACTION_READ_OPS_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_compaction_read_ops_total",
+            "Object read operations performed by compaction",
+            &["namespace", "class"]
+        ).unwrap();
+        pub static ref COMPACTION_FULL_RETRAIN_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_compaction_full_retrain_total",
+            "Compactions that retrained centroids instead of using the incremental path",
+            &["namespace"]
+        ).unwrap();
+        pub static ref COMPACTION_INCREMENTAL_FALLBACK_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_compaction_incremental_fallback_total",
+            "Incremental compactions that fell back to a full retrain",
+            &["namespace", "reason"]
+        ).unwrap();
 
         // New metrics — Phase 6
         pub static ref S3_OPERATION_DURATION: HistogramVec = register_histogram_vec!(
@@ -186,6 +206,10 @@ pub fn init() {
     lazy_static::initialize(&WAL_APPENDS_TOTAL);
     lazy_static::initialize(&CACHE_HITS_TOTAL);
     lazy_static::initialize(&COMPACTIONS_TOTAL);
+    lazy_static::initialize(&COMPACTION_READ_BYTES_TOTAL);
+    lazy_static::initialize(&COMPACTION_READ_OPS_TOTAL);
+    lazy_static::initialize(&COMPACTION_FULL_RETRAIN_TOTAL);
+    lazy_static::initialize(&COMPACTION_INCREMENTAL_FALLBACK_TOTAL);
     lazy_static::initialize(&S3_OPERATION_DURATION);
     lazy_static::initialize(&S3_ERRORS_TOTAL);
     lazy_static::initialize(&COMPACTION_DURATION);

@@ -25,6 +25,26 @@ use crate::wal::WalReader;
 
 /// Maximum CAS retry attempts for manifest updates.
 const MAX_CAS_RETRIES: u32 = 10;
+const COMPACTION_READ_CLASS_CLUSTER: &str = "cluster";
+const COMPACTION_READ_CLASS_ATTRS: &str = "attrs";
+const COMPACTION_READ_CLASS_CENTROIDS: &str = "centroids";
+const COMPACTION_READ_CLASS_SQ: &str = "sq";
+
+async fn get_compaction_read(
+    store: &ZeppelinStore,
+    namespace: &str,
+    key: &str,
+    class: &str,
+) -> Result<bytes::Bytes> {
+    crate::metrics::COMPACTION_READ_OPS_TOTAL
+        .with_label_values(&[namespace, class])
+        .inc();
+    let data = store.get(key).await?;
+    crate::metrics::COMPACTION_READ_BYTES_TOTAL
+        .with_label_values(&[namespace, class])
+        .inc_by(data.len() as u64);
+    Ok(data)
+}
 
 /// Result of a compaction run.
 #[derive(Debug)]
@@ -489,9 +509,25 @@ impl Compactor {
         // new vectors are a small fraction of the total.
         let new_from_wal = fragments.iter().map(|f| f.vectors.len()).sum::<usize>();
         let existing_count = vectors.len().saturating_sub(new_from_wal);
-        let should_retrain = existing_count == 0
-            || (new_from_wal as f64 / existing_count.max(1) as f64)
-                > self.config.retrain_imbalance_threshold;
+        let retrain_ratio = if existing_count == 0 {
+            f64::INFINITY
+        } else {
+            new_from_wal as f64 / existing_count as f64
+        };
+        let should_retrain =
+            existing_count == 0 || retrain_ratio > self.config.retrain_imbalance_threshold;
+        if should_retrain {
+            crate::metrics::COMPACTION_FULL_RETRAIN_TOTAL
+                .with_label_values(&[namespace])
+                .inc();
+            info!(
+                new_from_wal,
+                existing_count,
+                retrain_ratio,
+                retrain_imbalance_threshold = self.config.retrain_imbalance_threshold,
+                "compaction full retrain selected"
+            );
+        }
 
         // 8. Build index (expensive, done once — NOT retried)
         // Choose hierarchical or flat based on config.
@@ -557,6 +593,9 @@ impl Compactor {
                     )
                 }
                 Err(e) => {
+                    crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
+                        .with_label_values(&[namespace, "build_failed"])
+                        .inc();
                     warn!(error = %e, "incremental build failed, falling back to full retrain");
                     let index = build_ivf_flat(
                         &vectors,
@@ -691,7 +730,12 @@ impl Compactor {
             let attr_keys: Vec<String> = (0..cluster_count)
                 .map(|i| attrs_key(namespace, &segment_id, i))
                 .collect();
-            let read_futs: Vec<_> = attr_keys.iter().map(|k| self.store.get(k)).collect();
+            let read_futs: Vec<_> = attr_keys
+                .iter()
+                .map(|k| {
+                    get_compaction_read(&self.store, namespace, k, COMPACTION_READ_CLASS_ATTRS)
+                })
+                .collect();
             let read_results = futures::future::join_all(read_futs).await;
 
             // Phase 2: CPU — build inverted indexes (parallelized via spawn_blocking).
@@ -972,7 +1016,13 @@ impl Compactor {
 
         // Load existing centroids
         let ckey = centroids_key(namespace, old_segment_id);
-        let centroids_data = self.store.get(&ckey).await?;
+        let centroids_data = get_compaction_read(
+            &self.store,
+            namespace,
+            &ckey,
+            COMPACTION_READ_CLASS_CENTROIDS,
+        )
+        .await?;
         let decoded_centroids = deserialize_centroids_data(&centroids_data)?;
         let centroids = decoded_centroids.centroids;
         let dim = decoded_centroids.dim;
@@ -984,9 +1034,13 @@ impl Compactor {
         {
             use crate::index::quantization::sq::sq_calibration_key;
             sq_calibration_bytes = Some(
-                self.store
-                    .get(&sq_calibration_key(namespace, old_segment_id))
-                    .await?,
+                get_compaction_read(
+                    &self.store,
+                    namespace,
+                    &sq_calibration_key(namespace, old_segment_id),
+                    COMPACTION_READ_CLASS_SQ,
+                )
+                .await?,
             );
         }
         let sq_calibration = sq_calibration_bytes
@@ -1166,10 +1220,13 @@ impl Compactor {
                 // Reuse the old segment's codebook — retraining defeats the
                 // point of the incremental path. If it's missing, fail so the
                 // caller falls back to a full retrain.
-                let cb_data = self
-                    .store
-                    .get(&pq_codebook_key(namespace, old_segment_id))
-                    .await?;
+                let cb_data = get_compaction_read(
+                    &self.store,
+                    namespace,
+                    &pq_codebook_key(namespace, old_segment_id),
+                    COMPACTION_READ_CLASS_SQ,
+                )
+                .await?;
                 let codebook = PqCodebook::from_bytes(&cb_data)?;
                 self.store
                     .put(
@@ -1412,7 +1469,13 @@ async fn load_segment_vectors(
         h_index.num_leaf_clusters()
     } else {
         use crate::index::ivf_flat::build::{centroids_key, deserialize_centroids};
-        let centroids_data = store.get(&centroids_key(namespace, segment_id)).await?;
+        let centroids_data = get_compaction_read(
+            store,
+            namespace,
+            &centroids_key(namespace, segment_id),
+            COMPACTION_READ_CLASS_CENTROIDS,
+        )
+        .await?;
         let (centroids, _dim) = deserialize_centroids(&centroids_data)?;
         centroids.len()
     };
@@ -1420,20 +1483,39 @@ async fn load_segment_vectors(
     let mut cluster_results = Vec::new();
     if cluster_objects.is_empty() {
         // Parallel fetch: 2 GETs per cluster via tokio::join!
-        cluster_results = futures::future::join_all((0..num_clusters).map(|i| {
-            let cvec_key = cluster_key(namespace, owner(i), i);
-            let cattr_key = attrs_key(namespace, owner(i), i);
-            async move {
-                let (cluster_res, attrs_res) =
-                    tokio::join!(store.get(&cvec_key), store.get(&cattr_key),);
-                (i, cluster_res, attrs_res)
-            }
-        }))
-        .await;
+        cluster_results =
+            futures::future::join_all((0..num_clusters).map(|i| {
+                let cvec_key = cluster_key(namespace, owner(i), i);
+                let cattr_key = attrs_key(namespace, owner(i), i);
+                async move {
+                    let (cluster_res, attrs_res) = tokio::join!(
+                        get_compaction_read(
+                            store,
+                            namespace,
+                            &cvec_key,
+                            COMPACTION_READ_CLASS_CLUSTER,
+                        ),
+                        get_compaction_read(
+                            store,
+                            namespace,
+                            &cattr_key,
+                            COMPACTION_READ_CLASS_ATTRS,
+                        ),
+                    );
+                    (i, cluster_res, attrs_res)
+                }
+            }))
+            .await;
     } else {
         let object_results =
             futures::future::join_all(cluster_objects.iter().map(|object_ref| async move {
-                let object_res = store.get(&object_ref.key).await;
+                let object_res = get_compaction_read(
+                    store,
+                    namespace,
+                    &object_ref.key,
+                    COMPACTION_READ_CLASS_CLUSTER,
+                )
+                .await;
                 (object_ref, object_res)
             }))
             .await;
@@ -1457,7 +1539,9 @@ async fn load_segment_vectors(
                         ))
                     })?;
                 let cattr_key = attrs_key(namespace, owner(cluster_idx), cluster_idx);
-                let attrs_res = store.get(&cattr_key).await;
+                let attrs_res =
+                    get_compaction_read(store, namespace, &cattr_key, COMPACTION_READ_CLASS_ATTRS)
+                        .await;
                 cluster_results.push((
                     cluster_idx,
                     Ok(bytes::Bytes::copy_from_slice(section.data)),

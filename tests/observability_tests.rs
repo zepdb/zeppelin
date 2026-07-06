@@ -1,9 +1,13 @@
 mod common;
 
-use common::server::{cleanup_ns, create_ns_api, start_test_server, start_test_server_with_config};
-use common::vectors::random_vectors;
+use common::server::{
+    cleanup_ns, create_ns_api, start_test_server, start_test_server_with_compactor,
+    start_test_server_with_config,
+};
+use common::vectors::{clustered_vectors, random_vectors};
 
-use zeppelin::wal::WalReader;
+use zeppelin::wal::manifest::Manifest;
+use zeppelin::wal::{WalReader, WalWriter};
 
 // --- Test 1: HTTP request metrics are incremented after API calls ---
 
@@ -234,6 +238,154 @@ async fn test_compaction_duration_metric() {
     harness.cleanup().await;
 }
 
+fn metric_value(body: &str, family: &str, labels: &[String]) -> Option<f64> {
+    body.lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| line.starts_with(family))
+        .find(|line| labels.iter().all(|label| line.contains(label)))
+        .and_then(|line| line.rsplit_once(' '))
+        .and_then(|(_, value)| value.parse::<f64>().ok())
+}
+
+fn assert_metric_gt_zero(body: &str, family: &str, labels: &[String]) {
+    let value = metric_value(body, family, labels).unwrap_or(0.0);
+    assert!(
+        value > 0.0,
+        "metric {family} with labels {labels:?} should be registered and > 0, got {value}; matching lines:\n{}",
+        body.lines()
+            .filter(|line| line.contains(family))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Stage 2C.0: compaction I/O metrics are observable through the same scrape
+/// endpoint operators use. This exercises a real initial full compaction, a
+/// real incremental compaction, and the existing incremental build-failed
+/// fallback path.
+#[tokio::test]
+async fn test_compaction_io_metrics_registered_and_incremented() {
+    let mut config = zeppelin::config::Config::load(None).unwrap();
+    config.compaction.max_wal_fragments_before_compact = 1;
+    config.compaction.retrain_imbalance_threshold = 1000.0;
+    config.indexing.default_num_centroids = 6;
+    config.indexing.kmeans_max_iterations = 5;
+    config.indexing.quantization = zeppelin::index::quantization::QuantizationType::Product;
+    config.indexing.pq_m = 8;
+    config.indexing.bitmap_index = false;
+    config.indexing.fts_index = false;
+    config.indexing.hierarchical = false;
+
+    let (base_url, harness, _cache, _dir, compactor) =
+        start_test_server_with_compactor(Some(config)).await;
+    let client = reqwest::Client::new();
+    let ns = harness.key("obs-compaction-io");
+    let writer = WalWriter::new(harness.store.clone());
+
+    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    let (seed_vecs, _) = clustered_vectors(6, 20, 16, 0.01);
+    writer.append(&ns, seed_vecs.clone(), vec![]).await.unwrap();
+
+    // Initial full-retrain build: this should meter full_retrain_total.
+    compactor.compact(&ns).await.unwrap();
+
+    let anchor0 = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_0_vec_0")
+        .unwrap()
+        .values
+        .clone();
+    writer
+        .append(
+            &ns,
+            vec![zeppelin::types::VectorEntry {
+                id: "metrics_incremental_success".to_string(),
+                values: anchor0.iter().map(|x| x + 0.001).collect(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Successful incremental build: this should meter compaction read ops/bytes.
+    let incremental_result = compactor.compact(&ns).await.unwrap();
+    let incremental_segment = incremental_result
+        .segment_id
+        .expect("incremental compaction must produce a new segment");
+
+    let anchor1 = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_1_vec_0")
+        .unwrap()
+        .values
+        .clone();
+    writer
+        .append(
+            &ns,
+            vec![zeppelin::types::VectorEntry {
+                id: "metrics_incremental_fallback".to_string(),
+                values: anchor1.iter().map(|x| x + 0.001).collect(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+    harness
+        .store
+        .delete(&zeppelin::index::quantization::pq::pq_codebook_key(
+            &ns,
+            &incremental_segment,
+        ))
+        .await
+        .unwrap();
+
+    // Existing warn-fallback path: missing PQ codebook makes incremental_build
+    // fail after old vectors are loaded; full retrain succeeds from the already
+    // loaded vectors.
+    compactor.compact(&ns).await.unwrap();
+
+    let body = client
+        .get(format!("{base_url}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let ns_label = format!("namespace=\"{ns}\"");
+
+    assert_metric_gt_zero(
+        &body,
+        "zeppelin_compaction_read_ops_total",
+        &[ns_label.clone(), "class=\"cluster\"".to_string()],
+    );
+    assert_metric_gt_zero(
+        &body,
+        "zeppelin_compaction_read_bytes_total",
+        &[ns_label.clone(), "class=\"cluster\"".to_string()],
+    );
+    assert_metric_gt_zero(
+        &body,
+        "zeppelin_compaction_read_ops_total",
+        &[ns_label.clone(), "class=\"centroids\"".to_string()],
+    );
+    assert_metric_gt_zero(
+        &body,
+        "zeppelin_compaction_full_retrain_total",
+        std::slice::from_ref(&ns_label),
+    );
+    assert_metric_gt_zero(
+        &body,
+        "zeppelin_compaction_incremental_fallback_total",
+        &[ns_label, "reason=\"build_failed\"".to_string()],
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
 // --- Test 7: All metric families are registered ---
 
 #[tokio::test]
@@ -254,6 +406,18 @@ async fn test_all_metrics_registered() {
     CACHE_HITS_TOTAL.with_label_values(&["hit"]).inc();
     COMPACTIONS_TOTAL
         .with_label_values(&["__test__", "success"])
+        .inc();
+    COMPACTION_READ_BYTES_TOTAL
+        .with_label_values(&["__test__", "cluster"])
+        .inc_by(1);
+    COMPACTION_READ_OPS_TOTAL
+        .with_label_values(&["__test__", "cluster"])
+        .inc();
+    COMPACTION_FULL_RETRAIN_TOTAL
+        .with_label_values(&["__test__"])
+        .inc();
+    COMPACTION_INCREMENTAL_FALLBACK_TOTAL
+        .with_label_values(&["__test__", "build_failed"])
         .inc();
     S3_OPERATION_DURATION
         .with_label_values(&["get"])
@@ -282,6 +446,10 @@ async fn test_all_metrics_registered() {
         "zeppelin_wal_appends_total",
         "zeppelin_cache_hits_total",
         "zeppelin_compactions_total",
+        "zeppelin_compaction_read_bytes_total",
+        "zeppelin_compaction_read_ops_total",
+        "zeppelin_compaction_full_retrain_total",
+        "zeppelin_compaction_incremental_fallback_total",
         "zeppelin_s3_operation_duration_seconds",
         "zeppelin_s3_errors_total",
         "zeppelin_compaction_duration_seconds",

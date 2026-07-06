@@ -16,6 +16,7 @@
 mod common;
 
 use bytes::Bytes;
+use common::counting::{counting_store, ArtifactClass};
 use common::harness::TestHarness;
 use common::vectors::clustered_vectors;
 
@@ -31,6 +32,8 @@ use zeppelin::wal::{WalReader, WalWriter};
 
 const DIM: usize = 16;
 const N_CLUSTERS: usize = 6;
+const BASELINE_CLUSTERS: usize = 16;
+const BASELINE_VECTORS_PER_CLUSTER: usize = 4;
 
 /// Compactor whose config reuses centroids (high retrain threshold) and never
 /// quantizes, so the incremental IVF-Flat carry-over path is exercised.
@@ -44,6 +47,30 @@ fn incremental_compactor(store: &ZeppelinStore) -> Compactor {
     };
     let indexing_config = IndexingConfig {
         default_num_centroids: N_CLUSTERS,
+        kmeans_max_iterations: 25,
+        quantization: zeppelin::index::quantization::QuantizationType::None,
+        bitmap_index: false,
+        fts_index: false,
+        hierarchical: false,
+        ..Default::default()
+    };
+    Compactor::new(
+        store.clone(),
+        wal_reader,
+        compaction_config,
+        indexing_config,
+    )
+}
+
+fn baseline_compactor(store: &ZeppelinStore) -> Compactor {
+    let wal_reader = WalReader::new(store.clone());
+    let compaction_config = CompactionConfig {
+        max_wal_fragments_before_compact: 1,
+        retrain_imbalance_threshold: 1000.0,
+        ..Default::default()
+    };
+    let indexing_config = IndexingConfig {
+        default_num_centroids: BASELINE_CLUSTERS,
         kmeans_max_iterations: 25,
         quantization: zeppelin::index::quantization::QuantizationType::None,
         bitmap_index: false,
@@ -126,6 +153,86 @@ async fn seed_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEnt
     });
     manifest.write(store, ns).await.unwrap();
     (seg_id.to_string(), vectors)
+}
+
+/// Seed a legacy per-cluster IVF-Flat segment so the compaction read baseline
+/// observes one cluster GET per logical cluster. Grouped cluster objects are
+/// covered elsewhere; this test freezes the pre-2C.3 O(dataset) profile.
+async fn seed_legacy_flat_segment(
+    store: &ZeppelinStore,
+    ns: &str,
+    n_clusters: usize,
+    vectors_per_cluster: usize,
+) -> (String, Vec<VectorEntry>, u64, u64) {
+    let (vectors, centroids) = clustered_vectors(n_clusters, vectors_per_cluster, DIM, 0.01);
+    let seg_id = "seg_seed";
+    store
+        .put(
+            &format!("{ns}/segments/{seg_id}/centroids.bin"),
+            legacy_centroids_bytes(&centroids, DIM),
+        )
+        .await
+        .unwrap();
+
+    let mut cluster_bytes_total = 0u64;
+    let mut attrs_bytes_total = 0u64;
+    for cluster_idx in 0..n_clusters {
+        let prefix = format!("cluster_{cluster_idx}_");
+        let cluster: Vec<&VectorEntry> = vectors
+            .iter()
+            .filter(|vector| vector.id.starts_with(&prefix))
+            .collect();
+        let ids: Vec<String> = cluster.iter().map(|vector| vector.id.clone()).collect();
+        let values: Vec<Vec<f32>> = cluster.iter().map(|vector| vector.values.clone()).collect();
+        let attrs: Vec<_> = cluster
+            .iter()
+            .map(|vector| vector.attributes.clone())
+            .collect();
+
+        let cluster_bytes = legacy_cluster_bytes(&ids, &values, DIM);
+        cluster_bytes_total += cluster_bytes.len() as u64;
+        store
+            .put(
+                &format!("{ns}/segments/{seg_id}/cluster_{cluster_idx}.bin"),
+                cluster_bytes,
+            )
+            .await
+            .unwrap();
+
+        let attrs_bytes = Bytes::from(serde_json::to_vec(&attrs).unwrap());
+        attrs_bytes_total += attrs_bytes.len() as u64;
+        store
+            .put(
+                &format!("{ns}/segments/{seg_id}/attrs_{cluster_idx}.bin"),
+                attrs_bytes,
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut manifest = Manifest::new();
+    manifest.add_segment(SegmentRef {
+        id: seg_id.to_string(),
+        vector_count: vectors.len(),
+        cluster_count: n_clusters,
+        quantization: zeppelin::index::quantization::QuantizationType::None,
+        hierarchical: false,
+        bitmap_fields: Vec::new(),
+        fts_fields: Vec::new(),
+        has_global_fts: false,
+        cluster_owners: Vec::new(),
+        sketch: None,
+        cluster_objects: Vec::new(),
+        bootstrap: None,
+    });
+    manifest.write(store, ns).await.unwrap();
+
+    (
+        seg_id.to_string(),
+        vectors,
+        cluster_bytes_total,
+        attrs_bytes_total,
+    )
 }
 
 /// Like [`incremental_compactor`] but with a specific quantization type, so the
@@ -370,6 +477,70 @@ async fn test_incremental_rewrites_only_touched_cluster() {
             "B2: carried cluster {i} must keep its exact object (same ETag)"
         );
     }
+
+    harness.cleanup().await;
+}
+
+/// BASELINE (pre-2C.3): incremental compaction reads all N clusters; stages
+/// 2C.1-2C.3 will drive this to O(WAL + touched). Update these numbers when
+/// the bounded-read flip lands.
+#[tokio::test]
+async fn test_incremental_read_io_baseline_reads_all_clusters() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let ns = harness.key("incr-read-baseline");
+
+    let (_seed_id, seed_vecs, expected_cluster_bytes, expected_attrs_bytes) =
+        seed_legacy_flat_segment(&store, &ns, BASELINE_CLUSTERS, BASELINE_VECTORS_PER_CLUSTER)
+            .await;
+
+    let anchor = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_0_vec_0")
+        .unwrap()
+        .values
+        .clone();
+    let new_vec = VectorEntry {
+        id: "baseline_added_one_cluster".to_string(),
+        values: anchor.iter().map(|x| x + 0.001).collect(),
+        attributes: None,
+    };
+    WalWriter::new(store.clone())
+        .append(&ns, vec![new_vec], vec![])
+        .await
+        .unwrap();
+
+    counter.reset();
+    let result = baseline_compactor(&store).compact(&ns).await.unwrap();
+    assert!(
+        result.segment_id.is_some(),
+        "baseline compaction must produce a new segment"
+    );
+
+    println!("pre-2C.3 incremental compaction read baseline");
+    println!("{}", counter.report());
+
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Cluster),
+        BASELINE_CLUSTERS as u64,
+        "BASELINE (pre-2C.3): one WAL vector touches one cluster, but current \
+         incremental compaction reads every cluster blob"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Attrs),
+        BASELINE_CLUSTERS as u64,
+        "BASELINE (pre-2C.3): attrs are also read for every old cluster"
+    );
+    assert_eq!(
+        counter.get_bytes_for(ArtifactClass::Cluster),
+        expected_cluster_bytes,
+        "BASELINE (pre-2C.3): cluster bytes freeze the all-cluster read cost"
+    );
+    assert_eq!(
+        counter.get_bytes_for(ArtifactClass::Attrs),
+        expected_attrs_bytes,
+        "BASELINE (pre-2C.3): attrs bytes freeze the all-cluster read cost"
+    );
 
     harness.cleanup().await;
 }
