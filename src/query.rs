@@ -587,25 +587,14 @@ pub(crate) async fn execute_bm25_query_with_manifest(
                     fts_configs,
                     last_as_prefix,
                     fts_cache.map(|c| c.as_ref()),
+                    filter,
+                    include_attributes,
                     Some(top_k),
                 );
                 scanned_fragments = scan_result.fragment_count;
                 wal_deleted_ids = scan_result.deleted_ids;
-                // Apply post-filter to WAL results
-                let mut results = scan_result.results;
-                if let Some(f) = filter {
-                    results.retain(|r| match &r.attributes {
-                        Some(attrs) => crate::index::filter::evaluate_filter(f, attrs),
-                        None => false,
-                    });
-                }
-                if !include_attributes {
-                    for result in &mut results {
-                        result.attributes = None;
-                    }
-                }
-                wal_overriding_ids = results.iter().map(|r| r.id.clone()).collect();
-                results
+                wal_overriding_ids = scan_result.overriding_ids;
+                scan_result.results
             }
             ConsistencyLevel::Eventual if !manifest.uncompacted_fragments().is_empty() => {
                 wal_deleted_ids = wal_reader

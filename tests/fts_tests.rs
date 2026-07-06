@@ -42,6 +42,24 @@ fn content_doc(id: &str, text: &str) -> VectorEntry {
     }
 }
 
+/// Create a VectorEntry with "content" and "tenant" attributes.
+fn content_doc_with_tenant(id: &str, text: &str, tenant: &str) -> VectorEntry {
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "content".to_string(),
+        AttributeValue::String(text.to_string()),
+    );
+    attrs.insert(
+        "tenant".to_string(),
+        AttributeValue::String(tenant.to_string()),
+    );
+    VectorEntry {
+        id: id.to_string(),
+        values: vec![0.1, 0.2, 0.3, 0.4],
+        attributes: Some(attrs),
+    }
+}
+
 /// Create a VectorEntry with both "title" and "content" text attributes.
 fn title_content_doc(id: &str, title: &str, content: &str) -> VectorEntry {
     let mut attrs = HashMap::new();
@@ -212,6 +230,180 @@ async fn test_fts_wal_scan_basic() {
         body["scanned_fragments"].as_u64().unwrap() > 0,
         "strong consistency should scan WAL fragments"
     );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_fts_strong_wal_update_suppresses_stale_segment_doc_outside_topk() {
+    let config = fts_test_config();
+    let (base_url, harness, _cache, _dir, compactor) =
+        start_test_server_with_compactor(Some(config)).await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "content": {"language": "english", "stemming": true, "remove_stopwords": true}
+        }),
+    )
+    .await;
+
+    let segment_docs = vec![
+        content_doc("x", "rust programming systems"),
+        content_doc("segment_keep", "rust programming guide"),
+    ];
+    upsert_docs(&client, &base_url, &ns, &segment_docs).await;
+    compactor
+        .compact_with_fts(&ns, None, &content_fts_configs())
+        .await
+        .unwrap();
+
+    upsert_docs(
+        &client,
+        &base_url,
+        &ns,
+        &[content_doc("x", "cooking pasta tomato sauce")],
+    )
+    .await;
+
+    let body = bm25_query(
+        &client,
+        &base_url,
+        &ns,
+        serde_json::json!({
+            "rank_by": ["content", "BM25", "rust programming"],
+            "top_k": 10,
+            "consistency": "strong",
+        }),
+    )
+    .await;
+    let ids = result_ids(&body);
+
+    assert!(
+        ids.contains(&"segment_keep".to_string()),
+        "precondition: non-overridden segment match should remain visible"
+    );
+    assert!(
+        !ids.contains(&"x".to_string()),
+        "WAL's latest non-matching version of x must suppress the stale segment version"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_fts_strong_filtered_wal_update_suppresses_stale_segment_doc() {
+    let config = fts_test_config();
+    let (base_url, harness, _cache, _dir, compactor) =
+        start_test_server_with_compactor(Some(config)).await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "content": {"language": "english", "stemming": true, "remove_stopwords": true}
+        }),
+    )
+    .await;
+
+    let segment_docs = vec![
+        content_doc_with_tenant("x", "rust programming systems", "keep"),
+        content_doc_with_tenant("segment_keep", "rust programming guide", "keep"),
+    ];
+    upsert_docs(&client, &base_url, &ns, &segment_docs).await;
+    compactor
+        .compact_with_fts(&ns, None, &content_fts_configs())
+        .await
+        .unwrap();
+
+    upsert_docs(
+        &client,
+        &base_url,
+        &ns,
+        &[content_doc_with_tenant(
+            "x",
+            "rust programming systems",
+            "drop",
+        )],
+    )
+    .await;
+
+    let body = bm25_query(
+        &client,
+        &base_url,
+        &ns,
+        serde_json::json!({
+            "rank_by": ["content", "BM25", "rust programming"],
+            "top_k": 10,
+            "filter": {"op": "eq", "field": "tenant", "value": "keep"},
+            "consistency": "strong",
+        }),
+    )
+    .await;
+    let ids = result_ids(&body);
+
+    assert_eq!(ids, vec!["segment_keep".to_string()]);
+    assert!(
+        !ids.contains(&"x".to_string()),
+        "filtered-out WAL version of x must still suppress stale segment attrs"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_fts_wal_filter_before_topk_avoids_underfill() {
+    let config = fts_test_config();
+    let (base_url, harness, _cache, _dir, _compactor) =
+        start_test_server_with_compactor(Some(config)).await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "content": {"language": "english", "stemming": true, "remove_stopwords": true}
+        }),
+    )
+    .await;
+
+    let docs = vec![
+        content_doc_with_tenant("drop_a", "needle needle needle needle needle", "drop"),
+        content_doc_with_tenant("drop_b", "needle needle needle needle", "drop"),
+        content_doc_with_tenant(
+            "keep_a",
+            "needle alpha beta gamma delta epsilon zeta eta theta",
+            "keep",
+        ),
+        content_doc_with_tenant(
+            "keep_b",
+            "needle iota kappa lambda mu nu xi omicron pi",
+            "keep",
+        ),
+    ];
+    upsert_docs(&client, &base_url, &ns, &docs).await;
+
+    let body = bm25_query(
+        &client,
+        &base_url,
+        &ns,
+        serde_json::json!({
+            "rank_by": ["content", "BM25", "needle"],
+            "top_k": 2,
+            "filter": {"op": "eq", "field": "tenant", "value": "keep"},
+            "consistency": "strong",
+        }),
+    )
+    .await;
+    let ids = result_ids(&body);
+
+    assert_eq!(ids, vec!["keep_a".to_string(), "keep_b".to_string()]);
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;

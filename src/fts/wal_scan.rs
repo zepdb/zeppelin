@@ -16,21 +16,31 @@ use crate::fts::rank_by::{evaluate_rank_by, RankBy};
 use crate::fts::tokenizer::tokenize_text;
 use crate::fts::wal_cache::WalFtsCache;
 use crate::fts::FtsFieldConfig;
+use crate::index::filter::evaluate_filter;
 use crate::index::topk::TopK;
-use crate::types::{AttributeValue, SearchResult};
+use crate::types::{AttributeValue, Filter, SearchResult};
 use crate::wal::fragment::WalFragment;
 
 /// Per-doc, per-field data: (doc_length, term→term_frequency).
 type DocFieldData = HashMap<String, HashMap<String, (u32, HashMap<String, u32>)>>;
 
-fn bm25_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
-    b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
+fn bm25_scored_cmp(a: &ScoredBm25Doc<'_>, b: &ScoredBm25Doc<'_>) -> Ordering {
+    b.score.total_cmp(&a.score).then_with(|| a.id.cmp(b.id))
+}
+
+struct ScoredBm25Doc<'a> {
+    id: &'a str,
+    score: f32,
+    attrs: Option<&'a HashMap<String, AttributeValue>>,
 }
 
 /// Result of a WAL BM25 scan.
 pub struct WalBm25ScanResult {
     /// Scored search results, sorted descending by BM25 score.
     pub results: Vec<SearchResult>,
+    /// All live WAL IDs after dedup/delete processing, including IDs that
+    /// filter out, score zero, or rank outside top-k.
+    pub overriding_ids: HashSet<String>,
     /// Number of WAL fragments scanned.
     pub fragment_count: usize,
     /// IDs that were explicitly deleted in the WAL.
@@ -51,12 +61,15 @@ pub struct WalBm25ScanResult {
 ///
 /// When `top_k` is provided, results are truncated to the top K after scoring.
 /// This enables callers to limit work in the merge phase.
+#[allow(clippy::too_many_arguments)]
 pub fn wal_bm25_scan(
     fragments: &[WalFragment],
     rank_by: &RankBy,
     fts_configs: &HashMap<String, FtsFieldConfig>,
     last_as_prefix: bool,
     fts_cache: Option<&WalFtsCache>,
+    filter: Option<&Filter>,
+    include_attributes: bool,
     top_k: Option<usize>,
 ) -> WalBm25ScanResult {
     let frag_count = fragments.len();
@@ -64,6 +77,7 @@ pub fn wal_bm25_scan(
     if fragments.is_empty() {
         return WalBm25ScanResult {
             results: Vec::new(),
+            overriding_ids: HashSet::new(),
             fragment_count: 0,
             deleted_ids: HashSet::new(),
         };
@@ -71,23 +85,29 @@ pub fn wal_bm25_scan(
 
     // 1. Dedup: latest fragment wins, apply deletes
     let mut deleted_ids: HashSet<String> = HashSet::new();
-    let mut latest_vectors: HashMap<String, Option<HashMap<String, AttributeValue>>> =
+    let mut latest_vectors: HashMap<&str, Option<&HashMap<String, AttributeValue>>> =
         HashMap::new();
 
     for fragment in fragments {
         for del_id in &fragment.deletes {
             deleted_ids.insert(del_id.clone());
-            latest_vectors.remove(del_id);
+            latest_vectors.remove(del_id.as_str());
         }
         for vec in &fragment.vectors {
             deleted_ids.remove(&vec.id);
-            latest_vectors.insert(vec.id.clone(), vec.attributes.clone());
+            latest_vectors.insert(vec.id.as_str(), vec.attributes.as_ref());
         }
     }
+
+    let overriding_ids: HashSet<String> = latest_vectors
+        .keys()
+        .map(|doc_id| (*doc_id).to_string())
+        .collect();
 
     if latest_vectors.is_empty() {
         return WalBm25ScanResult {
             results: Vec::new(),
+            overriding_ids,
             fragment_count: frag_count,
             deleted_ids,
         };
@@ -126,6 +146,7 @@ pub fn wal_bm25_scan(
     if field_query_states.is_empty() {
         return WalBm25ScanResult {
             results: Vec::new(),
+            overriding_ids,
             fragment_count: frag_count,
             deleted_ids,
         };
@@ -148,7 +169,7 @@ pub fn wal_bm25_scan(
             let cached = cache.get_or_tokenize(fragment, fts_configs, &fields_needed);
             for ((doc_id, field_name), token_data) in &cached.doc_field_data {
                 // Only include docs that survived dedup
-                if latest_vectors.contains_key(doc_id) {
+                if latest_vectors.contains_key(doc_id.as_str()) {
                     doc_field_data.entry(doc_id.clone()).or_default().insert(
                         field_name.clone(),
                         (token_data.doc_length, token_data.term_freqs.clone()),
@@ -188,7 +209,7 @@ pub fn wal_bm25_scan(
                 }
 
                 doc_field_data
-                    .entry(doc_id.clone())
+                    .entry((*doc_id).to_string())
                     .or_default()
                     .insert(field_name.to_string(), (doc_length, tf_map));
             }
@@ -230,16 +251,23 @@ pub fn wal_bm25_scan(
     }
 
     // 6. Score each document
-    let mut results: Vec<SearchResult> = Vec::new();
+    let mut results: Vec<ScoredBm25Doc<'_>> = Vec::new();
     let mut top_results = top_k.map(|k| {
         TopK::new(
             k,
-            bm25_result_cmp as fn(&SearchResult, &SearchResult) -> Ordering,
+            bm25_scored_cmp as fn(&ScoredBm25Doc, &ScoredBm25Doc) -> Ordering,
         )
     });
 
     for (doc_id, attrs_opt) in &latest_vectors {
-        let doc_data = doc_field_data.get(doc_id);
+        if let Some(f) = filter {
+            match attrs_opt {
+                Some(attrs) if evaluate_filter(f, attrs) => {}
+                _ => continue,
+            }
+        }
+
+        let doc_data = doc_field_data.get(*doc_id);
 
         let mut field_scores: HashMap<String, f32> = HashMap::new();
 
@@ -292,10 +320,10 @@ pub fn wal_bm25_scan(
 
         let final_score = evaluate_rank_by(rank_by, &field_scores);
         if final_score > 0.0 {
-            let result = SearchResult {
-                id: doc_id.clone(),
+            let result = ScoredBm25Doc {
+                id: doc_id,
                 score: final_score,
-                attributes: attrs_opt.clone(),
+                attrs: *attrs_opt,
             };
             if let Some(top_results) = &mut top_results {
                 top_results.push(result);
@@ -308,18 +336,32 @@ pub fn wal_bm25_scan(
     let results = if let Some(top_results) = top_results {
         top_results.into_sorted_vec()
     } else {
-        results.sort_by(bm25_result_cmp);
+        results.sort_by(bm25_scored_cmp);
         results
     };
+    let results: Vec<SearchResult> = results
+        .into_iter()
+        .map(|scored| SearchResult {
+            id: scored.id.to_string(),
+            score: scored.score,
+            attributes: if include_attributes {
+                scored.attrs.cloned()
+            } else {
+                None
+            },
+        })
+        .collect();
 
     debug!(
-        surviving_vectors = results.len(),
+        surviving_vectors = overriding_ids.len(),
+        topk_returned = results.len(),
         total_fragments = frag_count,
         "WAL BM25 scan complete"
     );
 
     WalBm25ScanResult {
         results,
+        overriding_ids,
         fragment_count: frag_count,
         deleted_ids,
     }
@@ -383,9 +425,20 @@ mod tests {
             query: "cat".to_string(),
         };
 
-        let result = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false, None, None);
+        let result = wal_bm25_scan(
+            &fragments,
+            &rank_by,
+            &make_configs(),
+            false,
+            None,
+            None,
+            true,
+            None,
+        );
         assert_eq!(result.fragment_count, 1);
         assert_eq!(result.results.len(), 2); // v1 and v2 contain "cat"
+        assert_eq!(result.overriding_ids.len(), 3);
+        assert!(result.overriding_ids.contains("v3"));
         assert!(result.results[0].score >= result.results[1].score);
     }
 
@@ -415,6 +468,8 @@ mod tests {
             false,
             Some(&cache),
             None,
+            true,
+            None,
         );
         assert_eq!(result1.results.len(), 2);
         assert_eq!(cache.len(), 1);
@@ -426,6 +481,8 @@ mod tests {
             &make_configs(),
             false,
             Some(&cache),
+            None,
+            true,
             None,
         );
         assert_eq!(result2.results.len(), 2);
@@ -450,8 +507,18 @@ mod tests {
             query: "cat".to_string(),
         };
 
-        let result = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false, None, None);
+        let result = wal_bm25_scan(
+            &fragments,
+            &rank_by,
+            &make_configs(),
+            false,
+            None,
+            None,
+            true,
+            None,
+        );
         assert_eq!(result.results.len(), 1); // v1 was deleted
+        assert_eq!(result.overriding_ids, HashSet::from(["v2".to_string()]));
         assert_eq!(result.results[0].id, "v2");
     }
 
@@ -467,6 +534,8 @@ mod tests {
             false,
             None,
             None,
+            true,
+            None,
         );
         assert!(result.results.is_empty());
         assert_eq!(result.fragment_count, 0);
@@ -481,8 +550,18 @@ mod tests {
             query: "".to_string(),
         };
 
-        let result = wal_bm25_scan(&fragments, &rank_by, &make_configs(), false, None, None);
+        let result = wal_bm25_scan(
+            &fragments,
+            &rank_by,
+            &make_configs(),
+            false,
+            None,
+            None,
+            true,
+            None,
+        );
         assert!(result.results.is_empty());
+        assert_eq!(result.overriding_ids, HashSet::from(["v1".to_string()]));
     }
 
     #[test]
@@ -528,7 +607,9 @@ mod tests {
             },
         );
 
-        let result = wal_bm25_scan(&fragments, &rank_by, &configs, false, None, None);
+        let result = wal_bm25_scan(
+            &fragments, &rank_by, &configs, false, None, None, true, None,
+        );
         assert_eq!(result.results.len(), 1);
         assert!(result.results[0].score > 0.0);
     }
