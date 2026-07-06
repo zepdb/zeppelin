@@ -1853,6 +1853,8 @@ async fn load_bootstrap_artifacts(
         }
     }
     if let Some(c) = cache {
+        // Process-wide decoded reuse is only for disk-cache-backed query paths;
+        // cache-less callers are cold by construction and fetch S3 bytes.
         if let Some(decoded) = bootstrap_decoded_cache()
             .get(&bootstrap_ref.key)
             .map(|entry| Arc::clone(entry.value()))
