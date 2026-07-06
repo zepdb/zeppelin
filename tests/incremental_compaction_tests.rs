@@ -19,7 +19,7 @@ use bytes::Bytes;
 use common::counting::{counting_store, ArtifactClass};
 use common::harness::TestHarness;
 use common::vectors::clustered_vectors;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
 use zeppelin::compaction::Compactor;
@@ -561,12 +561,25 @@ async fn seed_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEnt
 async fn seed_modern_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEntry>) {
     Manifest::new().write(store, ns).await.unwrap();
     let (vectors, _centroids) = clustered_vectors(N_CLUSTERS, 20, DIM, 0.01);
+    seed_modern_vectors(store, ns, vectors, N_CLUSTERS).await
+}
+
+async fn seed_modern_vectors(
+    store: &ZeppelinStore,
+    ns: &str,
+    vectors: Vec<VectorEntry>,
+    n_clusters: usize,
+) -> (String, Vec<VectorEntry>) {
+    Manifest::new().write(store, ns).await.unwrap();
     WalWriter::new(store.clone())
         .append(ns, vectors.clone(), vec![])
         .await
         .unwrap();
 
-    let result = incremental_compactor(store).compact(ns).await.unwrap();
+    let result = compactor_with_clusters(store, n_clusters)
+        .compact(ns)
+        .await
+        .unwrap();
     let segment_id = result.segment_id.unwrap();
     let manifest = Manifest::read(store, ns).await.unwrap().unwrap();
     let segment = manifest
@@ -589,13 +602,13 @@ async fn seed_modern_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<Ve
     (segment_id, vectors)
 }
 
-async fn seed_grouped_segment(
-    store: &ZeppelinStore,
-    ns: &str,
-    n_clusters: usize,
-    vectors_per_cluster: usize,
-) -> (String, Vec<VectorEntry>, u64, u64, u64) {
-    let (vectors, _centroids) = clustered_vectors(n_clusters, vectors_per_cluster, DIM, 0.01);
+fn compactor_with_clusters(store: &ZeppelinStore, n_clusters: usize) -> Compactor {
+    let wal_reader = WalReader::new(store.clone());
+    let compaction_config = CompactionConfig {
+        max_wal_fragments_before_compact: 1,
+        retrain_imbalance_threshold: 1000.0,
+        ..Default::default()
+    };
     let indexing_config = IndexingConfig {
         default_num_centroids: n_clusters,
         kmeans_max_iterations: 25,
@@ -605,54 +618,79 @@ async fn seed_grouped_segment(
         hierarchical: false,
         ..Default::default()
     };
-    let seg_id = "seg_seed";
-    let index = build_ivf_flat(&vectors, &indexing_config, store, ns, seg_id)
+    Compactor::new(
+        store.clone(),
+        wal_reader,
+        compaction_config,
+        indexing_config,
+    )
+}
+
+async fn seed_modern_flat_segment(
+    store: &ZeppelinStore,
+    ns: &str,
+    n_clusters: usize,
+    vectors_per_cluster: usize,
+) -> (SegmentRef, Vec<VectorEntry>) {
+    let (_seed_id, seed_vecs, _cluster_bytes, _attrs_bytes) =
+        seed_legacy_flat_segment(store, ns, n_clusters, vectors_per_cluster).await;
+    let anchor = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_0_vec_0")
+        .unwrap()
+        .values
+        .clone();
+    WalWriter::new(store.clone())
+        .append(
+            ns,
+            vec![VectorEntry {
+                id: "self_heal_seed_added".to_string(),
+                values: anchor.iter().map(|x| x + 0.001).collect(),
+                attributes: None,
+            }],
+            vec![],
+        )
         .await
         .unwrap();
-    let cluster_objects = index.cluster_objects().to_vec();
+    compactor_with_clusters(store, n_clusters)
+        .compact(ns)
+        .await
+        .unwrap();
+
+    let segment = active_segment_ref(store, ns).await;
     assert!(
-        !cluster_objects.is_empty(),
-        "grouped baseline fixture must use cluster_objects"
+        segment.cluster_objects.is_empty(),
+        "modern flat fixture must keep the legacy per-cluster layout"
     );
-    let expected_cluster_gets = cluster_objects.len() as u64;
-    let expected_cluster_bytes = cluster_objects
-        .iter()
-        .map(|object_ref| object_ref.size_bytes)
-        .sum();
+    assert!(
+        segment.membership.is_some(),
+        "modern flat fixture must have membership for bounded reads"
+    );
+    assert!(
+        segment.sketch.is_some(),
+        "modern flat fixture must have a sketch for stitching"
+    );
+    (segment, seed_vecs)
+}
 
-    let mut expected_attrs_bytes = 0u64;
-    for cluster_idx in 0..n_clusters {
-        expected_attrs_bytes += store
-            .head(&attrs_key(ns, seg_id, cluster_idx))
-            .await
-            .unwrap()
-            .size as u64;
-    }
-
-    let mut manifest = Manifest::new();
-    manifest.add_segment(SegmentRef {
-        id: seg_id.to_string(),
-        vector_count: vectors.len(),
-        cluster_count: index.num_clusters(),
-        quantization: zeppelin::index::quantization::QuantizationType::None,
-        hierarchical: false,
-        bitmap_fields: Vec::new(),
-        fts_fields: Vec::new(),
-        has_global_fts: false,
-        cluster_owners: Vec::new(),
-        sketch: None,
-        cluster_objects,
-        bootstrap: None,
-        membership: None,
-    });
-    manifest.write(store, ns).await.unwrap();
-    (
-        seg_id.to_string(),
-        vectors,
-        expected_cluster_gets,
-        expected_cluster_bytes,
-        expected_attrs_bytes,
-    )
+async fn seed_modern_grouped_segment(
+    store: &ZeppelinStore,
+    ns: &str,
+    n_clusters: usize,
+    vectors_per_cluster: usize,
+) -> (SegmentRef, Vec<VectorEntry>) {
+    let (vectors, _centroids) = clustered_vectors(n_clusters, vectors_per_cluster, DIM, 0.01);
+    let (_segment_id, vectors) = seed_modern_vectors(store, ns, vectors, n_clusters).await;
+    let segment = active_segment_ref(store, ns).await;
+    assert!(
+        !segment.cluster_objects.is_empty(),
+        "modern grouped fixture must use cluster_objects"
+    );
+    assert!(
+        segment.membership.is_some(),
+        "modern grouped fixture must have membership for bounded reads"
+    );
+    (segment, vectors)
 }
 
 /// Seed a legacy per-cluster IVF-Flat segment so the compaction read baseline
@@ -902,6 +940,48 @@ async fn strong_query_ids(
     .await
     .unwrap();
     resp.results.into_iter().map(|r| r.id).collect()
+}
+
+async fn ordered_query_ids(
+    store: &ZeppelinStore,
+    ns: &str,
+    query: &[f32],
+    top_k: usize,
+    nprobe: usize,
+) -> Vec<String> {
+    let reader = WalReader::new(store.clone());
+    let resp = execute_query(QueryParams {
+        store,
+        wal_reader: &reader,
+        namespace: ns,
+        query,
+        top_k,
+        nprobe,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        cache: None,
+        manifest_cache: None,
+        include_attributes: true,
+    })
+    .await
+    .unwrap();
+    resp.results.into_iter().map(|r| r.id).collect()
+}
+
+fn cluster_for_id(membership: &BTreeMap<String, u32>, id: &str) -> usize {
+    *membership
+        .get(id)
+        .unwrap_or_else(|| panic!("membership missing id {id}")) as usize
+}
+
+fn cluster_object_for(segment: &SegmentRef, cluster_idx: usize) -> Option<&ClusterDataObjectRef> {
+    segment
+        .cluster_objects
+        .iter()
+        .find(|object_ref| object_ref.clusters.contains(&cluster_idx))
 }
 
 /// B1 + B2: appending vectors that all fall into ONE cluster rewrites exactly
@@ -1432,18 +1512,156 @@ async fn test_incremental_stitched_sketch_multicycle_carries_sections_stably() {
     harness.cleanup().await;
 }
 
-/// BASELINE (pre-2C.3): incremental compaction reads all N clusters; stages
-/// 2C.1-2C.3 will drive this to O(WAL + touched). Update these numbers when
-/// the bounded-read flip lands.
+#[tokio::test]
+async fn test_incremental_multicycle_bounded_reads_and_carried_object_fences() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let ns = harness.key("incr-bounded-multicycle-fences");
+
+    let (_seed_segment, seed_vecs) = seed_modern_grouped_segment(&store, &ns, N_CLUSTERS, 20).await;
+    let writer = WalWriter::new(store.clone());
+    let compactor = compactor_with_clusters(&store, N_CLUSTERS);
+    let anchor = |ci: usize| -> (&'static str, Vec<f32>) {
+        let id = match ci {
+            1 => "cluster_1_vec_0",
+            2 => "cluster_2_vec_0",
+            3 => "cluster_3_vec_0",
+            _ => unreachable!("fixture touches clusters 1, 2, and 3"),
+        };
+        (
+            id,
+            seed_vecs
+                .iter()
+                .find(|vector| vector.id == id)
+                .unwrap()
+                .values
+                .clone(),
+        )
+    };
+
+    for (cycle, cluster_hint) in [1usize, 2, 3].into_iter().enumerate() {
+        let cycle_no = cycle + 1;
+        let old_segment = active_segment_ref(&store, &ns).await;
+        let (_membership, membership_map) =
+            decoded_membership(&harness.store, old_segment.membership.as_ref().unwrap()).await;
+        let (anchor_id, anchor_values) = anchor(cluster_hint);
+        let touched_cluster = cluster_for_id(&membership_map, anchor_id);
+        let touched_object_key = cluster_object_for(&old_segment, touched_cluster)
+            .map(|object_ref| object_ref.key.clone())
+            .unwrap_or_else(|| cluster_data_key(&ns, &old_segment, touched_cluster));
+
+        let mut old_object_etags = HashMap::new();
+        for object_ref in &old_segment.cluster_objects {
+            let (_bytes, etag) = harness.store.get_with_meta(&object_ref.key).await.unwrap();
+            if let Some(etag) = etag {
+                old_object_etags.insert(object_ref.key.clone(), etag);
+            }
+        }
+
+        writer
+            .append(
+                &ns,
+                vec![VectorEntry {
+                    id: format!("bounded_cycle_{cycle_no}_added"),
+                    values: anchor_values.iter().map(|x| x + 0.001).collect(),
+                    attributes: None,
+                }],
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        counter.reset();
+        let result = compactor.compact(&ns).await.unwrap();
+        let new_seg = result
+            .segment_id
+            .expect("each bounded cycle must produce a segment");
+        let new_segment = active_segment_ref(&store, &ns).await;
+        assert_eq!(new_segment.id, new_seg);
+
+        let rewritten: Vec<usize> = (0..new_segment.cluster_count)
+            .filter(|&cluster_idx| new_segment.cluster_owner(cluster_idx) == new_seg)
+            .collect();
+        assert_eq!(
+            rewritten,
+            vec![touched_cluster],
+            "cycle {cycle_no} must rewrite exactly the newly touched cluster"
+        );
+        assert_eq!(
+            counter.gets_for(ArtifactClass::Cluster),
+            1,
+            "cycle {cycle_no} must read only the touched physical cluster object"
+        );
+        assert_eq!(
+            counter.gets_matching(&touched_object_key),
+            1,
+            "cycle {cycle_no} must read the touched object once"
+        );
+        for object_ref in &old_segment.cluster_objects {
+            if object_ref.key == touched_object_key {
+                continue;
+            }
+            assert_eq!(
+                counter.gets_matching(&object_ref.key),
+                0,
+                "cycle {cycle_no} must not read untouched object {}",
+                object_ref.key
+            );
+        }
+        assert_eq!(
+            counter.gets_for(ArtifactClass::Attrs),
+            1,
+            "cycle {cycle_no} must read attrs only for the touched cluster"
+        );
+
+        let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+        let live_cluster_object_keys: HashSet<String> = new_segment
+            .cluster_objects
+            .iter()
+            .map(|object_ref| object_ref.key.clone())
+            .collect();
+        for key in &live_cluster_object_keys {
+            assert!(
+                !manifest.pending_deletes.contains(key),
+                "cycle {cycle_no}: live carried object {key} must not be pending deletion"
+            );
+        }
+        for (key, old_etag) in old_object_etags {
+            if !live_cluster_object_keys.contains(&key) {
+                continue;
+            }
+            let (_bytes, new_etag) = harness.store.get_with_meta(&key).await.unwrap();
+            assert_eq!(
+                new_etag.as_deref(),
+                Some(old_etag.as_str()),
+                "cycle {cycle_no}: carried object {key} must keep a stable ETag"
+            );
+        }
+
+        let ids = ordered_query_ids(&store, &ns, &anchor_values, N_CLUSTERS * 25, N_CLUSTERS).await;
+        assert!(
+            ids.iter()
+                .any(|id| id == &format!("bounded_cycle_{cycle_no}_added")),
+            "cycle {cycle_no} exact query must include the new vector"
+        );
+    }
+
+    harness.cleanup().await;
+}
+
+/// 2C.3 achieved bound: flat incremental compaction reads membership plus only
+/// the touched cluster's vector and attrs objects, not every old cluster.
 #[tokio::test]
 async fn test_incremental_read_io_baseline_reads_all_clusters() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
     let ns = harness.key("incr-read-baseline");
 
-    let (_seed_id, seed_vecs, expected_cluster_bytes, expected_attrs_bytes) =
-        seed_legacy_flat_segment(&store, &ns, BASELINE_CLUSTERS, BASELINE_VECTORS_PER_CLUSTER)
+    let (old_segment, seed_vecs) =
+        seed_modern_flat_segment(&store, &ns, BASELINE_CLUSTERS, BASELINE_VECTORS_PER_CLUSTER)
             .await;
+    let (_membership, membership_map) =
+        decoded_membership(&store, old_segment.membership.as_ref().unwrap()).await;
 
     let anchor = seed_vecs
         .iter()
@@ -1451,6 +1669,20 @@ async fn test_incremental_read_io_baseline_reads_all_clusters() {
         .unwrap()
         .values
         .clone();
+    let touched_cluster = cluster_for_id(&membership_map, "cluster_0_vec_0");
+    let expected_cluster_key = cluster_data_key(&ns, &old_segment, touched_cluster);
+    let expected_attrs_key = attrs_key(
+        &ns,
+        old_segment.cluster_owner(touched_cluster),
+        touched_cluster,
+    );
+    let expected_cluster_bytes = harness
+        .store
+        .head(&expected_cluster_key)
+        .await
+        .unwrap()
+        .size as u64;
+    let expected_attrs_bytes = harness.store.head(&expected_attrs_key).await.unwrap().size as u64;
     let new_vec = VectorEntry {
         id: "baseline_added_one_cluster".to_string(),
         values: anchor.iter().map(|x| x + 0.001).collect(),
@@ -1468,45 +1700,63 @@ async fn test_incremental_read_io_baseline_reads_all_clusters() {
         "baseline compaction must produce a new segment"
     );
 
-    println!("pre-2C.3 incremental compaction read baseline");
+    println!("2C.3 bounded flat incremental compaction read profile");
+    println!("before: cluster GETs=16 attrs GETs=16");
     println!("{}", counter.report());
 
     assert_eq!(
         counter.gets_for(ArtifactClass::Cluster),
-        BASELINE_CLUSTERS as u64,
-        "BASELINE (pre-2C.3): one WAL vector touches one cluster, but current \
-         incremental compaction reads every cluster blob"
+        1,
+        "2C.3: one WAL vector touches one flat cluster, so compaction reads only \
+         that cluster blob"
     );
     assert_eq!(
         counter.gets_for(ArtifactClass::Attrs),
-        BASELINE_CLUSTERS as u64,
-        "BASELINE (pre-2C.3): attrs are also read for every old cluster"
+        1,
+        "2C.3: attrs are read only for the rewritten cluster"
+    );
+    assert_eq!(
+        counter.gets_matching("membership.bin"),
+        1,
+        "2C.3: old membership replaces deriving id->cluster from a full vector load"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Centroids),
+        1,
+        "2C.3: reused centroids are loaded once"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Sketch),
+        1,
+        "2C.3: old sketch is loaded once for stitching"
     );
     assert_eq!(
         counter.get_bytes_for(ArtifactClass::Cluster),
         expected_cluster_bytes,
-        "BASELINE (pre-2C.3): cluster bytes freeze the all-cluster read cost"
+        "2C.3: cluster bytes equal the one touched cluster"
     );
     assert_eq!(
         counter.get_bytes_for(ArtifactClass::Attrs),
         expected_attrs_bytes,
-        "BASELINE (pre-2C.3): attrs bytes freeze the all-cluster read cost"
+        "2C.3: attrs bytes equal the one touched cluster's attrs"
     );
 
     harness.cleanup().await;
 }
 
-/// BASELINE (pre-2C.3): grouped-layout incremental compaction reads every
-/// manifest cluster object plus attrs for every logical cluster. Update these
-/// numbers when the bounded-read flip lands.
+/// 2C.3 achieved bound: grouped incremental compaction reads only the physical
+/// grouped object that contains a touched cluster, plus touched attrs.
 #[tokio::test]
 async fn test_incremental_grouped_read_io_baseline_reads_all_cluster_objects() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
     let ns = harness.key("incr-grouped-read-baseline");
 
-    let (_seed_id, seed_vecs, expected_cluster_gets, expected_cluster_bytes, expected_attrs_bytes) =
-        seed_grouped_segment(&store, &ns, BASELINE_CLUSTERS, BASELINE_VECTORS_PER_CLUSTER).await;
+    let (old_segment, seed_vecs) =
+        seed_modern_grouped_segment(&store, &ns, BASELINE_CLUSTERS, BASELINE_VECTORS_PER_CLUSTER)
+            .await;
+    let (_membership, membership_map) =
+        decoded_membership(&store, old_segment.membership.as_ref().unwrap()).await;
 
     let anchor = seed_vecs
         .iter()
@@ -1514,6 +1764,15 @@ async fn test_incremental_grouped_read_io_baseline_reads_all_cluster_objects() {
         .unwrap()
         .values
         .clone();
+    let touched_cluster = cluster_for_id(&membership_map, "cluster_0_vec_0");
+    let touched_object = cluster_object_for(&old_segment, touched_cluster)
+        .expect("grouped fixture must have an object for the touched cluster");
+    let expected_attrs_key = attrs_key(
+        &ns,
+        old_segment.cluster_owner(touched_cluster),
+        touched_cluster,
+    );
+    let expected_attrs_bytes = harness.store.head(&expected_attrs_key).await.unwrap().size as u64;
     let new_vec = VectorEntry {
         id: "grouped_baseline_added_one_cluster".to_string(),
         values: anchor.iter().map(|x| x + 0.001).collect(),
@@ -1531,30 +1790,273 @@ async fn test_incremental_grouped_read_io_baseline_reads_all_cluster_objects() {
         "grouped baseline compaction must produce a new segment"
     );
 
-    println!("pre-2C.3 grouped incremental compaction read baseline");
+    println!("2C.3 bounded grouped incremental compaction read profile");
+    println!("before: cluster GETs=9 attrs GETs=16");
     println!("{}", counter.report());
 
     assert_eq!(
         counter.gets_for(ArtifactClass::Cluster),
-        expected_cluster_gets,
-        "BASELINE (pre-2C.3): one WAL vector touches one cluster, but grouped \
-         incremental compaction reads every manifest cluster object"
+        1,
+        "2C.3: grouped layout reads only the object containing the touched cluster"
     );
     assert_eq!(
         counter.gets_for(ArtifactClass::Attrs),
-        BASELINE_CLUSTERS as u64,
-        "BASELINE (pre-2C.3): grouped layout still reads attrs for every old cluster"
+        1,
+        "2C.3: grouped layout reads attrs only for the touched logical cluster"
+    );
+    assert_eq!(
+        counter.gets_matching("membership.bin"),
+        1,
+        "2C.3: grouped bounded reads use membership"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Centroids),
+        1,
+        "2C.3: reused centroids are loaded once"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Sketch),
+        1,
+        "2C.3: old sketch is loaded once for stitching"
     );
     assert_eq!(
         counter.get_bytes_for(ArtifactClass::Cluster),
-        expected_cluster_bytes,
-        "BASELINE (pre-2C.3): grouped cluster bytes freeze the all-object read cost"
+        touched_object.size_bytes,
+        "2C.3: grouped bytes equal the one touched physical object"
     );
     assert_eq!(
         counter.get_bytes_for(ArtifactClass::Attrs),
         expected_attrs_bytes,
-        "BASELINE (pre-2C.3): grouped attrs bytes freeze the all-cluster read cost"
+        "2C.3: grouped attrs bytes equal only the touched attrs blob"
     );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_incremental_membership_delete_reads_only_touched_object() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let ns = harness.key("incr-membership-delete-bounded");
+
+    let (old_segment, seed_vecs) = seed_modern_grouped_segment(&store, &ns, N_CLUSTERS, 20).await;
+    let (_membership, membership_map) =
+        decoded_membership(&store, old_segment.membership.as_ref().unwrap()).await;
+    let victim = "cluster_5_vec_0".to_string();
+    let victim_cluster = cluster_for_id(&membership_map, &victim);
+    let touched_object = cluster_object_for(&old_segment, victim_cluster)
+        .expect("victim cluster must live in one grouped object")
+        .clone();
+    let untouched_objects: Vec<String> = old_segment
+        .cluster_objects
+        .iter()
+        .filter(|object_ref| object_ref.key != touched_object.key)
+        .map(|object_ref| object_ref.key.clone())
+        .collect();
+
+    WalWriter::new(store.clone())
+        .append(&ns, vec![], vec![victim.clone()])
+        .await
+        .unwrap();
+
+    counter.reset();
+    let result = compactor_with_clusters(&store, N_CLUSTERS)
+        .compact(&ns)
+        .await
+        .unwrap();
+    let new_seg = result
+        .segment_id
+        .expect("delete compaction must produce a segment");
+    let new_segment = active_segment_ref(&store, &ns).await;
+    assert_eq!(new_segment.id, new_seg);
+
+    let rewritten: Vec<usize> = (0..new_segment.cluster_count)
+        .filter(|&cluster_idx| new_segment.cluster_owner(cluster_idx) == new_seg)
+        .collect();
+    assert_eq!(
+        rewritten,
+        vec![victim_cluster],
+        "membership must force exactly the deleted vector's old cluster to rewrite"
+    );
+    assert_eq!(
+        counter.gets_matching(&touched_object.key),
+        1,
+        "the physical object containing the touched cluster must be read once"
+    );
+    for object_key in untouched_objects {
+        assert_eq!(
+            counter.gets_matching(&object_key),
+            0,
+            "untouched grouped object {object_key} must not be read"
+        );
+    }
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Cluster),
+        1,
+        "a delete in one old cluster reads exactly one physical cluster object"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Attrs),
+        1,
+        "a delete in one old cluster reads exactly that cluster's attrs"
+    );
+    assert_eq!(counter.gets_matching("membership.bin"), 1);
+
+    let victim_vec = seed_vecs
+        .iter()
+        .find(|vector| vector.id == victim)
+        .unwrap()
+        .values
+        .clone();
+    let ids = ordered_query_ids(&store, &ns, &victim_vec, N_CLUSTERS * 20, N_CLUSTERS).await;
+    assert!(
+        !ids.iter().any(|id| id == &victim),
+        "deleted vector must not survive the membership-driven rewrite"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_incremental_nonexistent_tombstone_reads_no_cluster_objects() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let ns = harness.key("incr-nonexistent-tombstone-bounded");
+
+    seed_modern_grouped_segment(&store, &ns, N_CLUSTERS, 20).await;
+    WalWriter::new(store.clone())
+        .append(&ns, vec![], vec!["never_existed_id".to_string()])
+        .await
+        .unwrap();
+
+    counter.reset();
+    let result = compactor_with_clusters(&store, N_CLUSTERS)
+        .compact(&ns)
+        .await
+        .unwrap();
+    let new_seg = result
+        .segment_id
+        .expect("tombstone compaction must still advance the segment");
+    let new_segment = active_segment_ref(&store, &ns).await;
+    let rewritten: Vec<usize> = (0..new_segment.cluster_count)
+        .filter(|&cluster_idx| new_segment.cluster_owner(cluster_idx) == new_seg)
+        .collect();
+    assert!(
+        rewritten.is_empty(),
+        "a tombstone for a nonexistent id must not rewrite any cluster, got {rewritten:?}"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Cluster),
+        0,
+        "a nonexistent tombstone must not cause any cluster-object read"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Attrs),
+        0,
+        "a nonexistent tombstone must not cause any attrs read"
+    );
+    assert_eq!(counter.gets_matching("membership.bin"), 1);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_incremental_membership_absent_self_heals_then_bounds_reads() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let ns = harness.key("incr-membership-self-heal");
+
+    let (_seed_id, seed_vecs, _cluster_bytes, _attrs_bytes) =
+        seed_legacy_flat_segment(&store, &ns, BASELINE_CLUSTERS, BASELINE_VECTORS_PER_CLUSTER)
+            .await;
+    let anchor0 = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_0_vec_0")
+        .unwrap()
+        .values
+        .clone();
+    let anchor1 = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_1_vec_0")
+        .unwrap()
+        .values
+        .clone();
+
+    let fallback_counter = zeppelin::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
+        .with_label_values(&[ns.as_str(), "membership_absent"]);
+    let fallback_before = fallback_counter.get();
+
+    WalWriter::new(store.clone())
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "self_heal_cycle_1".to_string(),
+                values: anchor0.iter().map(|x| x + 0.001).collect(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+    counter.reset();
+    compactor_with_clusters(&store, BASELINE_CLUSTERS)
+        .compact(&ns)
+        .await
+        .unwrap();
+    assert_eq!(
+        fallback_counter.get(),
+        fallback_before + 1,
+        "pre-2C.1 segments must take the membership_absent fallback once"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Cluster),
+        BASELINE_CLUSTERS as u64,
+        "membership_absent fallback uses the legacy full-read path for this cycle"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Attrs),
+        BASELINE_CLUSTERS as u64,
+        "membership_absent fallback reads all attrs for this cycle"
+    );
+    let healed_segment = active_segment_ref(&store, &ns).await;
+    assert!(
+        healed_segment.membership.is_some(),
+        "fallback compaction must write membership so the next cycle is bounded"
+    );
+
+    WalWriter::new(store.clone())
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "self_heal_cycle_2".to_string(),
+                values: anchor1.iter().map(|x| x + 0.001).collect(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+    counter.reset();
+    compactor_with_clusters(&store, BASELINE_CLUSTERS)
+        .compact(&ns)
+        .await
+        .unwrap();
+    assert_eq!(
+        fallback_counter.get(),
+        fallback_before + 1,
+        "healed segment must not take membership_absent again"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Cluster),
+        1,
+        "cycle 2 must be bounded to the newly touched cluster"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Attrs),
+        1,
+        "cycle 2 must read attrs only for the newly touched cluster"
+    );
+    assert_eq!(counter.gets_matching("membership.bin"), 1);
 
     harness.cleanup().await;
 }
@@ -1704,8 +2206,8 @@ async fn test_incremental_carried_objects_not_deleted() {
     harness.cleanup().await;
 }
 
-/// Golden equivalence: incremental compaction returns the same result set as a
-/// full rewrite of the same logical data.
+/// Golden equivalence: bounded incremental compaction returns the same ordered
+/// nprobe=all results as a forced full rewrite of the same logical data.
 #[tokio::test]
 async fn test_incremental_matches_full_rewrite_results() {
     let harness = TestHarness::new().await;
@@ -1716,10 +2218,6 @@ async fn test_incremental_matches_full_rewrite_results() {
     let ns_incr = harness.key("incr-golden-incr");
     let ns_full = harness.key("incr-golden-full");
 
-    let (seed_incr, seed_vecs) = seed_segment(store, &ns_incr).await;
-    let _ = seed_incr;
-
-    // Mirror the same seed into the full-rewrite namespace.
     let indexing_config = IndexingConfig {
         default_num_centroids: N_CLUSTERS,
         kmeans_max_iterations: 25,
@@ -1729,41 +2227,49 @@ async fn test_incremental_matches_full_rewrite_results() {
         hierarchical: false,
         ..Default::default()
     };
-    let full_seed_index = build_ivf_flat(&seed_vecs, &indexing_config, store, &ns_full, "seg_seed")
-        .await
-        .unwrap();
-    let mut full_manifest = Manifest::new();
-    full_manifest.add_segment(SegmentRef {
-        id: "seg_seed".to_string(),
-        vector_count: seed_vecs.len(),
-        cluster_count: N_CLUSTERS,
-        quantization: zeppelin::index::quantization::QuantizationType::None,
-        hierarchical: false,
-        bitmap_fields: Vec::new(),
-        fts_fields: Vec::new(),
-        has_global_fts: false,
-        cluster_owners: Vec::new(),
-        sketch: None,
-        cluster_objects: full_seed_index.cluster_objects().to_vec(),
-        bootstrap: None,
-        membership: None,
-    });
-    full_manifest.write(store, &ns_full).await.unwrap();
+    let (seed_vecs, _centroids) = clustered_vectors(N_CLUSTERS, 20, DIM, 0.01);
+    let (_seed_incr, seed_vecs) = seed_modern_vectors(store, &ns_incr, seed_vecs, N_CLUSTERS).await;
+    seed_modern_vectors(store, &ns_full, seed_vecs.clone(), N_CLUSTERS).await;
 
     // Same WAL append to both.
-    let anchor = &seed_vecs[0].values;
+    let anchor0 = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_0_vec_0")
+        .unwrap()
+        .values
+        .clone();
+    let anchor3 = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_3_vec_0")
+        .unwrap()
+        .values
+        .clone();
     let make_new = || -> Vec<VectorEntry> {
         (0..5)
             .map(|i| VectorEntry {
                 id: format!("added_{i}"),
-                values: anchor.iter().map(|x| x + 0.002).collect(),
+                values: anchor0
+                    .iter()
+                    .map(|x| x + 0.002 + i as f32 * 0.0001)
+                    .collect(),
                 attributes: None,
             })
+            .chain(std::iter::once(VectorEntry {
+                id: "cluster_4_vec_0".to_string(),
+                values: anchor3.iter().map(|x| x + 0.001).collect(),
+                attributes: None,
+            }))
             .collect()
     };
     let writer = WalWriter::new(store.clone());
-    writer.append(&ns_incr, make_new(), vec![]).await.unwrap();
-    writer.append(&ns_full, make_new(), vec![]).await.unwrap();
+    writer
+        .append(&ns_incr, make_new(), vec!["cluster_5_vec_0".to_string()])
+        .await
+        .unwrap();
+    writer
+        .append(&ns_full, make_new(), vec!["cluster_5_vec_0".to_string()])
+        .await
+        .unwrap();
 
     // Incremental compaction.
     incremental_compactor(store)
@@ -1783,54 +2289,25 @@ async fn test_incremental_matches_full_rewrite_results() {
     };
     full_compactor.compact(&ns_full).await.unwrap();
 
-    // Query both with the same probe vector; result ID sets must match.
-    let query_vec = anchor.clone();
-    let reader = WalReader::new(store.clone());
-    let incr_res = execute_query(QueryParams {
-        store,
-        wal_reader: &reader,
-        namespace: &ns_incr,
-        query: &query_vec,
-        top_k: 10,
-        nprobe: N_CLUSTERS,
-        filter: None,
-        consistency: ConsistencyLevel::Strong,
-        distance_metric: DistanceMetric::Euclidean,
-        oversample_factor: 1,
-        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
-        cache: None,
-        manifest_cache: None,
-        include_attributes: true,
-    })
-    .await
-    .unwrap();
-    let full_res = execute_query(QueryParams {
-        store,
-        wal_reader: &reader,
-        namespace: &ns_full,
-        query: &query_vec,
-        top_k: 10,
-        nprobe: N_CLUSTERS,
-        filter: None,
-        consistency: ConsistencyLevel::Strong,
-        distance_metric: DistanceMetric::Euclidean,
-        oversample_factor: 1,
-        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
-        cache: None,
-        manifest_cache: None,
-        include_attributes: true,
-    })
-    .await
-    .unwrap();
-
-    let incr_ids: std::collections::HashSet<&str> =
-        incr_res.results.iter().map(|r| r.id.as_str()).collect();
-    let full_ids: std::collections::HashSet<&str> =
-        full_res.results.iter().map(|r| r.id.as_str()).collect();
-    assert_eq!(
-        incr_ids, full_ids,
-        "incremental and full-rewrite top-k must return the same IDs"
+    let incr_segment = active_segment_ref(store, &ns_incr).await;
+    assert!(
+        incr_segment.membership.is_some(),
+        "oracle must exercise the bounded membership path"
     );
+    assert!(
+        !incr_segment.cluster_owners.is_empty(),
+        "oracle must carry untouched clusters by reference"
+    );
+
+    for query_vec in [&anchor0, &anchor3] {
+        let incr_ids = ordered_query_ids(store, &ns_incr, query_vec, 40, N_CLUSTERS).await;
+        let full_ids = ordered_query_ids(store, &ns_full, query_vec, 40, N_CLUSTERS).await;
+        assert_eq!(
+            incr_ids, full_ids,
+            "bounded incremental and forced full rewrite must return identical \
+             ordered IDs at nprobe=all"
+        );
+    }
 
     harness.cleanup().await;
 }

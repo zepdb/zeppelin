@@ -17,7 +17,9 @@ use crate::index::ivf_flat::build::{
     attrs_key, build_ivf_flat, cluster_group_key, cluster_key, cluster_object_sections,
     deserialize_attrs, deserialize_cluster,
 };
-use crate::index::ivf_flat::membership::build_membership_artifact;
+use crate::index::ivf_flat::membership::{
+    build_membership_artifact, deserialize_membership, MembershipData,
+};
 use crate::storage::ZeppelinStore;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
@@ -33,6 +35,7 @@ const COMPACTION_READ_CLASS_ATTRS: &str = "attrs";
 const COMPACTION_READ_CLASS_CENTROIDS: &str = "centroids";
 const COMPACTION_READ_CLASS_SQ: &str = "sq";
 const COMPACTION_READ_CLASS_SKETCH: &str = "sketch";
+const COMPACTION_READ_CLASS_MEMBERSHIP: &str = "membership";
 
 async fn get_compaction_read(
     store: &ZeppelinStore,
@@ -74,6 +77,26 @@ pub struct Compactor {
     /// build phase outlasts the lease duration. Always `None` in production
     /// (`Compactor::new` never sets it); only `set_test_pre_cas_delay` does.
     test_pre_cas_delay: Option<Duration>,
+}
+
+struct IncrementalCentroidState {
+    centroids: Vec<Vec<f32>>,
+    dim: usize,
+    sq_calibration_bytes: Option<bytes::Bytes>,
+    sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
+}
+
+struct IncrementalClusterState {
+    cluster_ids: Vec<Vec<String>>,
+    cluster_vecs: Vec<Vec<Vec<f32>>>,
+    cluster_attrs: Vec<Vec<Option<HashMap<String, crate::types::AttributeValue>>>>,
+    touched: Vec<bool>,
+}
+
+impl IncrementalClusterState {
+    fn vector_count(&self) -> usize {
+        self.cluster_ids.iter().map(Vec::len).sum()
+    }
 }
 
 impl Compactor {
@@ -336,7 +359,9 @@ impl Compactor {
             }
         }
 
-        // 5. If existing active_segment: load vectors from it, merge
+        // 5. Snapshot the old active segment, if any. S3 manifest state is the
+        // source of truth for retrain decisions; do not load old vectors just to
+        // count them.
         let old_segment_id = manifest.active_segment.clone();
         // Snapshot of the old active segment's full SegmentRef — needed both
         // to resolve its per-cluster owners (carried-over clusters live under
@@ -350,68 +375,122 @@ impl Compactor {
             .as_ref()
             .map(|s| s.cluster_owners.clone())
             .unwrap_or_default();
-        // Old-segment membership (id → cluster index), used by the incremental
-        // fast path to detect which clusters a WAL delete/update touched.
-        let mut old_id_to_cluster: HashMap<String, usize> = HashMap::new();
-        if let Some(ref seg_id) = old_segment_id {
-            let is_hierarchical = old_segment_ref
-                .as_ref()
-                .map(|s| s.hierarchical)
-                .unwrap_or(false);
-            let (existing_vecs, id_to_cluster) = load_segment_vectors(
-                &self.store,
-                namespace,
-                seg_id,
-                is_hierarchical,
-                &old_cluster_owners,
-                old_segment_ref
-                    .as_ref()
-                    .map(|s| s.cluster_objects.as_slice())
-                    .unwrap_or(&[]),
-            )
-            .await?;
-            old_id_to_cluster = id_to_cluster;
-            for vec in existing_vecs {
-                // WAL overrides: only insert if not already in latest_vectors and not deleted
-                if !latest_vectors.contains_key(&vec.id) && !deleted_ids.contains(&vec.id) {
-                    latest_vectors.insert(vec.id.clone(), vec);
-                }
-            }
+
+        // 5b. Incremental compaction decision: skip k-means retraining when
+        // new vectors are a small fraction of the manifest-carried old count.
+        // This must happen before any old cluster data is read so the bounded
+        // incremental path stays O(WAL + touched clusters).
+        let new_from_wal = fragments.iter().map(|f| f.vectors.len()).sum::<usize>();
+        let existing_count = old_segment_ref
+            .as_ref()
+            .map(|segment| segment.vector_count)
+            .unwrap_or(0);
+        let retrain_ratio = if existing_count == 0 {
+            f64::INFINITY
+        } else {
+            new_from_wal as f64 / existing_count as f64
+        };
+        let should_retrain =
+            existing_count == 0 || retrain_ratio > self.config.retrain_imbalance_threshold;
+        if should_retrain {
+            crate::metrics::COMPACTION_FULL_RETRAIN_TOTAL
+                .with_label_values(&[namespace])
+                .inc();
+            info!(
+                new_from_wal,
+                existing_count,
+                retrain_ratio,
+                retrain_imbalance_threshold = self.config.retrain_imbalance_threshold,
+                "compaction full retrain selected"
+            );
         }
 
-        // 6. Collect surviving vectors, skipping any with non-finite values.
-        //
-        // Defense in depth (Task 10 I4): the API boundary now rejects
-        // NaN/inf, but data written BEFORE that fix may already be durable
-        // on S3. This skip is the ONE sanctioned degradation in the
-        // compactor: crashing here would fail every future compaction cycle
-        // for the namespace — one bad historical vector would brick it
-        // (WAL grows forever, deletes never resolve). Skipping is loud:
-        // ERROR-level structured log + metric per dropped vector. Note the
-        // vector remains visible to Strong queries via the WAL until this
-        // compaction's manifest lands; after that it is gone entirely.
-        let mut vectors: Vec<VectorEntry> = latest_vectors
-            .into_values()
-            .filter(|v| {
-                if let Some(bad_idx) = v.values.iter().position(|x| !x.is_finite()) {
-                    error!(
-                        vector_id = %v.id,
-                        dimension = bad_idx,
-                        value = %v.values[bad_idx],
-                        "skipping vector with non-finite value during compaction; \
-                         it will be dropped from the compacted segment"
-                    );
-                    crate::metrics::NON_FINITE_VECTORS_SKIPPED_TOTAL
-                        .with_label_values(&[namespace])
-                        .inc();
-                    false
-                } else {
-                    true
+        let incremental_candidate = !should_retrain
+            && old_segment_ref
+                .as_ref()
+                .is_some_and(|segment| !segment.hierarchical)
+            && !self.indexing_config.hierarchical;
+        let bounded_incremental = if incremental_candidate {
+            if !fts_configs.is_empty() {
+                crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
+                    .with_label_values(&[namespace, "fts_configured"])
+                    .inc();
+                warn!(
+                    "bounded incremental compaction disabled because FTS rebuild \
+                     requires all vectors"
+                );
+                None
+            } else if let Some(membership_ref) = old_segment_ref
+                .as_ref()
+                .and_then(|segment| segment.membership.as_ref())
+            {
+                let membership_bytes = get_compaction_read(
+                    &self.store,
+                    namespace,
+                    &membership_ref.key,
+                    COMPACTION_READ_CLASS_MEMBERSHIP,
+                )
+                .await?;
+                let membership = deserialize_membership(&membership_bytes)?;
+                Some(membership)
+            } else {
+                crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
+                    .with_label_values(&[namespace, "membership_absent"])
+                    .inc();
+                warn!(
+                    "bounded incremental compaction disabled because old segment \
+                     has no membership artifact; falling back to full old-segment read"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut old_id_to_cluster: HashMap<String, usize> = HashMap::new();
+        let mut vectors: Vec<VectorEntry> = Vec::new();
+        let mut vectors_compacted = if let Some(membership) = bounded_incremental.as_ref() {
+            bounded_survivor_count(membership, &latest_vectors, &deleted_ids)
+        } else {
+            // Full-read path: materialize old vectors, merge WAL overrides, and
+            // skip non-finite historical data loudly. On the bounded path,
+            // untouched clusters are no longer scanned; any pre-Task-10 poison
+            // in an untouched carried cluster remains exactly as it was served
+            // before until that cluster is rewritten or a retrain fires.
+            if let Some(ref seg_id) = old_segment_id {
+                let is_hierarchical = old_segment_ref
+                    .as_ref()
+                    .map(|s| s.hierarchical)
+                    .unwrap_or(false);
+                let (existing_vecs, id_to_cluster) = load_segment_vectors(
+                    &self.store,
+                    namespace,
+                    seg_id,
+                    is_hierarchical,
+                    &old_cluster_owners,
+                    old_segment_ref
+                        .as_ref()
+                        .map(|s| s.cluster_objects.as_slice())
+                        .unwrap_or(&[]),
+                )
+                .await?;
+                old_id_to_cluster = id_to_cluster;
+                for vec in existing_vecs {
+                    // WAL overrides: only insert if not already in latest_vectors and not deleted
+                    if !latest_vectors.contains_key(&vec.id) && !deleted_ids.contains(&vec.id) {
+                        latest_vectors.insert(vec.id.clone(), vec);
+                    }
                 }
-            })
-            .collect();
-        vectors.sort_by(|a, b| a.id.cmp(&b.id));
-        let vectors_compacted = vectors.len();
+            }
+
+            vectors = latest_vectors
+                .values()
+                .filter(|v| keep_finite_compaction_vector(namespace, v))
+                .cloned()
+                .collect();
+            vectors.sort_by(|a, b| a.id.cmp(&b.id));
+            vectors.len()
+        };
 
         // Collect keys for deferred deletion, carrying over keys whose
         // deletion failed in step 0 so they are retried next cycle. The old
@@ -424,7 +503,7 @@ impl Compactor {
             deferred_deletes.push(WalFragment::s3_key(namespace, &fref.id));
         }
 
-        if vectors.is_empty() {
+        if vectors_compacted == 0 {
             // No new segment is produced, so nothing is carried over — every
             // old-segment object is safe to delete.
             if let Some(ref seg_id) = old_segment_id {
@@ -509,30 +588,6 @@ impl Compactor {
         // 7. Generate new segment ID
         let segment_id = format!("seg_{}", Ulid::new());
 
-        // 7b. Incremental compaction decision: skip k-means retraining when
-        // new vectors are a small fraction of the total.
-        let new_from_wal = fragments.iter().map(|f| f.vectors.len()).sum::<usize>();
-        let existing_count = vectors.len().saturating_sub(new_from_wal);
-        let retrain_ratio = if existing_count == 0 {
-            f64::INFINITY
-        } else {
-            new_from_wal as f64 / existing_count as f64
-        };
-        let should_retrain =
-            existing_count == 0 || retrain_ratio > self.config.retrain_imbalance_threshold;
-        if should_retrain {
-            crate::metrics::COMPACTION_FULL_RETRAIN_TOTAL
-                .with_label_values(&[namespace])
-                .inc();
-            info!(
-                new_from_wal,
-                existing_count,
-                retrain_ratio,
-                retrain_imbalance_threshold = self.config.retrain_imbalance_threshold,
-                "compaction full retrain selected"
-            );
-        }
-
         // 8. Build index (expensive, done once — NOT retried)
         // Choose hierarchical or flat based on config.
         //
@@ -550,7 +605,101 @@ impl Compactor {
             bootstrap_ref,
             membership_ref,
             cluster_objects,
-        ) = if !should_retrain && old_segment_id.is_some() && !self.indexing_config.hierarchical {
+        ) = if let Some(old_membership) = bounded_incremental.as_ref() {
+            match self
+                .incremental_build_bounded(
+                    namespace,
+                    old_segment_id.as_deref().ok_or_else(|| {
+                        ZeppelinError::Index("no old segment for bounded incremental build".into())
+                    })?,
+                    &segment_id,
+                    &latest_vectors,
+                    &deleted_ids,
+                    &wal_touched_ids,
+                    old_membership,
+                    &old_cluster_owners,
+                    old_segment_ref
+                        .as_ref()
+                        .map(|s| s.cluster_objects.as_slice())
+                        .unwrap_or(&[]),
+                    old_segment_ref
+                        .as_ref()
+                        .map(|s| s.bitmap_fields.as_slice())
+                        .unwrap_or(&[]),
+                    old_segment_ref.as_ref().and_then(|s| s.sketch.as_ref()),
+                )
+                .await
+            {
+                Ok((
+                    count,
+                    bf,
+                    owners,
+                    sketch_ref,
+                    bootstrap_ref,
+                    membership_ref,
+                    cluster_objects,
+                )) => {
+                    vectors_compacted =
+                        usize::try_from(membership_ref.entry_count).map_err(|_| {
+                            ZeppelinError::Index(format!(
+                                "membership entry_count does not fit in usize: {}",
+                                membership_ref.entry_count
+                            ))
+                        })?;
+                    info!(
+                        new_from_wal,
+                        existing_count,
+                        "bounded incremental compaction: reusing centroids and membership"
+                    );
+                    (
+                        count,
+                        false,
+                        bf,
+                        owners,
+                        Some(sketch_ref),
+                        Some(bootstrap_ref),
+                        Some(membership_ref),
+                        cluster_objects,
+                    )
+                }
+                Err(e) => {
+                    crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
+                        .with_label_values(&[namespace, "build_failed"])
+                        .inc();
+                    warn!(error = %e, "bounded incremental build failed, falling back to full retrain");
+                    let full_vectors = load_full_surviving_vectors_for_fallback(
+                        &self.store,
+                        namespace,
+                        old_segment_id.as_deref(),
+                        old_segment_ref.as_ref(),
+                        &old_cluster_owners,
+                        latest_vectors.clone(),
+                        &deleted_ids,
+                    )
+                    .await?;
+                    vectors_compacted = full_vectors.len();
+                    let index = build_ivf_flat(
+                        &full_vectors,
+                        &self.indexing_config,
+                        &self.store,
+                        namespace,
+                        &segment_id,
+                    )
+                    .await?;
+                    let bf = index.bitmap_fields.clone();
+                    (
+                        index.num_clusters(),
+                        false,
+                        bf,
+                        Vec::new(),
+                        index.sketch_ref.clone(),
+                        index.bootstrap_ref.clone(),
+                        index.membership_ref.clone(),
+                        index.cluster_objects.clone(),
+                    )
+                }
+            }
+        } else if incremental_candidate {
             // Incremental path: reuse existing centroids, just reassign vectors.
             match self
                 .incremental_build(
@@ -1028,49 +1177,15 @@ impl Compactor {
         Vec<ClusterDataObjectRef>,
     )> {
         use crate::index::distance::euclidean_distance;
-        use crate::index::ivf_flat::build::{
-            build_bootstrap_artifact, centroids_key, deserialize_centroids_data, serialize_attrs,
-            serialize_centroids_with_sq_calibration, serialize_cluster,
-            serialize_cluster_data_object, serialize_colocated_sq_cluster,
-        };
-        use crate::index::ivf_flat::sketch::{
-            build_resident_sketch, stitch_resident_sketch, ResidentSketch, ResidentSketchStitch,
-        };
-        use bytes::Bytes;
-
-        // Load existing centroids
-        let ckey = centroids_key(namespace, old_segment_id);
-        let centroids_data = get_compaction_read(
-            &self.store,
-            namespace,
-            &ckey,
-            COMPACTION_READ_CLASS_CENTROIDS,
-        )
-        .await?;
-        let decoded_centroids = deserialize_centroids_data(&centroids_data)?;
-        let centroids = decoded_centroids.centroids;
-        let dim = decoded_centroids.dim;
-        let mut sq_calibration_bytes = decoded_centroids.sq_calibration;
-        if matches!(
-            self.indexing_config.quantization,
-            crate::index::quantization::QuantizationType::Scalar
-        ) && sq_calibration_bytes.is_none()
-        {
-            use crate::index::quantization::sq::sq_calibration_key;
-            sq_calibration_bytes = Some(
-                get_compaction_read(
-                    &self.store,
-                    namespace,
-                    &sq_calibration_key(namespace, old_segment_id),
-                    COMPACTION_READ_CLASS_SQ,
-                )
-                .await?,
-            );
-        }
-        let sq_calibration = sq_calibration_bytes
-            .as_ref()
-            .map(|bytes| crate::index::quantization::sq::SqCalibration::from_bytes(bytes))
-            .transpose()?;
+        let centroid_state = self
+            .load_incremental_centroid_state(namespace, old_segment_id)
+            .await?;
+        let IncrementalCentroidState {
+            centroids,
+            dim,
+            sq_calibration_bytes,
+            sq_calibration,
+        } = centroid_state;
         let num_clusters = centroids.len();
 
         // Assign ALL surviving vectors to nearest centroid.
@@ -1121,6 +1236,331 @@ impl Compactor {
             }
         }
 
+        let centroid_state = IncrementalCentroidState {
+            centroids,
+            dim,
+            sq_calibration_bytes,
+            sq_calibration,
+        };
+        let cluster_state = IncrementalClusterState {
+            cluster_ids,
+            cluster_vecs,
+            cluster_attrs,
+            touched,
+        };
+        self.write_incremental_segment(
+            namespace,
+            old_segment_id,
+            new_segment_id,
+            centroid_state,
+            cluster_state,
+            old_cluster_owners,
+            old_cluster_objects,
+            old_bitmap_fields,
+            old_sketch_ref,
+            None,
+            true,
+        )
+        .await
+    }
+
+    async fn load_incremental_centroid_state(
+        &self,
+        namespace: &str,
+        old_segment_id: &str,
+    ) -> Result<IncrementalCentroidState> {
+        use crate::index::ivf_flat::build::{centroids_key, deserialize_centroids_data};
+
+        let ckey = centroids_key(namespace, old_segment_id);
+        let centroids_data = get_compaction_read(
+            &self.store,
+            namespace,
+            &ckey,
+            COMPACTION_READ_CLASS_CENTROIDS,
+        )
+        .await?;
+        let decoded_centroids = deserialize_centroids_data(&centroids_data)?;
+        let centroids = decoded_centroids.centroids;
+        let dim = decoded_centroids.dim;
+        let mut sq_calibration_bytes = decoded_centroids.sq_calibration;
+        if matches!(
+            self.indexing_config.quantization,
+            crate::index::quantization::QuantizationType::Scalar
+        ) && sq_calibration_bytes.is_none()
+        {
+            use crate::index::quantization::sq::sq_calibration_key;
+            sq_calibration_bytes = Some(
+                get_compaction_read(
+                    &self.store,
+                    namespace,
+                    &sq_calibration_key(namespace, old_segment_id),
+                    COMPACTION_READ_CLASS_SQ,
+                )
+                .await?,
+            );
+        }
+        let sq_calibration = sq_calibration_bytes
+            .as_ref()
+            .map(|bytes| crate::index::quantization::sq::SqCalibration::from_bytes(bytes))
+            .transpose()?;
+
+        Ok(IncrementalCentroidState {
+            centroids,
+            dim,
+            sq_calibration_bytes,
+            sq_calibration,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn incremental_build_bounded(
+        &self,
+        namespace: &str,
+        old_segment_id: &str,
+        new_segment_id: &str,
+        latest_vectors: &HashMap<String, VectorEntry>,
+        deleted_ids: &HashSet<String>,
+        wal_touched_ids: &HashSet<String>,
+        old_membership: &MembershipData,
+        old_cluster_owners: &[String],
+        old_cluster_objects: &[ClusterDataObjectRef],
+        old_bitmap_fields: &[String],
+        old_sketch_ref: Option<&crate::wal::manifest::SketchRef>,
+    ) -> Result<(
+        usize,
+        Vec<String>,
+        Vec<String>,
+        crate::wal::manifest::SketchRef,
+        BootstrapRef,
+        MembershipRef,
+        Vec<ClusterDataObjectRef>,
+    )> {
+        use crate::index::ivf_flat::sketch::ResidentSketch;
+
+        let centroid_state = self
+            .load_incremental_centroid_state(namespace, old_segment_id)
+            .await?;
+        let num_clusters = centroid_state.centroids.len();
+        if old_membership.cluster_count as usize != num_clusters {
+            return Err(ZeppelinError::Membership(format!(
+                "membership cluster_count {} does not match centroid count {num_clusters}",
+                old_membership.cluster_count
+            )));
+        }
+
+        let old_sketch_ref = old_sketch_ref.ok_or_else(|| {
+            meter_sketch_unavailable(namespace, "old_sketch_ref_missing");
+            ZeppelinError::Index(
+                "bounded incremental requires an old resident sketch for carried clusters".into(),
+            )
+        })?;
+        let old_sketch_data = match get_compaction_read(
+            &self.store,
+            namespace,
+            &old_sketch_ref.key,
+            COMPACTION_READ_CLASS_SKETCH,
+        )
+        .await
+        {
+            Ok(data) => data,
+            Err(ZeppelinError::NotFound { key }) => {
+                warn!(
+                    key = %key,
+                    "old resident sketch missing for bounded incremental stitching"
+                );
+                meter_sketch_unavailable(namespace, "old_sketch_missing");
+                return Err(ZeppelinError::Index(
+                    "bounded incremental old resident sketch is missing".into(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let old_sketch = ResidentSketch::from_bytes(&old_sketch_data).map_err(|error| {
+            warn!(
+                error = %error,
+                key = %old_sketch_ref.key,
+                "old resident sketch could not be decoded for bounded incremental stitching"
+            );
+            meter_sketch_unavailable(namespace, "old_sketch_decode_failed");
+            error
+        })?;
+
+        let mut old_id_to_cluster: HashMap<String, usize> =
+            HashMap::with_capacity(old_membership.entries.len());
+        let mut carried_ids: Vec<Vec<String>> = vec![Vec::new(); num_clusters];
+        for (id, cluster_idx) in &old_membership.entries {
+            let cluster_idx = *cluster_idx as usize;
+            if cluster_idx >= num_clusters {
+                return Err(ZeppelinError::Membership(format!(
+                    "membership id {id} references out-of-range cluster {cluster_idx}"
+                )));
+            }
+            old_id_to_cluster.insert(id.clone(), cluster_idx);
+            if !deleted_ids.contains(id) && !latest_vectors.contains_key(id) {
+                carried_ids[cluster_idx].push(id.clone());
+            }
+        }
+
+        let mut wal_entries: Vec<VectorEntry> = latest_vectors
+            .values()
+            .filter(|entry| keep_finite_compaction_vector(namespace, entry))
+            .cloned()
+            .collect();
+        wal_entries.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let mut wal_by_cluster: Vec<Vec<VectorEntry>> = vec![Vec::new(); num_clusters];
+        let mut touched = vec![false; num_clusters];
+        for entry in wal_entries {
+            let cluster_idx = nearest_cluster(&centroid_state.centroids, &entry.values)?;
+            touched[cluster_idx] = true;
+            wal_by_cluster[cluster_idx].push(entry);
+        }
+        for id in wal_touched_ids {
+            if let Some(&old_cluster) = old_id_to_cluster.get(id) {
+                touched[old_cluster] = true;
+            }
+        }
+
+        let loaded_touched = load_touched_segment_vectors(
+            &self.store,
+            namespace,
+            old_segment_id,
+            old_cluster_owners,
+            old_cluster_objects,
+            &touched,
+        )
+        .await?;
+
+        let mut cluster_ids: Vec<Vec<String>> = vec![Vec::new(); num_clusters];
+        let mut cluster_vecs: Vec<Vec<Vec<f32>>> = vec![Vec::new(); num_clusters];
+        let mut cluster_attrs: Vec<Vec<Option<HashMap<String, crate::types::AttributeValue>>>> =
+            vec![Vec::new(); num_clusters];
+
+        for cluster_idx in 0..num_clusters {
+            if !touched[cluster_idx] {
+                cluster_ids[cluster_idx] = carried_ids[cluster_idx].clone();
+                cluster_vecs[cluster_idx] = vec![Vec::new(); carried_ids[cluster_idx].len()];
+                cluster_attrs[cluster_idx] = vec![None; carried_ids[cluster_idx].len()];
+                continue;
+            }
+
+            let mut entries = Vec::new();
+            for entry in &loaded_touched[cluster_idx] {
+                match old_id_to_cluster.get(&entry.id).copied() {
+                    Some(old_cluster) if old_cluster == cluster_idx => {}
+                    Some(old_cluster) => {
+                        return Err(ZeppelinError::Membership(format!(
+                            "membership says id {} belongs to cluster {old_cluster}, \
+                             but loaded it from cluster {cluster_idx}",
+                            entry.id
+                        )));
+                    }
+                    None => {
+                        return Err(ZeppelinError::Membership(format!(
+                            "loaded id {} from touched cluster {cluster_idx}, \
+                             but membership has no entry for it",
+                            entry.id
+                        )));
+                    }
+                }
+                if !deleted_ids.contains(&entry.id) && !latest_vectors.contains_key(&entry.id) {
+                    entries.push(entry.clone());
+                }
+            }
+            entries.extend(wal_by_cluster[cluster_idx].iter().cloned());
+            entries.sort_by(|a, b| a.id.cmp(&b.id));
+
+            for entry in entries {
+                cluster_ids[cluster_idx].push(entry.id);
+                cluster_vecs[cluster_idx].push(entry.values);
+                cluster_attrs[cluster_idx].push(entry.attributes);
+            }
+        }
+
+        let cluster_state = IncrementalClusterState {
+            cluster_ids,
+            cluster_vecs,
+            cluster_attrs,
+            touched,
+        };
+        if cluster_state.vector_count() == 0 {
+            return Err(ZeppelinError::Index(
+                "bounded incremental produced an empty vector set".into(),
+            ));
+        }
+
+        self.write_incremental_segment(
+            namespace,
+            old_segment_id,
+            new_segment_id,
+            centroid_state,
+            cluster_state,
+            old_cluster_owners,
+            old_cluster_objects,
+            old_bitmap_fields,
+            Some(old_sketch_ref),
+            Some(old_sketch),
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_incremental_segment(
+        &self,
+        namespace: &str,
+        old_segment_id: &str,
+        new_segment_id: &str,
+        centroid_state: IncrementalCentroidState,
+        cluster_state: IncrementalClusterState,
+        old_cluster_owners: &[String],
+        old_cluster_objects: &[ClusterDataObjectRef],
+        old_bitmap_fields: &[String],
+        old_sketch_ref: Option<&crate::wal::manifest::SketchRef>,
+        preloaded_old_sketch: Option<crate::index::ivf_flat::sketch::ResidentSketch>,
+        allow_sketch_rebuild: bool,
+    ) -> Result<(
+        usize,
+        Vec<String>,
+        Vec<String>,
+        crate::wal::manifest::SketchRef,
+        BootstrapRef,
+        MembershipRef,
+        Vec<ClusterDataObjectRef>,
+    )> {
+        use crate::index::ivf_flat::build::{
+            build_bootstrap_artifact, centroids_key, serialize_attrs,
+            serialize_centroids_with_sq_calibration, serialize_cluster,
+            serialize_cluster_data_object, serialize_colocated_sq_cluster,
+        };
+        use crate::index::ivf_flat::sketch::{
+            build_resident_sketch, stitch_resident_sketch, ResidentSketchStitch,
+        };
+        use bytes::Bytes;
+
+        let IncrementalCentroidState {
+            centroids,
+            dim,
+            sq_calibration_bytes,
+            sq_calibration,
+        } = centroid_state;
+        let IncrementalClusterState {
+            cluster_ids,
+            cluster_vecs,
+            cluster_attrs,
+            touched,
+        } = cluster_state;
+        let num_clusters = centroids.len();
+        if touched.len() != num_clusters
+            || cluster_ids.len() != num_clusters
+            || cluster_vecs.len() != num_clusters
+            || cluster_attrs.len() != num_clusters
+        {
+            return Err(ZeppelinError::Index(
+                "incremental cluster state length mismatch".into(),
+            ));
+        }
+
         // Resolve the owning segment ID for cluster `i` when carried over: the
         // old segment's own resolved owner (chain-compresses across
         // generations so we never point at a segment that itself only holds a
@@ -1132,7 +1572,7 @@ impl Compactor {
                 .unwrap_or_else(|| old_segment_id.to_string())
         };
 
-        // Build cluster_owners: rewritten → new_segment_id, carried → old owner.
+        // Build cluster_owners: rewritten -> new_segment_id, carried -> old owner.
         let mut cluster_owners: Vec<String> = Vec::with_capacity(num_clusters);
         for (i, is_touched) in touched.iter().enumerate() {
             if *is_touched {
@@ -1142,17 +1582,14 @@ impl Compactor {
             }
         }
         let rewritten_count = touched.iter().filter(|t| **t).count();
+        let carries_clusters = rewritten_count < num_clusters;
 
-        // Write centroids (segment-global — always under the new segment).
         let new_ckey = centroids_key(namespace, new_segment_id);
         let new_centroids_data = serialize_centroids_with_sq_calibration(
             &centroids,
             dim,
             sq_calibration_bytes.as_ref().map(|bytes| bytes.as_ref()),
         )?;
-        self.store
-            .put(&new_ckey, new_centroids_data.clone())
-            .await?;
 
         // CPU phase: pre-serialize payloads for REWRITTEN clusters only.
         //
@@ -1163,16 +1600,34 @@ impl Compactor {
         // every cluster is rewritten, so this seed is a harmless superset that
         // the rewritten-cluster scan reproduces anyway.
         let mut bitmap_fields_set: std::collections::HashSet<String> =
-            if carry_over && self.indexing_config.bitmap_index {
+            if carries_clusters && self.indexing_config.bitmap_index {
                 old_bitmap_fields.iter().cloned().collect()
             } else {
                 std::collections::HashSet::new()
             };
-        let mut payloads: Vec<(String, Bytes)> = Vec::new();
+        let mut payloads: Vec<(String, Bytes)> = vec![(new_ckey, new_centroids_data.clone())];
         let mut cluster_object_sizes: HashMap<String, u64> = HashMap::new();
 
         let mut sketch_unavailable_reason = None;
-        let stitched_sketch = if let Some(old_sketch_ref) = old_sketch_ref {
+        let stitched_sketch = if let Some(old_sketch) = preloaded_old_sketch.as_ref() {
+            match stitch_resident_sketch(
+                namespace,
+                new_segment_id,
+                dim,
+                old_sketch,
+                &touched,
+                &cluster_vecs,
+                &cluster_attrs,
+            )? {
+                ResidentSketchStitch::Stitched(sketch_ref, sketch_data, resident) => {
+                    Some((sketch_ref, sketch_data, *resident))
+                }
+                ResidentSketchStitch::Unavailable(reason) => {
+                    sketch_unavailable_reason = Some(reason);
+                    None
+                }
+            }
+        } else if let Some(old_sketch_ref) = old_sketch_ref {
             match get_compaction_read(
                 &self.store,
                 namespace,
@@ -1181,34 +1636,38 @@ impl Compactor {
             )
             .await
             {
-                Ok(old_sketch_data) => match ResidentSketch::from_bytes(&old_sketch_data) {
-                    Ok(old_sketch) => match stitch_resident_sketch(
-                        namespace,
-                        new_segment_id,
-                        dim,
-                        &old_sketch,
-                        &touched,
-                        &cluster_vecs,
-                        &cluster_attrs,
-                    )? {
-                        ResidentSketchStitch::Stitched(sketch_ref, sketch_data, resident) => {
-                            Some((sketch_ref, sketch_data, *resident))
-                        }
-                        ResidentSketchStitch::Unavailable(reason) => {
-                            sketch_unavailable_reason = Some(reason);
+                Ok(old_sketch_data) => {
+                    match crate::index::ivf_flat::sketch::ResidentSketch::from_bytes(
+                        &old_sketch_data,
+                    ) {
+                        Ok(old_sketch) => match stitch_resident_sketch(
+                            namespace,
+                            new_segment_id,
+                            dim,
+                            &old_sketch,
+                            &touched,
+                            &cluster_vecs,
+                            &cluster_attrs,
+                        )? {
+                            ResidentSketchStitch::Stitched(sketch_ref, sketch_data, resident) => {
+                                Some((sketch_ref, sketch_data, *resident))
+                            }
+                            ResidentSketchStitch::Unavailable(reason) => {
+                                sketch_unavailable_reason = Some(reason);
+                                None
+                            }
+                        },
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                key = %old_sketch_ref.key,
+                                "old resident sketch could not be decoded for stitching"
+                            );
+                            sketch_unavailable_reason = Some("old_sketch_decode_failed");
                             None
                         }
-                    },
-                    Err(error) => {
-                        warn!(
-                            error = %error,
-                            key = %old_sketch_ref.key,
-                            "old resident sketch could not be decoded for stitching"
-                        );
-                        sketch_unavailable_reason = Some("old_sketch_decode_failed");
-                        None
                     }
-                },
+                }
                 Err(ZeppelinError::NotFound { key }) => {
                     warn!(
                         key = %key,
@@ -1227,11 +1686,19 @@ impl Compactor {
             if let Some(stitched_sketch) = stitched_sketch {
                 stitched_sketch
             } else {
-                crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
-                    .with_label_values(&[namespace, "sketch_stitch_unavailable"])
-                    .inc();
+                let reason = sketch_unavailable_reason.unwrap_or("unknown");
+                meter_sketch_unavailable(namespace, reason);
+                if !allow_sketch_rebuild {
+                    warn!(
+                        reason,
+                        "bounded incremental resident sketch stitch unavailable"
+                    );
+                    return Err(ZeppelinError::Index(format!(
+                        "bounded incremental resident sketch stitch unavailable: {reason}"
+                    )));
+                }
                 warn!(
-                    reason = sketch_unavailable_reason.unwrap_or("unknown"),
+                    reason,
                     "incremental resident sketch stitch unavailable, rebuilding sketch"
                 );
                 build_resident_sketch(
@@ -1319,12 +1786,10 @@ impl Compactor {
                 )
                 .await?;
                 let codebook = PqCodebook::from_bytes(&cb_data)?;
-                self.store
-                    .put(
-                        &pq_codebook_key(namespace, new_segment_id),
-                        codebook.to_bytes(),
-                    )
-                    .await?;
+                payloads.push((
+                    pq_codebook_key(namespace, new_segment_id),
+                    codebook.to_bytes(),
+                ));
 
                 for i in 0..num_clusters {
                     if !touched[i] {
@@ -1340,7 +1805,7 @@ impl Compactor {
             crate::index::quantization::QuantizationType::None => {}
         }
 
-        // I/O phase: write all rewritten-cluster payloads in parallel.
+        // I/O phase: write all new segment-global and rewritten-cluster payloads in parallel.
         let write_futs: Vec<_> = payloads
             .iter()
             .map(|(key, data)| self.store.put(key, data.clone()))
@@ -1384,6 +1849,261 @@ impl Compactor {
             cluster_objects_out,
         ))
     }
+}
+
+fn meter_sketch_unavailable(namespace: &str, reason: &str) {
+    crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
+        .with_label_values(&[namespace, "sketch_stitch_unavailable"])
+        .inc();
+    debug!(
+        reason,
+        "metered incremental resident sketch stitch unavailable"
+    );
+}
+
+fn keep_finite_compaction_vector(namespace: &str, vector: &VectorEntry) -> bool {
+    // Defense in depth (Task 10 I4): the API boundary now rejects NaN/inf, but
+    // data written BEFORE that fix may already be durable on S3. This skip is
+    // the ONE sanctioned degradation in the compactor: crashing here would
+    // fail every future compaction cycle for the namespace. Skipping is loud:
+    // ERROR-level structured log + metric per dropped vector. In the bounded
+    // incremental path, untouched carried clusters are no longer scanned, so
+    // any pre-Task-10 poison there remains served exactly as before until that
+    // cluster is rewritten or a retrain fires.
+    if let Some(bad_idx) = vector.values.iter().position(|x| !x.is_finite()) {
+        error!(
+            vector_id = %vector.id,
+            dimension = bad_idx,
+            value = %vector.values[bad_idx],
+            "skipping vector with non-finite value during compaction; \
+             it will be dropped from the compacted segment"
+        );
+        crate::metrics::NON_FINITE_VECTORS_SKIPPED_TOTAL
+            .with_label_values(&[namespace])
+            .inc();
+        false
+    } else {
+        true
+    }
+}
+
+fn bounded_survivor_count(
+    old_membership: &MembershipData,
+    latest_vectors: &HashMap<String, VectorEntry>,
+    deleted_ids: &HashSet<String>,
+) -> usize {
+    let old_survivors = old_membership
+        .entries
+        .iter()
+        .filter(|(id, _)| !deleted_ids.contains(id) && !latest_vectors.contains_key(id))
+        .count();
+    let wal_survivors = latest_vectors
+        .values()
+        .filter(|entry| entry.values.iter().all(|value| value.is_finite()))
+        .count();
+    old_survivors + wal_survivors
+}
+
+fn nearest_cluster(centroids: &[Vec<f32>], values: &[f32]) -> Result<usize> {
+    use crate::index::distance::euclidean_distance;
+
+    if centroids.is_empty() {
+        return Err(ZeppelinError::Index(
+            "cannot assign vector with zero centroids".into(),
+        ));
+    }
+    let expected = centroids[0].len();
+    if values.len() != expected {
+        return Err(ZeppelinError::DimensionMismatch {
+            expected,
+            actual: values.len(),
+        });
+    }
+    let mut best_dist = f32::MAX;
+    let mut best_cluster = 0usize;
+    for (cluster_idx, centroid) in centroids.iter().enumerate() {
+        if centroid.len() != expected {
+            return Err(ZeppelinError::Index(format!(
+                "centroid {cluster_idx} has dim {}, expected {expected}",
+                centroid.len()
+            )));
+        }
+        let dist = euclidean_distance(values, centroid);
+        if dist < best_dist {
+            best_dist = dist;
+            best_cluster = cluster_idx;
+        }
+    }
+    Ok(best_cluster)
+}
+
+async fn load_full_surviving_vectors_for_fallback(
+    store: &ZeppelinStore,
+    namespace: &str,
+    old_segment_id: Option<&str>,
+    old_segment_ref: Option<&SegmentRef>,
+    old_cluster_owners: &[String],
+    mut latest_vectors: HashMap<String, VectorEntry>,
+    deleted_ids: &HashSet<String>,
+) -> Result<Vec<VectorEntry>> {
+    if let Some(seg_id) = old_segment_id {
+        let is_hierarchical = old_segment_ref
+            .map(|segment| segment.hierarchical)
+            .unwrap_or(false);
+        let (existing_vecs, _id_to_cluster) = load_segment_vectors(
+            store,
+            namespace,
+            seg_id,
+            is_hierarchical,
+            old_cluster_owners,
+            old_segment_ref
+                .map(|segment| segment.cluster_objects.as_slice())
+                .unwrap_or(&[]),
+        )
+        .await?;
+        for vector in existing_vecs {
+            if !latest_vectors.contains_key(&vector.id) && !deleted_ids.contains(&vector.id) {
+                latest_vectors.insert(vector.id.clone(), vector);
+            }
+        }
+    }
+
+    let mut vectors: Vec<VectorEntry> = latest_vectors
+        .values()
+        .filter(|vector| keep_finite_compaction_vector(namespace, vector))
+        .cloned()
+        .collect();
+    vectors.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(vectors)
+}
+
+async fn load_touched_segment_vectors(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_id: &str,
+    cluster_owners: &[String],
+    cluster_objects: &[ClusterDataObjectRef],
+    touched: &[bool],
+) -> Result<Vec<Vec<VectorEntry>>> {
+    let owner = |i: usize| -> &str {
+        cluster_owners
+            .get(i)
+            .map(String::as_str)
+            .unwrap_or(segment_id)
+    };
+    let num_clusters = touched.len();
+    let mut cluster_results = Vec::new();
+
+    if cluster_objects.is_empty() {
+        cluster_results =
+            futures::future::join_all((0..num_clusters).filter(|&i| touched[i]).map(|i| {
+                let cvec_key = cluster_key(namespace, owner(i), i);
+                let cattr_key = attrs_key(namespace, owner(i), i);
+                async move {
+                    let (cluster_res, attrs_res) = tokio::join!(
+                        get_compaction_read(
+                            store,
+                            namespace,
+                            &cvec_key,
+                            COMPACTION_READ_CLASS_CLUSTER,
+                        ),
+                        get_compaction_read(
+                            store,
+                            namespace,
+                            &cattr_key,
+                            COMPACTION_READ_CLASS_ATTRS,
+                        ),
+                    );
+                    (i, cluster_res, attrs_res)
+                }
+            }))
+            .await;
+    } else {
+        let object_results = futures::future::join_all(
+            cluster_objects
+                .iter()
+                .filter(|object_ref| {
+                    object_ref
+                        .clusters
+                        .iter()
+                        .any(|&cluster_idx| touched.get(cluster_idx).copied().unwrap_or(false))
+                })
+                .map(|object_ref| async move {
+                    let object_res = get_compaction_read(
+                        store,
+                        namespace,
+                        &object_ref.key,
+                        COMPACTION_READ_CLASS_CLUSTER,
+                    )
+                    .await;
+                    (object_ref, object_res)
+                }),
+        )
+        .await;
+
+        for (object_ref, object_res) in object_results {
+            let object_data = object_res?;
+            let Some(sections) = cluster_object_sections(&object_data)? else {
+                return Err(ZeppelinError::Index(format!(
+                    "manifest cluster object {} did not contain grouped cluster data",
+                    object_ref.key
+                )));
+            };
+            for &cluster_idx in &object_ref.clusters {
+                if cluster_idx >= num_clusters {
+                    return Err(ZeppelinError::Index(format!(
+                        "cluster object {} references out-of-range cluster {cluster_idx}",
+                        object_ref.key
+                    )));
+                }
+                if !touched[cluster_idx] {
+                    continue;
+                }
+                let section = sections
+                    .iter()
+                    .find(|section| section.cluster_idx == cluster_idx)
+                    .ok_or_else(|| {
+                        ZeppelinError::Index(format!(
+                            "cluster object {} missing cluster {cluster_idx}",
+                            object_ref.key
+                        ))
+                    })?;
+                let cattr_key = attrs_key(namespace, owner(cluster_idx), cluster_idx);
+                let attrs_res =
+                    get_compaction_read(store, namespace, &cattr_key, COMPACTION_READ_CLASS_ATTRS)
+                        .await;
+                cluster_results.push((
+                    cluster_idx,
+                    Ok(bytes::Bytes::copy_from_slice(section.data)),
+                    attrs_res,
+                ));
+            }
+        }
+    }
+
+    let mut clusters = vec![Vec::new(); num_clusters];
+    for (cluster_idx, cluster_res, attrs_res) in cluster_results {
+        let cluster = deserialize_cluster(&cluster_res?)?;
+        let attrs = deserialize_attrs(&attrs_res?)?;
+        if attrs.len() < cluster.ids.len() {
+            return Err(ZeppelinError::Index(format!(
+                "attrs length {} shorter than cluster {cluster_idx} vector count {}",
+                attrs.len(),
+                cluster.ids.len()
+            )));
+        }
+        for (row_idx, id) in cluster.ids.into_iter().enumerate() {
+            let entry = VectorEntry {
+                id,
+                values: cluster.vectors[row_idx].clone(),
+                attributes: attrs.get(row_idx).cloned().flatten(),
+            };
+            if keep_finite_compaction_vector(namespace, &entry) {
+                clusters[cluster_idx].push(entry);
+            }
+        }
+    }
+    Ok(clusters)
 }
 
 fn incremental_cluster_objects(
