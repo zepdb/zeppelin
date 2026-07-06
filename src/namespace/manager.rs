@@ -147,6 +147,9 @@ impl NamespaceManager {
                 "dimensions must be > 0".to_string(),
             ));
         }
+        for (field, config) in &full_text_search {
+            config.validate(&format!("full_text_search.{field}"))?;
+        }
 
         // Atomic create: write meta.json only if it doesn't already exist.
         // Uses S3 `If-None-Match: *` (PutMode::Create) to prevent TOCTOU races

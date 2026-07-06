@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 use zeppelin::config::Config;
-use zeppelin::startup::{build_app, init_logging, resolve_config_path};
+use zeppelin::startup::{build_app, init_logging, resolve_config_path, shutdown_background_tasks};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging(&config);
 
     // Build application (router + background tasks)
-    let (app, shutdown_tx) = build_app(config.clone()).await?;
+    let (app, shutdown_tx, compaction_handle) = build_app(config.clone()).await?;
 
     // Bind and serve
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -51,8 +51,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     tracing::info!("server stopped, shutting down background tasks");
-    let _ = shutdown_tx.send(true);
-    tokio::time::sleep(Duration::from_secs(config.server.shutdown_timeout_secs)).await;
+    shutdown_background_tasks(
+        shutdown_tx,
+        compaction_handle,
+        Duration::from_secs(config.server.shutdown_timeout_secs),
+    )
+    .await?;
     tracing::info!("zeppelin shutdown complete");
 
     Ok(())

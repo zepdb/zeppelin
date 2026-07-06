@@ -2,8 +2,10 @@ use bytes::Bytes;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
 use object_store::{
-    ClientOptions, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion,
+    BackoffConfig, ClientOptions, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload,
+    RetryConfig, UpdateVersion,
 };
+use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,7 +43,9 @@ impl ZeppelinStore {
                     }
                     if let Some(ref endpoint) = config.s3_endpoint {
                         if !endpoint.is_empty() {
-                            builder = builder.with_endpoint(endpoint);
+                            builder = builder
+                                .with_endpoint(endpoint)
+                                .with_virtual_hosted_style_request(false);
                         }
                     }
                     if let Some(ref key_id) = config.s3_access_key_id {
@@ -53,6 +57,15 @@ impl ZeppelinStore {
                     // Enable conditional PUT (ETag-based CAS) — required for
                     // manifest conflict detection and lease CAS operations.
                     builder = builder.with_conditional_put(S3ConditionalPut::ETagMatch);
+                    builder = builder.with_retry(RetryConfig {
+                        backoff: BackoffConfig {
+                            init_backoff: Duration::from_millis(100),
+                            max_backoff: Duration::from_millis(500),
+                            base: 2.0,
+                        },
+                        max_retries: 2,
+                        retry_timeout: Duration::from_secs(2),
+                    });
 
                     // Connection pool tuning: increase idle connections and timeouts
                     // to prevent 28% sustained throughput degradation observed in Run-007.
@@ -60,7 +73,7 @@ impl ZeppelinStore {
                         .with_allow_http(config.s3_allow_http)
                         .with_pool_max_idle_per_host(64)
                         .with_timeout(std::time::Duration::from_secs(30))
-                        .with_connect_timeout(std::time::Duration::from_secs(10))
+                        .with_connect_timeout(std::time::Duration::from_secs(2))
                         .with_pool_idle_timeout(std::time::Duration::from_secs(90));
                     builder = builder.with_client_options(client_options);
 
@@ -87,6 +100,68 @@ impl ZeppelinStore {
             };
 
         Ok(Self { inner: store })
+    }
+
+    /// Check that an explicitly configured S3-compatible endpoint accepts TCP connections.
+    pub async fn probe_configured_endpoint(
+        config: &StorageConfig,
+        timeout_duration: Duration,
+    ) -> Result<()> {
+        if config.backend != crate::config::StorageBackend::S3 {
+            return Ok(());
+        }
+        let Some(endpoint) = config
+            .s3_endpoint
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
+        };
+        let (host, port) = endpoint_host_port(endpoint)?;
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            let addr = SocketAddr::new(ip, port);
+            if ip.is_loopback() {
+                match std::net::TcpListener::bind(addr) {
+                    Ok(listener) => {
+                        drop(listener);
+                        return Err(ZeppelinError::Config(format!(
+                            "storage endpoint {endpoint} is unreachable at {host}:{port}: no listener on loopback port"
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Ok(()),
+                    Err(_error) => {}
+                }
+            }
+            match tokio::task::spawn_blocking(move || {
+                std::net::TcpStream::connect_timeout(&addr, timeout_duration)
+            })
+            .await
+            {
+                Ok(Ok(_stream)) => Ok(()),
+                Ok(Err(error)) => Err(ZeppelinError::Config(format!(
+                    "storage endpoint {endpoint} is unreachable at {host}:{port}: {error}"
+                ))),
+                Err(error) => Err(ZeppelinError::Config(format!(
+                    "storage endpoint probe task failed: {error}"
+                ))),
+            }
+        } else {
+            match tokio::time::timeout(
+                timeout_duration,
+                tokio::net::TcpStream::connect((host.as_str(), port)),
+            )
+            .await
+            {
+                Ok(Ok(_stream)) => Ok(()),
+                Ok(Err(error)) => Err(ZeppelinError::Config(format!(
+                    "storage endpoint {endpoint} is unreachable at {host}:{port}: {error}"
+                ))),
+                Err(_elapsed) => Err(ZeppelinError::Config(format!(
+                    "storage endpoint {endpoint} did not accept a connection within {}s",
+                    timeout_duration.as_secs()
+                ))),
+            }
+        }
     }
 
     /// Create a store directly from an ObjectStore instance (for testing).
@@ -612,4 +687,50 @@ impl ZeppelinStore {
 
         Ok(count)
     }
+}
+
+fn endpoint_host_port(endpoint: &str) -> Result<(String, u16)> {
+    let (default_port, without_scheme) = if let Some(rest) = endpoint.strip_prefix("http://") {
+        (80, rest)
+    } else if let Some(rest) = endpoint.strip_prefix("https://") {
+        (443, rest)
+    } else {
+        (443, endpoint)
+    };
+    let authority = without_scheme
+        .split('/')
+        .next()
+        .filter(|authority| !authority.is_empty())
+        .ok_or_else(|| ZeppelinError::Config(format!("invalid S3 endpoint URL: {endpoint}")))?;
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, after_host)) = rest.split_once(']') else {
+            return Err(ZeppelinError::Config(format!(
+                "invalid bracketed S3 endpoint host: {endpoint}"
+            )));
+        };
+        let port = after_host
+            .strip_prefix(':')
+            .map(parse_endpoint_port)
+            .transpose()?
+            .unwrap_or(default_port);
+        return Ok((host.to_string(), port));
+    }
+
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => (host, parse_endpoint_port(port)?),
+        Some((_host, _port)) => {
+            return Err(ZeppelinError::Config(format!(
+                "invalid S3 endpoint host: {endpoint}"
+            )));
+        }
+        None => (authority, default_port),
+    };
+    Ok((host.to_string(), port))
+}
+
+fn parse_endpoint_port(port: &str) -> Result<u16> {
+    port.parse::<u16>()
+        .map_err(|error| ZeppelinError::Config(format!("invalid S3 endpoint port {port}: {error}")))
 }

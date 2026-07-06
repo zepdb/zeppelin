@@ -20,6 +20,7 @@ use crate::cache::{
 use crate::compaction::background::start_compaction_thread;
 use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget};
+use crate::error::{Result as ZeppelinResult, ZeppelinError};
 use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
@@ -27,6 +28,8 @@ use crate::server::build_router;
 use crate::server::AppState;
 use crate::storage::ZeppelinStore;
 use crate::wal::{LeaseManager, WalReader, WalWriter};
+
+const STORAGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Resolve the configuration file path.
 ///
@@ -69,6 +72,7 @@ pub fn init_logging(config: &Config) {
 /// Returns:
 /// - The axum `Router` ready to be served
 /// - A shutdown channel sender to gracefully stop background tasks
+/// - The background compaction thread handle
 ///
 /// This function:
 /// - Initializes metrics
@@ -78,11 +82,12 @@ pub fn init_logging(config: &Config) {
 /// - Builds `AppState` and axum `Router`
 pub async fn build_app(
     config: Config,
-) -> Result<(Router, watch::Sender<bool>), Box<dyn std::error::Error>> {
+) -> Result<(Router, watch::Sender<bool>, std::thread::JoinHandle<()>), Box<dyn std::error::Error>>
+{
     tracing::info!("zeppelin starting");
 
     // Detect CPU budget and log allocation
-    let cpu_budget = CpuBudget::auto();
+    let cpu_budget = CpuBudget::auto()?;
     tracing::info!(
         query_workers = cpu_budget.query_workers,
         compaction_workers = cpu_budget.compaction_workers,
@@ -107,17 +112,107 @@ pub async fn build_app(
     // Initialize metrics
     crate::metrics::init();
 
+    let mut storage_available = true;
+    match ZeppelinStore::probe_configured_endpoint(&config.storage, STORAGE_STARTUP_TIMEOUT).await {
+        Ok(()) => {}
+        Err(error) if config.storage.fail_fast => {
+            let error = ZeppelinError::Config(format!("storage health probe failed: {error}"));
+            tracing::error!(
+                error = %error,
+                backend = %config.storage.backend,
+                bucket = %config.storage.bucket,
+                "storage health probe failed; refusing to boot"
+            );
+            return Err(Box::new(error));
+        }
+        Err(error) => {
+            storage_available = false;
+            tracing::warn!(
+                error = %error,
+                backend = %config.storage.backend,
+                bucket = %config.storage.bucket,
+                "storage health probe failed; continuing because storage.fail_fast=false"
+            );
+        }
+    }
     // Initialize storage
     let store = ZeppelinStore::from_config(&config.storage)?;
+    if storage_available {
+        match probe_storage(&store).await {
+            Ok(()) => tracing::info!("storage health probe succeeded"),
+            Err(error) if config.storage.fail_fast => {
+                tracing::error!(
+                    error = %error,
+                    backend = %config.storage.backend,
+                    bucket = %config.storage.bucket,
+                    "storage health probe failed; refusing to boot"
+                );
+                return Err(Box::new(error));
+            }
+            Err(error) => {
+                storage_available = false;
+                tracing::warn!(
+                    error = %error,
+                    backend = %config.storage.backend,
+                    bucket = %config.storage.bucket,
+                    "storage health probe failed; continuing because storage.fail_fast=false"
+                );
+            }
+        }
+    }
 
     // Initialize namespace manager and scan existing namespaces
     let namespace_manager = Arc::new(NamespaceManager::new_with_registry_ttl(
         store.clone(),
         Duration::from_millis(config.cache.namespace_registry_ttl_ms),
     ));
-    match namespace_manager.scan_and_register().await {
-        Ok(count) => tracing::info!(count, "registered existing namespaces"),
-        Err(e) => tracing::warn!(error = %e, "failed to scan namespaces on startup"),
+    if storage_available {
+        match tokio::time::timeout(
+            STORAGE_STARTUP_TIMEOUT,
+            namespace_manager.scan_and_register(),
+        )
+        .await
+        {
+            Ok(Ok(count)) => tracing::info!(count, "registered existing namespaces"),
+            Ok(Err(error)) if config.storage.fail_fast => {
+                let error =
+                    ZeppelinError::Config(format!("namespace scan failed during startup: {error}"));
+                tracing::error!(
+                    error = %error,
+                    backend = %config.storage.backend,
+                    bucket = %config.storage.bucket,
+                    "failed to scan namespaces on startup; refusing to boot"
+                );
+                return Err(Box::new(error));
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to scan namespaces on startup; continuing because storage.fail_fast=false"
+                );
+            }
+            Err(_elapsed) if config.storage.fail_fast => {
+                let error = ZeppelinError::Config(format!(
+                    "namespace scan timed out after {}s during startup",
+                    STORAGE_STARTUP_TIMEOUT.as_secs()
+                ));
+                tracing::error!(
+                    error = %error,
+                    backend = %config.storage.backend,
+                    bucket = %config.storage.bucket,
+                    "failed to scan namespaces on startup; refusing to boot"
+                );
+                return Err(Box::new(error));
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_secs = STORAGE_STARTUP_TIMEOUT.as_secs(),
+                    "namespace scan timed out on startup; continuing because storage.fail_fast=false"
+                );
+            }
+        }
+    } else {
+        tracing::warn!("skipping namespace scan because storage health probe failed");
     }
 
     // Initialize WAL writer and reader
@@ -165,7 +260,7 @@ pub async fn build_app(
 
     // Spawn background compaction on a dedicated runtime (CPU isolation from queries)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let _compaction_handle = start_compaction_thread(
+    let compaction_handle = start_compaction_thread(
         compactor.clone(),
         namespace_manager.clone(),
         shutdown_rx,
@@ -219,7 +314,43 @@ pub async fn build_app(
     // Build router
     let app = build_router(state);
 
-    Ok((app, shutdown_tx))
+    Ok((app, shutdown_tx, compaction_handle))
+}
+
+async fn probe_storage(store: &ZeppelinStore) -> ZeppelinResult<()> {
+    match tokio::time::timeout(STORAGE_STARTUP_TIMEOUT, store.list_common_prefixes("")).await {
+        Ok(result) => result.map(|_| ()).map_err(|error| {
+            ZeppelinError::Config(format!("storage health probe failed: {error}"))
+        }),
+        Err(_elapsed) => Err(ZeppelinError::Config(format!(
+            "storage health probe timed out after {}s",
+            STORAGE_STARTUP_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// Signal background tasks and join the compaction thread within `timeout_duration`.
+pub async fn shutdown_background_tasks(
+    shutdown_tx: watch::Sender<bool>,
+    compaction_handle: std::thread::JoinHandle<()>,
+    timeout_duration: Duration,
+) -> ZeppelinResult<()> {
+    let _ = shutdown_tx.send(true);
+    let join_task = tokio::task::spawn_blocking(move || compaction_handle.join());
+
+    match tokio::time::timeout(timeout_duration, join_task).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(_panic))) => Err(ZeppelinError::Config(
+            "background compaction thread panicked during shutdown".to_string(),
+        )),
+        Ok(Err(error)) => Err(ZeppelinError::Config(format!(
+            "failed to join background compaction thread: {error}"
+        ))),
+        Err(_elapsed) => Err(ZeppelinError::Config(format!(
+            "timed out after {}s waiting for background compaction shutdown",
+            timeout_duration.as_secs()
+        ))),
+    }
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -285,10 +416,11 @@ mod tests {
         let result = build_app(config).await;
         assert!(result.is_ok());
 
-        let (_router, shutdown_tx) = result.unwrap();
+        let (_router, shutdown_tx, compaction_handle) = result.unwrap();
 
-        // Signal shutdown
-        let _ = shutdown_tx.send(true);
+        shutdown_background_tasks(shutdown_tx, compaction_handle, Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -300,8 +432,10 @@ mod tests {
         let result = build_app(config).await;
         assert!(result.is_ok());
 
-        let (_router, shutdown_tx) = result.unwrap();
-        let _ = shutdown_tx.send(true);
+        let (_router, shutdown_tx, compaction_handle) = result.unwrap();
+        shutdown_background_tasks(shutdown_tx, compaction_handle, Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -309,14 +443,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(&tmp);
 
-        let (router, shutdown_tx) = build_app(config).await.unwrap();
+        let (router, shutdown_tx, compaction_handle) = build_app(config).await.unwrap();
 
         // Send shutdown signal
-        let result = shutdown_tx.send(true);
-        assert!(result.is_ok());
-
-        // Give the compaction loop a moment to see the signal
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        shutdown_background_tasks(shutdown_tx, compaction_handle, Duration::from_secs(1))
+            .await
+            .unwrap();
 
         // If we get here without hanging, shutdown worked
         drop(router);

@@ -42,6 +42,7 @@ impl TestHarness {
                     s3_access_key_id: None,
                     s3_secret_access_key: None,
                     s3_allow_http: false,
+                    fail_fast: true,
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
             }
@@ -57,6 +58,7 @@ impl TestHarness {
                         .ok()
                         .map(|v| v == "true")
                         .unwrap_or(false),
+                    fail_fast: true,
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
             }
@@ -78,6 +80,7 @@ impl TestHarness {
                             .unwrap_or_else(|_| "minioadmin".to_string()),
                     ),
                     s3_allow_http: true,
+                    fail_fast: true,
                 };
                 ZeppelinStore::from_config(&config).expect("failed to create store from config")
             }

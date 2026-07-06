@@ -7,6 +7,8 @@ use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::error::{Result, ZeppelinError};
+
 /// Supported languages for full-text search tokenization.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +20,7 @@ pub enum FtsLanguage {
 
 /// Per-field configuration for full-text search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FtsFieldConfig {
     /// Language for tokenization and stemming.
     #[serde(default)]
@@ -68,6 +71,32 @@ impl Default for FtsFieldConfig {
             k1: default_k1(),
             b: default_b(),
             max_token_length: default_max_token_length(),
+        }
+    }
+}
+
+impl FtsFieldConfig {
+    /// Validate BM25/tokenization bounds for one configured FTS field.
+    pub fn validate(&self, path: &str) -> Result<()> {
+        let mut violations = Vec::new();
+
+        if !self.k1.is_finite() || self.k1 <= 0.0 || self.k1 > 10.0 {
+            violations.push(format!("{path}.k1 must be finite and in (0, 10]"));
+        }
+        if !self.b.is_finite() || self.b < 0.0 || self.b > 1.0 {
+            violations.push(format!("{path}.b must be finite and in [0, 1]"));
+        }
+        if self.max_token_length == 0 {
+            violations.push(format!("{path}.max_token_length must be at least 1"));
+        }
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(ZeppelinError::Validation(format!(
+                "invalid FTS field configuration:\n- {}",
+                violations.join("\n- ")
+            )))
         }
     }
 }
@@ -292,6 +321,29 @@ mod tests {
         assert!((cfg.k1 - 1.2).abs() < f32::EPSILON);
         assert!((cfg.b - 0.75).abs() < f32::EPSILON);
         assert_eq!(cfg.max_token_length, 40);
+    }
+
+    #[test]
+    fn test_fts_field_config_validate_reports_all_bound_violations() {
+        let cfg = FtsFieldConfig {
+            k1: -0.1,
+            b: 1.1,
+            max_token_length: 0,
+            ..Default::default()
+        };
+
+        let err = cfg.validate("full_text_search.content").unwrap_err();
+        let message = err.to_string();
+        for needle in [
+            "full_text_search.content.k1",
+            "full_text_search.content.b",
+            "full_text_search.content.max_token_length",
+        ] {
+            assert!(
+                message.contains(needle),
+                "expected FTS validation error to contain {needle:?}, got: {message}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use crate::error::{Result, ZeppelinError};
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 const RERANK_COALESCE_GAP_ENV: &str = "ZEPPELIN_RERANK_COALESCE_GAP_BYTES";
 const HYDRATION_POLICY_ENV: &str = "ZEPPELIN_HYDRATION_POLICY";
@@ -46,6 +48,7 @@ pub const DEFAULT_RERANK_COALESCE_GAP_BYTES: usize = 1024 * 1024;
 
 /// Top-level application configuration loaded from a TOML file, env vars, or defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// HTTP server settings (host, port, limits).
     #[serde(default)]
@@ -75,6 +78,7 @@ pub struct Config {
 
 /// Query-time configuration loaded at boot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryConfig {
     /// Maximum gap, in bytes, between rerank f32 ranges merged into one GET.
     ///
@@ -130,6 +134,51 @@ mod tests {
                 HYDRATION_POLICY_ENV,
                 HYDRATION_HEAT_QUERIES_ENV,
                 HYDRATION_HEAT_WINDOW_SECS_ENV,
+                "ZEPPELIN_QUERY_WORKERS",
+                "ZEPPELIN_COMPACTION_WORKERS",
+                "ZEPPELIN_RAYON_THREADS",
+                "ZEPPELIN_HOST",
+                "ZEPPELIN_PORT",
+                "ZEPPELIN_REQUEST_TIMEOUT_SECS",
+                "ZEPPELIN_MAX_CONCURRENT_QUERIES",
+                "ZEPPELIN_MAX_BATCH_SIZE",
+                "ZEPPELIN_MAX_QUERY_BATCH_SIZE",
+                "ZEPPELIN_MAX_TOP_K",
+                "ZEPPELIN_SHUTDOWN_TIMEOUT_SECS",
+                "ZEPPELIN_MAX_DIMENSIONS",
+                "ZEPPELIN_MAX_VECTOR_ID_LENGTH",
+                "ZEPPELIN_MAX_REQUEST_BODY_MB",
+                "ZEPPELIN_DEFAULT_TOP_K",
+                "ZEPPELIN_RATE_LIMIT_RPS",
+                "ZEPPELIN_RATE_LIMIT_BURST",
+                "STORAGE_BACKEND",
+                "S3_BUCKET",
+                "AWS_REGION",
+                "S3_ENDPOINT",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "S3_ALLOW_HTTP",
+                "ZEPPELIN_STORAGE_FAIL_FAST",
+                "ZEPPELIN_CACHE_DIR",
+                "ZEPPELIN_CACHE_MAX_SIZE_GB",
+                "ZEPPELIN_MEMORY_CACHE_MAX_MB",
+                "ZEPPELIN_MANIFEST_CACHE_TTL_MS",
+                "ZEPPELIN_NAMESPACE_REGISTRY_TTL_MS",
+                "ZEPPELIN_DEFAULT_NUM_CENTROIDS",
+                "ZEPPELIN_DEFAULT_NPROBE",
+                "ZEPPELIN_QUANTIZATION",
+                "ZEPPELIN_BITMAP_INDEX",
+                "ZEPPELIN_FTS_INDEX",
+                "ZEPPELIN_BM25_MAX_FULL_SCAN_CLUSTERS",
+                "ZEPPELIN_HIERARCHICAL",
+                "ZEPPELIN_LEAF_SIZE",
+                "ZEPPELIN_COMPACTION_INTERVAL_SECS",
+                "ZEPPELIN_MAX_WAL_FRAGMENTS",
+                "ZEPPELIN_MAX_WAL_AGE_SECS",
+                "ZEPPELIN_MAX_WAL_BYTES",
+                "ZEPPELIN_MAX_PENDING_DELETES",
+                "ZEPPELIN_MAX_OLD_SEGMENTS",
+                "ZEPPELIN_LOG_FORMAT",
             ];
             let original = env_names
                 .into_iter()
@@ -158,6 +207,160 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), contents).unwrap();
         Config::load(Some(file.path().to_str().unwrap()))
+    }
+
+    fn assert_config_error_contains(result: Result<Config>, needles: &[&str]) {
+        let err = result.unwrap_err();
+        let message = err.to_string();
+        for needle in needles {
+            assert!(
+                message.contains(needle),
+                "expected config error to contain {needle:?}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_override_rejects_present_but_unparseable_port() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        std::env::set_var("ZEPPELIN_PORT", "80eighty");
+
+        assert_config_error_contains(load_toml(""), &["ZEPPELIN_PORT", "80eighty"]);
+    }
+
+    #[test]
+    fn toml_unknown_key_is_startup_error() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        assert_config_error_contains(
+            load_toml(
+                r#"
+                [server]
+                max_topk = 5
+                "#,
+            ),
+            &["max_topk"],
+        );
+    }
+
+    #[test]
+    fn validate_reports_each_cross_field_rule() {
+        type ValidateCase = (&'static str, Box<dyn Fn(&mut Config)>, Vec<&'static str>);
+        let cases: Vec<ValidateCase> = vec![
+            (
+                "server port must be nonzero",
+                Box::new(|config| config.server.port = 0),
+                vec!["server.port"],
+            ),
+            (
+                "rate limit burst must be nonzero when rps is enabled",
+                Box::new(|config| {
+                    config.server.rate_limit_rps = 10;
+                    config.server.rate_limit_burst = 0;
+                }),
+                vec!["server.rate_limit_burst"],
+            ),
+            (
+                "default nprobe must not exceed max nprobe",
+                Box::new(|config| {
+                    config.indexing.max_nprobe = 4;
+                    config.indexing.default_nprobe = 5;
+                }),
+                vec!["indexing.default_nprobe", "indexing.max_nprobe"],
+            ),
+            (
+                "default top k must be nonzero",
+                Box::new(|config| config.server.default_top_k = 0),
+                vec!["server.default_top_k"],
+            ),
+            (
+                "default top k must not exceed max top k",
+                Box::new(|config| {
+                    config.server.max_top_k = 4;
+                    config.server.default_top_k = 5;
+                }),
+                vec!["server.default_top_k", "server.max_top_k"],
+            ),
+            (
+                "max wal age threshold must be nonzero",
+                Box::new(|config| config.compaction.max_wal_age_before_compact_secs = 0),
+                vec!["compaction.max_wal_age_before_compact_secs"],
+            ),
+            (
+                "max wal bytes threshold must be nonzero",
+                Box::new(|config| config.compaction.max_wal_bytes_before_compact = 0),
+                vec!["compaction.max_wal_bytes_before_compact"],
+            ),
+            (
+                "max wal fragment threshold must be at least one",
+                Box::new(|config| config.compaction.max_wal_fragments_before_compact = 0),
+                vec!["compaction.max_wal_fragments_before_compact"],
+            ),
+            (
+                "request timeout must be nonzero",
+                Box::new(|config| config.server.request_timeout_secs = 0),
+                vec!["server.request_timeout_secs"],
+            ),
+            (
+                "shutdown timeout must be nonzero",
+                Box::new(|config| config.server.shutdown_timeout_secs = 0),
+                vec!["server.shutdown_timeout_secs"],
+            ),
+            (
+                "lease duration must be nonzero",
+                Box::new(|config| config.compaction.lease_duration_secs = 0),
+                vec!["compaction.lease_duration_secs"],
+            ),
+            (
+                "existing cache validation remains enforced",
+                Box::new(|config| config.cache.hydration_parallelism = 0),
+                vec!["cache.hydration_parallelism"],
+            ),
+        ];
+
+        for (name, mutate, needles) in cases {
+            let mut config = Config::default();
+            mutate(&mut config);
+            let err = config.validate().unwrap_err();
+            let message = err.to_string();
+            for needle in needles {
+                assert!(
+                    message.contains(needle),
+                    "{name}: expected {needle:?} in {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_reports_all_violations_at_once() {
+        let mut config = Config::default();
+        config.server.port = 0;
+        config.server.request_timeout_secs = 0;
+        config.server.default_top_k = 0;
+        config.indexing.max_nprobe = 4;
+        config.indexing.default_nprobe = 5;
+        config.compaction.max_wal_bytes_before_compact = 0;
+        config.cache.hydration_parallelism = 0;
+
+        let err = config.validate().unwrap_err();
+        let message = err.to_string();
+        for needle in [
+            "server.port",
+            "server.request_timeout_secs",
+            "server.default_top_k",
+            "indexing.default_nprobe",
+            "compaction.max_wal_bytes_before_compact",
+            "cache.hydration_parallelism",
+        ] {
+            assert!(
+                message.contains(needle),
+                "expected aggregate validation error to contain {needle:?}, got: {message}"
+            );
+        }
     }
 
     #[test]
@@ -309,14 +512,16 @@ mod tests {
 ///
 /// Group commit (coalescing concurrent appends into a shared manifest CAS) is
 /// now unconditional in `WalWriter` — there is no batching knob to tune. The
-/// former `batch_manifest_size` / `batch_manifest_timeout_ms` fields are gone;
-/// old configs that still set them parse fine (unknown keys are ignored). The
+/// former `batch_manifest_size` / `batch_manifest_timeout_ms` fields are gone.
+/// With strict boot config, stale WAL keys are rejected instead of ignored. The
 /// struct is retained as the home for future WAL settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WalConfig {}
 
 /// HTTP server configuration including bind address, timeouts, and request limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Bind address for the HTTP server. Default: `"0.0.0.0"`.
     #[serde(default = "default_host")]
@@ -403,6 +608,7 @@ impl std::fmt::Display for StorageBackend {
 
 /// Object storage backend selection and credential configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     /// Which storage backend to use. Default: `S3`.
     #[serde(default)]
@@ -427,10 +633,14 @@ pub struct StorageConfig {
     /// Allow plain HTTP (non-TLS) connections to S3. Default: `false`.
     #[serde(default)]
     pub s3_allow_http: bool,
+    /// Probe storage during boot and refuse to serve if it is unavailable. Default: `true`.
+    #[serde(default = "default_storage_fail_fast")]
+    pub fail_fast: bool,
 }
 
 /// Local disk and in-memory cache settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     /// Directory for on-disk cache files. Default: `/var/cache/zeppelin`.
     #[serde(default = "default_cache_dir")]
@@ -482,6 +692,7 @@ pub enum HydrationPolicyKind {
 
 /// Vector indexing parameters controlling IVF-Flat, quantization, and hierarchical trees.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexingConfig {
     /// Default number of IVF centroids per segment. Default: `256`.
     #[serde(default = "default_num_centroids")]
@@ -535,6 +746,7 @@ pub struct IndexingConfig {
 
 /// Background WAL-to-segment compaction schedule and thresholds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactionConfig {
     /// Polling interval between compaction checks, in seconds. Default: `30`.
     #[serde(default = "default_compaction_interval")]
@@ -577,6 +789,7 @@ pub struct CompactionConfig {
 
 /// Structured logging configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log verbosity filter (e.g. `"info"`, `"debug"`). Default: `"info"`.
     #[serde(default = "default_log_level")]
@@ -620,6 +833,9 @@ fn default_max_request_body_mb() -> usize {
 }
 fn default_bucket() -> String {
     "zeppelin".to_string()
+}
+fn default_storage_fail_fast() -> bool {
+    true
 }
 fn default_cache_dir() -> PathBuf {
     PathBuf::from("/var/cache/zeppelin")
@@ -743,6 +959,7 @@ impl Default for StorageConfig {
             s3_access_key_id: None,
             s3_secret_access_key: None,
             s3_allow_http: false,
+            fail_fast: default_storage_fail_fast(),
         }
     }
 }
@@ -828,7 +1045,7 @@ pub struct CpuBudget {
 
 impl CpuBudget {
     /// Auto-detect CPU count and allocate budgets.
-    pub fn auto() -> Self {
+    pub fn auto() -> Result<Self> {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -842,26 +1059,17 @@ impl CpuBudget {
         };
 
         // Allow env var overrides
-        if let Some(v) = std::env::var("ZEPPELIN_QUERY_WORKERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_QUERY_WORKERS")? {
             budget.query_workers = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_COMPACTION_WORKERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_COMPACTION_WORKERS")? {
             budget.compaction_workers = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_RAYON_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_RAYON_THREADS")? {
             budget.rayon_threads = v;
         }
 
-        budget
+        Ok(budget)
     }
 }
 
@@ -880,37 +1088,101 @@ impl Config {
             }
             None => Config::default(),
         };
-        config.resolve_query_config()?;
         config.apply_env_overrides()?;
-        config.validate_cache_config()?;
+        config.resolve_query_config()?;
+        config.validate()?;
         Ok(config)
     }
 
-    fn validate_cache_config(&self) -> Result<()> {
-        if self.cache.hydration_heat_queries == 0 {
-            return Err(ZeppelinError::Config(
-                "cache.hydration_heat_queries must be greater than zero".into(),
+    /// Validate all boot-time configuration and report every violation at once.
+    pub fn validate(&self) -> Result<()> {
+        let mut violations = Vec::new();
+
+        if self.server.port == 0 {
+            violations.push("server.port must be greater than zero".to_string());
+        }
+        if self.server.request_timeout_secs == 0 {
+            violations.push("server.request_timeout_secs must be greater than zero".to_string());
+        }
+        if self.server.shutdown_timeout_secs == 0 {
+            violations.push("server.shutdown_timeout_secs must be greater than zero".to_string());
+        }
+        if self.server.rate_limit_rps > 0 && self.server.rate_limit_burst == 0 {
+            violations.push(
+                "server.rate_limit_burst must be at least 1 when rate limiting is enabled"
+                    .to_string(),
+            );
+        }
+        if self.server.max_top_k == 0 {
+            violations.push("server.max_top_k must be greater than zero".to_string());
+        }
+        if self.server.default_top_k == 0 {
+            violations.push("server.default_top_k must be greater than zero".to_string());
+        } else if self.server.default_top_k > self.server.max_top_k {
+            violations.push(format!(
+                "server.default_top_k ({}) must be <= server.max_top_k ({})",
+                self.server.default_top_k, self.server.max_top_k
             ));
+        }
+
+        if self.indexing.default_nprobe == 0 {
+            violations.push("indexing.default_nprobe must be greater than zero".to_string());
+        }
+        if self.indexing.max_nprobe == 0 {
+            violations.push("indexing.max_nprobe must be greater than zero".to_string());
+        }
+        if self.indexing.default_nprobe > self.indexing.max_nprobe {
+            violations.push(format!(
+                "indexing.default_nprobe ({}) must be <= indexing.max_nprobe ({})",
+                self.indexing.default_nprobe, self.indexing.max_nprobe
+            ));
+        }
+
+        if self.compaction.max_wal_age_before_compact_secs == 0 {
+            violations.push(
+                "compaction.max_wal_age_before_compact_secs must be greater than zero".to_string(),
+            );
+        }
+        if self.compaction.max_wal_bytes_before_compact == 0 {
+            violations.push(
+                "compaction.max_wal_bytes_before_compact must be greater than zero".to_string(),
+            );
+        }
+        if self.compaction.max_wal_fragments_before_compact == 0 {
+            violations
+                .push("compaction.max_wal_fragments_before_compact must be at least 1".to_string());
+        }
+        if self.compaction.lease_duration_secs == 0 {
+            violations.push("compaction.lease_duration_secs must be greater than zero".to_string());
+        }
+
+        if self.cache.hydration_heat_queries == 0 {
+            violations.push("cache.hydration_heat_queries must be greater than zero".to_string());
         }
         if self.cache.hydration_heat_window_secs == 0 {
-            return Err(ZeppelinError::Config(
-                "cache.hydration_heat_window_secs must be greater than zero".into(),
-            ));
+            violations
+                .push("cache.hydration_heat_window_secs must be greater than zero".to_string());
         }
         if self.cache.hydration_parallelism == 0 {
-            return Err(ZeppelinError::Config(
-                "cache.hydration_parallelism must be greater than zero".into(),
-            ));
+            violations.push("cache.hydration_parallelism must be greater than zero".to_string());
         }
         if !self.cache.hydration_max_segment_fraction.is_finite()
             || self.cache.hydration_max_segment_fraction <= 0.0
             || self.cache.hydration_max_segment_fraction > 1.0
         {
-            return Err(ZeppelinError::Config(
-                "cache.hydration_max_segment_fraction must be finite and in (0, 1]".into(),
-            ));
+            violations.push(
+                "cache.hydration_max_segment_fraction must be finite and in (0, 1]".to_string(),
+            );
         }
-        Ok(())
+
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(ZeppelinError::Config(format!(
+                "invalid configuration:\n- {}",
+                violations.join("\n- ")
+            )))
+        }
     }
 
     fn resolve_query_config(&mut self) -> Result<()> {
@@ -948,186 +1220,126 @@ impl Config {
     /// This ensures env vars always take priority over TOML settings.
     fn apply_env_overrides(&mut self) -> Result<()> {
         // Server
-        if let Ok(v) = std::env::var("ZEPPELIN_HOST") {
+        if let Some(v) = env_override::<String>("ZEPPELIN_HOST")? {
             self.server.host = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_PORT")? {
             self.server.port = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_REQUEST_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_REQUEST_TIMEOUT_SECS")? {
             self.server.request_timeout_secs = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_CONCURRENT_QUERIES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_CONCURRENT_QUERIES")? {
             self.server.max_concurrent_queries = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_BATCH_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_BATCH_SIZE")? {
             self.server.max_batch_size = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_QUERY_BATCH_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_QUERY_BATCH_SIZE")? {
             self.server.max_query_batch_size = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_TOP_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_TOP_K")? {
             self.server.max_top_k = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_SHUTDOWN_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_SHUTDOWN_TIMEOUT_SECS")? {
             self.server.shutdown_timeout_secs = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_DIMENSIONS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_DIMENSIONS")? {
             self.server.max_dimensions = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_VECTOR_ID_LENGTH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_VECTOR_ID_LENGTH")? {
             self.server.max_vector_id_length = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_REQUEST_BODY_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_REQUEST_BODY_MB")? {
             self.server.max_request_body_mb = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_DEFAULT_TOP_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_DEFAULT_TOP_K")? {
             self.server.default_top_k = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_RATE_LIMIT_RPS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_RATE_LIMIT_RPS")? {
             self.server.rate_limit_rps = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_RATE_LIMIT_BURST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_RATE_LIMIT_BURST")? {
             self.server.rate_limit_burst = v;
         }
 
         // Storage
-        if let Ok(v) = std::env::var("STORAGE_BACKEND") {
+        if let Some(v) = env_override::<String>("STORAGE_BACKEND")? {
             match v.to_lowercase().as_str() {
                 "s3" => self.storage.backend = StorageBackend::S3,
                 "gcs" => self.storage.backend = StorageBackend::Gcs,
                 "azure" => self.storage.backend = StorageBackend::Azure,
                 "local" => self.storage.backend = StorageBackend::Local,
-                _ => tracing::warn!("Unknown STORAGE_BACKEND value: {v}"),
+                _ => {
+                    return Err(ZeppelinError::Config(format!(
+                        "env var STORAGE_BACKEND={v} is not a valid storage backend; expected one of s3, gcs, azure, local"
+                    )));
+                }
             }
         }
-        if let Ok(v) = std::env::var("S3_BUCKET") {
+        if let Some(v) = env_override::<String>("S3_BUCKET")? {
             self.storage.bucket = v;
         }
-        if let Ok(v) = std::env::var("AWS_REGION") {
+        if let Some(v) = env_override::<String>("AWS_REGION")? {
             self.storage.s3_region = Some(v);
         }
-        if let Some(v) = std::env::var("S3_ENDPOINT").ok().filter(|s| !s.is_empty()) {
-            self.storage.s3_endpoint = Some(v);
+        if let Some(v) = env_override::<String>("S3_ENDPOINT")? {
+            self.storage.s3_endpoint = if v.is_empty() { None } else { Some(v) };
         }
-        if let Ok(v) = std::env::var("AWS_ACCESS_KEY_ID") {
+        if let Some(v) = env_override::<String>("AWS_ACCESS_KEY_ID")? {
             self.storage.s3_access_key_id = Some(v);
         }
-        if let Ok(v) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+        if let Some(v) = env_override::<String>("AWS_SECRET_ACCESS_KEY")? {
             self.storage.s3_secret_access_key = Some(v);
         }
-        if let Ok(v) = std::env::var("S3_ALLOW_HTTP") {
-            self.storage.s3_allow_http = v == "true";
+        if let Some(v) = env_override("S3_ALLOW_HTTP")? {
+            self.storage.s3_allow_http = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_STORAGE_FAIL_FAST")? {
+            self.storage.fail_fast = v;
         }
 
         // Cache
-        if let Ok(v) = std::env::var("ZEPPELIN_CACHE_DIR") {
+        if let Some(v) = env_override::<String>("ZEPPELIN_CACHE_DIR")? {
             self.cache.dir = PathBuf::from(v);
         }
-        if let Some(v) = std::env::var("ZEPPELIN_CACHE_MAX_SIZE_GB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_CACHE_MAX_SIZE_GB")? {
             self.cache.max_size_gb = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MEMORY_CACHE_MAX_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MEMORY_CACHE_MAX_MB")? {
             self.cache.memory_cache_max_mb = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MANIFEST_CACHE_TTL_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MANIFEST_CACHE_TTL_MS")? {
             self.cache.manifest_cache_ttl_ms = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_NAMESPACE_REGISTRY_TTL_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_NAMESPACE_REGISTRY_TTL_MS")? {
             self.cache.namespace_registry_ttl_ms = v;
         }
-        match std::env::var(HYDRATION_POLICY_ENV) {
-            Ok(v) => {
-                self.cache.hydration_policy = match v.to_lowercase().as_str() {
-                    "session_window" => HydrationPolicyKind::SessionWindow,
-                    _ => {
-                        return Err(ZeppelinError::Config(format!(
-                            "{HYDRATION_POLICY_ENV} has unsupported hydration policy {v}; expected session_window"
-                        )));
-                    }
-                };
-            }
-            Err(std::env::VarError::NotPresent) => {}
-            Err(error) => {
-                return Err(ZeppelinError::Config(format!(
-                    "failed to read {HYDRATION_POLICY_ENV}: {error}"
-                )));
-            }
+        if let Some(v) = env_override::<String>(HYDRATION_POLICY_ENV)? {
+            self.cache.hydration_policy = match v.to_lowercase().as_str() {
+                "session_window" => HydrationPolicyKind::SessionWindow,
+                _ => {
+                    return Err(ZeppelinError::Config(format!(
+                        "env var {HYDRATION_POLICY_ENV}={v} is not a valid hydration policy; expected session_window"
+                    )));
+                }
+            };
         }
-        if let Some(value) = read_u64_env(HYDRATION_HEAT_QUERIES_ENV)? {
+        if let Some(value) = env_override(HYDRATION_HEAT_QUERIES_ENV)? {
             self.cache.hydration_heat_queries = value;
         }
-        if let Some(value) = read_u64_env(HYDRATION_HEAT_WINDOW_SECS_ENV)? {
+        if let Some(value) = env_override(HYDRATION_HEAT_WINDOW_SECS_ENV)? {
             self.cache.hydration_heat_window_secs = value;
         }
 
         // Indexing
-        if let Some(v) = std::env::var("ZEPPELIN_DEFAULT_NUM_CENTROIDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_DEFAULT_NUM_CENTROIDS")? {
             self.indexing.default_num_centroids = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_DEFAULT_NPROBE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_DEFAULT_NPROBE")? {
             self.indexing.default_nprobe = v;
         }
-
-        // Indexing (continued)
-        if let Ok(v) = std::env::var("ZEPPELIN_QUANTIZATION") {
+        if let Some(v) = env_override::<String>("ZEPPELIN_QUANTIZATION")? {
             match v.to_lowercase().as_str() {
                 "none" => {
                     self.indexing.quantization = crate::index::quantization::QuantizationType::None
@@ -1140,101 +1352,75 @@ impl Config {
                     self.indexing.quantization =
                         crate::index::quantization::QuantizationType::Product
                 }
-                _ => tracing::warn!("Unknown ZEPPELIN_QUANTIZATION value: {v}"),
+                _ => {
+                    return Err(ZeppelinError::Config(format!(
+                        "env var ZEPPELIN_QUANTIZATION={v} is not a valid quantization; expected one of none, scalar, sq8, product, pq"
+                    )));
+                }
             }
         }
-        if let Ok(v) = std::env::var("ZEPPELIN_BITMAP_INDEX") {
-            self.indexing.bitmap_index = v == "true";
+        if let Some(v) = env_override("ZEPPELIN_BITMAP_INDEX")? {
+            self.indexing.bitmap_index = v;
         }
-        if let Ok(v) = std::env::var("ZEPPELIN_FTS_INDEX") {
-            self.indexing.fts_index = v == "true";
+        if let Some(v) = env_override("ZEPPELIN_FTS_INDEX")? {
+            self.indexing.fts_index = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_BM25_MAX_FULL_SCAN_CLUSTERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_BM25_MAX_FULL_SCAN_CLUSTERS")? {
             self.indexing.bm25_max_full_scan_clusters = v;
         }
-        // Hierarchical indexing
-        if let Ok(v) = std::env::var("ZEPPELIN_HIERARCHICAL") {
-            self.indexing.hierarchical = v == "true";
+        if let Some(v) = env_override("ZEPPELIN_HIERARCHICAL")? {
+            self.indexing.hierarchical = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_LEAF_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_LEAF_SIZE")? {
             self.indexing.leaf_size = Some(v);
         }
 
         // Compaction
-        if let Some(v) = std::env::var("ZEPPELIN_COMPACTION_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_COMPACTION_INTERVAL_SECS")? {
             self.compaction.interval_secs = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_WAL_FRAGMENTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_WAL_FRAGMENTS")? {
             self.compaction.max_wal_fragments_before_compact = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_WAL_AGE_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_WAL_AGE_SECS")? {
             self.compaction.max_wal_age_before_compact_secs = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_WAL_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_WAL_BYTES")? {
             self.compaction.max_wal_bytes_before_compact = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_PENDING_DELETES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_PENDING_DELETES")? {
             self.compaction.max_pending_deletes = v;
         }
-        if let Some(v) = std::env::var("ZEPPELIN_MAX_OLD_SEGMENTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-        {
+        if let Some(v) = env_override("ZEPPELIN_MAX_OLD_SEGMENTS")? {
             self.compaction.max_old_segments = v;
         }
 
         // Logging
-        if let Ok(v) = std::env::var("ZEPPELIN_LOG_FORMAT") {
+        if let Some(v) = env_override::<String>("ZEPPELIN_LOG_FORMAT")? {
             self.logging.format = v;
         }
 
         // Query
-        match std::env::var(RERANK_COALESCE_GAP_ENV) {
-            Ok(v) => {
-                self.query.rerank_coalesce_gap_bytes = Some(v.parse::<usize>().map_err(|e| {
-                    ZeppelinError::Config(format!(
-                        "{RERANK_COALESCE_GAP_ENV} must be a non-negative integer byte count: {e}"
-                    ))
-                })?);
-                self.query.cost_latency_profile = None;
-            }
-            Err(std::env::VarError::NotPresent) => {}
-            Err(e) => {
-                return Err(ZeppelinError::Config(format!(
-                    "failed to read {RERANK_COALESCE_GAP_ENV}: {e}"
-                )));
-            }
+        if let Some(v) = env_override(RERANK_COALESCE_GAP_ENV)? {
+            self.query.rerank_coalesce_gap_bytes = Some(v);
+            self.query.cost_latency_profile = None;
         }
 
         Ok(())
     }
 }
 
-fn read_u64_env(name: &'static str) -> Result<Option<u64>> {
+fn env_override<T>(name: &'static str) -> Result<Option<T>>
+where
+    T: FromStr,
+    T::Err: Display,
+{
     match std::env::var(name) {
-        Ok(value) => value.parse::<u64>().map(Some).map_err(|error| {
-            ZeppelinError::Config(format!("{name} must be a non-negative integer: {error}"))
+        Ok(value) => value.parse::<T>().map(Some).map_err(|error| {
+            ZeppelinError::Config(format!(
+                "env var {name}={value} is not a valid {}: {error}",
+                std::any::type_name::<T>()
+            ))
         }),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(error) => Err(ZeppelinError::Config(format!(

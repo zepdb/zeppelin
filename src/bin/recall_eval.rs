@@ -597,6 +597,7 @@ fn minio_storage_config() -> Result<StorageConfig> {
             env::var("MINIO_SECRET_KEY").unwrap_or_else(|_| "minioadmin".to_string()),
         ),
         s3_allow_http: true,
+        fail_fast: true,
     })
 }
 

@@ -44,6 +44,44 @@ async fn test_dimensions_zero_rejected() {
     harness.cleanup().await;
 }
 
+#[tokio::test]
+async fn test_create_namespace_rejects_invalid_fts_field_config() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces"))
+        .json(&serde_json::json!({
+            "dimensions": 4,
+            "full_text_search": {
+                "content": {
+                    "k1": -1.0,
+                    "b": 1.5,
+                    "max_token_length": 0
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let error_msg = body["error"].as_str().unwrap();
+    for needle in [
+        "full_text_search.content.k1",
+        "full_text_search.content.b",
+        "full_text_search.content.max_token_length",
+    ] {
+        assert!(
+            error_msg.contains(needle),
+            "expected invalid FTS create error to contain {needle:?}, got: {error_msg}"
+        );
+    }
+
+    harness.cleanup().await;
+}
+
 // --- Test 3: Vector ID too long rejected ---
 
 #[tokio::test]

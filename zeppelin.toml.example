@@ -5,19 +5,23 @@
 
 [server]
 # host = "0.0.0.0"                   # ZEPPELIN_HOST
-# port = 8080                        # ZEPPELIN_PORT
-# request_timeout_secs = 30          # ZEPPELIN_REQUEST_TIMEOUT_SECS
+# port = 8080                        # ZEPPELIN_PORT; must be > 0
+# request_timeout_secs = 30          # ZEPPELIN_REQUEST_TIMEOUT_SECS; must be > 0
 # max_concurrent_queries = 64        # ZEPPELIN_MAX_CONCURRENT_QUERIES
 # max_batch_size = 50000             # ZEPPELIN_MAX_BATCH_SIZE
-# max_top_k = 10000                  # ZEPPELIN_MAX_TOP_K
-# shutdown_timeout_secs = 30         # ZEPPELIN_SHUTDOWN_TIMEOUT_SECS
+# max_top_k = 10000                  # ZEPPELIN_MAX_TOP_K; must be > 0
+# default_top_k = 10                 # ZEPPELIN_DEFAULT_TOP_K; must be in 1..=max_top_k
+# shutdown_timeout_secs = 30         # ZEPPELIN_SHUTDOWN_TIMEOUT_SECS; must be > 0
 # max_dimensions = 65536             # ZEPPELIN_MAX_DIMENSIONS
 # max_vector_id_length = 1024        # ZEPPELIN_MAX_VECTOR_ID_LENGTH
 # max_request_body_mb = 512          # ZEPPELIN_MAX_REQUEST_BODY_MB
+# rate_limit_rps = 10                # ZEPPELIN_RATE_LIMIT_RPS
+# rate_limit_burst = 20              # ZEPPELIN_RATE_LIMIT_BURST; must be >= 1 when rate_limit_rps > 0
 
 [storage]
 # backend = "s3"                     # STORAGE_BACKEND — "s3" or "local" (gcs/azure planned)
 # bucket = "zeppelin"                # S3_BUCKET
+# fail_fast = true                   # ZEPPELIN_STORAGE_FAIL_FAST; false allows intentionally degraded boot
 
 # S3 / MinIO / R2
 # s3_region = "us-east-1"            # AWS_REGION
@@ -31,10 +35,10 @@
 # max_size_gb = 50                   # ZEPPELIN_CACHE_MAX_SIZE_GB
 # hydration_enabled = false
 # hydration_policy = "session_window"       # ZEPPELIN_HYDRATION_POLICY
-# hydration_heat_queries = 3                # ZEPPELIN_HYDRATION_HEAT_QUERIES
-# hydration_heat_window_secs = 60           # ZEPPELIN_HYDRATION_HEAT_WINDOW_SECS
-# hydration_parallelism = 4
-# hydration_max_segment_fraction = 0.5
+# hydration_heat_queries = 3                # ZEPPELIN_HYDRATION_HEAT_QUERIES; must be > 0
+# hydration_heat_window_secs = 60           # ZEPPELIN_HYDRATION_HEAT_WINDOW_SECS; must be > 0
+# hydration_parallelism = 4                 # must be > 0
+# hydration_max_segment_fraction = 0.5      # must be finite and in (0, 1]
 # If a namespace's active warm set exceeds max_size_gb * hydration_max_segment_fraction,
 # Zeppelin leaves it on the cold path and sets zeppelin_hydration_refused plus
 # zeppelin_hydration_required_bytes. Raise hydration_max_segment_fraction, raise
@@ -44,11 +48,14 @@
 
 [indexing]
 # default_num_centroids = 256        # ZEPPELIN_DEFAULT_NUM_CENTROIDS
-# default_nprobe = 16                # ZEPPELIN_DEFAULT_NPROBE
-# max_nprobe = 128
+# default_nprobe = 16                # ZEPPELIN_DEFAULT_NPROBE; must be > 0 and <= max_nprobe
+# max_nprobe = 128                   # must be > 0
 # kmeans_max_iterations = 25
 # kmeans_convergence_epsilon = 0.0001
 # oversample_factor = 3
+# Namespace full_text_search field configs are validated on namespace create:
+# k1 must be finite and in (0, 10], b must be finite and in [0, 1],
+# max_token_length must be >= 1.
 
 [query]
 # rerank_coalesce_gap_bytes = 1048576      # ZEPPELIN_RERANK_COALESCE_GAP_BYTES
@@ -56,16 +63,16 @@
 
 [compaction]
 # interval_secs = 30                 # ZEPPELIN_COMPACTION_INTERVAL_SECS
-# max_wal_fragments_before_compact = 100   # ZEPPELIN_MAX_WAL_FRAGMENTS — count trigger
-# max_wal_age_before_compact_secs = 300    # ZEPPELIN_MAX_WAL_AGE_SECS — age trigger:
+# max_wal_fragments_before_compact = 100   # ZEPPELIN_MAX_WAL_FRAGMENTS — count trigger; must be >= 1
+# max_wal_age_before_compact_secs = 300    # ZEPPELIN_MAX_WAL_AGE_SECS — age trigger; must be > 0:
 #                                          # compact when the oldest uncompacted WAL
 #                                          # fragment exceeds this age (bounded
 #                                          # convergence for quiet namespaces)
-# max_wal_bytes_before_compact = 67108864  # ZEPPELIN_MAX_WAL_BYTES — size trigger:
+# max_wal_bytes_before_compact = 67108864  # ZEPPELIN_MAX_WAL_BYTES — size trigger; must be > 0:
 #                                          # compact when total uncompacted WAL bytes
 #                                          # exceed this threshold (64 MB)
 # retrain_imbalance_threshold = 5.0
-# lease_duration_secs = 300          # per-namespace compaction lease (multi-node)
+# lease_duration_secs = 300          # per-namespace compaction lease (multi-node); must be > 0
 
 [logging]
 # level = "info"                     # RUST_LOG compatible
