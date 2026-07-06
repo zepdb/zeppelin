@@ -5,10 +5,13 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::future::Future;
 use std::io::ErrorKind;
+use std::path::Path;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -25,6 +28,17 @@ use crate::error::{Result, ZeppelinError};
 /// sample a small fixed number of entries and evict the oldest.
 /// At 20K+ entries, this reduces eviction from O(N) to O(16).
 const EVICTION_SAMPLE_SIZE: usize = 16;
+const EVICTION_MAX_CONSECUTIVE_FAILURES: usize = 3;
+const EVICTION_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
+
+#[cfg(test)]
+static EVICTION_TEST_PANIC_ON_START: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static EVICTION_TEST_REMOVE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static EVICTION_TEST_REMOVE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static EVICTION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Metadata for a cached entry.
 struct CacheEntry {
@@ -534,8 +548,15 @@ impl DiskCache {
         let eviction_running = Arc::clone(&self.eviction_running);
 
         tokio::spawn(async move {
+            let _reset_running = EvictionRunningReset::new(Arc::clone(&eviction_running));
+            let mut consecutive_failures = 0usize;
             loop {
-                evict_if_needed_background(
+                #[cfg(test)]
+                if EVICTION_TEST_PANIC_ON_START.swap(false, Ordering::AcqRel) {
+                    panic!("injected disk cache eviction panic");
+                }
+
+                let outcome = evict_if_needed_background(
                     &dir,
                     max_size_bytes,
                     &entries,
@@ -544,6 +565,30 @@ impl DiskCache {
                     memory.as_deref(),
                 )
                 .await;
+                match outcome {
+                    EvictionPassOutcome::UnderBudget => {
+                        consecutive_failures = 0;
+                    }
+                    EvictionPassOutcome::NoVictim => {
+                        debug!(
+                            current_size = total_size.load(Ordering::Relaxed),
+                            max_size_bytes, "disk cache eviction stopped with no unpinned victim"
+                        );
+                        break;
+                    }
+                    EvictionPassOutcome::Failed => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= EVICTION_MAX_CONSECUTIVE_FAILURES {
+                            error!(
+                                failures = consecutive_failures,
+                                backoff_ms = EVICTION_FAILURE_BACKOFF.as_millis(),
+                                "pausing disk cache eviction after repeated failures"
+                            );
+                            tokio::time::sleep(EVICTION_FAILURE_BACKOFF).await;
+                            consecutive_failures = 0;
+                        }
+                    }
+                }
 
                 eviction_running.store(false, Ordering::Release);
                 if total_size.load(Ordering::Relaxed) <= max_size_bytes {
@@ -558,6 +603,29 @@ impl DiskCache {
             }
         });
     }
+}
+
+struct EvictionRunningReset {
+    eviction_running: Arc<AtomicBool>,
+}
+
+impl EvictionRunningReset {
+    fn new(eviction_running: Arc<AtomicBool>) -> Self {
+        Self { eviction_running }
+    }
+}
+
+impl Drop for EvictionRunningReset {
+    fn drop(&mut self) {
+        self.eviction_running.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvictionPassOutcome {
+    UnderBudget,
+    NoVictim,
+    Failed,
 }
 
 fn sampled_disk_victim(
@@ -617,11 +685,11 @@ async fn evict_if_needed_background(
     pinned: &RwLock<HashSet<String>>,
     total_size: &AtomicU64,
     memory: Option<&MemoryCache>,
-) {
+) -> EvictionPassOutcome {
     loop {
         let current = total_size.load(Ordering::Relaxed);
         if current <= max_size_bytes {
-            break;
+            return EvictionPassOutcome::UnderBudget;
         }
 
         let pinned_keys = pinned.read().await;
@@ -641,7 +709,7 @@ async fn evict_if_needed_background(
                     continue;
                 };
                 let path = dir.join(&entry.filename);
-                match tokio::fs::remove_file(&path).await {
+                match remove_cache_file(&path).await {
                     Ok(()) => {
                         if let Some((_, removed)) = entries.remove(&key) {
                             total_size.fetch_sub(removed.size, Ordering::Relaxed);
@@ -669,16 +737,36 @@ async fn evict_if_needed_background(
                             error = %error,
                             "failed to evict cache entry"
                         );
-                        break;
+                        return EvictionPassOutcome::Failed;
                     }
                 }
             }
             None => {
                 // All sampled entries are pinned, can't evict more
-                break;
+                return EvictionPassOutcome::NoVictim;
             }
         }
     }
+}
+
+async fn remove_cache_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        EVICTION_TEST_REMOVE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        if EVICTION_TEST_REMOVE_FAILURES
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "injected cache eviction removal failure",
+            ));
+        }
+    }
+
+    tokio::fs::remove_file(path).await
 }
 
 /// In-memory LRU cache tier for hot cluster data.
@@ -949,5 +1037,64 @@ mod tests {
             .get_decoded::<String>("immutable.bin")
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn disk_eviction_worker_panic_resets_running_flag() {
+        let _test_guard = EVICTION_TEST_LOCK.lock().await;
+        EVICTION_TEST_PANIC_ON_START.store(false, Ordering::SeqCst);
+        EVICTION_TEST_REMOVE_FAILURES.store(0, Ordering::SeqCst);
+        EVICTION_TEST_REMOVE_ATTEMPTS.store(0, Ordering::SeqCst);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new_with_max_bytes(dir.path().to_path_buf(), 1).unwrap();
+
+        EVICTION_TEST_PANIC_ON_START.store(true, Ordering::SeqCst);
+        cache
+            .put("panic-entry", &Bytes::from(vec![1_u8; 16]))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        assert!(
+            !cache.eviction_running.load(Ordering::Acquire),
+            "eviction_running must be reset after an eviction worker panic"
+        );
+
+        cache.spawn_eviction_if_needed();
+        for _ in 0..100 {
+            if cache.total_size() <= 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!(
+            "subsequent eviction did not run after panic: size={}",
+            cache.total_size()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disk_eviction_removal_errors_do_not_spin() {
+        let _test_guard = EVICTION_TEST_LOCK.lock().await;
+        EVICTION_TEST_PANIC_ON_START.store(false, Ordering::SeqCst);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = DiskCache::new_with_max_bytes(dir.path().to_path_buf(), 1).unwrap();
+        EVICTION_TEST_REMOVE_ATTEMPTS.store(0, Ordering::SeqCst);
+        EVICTION_TEST_REMOVE_FAILURES.store(1_000, Ordering::SeqCst);
+
+        cache
+            .put("permission-denied-entry", &Bytes::from(vec![2_u8; 16]))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let attempts = EVICTION_TEST_REMOVE_ATTEMPTS.load(Ordering::SeqCst);
+        EVICTION_TEST_REMOVE_FAILURES.store(0, Ordering::SeqCst);
+        assert!(
+            attempts <= 3,
+            "persistent eviction removal errors must be retry-bounded, got {attempts} attempts"
+        );
     }
 }
