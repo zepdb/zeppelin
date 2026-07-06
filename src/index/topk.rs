@@ -1,5 +1,10 @@
 use std::cmp::Ordering;
 
+/// Keep the best `k` items according to `cmp`.
+///
+/// Selection is intentionally unstable: equal items under `cmp` do not retain
+/// scan order. Callers that need deterministic ties must include the tie-break
+/// in `cmp`, as the ANN coarse-ranking paths do with id ordering.
 pub(crate) fn partial_topk_by<T>(
     vec: &mut Vec<T>,
     k: usize,
