@@ -263,6 +263,9 @@ pub struct ServerConfig {
     /// Maximum vectors per upsert batch. Default: `50_000`.
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
+    /// Maximum query entries per batch query request. Default: `256`.
+    #[serde(default = "default_max_query_batch_size")]
+    pub max_query_batch_size: usize,
     /// Hard upper bound on `top_k` query parameter. Default: `10_000`.
     #[serde(default = "default_max_top_k")]
     pub max_top_k: usize,
@@ -297,6 +300,9 @@ fn default_rate_limit_rps() -> u32 {
 }
 fn default_rate_limit_burst() -> u32 {
     20
+}
+fn default_max_query_batch_size() -> usize {
+    256
 }
 
 /// Supported object storage backends.
@@ -593,6 +599,7 @@ impl Default for ServerConfig {
             request_timeout_secs: default_request_timeout(),
             max_concurrent_queries: default_max_concurrent_queries(),
             max_batch_size: default_max_batch_size(),
+            max_query_batch_size: default_max_query_batch_size(),
             max_top_k: default_max_top_k(),
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
             max_dimensions: default_max_dimensions(),
@@ -811,6 +818,12 @@ impl Config {
             .and_then(|v| v.parse().ok())
         {
             self.server.max_batch_size = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_MAX_QUERY_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.server.max_query_batch_size = v;
         }
         if let Some(v) = std::env::var("ZEPPELIN_MAX_TOP_K")
             .ok()

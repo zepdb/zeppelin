@@ -224,6 +224,42 @@ paths:
         "404":
           $ref: "#/components/responses/NotFoundError"
 
+  /v1/namespaces/{ns}/query/batch:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    post:
+      operationId: batchQueryNamespace
+      summary: Batch query vectors
+      description: |
+        Run multiple vector similarity or BM25 full-text searches in one
+        request. Each entry uses the same body shape as `POST
+        /v1/namespaces/{ns}/query`.
+
+        Results are returned positionally. A failure in one entry is reported
+        in that entry's error envelope and does not fail the whole batch.
+        Entries share one manifest freshness check and segment metadata load.
+      tags: [Query]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchQueryRequest"
+      responses:
+        "200":
+          description: Positional batch query results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchQueryResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
 components:
   parameters:
     NamespacePath:
@@ -249,8 +285,20 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     PayloadTooLarge:
       description: |
-        Request body exceeds the configured size limit (413). Canonical error
-        envelope with code `PAYLOAD_TOO_LARGE`.
+        Request body exceeds the configured byte limit, or a logical request
+        batch exceeds its configured item cap (413). Canonical error envelope
+        with code `PAYLOAD_TOO_LARGE`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    RateLimited:
+      description: Rate limit exceeded (429)
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying.
       content:
         application/json:
           schema:
@@ -767,6 +815,18 @@ components:
             ANN queries skip final attribute enrichment, and unfiltered BM25
             segment queries skip attribute-object reads.
 
+    BatchQueryRequest:
+      type: object
+      required: [queries]
+      properties:
+        queries:
+          type: array
+          minItems: 1
+          maxItems: 256
+          description: Positional list of single-query request bodies.
+          items:
+            $ref: "#/components/schemas/QueryRequest"
+
     QueryResponse:
       type: object
       required: [results, scanned_fragments, scanned_segments]
@@ -781,3 +841,51 @@ components:
         scanned_segments:
           type: integer
           description: Number of index segments scanned
+
+    BatchQueryResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          description: Positional entry responses matching the request order.
+          items:
+            $ref: "#/components/schemas/BatchQueryEntry"
+
+    BatchQueryEntry:
+      oneOf:
+        - $ref: "#/components/schemas/BatchQuerySuccess"
+        - $ref: "#/components/schemas/BatchQueryFailure"
+
+    BatchQuerySuccess:
+      type: object
+      required: [ok, response, metadata]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+        response:
+          $ref: "#/components/schemas/QueryResponse"
+        metadata:
+          $ref: "#/components/schemas/BatchQueryEntryMetadata"
+
+    BatchQueryFailure:
+      type: object
+      required: [ok, error, metadata]
+      properties:
+        ok:
+          type: boolean
+          enum: [false]
+        error:
+          $ref: "#/components/schemas/ErrorResponse"
+        metadata:
+          $ref: "#/components/schemas/BatchQueryEntryMetadata"
+
+    BatchQueryEntryMetadata:
+      type: object
+      required: [latency_ms]
+      properties:
+        latency_ms:
+          type: integer
+          minimum: 0
+          description: Server-side latency for this batch entry.

@@ -125,6 +125,17 @@ pub enum ZeppelinError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    /// A logical request payload exceeded a configured limit.
+    #[error("{resource} size {actual} exceeds maximum of {limit}")]
+    PayloadTooLarge {
+        /// Logical resource that exceeded the cap.
+        resource: &'static str,
+        /// Submitted logical size.
+        actual: usize,
+        /// Configured maximum.
+        limit: usize,
+    },
+
     // Config errors
     /// An invalid or missing configuration value.
     #[error("config error: {0}")]
@@ -199,6 +210,8 @@ impl ZeppelinError {
             | ZeppelinError::Validation(_)
             | ZeppelinError::FtsFieldNotConfigured { .. } => 400,
 
+            ZeppelinError::PayloadTooLarge { .. } => 413,
+
             ZeppelinError::QueryConcurrencyExhausted => 503,
 
             ZeppelinError::RateLimitExceeded { .. } => 429,
@@ -236,6 +249,7 @@ impl ZeppelinError {
             ZeppelinError::KMeansConvergence { .. } => "INTERNAL_ERROR",
             ZeppelinError::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
             ZeppelinError::Validation(_) => "VALIDATION_ERROR",
+            ZeppelinError::PayloadTooLarge { .. } => "PAYLOAD_TOO_LARGE",
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
             ZeppelinError::Io(_) => "INTERNAL_ERROR",
             ZeppelinError::Cache(_) => "INTERNAL_ERROR",
@@ -324,6 +338,7 @@ impl ZeppelinError {
             ZeppelinError::NamespaceAlreadyExists { .. }
             | ZeppelinError::DimensionMismatch { .. }
             | ZeppelinError::Validation(_)
+            | ZeppelinError::PayloadTooLarge { .. }
             | ZeppelinError::FtsFieldNotConfigured { .. }
             | ZeppelinError::QueryConcurrencyExhausted
             | ZeppelinError::RateLimitExceeded { .. } => self.to_string(),
@@ -492,6 +507,11 @@ mod tests {
                 actual: 2,
             },
             ZeppelinError::Validation("v".into()),
+            ZeppelinError::PayloadTooLarge {
+                resource: "query batch",
+                actual: 257,
+                limit: 256,
+            },
             ZeppelinError::Config("c".into()),
             ZeppelinError::Cache("c".into()),
             ZeppelinError::FullTextSearch("f".into()),

@@ -79,7 +79,7 @@ fn bm25_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
     b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
 }
 
-async fn read_manifest_for_query(
+pub(crate) async fn read_manifest_for_query(
     store: &ZeppelinStore,
     namespace: &str,
     consistency: ConsistencyLevel,
@@ -97,6 +97,23 @@ async fn read_manifest_for_query(
 /// Execute a query against a namespace, combining WAL scan and segment search.
 #[instrument(skip(params), fields(namespace = params.namespace))]
 pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
+    let manifest = read_manifest_for_query(
+        params.store,
+        params.namespace,
+        params.consistency,
+        params.manifest_cache,
+    )
+    .await?;
+    execute_query_with_manifest(params, manifest).await
+}
+
+/// Execute a vector query against an already-read manifest snapshot.
+///
+/// Batch query uses this to share one manifest freshness check across entries.
+pub(crate) async fn execute_query_with_manifest(
+    params: QueryParams<'_>,
+    manifest: Manifest,
+) -> Result<QueryResponse> {
     let QueryParams {
         store,
         wal_reader,
@@ -110,10 +127,9 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         oversample_factor,
         rerank_coalesce_gap_bytes,
         cache,
-        manifest_cache,
+        manifest_cache: _,
         include_attributes,
     } = params;
-    let manifest = read_manifest_for_query(store, namespace, consistency, manifest_cache).await?;
 
     // WAL work and segment search are independent — they share only the
     // manifest snapshot — so run them concurrently. Strong scans and scores
@@ -449,7 +465,45 @@ pub async fn execute_bm25_query(
     include_attributes: bool,
 ) -> Result<QueryResponse> {
     let manifest = read_manifest_for_query(store, namespace, consistency, manifest_cache).await?;
+    execute_bm25_query_with_manifest(
+        store,
+        wal_reader,
+        namespace,
+        rank_by,
+        fts_configs,
+        top_k,
+        filter,
+        consistency,
+        last_as_prefix,
+        fts_cache,
+        cache,
+        max_full_scan_clusters,
+        include_attributes,
+        manifest,
+    )
+    .await
+}
 
+/// Execute a BM25 query against an already-read manifest snapshot.
+///
+/// Batch query uses this to share one manifest freshness check across entries.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_bm25_query_with_manifest(
+    store: &ZeppelinStore,
+    wal_reader: &WalReader,
+    namespace: &str,
+    rank_by: &RankBy,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    top_k: usize,
+    filter: Option<&Filter>,
+    consistency: ConsistencyLevel,
+    last_as_prefix: bool,
+    fts_cache: Option<&Arc<WalFtsCache>>,
+    cache: Option<&Arc<DiskCache>>,
+    max_full_scan_clusters: usize,
+    include_attributes: bool,
+    manifest: Manifest,
+) -> Result<QueryResponse> {
     // Evict compacted fragments from the FTS cache to prevent unbounded growth
     if let Some(cache) = fts_cache {
         let active_ids: Vec<ulid::Ulid> = manifest

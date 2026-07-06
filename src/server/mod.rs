@@ -219,6 +219,26 @@ pub async fn rate_limit(
     }
 
     let ip = addr.ip();
+    match consume_rate_limit(&state, ip, 1) {
+        Ok(()) => next.run(request).await,
+        Err(err) => ApiError(err).into_response(),
+    }
+}
+
+/// Consume `tokens` from the per-IP rate limiter.
+///
+/// Batch query calls this after deserialization to charge each entry rather
+/// than each HTTP request. The route-level middleware has already consumed one
+/// token, so handlers should pass only the additional token count.
+pub(crate) fn consume_rate_limit(
+    state: &AppState,
+    ip: IpAddr,
+    tokens_to_consume: u64,
+) -> Result<(), ZeppelinError> {
+    if tokens_to_consume == 0 {
+        return Ok(());
+    }
+
     let rps = state.config.server.rate_limit_rps as u64;
     let burst = state.config.server.rate_limit_burst as u64;
     let now = Instant::now();
@@ -238,8 +258,8 @@ pub async fn rate_limit(
             *last_refill = now;
         }
 
-        if *tokens > 0 {
-            *tokens -= 1;
+        if *tokens >= tokens_to_consume {
+            *tokens -= tokens_to_consume;
             true
         } else {
             false
@@ -247,14 +267,18 @@ pub async fn rate_limit(
     };
 
     if allowed {
-        next.run(request).await
+        Ok(())
     } else {
         let retry_after_secs = if rps > 0 { 1 } else { 60 };
         RATE_LIMITED_TOTAL
             .with_label_values(&[&ip.to_string()])
             .inc();
-        tracing::warn!(ip = %ip, "rate limit exceeded");
-        ApiError(ZeppelinError::RateLimitExceeded { retry_after_secs }).into_response()
+        tracing::warn!(
+            ip = %ip,
+            requested_tokens = tokens_to_consume,
+            "rate limit exceeded"
+        );
+        Err(ZeppelinError::RateLimitExceeded { retry_after_secs })
     }
 }
 
@@ -270,6 +294,13 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/namespaces/:ns/query",
             post(query::query_namespace).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                concurrency_limit,
+            )),
+        )
+        .route(
+            "/v1/namespaces/:ns/query/batch",
+            post(query::batch_query_namespace).layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 concurrency_limit,
             )),
