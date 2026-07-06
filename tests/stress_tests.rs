@@ -1,5 +1,6 @@
 mod common;
 
+use common::harness::TestHarness;
 use common::server::{
     cleanup_ns, create_ns_api, create_ns_api_with, start_test_server,
     start_test_server_with_compactor, start_test_server_with_config,
@@ -9,9 +10,12 @@ use common::vectors::random_vectors;
 use futures::future::join_all;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::collections::HashMap;
 use std::time::Instant;
 use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
-use zeppelin::types::VectorEntry;
+use zeppelin::query::{execute_query, QueryParams};
+use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
+use zeppelin::wal::{Manifest, WalReader, WalWriter};
 
 /// Generate `n` random vectors with a given ID prefix and dimension.
 /// Uses a hash of the prefix as the seed so different prefixes produce different vectors.
@@ -43,6 +47,105 @@ fn stress_test_config() -> Config {
         ..Default::default()
     };
     config
+}
+
+fn squared_l2_to_origin(values: &[f32]) -> f32 {
+    values.iter().map(|value| value * value).sum()
+}
+
+// ---------------------------------------------------------------------------
+// Task 28: Large uncompacted WAL backlog exact top-k
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_stress_large_uncompacted_wal_backlog_exact_topk() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("large-uncompacted-wal-backlog");
+    Manifest::new()
+        .write(&harness.store, &namespace)
+        .await
+        .unwrap();
+
+    let writer = WalWriter::new(harness.store.clone());
+    let mut latest: HashMap<String, Vec<f32>> = HashMap::new();
+    let fragment_count = 30usize;
+    let vectors_per_fragment = 200usize;
+
+    for fragment_idx in 0..fragment_count {
+        let mut vectors = Vec::with_capacity(vectors_per_fragment);
+        for vector_idx in 0..vectors_per_fragment {
+            let logical_id = (fragment_idx * 137 + vector_idx) % 1_000;
+            let id = format!("backlog_{logical_id:04}");
+            let sequence = (fragment_idx * vectors_per_fragment + vector_idx + 1) as f32;
+            let values = vec![
+                sequence / 10_000.0,
+                (logical_id % 17) as f32 / 1_000.0,
+                (fragment_idx % 11) as f32 / 1_000.0,
+                (vector_idx % 13) as f32 / 1_000.0,
+            ];
+            latest.insert(id.clone(), values.clone());
+            vectors.push(VectorEntry {
+                id,
+                values,
+                attributes: None,
+            });
+        }
+        writer.append(&namespace, vectors, vec![]).await.unwrap();
+    }
+
+    let manifest = Manifest::read(&harness.store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.uncompacted_fragments().len(), fragment_count);
+
+    let mut expected: Vec<(String, f32)> = latest
+        .iter()
+        .map(|(id, values)| (id.clone(), squared_l2_to_origin(values)))
+        .collect();
+    expected.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    expected.truncate(10);
+
+    let wal_reader = WalReader::new(harness.store.clone());
+    let response = execute_query(QueryParams {
+        store: &harness.store,
+        wal_reader: &wal_reader,
+        namespace: &namespace,
+        query: &[0.0, 0.0, 0.0, 0.0],
+        top_k: 10,
+        nprobe: 1,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        cache: None,
+        manifest_cache: None,
+        include_attributes: false,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(response.scanned_fragments, fragment_count);
+    assert_eq!(response.scanned_segments, 0);
+
+    let actual: Vec<(String, f32)> = response
+        .results
+        .iter()
+        .map(|result| (result.id.clone(), result.score))
+        .collect();
+    assert_eq!(actual.len(), expected.len());
+    for ((actual_id, actual_score), (expected_id, expected_score)) in
+        actual.iter().zip(expected.iter())
+    {
+        assert_eq!(actual_id, expected_id);
+        assert!(
+            (actual_score - expected_score).abs() <= f32::EPSILON,
+            "score mismatch for {actual_id}: actual={actual_score}, expected={expected_score}"
+        );
+    }
+
+    harness.cleanup().await;
 }
 
 // ---------------------------------------------------------------------------
