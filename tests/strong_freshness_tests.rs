@@ -1,5 +1,6 @@
 mod common;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
+use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
 use zeppelin::wal::manifest::Manifest;
 use zeppelin::wal::{WalReader, WalWriter};
 
@@ -37,6 +38,19 @@ fn vector(id: &str, values: [f32; DIM]) -> VectorEntry {
         id: id.to_string(),
         values: values.to_vec(),
         attributes: None,
+    }
+}
+
+fn vector_with_tenant(id: &str, values: [f32; DIM], tenant: &str) -> VectorEntry {
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "tenant".to_string(),
+        AttributeValue::String(tenant.to_string()),
+    );
+    VectorEntry {
+        id: id.to_string(),
+        values: values.to_vec(),
+        attributes: Some(attrs),
     }
 }
 
@@ -121,6 +135,34 @@ async fn query_for_fresh_vector(
         rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
         cache: None,
         manifest_cache: Some(manifest_cache),
+        include_attributes: true,
+    })
+    .await
+    .unwrap()
+}
+
+async fn strong_query(
+    store: &ZeppelinStore,
+    namespace: &str,
+    query: &[f32],
+    top_k: usize,
+    filter: Option<&Filter>,
+) -> zeppelin::query::QueryResponse {
+    let wal_reader = WalReader::new(store.clone());
+    execute_query(QueryParams {
+        store,
+        wal_reader: &wal_reader,
+        namespace,
+        query,
+        top_k,
+        nprobe: 1,
+        filter,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        cache: None,
+        manifest_cache: None,
         include_attributes: true,
     })
     .await
@@ -242,6 +284,91 @@ async fn strong_query_with_unchanged_manifest_uses_one_bodyless_freshness_get() 
         counter.get_bytes_for(ArtifactClass::Manifest),
         0,
         "unchanged manifest should not be downloaded again"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn strong_wal_update_outside_topk_still_overrides_stale_segment_vector() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("strong-wal-topk-overrides-segment");
+    let store = &harness.store;
+    Manifest::new().write(store, &namespace).await.unwrap();
+
+    let writer = WalWriter::new(store.clone());
+    writer
+        .append(&namespace, vec![vector("x", [0.0, 0.0, 0.0, 0.0])], vec![])
+        .await
+        .unwrap();
+    test_compactor(store).compact(&namespace).await.unwrap();
+
+    writer
+        .append(
+            &namespace,
+            vec![
+                vector("x", [100.0, 0.0, 0.0, 0.0]),
+                vector("wal_a", [0.1, 0.0, 0.0, 0.0]),
+                vector("wal_b", [0.2, 0.0, 0.0, 0.0]),
+            ],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    let response = strong_query(store, &namespace, &[0.0, 0.0, 0.0, 0.0], 2, None).await;
+    let ids: Vec<&str> = response.results.iter().map(|r| r.id.as_str()).collect();
+
+    assert_eq!(ids, vec!["wal_a", "wal_b"]);
+    assert!(
+        !ids.contains(&"x"),
+        "the stale compacted version of x must stay suppressed even when the WAL version is outside top_k"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn strong_filtered_wal_update_still_overrides_stale_segment_attrs() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("strong-wal-filter-overrides-segment");
+    let store = &harness.store;
+    Manifest::new().write(store, &namespace).await.unwrap();
+
+    let writer = WalWriter::new(store.clone());
+    writer
+        .append(
+            &namespace,
+            vec![vector_with_tenant("x", [0.0, 0.0, 0.0, 0.0], "keep")],
+            vec![],
+        )
+        .await
+        .unwrap();
+    test_compactor(store).compact(&namespace).await.unwrap();
+
+    writer
+        .append(
+            &namespace,
+            vec![
+                vector_with_tenant("x", [0.0, 0.0, 0.0, 0.0], "drop"),
+                vector_with_tenant("visible", [0.1, 0.0, 0.0, 0.0], "keep"),
+            ],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    let filter = Filter::Eq {
+        field: "tenant".to_string(),
+        value: AttributeValue::String("keep".to_string()),
+    };
+    let response = strong_query(store, &namespace, &[0.0, 0.0, 0.0, 0.0], 10, Some(&filter)).await;
+    let ids: Vec<&str> = response.results.iter().map(|r| r.id.as_str()).collect();
+
+    assert_eq!(ids, vec!["visible"]);
+    assert!(
+        !ids.contains(&"x"),
+        "a filtered-out WAL update must still suppress the stale compacted attrs for the same id"
     );
 
     harness.cleanup().await;

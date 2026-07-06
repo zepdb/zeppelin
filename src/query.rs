@@ -79,6 +79,17 @@ fn bm25_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
     b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
 }
 
+#[cfg(test)]
+static WAL_ATTR_CLONES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn clone_wal_result_attrs(
+    attrs: &HashMap<String, AttributeValue>,
+) -> HashMap<String, AttributeValue> {
+    #[cfg(test)]
+    WAL_ATTR_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    attrs.clone()
+}
+
 pub(crate) async fn read_manifest_for_query(
     store: &ZeppelinStore,
     namespace: &str,
@@ -149,6 +160,7 @@ pub(crate) async fn execute_query_with_manifest(
                     distance_metric,
                     cache,
                     include_attributes,
+                    top_k,
                 )
                 .await?
             }
@@ -162,12 +174,14 @@ pub(crate) async fn execute_query_with_manifest(
                     .await?;
                 WalScanResult {
                     results: Vec::new(),
+                    overriding_ids: HashSet::new(),
                     fragment_count: 0,
                     deleted_ids,
                 }
             }
             _ => WalScanResult {
                 results: Vec::new(),
+                overriding_ids: HashSet::new(),
                 fragment_count: 0,
                 deleted_ids: HashSet::new(),
             },
@@ -221,6 +235,7 @@ pub(crate) async fn execute_query_with_manifest(
     let (wal_result, segment_result) = tokio::join!(wal_future, segment_future);
     let WalScanResult {
         results: wal_results,
+        overriding_ids: wal_overriding_ids,
         fragment_count: scanned_fragments,
         deleted_ids: wal_deleted_ids,
     } = wal_result?;
@@ -232,6 +247,7 @@ pub(crate) async fn execute_query_with_manifest(
     let merge_start = std::time::Instant::now();
     let results = merge_results(
         wal_results,
+        &wal_overriding_ids,
         segment_results,
         top_k,
         consistency,
@@ -253,8 +269,11 @@ pub(crate) async fn execute_query_with_manifest(
 
 /// Result of an ANN WAL scan.
 struct WalScanResult {
-    /// Scored search results, sorted ascending by distance.
+    /// Top-k scored search results, sorted ascending by distance.
     results: Vec<SearchResult>,
+    /// All live WAL IDs after dedup/delete processing, including IDs that
+    /// filter out or rank outside top-k. These suppress stale segment hits.
+    overriding_ids: HashSet<String>,
     /// Number of WAL fragments scanned.
     fragment_count: usize,
     /// IDs that were explicitly deleted in the WAL.
@@ -274,6 +293,7 @@ async fn wal_scan(
     distance_metric: DistanceMetric,
     cache: Option<&Arc<DiskCache>>,
     include_attributes: bool,
+    top_k: usize,
 ) -> Result<WalScanResult> {
     let refs = manifest.uncompacted_fragments().to_vec();
     // Skip checksum validation on query reads — fragments were already
@@ -286,6 +306,7 @@ async fn wal_scan(
     if fragments.is_empty() {
         return Ok(WalScanResult {
             results: Vec::new(),
+            overriding_ids: HashSet::new(),
             fragment_count: 0,
             deleted_ids: HashSet::new(),
         });
@@ -293,13 +314,14 @@ async fn wal_scan(
 
     // Collect all delete tombstones
     let mut deleted_ids: HashSet<String> = HashSet::new();
-    // Latest vector state per ID (latest fragment wins)
+    // Latest vector state per ID (latest fragment wins), borrowed from the
+    // fragment batch so vector payloads and attrs are not cloned before top-k.
     #[allow(clippy::type_complexity)]
     let mut latest_vectors: HashMap<
-        String,
+        &str,
         (
-            Vec<f32>,
-            Option<HashMap<String, crate::types::AttributeValue>>,
+            &[f32],
+            Option<&HashMap<String, crate::types::AttributeValue>>,
         ),
     > = HashMap::new();
 
@@ -307,48 +329,77 @@ async fn wal_scan(
     for fragment in &fragments {
         for del_id in &fragment.deletes {
             deleted_ids.insert(del_id.clone());
-            latest_vectors.remove(del_id);
+            latest_vectors.remove(del_id.as_str());
         }
         for vec in &fragment.vectors {
             deleted_ids.remove(&vec.id);
-            latest_vectors.insert(vec.id.clone(), (vec.values.clone(), vec.attributes.clone()));
+            latest_vectors.insert(
+                vec.id.as_str(),
+                (vec.values.as_slice(), vec.attributes.as_ref()),
+            );
         }
     }
 
-    // Score surviving vectors
-    let mut results: Vec<SearchResult> = latest_vectors
-        .into_iter()
-        .filter(|(_, (values, attrs))| {
+    struct ScoredWalVector<'a> {
+        id: &'a str,
+        score: f32,
+        attrs: Option<&'a HashMap<String, AttributeValue>>,
+    }
+
+    let mut overriding_ids = HashSet::with_capacity(latest_vectors.len());
+    let mut top_results = TopK::new(top_k, |a: &ScoredWalVector<'_>, b: &ScoredWalVector<'_>| {
+        a.score.total_cmp(&b.score).then_with(|| a.id.cmp(b.id))
+    });
+
+    // Score surviving vectors, but keep only the bounded top-k candidates.
+    for (id, (values, attrs)) in &latest_vectors {
+        overriding_ids.insert((*id).to_string());
+        let passes_filter = {
             if let Some(f) = filter {
                 match attrs {
                     Some(a) => evaluate_filter(f, a),
                     None => false,
                 }
             } else {
-                let _ = values; // suppress unused warning
                 true
             }
-        })
-        .map(|(id, (values, attributes))| {
-            let score = compute_distance(query, &values, distance_metric);
-            SearchResult {
-                id,
-                score,
-                attributes: if include_attributes { attributes } else { None },
-            }
+        };
+        if !passes_filter {
+            continue;
+        }
+
+        let score = compute_distance(query, values, distance_metric);
+        top_results.push(ScoredWalVector {
+            id,
+            score,
+            attrs: *attrs,
+        });
+    }
+
+    let results: Vec<SearchResult> = top_results
+        .into_sorted_vec()
+        .into_iter()
+        .map(|scored| SearchResult {
+            id: scored.id.to_string(),
+            score: scored.score,
+            attributes: if include_attributes {
+                scored.attrs.map(clone_wal_result_attrs)
+            } else {
+                None
+            },
         })
         .collect();
 
-    results.sort_by(distance_result_cmp);
-
     debug!(
-        surviving_vectors = results.len(),
+        surviving_vectors = overriding_ids.len(),
+        topk_returned = results.len(),
         total_fragments = frag_count,
         "WAL scan complete"
     );
 
     Ok(WalScanResult {
         results,
+        overriding_ids,
         fragment_count: frag_count,
         deleted_ids,
     })
@@ -522,6 +573,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
         let wal_start = std::time::Instant::now();
         let mut scanned_fragments = 0;
         let mut wal_deleted_ids = std::collections::HashSet::new();
+        let mut wal_overriding_ids = std::collections::HashSet::new();
         let wal_results = match consistency {
             ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
                 let refs = manifest.uncompacted_fragments().to_vec();
@@ -552,6 +604,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
                         result.attributes = None;
                     }
                 }
+                wal_overriding_ids = results.iter().map(|r| r.id.clone()).collect();
                 results
             }
             ConsistencyLevel::Eventual if !manifest.uncompacted_fragments().is_empty() => {
@@ -571,7 +624,12 @@ pub(crate) async fn execute_bm25_query_with_manifest(
             fragments_scanned = scanned_fragments,
             "BM25 query phase: WAL scan"
         );
-        Ok::<_, crate::error::ZeppelinError>((wal_results, scanned_fragments, wal_deleted_ids))
+        Ok::<_, crate::error::ZeppelinError>((
+            wal_results,
+            scanned_fragments,
+            wal_deleted_ids,
+            wal_overriding_ids,
+        ))
     };
 
     let segment_future = async {
@@ -616,13 +674,14 @@ pub(crate) async fn execute_bm25_query_with_manifest(
     };
 
     let (wal_result, segment_result) = tokio::join!(wal_future, segment_future);
-    let (wal_results, scanned_fragments, wal_deleted_ids) = wal_result?;
+    let (wal_results, scanned_fragments, wal_deleted_ids, wal_overriding_ids) = wal_result?;
     let (segment_results, scanned_segments) = segment_result?;
 
     // Merge results — BM25 is higher-is-better
     // Pass deleted IDs so segment results for deleted docs are excluded
     let mut results = merge_bm25_results(
         wal_results,
+        &wal_overriding_ids,
         segment_results,
         top_k,
         consistency,
@@ -1155,6 +1214,7 @@ async fn segment_bm25_search_full_scan(
 /// not appear in the final results even if they exist in the segment.
 fn merge_bm25_results(
     wal_results: Vec<SearchResult>,
+    wal_overriding_ids: &HashSet<String>,
     segment_results: Vec<SearchResult>,
     top_k: usize,
     consistency: ConsistencyLevel,
@@ -1162,7 +1222,6 @@ fn merge_bm25_results(
 ) -> Vec<SearchResult> {
     match consistency {
         ConsistencyLevel::Strong => {
-            let wal_ids: HashSet<String> = wal_results.iter().map(|r| r.id.clone()).collect();
             let mut merged = TopK::new(
                 top_k,
                 bm25_result_cmp as fn(&SearchResult, &SearchResult) -> Ordering,
@@ -1173,7 +1232,7 @@ fn merge_bm25_results(
             }
             for sr in segment_results {
                 // Exclude if WAL has a newer version OR if explicitly deleted
-                if !wal_ids.contains(&sr.id) && !wal_deleted_ids.contains(&sr.id) {
+                if !wal_overriding_ids.contains(&sr.id) && !wal_deleted_ids.contains(&sr.id) {
                     merged.push(sr);
                 }
             }
@@ -1201,6 +1260,7 @@ fn merge_bm25_results(
 /// (a tombstone for an already-compacted vector has no live WAL entry).
 fn merge_results(
     wal_results: Vec<SearchResult>,
+    wal_overriding_ids: &HashSet<String>,
     segment_results: Vec<SearchResult>,
     top_k: usize,
     consistency: ConsistencyLevel,
@@ -1211,7 +1271,6 @@ fn merge_results(
             // WAL results already have the latest state.
             // Remove segment results whose IDs appear in WAL results (WAL is
             // authoritative) or were deleted in the WAL.
-            let wal_ids: HashSet<String> = wal_results.iter().map(|r| r.id.clone()).collect();
             let mut merged = TopK::new(
                 top_k,
                 distance_result_cmp as fn(&SearchResult, &SearchResult) -> Ordering,
@@ -1221,7 +1280,7 @@ fn merge_results(
                 merged.push(sr);
             }
             for sr in segment_results {
-                if !wal_ids.contains(&sr.id) && !wal_deleted_ids.contains(&sr.id) {
+                if !wal_overriding_ids.contains(&sr.id) && !wal_deleted_ids.contains(&sr.id) {
                     merged.push(sr);
                 }
             }
@@ -1252,6 +1311,90 @@ mod tests {
         }
     }
 
+    fn wal_vector_with_attrs(id: &str, offset: f32) -> crate::types::VectorEntry {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "payload".to_string(),
+            AttributeValue::String(format!("payload-{id}")),
+        );
+        crate::types::VectorEntry {
+            id: id.to_string(),
+            values: vec![offset, 0.0],
+            attributes: Some(attrs),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wal_scan_materializes_attrs_only_for_returned_topk() {
+        let store = crate::storage::ZeppelinStore::new(std::sync::Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
+        let namespace = "wal-scan-attrs-clone";
+        crate::wal::manifest::Manifest::new()
+            .write(&store, namespace)
+            .await
+            .unwrap();
+
+        let vectors: Vec<_> = (0..100)
+            .map(|idx| wal_vector_with_attrs(&format!("v_{idx:03}"), idx as f32))
+            .collect();
+        let (_, manifest) = crate::wal::WalWriter::new(store.clone())
+            .append(namespace, vectors, vec![])
+            .await
+            .unwrap();
+        let wal_reader = WalReader::new(store.clone());
+
+        WAL_ATTR_CLONES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let without_attrs = wal_scan(
+            &wal_reader,
+            namespace,
+            &manifest,
+            &[0.0, 0.0],
+            None,
+            DistanceMetric::Euclidean,
+            None,
+            false,
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(without_attrs.results.len(), 5);
+        assert!(without_attrs
+            .results
+            .iter()
+            .all(|result| result.attributes.is_none()));
+        assert_eq!(
+            WAL_ATTR_CLONES.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "include_attributes=false must not clone WAL attrs"
+        );
+
+        WAL_ATTR_CLONES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let with_attrs = wal_scan(
+            &wal_reader,
+            namespace,
+            &manifest,
+            &[0.0, 0.0],
+            None,
+            DistanceMetric::Euclidean,
+            None,
+            true,
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(with_attrs.results.len(), 5);
+        assert!(with_attrs
+            .results
+            .iter()
+            .all(|result| result.attributes.is_some()));
+        assert_eq!(
+            WAL_ATTR_CLONES.load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "WAL attrs should be cloned only for returned top-k results"
+        );
+    }
+
     #[test]
     fn test_merge_strong_excludes_wal_deleted_segment_results() {
         // Vector "compacted" lives only in the segment; its WAL tombstone
@@ -1259,9 +1402,11 @@ mod tests {
         let wal_results = vec![make_result("fresh", 0.1)];
         let segment_results = vec![make_result("compacted", 0.2), make_result("kept", 0.3)];
         let deleted: HashSet<String> = ["compacted".to_string()].into_iter().collect();
+        let overriding: HashSet<String> = ["fresh".to_string()].into_iter().collect();
 
         let merged = merge_results(
             wal_results,
+            &overriding,
             segment_results,
             10,
             ConsistencyLevel::Strong,
@@ -1277,9 +1422,11 @@ mod tests {
         // Same ID in WAL and segment: WAL version wins, no duplicate.
         let wal_results = vec![make_result("v1", 0.5)];
         let segment_results = vec![make_result("v1", 0.1)];
+        let overriding: HashSet<String> = ["v1".to_string()].into_iter().collect();
 
         let merged = merge_results(
             wal_results,
+            &overriding,
             segment_results,
             10,
             ConsistencyLevel::Strong,
@@ -1300,6 +1447,7 @@ mod tests {
 
         let merged = merge_results(
             Vec::new(),
+            &HashSet::new(),
             segment_results,
             10,
             ConsistencyLevel::Eventual,
@@ -1319,6 +1467,7 @@ mod tests {
 
         let merged = merge_bm25_results(
             Vec::new(),
+            &HashSet::new(),
             segment_results,
             10,
             ConsistencyLevel::Eventual,
