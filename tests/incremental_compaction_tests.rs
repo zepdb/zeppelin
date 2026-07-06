@@ -19,15 +19,18 @@ use bytes::Bytes;
 use common::counting::{counting_store, ArtifactClass};
 use common::harness::TestHarness;
 use common::vectors::clustered_vectors;
+use std::collections::BTreeMap;
+use std::ops::Range;
 
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
-use zeppelin::index::ivf_flat::build::build_ivf_flat;
+use zeppelin::index::ivf_flat::build::{attrs_key, build_ivf_flat};
+use zeppelin::index::ivf_flat::membership::{deserialize_membership, MembershipData};
 use zeppelin::index::quantization::sq::{serialize_sq_cluster, SqCalibration};
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
-use zeppelin::wal::manifest::{Manifest, SegmentRef};
+use zeppelin::wal::manifest::{ClusterDataObjectRef, Manifest, MembershipRef, SegmentRef};
 use zeppelin::wal::{WalReader, WalWriter};
 
 const DIM: usize = 16;
@@ -117,6 +120,142 @@ fn cluster_data_key(ns: &str, segment: &SegmentRef, cluster_idx: usize) -> Strin
     format!("{ns}/segments/{owner}/cluster_{cluster_idx}.bin")
 }
 
+async fn decoded_membership(
+    store: &ZeppelinStore,
+    membership_ref: &MembershipRef,
+) -> (MembershipData, BTreeMap<String, u32>) {
+    let bytes = store.get(&membership_ref.key).await.unwrap();
+    assert_eq!(membership_ref.size_bytes, bytes.len() as u64);
+    let decoded = deserialize_membership(&bytes).unwrap();
+    assert_eq!(membership_ref.entry_count, decoded.entries.len() as u64);
+    let map = decoded.entries.iter().cloned().collect();
+    (decoded, map)
+}
+
+async fn actual_cluster_membership(
+    store: &ZeppelinStore,
+    ns: &str,
+    segment: &SegmentRef,
+) -> BTreeMap<String, u32> {
+    let mut membership = BTreeMap::new();
+    if segment.cluster_objects.is_empty() {
+        for cluster_idx in 0..segment.cluster_count {
+            let key = cluster_data_key(ns, segment, cluster_idx);
+            let bytes = store.get(&key).await.unwrap();
+            for id in decode_cluster_ids(&bytes) {
+                assert!(
+                    membership.insert(id, cluster_idx as u32).is_none(),
+                    "each vector id appears in exactly one cluster"
+                );
+            }
+        }
+        return membership;
+    }
+
+    for object_ref in &segment.cluster_objects {
+        let bytes = store.get(&object_ref.key).await.unwrap();
+        for cluster_idx in &object_ref.clusters {
+            let section = grouped_full_section(&bytes, *cluster_idx, object_ref);
+            for id in decode_cluster_ids(section) {
+                assert!(
+                    membership.insert(id, *cluster_idx as u32).is_none(),
+                    "each vector id appears in exactly one cluster"
+                );
+            }
+        }
+    }
+    membership
+}
+
+fn grouped_full_section<'a>(
+    data: &'a [u8],
+    cluster_idx: usize,
+    object_ref: &ClusterDataObjectRef,
+) -> &'a [u8] {
+    let ranges = grouped_full_ranges(data).unwrap_or_else(|| {
+        panic!(
+            "manifest cluster object {} must contain grouped data",
+            object_ref.key
+        )
+    });
+    let range = ranges
+        .into_iter()
+        .find(|(idx, _)| *idx == cluster_idx)
+        .unwrap_or_else(|| {
+            panic!(
+                "manifest cluster object {} missing cluster {cluster_idx}",
+                object_ref.key
+            )
+        })
+        .1;
+    &data[range]
+}
+
+fn grouped_full_ranges(data: &[u8]) -> Option<Vec<(usize, Range<usize>)>> {
+    if data.starts_with(b"ZBP1") {
+        let entry_count = read_u32(data, 4) as usize;
+        let mut sections = Vec::with_capacity(entry_count);
+        for entry_idx in 0..entry_count {
+            let base = 8 + entry_idx * 20;
+            let cluster_idx = read_u32(data, base) as usize;
+            let offset = read_u64(data, base + 4) as usize;
+            let len = read_u64(data, base + 12) as usize;
+            sections.push((cluster_idx, offset..offset + len));
+        }
+        return Some(sections);
+    }
+    if data.len() >= 4 && &data[0..3] == b"ZBP" && data[3] == 4 {
+        let entry_count = read_u32(data, 4) as usize;
+        let mut sections = Vec::with_capacity(entry_count);
+        for entry_idx in 0..entry_count {
+            let base = 8 + entry_idx * 36;
+            let cluster_idx = read_u32(data, base) as usize;
+            let offset = read_u64(data, base + 20) as usize;
+            let len = read_u64(data, base + 28) as usize;
+            sections.push((cluster_idx, offset..offset + len));
+        }
+        return Some(sections);
+    }
+    None
+}
+
+fn decode_cluster_ids(data: &[u8]) -> Vec<String> {
+    let data = full_cluster_section(data);
+    let n = read_u32(data, 0) as usize;
+    let dim = read_u32(data, 4) as usize;
+    let mut offset = 8usize;
+    let mut ids = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id_len = read_u32(data, offset) as usize;
+        offset += 4;
+        let id = std::str::from_utf8(&data[offset..offset + id_len])
+            .unwrap()
+            .to_string();
+        offset += id_len;
+        offset += dim * 4;
+        ids.push(id);
+    }
+    ids
+}
+
+fn full_cluster_section(data: &[u8]) -> &[u8] {
+    if data.starts_with(b"ZCL2") {
+        let offset = read_u64(data, 20) as usize;
+        let len = read_u64(data, 28) as usize;
+        &data[offset..offset + len]
+    } else {
+        data
+    }
+}
+
+fn read_u32(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_u64(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+}
+
 /// Build an initial IVF-Flat segment from well-separated clusters and register
 /// it as the active segment. Returns (segment_id, vectors) so the test knows
 /// each vector's ground-truth cluster from its ID (`cluster_{ci}_vec_{vi}`).
@@ -150,9 +289,76 @@ async fn seed_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEnt
         sketch: None,
         cluster_objects: index.cluster_objects().to_vec(),
         bootstrap: None,
+        membership: None,
     });
     manifest.write(store, ns).await.unwrap();
     (seg_id.to_string(), vectors)
+}
+
+async fn seed_grouped_segment(
+    store: &ZeppelinStore,
+    ns: &str,
+    n_clusters: usize,
+    vectors_per_cluster: usize,
+) -> (String, Vec<VectorEntry>, u64, u64, u64) {
+    let (vectors, _centroids) = clustered_vectors(n_clusters, vectors_per_cluster, DIM, 0.01);
+    let indexing_config = IndexingConfig {
+        default_num_centroids: n_clusters,
+        kmeans_max_iterations: 25,
+        quantization: zeppelin::index::quantization::QuantizationType::None,
+        bitmap_index: false,
+        fts_index: false,
+        hierarchical: false,
+        ..Default::default()
+    };
+    let seg_id = "seg_seed";
+    let index = build_ivf_flat(&vectors, &indexing_config, store, ns, seg_id)
+        .await
+        .unwrap();
+    let cluster_objects = index.cluster_objects().to_vec();
+    assert!(
+        !cluster_objects.is_empty(),
+        "grouped baseline fixture must use cluster_objects"
+    );
+    let expected_cluster_gets = cluster_objects.len() as u64;
+    let expected_cluster_bytes = cluster_objects
+        .iter()
+        .map(|object_ref| object_ref.size_bytes)
+        .sum();
+
+    let mut expected_attrs_bytes = 0u64;
+    for cluster_idx in 0..n_clusters {
+        expected_attrs_bytes += store
+            .head(&attrs_key(ns, seg_id, cluster_idx))
+            .await
+            .unwrap()
+            .size as u64;
+    }
+
+    let mut manifest = Manifest::new();
+    manifest.add_segment(SegmentRef {
+        id: seg_id.to_string(),
+        vector_count: vectors.len(),
+        cluster_count: index.num_clusters(),
+        quantization: zeppelin::index::quantization::QuantizationType::None,
+        hierarchical: false,
+        bitmap_fields: Vec::new(),
+        fts_fields: Vec::new(),
+        has_global_fts: false,
+        cluster_owners: Vec::new(),
+        sketch: None,
+        cluster_objects,
+        bootstrap: None,
+        membership: None,
+    });
+    manifest.write(store, ns).await.unwrap();
+    (
+        seg_id.to_string(),
+        vectors,
+        expected_cluster_gets,
+        expected_cluster_bytes,
+        expected_attrs_bytes,
+    )
 }
 
 /// Seed a legacy per-cluster IVF-Flat segment so the compaction read baseline
@@ -224,6 +430,7 @@ async fn seed_legacy_flat_segment(
         sketch: None,
         cluster_objects: Vec::new(),
         bootstrap: None,
+        membership: None,
     });
     manifest.write(store, ns).await.unwrap();
 
@@ -341,6 +548,7 @@ async fn seed_legacy_sq8_segment(store: &ZeppelinStore, ns: &str) -> (String, Ve
         sketch: None,
         cluster_objects: Vec::new(),
         bootstrap: None,
+        membership: None,
     });
     manifest.write(store, ns).await.unwrap();
     (seg_id.to_string(), vectors)
@@ -481,6 +689,105 @@ async fn test_incremental_rewrites_only_touched_cluster() {
     harness.cleanup().await;
 }
 
+#[tokio::test]
+async fn test_full_compaction_writes_segment_membership_artifact() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("full-membership");
+    let store = &harness.store;
+
+    Manifest::new().write(store, &ns).await.unwrap();
+    let (vectors, _centroids) = clustered_vectors(N_CLUSTERS, 10, DIM, 0.01);
+    WalWriter::new(store.clone())
+        .append(&ns, vectors.clone(), vec![])
+        .await
+        .unwrap();
+
+    let result = incremental_compactor(store).compact(&ns).await.unwrap();
+    let new_seg = result
+        .segment_id
+        .expect("full compaction produces a segment");
+    assert_eq!(result.vectors_compacted, vectors.len());
+
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    let seg_ref = manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == new_seg)
+        .unwrap();
+    let membership_ref = seg_ref
+        .membership
+        .as_ref()
+        .expect("new IVF-Flat full compaction segment must record membership");
+    assert!(
+        store.exists(&membership_ref.key).await.unwrap(),
+        "manifest membership object must exist on S3"
+    );
+
+    let (decoded, decoded_map) = decoded_membership(store, membership_ref).await;
+    assert_eq!(decoded.cluster_count, seg_ref.cluster_count as u32);
+    assert_eq!(membership_ref.entry_count, seg_ref.vector_count as u64);
+    assert_eq!(decoded.entries.len(), vectors.len());
+    assert_eq!(
+        decoded_map,
+        actual_cluster_membership(store, &ns, seg_ref).await,
+        "membership must exactly match the segment's persisted id-to-cluster assignment"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_incremental_compaction_writes_segment_global_membership_artifact() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("incr-membership");
+    let store = &harness.store;
+
+    let (_seed_id, seed_vecs) = seed_segment(store, &ns).await;
+    let anchor = &seed_vecs[0].values;
+    let new_vecs: Vec<VectorEntry> = (0..5)
+        .map(|i| VectorEntry {
+            id: format!("membership_added_{i}"),
+            values: anchor.iter().map(|x| x + 0.001).collect(),
+            attributes: None,
+        })
+        .collect();
+    WalWriter::new(store.clone())
+        .append(&ns, new_vecs, vec![])
+        .await
+        .unwrap();
+
+    let result = incremental_compactor(store).compact(&ns).await.unwrap();
+    let new_seg = result
+        .segment_id
+        .expect("incremental compaction produces a segment");
+
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    let seg_ref = manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == new_seg)
+        .unwrap();
+    assert!(
+        !seg_ref.cluster_owners.is_empty(),
+        "fixture must exercise carried clusters and rewritten clusters"
+    );
+    let membership_ref = seg_ref
+        .membership
+        .as_ref()
+        .expect("new IVF-Flat incremental segment must record membership");
+    let (decoded, decoded_map) = decoded_membership(store, membership_ref).await;
+    let actual_map = actual_cluster_membership(store, &ns, seg_ref).await;
+    assert_eq!(decoded.cluster_count, seg_ref.cluster_count as u32);
+    assert_eq!(membership_ref.entry_count, seg_ref.vector_count as u64);
+    assert_eq!(decoded.entries.len(), seg_ref.vector_count);
+    assert_eq!(
+        decoded_map, actual_map,
+        "incremental membership must cover carried and rewritten clusters under the new segment id"
+    );
+
+    harness.cleanup().await;
+}
+
 /// BASELINE (pre-2C.3): incremental compaction reads all N clusters; stages
 /// 2C.1-2C.3 will drive this to O(WAL + touched). Update these numbers when
 /// the bounded-read flip lands.
@@ -540,6 +847,69 @@ async fn test_incremental_read_io_baseline_reads_all_clusters() {
         counter.get_bytes_for(ArtifactClass::Attrs),
         expected_attrs_bytes,
         "BASELINE (pre-2C.3): attrs bytes freeze the all-cluster read cost"
+    );
+
+    harness.cleanup().await;
+}
+
+/// BASELINE (pre-2C.3): grouped-layout incremental compaction reads every
+/// manifest cluster object plus attrs for every logical cluster. Update these
+/// numbers when the bounded-read flip lands.
+#[tokio::test]
+async fn test_incremental_grouped_read_io_baseline_reads_all_cluster_objects() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let ns = harness.key("incr-grouped-read-baseline");
+
+    let (_seed_id, seed_vecs, expected_cluster_gets, expected_cluster_bytes, expected_attrs_bytes) =
+        seed_grouped_segment(&store, &ns, BASELINE_CLUSTERS, BASELINE_VECTORS_PER_CLUSTER).await;
+
+    let anchor = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_0_vec_0")
+        .unwrap()
+        .values
+        .clone();
+    let new_vec = VectorEntry {
+        id: "grouped_baseline_added_one_cluster".to_string(),
+        values: anchor.iter().map(|x| x + 0.001).collect(),
+        attributes: None,
+    };
+    WalWriter::new(store.clone())
+        .append(&ns, vec![new_vec], vec![])
+        .await
+        .unwrap();
+
+    counter.reset();
+    let result = baseline_compactor(&store).compact(&ns).await.unwrap();
+    assert!(
+        result.segment_id.is_some(),
+        "grouped baseline compaction must produce a new segment"
+    );
+
+    println!("pre-2C.3 grouped incremental compaction read baseline");
+    println!("{}", counter.report());
+
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Cluster),
+        expected_cluster_gets,
+        "BASELINE (pre-2C.3): one WAL vector touches one cluster, but grouped \
+         incremental compaction reads every manifest cluster object"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Attrs),
+        BASELINE_CLUSTERS as u64,
+        "BASELINE (pre-2C.3): grouped layout still reads attrs for every old cluster"
+    );
+    assert_eq!(
+        counter.get_bytes_for(ArtifactClass::Cluster),
+        expected_cluster_bytes,
+        "BASELINE (pre-2C.3): grouped cluster bytes freeze the all-object read cost"
+    );
+    assert_eq!(
+        counter.get_bytes_for(ArtifactClass::Attrs),
+        expected_attrs_bytes,
+        "BASELINE (pre-2C.3): grouped attrs bytes freeze the all-cluster read cost"
     );
 
     harness.cleanup().await;
@@ -732,6 +1102,7 @@ async fn test_incremental_matches_full_rewrite_results() {
         sketch: None,
         cluster_objects: full_seed_index.cluster_objects().to_vec(),
         bootstrap: None,
+        membership: None,
     });
     full_manifest.write(store, &ns_full).await.unwrap();
 

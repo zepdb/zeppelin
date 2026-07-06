@@ -2379,6 +2379,7 @@ mod tests {
             resident_sketch: None,
             sketch_ref: None,
             bootstrap_ref: None,
+            membership_ref: None,
         }
     }
 

@@ -6,6 +6,7 @@
 
 pub mod build;
 pub mod kmeans;
+pub mod membership;
 pub mod search;
 pub mod sketch;
 
@@ -17,7 +18,7 @@ use crate::error::Result;
 use crate::index::VectorIndex;
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, Filter, SearchResult, VectorEntry};
-use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef};
+use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef, MembershipRef};
 
 /// In-memory handle for a built IVF-Flat index.
 ///
@@ -62,6 +63,9 @@ pub struct IvfFlatIndex {
     /// Manifest reference for the segment bootstrap artifact, when this handle
     /// came from a build path that created one.
     pub(crate) bootstrap_ref: Option<BootstrapRef>,
+    /// Manifest reference for the segment membership artifact, when this handle
+    /// came from a build path that created one.
+    pub(crate) membership_ref: Option<MembershipRef>,
 }
 
 impl IvfFlatIndex {

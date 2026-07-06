@@ -410,6 +410,7 @@ async fn test_compact_with_existing_segment() {
         sketch: None,
         cluster_objects: old_index.cluster_objects().to_vec(),
         bootstrap: None,
+        membership: None,
     });
     manifest.write(store, &ns).await.unwrap();
 

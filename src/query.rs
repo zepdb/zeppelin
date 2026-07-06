@@ -1514,6 +1514,7 @@ mod tests {
             sketch: None,
             cluster_objects: Vec::new(),
             bootstrap: None,
+            membership: None,
         }
     }
 

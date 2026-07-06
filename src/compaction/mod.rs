@@ -17,10 +17,13 @@ use crate::index::ivf_flat::build::{
     attrs_key, build_ivf_flat, cluster_group_key, cluster_key, cluster_object_sections,
     deserialize_attrs, deserialize_cluster,
 };
+use crate::index::ivf_flat::membership::build_membership_artifact;
 use crate::storage::ZeppelinStore;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
-use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef, Manifest, SegmentRef};
+use crate::wal::manifest::{
+    BootstrapRef, ClusterDataObjectRef, Manifest, MembershipRef, SegmentRef,
+};
 use crate::wal::WalReader;
 
 /// Maximum CAS retry attempts for manifest updates.
@@ -544,6 +547,7 @@ impl Compactor {
             cluster_owners,
             sketch_ref,
             bootstrap_ref,
+            membership_ref,
             cluster_objects,
         ) = if !should_retrain && old_segment_id.is_some() && !self.indexing_config.hierarchical {
             // Incremental path: reuse existing centroids, just reassign vectors.
@@ -577,7 +581,15 @@ impl Compactor {
                 )
                 .await
             {
-                Ok((count, bf, owners, sketch_ref, bootstrap_ref, cluster_objects)) => {
+                Ok((
+                    count,
+                    bf,
+                    owners,
+                    sketch_ref,
+                    bootstrap_ref,
+                    membership_ref,
+                    cluster_objects,
+                )) => {
                     info!(
                         new_from_wal,
                         existing_count, "incremental compaction: reusing centroids"
@@ -589,6 +601,7 @@ impl Compactor {
                         owners,
                         Some(sketch_ref),
                         Some(bootstrap_ref),
+                        Some(membership_ref),
                         cluster_objects,
                     )
                 }
@@ -613,6 +626,7 @@ impl Compactor {
                         Vec::new(),
                         index.sketch_ref.clone(),
                         index.bootstrap_ref.clone(),
+                        index.membership_ref.clone(),
                         index.cluster_objects.clone(),
                     )
                 }
@@ -634,6 +648,7 @@ impl Compactor {
                 Vec::new(),
                 None,
                 None,
+                None,
                 Vec::new(),
             )
         } else {
@@ -653,6 +668,7 @@ impl Compactor {
                 Vec::new(),
                 index.sketch_ref.clone(),
                 index.bootstrap_ref.clone(),
+                index.membership_ref.clone(),
                 index.cluster_objects.clone(),
             )
         };
@@ -900,6 +916,7 @@ impl Compactor {
                     sketch: sketch_ref.clone(),
                     cluster_objects: cluster_objects.clone(),
                     bootstrap: bootstrap_ref.clone(),
+                    membership: membership_ref.clone(),
                 },
                 self.config.max_pending_deletes,
                 self.config.max_old_segments,
@@ -961,7 +978,8 @@ impl Compactor {
     /// old keys), bounding per-cycle write I/O to O(touched clusters) instead
     /// of O(dataset).
     ///
-    /// Returns `(cluster_count, bitmap_fields, cluster_owners, sketch_ref, bootstrap_ref, cluster_objects)`.
+    /// Returns `(cluster_count, bitmap_fields, cluster_owners, sketch_ref,
+    /// bootstrap_ref, membership_ref, cluster_objects)`.
     /// `cluster_owners[i]` is the segment ID that owns cluster `i`'s per-cluster sidecars:
     /// `new_segment_id` for rewritten clusters, the old segment's resolved
     /// owner for carried-over ones. An empty vec would mean "all owned by
@@ -1003,6 +1021,7 @@ impl Compactor {
         Vec<String>,
         crate::wal::manifest::SketchRef,
         BootstrapRef,
+        MembershipRef,
         Vec<ClusterDataObjectRef>,
     )> {
         use crate::index::distance::euclidean_distance;
@@ -1156,8 +1175,11 @@ impl Compactor {
         )?;
         let (bootstrap_ref, bootstrap_data) =
             build_bootstrap_artifact(namespace, new_segment_id, &new_centroids_data, &sketch_data)?;
+        let (membership_ref, membership_data) =
+            build_membership_artifact(namespace, new_segment_id, &cluster_ids)?;
         payloads.push((sketch_ref.key.clone(), sketch_data));
         payloads.push((bootstrap_ref.key.clone(), bootstrap_data));
+        payloads.push((membership_ref.key.clone(), membership_data));
 
         for i in 0..num_clusters {
             if !touched[i] {
@@ -1289,6 +1311,7 @@ impl Compactor {
             owners_out,
             sketch_ref,
             bootstrap_ref,
+            membership_ref,
             cluster_objects_out,
         ))
     }

@@ -66,6 +66,7 @@ use crate::types::{AttributeValue, VectorEntry};
 use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef};
 
 use super::kmeans::train_kmeans;
+use super::membership::build_membership_artifact;
 use super::sketch::{build_resident_sketch, ResidentSketch};
 use super::IvfFlatIndex;
 use crate::index::distance;
@@ -1644,7 +1645,18 @@ pub async fn build_ivf_flat(
         "wrote all grouped cluster data"
     );
 
-    // --- Step 4: Write resident coarse sketch ---
+    // --- Step 4: Write segment membership artifact ---
+    let (membership_ref, membership_data) =
+        build_membership_artifact(namespace, segment_id, &cluster_ids)?;
+    store.put(&membership_ref.key, membership_data).await?;
+    info!(
+        key = %membership_ref.key,
+        entry_count = membership_ref.entry_count,
+        size_bytes = membership_ref.size_bytes,
+        "wrote segment membership"
+    );
+
+    // --- Step 5: Write resident coarse sketch ---
     let (sketch_ref, sketch_data, resident_sketch) =
         build_resident_sketch(namespace, segment_id, dim, &cluster_vecs, &cluster_attrs)?;
     store.put(&sketch_ref.key, sketch_data.clone()).await?;
@@ -1656,7 +1668,7 @@ pub async fn build_ivf_flat(
         "wrote resident coarse sketch"
     );
 
-    // --- Step 5: Write segment bootstrap artifact ---
+    // --- Step 6: Write segment bootstrap artifact ---
     let (bootstrap_ref, bootstrap_data) =
         build_bootstrap_artifact(namespace, segment_id, &centroids_data, &sketch_data)?;
     store.put(&bootstrap_ref.key, bootstrap_data).await?;
@@ -1666,7 +1678,7 @@ pub async fn build_ivf_flat(
         "wrote segment bootstrap"
     );
 
-    // --- Step 6: Write quantized artifacts (if configured) ---
+    // --- Step 7: Write quantized artifacts (if configured) ---
     match quantization {
         QuantizationType::Scalar => {
             info!("wrote SQ8 co-located clusters and embedded calibration");
@@ -1736,6 +1748,7 @@ pub async fn build_ivf_flat(
         resident_sketch: Some(Arc::new(resident_sketch)),
         sketch_ref: Some(sketch_ref),
         bootstrap_ref: Some(bootstrap_ref),
+        membership_ref: Some(membership_ref),
     })
 }
 
@@ -1826,6 +1839,7 @@ pub async fn load_ivf_flat_from_manifest(
         resident_sketch: metadata.resident_sketch,
         sketch_ref,
         bootstrap_ref,
+        membership_ref: None,
     })
 }
 
@@ -2137,6 +2151,7 @@ pub async fn load_ivf_flat(
         resident_sketch: None,
         sketch_ref: None,
         bootstrap_ref: None,
+        membership_ref: None,
     })
 }
 

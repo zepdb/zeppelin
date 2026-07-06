@@ -120,6 +120,10 @@ pub enum ZeppelinError {
     #[error("index error: {0}")]
     Index(String),
 
+    /// A segment membership artifact operation failed.
+    #[error("membership artifact error: {0}")]
+    Membership(String),
+
     /// K-means clustering did not converge within the iteration limit.
     #[error("k-means failed to converge after {iterations} iterations")]
     KMeansConvergence {
@@ -271,6 +275,7 @@ impl ZeppelinError {
             ZeppelinError::NamespaceDeleting { .. } => "NAMESPACE_DELETING",
             ZeppelinError::NamespaceDeleteIncomplete { .. } => "INTERNAL_ERROR",
             ZeppelinError::Index(_) => "INTERNAL_ERROR",
+            ZeppelinError::Membership(_) => "INTERNAL_ERROR",
             ZeppelinError::KMeansConvergence { .. } => "INTERNAL_ERROR",
             ZeppelinError::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
             ZeppelinError::Validation(_) => "VALIDATION_ERROR",
@@ -336,6 +341,7 @@ impl ZeppelinError {
             | ZeppelinError::Bincode(_)
             | ZeppelinError::Serialization(_)
             | ZeppelinError::Index(_)
+            | ZeppelinError::Membership(_)
             | ZeppelinError::KMeansConvergence { .. }
             | ZeppelinError::Config(_)
             | ZeppelinError::Io(_)
@@ -541,6 +547,7 @@ mod tests {
                 remaining_keys: 1,
             },
             ZeppelinError::Index("i".into()),
+            ZeppelinError::Membership("m".into()),
             ZeppelinError::KMeansConvergence { iterations: 3 },
             ZeppelinError::DimensionMismatch {
                 expected: 1,

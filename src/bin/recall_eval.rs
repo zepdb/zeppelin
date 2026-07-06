@@ -1543,6 +1543,7 @@ mod tests {
                 size_bytes: 0,
             }],
             bootstrap: None,
+            membership: None,
         });
         manifest.write(&store, namespace).await.unwrap();
 

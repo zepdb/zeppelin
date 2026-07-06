@@ -64,6 +64,17 @@ pub struct BootstrapRef {
     pub size_bytes: u64,
 }
 
+/// A reference to an immutable IVF-Flat segment membership artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MembershipRef {
+    /// S3 key for the immutable membership artifact.
+    pub key: String,
+    /// Serialized artifact size in bytes.
+    pub size_bytes: u64,
+    /// Number of vector-id entries in the artifact.
+    pub entry_count: u64,
+}
+
 /// A manifest reference to one immutable object containing one or more IVF
 /// cluster payloads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -203,11 +214,19 @@ pub struct SegmentRef {
     /// `None` means the segment predates bootstrap artifacts and must load the
     /// legacy `centroids.bin` and `coarse_sketch.bin` objects explicitly.
     ///
+    #[serde(default)]
+    pub bootstrap: Option<BootstrapRef>,
+    /// Immutable IVF-Flat segment membership artifact.
+    ///
+    /// When present, this segment has a compact id → cluster-index map. Stage
+    /// 2C.1 writes it for new IVF-Flat segments only; current readers do not
+    /// consult it yet.
+    ///
     /// NOTE: this field must stay LAST in the struct. MessagePack encodes
     /// structs as arrays, so old manifests decode only if new fields are
     /// trailing and `#[serde(default)]`.
     #[serde(default)]
-    pub bootstrap: Option<BootstrapRef>,
+    pub membership: Option<MembershipRef>,
 }
 
 impl SegmentRef {
@@ -487,6 +506,7 @@ mod tests {
             sketch: None,
             cluster_objects: Vec::new(),
             bootstrap: None,
+            membership: None,
         }
     }
 
@@ -900,6 +920,78 @@ mod tests {
             object_ref.size_bytes, 0,
             "missing cluster object size_bytes decodes to unknown"
         );
+    }
+
+    /// Backward compat: manifests serialized BEFORE `SegmentRef.membership`
+    /// existed must still decode, in both MessagePack (structs as arrays —
+    /// new fields must be trailing + defaulted) and legacy JSON.
+    #[test]
+    fn test_decode_segment_ref_without_membership_field() {
+        #[derive(Serialize)]
+        struct OldSegmentRef {
+            id: String,
+            vector_count: usize,
+            cluster_count: usize,
+            quantization: crate::index::quantization::QuantizationType,
+            hierarchical: bool,
+            bitmap_fields: Vec<String>,
+            fts_fields: Vec<String>,
+            has_global_fts: bool,
+            cluster_owners: Vec<String>,
+            sketch: Option<SketchRef>,
+            cluster_objects: Vec<ClusterDataObjectRef>,
+            bootstrap: Option<BootstrapRef>,
+        }
+        #[derive(Serialize)]
+        struct MixedManifest {
+            fragments: Vec<FragmentRef>,
+            segments: Vec<OldSegmentRef>,
+            compaction_watermark: Option<Ulid>,
+            active_segment: Option<String>,
+            next_sequence: u64,
+            pending_deletes: Vec<String>,
+            fencing_token: u64,
+            updated_at: DateTime<Utc>,
+        }
+
+        let old = MixedManifest {
+            fragments: vec![],
+            segments: vec![OldSegmentRef {
+                id: "seg_pre_membership".to_string(),
+                vector_count: 10,
+                cluster_count: 2,
+                quantization: crate::index::quantization::QuantizationType::None,
+                hierarchical: false,
+                bitmap_fields: vec![],
+                fts_fields: vec![],
+                has_global_fts: false,
+                cluster_owners: vec![],
+                sketch: None,
+                cluster_objects: vec![],
+                bootstrap: None,
+            }],
+            compaction_watermark: None,
+            active_segment: Some("seg_pre_membership".to_string()),
+            next_sequence: 0,
+            pending_deletes: vec![],
+            fencing_token: 0,
+            updated_at: Utc::now(),
+        };
+
+        let msgpack = rmp_serde::to_vec(&old).unwrap();
+        let mut data = vec![MANIFEST_FORMAT_MSGPACK];
+        data.extend_from_slice(&msgpack);
+        let decoded =
+            Manifest::from_bytes(&data).expect("old segment refs without membership must decode");
+        assert!(
+            decoded.segments[0].membership.is_none(),
+            "missing membership decodes to the serde default (None)"
+        );
+
+        let json = serde_json::to_vec(&old).unwrap();
+        let decoded_json = Manifest::from_bytes(&json)
+            .expect("legacy JSON segment refs without membership must decode");
+        assert!(decoded_json.segments[0].membership.is_none());
     }
 
     /// Round-trip: size_bytes survives serialize → deserialize.
