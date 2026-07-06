@@ -18,6 +18,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Instrument, Level};
 
+use crate::cache::hydration::SegmentHydrator;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
 use crate::config::Config;
@@ -71,6 +72,8 @@ pub struct AppState {
     pub cache: Arc<DiskCache>,
     /// In-memory manifest cache with TTL.
     pub manifest_cache: Arc<ManifestCache>,
+    /// Optional background warm-set hydrator.
+    pub hydrator: Option<Arc<SegmentHydrator>>,
     /// In-memory cache for WAL-level full-text search indexes.
     pub fts_cache: Arc<WalFtsCache>,
     /// Semaphore that caps concurrent in-flight queries.

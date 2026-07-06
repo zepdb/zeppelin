@@ -98,6 +98,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         query_knob_bounds,
         cache: cache.clone(),
         manifest_cache,
+        hydrator: None,
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         rate_limiters: Arc::new(DashMap::new()),

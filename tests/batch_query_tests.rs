@@ -68,6 +68,7 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
         query_knob_bounds,
         cache,
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_secs(60))),
+        hydrator: None,
         fts_cache: Arc::new(WalFtsCache::new()),
         rate_limiters: Arc::new(DashMap::new()),
     });

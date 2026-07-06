@@ -3,7 +3,7 @@
 mod inner {
     use prometheus::{
         register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
-        HistogramVec, IntCounter, IntCounterVec, IntGauge,
+        register_int_gauge_vec, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
     };
 
     lazy_static::lazy_static! {
@@ -57,6 +57,39 @@ mod inner {
             "zeppelin_range_source_total",
             "Range reads served by source",
             &["phase", "source"]
+        ).unwrap();
+        pub static ref HYDRATION_JOBS_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_hydration_jobs_total",
+            "Hydration jobs accepted by trigger",
+            &["trigger"]
+        ).unwrap();
+        pub static ref HYDRATION_OBJECTS_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_hydration_objects_total",
+            "Hydrated objects by kind",
+            &["kind"]
+        ).unwrap();
+        pub static ref HYDRATION_BYTES_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_hydration_bytes_total",
+            "Hydrated bytes by kind",
+            &["kind"]
+        ).unwrap();
+        pub static ref HYDRATION_FAILURES_TOTAL: IntCounter = register_int_counter!(
+            "zeppelin_hydration_failures_total",
+            "Hydration job failures"
+        ).unwrap();
+        pub static ref HYDRATION_INFLIGHT: IntGauge = register_int_gauge!(
+            "zeppelin_hydration_inflight",
+            "Hydration jobs currently running"
+        ).unwrap();
+        pub static ref HYDRATION_SKIPPED_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_hydration_skipped_total",
+            "Hydration jobs skipped before object fetch",
+            &["reason"]
+        ).unwrap();
+        pub static ref NAMESPACE_HEAT: IntGaugeVec = register_int_gauge_vec!(
+            "zeppelin_namespace_heat",
+            "Observed namespace query heat",
+            &["namespace"]
         ).unwrap();
         pub static ref INDEX_BUILD_DURATION: HistogramVec = register_histogram_vec!(
             "zeppelin_index_build_duration_seconds", "Index build duration",
@@ -145,6 +178,13 @@ pub fn init() {
     lazy_static::initialize(&ACTIVE_QUERIES);
     lazy_static::initialize(&RERANK_COALESCE_GAP_BYTES);
     lazy_static::initialize(&RANGE_SOURCE_TOTAL);
+    lazy_static::initialize(&HYDRATION_JOBS_TOTAL);
+    lazy_static::initialize(&HYDRATION_OBJECTS_TOTAL);
+    lazy_static::initialize(&HYDRATION_BYTES_TOTAL);
+    lazy_static::initialize(&HYDRATION_FAILURES_TOTAL);
+    lazy_static::initialize(&HYDRATION_INFLIGHT);
+    lazy_static::initialize(&HYDRATION_SKIPPED_TOTAL);
+    lazy_static::initialize(&NAMESPACE_HEAT);
     lazy_static::initialize(&INDEX_BUILD_DURATION);
     lazy_static::initialize(&FTS_INDEX_BUILD_DURATION);
     lazy_static::initialize(&FTS_QUERIES_TOTAL);

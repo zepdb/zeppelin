@@ -14,6 +14,7 @@ use crate::query::QueryResponse;
 use crate::runtime_config::QueryKnobs;
 use crate::server::AppState;
 use crate::types::{ConsistencyLevel, Filter};
+use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 
 use super::ApiError;
@@ -59,6 +60,11 @@ struct ValidatedQuery {
     top_k: usize,
     nprobe: usize,
     include_attributes: bool,
+}
+
+struct QueryExecutionOptions {
+    manifest: Option<Manifest>,
+    notify_hydration: bool,
 }
 
 /// Response body for a batch query request.
@@ -165,9 +171,20 @@ pub async fn query_namespace(
         .await
         .map_err(ApiError::from)?;
 
-    let result = execute_validated_query(&state, &ns, &meta, &req, validated, knobs.as_ref(), None)
-        .await
-        .map_err(ApiError::from)?;
+    let result = execute_validated_query(
+        &state,
+        &ns,
+        &meta,
+        &req,
+        validated,
+        knobs.as_ref(),
+        QueryExecutionOptions {
+            manifest: None,
+            notify_hydration: true,
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
 
     info!(
         results = result.results.len(),
@@ -271,6 +288,9 @@ pub async fn batch_query_namespace(
         }
         false => None,
     };
+    if let Some(manifest) = manifest.as_ref() {
+        notify_hydrator(&state, &ns, manifest);
+    }
 
     let mut results = Vec::with_capacity(req.queries.len());
     for (idx, query_req) in req.queries.iter().enumerate() {
@@ -284,7 +304,10 @@ pub async fn batch_query_namespace(
                     query_req,
                     *validated,
                     knobs.as_ref(),
-                    manifest.clone(),
+                    QueryExecutionOptions {
+                        manifest: manifest.clone(),
+                        notify_hydration: false,
+                    },
                 )
                 .await
                 {
@@ -362,7 +385,7 @@ async fn execute_validated_query(
     req: &QueryRequest,
     validated: ValidatedQuery,
     knobs: &QueryKnobs,
-    manifest: Option<Manifest>,
+    options: QueryExecutionOptions,
 ) -> Result<QueryResponse, ZeppelinError> {
     if let Some(ref rank_by) = req.rank_by {
         // BM25 query path
@@ -380,7 +403,7 @@ async fn execute_validated_query(
             .with_label_values(&[ns])
             .inc();
 
-        return match manifest {
+        return match options.manifest {
             Some(manifest) => {
                 query::execute_bm25_query_with_manifest(
                     &state.store,
@@ -457,10 +480,41 @@ async fn execute_validated_query(
         include_attributes: validated.include_attributes,
     };
 
-    match manifest {
-        Some(manifest) => query::execute_query_with_manifest(params, manifest).await,
-        None => query::execute_query(params).await,
+    let manifest = match options.manifest {
+        Some(manifest) => manifest,
+        None => {
+            query::read_manifest_for_query(
+                &state.store,
+                ns,
+                req.consistency,
+                Some(&state.manifest_cache),
+            )
+            .await?
+        }
+    };
+    if options.notify_hydration {
+        notify_hydrator(state, ns, &manifest);
     }
+    query::execute_query_with_manifest(params, manifest).await
+}
+
+fn notify_hydrator(state: &AppState, namespace: &str, manifest: &Manifest) {
+    let Some(hydrator) = state.hydrator.as_ref() else {
+        return;
+    };
+    let Some(segment) = active_segment_snapshot(manifest) else {
+        return;
+    };
+    hydrator.observe_query(namespace, &segment);
+}
+
+fn active_segment_snapshot(manifest: &Manifest) -> Option<SegmentRef> {
+    let active_segment = manifest.active_segment.as_ref()?;
+    manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == *active_segment)
+        .cloned()
 }
 
 fn strongest_consistency(

@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 
 use super::harness::TestHarness;
 
+use zeppelin::cache::hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator};
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::compaction_loop;
@@ -35,6 +36,24 @@ fn runtime_query_state(config: &Config) -> (Arc<RuntimeQueryConfig>, QueryKnobBo
     )
 }
 
+fn maybe_hydrator(
+    config: &Config,
+    store: &ZeppelinStore,
+    cache: &Arc<DiskCache>,
+) -> Option<Arc<SegmentHydrator>> {
+    if !config.cache.hydration_enabled {
+        return None;
+    }
+    let hydration_config = HydrationConfig::from_cache_config(&config.cache).unwrap();
+    let policy = heat_policy_from_config(&config.cache).unwrap();
+    Some(SegmentHydrator::start(
+        store.clone(),
+        cache.clone(),
+        policy,
+        hydration_config,
+    ))
+}
+
 /// Start a test server with optional config override, returning (base_url, harness, cache, _cache_dir).
 /// The TempDir must be kept alive for the cache to function.
 pub async fn start_test_server_with_config(
@@ -56,6 +75,7 @@ pub async fn start_test_server_with_config(
         config.server.max_concurrent_queries,
     ));
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
+    let hydrator = maybe_hydrator(&config, &harness.store, &cache);
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
@@ -67,6 +87,7 @@ pub async fn start_test_server_with_config(
         query_knob_bounds,
         cache: cache.clone(),
         manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
+        hydrator,
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         rate_limiters: Arc::new(DashMap::new()),
@@ -123,6 +144,7 @@ pub async fn start_test_server_with_compactor(
         config.server.max_concurrent_queries,
     ));
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
+    let hydrator = maybe_hydrator(&config, &harness.store, &cache);
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
@@ -134,6 +156,7 @@ pub async fn start_test_server_with_compactor(
         query_knob_bounds,
         cache: cache.clone(),
         manifest_cache,
+        hydrator,
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         rate_limiters: Arc::new(DashMap::new()),
@@ -220,6 +243,7 @@ pub async fn start_test_server_with_compaction(
         config.server.max_concurrent_queries,
     ));
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
+    let hydrator = maybe_hydrator(&config, &harness.store, &cache);
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager,
@@ -231,6 +255,7 @@ pub async fn start_test_server_with_compaction(
         query_knob_bounds,
         cache: cache.clone(),
         manifest_cache,
+        hydrator,
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
         rate_limiters: Arc::new(DashMap::new()),

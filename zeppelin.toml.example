@@ -29,9 +29,12 @@
 [cache]
 # dir = "/var/cache/zeppelin"        # ZEPPELIN_CACHE_DIR
 # max_size_gb = 50                   # ZEPPELIN_CACHE_MAX_SIZE_GB
+# hydration_enabled = false
 # hydration_policy = "session_window"       # ZEPPELIN_HYDRATION_POLICY
 # hydration_heat_queries = 3                # ZEPPELIN_HYDRATION_HEAT_QUERIES
 # hydration_heat_window_secs = 60           # ZEPPELIN_HYDRATION_HEAT_WINDOW_SECS
+# hydration_parallelism = 4
+# hydration_max_segment_fraction = 0.5
 # Per-namespace hydration policy overrides are intentionally deferred until
 # production traffic validates that extra selection matrix.
 

@@ -279,20 +279,29 @@ mod tests {
             defaulted.cache.hydration_policy,
             HydrationPolicyKind::SessionWindow
         );
+        assert!(!defaulted.cache.hydration_enabled);
         assert_eq!(defaulted.cache.hydration_heat_queries, 3);
         assert_eq!(defaulted.cache.hydration_heat_window_secs, 60);
+        assert_eq!(defaulted.cache.hydration_parallelism, 4);
+        assert_eq!(defaulted.cache.hydration_max_segment_fraction, 0.5);
 
         let explicit = load_toml(
             r#"
             [cache]
+            hydration_enabled = true
             hydration_policy = "session_window"
             hydration_heat_queries = 5
             hydration_heat_window_secs = 90
+            hydration_parallelism = 8
+            hydration_max_segment_fraction = 0.25
             "#,
         )
         .unwrap();
+        assert!(explicit.cache.hydration_enabled);
         assert_eq!(explicit.cache.hydration_heat_queries, 5);
         assert_eq!(explicit.cache.hydration_heat_window_secs, 90);
+        assert_eq!(explicit.cache.hydration_parallelism, 8);
+        assert_eq!(explicit.cache.hydration_max_segment_fraction, 0.25);
     }
 }
 
@@ -439,6 +448,9 @@ pub struct CacheConfig {
     /// Namespace metadata positive-cache TTL in milliseconds. Default: `5000`.
     #[serde(default = "default_namespace_registry_ttl_ms")]
     pub namespace_registry_ttl_ms: u64,
+    /// Enable background warm-set hydration. Default: `false` (dark launch).
+    #[serde(default)]
+    pub hydration_enabled: bool,
     /// Boot-selected hydration heat policy.
     ///
     /// Per-namespace policy selection is intentionally deferred until real
@@ -452,6 +464,12 @@ pub struct CacheConfig {
     /// Heat window length in seconds. Default: `60`.
     #[serde(default = "default_hydration_heat_window_secs")]
     pub hydration_heat_window_secs: u64,
+    /// Maximum concurrent object downloads per hydration job. Default: `4`.
+    #[serde(default = "default_hydration_parallelism")]
+    pub hydration_parallelism: usize,
+    /// Maximum fraction of the disk cache one segment may occupy. Default: `0.5`.
+    #[serde(default = "default_hydration_max_segment_fraction")]
+    pub hydration_max_segment_fraction: f64,
 }
 
 /// Globally selected warm-set hydration heat policy.
@@ -627,6 +645,12 @@ fn default_hydration_heat_queries() -> u64 {
 fn default_hydration_heat_window_secs() -> u64 {
     60
 }
+fn default_hydration_parallelism() -> usize {
+    4
+}
+fn default_hydration_max_segment_fraction() -> f64 {
+    0.5
+}
 fn default_num_centroids() -> usize {
     256
 }
@@ -731,9 +755,12 @@ impl Default for CacheConfig {
             memory_cache_max_mb: default_memory_cache_max_mb(),
             manifest_cache_ttl_ms: default_manifest_cache_ttl_ms(),
             namespace_registry_ttl_ms: default_namespace_registry_ttl_ms(),
+            hydration_enabled: false,
             hydration_policy: default_hydration_policy(),
             hydration_heat_queries: default_hydration_heat_queries(),
             hydration_heat_window_secs: default_hydration_heat_window_secs(),
+            hydration_parallelism: default_hydration_parallelism(),
+            hydration_max_segment_fraction: default_hydration_max_segment_fraction(),
         }
     }
 }
@@ -868,6 +895,19 @@ impl Config {
         if self.cache.hydration_heat_window_secs == 0 {
             return Err(ZeppelinError::Config(
                 "cache.hydration_heat_window_secs must be greater than zero".into(),
+            ));
+        }
+        if self.cache.hydration_parallelism == 0 {
+            return Err(ZeppelinError::Config(
+                "cache.hydration_parallelism must be greater than zero".into(),
+            ));
+        }
+        if !self.cache.hydration_max_segment_fraction.is_finite()
+            || self.cache.hydration_max_segment_fraction <= 0.0
+            || self.cache.hydration_max_segment_fraction > 1.0
+        {
+            return Err(ZeppelinError::Config(
+                "cache.hydration_max_segment_fraction must be finite and in (0, 1]".into(),
             ));
         }
         Ok(())

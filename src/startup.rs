@@ -13,7 +13,10 @@ use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
 use crate::cache::manifest_cache::ManifestCache;
-use crate::cache::DiskCache;
+use crate::cache::{
+    hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator},
+    DiskCache,
+};
 use crate::compaction::background::start_compaction_thread;
 use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget};
@@ -124,6 +127,19 @@ pub async fn build_app(
     // Initialize disk cache
     let cache = Arc::new(DiskCache::new(&config.cache)?);
 
+    let hydrator = if config.cache.hydration_enabled {
+        let hydration_config = HydrationConfig::from_cache_config(&config.cache)?;
+        let policy = heat_policy_from_config(&config.cache)?;
+        Some(SegmentHydrator::start(
+            store.clone(),
+            cache.clone(),
+            policy,
+            hydration_config,
+        ))
+    } else {
+        None
+    };
+
     // Initialize manifest cache — drops one S3 GET from eventual queries while
     // strong queries still verify freshness against S3.
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(
@@ -194,6 +210,7 @@ pub async fn build_app(
         query_knob_bounds,
         cache,
         manifest_cache,
+        hydrator,
         fts_cache,
         query_semaphore,
         rate_limiters,

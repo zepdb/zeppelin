@@ -533,6 +533,12 @@ impl DiskCache {
         self.total_size.load(Ordering::Relaxed)
     }
 
+    /// Maximum configured disk cache size in bytes.
+    #[must_use]
+    pub fn max_size_bytes(&self) -> u64 {
+        self.max_size_bytes
+    }
+
     fn spawn_eviction_if_needed(&self) {
         if self.total_size.load(Ordering::Relaxed) <= self.max_size_bytes {
             return;
