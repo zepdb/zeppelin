@@ -2,8 +2,9 @@
 #[allow(clippy::unwrap_used, missing_docs)]
 mod inner {
     use prometheus::{
-        register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
-        register_int_gauge_vec, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+        register_gauge_vec, register_histogram_vec, register_int_counter, register_int_counter_vec,
+        register_int_gauge, register_int_gauge_vec, GaugeVec, HistogramVec, IntCounter,
+        IntCounterVec, IntGauge, IntGaugeVec,
     };
 
     lazy_static::lazy_static! {
@@ -85,6 +86,21 @@ mod inner {
             "zeppelin_hydration_skipped_total",
             "Hydration jobs skipped before object fetch",
             &["reason"]
+        ).unwrap();
+        pub static ref HYDRATION_REFUSED: IntGaugeVec = register_int_gauge_vec!(
+            "zeppelin_hydration_refused",
+            "Whether a namespace's latest hydration attempt is currently refused",
+            &["namespace", "reason"]
+        ).unwrap();
+        pub static ref HYDRATION_REQUIRED_BYTES: GaugeVec = register_gauge_vec!(
+            "zeppelin_hydration_required_bytes",
+            "Bytes required to hydrate the active namespace warm set",
+            &["namespace"]
+        ).unwrap();
+        pub static ref HYDRATION_REFUSAL_LOGS_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_hydration_refusal_logs_total",
+            "Capacity refusal warnings emitted after per-generation deduplication",
+            &["namespace", "reason"]
         ).unwrap();
         pub static ref NAMESPACE_HEAT: IntGaugeVec = register_int_gauge_vec!(
             "zeppelin_namespace_heat",
@@ -184,6 +200,9 @@ pub fn init() {
     lazy_static::initialize(&HYDRATION_FAILURES_TOTAL);
     lazy_static::initialize(&HYDRATION_INFLIGHT);
     lazy_static::initialize(&HYDRATION_SKIPPED_TOTAL);
+    lazy_static::initialize(&HYDRATION_REFUSED);
+    lazy_static::initialize(&HYDRATION_REQUIRED_BYTES);
+    lazy_static::initialize(&HYDRATION_REFUSAL_LOGS_TOTAL);
     lazy_static::initialize(&NAMESPACE_HEAT);
     lazy_static::initialize(&INDEX_BUILD_DURATION);
     lazy_static::initialize(&FTS_INDEX_BUILD_DURATION);

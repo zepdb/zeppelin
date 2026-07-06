@@ -263,6 +263,28 @@ fn metric_value(name: &str, labels: &[(&str, &str)]) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn metric_gauge_value(name: &str, labels: &[(&str, &str)]) -> f64 {
+    prometheus::gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .map(|family| {
+            family
+                .get_metric()
+                .iter()
+                .filter(|metric| {
+                    labels.iter().all(|(name, value)| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.name() == *name && label.value() == *value)
+                    })
+                })
+                .map(|metric| metric.get_gauge().get_value())
+                .sum()
+        })
+        .unwrap_or(0.0)
+}
+
 async fn wait_for_cached_segment(cache: &DiskCache, segment: &SegmentRef) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -297,6 +319,19 @@ async fn wait_for_metric_increase(name: &str, labels: &[(&str, &str)], before: f
     })
     .await
     .expect("metric should increase");
+}
+
+async fn wait_for_gauge_value(name: &str, labels: &[(&str, &str)], expected: f64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if (metric_gauge_value(name, labels) - expected).abs() < f64::EPSILON {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("gauge should reach expected value");
 }
 
 fn query_params<'a>(
@@ -334,6 +369,26 @@ fn start_test_hydrator(
         policy,
         test_hydration_config(max_segment_fraction),
     )
+}
+
+async fn warm_set_required_bytes(fixture: &HydrationFixture) -> u64 {
+    let mut bytes: u64 = fixture
+        .segment
+        .cluster_objects
+        .iter()
+        .map(|object| object.size_bytes)
+        .sum();
+    for key in attrs_keys(&fixture.namespace, &fixture.segment) {
+        bytes += fixture.store.get(&key).await.unwrap().len() as u64;
+    }
+    for key in bitmap_keys(&fixture.namespace, &fixture.segment) {
+        bytes += fixture.store.get(&key).await.unwrap().len() as u64;
+    }
+    if fixture.segment.has_global_fts {
+        let key = global_fts_key(&fixture.namespace, &fixture.segment.id);
+        bytes += fixture.store.get(&key).await.unwrap().len() as u64;
+    }
+    bytes
 }
 
 #[tokio::test]
@@ -384,12 +439,7 @@ async fn test_hydration_includes_attrs_sidecars() {
     let attrs_keys = attrs_keys(&fixture.namespace, &fixture.segment);
 
     hydrator.observe_query(&fixture.namespace, &fixture.segment);
-    wait_for_cached_segment(&cache, &fixture.segment).await;
-    let attrs_cached_before_query =
-        futures::future::join_all(attrs_keys.iter().map(|key| cache.get(key)))
-            .await
-            .into_iter()
-            .all(|entry| entry.is_some());
+    wait_for_cached_keys(&cache, &attrs_keys).await;
 
     fixture.counter.reset();
     let filter = category_filter();
@@ -402,10 +452,6 @@ async fn test_hydration_includes_attrs_sidecars() {
         fixture.counter.gets_for(ArtifactClass::Attrs),
         0,
         "hydrated attrs sidecars should eliminate attrs S3 GETs"
-    );
-    assert!(
-        attrs_cached_before_query,
-        "hydrator must cache attrs sidecars before query traffic naturally does"
     );
 
     fixture.harness.cleanup().await;
@@ -435,12 +481,7 @@ async fn test_hydration_includes_bitmap_sidecars() {
     sidecar_keys.extend(bitmap_keys);
 
     hydrator.observe_query(&fixture.namespace, &fixture.segment);
-    wait_for_cached_segment(&cache, &fixture.segment).await;
-    let sidecars_cached_before_query =
-        futures::future::join_all(sidecar_keys.iter().map(|key| cache.get(key)))
-            .await
-            .into_iter()
-            .all(|entry| entry.is_some());
+    wait_for_cached_keys(&cache, &sidecar_keys).await;
 
     fixture.counter.reset();
     let filter = category_filter();
@@ -458,10 +499,6 @@ async fn test_hydration_includes_bitmap_sidecars() {
         fixture.counter.gets_for(ArtifactClass::Attrs),
         0,
         "bitmap-filtered warm queries should not re-fetch attrs from S3"
-    );
-    assert!(
-        sidecars_cached_before_query,
-        "hydrator must cache bitmap and attrs sidecars before query traffic naturally does"
     );
 
     fixture.harness.cleanup().await;
@@ -485,8 +522,7 @@ async fn test_hydration_includes_global_fts_index() {
     let global_key = global_fts_key(&fixture.namespace, &fixture.segment.id);
 
     hydrator.observe_query(&fixture.namespace, &fixture.segment);
-    wait_for_cached_segment(&cache, &fixture.segment).await;
-    let global_cached_before_query = cache.get(&global_key).await.is_some();
+    wait_for_cached_keys(&cache, std::slice::from_ref(&global_key)).await;
 
     fixture.counter.reset();
     let wal_reader = WalReader::new(fixture.store.clone());
@@ -517,10 +553,6 @@ async fn test_hydration_includes_global_fts_index() {
         fixture.counter.gets_for(ArtifactClass::Fts),
         0,
         "hydrated global FTS sidecar should eliminate FTS S3 GETs"
-    );
-    assert!(
-        global_cached_before_query,
-        "hydrator must cache the global FTS sidecar before query traffic naturally does"
     );
 
     fixture.harness.cleanup().await;
@@ -574,6 +606,156 @@ async fn test_capacity_counts_sidecars() {
     for object in &fixture.segment.cluster_objects {
         assert_eq!(cache.get(&object.key).await, None);
     }
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_capacity_refusal_sets_gauge() {
+    zeppelin::metrics::init();
+    let fixture = hydration_fixture_with(
+        "hydrate-capacity-gauge",
+        attributed_vectors(),
+        base_indexing_config(),
+        &HashMap::new(),
+    )
+    .await;
+    let required_bytes = warm_set_required_bytes(&fixture).await;
+    let (_cache_dir, cache) = test_cache(1);
+    let hydrator = start_test_hydrator(&fixture, cache, 0.5);
+
+    hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    wait_for_gauge_value(
+        "zeppelin_hydration_refused",
+        &[("namespace", &fixture.namespace), ("reason", "capacity")],
+        1.0,
+    )
+    .await;
+    wait_for_gauge_value(
+        "zeppelin_hydration_required_bytes",
+        &[("namespace", &fixture.namespace)],
+        required_bytes as f64,
+    )
+    .await;
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_capacity_refusal_clears_on_fit() {
+    zeppelin::metrics::init();
+    let fixture = hydration_fixture_with(
+        "hydrate-capacity-clears",
+        attributed_vectors(),
+        base_indexing_config(),
+        &HashMap::new(),
+    )
+    .await;
+    let (_small_dir, small_cache) = test_cache(1);
+    let refusing_hydrator = start_test_hydrator(&fixture, small_cache, 0.5);
+    refusing_hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    wait_for_gauge_value(
+        "zeppelin_hydration_refused",
+        &[("namespace", &fixture.namespace), ("reason", "capacity")],
+        1.0,
+    )
+    .await;
+
+    let (_fit_dir, fit_cache) = test_cache(512 * 1024 * 1024);
+    let fitting_hydrator = start_test_hydrator(&fixture, fit_cache.clone(), 0.5);
+    fitting_hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    wait_for_cached_segment(&fit_cache, &fixture.segment).await;
+    wait_for_gauge_value(
+        "zeppelin_hydration_refused",
+        &[("namespace", &fixture.namespace), ("reason", "capacity")],
+        0.0,
+    )
+    .await;
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_refusal_logs_once_per_generation() {
+    zeppelin::metrics::init();
+    let fixture = hydration_fixture_with(
+        "hydrate-capacity-log-dedupe",
+        attributed_vectors(),
+        base_indexing_config(),
+        &HashMap::new(),
+    )
+    .await;
+    let (_cache_dir, cache) = test_cache(1);
+    let hydrator = start_test_hydrator(&fixture, cache, 0.5);
+    let log_counter = zeppelin::metrics::HYDRATION_REFUSAL_LOGS_TOTAL
+        .with_label_values(&[fixture.namespace.as_str(), "capacity"]);
+    let before = log_counter.get();
+
+    hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if log_counter.get() > before {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("refusal log counter should increase");
+    let after_first = log_counter.get();
+
+    hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        log_counter.get(),
+        after_first,
+        "same namespace/segment capacity refusal should log once"
+    );
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_refused_namespace_queries_correct() {
+    zeppelin::metrics::init();
+    let fixture = hydration_fixture_with(
+        "hydrate-capacity-query-correct",
+        attributed_vectors(),
+        base_indexing_config(),
+        &HashMap::new(),
+    )
+    .await;
+    let (_cache_dir, cache) = test_cache(1);
+    let hydrator = start_test_hydrator(&fixture, cache.clone(), 0.5);
+    hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    wait_for_gauge_value(
+        "zeppelin_hydration_refused",
+        &[("namespace", &fixture.namespace), ("reason", "capacity")],
+        1.0,
+    )
+    .await;
+
+    let wal_reader = WalReader::new(fixture.store.clone());
+    let refused_response = execute_query(query_params(&fixture, &wal_reader, Some(&cache)))
+        .await
+        .unwrap();
+    let cold_response = execute_query(query_params(&fixture, &wal_reader, None))
+        .await
+        .unwrap();
+    let refused_ids = refused_response
+        .results
+        .iter()
+        .map(|result| result.id.as_str())
+        .collect::<Vec<_>>();
+    let cold_ids = cold_response
+        .results
+        .iter()
+        .map(|result| result.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        refused_ids, cold_ids,
+        "capacity refusal must leave query results on the correct cold path"
+    );
 
     fixture.harness.cleanup().await;
 }

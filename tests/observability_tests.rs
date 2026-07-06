@@ -262,6 +262,15 @@ async fn test_all_metrics_registered() {
     COMPACTION_DURATION
         .with_label_values(&["__test__"])
         .observe(0.0);
+    HYDRATION_REFUSED
+        .with_label_values(&["__test__", "capacity"])
+        .set(0);
+    HYDRATION_REQUIRED_BYTES
+        .with_label_values(&["__test__"])
+        .set(0.0);
+    HYDRATION_REFUSAL_LOGS_TOTAL
+        .with_label_values(&["__test__", "capacity"])
+        .inc();
 
     let families = prometheus::gather();
     let names: Vec<String> = families.iter().map(|f| f.name().to_string()).collect();
@@ -276,6 +285,9 @@ async fn test_all_metrics_registered() {
         "zeppelin_s3_operation_duration_seconds",
         "zeppelin_s3_errors_total",
         "zeppelin_compaction_duration_seconds",
+        "zeppelin_hydration_refused",
+        "zeppelin_hydration_required_bytes",
+        "zeppelin_hydration_refusal_logs_total",
         "zeppelin_cache_entries",
         "zeppelin_cache_evictions_total",
         "zeppelin_active_queries",

@@ -1,5 +1,6 @@
 //! Warm-set hydration policy and worker support.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -220,8 +221,9 @@ async fn worker_loop(
     config: HydrationConfig,
     mut rx: mpsc::Receiver<HydrationJob>,
 ) {
+    let mut capacity_refusals_logged = HashMap::new();
     while let Some(job) = rx.recv().await {
-        run_job_with_retries(&store, &cache, &config, job).await;
+        run_job_with_retries(&store, &cache, &config, job, &mut capacity_refusals_logged).await;
     }
 }
 
@@ -230,12 +232,13 @@ async fn run_job_with_retries(
     cache: &Arc<DiskCache>,
     config: &HydrationConfig,
     job: HydrationJob,
+    capacity_refusals_logged: &mut HashMap<String, String>,
 ) {
     crate::metrics::HYDRATION_INFLIGHT.inc();
     let _inflight_guard = crate::metrics::GaugeGuard(&crate::metrics::HYDRATION_INFLIGHT);
     let mut attempt = 0usize;
     loop {
-        match hydrate_segment_once(store, cache, config, &job).await {
+        match hydrate_segment_once(store, cache, config, &job, capacity_refusals_logged).await {
             Ok(()) => return,
             Err(error) => {
                 crate::metrics::HYDRATION_FAILURES_TOTAL.inc();
@@ -262,6 +265,7 @@ async fn hydrate_segment_once(
     cache: &Arc<DiskCache>,
     config: &HydrationConfig,
     job: &HydrationJob,
+    capacity_refusals_logged: &mut HashMap<String, String>,
 ) -> Result<()> {
     if is_incremental_segment(&job.segment) {
         crate::metrics::HYDRATION_SKIPPED_TOTAL
@@ -279,19 +283,20 @@ async fn hydrate_segment_once(
 
     let items = plan_hydration_items(store, job).await?;
     let required_bytes = hydration_items_bytes(&items, &job.segment)?;
+    crate::metrics::HYDRATION_REQUIRED_BYTES
+        .with_label_values(&[&job.namespace])
+        .set(required_bytes as f64);
     let capacity_limit = hydration_capacity_limit(cache.max_size_bytes(), config)?;
     if required_bytes > capacity_limit {
         crate::metrics::HYDRATION_SKIPPED_TOTAL
             .with_label_values(&["capacity"])
             .inc();
-        warn!(
-            namespace = %job.namespace,
-            segment_id = %job.segment.id,
+        record_capacity_refusal(
+            job,
             required_bytes,
-            capacity_limit,
-            cache_max_size_bytes = cache.max_size_bytes(),
-            max_segment_fraction = config.max_segment_fraction,
-            "warm-set hydration refused: segment exceeds capacity fraction"
+            cache.max_size_bytes(),
+            config,
+            capacity_refusals_logged,
         );
         return Ok(());
     }
@@ -302,7 +307,45 @@ async fn hydrate_segment_once(
     while let Some(result) = stream.next().await {
         result?;
     }
+    crate::metrics::HYDRATION_REFUSED
+        .with_label_values(&[job.namespace.as_str(), "capacity"])
+        .set(0);
+    capacity_refusals_logged.remove(&job.namespace);
     Ok(())
+}
+
+fn record_capacity_refusal(
+    job: &HydrationJob,
+    required_bytes: u64,
+    cache_max_size_bytes: u64,
+    config: &HydrationConfig,
+    capacity_refusals_logged: &mut HashMap<String, String>,
+) {
+    crate::metrics::HYDRATION_REFUSED
+        .with_label_values(&[job.namespace.as_str(), "capacity"])
+        .set(1);
+
+    let should_log = capacity_refusals_logged
+        .get(&job.namespace)
+        .map(|segment_id| segment_id != &job.segment.id)
+        .unwrap_or(true);
+    if !should_log {
+        return;
+    }
+
+    capacity_refusals_logged.insert(job.namespace.clone(), job.segment.id.clone());
+    crate::metrics::HYDRATION_REFUSAL_LOGS_TOTAL
+        .with_label_values(&[job.namespace.as_str(), "capacity"])
+        .inc();
+    warn!(
+        namespace = %job.namespace,
+        segment_id = %job.segment.id,
+        segment_bytes = required_bytes,
+        cache_max_bytes = cache_max_size_bytes,
+        max_fraction = config.max_segment_fraction,
+        remediation = "raise cache.hydration_max_segment_fraction, raise cache.max_size_gb/cache.max_size_bytes with a larger NVMe/node, or deliberately leave this namespace on the cold path",
+        "warm-set hydration refused: segment exceeds capacity fraction"
+    );
 }
 
 fn is_incremental_segment(segment: &SegmentRef) -> bool {

@@ -35,6 +35,10 @@
 # hydration_heat_window_secs = 60           # ZEPPELIN_HYDRATION_HEAT_WINDOW_SECS
 # hydration_parallelism = 4
 # hydration_max_segment_fraction = 0.5
+# If a namespace's active warm set exceeds max_size_gb * hydration_max_segment_fraction,
+# Zeppelin leaves it on the cold path and sets zeppelin_hydration_refused plus
+# zeppelin_hydration_required_bytes. Raise hydration_max_segment_fraction, raise
+# max_size_gb by provisioning a larger cache disk/node, or accept cold-path serving.
 # Per-namespace hydration policy overrides are intentionally deferred until
 # production traffic validates that extra selection matrix.
 
