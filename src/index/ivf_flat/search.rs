@@ -1309,10 +1309,10 @@ async fn load_sq_object_for_coarse(
         });
     }
 
-    let object_data =
-        fetch_with_cache_counted(cache, store, &object.key, stats, SqBytePhase::Sq).await?;
-    if let Some(layout) = cluster_object_layout(&object_data)? {
+    if let Some(layout) = load_cluster_object_layout(index, object, store, cache, stats).await? {
         if layout.sections.iter().all(|section| section.sq.is_some()) {
+            let sq_bytes =
+                fetch_object_sq_range(&object.key, &layout, &object.clusters, store, stats).await?;
             let mut sq_clusters = Vec::with_capacity(object.clusters.len());
             let mut vector_ranges = Vec::with_capacity(object.clusters.len());
             for &cluster_idx in &object.clusters {
@@ -1322,20 +1322,20 @@ async fn load_sq_object_for_coarse(
                         object.key
                     ))
                 })?;
-                let sq_cluster =
-                    deserialize_colocated_sq_cluster_from_object(&object_data, cluster_idx)?
-                        .ok_or_else(|| {
-                            ZeppelinError::Index(format!(
-                                "cluster {cluster_idx} missing co-located SQ data in {}",
-                                object.key
-                            ))
-                        })?;
-                if let Some(stats) = stats {
-                    let sq_bytes = sq_cluster.codes.iter().map(Vec::len).sum::<usize>()
-                        + sq_cluster.ids.iter().map(|id| 4 + id.len()).sum::<usize>()
-                        + 8;
-                    stats.record_logical_sq_bytes(sq_bytes);
-                }
+                let sq_range = section.sq.as_ref().ok_or_else(|| {
+                    ZeppelinError::Index(format!(
+                        "cluster {cluster_idx} missing SQ range in {}",
+                        object.key
+                    ))
+                })?;
+                let sq_slice = slice_relative_range(
+                    &sq_bytes.bytes,
+                    &sq_range.clone(),
+                    sq_bytes.base_offset,
+                    "SQ range",
+                    &object.key,
+                )?;
+                let sq_cluster = deserialize_sq_cluster(sq_slice)?;
                 let ranges = full_vector_ranges_from_sq_ids(section, &sq_cluster.ids, index.dim)?;
                 sq_clusters.push((cluster_idx, sq_cluster));
                 vector_ranges.push((cluster_idx, ranges));
@@ -1344,11 +1344,13 @@ async fn load_sq_object_for_coarse(
                 object_key: object.key.clone(),
                 sq_clusters,
                 vector_ranges,
-                full_object: Some(object_data),
+                full_object: None,
             });
         }
     }
 
+    let object_data =
+        fetch_with_cache_counted(cache, store, &object.key, stats, SqBytePhase::Sq).await?;
     let mut sq_clusters = Vec::with_capacity(object.clusters.len());
     for &cluster_idx in &object.clusters {
         if let Some(sq_cluster) =
@@ -1382,6 +1384,54 @@ async fn load_sq_object_for_coarse(
         sq_clusters,
         vector_ranges: Vec::new(),
         full_object: Some(object_data),
+    })
+}
+
+struct RangeBytes {
+    base_offset: usize,
+    bytes: bytes::Bytes,
+}
+
+async fn fetch_object_sq_range(
+    object_key: &str,
+    layout: &ClusterObjectLayout,
+    clusters: &[usize],
+    store: &ZeppelinStore,
+    stats: Option<&SqSearchByteStats>,
+) -> Result<RangeBytes> {
+    let mut start = usize::MAX;
+    let mut end = 0usize;
+    let mut logical_bytes = 0usize;
+    for &cluster_idx in clusters {
+        let section = layout.section(cluster_idx).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing from layout for {object_key}"
+            ))
+        })?;
+        let sq = section.sq.as_ref().ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "cluster {cluster_idx} missing SQ range in {object_key}"
+            ))
+        })?;
+        logical_bytes = logical_bytes
+            .checked_add(sq.end - sq.start)
+            .ok_or_else(|| ZeppelinError::Index("SQ logical byte count overflows".into()))?;
+        start = start.min(sq.start);
+        end = end.max(sq.end);
+    }
+    if start == usize::MAX || start >= end {
+        return Err(ZeppelinError::Index(format!(
+            "empty SQ range for object {object_key}"
+        )));
+    }
+    let bytes = store.get_range(object_key, start..end).await?;
+    if let Some(stats) = stats {
+        stats.record_get(SqBytePhase::Sq, bytes.len());
+        stats.record_logical_sq_bytes(logical_bytes);
+    }
+    Ok(RangeBytes {
+        base_offset: start,
+        bytes,
     })
 }
 

@@ -347,6 +347,29 @@ async fn run_query(
     .unwrap()
 }
 
+async fn active_cluster_object_bytes(fixture: &BenchFixture) -> u64 {
+    let manifest = Manifest::read(&fixture.store, &fixture.namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    let active_segment_id = manifest.active_segment.as_ref().unwrap();
+    let active_segment = manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == *active_segment_id)
+        .unwrap();
+    assert!(
+        !active_segment.cluster_objects.is_empty(),
+        "fixture must use grouped cluster-data objects"
+    );
+
+    let mut bytes = 0u64;
+    for object in &active_segment.cluster_objects {
+        bytes += fixture.store.head(&object.key).await.unwrap().size as u64;
+    }
+    bytes
+}
+
 fn print_profile(label: &str, counter: &GetCounter) {
     println!("H1 profile: {label}");
     println!("{}", counter.report());
@@ -419,12 +442,16 @@ async fn cold_strong_vector_query_pins_sq8_get_profile() {
     // - bootstrap=1: active segment bootstrap blob, including centroids,
     //   SQ calibration, and resident sketch.
     // - sq=0: no SQ calibration or per-cluster SQ sidecars for v2 segments.
-    // - cluster=2: two grouped cluster-data objects cover the four clusters.
+    // - cluster=6: two grouped cluster-data objects cover the four clusters;
+    //   each object pays one header-range GET, one SQ-range GET, and one
+    //   coalesced rerank-vector range GET. This intentionally accepts more
+    //   operations than the earlier full-object coarse fetch so cold SQ scans
+    //   avoid downloading full f32 payload bytes during coarse scoring.
     // - attrs=4: lazy final-result enrichment still needs all four attrs
     //   blobs in this fixture because top_k=4 returns one vector from each
     //   one-vector cluster. attrs_laziness_tests pins the reduced top_k=1
     //   profile where only the winning cluster's attrs are fetched.
-    // - total=8: honest object GET count, not the thesis-level "2".
+    // - total=12: honest object GET count, not the thesis-level "2".
     assert_get_profile(
         &fixture.counter,
         ExpectedGets {
@@ -432,11 +459,35 @@ async fn cold_strong_vector_query_pins_sq8_get_profile() {
             centroids: 0,
             bootstrap: 1,
             sq: 0,
-            cluster: 2,
+            cluster: 6,
             attrs: 4,
             sketch: 0,
             wal: 0,
         },
+    );
+
+    fixture.harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn grouped_sq8_coarse_scan_fetches_less_than_full_cluster_objects() {
+    let fixture = compacted_fixture("h1-grouped-sq8-range-bytes").await;
+    let full_cluster_object_bytes = active_cluster_object_bytes(&fixture).await;
+    fixture.counter.reset();
+
+    let response = run_query(&fixture, ConsistencyLevel::Strong, ALL_CLUSTERS, None).await;
+    assert_eq!(response.scanned_segments, 1);
+    assert_eq!(response.scanned_fragments, 0);
+    assert_eq!(response.results.len(), TOP_K_ALL);
+
+    print_profile(
+        "cold strong vector query, grouped SQ8 byte profile, nprobe=4",
+        &fixture.counter,
+    );
+    let cluster_bytes = fixture.counter.get_bytes_for(ArtifactClass::Cluster);
+    assert!(
+        cluster_bytes < full_cluster_object_bytes,
+        "SQ coarse scan must not download full grouped cluster objects: cluster_get_bytes={cluster_bytes}, full_cluster_object_bytes={full_cluster_object_bytes}"
     );
 
     fixture.harness.cleanup().await;
@@ -510,7 +561,11 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
     )
     .await;
 
+    let warmup = run_query(&fixture, ConsistencyLevel::Eventual, ALL_CLUSTERS, None).await;
+    assert_eq!(warmup.scanned_segments, 1);
+    assert_eq!(warmup.scanned_fragments, 0);
     fixture.counter.reset();
+
     let eventual = run_query(&fixture, ConsistencyLevel::Eventual, ALL_CLUSTERS, None).await;
     assert_eq!(eventual.scanned_segments, 1);
     assert_eq!(
@@ -528,7 +583,7 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
             centroids: 0,
             bootstrap: 1,
             sq: 0,
-            cluster: 2,
+            cluster: 4,
             attrs: 4,
             sketch: 0,
             wal: 0,
@@ -554,7 +609,7 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
             centroids: 0,
             bootstrap: 1,
             sq: 0,
-            cluster: 2,
+            cluster: 4,
             attrs: 4,
             sketch: 0,
             wal: 1,
@@ -562,8 +617,8 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
     );
     let strong_total = fixture.counter.total_gets();
 
-    assert_eq!(eventual_total, 7);
-    assert_eq!(strong_total, 9);
+    assert_eq!(eventual_total, 9);
+    assert_eq!(strong_total, 11);
     assert_eq!(
         strong_total - eventual_total,
         2,
@@ -574,8 +629,8 @@ async fn eventual_query_is_two_gets_cheaper_than_strong_with_uncompacted_upsert(
 }
 
 #[tokio::test]
-async fn cluster_gets_scale_exactly_with_nprobe() {
-    let fixture = compacted_fixture("h1-nprobe-scaling").await;
+async fn cluster_gets_reflect_grouped_sq_ranges_and_nprobe() {
+    let fixture = compacted_fixture("h1-nprobe-scaling-one").await;
 
     let response = run_query(&fixture, ConsistencyLevel::Strong, 1, None).await;
     assert_eq!(response.scanned_segments, 1);
@@ -588,15 +643,16 @@ async fn cluster_gets_scale_exactly_with_nprobe() {
             centroids: 0,
             bootstrap: 1,
             sq: 0,
-            cluster: 1,
-            attrs: 1,
+            cluster: 3,
+            attrs: 2,
             sketch: 0,
             wal: 0,
         },
     );
     let cluster_gets_nprobe_1 = fixture.counter.gets_for(ArtifactClass::Cluster);
+    fixture.harness.cleanup().await;
 
-    fixture.counter.reset();
+    let fixture = compacted_fixture("h1-nprobe-scaling-all").await;
     let response = run_query(&fixture, ConsistencyLevel::Strong, ALL_CLUSTERS, None).await;
     assert_eq!(response.scanned_segments, 1);
     assert_eq!(response.scanned_fragments, 0);
@@ -608,7 +664,7 @@ async fn cluster_gets_scale_exactly_with_nprobe() {
             centroids: 0,
             bootstrap: 1,
             sq: 0,
-            cluster: 2,
+            cluster: 6,
             attrs: 4,
             sketch: 0,
             wal: 0,
@@ -616,8 +672,8 @@ async fn cluster_gets_scale_exactly_with_nprobe() {
     );
     let cluster_gets_nprobe_4 = fixture.counter.gets_for(ArtifactClass::Cluster);
 
-    assert_eq!(cluster_gets_nprobe_1, 1);
-    assert_eq!(cluster_gets_nprobe_4, 2);
+    assert_eq!(cluster_gets_nprobe_1, 3);
+    assert_eq!(cluster_gets_nprobe_4, 6);
 
     fixture.harness.cleanup().await;
 }
@@ -650,7 +706,7 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
             centroids: 0,
             bootstrap: 1,
             sq: 0,
-            cluster: 2,
+            cluster: 6,
             attrs: 4,
             sketch: 0,
             wal: 0,
@@ -672,6 +728,10 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
         "warm strong vector query with populated disk cache, SQ8, nprobe=4",
         &fixture.counter,
     );
+    // The disk cache still serves bootstrap metadata, attrs, and decoded
+    // grouped-object layouts. SQ and rerank vector ranges intentionally remain
+    // ranged S3 reads so the cache does not need to store full grouped objects
+    // just to satisfy coarse SQ scoring.
     assert_get_profile(
         &fixture.counter,
         ExpectedGets {
@@ -679,7 +739,7 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
             centroids: 0,
             bootstrap: 0,
             sq: 0,
-            cluster: 0,
+            cluster: 4,
             attrs: 0,
             sketch: 0,
             wal: 0,
@@ -687,8 +747,8 @@ async fn warm_query_serves_segment_artifacts_from_cache() {
     );
     let warm_total = fixture.counter.total_gets();
 
-    assert_eq!(cold_total, 8);
-    assert_eq!(warm_total, 1);
+    assert_eq!(cold_total, 12);
+    assert_eq!(warm_total, 5);
     assert!(
         warm_total < cold_total,
         "warm query must reduce S3 GETs by serving segment artifacts from cache"
