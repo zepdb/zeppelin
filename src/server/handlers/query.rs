@@ -403,46 +403,39 @@ async fn execute_validated_query(
             .with_label_values(&[ns])
             .inc();
 
-        return match options.manifest {
-            Some(manifest) => {
-                query::execute_bm25_query_with_manifest(
-                    &state.store,
-                    &state.wal_reader,
-                    ns,
-                    rank_by,
-                    &meta.full_text_search,
-                    validated.top_k,
-                    req.filter.as_ref(),
-                    req.consistency,
-                    req.last_as_prefix,
-                    Some(&state.fts_cache),
-                    Some(&state.cache),
-                    knobs.bm25_max_full_scan_clusters,
-                    validated.include_attributes,
-                    manifest,
-                )
-                .await
-            }
+        let manifest = match options.manifest {
+            Some(manifest) => manifest,
             None => {
-                query::execute_bm25_query(
+                query::read_manifest_for_query(
                     &state.store,
-                    &state.wal_reader,
                     ns,
-                    rank_by,
-                    &meta.full_text_search,
-                    validated.top_k,
-                    req.filter.as_ref(),
                     req.consistency,
-                    req.last_as_prefix,
                     Some(&state.manifest_cache),
-                    Some(&state.fts_cache),
-                    Some(&state.cache),
-                    knobs.bm25_max_full_scan_clusters,
-                    validated.include_attributes,
                 )
-                .await
+                .await?
             }
         };
+        if options.notify_hydration {
+            notify_hydrator(state, ns, &manifest);
+        }
+
+        return query::execute_bm25_query_with_manifest(
+            &state.store,
+            &state.wal_reader,
+            ns,
+            rank_by,
+            &meta.full_text_search,
+            validated.top_k,
+            req.filter.as_ref(),
+            req.consistency,
+            req.last_as_prefix,
+            Some(&state.fts_cache),
+            Some(&state.cache),
+            knobs.bm25_max_full_scan_clusters,
+            validated.include_attributes,
+            manifest,
+        )
+        .await;
     }
 
     // Vector query path

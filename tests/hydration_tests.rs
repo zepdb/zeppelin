@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::counting::{counting_store, ArtifactClass};
 use common::harness::TestHarness;
-use common::server::start_test_server_with_compactor;
+use common::server::{create_ns_api_fts, start_test_server_with_compactor};
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 use serde_json::json;
 use tempfile::TempDir;
@@ -852,6 +852,99 @@ async fn test_query_handler_triggers_hydration_when_enabled() {
             .unwrap();
     }
     wait_for_cached_segment(&cache, &segment).await;
+
+    harness
+        .store
+        .delete_prefix(&format!("{namespace}/"))
+        .await
+        .unwrap();
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_bm25_query_handler_triggers_hydration_when_enabled() {
+    zeppelin::metrics::init();
+    let mut config = Config::default();
+    config.cache.hydration_enabled = true;
+    config.cache.hydration_heat_queries = 3;
+    config.cache.hydration_heat_window_secs = 60;
+    config.indexing.default_num_centroids = 4;
+    config.indexing.kmeans_max_iterations = 10;
+    config.indexing.fts_index = true;
+    config.compaction.max_wal_fragments_before_compact = 1;
+
+    let (base_url, harness, cache, _cache_dir, compactor) =
+        start_test_server_with_compactor(Some(config)).await;
+    let client = reqwest::Client::new();
+    let namespace = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        json!({
+            "content": {"stemming": true, "remove_stopwords": true}
+        }),
+    )
+    .await;
+
+    let upsert = client
+        .post(format!("{base_url}/v1/namespaces/{namespace}/vectors"))
+        .json(&json!({ "vectors": fts_vectors() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        upsert.status(),
+        200,
+        "upsert failed: {}",
+        upsert.text().await.unwrap()
+    );
+    compactor
+        .compact_with_fts(&namespace, None, &fts_configs())
+        .await
+        .unwrap();
+
+    let manifest = Manifest::read(&harness.store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    let segment = active_segment_ref(&manifest).clone();
+    assert!(
+        segment.has_global_fts,
+        "fixture must build a global FTS sidecar"
+    );
+    let attr_sidecars = attrs_keys(&namespace, &segment);
+    assert!(
+        !attr_sidecars.is_empty(),
+        "fixture must plan attrs sidecars"
+    );
+    for key in &attr_sidecars {
+        assert_eq!(
+            cache.get(key).await,
+            None,
+            "BM25 hydration evidence must start cold for attrs sidecars"
+        );
+    }
+
+    for _ in 0..3 {
+        let response = client
+            .post(format!("{base_url}/v1/namespaces/{namespace}/query"))
+            .json(&json!({
+                "rank_by": ["content", "BM25", "rust programming"],
+                "top_k": 10,
+                "consistency": "eventual",
+                "include_attributes": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "BM25 query failed: {}",
+            response.text().await.unwrap()
+        );
+    }
+    wait_for_cached_keys(&cache, &attr_sidecars).await;
 
     harness
         .store
