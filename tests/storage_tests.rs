@@ -2,6 +2,7 @@ mod common;
 
 use bytes::Bytes;
 use common::harness::TestHarness;
+use std::time::Duration;
 use zeppelin::config::{StorageBackend, StorageConfig};
 use zeppelin::storage::ZeppelinStore;
 
@@ -194,6 +195,62 @@ async fn test_s3_delete_prefix() {
     assert!(keys_after.is_empty(), "prefix should be empty after delete");
 
     harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_delete_prefix_paged_excludes_key_and_resumes() {
+    let harness = TestHarness::new().await;
+    let prefix = harness.key("paged-delete/");
+    let excluded = format!("{prefix}meta.json");
+
+    harness
+        .store
+        .put(&excluded, Bytes::from_static(b"tombstone"))
+        .await
+        .unwrap();
+    for i in 0..1001 {
+        let key = format!("{prefix}object_{i}.bin");
+        harness
+            .store
+            .put(&key, Bytes::from(vec![i as u8; 8]))
+            .await
+            .unwrap();
+    }
+
+    let first = harness
+        .store
+        .delete_prefix_paged(&prefix, Some(&excluded), Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(first.deleted, 1000);
+    assert!(
+        !first.complete,
+        "zero budget should stop after the first delete chunk"
+    );
+    assert!(harness.store.exists(&excluded).await.unwrap());
+
+    let second = harness
+        .store
+        .delete_prefix_paged(&prefix, Some(&excluded), Duration::MAX)
+        .await
+        .unwrap();
+    assert!(second.complete);
+    assert_eq!(second.deleted, 1);
+    assert!(harness.store.exists(&excluded).await.unwrap());
+
+    harness.store.delete(&excluded).await.unwrap();
+    let remaining = harness.store.list_prefix(&prefix).await.unwrap();
+    assert!(remaining.is_empty(), "remaining keys: {remaining:?}");
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "recursive root listing must use list_common_prefixes")]
+async fn test_list_prefix_rejects_recursive_root_listing() {
+    let harness = TestHarness::new().await;
+
+    let _ = harness.store.list_prefix("").await;
 }
 
 // ── Coverage tests for store.rs uncovered lines ──────────────────────

@@ -92,15 +92,24 @@ async fn test_namespace_crud() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 202);
 
     // Verify deleted
-    let resp = client
-        .get(format!("{base_url}/v1/namespaces/{ns}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
+    let mut deleted = false;
+    for _ in 0..50 {
+        let resp = client
+            .get(format!("{base_url}/v1/namespaces/{ns}"))
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 404 {
+            deleted = true;
+            break;
+        }
+        assert_eq!(resp.status(), 200);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(deleted, "namespace {ns} did not reach 404 after DELETE 202");
 
     harness.cleanup().await;
 }

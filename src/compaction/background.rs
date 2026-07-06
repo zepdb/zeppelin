@@ -10,6 +10,7 @@ use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
+use crate::namespace::manager::NamespaceState;
 use crate::namespace::NamespaceManager;
 use crate::storage::ZeppelinStore;
 use crate::wal::Lease;
@@ -283,6 +284,8 @@ pub async fn compaction_loop(
         "background compaction loop started"
     );
 
+    let mut tick: u64 = 0;
+
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(compactor.config().interval_secs)) => {},
@@ -292,17 +295,62 @@ pub async fn compaction_loop(
             }
         }
 
-        let namespaces = match namespace_manager.list(namespace_prefix.as_deref()).await {
-            Ok(ns) => ns,
-            Err(e) => {
-                warn!(error = %e, "failed to list namespaces for compaction");
-                continue;
+        tick = tick.saturating_add(1);
+        let namespaces = if tick == 1 || tick % 12 == 0 {
+            match namespace_manager.list(namespace_prefix.as_deref()).await {
+                Ok(ns) => ns,
+                Err(e) => {
+                    warn!(error = %e, "failed to list namespaces for compaction");
+                    namespace_manager.cached_namespaces(namespace_prefix.as_deref())
+                }
             }
+        } else {
+            namespace_manager.cached_namespaces(namespace_prefix.as_deref())
         };
 
-        debug!(namespace_count = namespaces.len(), "compaction loop tick");
+        debug!(
+            namespace_count = namespaces.len(),
+            tick, "compaction loop tick"
+        );
 
         for ns in &namespaces {
+            if ns.state == NamespaceState::Deleting {
+                match namespace_manager
+                    .finish_delete(&ns.name, Duration::from_secs(25))
+                    .await
+                {
+                    Ok(outcome) if outcome.complete => {
+                        manifest_cache.invalidate(&ns.name);
+                        info!(
+                            namespace = %ns.name,
+                            objects_deleted = outcome.deleted,
+                            "resumed namespace delete completed"
+                        );
+                    }
+                    Ok(outcome) => {
+                        warn!(
+                            namespace = %ns.name,
+                            objects_deleted = outcome.deleted,
+                            "resumed namespace delete budget exhausted"
+                        );
+                    }
+                    Err(ZeppelinError::NamespaceNotFound { .. }) => {
+                        debug!(
+                            namespace = %ns.name,
+                            "namespace delete already completed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            namespace = %ns.name,
+                            error = %e,
+                            "failed to resume namespace delete"
+                        );
+                    }
+                }
+                continue;
+            }
+
             match compactor.should_compact(&ns.name).await {
                 Ok(true) => {
                     // Compact under the per-namespace lease (acquire →

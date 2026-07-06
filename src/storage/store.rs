@@ -6,6 +6,7 @@ use object_store::{
 };
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, instrument};
 
 use crate::config::StorageConfig;
@@ -16,6 +17,15 @@ use crate::error::{Result, ZeppelinError};
 #[derive(Clone)]
 pub struct ZeppelinStore {
     inner: Arc<dyn ObjectStore>,
+}
+
+/// Result of a bounded prefix deletion pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeletePrefixOutcome {
+    /// Number of objects successfully deleted in this pass.
+    pub deleted: usize,
+    /// Whether the prefix listing was fully consumed before the time budget.
+    pub complete: bool,
 }
 
 impl ZeppelinStore {
@@ -380,7 +390,12 @@ impl ZeppelinStore {
     pub async fn delete(&self, key: &str) -> Result<()> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
-        self.inner.delete(&path).await?;
+        self.inner.delete(&path).await.map_err(|e| match e {
+            object_store::Error::NotFound { path, .. } => ZeppelinError::NotFound {
+                key: path.to_string(),
+            },
+            other => ZeppelinError::Storage(other),
+        })?;
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 delete");
         crate::metrics::S3_OPERATION_DURATION
@@ -392,6 +407,17 @@ impl ZeppelinStore {
     /// List objects under a prefix.
     #[instrument(skip(self), fields(prefix = prefix))]
     pub async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        debug_assert!(
+            !prefix.is_empty(),
+            "recursive root listing must use list_common_prefixes"
+        );
+        if prefix.is_empty() {
+            return Err(ZeppelinError::Validation(
+                "list_prefix requires a non-empty prefix; use list_common_prefixes for namespace discovery"
+                    .to_string(),
+            ));
+        }
+
         let start = std::time::Instant::now();
         use futures::TryStreamExt;
         let path = Path::parse(prefix)?;
@@ -493,27 +519,97 @@ impl ZeppelinStore {
     /// Delete all objects under a prefix (for cleanup).
     #[instrument(skip(self), fields(prefix = prefix))]
     pub async fn delete_prefix(&self, prefix: &str) -> Result<usize> {
-        let start = std::time::Instant::now();
-        let keys = self.list_prefix(prefix).await?;
-        let count = keys.len();
-        let inner = &self.inner;
-        let delete_futs: Vec<_> = keys
-            .iter()
-            .map(|key| async move {
-                let path = Path::parse(key)?;
-                inner.delete(&path).await?;
-                Ok::<_, ZeppelinError>(())
-            })
-            .collect();
-        let results = futures::future::join_all(delete_futs).await;
-        for result in results {
-            result?;
+        let outcome = self
+            .delete_prefix_paged(prefix, None, Duration::MAX)
+            .await?;
+        Ok(outcome.deleted)
+    }
+
+    /// Delete objects under a prefix without materializing the full key list.
+    ///
+    /// Objects are deleted in chunks with bounded concurrency. If `exclude` is
+    /// provided, that exact key is left untouched; namespace deletion uses this
+    /// to keep `meta.json` as the tombstone until all other data is gone.
+    #[instrument(skip(self), fields(prefix = prefix, exclude = exclude.unwrap_or("<none>")))]
+    pub async fn delete_prefix_paged(
+        &self,
+        prefix: &str,
+        exclude: Option<&str>,
+        budget: Duration,
+    ) -> Result<DeletePrefixOutcome> {
+        debug_assert!(
+            !prefix.is_empty(),
+            "recursive root deletion is never allowed"
+        );
+        if prefix.is_empty() {
+            return Err(ZeppelinError::Validation(
+                "delete_prefix requires a non-empty prefix".to_string(),
+            ));
         }
+
+        let start = std::time::Instant::now();
+        use futures::TryStreamExt;
+
+        let path = Path::parse(prefix)?;
+        let mut listed = self.inner.list(Some(&path));
+        let mut chunk = Vec::with_capacity(1000);
+        let mut deleted = 0usize;
+        let mut complete = true;
+
+        while let Some(object) = listed.try_next().await? {
+            let key = object.location.to_string();
+            if exclude == Some(key.as_str()) {
+                continue;
+            }
+            chunk.push(key);
+            if chunk.len() == 1000 {
+                deleted += self.delete_key_chunk(std::mem::take(&mut chunk)).await?;
+                if start.elapsed() >= budget {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+
+        if complete && !chunk.is_empty() {
+            deleted += self.delete_key_chunk(chunk).await?;
+        }
+
         let elapsed = start.elapsed();
-        debug!(elapsed_ms = elapsed.as_millis(), count, "s3 delete_prefix");
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            count = deleted,
+            complete,
+            "s3 delete_prefix"
+        );
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["delete_prefix"])
             .observe(elapsed.as_secs_f64());
+        Ok(DeletePrefixOutcome { deleted, complete })
+    }
+
+    async fn delete_key_chunk(&self, keys: Vec<String>) -> Result<usize> {
+        use futures::StreamExt;
+
+        let count = keys.len();
+        let inner = Arc::clone(&self.inner);
+        let mut deletes = futures::stream::iter(keys.into_iter().map(move |key| {
+            let inner = Arc::clone(&inner);
+            async move {
+                let path = Path::parse(&key)?;
+                match inner.delete(&path).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => return Err(ZeppelinError::Storage(e)),
+                }
+                Ok::<_, ZeppelinError>(())
+            }
+        }))
+        .buffer_unordered(32);
+
+        while let Some(result) = deletes.next().await {
+            result?;
+        }
+
         Ok(count)
     }
 }

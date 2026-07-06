@@ -11,7 +11,7 @@ use futures::future::join_all;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
@@ -469,17 +469,26 @@ async fn test_stress_rapid_namespace_create_delete() {
     let results = join_all(delete_handles).await;
     for r in &results {
         let (ns, status) = r.as_ref().unwrap();
-        assert_eq!(*status, 204, "failed to delete namespace {ns}");
+        assert_eq!(*status, 202, "failed to accept namespace delete {ns}");
     }
 
     // Verify each namespace is gone (GET returns 404)
     for ns in &ns_names {
-        let resp = client
-            .get(format!("{base_url}/v1/namespaces/{ns}"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 404, "namespace {ns} should be deleted (404)");
+        let mut deleted = false;
+        for _ in 0..50 {
+            let resp = client
+                .get(format!("{base_url}/v1/namespaces/{ns}"))
+                .send()
+                .await
+                .unwrap();
+            if resp.status() == 404 {
+                deleted = true;
+                break;
+            }
+            assert_eq!(resp.status(), 200, "unexpected status for namespace {ns}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(deleted, "namespace {ns} should be deleted (404)");
     }
 
     // Re-create one to prove cleanup was complete

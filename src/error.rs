@@ -99,6 +99,22 @@ pub enum ZeppelinError {
         namespace: String,
     },
 
+    /// The namespace exists but is in the middle of deletion.
+    #[error("namespace is being deleted: {namespace}")]
+    NamespaceDeleting {
+        /// The name of the deleting namespace.
+        namespace: String,
+    },
+
+    /// Namespace deletion reached final verification with non-tombstone keys left.
+    #[error("namespace delete incomplete for {namespace}: {remaining_keys} keys remain")]
+    NamespaceDeleteIncomplete {
+        /// The namespace whose prefix still contains data.
+        namespace: String,
+        /// Number of non-tombstone keys still present.
+        remaining_keys: usize,
+    },
+
     // Index errors
     /// A vector indexing operation failed.
     #[error("index error: {0}")]
@@ -200,6 +216,8 @@ impl ZeppelinError {
         match self {
             ZeppelinError::NamespaceNotFound { .. } | ZeppelinError::ManifestNotFound { .. } => 404,
 
+            ZeppelinError::NamespaceDeleting { .. } => 410,
+
             ZeppelinError::NamespaceAlreadyExists { .. }
             | ZeppelinError::ManifestConflict { .. }
             | ZeppelinError::LeaseHeld { .. }
@@ -245,6 +263,8 @@ impl ZeppelinError {
             ZeppelinError::FencingTokenStale { .. } => "CONFLICT_RETRY",
             ZeppelinError::NamespaceNotFound { .. } => "NAMESPACE_NOT_FOUND",
             ZeppelinError::NamespaceAlreadyExists { .. } => "NAMESPACE_ALREADY_EXISTS",
+            ZeppelinError::NamespaceDeleting { .. } => "NAMESPACE_DELETING",
+            ZeppelinError::NamespaceDeleteIncomplete { .. } => "INTERNAL_ERROR",
             ZeppelinError::Index(_) => "INTERNAL_ERROR",
             ZeppelinError::KMeansConvergence { .. } => "INTERNAL_ERROR",
             ZeppelinError::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
@@ -314,7 +334,10 @@ impl ZeppelinError {
             | ZeppelinError::Config(_)
             | ZeppelinError::Io(_)
             | ZeppelinError::Cache(_)
-            | ZeppelinError::FullTextSearch(_) => "an internal error occurred".to_string(),
+            | ZeppelinError::FullTextSearch(_)
+            | ZeppelinError::NamespaceDeleteIncomplete { .. } => {
+                "an internal error occurred".to_string()
+            }
             ZeppelinError::ChecksumMismatch { .. } => {
                 "stored data failed an integrity check; this is a server-side error".to_string()
             }
@@ -334,6 +357,9 @@ impl ZeppelinError {
             ZeppelinError::ManifestNotFound { namespace }
             | ZeppelinError::NamespaceNotFound { namespace } => {
                 format!("namespace not found: {namespace}")
+            }
+            ZeppelinError::NamespaceDeleting { namespace } => {
+                format!("namespace is being deleted: {namespace}")
             }
             ZeppelinError::NamespaceAlreadyExists { .. }
             | ZeppelinError::DimensionMismatch { .. }
@@ -499,6 +525,13 @@ mod tests {
             },
             ZeppelinError::NamespaceAlreadyExists {
                 namespace: "n".into(),
+            },
+            ZeppelinError::NamespaceDeleting {
+                namespace: "n".into(),
+            },
+            ZeppelinError::NamespaceDeleteIncomplete {
+                namespace: "n".into(),
+                remaining_keys: 1,
             },
             ZeppelinError::Index("i".into()),
             ZeppelinError::KMeansConvergence { iterations: 3 },

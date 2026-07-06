@@ -14,8 +14,9 @@ use std::collections::HashMap;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::error::ZeppelinError;
+use zeppelin::namespace::NamespaceManager;
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::types::VectorEntry;
+use zeppelin::types::{DistanceMetric, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::{FragmentRef, Manifest};
 use zeppelin::wal::{WalReader, WalWriter};
@@ -178,18 +179,22 @@ async fn test_query_read_consistency_deferred_deletion() {
 //
 // TLA+ invariant: DeleteIsAtomic
 //
-// FIX: Delete manifest first. Concurrent queries see None manifest → empty results.
-// Fragments can still exist on S3, but no query will read them without a manifest.
+// FIX: Delete flips meta.json to deleting first, purges all namespace objects,
+// then removes meta.json last. A completed delete leaves zero keys.
 
 #[tokio::test]
-async fn test_namespace_deletion_manifest_first() {
+async fn test_namespace_deletion_leaves_zero_keys() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("inv-ns-deletion");
+    let ns = format!("{}-inv-ns-deletion", harness.prefix);
     let store = &harness.store;
+    let manager = NamespaceManager::new(store.clone());
     let writer = WalWriter::new(store.clone());
 
     // 1. Create namespace with manifest + fragments
-    Manifest::new().write(store, &ns).await.unwrap();
+    manager
+        .create(&ns, 16, DistanceMetric::Cosine)
+        .await
+        .unwrap();
 
     let (f1, _) = writer
         .append(&ns, make_vectors("del1", 10, 16), vec![])
@@ -208,19 +213,16 @@ async fn test_namespace_deletion_manifest_first() {
     assert_s3_object_exists(store, &f1_key).await;
     assert_s3_object_exists(store, &f2_key).await;
 
-    // 3. Simulate the fixed deletion order: delete manifest FIRST
-    store.delete(&manifest_key).await.unwrap();
+    // 3. Delete through the namespace manager.
+    manager.delete(&ns).await.unwrap();
 
-    // 4. FIX VERIFIED: Manifest is gone — queries see None → empty results
-    let manifest = Manifest::read(store, &ns).await.unwrap();
+    // 4. FIX VERIFIED: completed delete leaves no manifest, WAL, meta, or
+    // tombstone objects under the namespace prefix.
+    let remaining = store.list_prefix(&format!("{ns}/")).await.unwrap();
     assert!(
-        manifest.is_none(),
-        "FIX VERIFIED: Manifest is deleted first, queries see None"
+        remaining.is_empty(),
+        "completed namespace delete must leave zero keys, got {remaining:?}"
     );
-
-    // 5. Fragment files still exist (safe — no query will read them without a manifest)
-    assert_s3_object_exists(store, &f1_key).await;
-    assert_s3_object_exists(store, &f2_key).await;
 
     harness.cleanup().await;
 }

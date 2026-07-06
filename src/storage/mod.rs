@@ -1,4 +1,4 @@
 /// Object storage wrapper over `object_store`.
 pub mod store;
 
-pub use store::ZeppelinStore;
+pub use store::{DeletePrefixOutcome, ZeppelinStore};

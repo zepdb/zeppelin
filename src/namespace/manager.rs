@@ -2,12 +2,37 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 use tracing::{info, instrument};
 
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, IndexType};
+
+const DEFAULT_NAMESPACE_REGISTRY_TTL: Duration = Duration::from_secs(5);
+
+/// Lifecycle state stored in `meta.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NamespaceState {
+    /// Namespace accepts reads and writes.
+    #[default]
+    Active,
+    /// Namespace is being deleted; clients may observe status but not use it.
+    Deleting,
+}
+
+impl NamespaceState {
+    /// Stable lowercase API representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NamespaceState::Active => "active",
+            NamespaceState::Deleting => "deleting",
+        }
+    }
+}
 
 /// Metadata for a namespace, stored as meta.json on S3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +51,9 @@ pub struct NamespaceMetadata {
     pub created_at: DateTime<Utc>,
     /// Timestamp of the last metadata update.
     pub updated_at: DateTime<Utc>,
+    /// Lifecycle state for recoverable namespace deletion.
+    #[serde(default)]
+    pub state: NamespaceState,
     /// Per-field full-text search configuration.
     /// Empty map means FTS is not enabled for this namespace.
     #[serde(default)]
@@ -50,19 +78,33 @@ impl NamespaceMetadata {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RegistryEntry {
+    meta: NamespaceMetadata,
+    fetched_at: Instant,
+}
+
 /// Manages namespace CRUD operations with an in-memory cache backed by S3.
 pub struct NamespaceManager {
     store: ZeppelinStore,
     /// In-memory registry for fast lookups.
-    registry: DashMap<String, NamespaceMetadata>,
+    registry: DashMap<String, RegistryEntry>,
+    registry_ttl: Duration,
 }
 
 impl NamespaceManager {
     /// Create a new namespace manager backed by the given store.
     pub fn new(store: ZeppelinStore) -> Self {
+        Self::new_with_registry_ttl(store, DEFAULT_NAMESPACE_REGISTRY_TTL)
+    }
+
+    /// Create a namespace manager with an explicit registry TTL.
+    #[must_use]
+    pub fn new_with_registry_ttl(store: ZeppelinStore, registry_ttl: Duration) -> Self {
         Self {
             store,
             registry: DashMap::new(),
+            registry_ttl,
         }
     }
 
@@ -121,20 +163,38 @@ impl NamespaceManager {
             vector_count: 0,
             created_at: now,
             updated_at: now,
+            state: NamespaceState::Active,
             full_text_search,
         };
 
         // Atomic write — returns NamespaceAlreadyExists if meta.json exists
-        self.store
+        match self
+            .store
             .put_if_not_exists(&key, meta.to_bytes()?, name)
-            .await?;
+            .await
+        {
+            Ok(()) => {}
+            Err(ZeppelinError::NamespaceAlreadyExists { .. }) => {
+                if let Ok(existing) = self.read_metadata_from_s3(name).await {
+                    if existing.state == NamespaceState::Deleting {
+                        return Err(ZeppelinError::NamespaceDeleting {
+                            namespace: name.to_string(),
+                        });
+                    }
+                }
+                return Err(ZeppelinError::NamespaceAlreadyExists {
+                    namespace: name.to_string(),
+                });
+            }
+            Err(e) => return Err(e),
+        }
 
         // Also initialize an empty manifest
         let manifest = crate::wal::Manifest::new();
         manifest.write(&self.store, name).await?;
 
         // Add to registry
-        self.registry.insert(name.to_string(), meta.clone());
+        self.insert_registry(meta.clone());
 
         info!(namespace = name, dimensions, %distance_metric, "created namespace");
         Ok(meta)
@@ -143,17 +203,26 @@ impl NamespaceManager {
     /// Get namespace metadata.
     #[instrument(skip(self), fields(namespace = name))]
     pub async fn get(&self, name: &str) -> Result<NamespaceMetadata> {
-        // Check registry first
-        if let Some(meta) = self.registry.get(name) {
-            return Ok(meta.clone());
+        let meta = self.get_including_deleting(name).await?;
+        self.ensure_active(meta)
+    }
+
+    /// Get namespace metadata even if it is in the `deleting` state.
+    #[instrument(skip(self), fields(namespace = name))]
+    pub async fn get_including_deleting(&self, name: &str) -> Result<NamespaceMetadata> {
+        if let Some(meta) = self.fresh_registry_meta(name) {
+            return Ok(meta);
         }
 
-        // Fall back to S3
+        self.read_metadata_from_s3(name).await
+    }
+
+    async fn read_metadata_from_s3(&self, name: &str) -> Result<NamespaceMetadata> {
         let key = NamespaceMetadata::s3_key(name);
         match self.store.get(&key).await {
             Ok(data) => {
                 let meta = NamespaceMetadata::from_bytes(&data)?;
-                self.registry.insert(name.to_string(), meta.clone());
+                self.insert_registry(meta.clone());
                 Ok(meta)
             }
             Err(ZeppelinError::NotFound { .. }) => Err(ZeppelinError::NamespaceNotFound {
@@ -163,19 +232,51 @@ impl NamespaceManager {
         }
     }
 
-    async fn get_from_s3(&self, name: &str) -> Result<NamespaceMetadata> {
+    async fn read_metadata_versioned(
+        &self,
+        name: &str,
+    ) -> Result<(NamespaceMetadata, Option<String>)> {
         let key = NamespaceMetadata::s3_key(name);
-        match self.store.get(&key).await {
-            Ok(data) => {
+        match self.store.get_with_meta(&key).await {
+            Ok((data, etag)) => {
                 let meta = NamespaceMetadata::from_bytes(&data)?;
-                self.registry.insert(name.to_string(), meta.clone());
-                Ok(meta)
+                self.insert_registry(meta.clone());
+                Ok((meta, etag))
             }
             Err(ZeppelinError::NotFound { .. }) => Err(ZeppelinError::NamespaceNotFound {
                 namespace: name.to_string(),
             }),
             Err(e) => Err(e),
         }
+    }
+
+    fn fresh_registry_meta(&self, name: &str) -> Option<NamespaceMetadata> {
+        self.registry.get(name).and_then(|entry| {
+            if entry.fetched_at.elapsed() < self.registry_ttl {
+                Some(entry.meta.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn insert_registry(&self, meta: NamespaceMetadata) {
+        self.registry.insert(
+            meta.name.clone(),
+            RegistryEntry {
+                meta,
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+
+    fn ensure_active(&self, meta: NamespaceMetadata) -> Result<NamespaceMetadata> {
+        if meta.state == NamespaceState::Deleting {
+            return Err(ZeppelinError::NamespaceDeleting {
+                namespace: meta.name,
+            });
+        }
+        Ok(meta)
     }
 
     /// List all namespaces, optionally filtered by prefix.
@@ -199,60 +300,146 @@ impl NamespaceManager {
 
         let mut namespaces = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut found = std::collections::HashSet::new();
 
         for prefix in &namespace_prefixes {
             let ns_name = prefix.trim_end_matches('/');
             if seen.insert(ns_name.to_string()) {
-                match self.get_from_s3(ns_name).await {
-                    Ok(meta) => namespaces.push(meta),
+                match self.read_metadata_from_s3(ns_name).await {
+                    Ok(meta) => {
+                        found.insert(meta.name.clone());
+                        namespaces.push(meta);
+                    }
                     Err(ZeppelinError::NamespaceNotFound { .. }) => continue,
                     Err(e) => return Err(e),
                 }
             }
         }
 
+        self.registry.retain(|name, _| match prefix {
+            Some(scope) if name.starts_with(scope) => found.contains(name),
+            Some(_) => true,
+            None => found.contains(name),
+        });
+
         Ok(namespaces)
     }
 
     /// Delete a namespace and all its data.
     ///
-    /// Deletes manifest first so concurrent queries see `None` manifest → empty
-    /// results, rather than a manifest referencing already-deleted fragments.
+    /// Synchronous direct delete: flips `meta.json` to `deleting`, purges all
+    /// namespace data while keeping the tombstone, then deletes `meta.json`
+    /// last. The HTTP handler uses the same start/finish primitives but runs
+    /// the purge in a background task and returns 202.
     #[instrument(skip(self), fields(namespace = name))]
     pub async fn delete(&self, name: &str) -> Result<()> {
-        // Verify it exists
-        let key = NamespaceMetadata::s3_key(name);
-        if !self.store.exists(&key).await? {
-            return Err(ZeppelinError::NamespaceNotFound {
+        self.start_delete(name).await?;
+        let outcome = self.finish_delete(name, Duration::MAX).await?;
+        if !outcome.complete {
+            return Err(ZeppelinError::NamespaceDeleteIncomplete {
                 namespace: name.to_string(),
+                remaining_keys: 1,
             });
         }
 
-        // 1. Delete manifest first — queries will see None and return empty results
+        Ok(())
+    }
+
+    /// Mark a namespace as deleting and remove fixed-cost roots.
+    #[instrument(skip(self), fields(namespace = name))]
+    pub async fn start_delete(&self, name: &str) -> Result<NamespaceMetadata> {
+        let meta = self.mark_deleting(name).await?;
+
+        self.registry.remove(name);
         let manifest_key = crate::wal::Manifest::s3_key(name);
-        if let Err(e) = self.store.delete(&manifest_key).await {
-            // Manifest may not exist (e.g., never initialized), log and continue
-            tracing::warn!(key = %manifest_key, error = %e, "failed to delete manifest during namespace deletion");
+        match self.store.delete(&manifest_key).await {
+            Ok(()) | Err(ZeppelinError::NotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
+        info!(
+            namespace = name,
+            state = NamespaceState::Deleting.as_str(),
+            "namespace marked deleting"
+        );
+        Ok(meta)
+    }
+
+    /// Resume or complete deletion of a namespace already marked `deleting`.
+    #[instrument(skip(self), fields(namespace = name))]
+    pub async fn finish_delete(
+        &self,
+        name: &str,
+        budget: Duration,
+    ) -> Result<crate::storage::DeletePrefixOutcome> {
+        let meta_key = NamespaceMetadata::s3_key(name);
+        let meta = self.read_metadata_from_s3(name).await?;
+        if meta.state != NamespaceState::Deleting {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} is not marked deleting"
+            )));
         }
 
-        // 2. Delete meta.json
-        if let Err(e) = self.store.delete(&key).await {
-            tracing::warn!(key = %key, error = %e, "failed to delete meta.json during namespace deletion");
-        }
-
-        // 3. Delete remaining keys (WAL fragments, segments, etc.)
         let prefix = format!("{name}/");
-        let deleted = self.store.delete_prefix(&prefix).await?;
+        let outcome = self
+            .store
+            .delete_prefix_paged(&prefix, Some(&meta_key), budget)
+            .await?;
 
-        // 4. Remove from registry
+        if !outcome.complete {
+            return Ok(outcome);
+        }
+
+        let remaining = self.store.list_prefix(&prefix).await?;
+        let non_meta_remaining = remaining.iter().filter(|key| *key != &meta_key).count();
+        if non_meta_remaining != 0 {
+            return Err(ZeppelinError::NamespaceDeleteIncomplete {
+                namespace: name.to_string(),
+                remaining_keys: non_meta_remaining,
+            });
+        }
+
+        match self.store.delete(&meta_key).await {
+            Ok(()) | Err(ZeppelinError::NotFound { .. }) => {}
+            Err(e) => return Err(e),
+        }
         self.registry.remove(name);
 
         info!(
             namespace = name,
-            objects_deleted = deleted + 2, // +2 for manifest and meta
+            objects_deleted = outcome.deleted + 1,
             "deleted namespace"
         );
-        Ok(())
+        Ok(outcome)
+    }
+
+    async fn mark_deleting(&self, name: &str) -> Result<NamespaceMetadata> {
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..2 {
+            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+            if meta.state == NamespaceState::Deleting {
+                return Ok(meta);
+            }
+
+            meta.state = NamespaceState::Deleting;
+            meta.updated_at = Utc::now();
+            let etag = etag.unwrap_or_default();
+            match self
+                .store
+                .put_if_match(&key, meta.to_bytes()?, &etag, name)
+                .await
+            {
+                Ok(()) => {
+                    self.insert_registry(meta.clone());
+                    return Ok(meta);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(ZeppelinError::ManifestConflict {
+            namespace: name.to_string(),
+        })
     }
 
     /// Scan S3 for existing namespaces and populate the registry.
@@ -269,6 +456,21 @@ impl NamespaceManager {
     /// Check if a namespace exists in the registry.
     pub fn exists_in_registry(&self, name: &str) -> bool {
         self.registry.contains_key(name)
+    }
+
+    /// Snapshot cached namespaces for background maintenance loops.
+    #[must_use]
+    pub fn cached_namespaces(&self, prefix: Option<&str>) -> Vec<NamespaceMetadata> {
+        self.registry
+            .iter()
+            .filter_map(|entry| {
+                let meta = &entry.value().meta;
+                match prefix {
+                    Some(prefix) if !meta.name.starts_with(prefix) => None,
+                    _ => Some(meta.clone()),
+                }
+            })
+            .collect()
     }
 }
 

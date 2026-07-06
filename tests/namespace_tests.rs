@@ -5,7 +5,7 @@ use common::harness::TestHarness;
 
 use chrono::Utc;
 use zeppelin::error::ZeppelinError;
-use zeppelin::namespace::manager::NamespaceMetadata;
+use zeppelin::namespace::manager::{NamespaceMetadata, NamespaceState};
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::types::DistanceMetric;
 use zeppelin::types::IndexType;
@@ -142,6 +142,7 @@ async fn test_list_namespaces_ignores_nested_meta_objects() {
         vector_count: 0,
         created_at: now,
         updated_at: now,
+        state: NamespaceState::Active,
         full_text_search: std::collections::HashMap::new(),
     };
     harness

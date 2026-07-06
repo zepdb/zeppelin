@@ -132,11 +132,18 @@ paths:
     delete:
       operationId: deleteNamespace
       summary: Delete namespace
-      description: Deletes a namespace and all its data.
+      description: |
+        Marks a namespace as deleting and starts resumable background cleanup.
+        Re-issuing DELETE while cleanup is in progress resumes cleanup. Once
+        cleanup finishes, the namespace returns 404.
       tags: [Namespaces]
       responses:
-        "204":
-          description: Namespace deleted
+        "202":
+          description: Namespace deletion accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteNamespaceResponse"
         "404":
           $ref: "#/components/responses/NotFoundError"
 
@@ -171,6 +178,8 @@ paths:
           $ref: "#/components/responses/ValidationError"
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "410":
+          $ref: "#/components/responses/NamespaceDeletingError"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
 
@@ -192,6 +201,8 @@ paths:
           $ref: "#/components/responses/ValidationError"
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "410":
+          $ref: "#/components/responses/NamespaceDeletingError"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
 
@@ -223,6 +234,8 @@ paths:
           $ref: "#/components/responses/ValidationError"
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "410":
+          $ref: "#/components/responses/NamespaceDeletingError"
 
   /v1/namespaces/{ns}/query/batch:
     parameters:
@@ -279,6 +292,12 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     NotFoundError:
       description: Resource not found (404)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NamespaceDeletingError:
+      description: Namespace is being deleted (410)
       content:
         application/json:
           schema:
@@ -729,7 +748,7 @@ components:
 
     NamespaceResponse:
       type: object
-      required: [name, dimensions, distance_metric, vector_count, created_at, updated_at]
+      required: [name, dimensions, distance_metric, vector_count, created_at, updated_at, state]
       properties:
         name:
           type: string
@@ -746,11 +765,27 @@ components:
         updated_at:
           type: string
           format: date-time
+        state:
+          type: string
+          enum: [active, deleting]
+          description: |
+            Namespace lifecycle state. `deleting` means deletion has started;
+            reads and writes against data endpoints return 410 while cleanup
+            completes.
         full_text_search:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/FtsFieldConfig"
           description: Present only when FTS fields are configured.
+
+    DeleteNamespaceResponse:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [deleting]
+          description: Namespace deletion has been accepted and cleanup is resumable.
 
     UpsertVectorsRequest:
       type: object

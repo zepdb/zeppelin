@@ -108,7 +108,10 @@ pub async fn build_app(
     let store = ZeppelinStore::from_config(&config.storage)?;
 
     // Initialize namespace manager and scan existing namespaces
-    let namespace_manager = Arc::new(NamespaceManager::new(store.clone()));
+    let namespace_manager = Arc::new(NamespaceManager::new_with_registry_ttl(
+        store.clone(),
+        Duration::from_millis(config.cache.namespace_registry_ttl_ms),
+    ));
     match namespace_manager.scan_and_register().await {
         Ok(count) => tracing::info!(count, "registered existing namespaces"),
         Err(e) => tracing::warn!(error = %e, "failed to scan namespaces on startup"),

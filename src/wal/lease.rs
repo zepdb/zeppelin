@@ -130,7 +130,15 @@ impl LeaseManager {
     #[instrument(skip(self, lease), fields(namespace = namespace, holder = %self.holder_id))]
     pub async fn renew(&self, namespace: &str, lease: &Lease) -> Result<Lease> {
         let key = lease_key(namespace);
-        let (data, etag) = self.store.get_with_meta(&key).await?;
+        let (data, etag) = match self.store.get_with_meta(&key).await {
+            Ok(value) => value,
+            Err(ZeppelinError::NotFound { .. }) => {
+                return Err(ZeppelinError::LeaseExpired {
+                    namespace: namespace.to_string(),
+                });
+            }
+            Err(e) => return Err(e),
+        };
         let current: Lease = serde_json::from_slice(&data)?;
 
         if current.holder_id != self.holder_id || current.fencing_token != lease.fencing_token {

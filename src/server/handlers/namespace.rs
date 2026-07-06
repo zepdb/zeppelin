@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
@@ -45,9 +46,18 @@ pub struct NamespaceResponse {
     pub created_at: String,
     /// RFC 3339 timestamp of the last update.
     pub updated_at: String,
+    /// Namespace lifecycle state.
+    pub state: String,
     /// Full-text search field configurations (omitted when empty).
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
+}
+
+/// Response body for asynchronous namespace deletion.
+#[derive(Debug, Serialize)]
+pub struct DeleteNamespaceResponse {
+    /// Current lifecycle state.
+    pub state: &'static str,
 }
 
 /// Response body for namespace creation (includes warning about saving UUID).
@@ -70,6 +80,7 @@ impl From<NamespaceMetadata> for NamespaceResponse {
             vector_count: meta.vector_count,
             created_at: meta.created_at.to_rfc3339(),
             updated_at: meta.updated_at.to_rfc3339(),
+            state: meta.state.as_str().to_string(),
             full_text_search: meta.full_text_search,
         }
     }
@@ -141,7 +152,7 @@ pub async fn get_namespace(
 ) -> Result<Json<NamespaceResponse>, ApiError> {
     let meta = state
         .namespace_manager
-        .get(&ns)
+        .get_including_deleting(&ns)
         .await
         .map_err(ApiError::from)?;
 
@@ -153,11 +164,11 @@ pub async fn get_namespace(
 pub async fn delete_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<(StatusCode, Json<DeleteNamespaceResponse>), ApiError> {
     info!(namespace = %ns, "deleting namespace");
     state
         .namespace_manager
-        .delete(&ns)
+        .start_delete(&ns)
         .await
         .map_err(ApiError::from)?;
 
@@ -165,6 +176,41 @@ pub async fn delete_namespace(
     state.wal_writer.remove_lock(&ns);
     state.manifest_cache.invalidate(&ns);
 
-    info!(namespace = %ns, "namespace deleted");
-    Ok(StatusCode::NO_CONTENT)
+    let namespace_manager = state.namespace_manager.clone();
+    let ns_for_task = ns.clone();
+    tokio::spawn(async move {
+        match namespace_manager
+            .finish_delete(&ns_for_task, Duration::from_secs(25))
+            .await
+        {
+            Ok(outcome) => {
+                if outcome.complete {
+                    tracing::info!(
+                        namespace = %ns_for_task,
+                        objects_deleted = outcome.deleted,
+                        "namespace background delete completed"
+                    );
+                } else {
+                    tracing::warn!(
+                        namespace = %ns_for_task,
+                        objects_deleted = outcome.deleted,
+                        "namespace background delete budget exhausted; retry DELETE to resume"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    namespace = %ns_for_task,
+                    error = %e,
+                    "namespace background delete failed; retry DELETE to resume"
+                );
+            }
+        }
+    });
+
+    info!(namespace = %ns, state = "deleting", "namespace delete accepted");
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(DeleteNamespaceResponse { state: "deleting" }),
+    ))
 }

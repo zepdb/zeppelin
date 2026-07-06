@@ -375,6 +375,9 @@ pub struct CacheConfig {
     /// Manifest cache TTL in milliseconds. Default: `500`.
     #[serde(default = "default_manifest_cache_ttl_ms")]
     pub manifest_cache_ttl_ms: u64,
+    /// Namespace metadata positive-cache TTL in milliseconds. Default: `5000`.
+    #[serde(default = "default_namespace_registry_ttl_ms")]
+    pub namespace_registry_ttl_ms: u64,
 }
 
 /// Vector indexing parameters controlling IVF-Flat, quantization, and hierarchical trees.
@@ -530,6 +533,9 @@ fn default_memory_cache_max_mb() -> usize {
 fn default_manifest_cache_ttl_ms() -> u64 {
     500
 }
+fn default_namespace_registry_ttl_ms() -> u64 {
+    5000
+}
 fn default_num_centroids() -> usize {
     256
 }
@@ -633,6 +639,7 @@ impl Default for CacheConfig {
             max_size_gb: default_max_size_gb(),
             memory_cache_max_mb: default_memory_cache_max_mb(),
             manifest_cache_ttl_ms: default_manifest_cache_ttl_ms(),
+            namespace_registry_ttl_ms: default_namespace_registry_ttl_ms(),
         }
     }
 }
@@ -924,6 +931,12 @@ impl Config {
             .and_then(|v| v.parse().ok())
         {
             self.cache.manifest_cache_ttl_ms = v;
+        }
+        if let Some(v) = std::env::var("ZEPPELIN_NAMESPACE_REGISTRY_TTL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            self.cache.namespace_registry_ttl_ms = v;
         }
 
         // Indexing

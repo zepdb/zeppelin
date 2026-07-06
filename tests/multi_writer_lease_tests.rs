@@ -145,6 +145,34 @@ async fn test_lease_expired_takeover() {
     harness.cleanup().await;
 }
 
+#[tokio::test]
+async fn test_lease_renew_after_lease_object_deleted_returns_expired() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("lease-renew-deleted");
+
+    Manifest::new().write(&harness.store, &ns).await.unwrap();
+
+    let manager = LeaseManager::new(
+        harness.store.clone(),
+        "node-lease-delete".to_string(),
+        Duration::from_secs(30),
+    );
+    let lease = manager.acquire(&ns).await.unwrap();
+    harness
+        .store
+        .delete(&format!("{ns}/lease.json"))
+        .await
+        .unwrap();
+
+    let result = manager.renew(&ns, &lease).await;
+    assert!(
+        matches!(result, Err(ZeppelinError::LeaseExpired { .. })),
+        "missing lease.json must mean this holder no longer owns the lease, got {result:?}"
+    );
+
+    harness.cleanup().await;
+}
+
 /// Test 4: Fencing rejects zombie writer.
 /// Zombie writes fragment, lease expires, new writer writes manifest with
 /// higher token, zombie reads manifest and sees stale token.
