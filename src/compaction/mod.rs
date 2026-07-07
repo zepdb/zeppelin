@@ -589,6 +589,7 @@ impl Compactor {
 
         // 7. Generate new segment ID
         let segment_id = format!("seg_{}", Ulid::new());
+        let upload_phase_start = std::time::Instant::now();
 
         // 8. Build index (expensive, done once — NOT retried)
         // Choose hierarchical or flat based on config.
@@ -840,6 +841,10 @@ impl Compactor {
             "index build phase complete"
         );
 
+        if let Some(token) = fencing_token {
+            publish_compaction_staging(&self.store, namespace, &segment_id, token).await?;
+        }
+
         // 8a. Enqueue the old segment's now-superseded S3 objects for deletion.
         //
         // DATA-LOSS CLIFF: with incremental carry-over, some of the old
@@ -1005,6 +1010,10 @@ impl Compactor {
             Vec::new()
         };
 
+        if let Some(token) = fencing_token {
+            publish_compaction_staging(&self.store, namespace, &segment_id, token).await?;
+        }
+
         // Test-only slow-step injection (see `set_test_pre_cas_delay`):
         // simulates an index-build phase that outlasts the lease duration.
         if let Some(delay) = self.test_pre_cas_delay {
@@ -1017,6 +1026,16 @@ impl Compactor {
 
         // 9. CAS loop: re-read manifest, apply changes, write conditionally
         for attempt in 0..MAX_CAS_RETRIES {
+            if let Err(e) = check_upload_window(
+                namespace,
+                upload_phase_start,
+                compaction_upload_window(&self.config),
+            ) {
+                if let Some(token) = fencing_token {
+                    drop_compaction_staging(&self.store, namespace, token).await;
+                }
+                return Err(e);
+            }
             // Invariant A2: a compaction whose lease-renewal heartbeat
             // failed must abort BEFORE committing its manifest — the
             // in-flight segment becomes an orphan (GC's problem), never
@@ -1096,6 +1115,10 @@ impl Compactor {
                         attempt,
                         "compaction complete"
                     );
+
+                    if let Some(token) = fencing_token {
+                        drop_compaction_staging(&self.store, namespace, token).await;
+                    }
 
                     return Ok(CompactionResult {
                         segment_id: Some(segment_id),
@@ -2239,6 +2262,55 @@ fn merge_pending_deletes(
         .cloned()
         .collect();
     manifest.pending_deletes.extend(new_keys);
+}
+
+async fn publish_compaction_staging(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_id: &str,
+    fencing_token: u64,
+) -> Result<()> {
+    let prefix = format!("{namespace}/segments/{segment_id}/");
+    let keys = store.list_prefix(&prefix).await?.into_iter().collect();
+    gc::write_compaction_staging(store, namespace, fencing_token, keys).await
+}
+
+async fn drop_compaction_staging(store: &ZeppelinStore, namespace: &str, fencing_token: u64) {
+    if let Err(e) = gc::clear_compaction_staging(store, namespace, fencing_token).await {
+        warn!(
+            namespace = %namespace,
+            fencing_token,
+            error = %e,
+            "failed to clear compaction staging side object"
+        );
+    }
+}
+
+fn compaction_upload_window(config: &CompactionConfig) -> Duration {
+    Duration::from_secs(config.compaction_upload_window_secs)
+}
+
+fn check_upload_window(
+    namespace: &str,
+    upload_phase_start: std::time::Instant,
+    upload_window: Duration,
+) -> Result<()> {
+    let elapsed = upload_phase_start.elapsed();
+    if elapsed > upload_window {
+        error!(
+            namespace = %namespace,
+            elapsed_ms = elapsed.as_millis() as u64,
+            upload_window_ms = upload_window.as_millis() as u64,
+            "aborting compaction before manifest CAS: upload phase exceeded GC horizon window"
+        );
+        return Err(ZeppelinError::Index(format!(
+            "compaction upload phase exceeded GC horizon window for namespace {namespace}: \
+             elapsed_ms={}, window_ms={}",
+            elapsed.as_millis(),
+            upload_window.as_millis()
+        )));
+    }
+    Ok(())
 }
 
 /// Load all vectors from an existing IVF-Flat segment on S3.

@@ -785,6 +785,11 @@ pub struct CompactionConfig {
     /// prevent a stale commit. Default: `300`.
     #[serde(default = "default_compaction_lease_secs")]
     pub lease_duration_secs: u64,
+    /// Maximum allowed duration between compaction segment upload start and
+    /// final manifest CAS, in seconds. This is a local compatibility field
+    /// until Task 19A owns the canonical GC horizon config.
+    #[serde(default = "default_compaction_upload_window_secs")]
+    pub compaction_upload_window_secs: u64,
 }
 
 /// Structured logging configuration.
@@ -921,6 +926,9 @@ fn default_max_old_segments() -> usize {
 fn default_compaction_lease_secs() -> u64 {
     300
 }
+fn default_compaction_upload_window_secs() -> u64 {
+    300
+}
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -1013,6 +1021,7 @@ impl Default for CompactionConfig {
             max_pending_deletes: default_max_pending_deletes(),
             max_old_segments: default_max_old_segments(),
             lease_duration_secs: default_compaction_lease_secs(),
+            compaction_upload_window_secs: default_compaction_upload_window_secs(),
         }
     }
 }
@@ -1154,6 +1163,11 @@ impl Config {
         }
         if self.compaction.lease_duration_secs == 0 {
             violations.push("compaction.lease_duration_secs must be greater than zero".to_string());
+        }
+        if self.compaction.compaction_upload_window_secs == 0 {
+            violations.push(
+                "compaction.compaction_upload_window_secs must be greater than zero".to_string(),
+            );
         }
 
         if self.cache.hydration_heat_queries == 0 {
