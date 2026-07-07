@@ -14,6 +14,7 @@ const GC_COMPACTION_UPLOAD_WINDOW_SECS_ENV: &str = "ZEPPELIN_GC_COMPACTION_UPLOA
 const GC_SKEW_SLOP_SECS_ENV: &str = "ZEPPELIN_GC_SKEW_SLOP_SECS";
 const GC_ALLOW_UNSAFE_SHORT_HORIZON_ENV: &str = "ZEPPELIN_GC_ALLOW_UNSAFE_SHORT_HORIZON";
 const GC_MANIFEST_HISTORY_KEEP_COUNT_ENV: &str = "ZEPPELIN_GC_MANIFEST_HISTORY_KEEP_COUNT";
+const GC_PITR_RETENTION_SECS_ENV: &str = "ZEPPELIN_GC_PITR_RETENTION_SECS";
 
 /// Default maximum gap, in bytes, between rerank f32 ranges that are merged
 /// into one physical GET.
@@ -120,6 +121,13 @@ pub struct GcConfig {
     /// become collectible after the normal GC horizon. Default: `128`.
     #[serde(default = "default_gc_manifest_history_keep_count")]
     pub manifest_history_keep_count: usize,
+    /// Time-based PITR retention window for committed manifest snapshots.
+    ///
+    /// A history generation is retained if it is within the count window OR
+    /// its commit timestamp is younger than this window OR a named snapshot
+    /// pins it. `0` disables time-based retention. Default: `0`.
+    #[serde(default)]
+    pub pitr_retention_secs: u64,
 }
 
 /// Query-time configuration loaded at boot.
@@ -184,6 +192,7 @@ mod tests {
                 GC_COMPACTION_UPLOAD_WINDOW_SECS_ENV,
                 GC_SKEW_SLOP_SECS_ENV,
                 GC_ALLOW_UNSAFE_SHORT_HORIZON_ENV,
+                GC_PITR_RETENTION_SECS_ENV,
                 "ZEPPELIN_QUERY_WORKERS",
                 "ZEPPELIN_COMPACTION_WORKERS",
                 "ZEPPELIN_RAYON_THREADS",
@@ -666,6 +675,7 @@ mod tests {
             skew_slop_secs = 4
             allow_unsafe_short_horizon = true
             manifest_history_keep_count = 7
+            pitr_retention_secs = 86400
             "#,
         )
         .unwrap();
@@ -675,6 +685,7 @@ mod tests {
         assert_eq!(config.gc.skew_slop_secs, 4);
         assert!(config.gc.allow_unsafe_short_horizon);
         assert_eq!(config.gc.manifest_history_keep_count, 7);
+        assert_eq!(config.gc.pitr_retention_secs, 86_400);
 
         let source = include_str!("config.rs");
         assert!(source.contains("manifest_cache_ttl_secs + request_timeout_secs + compaction_upload_window_secs + skew_slop_secs"));
@@ -1291,6 +1302,7 @@ impl Default for GcConfig {
             skew_slop_secs: default_gc_skew_slop_secs(),
             allow_unsafe_short_horizon: false,
             manifest_history_keep_count: default_gc_manifest_history_keep_count(),
+            pitr_retention_secs: 0,
         }
     }
 }
@@ -1809,6 +1821,9 @@ impl Config {
         }
         if let Some(v) = env_override(GC_MANIFEST_HISTORY_KEEP_COUNT_ENV)? {
             self.gc.manifest_history_keep_count = v;
+        }
+        if let Some(v) = env_override(GC_PITR_RETENTION_SECS_ENV)? {
+            self.gc.pitr_retention_secs = v;
         }
 
         Ok(())

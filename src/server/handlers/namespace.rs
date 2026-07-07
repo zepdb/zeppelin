@@ -16,7 +16,7 @@ use crate::namespace::manager::{
 };
 use crate::server::AppState;
 use crate::types::{DistanceMetric, IndexType};
-use crate::wal::manifest::SegmentRef;
+use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
 use crate::wal::Manifest;
 
 use super::ApiError;
@@ -196,6 +196,24 @@ pub struct CompactNamespaceResponse {
     pub ready: bool,
 }
 
+/// Response body for a named PITR snapshot.
+#[derive(Debug, Serialize)]
+pub struct SnapshotResponse {
+    /// Snapshot name.
+    pub name: String,
+    /// Manifest generation pinned by this snapshot.
+    pub generation: u64,
+    /// RFC 3339 timestamp when the snapshot was created.
+    pub created_at: String,
+}
+
+/// Response body for listing named PITR snapshots.
+#[derive(Debug, Serialize)]
+pub struct ListSnapshotsResponse {
+    /// Snapshot pins for this namespace.
+    pub snapshots: Vec<SnapshotResponse>,
+}
+
 /// Response body for namespace creation.
 #[derive(Debug, Serialize)]
 pub struct CreateNamespaceResponse {
@@ -204,6 +222,16 @@ pub struct CreateNamespaceResponse {
     pub namespace: NamespaceResponse,
     /// Creation note.
     pub warning: String,
+}
+
+impl SnapshotResponse {
+    fn from_ref(snapshot: NamedSnapshotRef) -> Self {
+        Self {
+            name: snapshot.name,
+            generation: snapshot.generation,
+            created_at: snapshot.created_at.to_rfc3339(),
+        }
+    }
 }
 
 impl NamespaceResponse {
@@ -248,6 +276,101 @@ impl NamespaceResponse {
             full_text_search: meta.full_text_search,
         }
     }
+}
+
+/// Creates a named PITR snapshot pin for the current committed generation.
+#[instrument(skip(state), fields(namespace = %ns, snapshot = %name))]
+pub async fn put_snapshot(
+    State(state): State<AppState>,
+    Path((ns, name)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<SnapshotResponse>), ApiError> {
+    state
+        .namespace_manager
+        .get(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    let manifest = state
+        .manifest_cache
+        .get_strong(&state.store, &ns)
+        .await
+        .map_err(ApiError::from)?;
+    let snapshot = NamedSnapshot::create(&state.store, &ns, &name, manifest.version())
+        .await
+        .map_err(ApiError::from)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(SnapshotResponse::from_ref(snapshot)),
+    ))
+}
+
+/// Lists named PITR snapshot pins for a namespace.
+#[instrument(skip(state), fields(namespace = %ns))]
+pub async fn list_snapshots(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<Json<ListSnapshotsResponse>, ApiError> {
+    state
+        .namespace_manager
+        .get(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    let snapshots = NamedSnapshot::list(&state.store, &ns)
+        .await
+        .map_err(ApiError::from)?
+        .into_iter()
+        .map(SnapshotResponse::from_ref)
+        .collect();
+    Ok(Json(ListSnapshotsResponse { snapshots }))
+}
+
+/// Gets one named PITR snapshot pin.
+#[instrument(skip(state), fields(namespace = %ns, snapshot = %name))]
+pub async fn get_snapshot(
+    State(state): State<AppState>,
+    Path((ns, name)): Path<(String, String)>,
+) -> Result<Json<SnapshotResponse>, ApiError> {
+    state
+        .namespace_manager
+        .get(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    let snapshot = NamedSnapshot::read(&state.store, &ns, &name)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError(ZeppelinError::SnapshotNotFound {
+                namespace: ns.clone(),
+                name: name.clone(),
+            })
+        })?;
+    Ok(Json(SnapshotResponse::from_ref(snapshot)))
+}
+
+/// Deletes one named PITR snapshot pin.
+#[instrument(skip(state), fields(namespace = %ns, snapshot = %name))]
+pub async fn delete_snapshot(
+    State(state): State<AppState>,
+    Path((ns, name)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .namespace_manager
+        .get(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    if NamedSnapshot::read(&state.store, &ns, &name)
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err(ApiError(ZeppelinError::SnapshotNotFound {
+            namespace: ns,
+            name,
+        }));
+    }
+    NamedSnapshot::delete(&state.store, &ns, &name)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 impl CompactNamespaceResponse {

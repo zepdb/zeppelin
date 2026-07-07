@@ -86,6 +86,9 @@
 #                                          # true accepts a sub-floor horizon and emits a loud WARN at boot.
 # manifest_history_keep_count = 128        # ZEPPELIN_GC_MANIFEST_HISTORY_KEEP_COUNT
 #                                          # GC retains this many committed manifest snapshots as live roots.
+# pitr_retention_secs = 0                  # ZEPPELIN_GC_PITR_RETENTION_SECS
+#                                          # 0 disables time-based PITR retention; otherwise
+#                                          # history younger than this window is also retained.
 
 [compaction]
 # interval_secs = 30                 # ZEPPELIN_COMPACTION_INTERVAL_SECS

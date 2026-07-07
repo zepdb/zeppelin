@@ -605,6 +605,16 @@ pub fn build_router(state: AppState) -> Router {
             get(namespace::get_namespace).delete(namespace::delete_namespace),
         )
         .route(
+            "/v1/namespaces/:ns/snapshots",
+            get(namespace::list_snapshots),
+        )
+        .route(
+            "/v1/namespaces/:ns/snapshots/:name",
+            get(namespace::get_snapshot)
+                .put(namespace::put_snapshot)
+                .delete(namespace::delete_snapshot),
+        )
+        .route(
             "/v1/namespaces/:ns/index_config",
             patch(namespace::patch_index_config),
         )

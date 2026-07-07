@@ -121,6 +121,88 @@ async fn test_namespace_crud() {
 }
 
 #[tokio::test]
+async fn test_snapshot_crud_pins_current_generation() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api(&client, &base_url, 8).await;
+
+    let created = client
+        .put(format!("{base_url}/v1/namespaces/{ns}/snapshots/daily"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let created_body: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(created_body["name"], "daily");
+    assert_eq!(created_body["generation"], 1);
+    assert!(created_body["created_at"].is_string());
+
+    let repeated = client
+        .put(format!("{base_url}/v1/namespaces/{ns}/snapshots/daily"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repeated.status(), 201);
+    let repeated_body: serde_json::Value = repeated.json().await.unwrap();
+    assert_eq!(repeated_body["generation"], 1);
+    assert_eq!(repeated_body["created_at"], created_body["created_at"]);
+
+    let list = client
+        .get(format!("{base_url}/v1/namespaces/{ns}/snapshots"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), 200);
+    let list_body: serde_json::Value = list.json().await.unwrap();
+    assert_eq!(list_body["snapshots"].as_array().unwrap().len(), 1);
+    assert_eq!(list_body["snapshots"][0]["name"], "daily");
+
+    let one = client
+        .get(format!("{base_url}/v1/namespaces/{ns}/snapshots/daily"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(one.status(), 200);
+    let one_body: serde_json::Value = one.json().await.unwrap();
+    assert_eq!(one_body, created_body);
+
+    let vectors = random_vectors(1, 8);
+    let upsert = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({ "vectors": vectors }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upsert.status(), 200);
+
+    let conflict = client
+        .put(format!("{base_url}/v1/namespaces/{ns}/snapshots/daily"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), 409);
+    let conflict_body: serde_json::Value = conflict.json().await.unwrap();
+    assert_eq!(conflict_body["code"], "SNAPSHOT_ALREADY_EXISTS");
+
+    let deleted = client
+        .delete(format!("{base_url}/v1/namespaces/{ns}/snapshots/daily"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 204);
+
+    let missing = client
+        .get(format!("{base_url}/v1/namespaces/{ns}/snapshots/daily"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn test_vector_upsert() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();

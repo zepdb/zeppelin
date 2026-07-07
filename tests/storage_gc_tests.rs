@@ -15,7 +15,7 @@ use zeppelin::config::{CompactionConfig, GcConfig, IndexingConfig};
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::types::DistanceMetric;
 use zeppelin::wal::fragment::WalFragment;
-use zeppelin::wal::manifest::{FragmentRef, Manifest};
+use zeppelin::wal::manifest::{FragmentRef, Manifest, NamedSnapshot};
 use zeppelin::wal::{LeaseManager, WalReader};
 
 use common::assertions::{assert_s3_object_exists, assert_s3_object_not_exists};
@@ -176,6 +176,242 @@ async fn gc_cycle_retains_objects_referenced_only_by_manifest_history() {
             .all(|candidate| candidate.key != old_key),
         "history-referenced objects must not enter the candidate ledger"
     );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_pitr_time_retention_keeps_old_generation_and_artifacts() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("storage-gc-pitr-time");
+    let store = harness.store.clone();
+    let old_id = old_ulid(60, 89);
+    let old_key = WalFragment::s3_key(&ns, &old_id);
+
+    store
+        .put(&old_key, Bytes::from_static(b"time retained body"))
+        .await
+        .unwrap();
+    let mut manifest = Manifest::new();
+    manifest.add_fragment(FragmentRef {
+        id: old_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 18,
+    });
+    manifest.write(&store, &ns).await.unwrap();
+
+    for _ in 0..2 {
+        let (mut current, etag) = Manifest::read_versioned(&store, &ns)
+            .await
+            .unwrap()
+            .unwrap();
+        current.fragments.clear();
+        current.updated_at = Utc::now();
+        current.write_conditional(&store, &ns, &etag).await.unwrap();
+    }
+
+    run_gc_cycle(
+        &store,
+        &ns,
+        &GcConfig {
+            manifest_history_keep_count: 1,
+            pitr_retention_secs: 3_600,
+            ..unsafe_short_gc(0)
+        },
+    )
+    .await
+    .unwrap();
+    run_gc_cycle(
+        &store,
+        &ns,
+        &GcConfig {
+            manifest_history_keep_count: 1,
+            pitr_retention_secs: 3_600,
+            ..unsafe_short_gc(0)
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        Manifest::read_history(&store, &ns, 1)
+            .await
+            .unwrap()
+            .is_some(),
+        "generation 1 is outside keep_count=1 but inside PITR time retention"
+    );
+    assert_s3_object_exists(&store, &old_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_prunes_expired_history_and_collects_artifacts_after_horizon() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("storage-gc-pitr-expired");
+    let store = harness.store.clone();
+    let old_id = old_ulid(60, 99);
+    let old_key = WalFragment::s3_key(&ns, &old_id);
+
+    store
+        .put(&old_key, Bytes::from_static(b"expired history body"))
+        .await
+        .unwrap();
+    let mut manifest = Manifest::new();
+    manifest.updated_at = Utc::now() - chrono::Duration::seconds(60);
+    manifest.add_fragment(FragmentRef {
+        id: old_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 20,
+    });
+    manifest.updated_at = Utc::now() - chrono::Duration::seconds(60);
+    manifest.write(&store, &ns).await.unwrap();
+
+    for _ in 0..2 {
+        let (mut current, etag) = Manifest::read_versioned(&store, &ns)
+            .await
+            .unwrap()
+            .unwrap();
+        current.fragments.clear();
+        current.updated_at = Utc::now();
+        current.write_conditional(&store, &ns, &etag).await.unwrap();
+    }
+
+    let config = GcConfig {
+        manifest_history_keep_count: 1,
+        pitr_retention_secs: 1,
+        ..unsafe_short_gc(0)
+    };
+    run_gc_cycle(&store, &ns, &config).await.unwrap();
+    run_gc_cycle(&store, &ns, &config).await.unwrap();
+
+    assert!(
+        Manifest::read_history(&store, &ns, 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "generation 1 is outside count and time retention"
+    );
+    assert_s3_object_not_exists(&store, &old_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_named_snapshot_pin_keeps_generation_until_released() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("storage-gc-pitr-pin");
+    let store = harness.store.clone();
+    let old_id = old_ulid(60, 109);
+    let old_key = WalFragment::s3_key(&ns, &old_id);
+
+    store
+        .put(&old_key, Bytes::from_static(b"snapshot pinned body"))
+        .await
+        .unwrap();
+    let mut manifest = Manifest::new();
+    manifest.updated_at = Utc::now() - chrono::Duration::seconds(60);
+    manifest.add_fragment(FragmentRef {
+        id: old_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 20,
+    });
+    manifest.updated_at = Utc::now() - chrono::Duration::seconds(60);
+    manifest.write(&store, &ns).await.unwrap();
+    NamedSnapshot::create(&store, &ns, "before-delete", 1)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let (mut current, etag) = Manifest::read_versioned(&store, &ns)
+            .await
+            .unwrap()
+            .unwrap();
+        current.fragments.clear();
+        current.updated_at = Utc::now();
+        current.write_conditional(&store, &ns, &etag).await.unwrap();
+    }
+
+    let config = GcConfig {
+        manifest_history_keep_count: 1,
+        pitr_retention_secs: 0,
+        ..unsafe_short_gc(0)
+    };
+    run_gc_cycle(&store, &ns, &config).await.unwrap();
+    run_gc_cycle(&store, &ns, &config).await.unwrap();
+    assert!(Manifest::read_history(&store, &ns, 1)
+        .await
+        .unwrap()
+        .is_some());
+    assert_s3_object_exists(&store, &old_key).await;
+
+    NamedSnapshot::delete(&store, &ns, "before-delete")
+        .await
+        .unwrap();
+    run_gc_cycle(&store, &ns, &config).await.unwrap();
+    run_gc_cycle(&store, &ns, &config).await.unwrap();
+    assert!(Manifest::read_history(&store, &ns, 1)
+        .await
+        .unwrap()
+        .is_none());
+    assert_s3_object_not_exists(&store, &old_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_snapshot_pin_does_not_retain_unreferenced_pending_delete() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("storage-gc-pitr-pin-pending");
+    let store = harness.store.clone();
+    let pending_id = old_ulid(60, 119);
+    let pending_key = WalFragment::s3_key(&ns, &pending_id);
+
+    store
+        .put(
+            &pending_key,
+            Bytes::from_static(b"unreferenced pending body"),
+        )
+        .await
+        .unwrap();
+    Manifest::new().write(&store, &ns).await.unwrap();
+    NamedSnapshot::create(&store, &ns, "empty", 1)
+        .await
+        .unwrap();
+
+    let (mut current, etag) = Manifest::read_versioned(&store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    current.pending_deletes.push(pending_key.clone());
+    current.updated_at = Utc::now();
+    current.write_conditional(&store, &ns, &etag).await.unwrap();
+    store
+        .delete(&Manifest::history_key(&ns, current.version()))
+        .await
+        .unwrap();
+
+    let report = run_gc_cycle(
+        &store,
+        &ns,
+        &GcConfig {
+            manifest_history_keep_count: 1,
+            pitr_retention_secs: 0,
+            ..unsafe_short_gc(0)
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.pending_deletes_deleted, 1);
+    assert_eq!(report.pending_deletes_pruned, 1);
+    assert_s3_object_not_exists(&store, &pending_key).await;
 
     harness.cleanup().await;
 }

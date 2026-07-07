@@ -314,6 +314,46 @@ pub struct ManifestHistoryRef {
     pub key: String,
 }
 
+/// Named PITR snapshot pin stored under `{namespace}/snapshots/{name}.msgpack`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamedSnapshot {
+    /// Manifest generation pinned by this snapshot.
+    pub generation: u64,
+    /// Snapshot creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Addressable named snapshot pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedSnapshotRef {
+    /// Caller-supplied snapshot name.
+    pub name: String,
+    /// S3 key containing the snapshot pin.
+    pub key: String,
+    /// Manifest generation pinned by this snapshot.
+    pub generation: u64,
+    /// Snapshot creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Result of pruning manifest history.
+#[derive(Debug, Clone)]
+pub struct ManifestHistoryPruneResult {
+    /// Number of history snapshots deleted.
+    pub pruned: usize,
+    /// Retained manifest snapshots after pruning.
+    pub retained_manifests: Vec<Manifest>,
+}
+
+/// Policy controlling manifest-history retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestHistoryRetention {
+    /// Most recent generation count to retain.
+    pub keep_count: usize,
+    /// Time-based PITR retention window in seconds. `0` disables time retention.
+    pub pitr_retention_secs: u64,
+}
+
 enum HistorySnapshotWrite {
     Stored,
     AlreadyExistsWithDifferentBytes { key: String },
@@ -683,18 +723,58 @@ impl Manifest {
         namespace: &str,
         keep_count: usize,
     ) -> Result<usize> {
-        if keep_count == 0 {
+        Ok(Self::prune_history_with_retention(
+            store,
+            namespace,
+            ManifestHistoryRetention {
+                keep_count,
+                pitr_retention_secs: 0,
+            },
+        )
+        .await?
+        .pruned)
+    }
+
+    /// Prune manifest history by count OR PITR retention window OR named snapshot pins.
+    pub async fn prune_history_with_retention(
+        store: &ZeppelinStore,
+        namespace: &str,
+        retention: ManifestHistoryRetention,
+    ) -> Result<ManifestHistoryPruneResult> {
+        if retention.keep_count == 0 {
             return Err(ZeppelinError::Config(
                 "gc.manifest_history_keep_count must be greater than zero".to_string(),
             ));
         }
-
         let history = Self::list_history(store, namespace).await?;
-        let prune_count = history.len().saturating_sub(keep_count);
-        for entry in history.iter().take(prune_count) {
-            store.delete(&entry.key).await?;
+        let keep_from = history.len().saturating_sub(retention.keep_count);
+        let pinned_generations = NamedSnapshot::pinned_generations(store, namespace).await?;
+        let now = Utc::now();
+
+        let mut retained_manifests = Vec::new();
+        let mut pruned = 0usize;
+        for (index, entry) in history.iter().enumerate() {
+            let manifest = Self::read_history(store, namespace, entry.version)
+                .await?
+                .ok_or_else(|| ZeppelinError::NotFound {
+                    key: entry.key.clone(),
+                })?;
+            let keep_by_count = index >= keep_from;
+            let keep_by_pin = pinned_generations.contains(&entry.version);
+            let keep_by_time = retention.pitr_retention_secs > 0
+                && now.signed_duration_since(manifest.updated_at).num_seconds()
+                    <= retention.pitr_retention_secs as i64;
+            if keep_by_count || keep_by_time || keep_by_pin {
+                retained_manifests.push(manifest);
+            } else {
+                store.delete(&entry.key).await?;
+                pruned += 1;
+            }
         }
-        Ok(prune_count)
+        Ok(ManifestHistoryPruneResult {
+            pruned,
+            retained_manifests,
+        })
     }
 
     async fn write_history_snapshot_for_commit(
@@ -784,6 +864,183 @@ impl Manifest {
             ))
         })
     }
+}
+
+impl NamedSnapshot {
+    /// Get the S3 prefix for named snapshot pins.
+    #[must_use]
+    pub fn prefix(namespace: &str) -> String {
+        format!("{namespace}/snapshots/")
+    }
+
+    /// Get the S3 key for a named snapshot pin.
+    pub fn key(namespace: &str, name: &str) -> Result<String> {
+        validate_snapshot_name(name)?;
+        Ok(format!("{}{}.msgpack", Self::prefix(namespace), name))
+    }
+
+    /// Serialize to MessagePack bytes with a version header.
+    pub fn to_bytes(&self) -> Result<Bytes> {
+        let msgpack = rmp_serde::to_vec(self).map_err(|e| {
+            ZeppelinError::Serialization(format!("snapshot msgpack serialize: {e}"))
+        })?;
+        let mut data = Vec::with_capacity(1 + msgpack.len());
+        data.push(MANIFEST_FORMAT_MSGPACK);
+        data.extend_from_slice(&msgpack);
+        Ok(Bytes::from(data))
+    }
+
+    /// Deserialize from bytes, auto-detecting format (MessagePack or legacy JSON).
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.is_empty() {
+            return Err(ZeppelinError::Serialization(
+                "snapshot pin object is empty".to_string(),
+            ));
+        }
+        match data[0] {
+            MANIFEST_FORMAT_MSGPACK => rmp_serde::from_slice(&data[1..]).map_err(|e| {
+                ZeppelinError::Serialization(format!("snapshot msgpack deserialize: {e}"))
+            }),
+            b'{' => Ok(serde_json::from_slice(data)?),
+            _ => rmp_serde::from_slice(&data[1..])
+                .or_else(|_| rmp_serde::from_slice(data))
+                .map_err(|e| {
+                    ZeppelinError::Serialization(format!("snapshot msgpack deserialize: {e}"))
+                }),
+        }
+    }
+
+    /// Create or idempotently confirm a named snapshot for `generation`.
+    pub async fn create(
+        store: &ZeppelinStore,
+        namespace: &str,
+        name: &str,
+        generation: u64,
+    ) -> Result<NamedSnapshotRef> {
+        if generation == 0 {
+            return Err(ZeppelinError::Validation(
+                "snapshot generation must be a committed nonzero manifest generation".into(),
+            ));
+        }
+        let key = Self::key(namespace, name)?;
+        let snapshot = Self {
+            generation,
+            created_at: Utc::now(),
+        };
+        match store
+            .put_if_not_exists(&key, snapshot.to_bytes()?, namespace)
+            .await
+        {
+            Ok(()) => Ok(NamedSnapshotRef {
+                name: name.to_string(),
+                key,
+                generation,
+                created_at: snapshot.created_at,
+            }),
+            Err(ZeppelinError::NamespaceAlreadyExists { .. }) => {
+                let existing = Self::read(store, namespace, name)
+                    .await?
+                    .ok_or_else(|| ZeppelinError::NotFound { key: key.clone() })?;
+                if existing.generation == generation {
+                    Ok(existing)
+                } else {
+                    Err(ZeppelinError::SnapshotAlreadyExists {
+                        namespace: namespace.to_string(),
+                        name: name.to_string(),
+                        existing_generation: existing.generation,
+                        requested_generation: generation,
+                    })
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Read a named snapshot pin.
+    pub async fn read(
+        store: &ZeppelinStore,
+        namespace: &str,
+        name: &str,
+    ) -> Result<Option<NamedSnapshotRef>> {
+        let key = Self::key(namespace, name)?;
+        match store.get(&key).await {
+            Ok(data) => {
+                let snapshot = Self::from_bytes(&data)?;
+                Ok(Some(NamedSnapshotRef {
+                    name: name.to_string(),
+                    key,
+                    generation: snapshot.generation,
+                    created_at: snapshot.created_at,
+                }))
+            }
+            Err(ZeppelinError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// List all named snapshot pins in name order.
+    pub async fn list(store: &ZeppelinStore, namespace: &str) -> Result<Vec<NamedSnapshotRef>> {
+        let prefix = Self::prefix(namespace);
+        let mut snapshots = Vec::new();
+        for key in store.list_prefix(&prefix).await? {
+            let name = snapshot_name_from_key(namespace, &key)?;
+            let data = store.get(&key).await?;
+            let snapshot = Self::from_bytes(&data)?;
+            snapshots.push(NamedSnapshotRef {
+                name,
+                key,
+                generation: snapshot.generation,
+                created_at: snapshot.created_at,
+            });
+        }
+        snapshots.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(snapshots)
+    }
+
+    /// Delete a named snapshot pin.
+    pub async fn delete(store: &ZeppelinStore, namespace: &str, name: &str) -> Result<()> {
+        let key = Self::key(namespace, name)?;
+        store.delete(&key).await
+    }
+
+    async fn pinned_generations(store: &ZeppelinStore, namespace: &str) -> Result<HashSet<u64>> {
+        Ok(Self::list(store, namespace)
+            .await?
+            .into_iter()
+            .map(|snapshot| snapshot.generation)
+            .collect())
+    }
+}
+
+fn validate_snapshot_name(name: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 255
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(ZeppelinError::Validation(format!(
+            "invalid snapshot name '{name}': must be 1-255 chars and contain only alphanumeric, dash, underscore, or dot characters"
+        )))
+    }
+}
+
+fn snapshot_name_from_key(namespace: &str, key: &str) -> Result<String> {
+    let prefix = NamedSnapshot::prefix(namespace);
+    let Some(name) = key.strip_prefix(&prefix) else {
+        return Err(ZeppelinError::Serialization(format!(
+            "snapshot key {key} is outside prefix {prefix}"
+        )));
+    };
+    let Some(name) = name.strip_suffix(".msgpack") else {
+        return Err(ZeppelinError::Serialization(format!(
+            "snapshot key {key} must end with .msgpack"
+        )));
+    };
+    validate_snapshot_name(name)?;
+    Ok(name.to_string())
 }
 
 /// Wraps the ETag for optimistic concurrency control on manifest writes.
@@ -946,6 +1203,103 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn manifest_history_prune_keeps_count_or_time_or_snapshot_pin() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let ns = "manifest_history_retention";
+
+        let mut initial = Manifest::new();
+        initial.updated_at = Utc::now() - chrono::Duration::seconds(60);
+        initial.write(&store, ns).await.unwrap();
+        for version in 2..=5 {
+            let (mut manifest, etag) = Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+            manifest.add_fragment(FragmentRef {
+                id: Ulid::from_parts(40_000 + version, u128::from(version)),
+                vector_count: version as usize,
+                delete_count: 0,
+                sequence_number: 0,
+                size_bytes: 16,
+            });
+            manifest.updated_at = match version {
+                2 => Utc::now() - chrono::Duration::seconds(60),
+                3 => Utc::now() - chrono::Duration::seconds(5),
+                4 => Utc::now() - chrono::Duration::seconds(60),
+                5 => Utc::now(),
+                _ => unreachable!(),
+            };
+            manifest.write_conditional(&store, ns, &etag).await.unwrap();
+        }
+
+        NamedSnapshot::create(&store, ns, "pin-v2", 2)
+            .await
+            .unwrap();
+        let result = Manifest::prune_history_with_retention(
+            &store,
+            ns,
+            ManifestHistoryRetention {
+                keep_count: 1,
+                pitr_retention_secs: 30,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.pruned, 2);
+        let history = Manifest::list_history(&store, ns).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.version)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 5],
+            "history is retained by snapshot pin OR time window OR recent count"
+        );
+        assert_eq!(
+            result
+                .retained_manifests
+                .iter()
+                .map(Manifest::version)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 5]
+        );
+    }
+
+    #[tokio::test]
+    async fn named_snapshot_create_is_idempotent_but_conflicts_on_generation_change() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let ns = "named_snapshot_create";
+
+        let first = NamedSnapshot::create(&store, ns, "daily.2026-07-08", 7)
+            .await
+            .unwrap();
+        let second = NamedSnapshot::create(&store, ns, "daily.2026-07-08", 7)
+            .await
+            .unwrap();
+        assert_eq!(first.generation, second.generation);
+        assert_eq!(first.created_at, second.created_at);
+
+        let err = NamedSnapshot::create(&store, ns, "daily.2026-07-08", 8)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ZeppelinError::SnapshotAlreadyExists { .. }),
+            "different generation must conflict, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn named_snapshot_decodes_msgpack_and_json() {
+        let snapshot = NamedSnapshot {
+            generation: 42,
+            created_at: Utc::now(),
+        };
+        let msgpack = snapshot.to_bytes().unwrap();
+        assert_eq!(NamedSnapshot::from_bytes(&msgpack).unwrap(), snapshot);
+
+        let json = serde_json::to_vec(&snapshot).unwrap();
+        assert_eq!(NamedSnapshot::from_bytes(&json).unwrap(), snapshot);
     }
 
     #[test]

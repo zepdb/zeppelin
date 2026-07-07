@@ -20,7 +20,7 @@ use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
 use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::wal::fragment::WalFragment;
-use crate::wal::manifest::Manifest;
+use crate::wal::manifest::{Manifest, ManifestHistoryRetention};
 use crate::wal::Lease;
 
 const GC_CANDIDATE_STORE_VERSION: u32 = 1;
@@ -149,6 +149,17 @@ pub async fn retained_manifest_history_reachable_keys(
         keys.extend(reachable_keys(namespace, &manifest));
     }
     Ok(keys)
+}
+
+fn retained_manifest_history_reachable_keys_from_manifests(
+    namespace: &str,
+    manifests: &[Manifest],
+) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for manifest in manifests {
+        keys.extend(reachable_keys(namespace, manifest));
+    }
+    keys
 }
 
 /// Exact-key set of current manifest refs, retained manifest history, and active staging.
@@ -547,29 +558,31 @@ pub async fn run_gc_cycle(
     gc: &GcConfig,
 ) -> Result<GcCycleReport> {
     let now = Utc::now();
-    let manifest_history_pruned =
-        match Manifest::prune_history(store, namespace, gc.manifest_history_keep_count).await {
-            Ok(pruned) => pruned,
-            Err(e) => {
-                warn!(
-                    namespace,
-                    error = %e,
-                    "gc manifest-history prune failed; aborting cycle"
-                );
-                return Ok(GcCycleReport::default());
-            }
-        };
-    let retained_history = match retained_manifest_history_reachable_keys(store, namespace).await {
-        Ok(reachable) => reachable,
+    let history_prune = match Manifest::prune_history_with_retention(
+        store,
+        namespace,
+        ManifestHistoryRetention {
+            keep_count: gc.manifest_history_keep_count,
+            pitr_retention_secs: gc.pitr_retention_secs,
+        },
+    )
+    .await
+    {
+        Ok(result) => result,
         Err(e) => {
             warn!(
                 namespace,
                 error = %e,
-                "gc manifest-history reachability read failed; aborting cycle"
+                "gc manifest-history prune failed; aborting cycle"
             );
             return Ok(GcCycleReport::default());
         }
     };
+    let manifest_history_pruned = history_prune.pruned;
+    let retained_history = retained_manifest_history_reachable_keys_from_manifests(
+        namespace,
+        &history_prune.retained_manifests,
+    );
     let pending_report =
         match drain_pending_deletes_with_retained_history(store, namespace, gc, &retained_history)
             .await

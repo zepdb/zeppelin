@@ -99,6 +99,30 @@ pub enum ZeppelinError {
         namespace: String,
     },
 
+    /// A named snapshot already exists for a different manifest generation.
+    #[error(
+        "snapshot {name} already exists on namespace {namespace}: existing generation {existing_generation}, requested generation {requested_generation}"
+    )]
+    SnapshotAlreadyExists {
+        /// Namespace containing the snapshot.
+        namespace: String,
+        /// Caller-supplied snapshot name.
+        name: String,
+        /// Generation already pinned by this name.
+        existing_generation: u64,
+        /// Generation the caller attempted to pin.
+        requested_generation: u64,
+    },
+
+    /// The requested named snapshot does not exist.
+    #[error("snapshot not found on namespace {namespace}: {name}")]
+    SnapshotNotFound {
+        /// Namespace searched for the snapshot.
+        namespace: String,
+        /// Snapshot name that was absent.
+        name: String,
+    },
+
     /// The namespace exists but is in the middle of deletion.
     #[error("namespace is being deleted: {namespace}")]
     NamespaceDeleting {
@@ -243,12 +267,14 @@ impl ZeppelinError {
     pub fn status_code(&self) -> u16 {
         match self {
             ZeppelinError::NamespaceNotFound { .. }
+            | ZeppelinError::SnapshotNotFound { .. }
             | ZeppelinError::ManifestNotFound { .. }
             | ZeppelinError::VectorNotFound { .. } => 404,
 
             ZeppelinError::NamespaceDeleting { .. } => 410,
 
             ZeppelinError::NamespaceAlreadyExists { .. }
+            | ZeppelinError::SnapshotAlreadyExists { .. }
             | ZeppelinError::ManifestConflict { .. }
             | ZeppelinError::LeaseHeld { .. }
             | ZeppelinError::LeaseExpired { .. }
@@ -296,6 +322,8 @@ impl ZeppelinError {
             ZeppelinError::FencingTokenStale { .. } => "CONFLICT_RETRY",
             ZeppelinError::NamespaceNotFound { .. } => "NAMESPACE_NOT_FOUND",
             ZeppelinError::NamespaceAlreadyExists { .. } => "NAMESPACE_ALREADY_EXISTS",
+            ZeppelinError::SnapshotAlreadyExists { .. } => "SNAPSHOT_ALREADY_EXISTS",
+            ZeppelinError::SnapshotNotFound { .. } => "SNAPSHOT_NOT_FOUND",
             ZeppelinError::NamespaceDeleting { .. } => "NAMESPACE_DELETING",
             ZeppelinError::NamespaceDeleteIncomplete { .. } => "INTERNAL_ERROR",
             ZeppelinError::Index(_) => "INTERNAL_ERROR",
@@ -397,10 +425,14 @@ impl ZeppelinError {
             | ZeppelinError::NamespaceNotFound { namespace } => {
                 format!("namespace not found: {namespace}")
             }
+            ZeppelinError::SnapshotNotFound { namespace, name } => {
+                format!("snapshot not found on namespace {namespace}: {name}")
+            }
             ZeppelinError::NamespaceDeleting { namespace } => {
                 format!("namespace is being deleted: {namespace}")
             }
             ZeppelinError::NamespaceAlreadyExists { .. }
+            | ZeppelinError::SnapshotAlreadyExists { .. }
             | ZeppelinError::DimensionMismatch { .. }
             | ZeppelinError::VectorNotFound { .. }
             | ZeppelinError::Validation(_)
@@ -568,6 +600,16 @@ mod tests {
             },
             ZeppelinError::NamespaceAlreadyExists {
                 namespace: "n".into(),
+            },
+            ZeppelinError::SnapshotAlreadyExists {
+                namespace: "n".into(),
+                name: "s".into(),
+                existing_generation: 1,
+                requested_generation: 2,
+            },
+            ZeppelinError::SnapshotNotFound {
+                namespace: "n".into(),
+                name: "s".into(),
             },
             ZeppelinError::NamespaceDeleting {
                 namespace: "n".into(),
