@@ -255,6 +255,45 @@ paths:
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
 
+  /v1/namespaces/{ns}/vectors/get:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    post:
+      operationId: getVectors
+      summary: Fetch vectors by ID
+      description: |
+        Fetch explicit vector IDs with projection controls. Found records are
+        returned in request order. Missing IDs and tombstoned IDs are reported
+        in `missing` and are never silently mapped to another record.
+
+        `consistency=strong` sees latest committed WAL writes and deletes.
+        `consistency=eventual` reads the active segment plus WAL tombstones, so
+        it may miss recent uncompacted upserts while still suppressing deleted
+        segment records.
+      tags: [Vectors]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetVectorsRequest"
+      responses:
+        "200":
+          description: Fetched records and explicit missing IDs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetVectorsResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "410":
+          $ref: "#/components/responses/NamespaceDeletingError"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+
   /v1/namespaces/{ns}/query:
     parameters:
       - $ref: "#/components/parameters/NamespacePath"
@@ -956,6 +995,71 @@ components:
           minItems: 1
           items:
             type: string
+
+    GetVectorsRequest:
+      type: object
+      required: [ids]
+      additionalProperties: false
+      properties:
+        ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+          description: Vector IDs to fetch. Duplicates are rejected.
+        include_vector:
+          type: boolean
+          default: true
+          description: Include vector values in found records.
+        include_attributes:
+          type: boolean
+          default: true
+          description: Include attributes in found records.
+        attribute_fields:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: |
+            Optional attribute field allow-list. Valid only when
+            `include_attributes=true`; missing fields are omitted.
+        consistency:
+          $ref: "#/components/schemas/ConsistencyLevel"
+
+    GetVectorsResponse:
+      type: object
+      required: [results, missing]
+      properties:
+        results:
+          type: array
+          description: Found live records in request order.
+          items:
+            $ref: "#/components/schemas/FetchedVectorRecord"
+        missing:
+          type: array
+          description: Requested IDs that were absent or tombstoned.
+          items:
+            type: string
+
+    FetchedVectorRecord:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          description: Vector identifier.
+        values:
+          type: array
+          items:
+            type: number
+            format: float
+          description: Present only when `include_vector=true`.
+        attributes:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/AttributeValue"
+          description: Present only when included and non-empty after projection.
 
     QueryRequest:
       type: object
