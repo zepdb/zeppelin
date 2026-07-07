@@ -925,8 +925,9 @@ pub struct CompactionConfig {
     /// Ratio of new-to-existing vectors that triggers centroid retraining. Default: `5.0`.
     #[serde(default = "default_retrain_threshold")]
     pub retrain_imbalance_threshold: f64,
-    /// Maximum pending deletes to retain in the manifest before pruning.
-    /// Older entries beyond this limit are dropped. Default: 1000.
+    /// Legacy compatibility knob for deferred deletes. Pending-delete entries
+    /// are never pruned by count; GC removes them only after delete/absence is
+    /// confirmed. Default: 1000.
     #[serde(default = "default_max_pending_deletes")]
     pub max_pending_deletes: usize,
     /// Maximum old (non-active) segments to retain in the manifest.

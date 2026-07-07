@@ -216,8 +216,8 @@ impl Compactor {
     /// Compact all uncompacted WAL fragments into a new IVF-Flat segment.
     ///
     /// Uses CAS (compare-and-swap) for manifest updates to prevent concurrent overwrites.
-    /// Fragment deletion is deferred: keys are added to `pending_deletes` in the manifest
-    /// and cleaned up at the start of the next compaction cycle.
+    /// Fragment deletion is deferred: keys are added to `pending_deletes` in
+    /// the manifest and reclaimed by storage GC after the configured horizon.
     #[instrument(skip(self), fields(namespace = namespace))]
     pub async fn compact(&self, namespace: &str) -> Result<CompactionResult> {
         self.compact_with_lease(namespace, None).await
@@ -273,42 +273,7 @@ impl Compactor {
     ) -> Result<CompactionResult> {
         let start = std::time::Instant::now();
 
-        // 0. GC: delete any pending_deletes from a previous compaction cycle.
-        // Keys whose deletion fails are carried into this cycle's
-        // pending_deletes and retried next cycle — dropping them would leak
-        // the objects forever. NotFound counts as already deleted.
-        // `processed_deletes` records every key attempted here so the CAS
-        // step can distinguish them from keys enqueued concurrently.
-        let mut carryover_deletes: Vec<String> = Vec::new();
-        let mut processed_deletes: HashSet<String> = HashSet::new();
-        {
-            let manifest = Manifest::read(&self.store, namespace)
-                .await?
-                .unwrap_or_default();
-            if !manifest.pending_deletes.is_empty() {
-                debug!(
-                    pending_count = manifest.pending_deletes.len(),
-                    "cleaning up deferred deletes from previous compaction"
-                );
-                let delete_futs: Vec<_> = manifest
-                    .pending_deletes
-                    .iter()
-                    .map(|key| self.store.delete(key))
-                    .collect();
-                let delete_results = futures::future::join_all(delete_futs).await;
-                for (key, result) in manifest.pending_deletes.iter().zip(delete_results) {
-                    processed_deletes.insert(key.clone());
-                    match result {
-                        Ok(()) => {}
-                        Err(ZeppelinError::Storage(object_store::Error::NotFound { .. })) => {}
-                        Err(e) => {
-                            warn!(key = %key, error = %e, "failed to delete deferred key; retrying next cycle");
-                            carryover_deletes.push(key.clone());
-                        }
-                    }
-                }
-            }
-        }
+        let processed_deletes: HashSet<String> = HashSet::new();
 
         // 1. Read manifest to get fragment list (snapshot for segment building)
         let manifest = Manifest::read(&self.store, namespace)
@@ -503,13 +468,12 @@ impl Compactor {
             vectors.len()
         };
 
-        // Collect keys for deferred deletion, carrying over keys whose
-        // deletion failed in step 0 so they are retried next cycle. The old
-        // segment's own S3 objects are added PER BRANCH below: the incremental
-        // fast path must EXCLUDE carried-over cluster objects (still referenced
-        // by the new segment) from deletion, whereas the all-deleted and full-
-        // rebuild branches delete every old object.
-        let mut deferred_deletes: Vec<String> = carryover_deletes;
+        // Collect keys for deferred deletion. The old segment's own S3
+        // objects are added PER BRANCH below: the incremental fast path must
+        // EXCLUDE carried-over cluster objects (still referenced by the new
+        // segment) from deletion, whereas the all-deleted and full-rebuild
+        // branches delete every old object.
+        let mut deferred_deletes: Vec<String> = Vec::new();
         for fref in &fragment_refs {
             deferred_deletes.push(WalFragment::s3_key(namespace, &fref.id));
         }

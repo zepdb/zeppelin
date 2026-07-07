@@ -17,7 +17,7 @@ use crate::cache::{
     hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator},
     DiskCache,
 };
-use crate::compaction::background::start_compaction_thread;
+use crate::compaction::background::{start_compaction_thread, CompactionThreadOptions};
 use crate::compaction::Compactor;
 use crate::config::{Config, CpuBudget};
 use crate::error::{Result as ZeppelinResult, ZeppelinError};
@@ -271,10 +271,13 @@ pub async fn build_app(
         compactor.clone(),
         namespace_manager.clone(),
         shutdown_rx,
-        cpu_budget.compaction_workers,
         manifest_cache.clone(),
         lease_manager,
         cache.clone(),
+        CompactionThreadOptions {
+            compaction_workers: cpu_budget.compaction_workers,
+            gc_config: config.gc.clone(),
+        },
     );
 
     // Initialize WAL FTS cache (pre-tokenized BM25 data)

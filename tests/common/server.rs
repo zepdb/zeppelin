@@ -10,7 +10,7 @@ use super::harness::TestHarness;
 use zeppelin::cache::hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator};
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
-use zeppelin::compaction::background::compaction_loop;
+use zeppelin::compaction::background::{compaction_loop, CompactionLoopOptions};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::Config;
 use zeppelin::fts::wal_cache::WalFtsCache;
@@ -285,6 +285,7 @@ pub async fn start_test_server_with_compaction(
         Duration::from_secs(config.compaction.lease_duration_secs),
     ));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let gc_config = config.gc.clone();
     {
         let compactor = compactor.clone();
         let namespace_manager = namespace_manager.clone();
@@ -299,7 +300,10 @@ pub async fn start_test_server_with_compaction(
                 manifest_cache,
                 lease_manager,
                 cache,
-                namespace_prefix,
+                CompactionLoopOptions {
+                    gc_config,
+                    namespace_prefix,
+                },
             )
             .await;
         });

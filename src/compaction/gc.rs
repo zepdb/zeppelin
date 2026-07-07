@@ -24,6 +24,7 @@ use crate::wal::manifest::Manifest;
 use crate::wal::Lease;
 
 const GC_CANDIDATE_STORE_VERSION: u32 = 1;
+const GC_MANIFEST_CAS_RETRIES: usize = 10;
 
 /// Lease-scoped side-object recording compaction uploads that have not yet
 /// been committed into the manifest.
@@ -167,10 +168,27 @@ pub struct GcCycleReport {
     pub candidates_marked: usize,
     /// Number of objects deleted from storage.
     pub objects_deleted: usize,
+    /// Number of pending-delete objects physically deleted by this cycle.
+    pub pending_deletes_deleted: usize,
+    /// Number of manifest pending-delete entries pruned after confirmed delete/absence.
+    pub pending_deletes_pruned: usize,
+    /// Number of manifest pending-delete entries retained for retry.
+    pub pending_deletes_retained: usize,
     /// Known bytes reclaimed from manifest-recorded artifact sizes.
     pub bytes_reclaimed: u64,
     /// Number of candidates skipped instead of deleted.
     pub candidates_skipped: usize,
+}
+
+/// Summary of a manifest pending-delete drain pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingDeleteDrainReport {
+    /// Number of pending-delete objects physically deleted from storage.
+    pub objects_deleted: usize,
+    /// Number of manifest entries removed after delete/absence confirmation.
+    pub entries_pruned: usize,
+    /// Number of entries kept because deletion failed.
+    pub entries_retained: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +283,152 @@ pub async fn save_gc_candidates(
         .await
 }
 
+/// Delete manifest `pending_deletes`, then prune only confirmed entries.
+///
+/// A key leaves `pending_deletes` only after its object delete succeeds or the
+/// object is already absent. Delete failures keep the entry in the manifest for
+/// a later GC/compaction cycle.
+pub async fn drain_pending_deletes(
+    store: &ZeppelinStore,
+    namespace: &str,
+    gc: &GcConfig,
+) -> Result<PendingDeleteDrainReport> {
+    let now = Utc::now();
+    let mut deleted_keys = BTreeSet::new();
+
+    for attempt in 0..GC_MANIFEST_CAS_RETRIES {
+        let Some((mut manifest, version)) = Manifest::read_versioned(store, namespace).await?
+        else {
+            return Ok(PendingDeleteDrainReport {
+                objects_deleted: deleted_keys.len(),
+                ..PendingDeleteDrainReport::default()
+            });
+        };
+
+        if manifest.pending_deletes.is_empty() {
+            return Ok(PendingDeleteDrainReport {
+                objects_deleted: deleted_keys.len(),
+                ..PendingDeleteDrainReport::default()
+            });
+        }
+
+        let pending = manifest.pending_deletes.clone();
+        let mut confirmed_absent = BTreeSet::new();
+        let mut retained = BTreeSet::new();
+
+        for key in &pending {
+            if !pending_delete_horizon_satisfied(
+                namespace,
+                key,
+                manifest.updated_at,
+                now,
+                gc.horizon_secs,
+            ) {
+                retained.insert(key.clone());
+                continue;
+            }
+
+            match store.delete(key).await {
+                Ok(()) => {
+                    deleted_keys.insert(key.clone());
+                    confirmed_absent.insert(key.clone());
+                    crate::metrics::GC_OBJECTS_DELETED_TOTAL
+                        .with_label_values(&[namespace])
+                        .inc();
+                    info!(
+                        namespace,
+                        key = %key,
+                        "gc deleted pending-delete object"
+                    );
+                }
+                Err(crate::error::ZeppelinError::NotFound { .. }) => {
+                    confirmed_absent.insert(key.clone());
+                    debug_pending_delete_absent(namespace, key);
+                }
+                Err(e) => {
+                    retained.insert(key.clone());
+                    warn!(
+                        namespace,
+                        key = %key,
+                        error = %e,
+                        "gc pending-delete failed; retaining manifest entry"
+                    );
+                }
+            }
+        }
+
+        if confirmed_absent.is_empty() {
+            return Ok(PendingDeleteDrainReport {
+                objects_deleted: deleted_keys.len(),
+                entries_pruned: 0,
+                entries_retained: retained.len(),
+            });
+        }
+
+        manifest
+            .pending_deletes
+            .retain(|key| !confirmed_absent.contains(key));
+        manifest.updated_at = Utc::now();
+
+        match manifest.write_conditional(store, namespace, &version).await {
+            Ok(()) => {
+                return Ok(PendingDeleteDrainReport {
+                    objects_deleted: deleted_keys.len(),
+                    entries_pruned: confirmed_absent.len(),
+                    entries_retained: retained.len(),
+                });
+            }
+            Err(crate::error::ZeppelinError::ManifestConflict { .. }) => {
+                warn!(
+                    namespace,
+                    attempt, "gc pending-delete manifest CAS conflict; retrying"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(crate::error::ZeppelinError::ManifestConflict {
+        namespace: namespace.to_string(),
+    })
+}
+
+fn pending_delete_horizon_satisfied(
+    namespace: &str,
+    key: &str,
+    pending_since: DateTime<Utc>,
+    now: DateTime<Utc>,
+    horizon_secs: u64,
+) -> bool {
+    if horizon_secs == 0 {
+        return true;
+    }
+
+    // `pending_deletes` predates per-entry enqueue timestamps. The manifest
+    // update time is therefore a conservative lower bound for how long every
+    // pending key has been retained as history. Later manifest writes may
+    // delay deletion, but they cannot make it happen too early.
+    let retained_for = now.signed_duration_since(pending_since).num_seconds();
+    if retained_for < i64::try_from(horizon_secs).unwrap_or(i64::MAX) {
+        return false;
+    }
+
+    let Some(parsed) = parse_gc_artifact_key(namespace, key) else {
+        return false;
+    };
+    let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+    let ulid_age_secs = super::fragment_age_secs(&parsed.ulid(), now_ms);
+    ulid_age_secs >= horizon_secs
+}
+
+fn debug_pending_delete_absent(namespace: &str, key: &str) {
+    tracing::debug!(
+        namespace,
+        key,
+        "gc pending-delete object already absent; pruning manifest entry"
+    );
+}
+
 fn decode_gc_candidates(data: &[u8]) -> Result<Vec<GcCandidate>> {
     if data.is_empty() {
         return Ok(Vec::new());
@@ -337,12 +501,31 @@ pub async fn run_gc_cycle(
     gc: &GcConfig,
 ) -> Result<GcCycleReport> {
     let now = Utc::now();
+    let pending_report = match drain_pending_deletes(store, namespace, gc).await {
+        Ok(report) => report,
+        Err(e) => {
+            warn!(
+                namespace,
+                error = %e,
+                "gc pending-delete drain failed; aborting cycle"
+            );
+            return Ok(GcCycleReport::default());
+        }
+    };
+    let base_report = GcCycleReport {
+        objects_deleted: pending_report.objects_deleted,
+        pending_deletes_deleted: pending_report.objects_deleted,
+        pending_deletes_pruned: pending_report.entries_pruned,
+        pending_deletes_retained: pending_report.entries_retained,
+        ..GcCycleReport::default()
+    };
+
     let prefix = format!("{namespace}/");
     let listed_keys = match store.list_prefix(&prefix).await {
         Ok(keys) => keys.into_iter().collect::<BTreeSet<_>>(),
         Err(e) => {
             warn!(namespace, error = %e, "gc listing failed; aborting cycle");
-            return Ok(GcCycleReport::default());
+            return Ok(base_report);
         }
     };
 
@@ -350,7 +533,7 @@ pub async fn run_gc_cycle(
         Ok(candidates) => candidates,
         Err(e) => {
             warn!(namespace, error = %e, "gc candidate load failed; aborting cycle");
-            return Ok(GcCycleReport::default());
+            return Ok(base_report);
         }
     };
 
@@ -358,18 +541,18 @@ pub async fn run_gc_cycle(
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
             warn!(namespace, "gc manifest missing; skipping namespace");
-            return Ok(GcCycleReport::default());
+            return Ok(base_report);
         }
         Err(e) => {
             warn!(namespace, error = %e, "gc manifest read failed; aborting cycle");
-            return Ok(GcCycleReport::default());
+            return Ok(base_report);
         }
     };
     let mark_staging = match active_staged_keys(store, namespace).await {
         Ok(staging) => staging,
         Err(e) => {
             warn!(namespace, error = %e, "gc active staging read failed; aborting cycle");
-            return Ok(GcCycleReport::default());
+            return Ok(base_report);
         }
     };
     let mark_reachable = reachable_keys_with_staging(namespace, &mark_manifest, &mark_staging);
@@ -400,12 +583,10 @@ pub async fn run_gc_cycle(
 
     if let Err(e) = save_gc_candidates(store, namespace, &marked_candidates).await {
         warn!(namespace, error = %e, "gc candidate mark persist failed; skipping sweep");
-        return Ok(GcCycleReport {
-            candidates_marked: 0,
-            objects_deleted: 0,
-            bytes_reclaimed: 0,
-            candidates_skipped: marked_candidates.len(),
-        });
+        let mut report = base_report;
+        report.candidates_marked = 0;
+        report.candidates_skipped = marked_candidates.len();
+        return Ok(report);
     }
     crate::metrics::GC_CANDIDATES_MARKED_TOTAL
         .with_label_values(&[namespace])
@@ -418,30 +599,27 @@ pub async fn run_gc_cycle(
                 namespace,
                 "gc manifest missing before sweep; skipping deletes"
             );
-            return Ok(GcCycleReport {
-                candidates_marked,
-                candidates_skipped: unknown_shape_skips,
-                ..GcCycleReport::default()
-            });
+            let mut report = base_report;
+            report.candidates_marked = candidates_marked;
+            report.candidates_skipped = unknown_shape_skips;
+            return Ok(report);
         }
         Err(e) => {
             warn!(namespace, error = %e, "gc manifest re-read failed; skipping deletes");
-            return Ok(GcCycleReport {
-                candidates_marked,
-                candidates_skipped: unknown_shape_skips,
-                ..GcCycleReport::default()
-            });
+            let mut report = base_report;
+            report.candidates_marked = candidates_marked;
+            report.candidates_skipped = unknown_shape_skips;
+            return Ok(report);
         }
     };
     let sweep_staging = match active_staged_keys(store, namespace).await {
         Ok(staging) => staging,
         Err(e) => {
             warn!(namespace, error = %e, "gc active staging re-read failed; skipping sweep");
-            return Ok(GcCycleReport {
-                candidates_marked,
-                candidates_skipped: unknown_shape_skips,
-                ..GcCycleReport::default()
-            });
+            let mut report = base_report;
+            report.candidates_marked = candidates_marked;
+            report.candidates_skipped = unknown_shape_skips;
+            return Ok(report);
         }
     };
     let sweep_reachable = reachable_keys_with_staging(namespace, &sweep_manifest, &sweep_staging);
@@ -449,7 +627,7 @@ pub async fn run_gc_cycle(
     let known_sizes = known_reclaimable_sizes(namespace, &sweep_manifest);
 
     let mut retained = Vec::new();
-    let mut objects_deleted = 0usize;
+    let mut objects_deleted = pending_report.objects_deleted;
     let mut bytes_reclaimed = 0u64;
     let mut candidates_skipped = unknown_shape_skips;
 
@@ -521,6 +699,9 @@ pub async fn run_gc_cycle(
         namespace,
         candidates_marked,
         objects_deleted,
+        pending_deletes_deleted = pending_report.objects_deleted,
+        pending_deletes_pruned = pending_report.entries_pruned,
+        pending_deletes_retained = pending_report.entries_retained,
         bytes_reclaimed,
         candidates_skipped,
         "gc cycle complete"
@@ -529,6 +710,9 @@ pub async fn run_gc_cycle(
     Ok(GcCycleReport {
         candidates_marked,
         objects_deleted,
+        pending_deletes_deleted: pending_report.objects_deleted,
+        pending_deletes_pruned: pending_report.entries_pruned,
+        pending_deletes_retained: pending_report.entries_retained,
         bytes_reclaimed,
         candidates_skipped,
     })

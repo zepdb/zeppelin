@@ -4,6 +4,7 @@ use common::counting::counting_store;
 use common::harness::TestHarness;
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 
+use zeppelin::compaction::background::CompactionLoopOptions;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::index::ivf_flat::build::build_ivf_flat;
@@ -1336,7 +1337,10 @@ async fn test_compaction_warms_new_segment_centroids() {
                 manifest_cache,
                 lease_manager,
                 cache,
-                namespace_prefix,
+                CompactionLoopOptions {
+                    gc_config: zeppelin::config::GcConfig::default(),
+                    namespace_prefix,
+                },
             )
             .await;
         });
@@ -1447,7 +1451,10 @@ async fn test_background_compaction_discovery_is_delimited_and_prefix_scoped() {
                 manifest_cache,
                 lease_manager,
                 cache,
-                namespace_prefix,
+                CompactionLoopOptions {
+                    gc_config: zeppelin::config::GcConfig::default(),
+                    namespace_prefix,
+                },
             )
             .await;
         })
@@ -1508,7 +1515,10 @@ async fn test_background_compaction_discovery_is_delimited_and_prefix_scoped() {
                 manifest_cache,
                 lease_manager,
                 cache,
-                None,
+                CompactionLoopOptions {
+                    gc_config: zeppelin::config::GcConfig::default(),
+                    namespace_prefix: None,
+                },
             )
             .await;
         })

@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
+use crate::config::GcConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::namespace::manager::NamespaceState;
@@ -18,6 +19,24 @@ use crate::wal::LeaseManager;
 use crate::wal::Manifest;
 
 use super::{CompactionResult, Compactor};
+
+/// Options for the dedicated compaction runtime thread.
+#[derive(Debug, Clone)]
+pub struct CompactionThreadOptions {
+    /// Number of Tokio worker threads assigned to background compaction.
+    pub compaction_workers: usize,
+    /// Garbage-collection safety and horizon configuration.
+    pub gc_config: GcConfig,
+}
+
+/// Options for one background compaction loop.
+#[derive(Debug, Clone)]
+pub struct CompactionLoopOptions {
+    /// Garbage-collection safety and horizon configuration.
+    pub gc_config: GcConfig,
+    /// Optional namespace prefix used by tests to isolate shared buckets.
+    pub namespace_prefix: Option<String>,
+}
 
 /// Lease-renewal heartbeat for a running compaction (Task 2 Phase A).
 ///
@@ -239,11 +258,13 @@ pub fn start_compaction_thread(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-    compaction_workers: usize,
     manifest_cache: Arc<ManifestCache>,
     lease_manager: Arc<LeaseManager>,
     cache: Arc<DiskCache>,
+    options: CompactionThreadOptions,
 ) -> std::thread::JoinHandle<()> {
+    let compaction_workers = options.compaction_workers;
+    let gc_config = options.gc_config;
     info!(compaction_workers, "starting compaction runtime");
     std::thread::Builder::new()
         .name("compaction-runtime".to_string())
@@ -262,7 +283,10 @@ pub fn start_compaction_thread(
                 manifest_cache,
                 lease_manager,
                 cache,
-                None,
+                CompactionLoopOptions {
+                    gc_config,
+                    namespace_prefix: None,
+                },
             ));
         })
         .expect("failed to spawn compaction thread")
@@ -276,10 +300,15 @@ pub async fn compaction_loop(
     manifest_cache: Arc<ManifestCache>,
     lease_manager: Arc<LeaseManager>,
     cache: Arc<DiskCache>,
-    namespace_prefix: Option<String>,
+    options: CompactionLoopOptions,
 ) {
+    let CompactionLoopOptions {
+        gc_config,
+        namespace_prefix,
+    } = options;
     info!(
         interval_secs = compactor.config().interval_secs,
+        gc_horizon_secs = gc_config.horizon_secs,
         namespace_prefix = namespace_prefix.as_deref().unwrap_or("<all>"),
         "background compaction loop started"
     );
@@ -349,6 +378,35 @@ pub async fn compaction_loop(
                     }
                 }
                 continue;
+            }
+
+            match super::gc::run_gc_cycle(compactor.store(), &ns.name, &gc_config).await {
+                Ok(report) => {
+                    if report.objects_deleted > 0
+                        || report.candidates_marked > 0
+                        || report.candidates_skipped > 0
+                        || report.pending_deletes_pruned > 0
+                        || report.pending_deletes_retained > 0
+                    {
+                        info!(
+                            namespace = %ns.name,
+                            objects_deleted = report.objects_deleted,
+                            pending_deletes_pruned = report.pending_deletes_pruned,
+                            pending_deletes_retained = report.pending_deletes_retained,
+                            candidates_marked = report.candidates_marked,
+                            candidates_skipped = report.candidates_skipped,
+                            bytes_reclaimed = report.bytes_reclaimed,
+                            "storage gc cycle completed"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        namespace = %ns.name,
+                        error = %e,
+                        "storage gc cycle failed"
+                    );
+                }
             }
 
             match compactor.should_compact(&ns.name).await {
