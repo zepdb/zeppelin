@@ -2,6 +2,8 @@
 
 use std::collections::BTreeSet;
 
+use chrono::{DateTime, Utc};
+
 use crate::fts::global_index::global_fts_key;
 use crate::fts::inverted_index::fts_index_key;
 use crate::index::bitmap::bitmap_key;
@@ -95,11 +97,70 @@ pub fn reachable_keys(namespace: &str, manifest: &Manifest) -> BTreeSet<String> 
     keys
 }
 
+/// A manifest-derived orphan candidate for the future two-pass GC sweep.
+///
+/// This is not an authoritative refcount. It only records that `key` left the
+/// exact reachable union at a manifest CAS time; delete decisions must still
+/// revalidate against `reachable_keys()` from a fresh manifest snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcCandidate {
+    /// Exact S3 key that left the manifest-derived reachable union.
+    pub key: String,
+    /// Manifest commit time at which the key was first observed unreachable.
+    pub first_seen_unreachable_at: DateTime<Utc>,
+}
+
+/// Build GC candidates from the exact key delta across a manifest CAS.
+///
+/// The returned keys are `reachable(old_manifest) - reachable(new_manifest)`.
+/// This preserves carried-object correctness by construction: any object still
+/// referenced by at least one live segment remains in the reachable union and
+/// is not emitted. Crash-orphans that never entered a manifest are invisible to
+/// this delta and remain the periodic LIST sweep's responsibility.
+#[must_use]
+pub fn gc_candidates_from_manifest_delta(
+    namespace: &str,
+    old_manifest: &Manifest,
+    new_manifest: &Manifest,
+    commit_time: DateTime<Utc>,
+) -> Vec<GcCandidate> {
+    let old_reachable = reachable_keys(namespace, old_manifest);
+    let new_reachable = reachable_keys(namespace, new_manifest);
+
+    old_reachable
+        .difference(&new_reachable)
+        .map(|key| GcCandidate {
+            key: key.clone(),
+            first_seen_unreachable_at: commit_time,
+        })
+        .collect()
+}
+
+/// Keep only candidates that are still unreachable in `manifest`.
+///
+/// Candidate state is an accelerator, not truth. The future delete stage must
+/// call this shape of check after reading the authoritative manifest so a key
+/// that became live again is skipped.
+#[must_use]
+pub fn revalidate_unreachable_candidates(
+    namespace: &str,
+    manifest: &Manifest,
+    candidates: &[GcCandidate],
+) -> Vec<GcCandidate> {
+    let reachable = reachable_keys(namespace, manifest);
+    candidates
+        .iter()
+        .filter(|candidate| !reachable.contains(&candidate.key))
+        .cloned()
+        .collect()
+}
+
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use chrono::Utc;
     use ulid::Ulid;
 
     use crate::fts::global_index::global_fts_key;
@@ -146,6 +207,13 @@ mod tests {
             bootstrap: None,
             membership: None,
         }
+    }
+
+    fn candidate_keys(candidates: &[GcCandidate]) -> BTreeSet<String> {
+        candidates
+            .iter()
+            .map(|candidate| candidate.key.clone())
+            .collect()
     }
 
     struct ReachabilityCase {
@@ -364,6 +432,149 @@ mod tests {
             reachable.iter().filter(|key| *key == &shared_key).count(),
             1,
             "shared carried object must appear once"
+        );
+    }
+
+    #[test]
+    fn cas_delta_candidates_are_exact_keys_that_left_reachability() {
+        let commit_time = Utc::now();
+        let compacted_fragment = Ulid::from_parts(10, 1);
+        let new_fragment = Ulid::from_parts(11, 1);
+
+        let mut old_manifest = Manifest::new();
+        old_manifest.fragments = vec![fragment_ref(compacted_fragment)];
+        old_manifest.segments = vec![segment_ref("seg_old", 2)];
+
+        let mut new_segment = segment_ref("seg_new", 2);
+        new_segment.cluster_owners = vec!["seg_old".to_string(), "seg_new".to_string()];
+        let mut new_manifest = Manifest::new();
+        new_manifest.fragments = vec![fragment_ref(new_fragment)];
+        new_manifest.segments = vec![new_segment];
+
+        let candidates =
+            gc_candidates_from_manifest_delta(NS, &old_manifest, &new_manifest, commit_time);
+
+        assert_eq!(
+            candidate_keys(&candidates),
+            BTreeSet::from([
+                WalFragment::s3_key(NS, &compacted_fragment),
+                centroids_key(NS, "seg_old"),
+                cluster_key(NS, "seg_old", 1),
+                attrs_key(NS, "seg_old", 1),
+            ]),
+            "only keys whose live reference set dropped to zero are candidates"
+        );
+        assert_eq!(
+            candidates.len(),
+            4,
+            "each key that left reachability must be emitted exactly once"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.first_seen_unreachable_at == commit_time),
+            "every delta candidate must be stamped with the manifest commit time"
+        );
+        assert!(
+            !candidate_keys(&candidates).contains(&WalFragment::s3_key(NS, &new_fragment)),
+            "keys added by the new manifest are not orphan candidates"
+        );
+        assert!(
+            !candidate_keys(&candidates).contains(&cluster_key(NS, "seg_old", 0)),
+            "carried cluster object remains reachable through the new segment"
+        );
+    }
+
+    #[test]
+    fn shared_carried_object_is_candidate_only_after_last_reference_releases_it() {
+        let commit_time = Utc::now();
+        let shared_cluster_key = cluster_key(NS, "seg_shared", 0);
+        let shared_attrs_key = attrs_key(NS, "seg_shared", 0);
+
+        let mut old_manifest = Manifest::new();
+        let mut first = segment_ref("seg_first", 1);
+        first.cluster_owners = vec!["seg_shared".to_string()];
+        let mut second = segment_ref("seg_second", 1);
+        second.cluster_owners = vec!["seg_shared".to_string()];
+        old_manifest.segments = vec![first, second.clone()];
+
+        let mut one_reference_released = Manifest::new();
+        one_reference_released.segments = vec![second.clone()];
+        let first_release = gc_candidates_from_manifest_delta(
+            NS,
+            &old_manifest,
+            &one_reference_released,
+            commit_time,
+        );
+        let first_release_keys = candidate_keys(&first_release);
+        assert!(
+            !first_release_keys.contains(&shared_cluster_key),
+            "shared cluster data must survive while any segment still references it"
+        );
+        assert!(
+            !first_release_keys.contains(&shared_attrs_key),
+            "shared sidecar data must survive while any segment still references it"
+        );
+
+        let no_references = Manifest::new();
+        let second_release = gc_candidates_from_manifest_delta(
+            NS,
+            &one_reference_released,
+            &no_references,
+            commit_time,
+        );
+        assert!(
+            candidate_keys(&second_release)
+                .is_superset(&BTreeSet::from([shared_cluster_key, shared_attrs_key,])),
+            "shared carried keys become candidates when the last reference is gone"
+        );
+    }
+
+    #[test]
+    fn crash_orphan_absent_from_both_manifests_is_not_a_delta_candidate() {
+        let commit_time = Utc::now();
+        let crash_orphan = format!("{NS}/segments/crash_orphan/cluster_0.bin");
+
+        let mut old_manifest = Manifest::new();
+        old_manifest.segments = vec![segment_ref("seg_live", 1)];
+        let mut new_manifest = Manifest::new();
+        new_manifest.segments = vec![segment_ref("seg_live", 1)];
+
+        let candidates =
+            gc_candidates_from_manifest_delta(NS, &old_manifest, &new_manifest, commit_time);
+
+        assert!(
+            !candidate_keys(&candidates).contains(&crash_orphan),
+            "PUT-without-CAS orphans never entered a manifest and require the LIST backstop"
+        );
+    }
+
+    #[test]
+    fn candidate_revalidation_recomputes_reachability_from_manifest_before_deletion() {
+        let commit_time = Utc::now();
+        let live_key = cluster_key(NS, "seg_live", 0);
+        let dead_key = format!("{NS}/wal/dead.wal");
+
+        let mut manifest = Manifest::new();
+        manifest.segments = vec![segment_ref("seg_live", 1)];
+
+        let candidates = vec![
+            GcCandidate {
+                key: live_key,
+                first_seen_unreachable_at: commit_time,
+            },
+            GcCandidate {
+                key: dead_key.clone(),
+                first_seen_unreachable_at: commit_time,
+            },
+        ];
+
+        let still_unreachable = revalidate_unreachable_candidates(NS, &manifest, &candidates);
+
+        assert_eq!(
+            candidate_keys(&still_unreachable),
+            BTreeSet::from([dead_key]),
+            "delete decisions must re-read exact manifest reachability, not trust candidate state"
         );
     }
 }
