@@ -1,0 +1,369 @@
+//! Exact-key reachability for storage garbage collection.
+
+use std::collections::BTreeSet;
+
+use crate::fts::global_index::global_fts_key;
+use crate::fts::inverted_index::fts_index_key;
+use crate::index::bitmap::bitmap_key;
+use crate::index::hierarchical::tree_meta_key;
+use crate::index::ivf_flat::build::{attrs_key, centroids_key, cluster_key};
+use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
+use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
+use crate::index::quantization::QuantizationType;
+use crate::wal::fragment::WalFragment;
+use crate::wal::manifest::Manifest;
+
+/// Exact-key set of every S3 object still referenced by `manifest`.
+#[must_use]
+pub fn reachable_keys(namespace: &str, manifest: &Manifest) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+
+    for fragment in &manifest.fragments {
+        keys.insert(WalFragment::s3_key(namespace, &fragment.id));
+    }
+
+    for segment in &manifest.segments {
+        if segment.hierarchical {
+            keys.insert(tree_meta_key(namespace, &segment.id));
+        } else {
+            keys.insert(centroids_key(namespace, &segment.id));
+        }
+
+        if let Some(sketch) = &segment.sketch {
+            keys.insert(sketch.key.clone());
+        }
+        if let Some(bootstrap) = &segment.bootstrap {
+            keys.insert(bootstrap.key.clone());
+        }
+        if let Some(membership) = &segment.membership {
+            keys.insert(membership.key.clone());
+        }
+
+        if segment.cluster_objects.is_empty() {
+            for cluster_idx in 0..segment.cluster_count {
+                keys.insert(cluster_key(
+                    namespace,
+                    segment.cluster_owner(cluster_idx),
+                    cluster_idx,
+                ));
+            }
+        } else {
+            for object_ref in &segment.cluster_objects {
+                keys.insert(object_ref.key.clone());
+            }
+        }
+
+        for cluster_idx in 0..segment.cluster_count {
+            let owner = segment.cluster_owner(cluster_idx);
+            keys.insert(attrs_key(namespace, owner, cluster_idx));
+
+            if !segment.bitmap_fields.is_empty() {
+                keys.insert(bitmap_key(namespace, owner, cluster_idx));
+            }
+
+            if !segment.fts_fields.is_empty() {
+                keys.insert(fts_index_key(namespace, owner, cluster_idx));
+            }
+
+            match segment.quantization {
+                QuantizationType::Scalar => {
+                    keys.insert(sq_cluster_key(namespace, owner, cluster_idx));
+                }
+                QuantizationType::Product => {
+                    keys.insert(pq_cluster_key(namespace, owner, cluster_idx));
+                }
+                QuantizationType::None => {}
+            }
+        }
+
+        match segment.quantization {
+            QuantizationType::Scalar => {
+                keys.insert(sq_calibration_key(namespace, &segment.id));
+            }
+            QuantizationType::Product => {
+                keys.insert(pq_codebook_key(namespace, &segment.id));
+            }
+            QuantizationType::None => {}
+        }
+
+        if segment.has_global_fts {
+            keys.insert(global_fts_key(namespace, &segment.id));
+        }
+    }
+
+    keys.extend(manifest.pending_deletes.iter().cloned());
+    keys
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ulid::Ulid;
+
+    use crate::fts::global_index::global_fts_key;
+    use crate::fts::inverted_index::fts_index_key;
+    use crate::index::bitmap::bitmap_key;
+    use crate::index::hierarchical::tree_meta_key;
+    use crate::index::ivf_flat::build::{attrs_key, bootstrap_key, centroids_key, cluster_key};
+    use crate::index::ivf_flat::membership::membership_key;
+    use crate::index::ivf_flat::sketch::sketch_key;
+    use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
+    use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
+    use crate::index::quantization::QuantizationType;
+    use crate::wal::fragment::WalFragment;
+    use crate::wal::manifest::{
+        BootstrapRef, ClusterDataObjectRef, FragmentRef, Manifest, MembershipRef, SegmentRef,
+        SketchRef,
+    };
+
+    const NS: &str = "gc_ns";
+
+    fn fragment_ref(id: Ulid) -> FragmentRef {
+        FragmentRef {
+            id,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 100,
+        }
+    }
+
+    fn segment_ref(id: &str, cluster_count: usize) -> SegmentRef {
+        SegmentRef {
+            id: id.to_string(),
+            vector_count: 10,
+            cluster_count,
+            quantization: QuantizationType::None,
+            hierarchical: false,
+            bitmap_fields: Vec::new(),
+            fts_fields: Vec::new(),
+            has_global_fts: false,
+            cluster_owners: Vec::new(),
+            sketch: None,
+            cluster_objects: Vec::new(),
+            bootstrap: None,
+            membership: None,
+        }
+    }
+
+    struct ReachabilityCase {
+        name: &'static str,
+        manifest: Manifest,
+        present: Vec<String>,
+        absent: Vec<String>,
+    }
+
+    #[test]
+    fn reachable_keys_are_the_exact_manifest_references() {
+        let frag_a = Ulid::from_parts(1, 10);
+        let frag_b = Ulid::from_parts(2, 20);
+
+        let mut carried_manifest = Manifest::new();
+        let mut carried = segment_ref("seg_new", 3);
+        carried.cluster_owners = vec![
+            "seg_old".to_string(),
+            "seg_new".to_string(),
+            "seg_older".to_string(),
+        ];
+        carried_manifest.segments.push(carried);
+
+        let mut legacy_manifest = Manifest::new();
+        legacy_manifest.segments.push(segment_ref("seg_legacy", 2));
+
+        let mut pending_manifest = Manifest::new();
+        pending_manifest.pending_deletes = vec![
+            "gc_ns/wal/pruned-but-undeleted.wal".to_string(),
+            "gc_ns/segments/seg_pruned/cluster_0.bin".to_string(),
+        ];
+
+        let mut fragments_manifest = Manifest::new();
+        fragments_manifest.fragments = vec![fragment_ref(frag_a), fragment_ref(frag_b)];
+
+        let mut metadata_manifest = Manifest::new();
+        let mut metadata = segment_ref("seg_meta", 2);
+        metadata.quantization = QuantizationType::Product;
+        metadata.bitmap_fields = vec!["color".to_string()];
+        metadata.fts_fields = vec!["body".to_string()];
+        metadata.has_global_fts = true;
+        metadata.sketch = Some(SketchRef {
+            key: sketch_key(NS, "seg_meta"),
+            version: 3,
+            code_dims: 8,
+            bytes_per_vector: 8,
+            size_bytes: 512,
+        });
+        metadata.bootstrap = Some(BootstrapRef {
+            key: bootstrap_key(NS, "seg_meta"),
+            size_bytes: 1024,
+        });
+        metadata.membership = Some(MembershipRef {
+            key: membership_key(NS, "seg_meta"),
+            size_bytes: 256,
+            entry_count: 10,
+        });
+        metadata.cluster_objects = vec![ClusterDataObjectRef {
+            key: format!("{NS}/segments/seg_meta/cluster_group_0.bin"),
+            clusters: vec![0, 1],
+            live_offset: 0,
+            live_len: 0,
+            size_bytes: 2048,
+        }];
+        metadata_manifest.segments.push(metadata);
+
+        let mut no_global_fts_manifest = Manifest::new();
+        let mut no_global_fts = segment_ref("seg_no_global_fts", 1);
+        no_global_fts.fts_fields = vec!["body".to_string()];
+        no_global_fts.has_global_fts = false;
+        no_global_fts_manifest.segments.push(no_global_fts);
+
+        let mut hierarchical_manifest = Manifest::new();
+        let mut hierarchical = segment_ref("seg_tree", 1);
+        hierarchical.hierarchical = true;
+        hierarchical.quantization = QuantizationType::Scalar;
+        hierarchical_manifest.segments.push(hierarchical);
+
+        let mut multi_manifest = Manifest::new();
+        let mut first = segment_ref("seg_first", 2);
+        first.cluster_owners = vec!["seg_shared".to_string(), "seg_first".to_string()];
+        let mut second = segment_ref("seg_second", 2);
+        second.cluster_owners = vec!["seg_second".to_string(), "seg_shared".to_string()];
+        multi_manifest.segments = vec![first, second];
+
+        let cases = vec![
+            ReachabilityCase {
+                name: "carried cluster owners",
+                manifest: carried_manifest,
+                present: vec![
+                    cluster_key(NS, "seg_old", 0),
+                    cluster_key(NS, "seg_new", 1),
+                    cluster_key(NS, "seg_older", 2),
+                    attrs_key(NS, "seg_old", 0),
+                    attrs_key(NS, "seg_older", 2),
+                ],
+                absent: vec![cluster_key(NS, "seg_new", 0)],
+            },
+            ReachabilityCase {
+                name: "legacy self-owned layout",
+                manifest: legacy_manifest,
+                present: vec![
+                    cluster_key(NS, "seg_legacy", 0),
+                    cluster_key(NS, "seg_legacy", 1),
+                    attrs_key(NS, "seg_legacy", 0),
+                    attrs_key(NS, "seg_legacy", 1),
+                    centroids_key(NS, "seg_legacy"),
+                ],
+                absent: vec![cluster_key(NS, "some_other_segment", 0)],
+            },
+            ReachabilityCase {
+                name: "pending deletes are still reachable",
+                manifest: pending_manifest,
+                present: vec![
+                    "gc_ns/wal/pruned-but-undeleted.wal".to_string(),
+                    "gc_ns/segments/seg_pruned/cluster_0.bin".to_string(),
+                ],
+                absent: Vec::new(),
+            },
+            ReachabilityCase {
+                name: "fragments",
+                manifest: fragments_manifest,
+                present: vec![
+                    WalFragment::s3_key(NS, &frag_a),
+                    WalFragment::s3_key(NS, &frag_b),
+                ],
+                absent: Vec::new(),
+            },
+            ReachabilityCase {
+                name: "per-segment metadata",
+                manifest: metadata_manifest,
+                present: vec![
+                    centroids_key(NS, "seg_meta"),
+                    sketch_key(NS, "seg_meta"),
+                    bootstrap_key(NS, "seg_meta"),
+                    membership_key(NS, "seg_meta"),
+                    format!("{NS}/segments/seg_meta/cluster_group_0.bin"),
+                    attrs_key(NS, "seg_meta", 0),
+                    attrs_key(NS, "seg_meta", 1),
+                    bitmap_key(NS, "seg_meta", 0),
+                    bitmap_key(NS, "seg_meta", 1),
+                    fts_index_key(NS, "seg_meta", 0),
+                    fts_index_key(NS, "seg_meta", 1),
+                    pq_codebook_key(NS, "seg_meta"),
+                    pq_cluster_key(NS, "seg_meta", 0),
+                    pq_cluster_key(NS, "seg_meta", 1),
+                    global_fts_key(NS, "seg_meta"),
+                ],
+                absent: vec![
+                    cluster_key(NS, "seg_meta", 0),
+                    sq_calibration_key(NS, "seg_meta"),
+                    global_fts_key(NS, "seg_no_global_fts"),
+                ],
+            },
+            ReachabilityCase {
+                name: "global fts omitted when manifest says absent",
+                manifest: no_global_fts_manifest,
+                present: vec![fts_index_key(NS, "seg_no_global_fts", 0)],
+                absent: vec![global_fts_key(NS, "seg_no_global_fts")],
+            },
+            ReachabilityCase {
+                name: "hierarchical metadata",
+                manifest: hierarchical_manifest,
+                present: vec![
+                    tree_meta_key(NS, "seg_tree"),
+                    attrs_key(NS, "seg_tree", 0),
+                    sq_calibration_key(NS, "seg_tree"),
+                    sq_cluster_key(NS, "seg_tree", 0),
+                ],
+                absent: vec![centroids_key(NS, "seg_tree")],
+            },
+            ReachabilityCase {
+                name: "multiple live segments share one object",
+                manifest: multi_manifest,
+                present: vec![
+                    cluster_key(NS, "seg_shared", 0),
+                    cluster_key(NS, "seg_shared", 1),
+                    cluster_key(NS, "seg_first", 1),
+                    cluster_key(NS, "seg_second", 0),
+                ],
+                absent: Vec::new(),
+            },
+        ];
+
+        for case in cases {
+            let reachable = reachable_keys(NS, &case.manifest);
+            for key in case.present {
+                assert!(
+                    reachable.contains(&key),
+                    "{}: expected reachable key {key}",
+                    case.name
+                );
+            }
+            for key in case.absent {
+                assert!(
+                    !reachable.contains(&key),
+                    "{}: key must not be marked reachable: {key}",
+                    case.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reachable_keys_are_deduplicated() {
+        let mut manifest = Manifest::new();
+        let mut first = segment_ref("seg_first", 1);
+        first.cluster_owners = vec!["seg_shared".to_string()];
+        let mut second = segment_ref("seg_second", 1);
+        second.cluster_owners = vec!["seg_shared".to_string()];
+        manifest.segments = vec![first, second];
+
+        let reachable = reachable_keys(NS, &manifest);
+        let shared_key = cluster_key(NS, "seg_shared", 0);
+        assert_eq!(
+            reachable.iter().filter(|key| *key == &shared_key).count(),
+            1,
+            "shared carried object must appear once"
+        );
+    }
+}

@@ -1,5 +1,7 @@
 /// Background compaction task management.
 pub mod background;
+/// Exact-key reachability for future storage GC.
+pub mod gc;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
