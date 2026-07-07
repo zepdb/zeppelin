@@ -1402,10 +1402,10 @@ components:
         - opaque cursor pagination
         - field grouping
         - lightweight facet counts over the filtered candidate frontier
+        - plan and full query explain output
         - `projection.include_attributes`
 
         Reserved today (returns code `NOT_IMPLEMENTED`):
-        - enabled explain output
         - field/vector projection
       properties:
         vector:
@@ -1767,8 +1767,9 @@ components:
 
     ExplainSpec:
       description: |
-        Explain output request. `false` and `"none"` are accepted; enabled
-        explain output is rejected until responses carry explain payloads.
+        Explain output request. `true` and `"plan"` return the executed
+        plan. `"full"` additionally returns per-result score provenance for
+        the returned hits. `false` and `"none"` omit the response block.
       oneOf:
         - type: boolean
         - type: string
@@ -1815,6 +1816,8 @@ components:
             $ref: "#/components/schemas/QueryResultGroup"
         facets:
           $ref: "#/components/schemas/QueryFacets"
+        explain:
+          $ref: "#/components/schemas/QueryExplain"
 
     QueryResultGroup:
       type: object
@@ -1842,6 +1845,227 @@ components:
         additionalProperties:
           type: integer
           minimum: 0
+
+    QueryExplain:
+      type: object
+      required: [mode, plan]
+      description: |
+        Present only when explain is enabled. Explain is pure observability:
+        adding it does not change ranking, result order, or projection.
+      properties:
+        mode:
+          type: string
+          enum: [plan, full]
+        plan:
+          $ref: "#/components/schemas/QueryExplainPlan"
+        results:
+          type: array
+          description: Present only for `full` explain.
+          items:
+            $ref: "#/components/schemas/QueryExplainResult"
+
+    QueryExplainPlan:
+      type: object
+      required:
+        - path
+        - candidate_k
+        - first_stage_top_k
+        - top_k
+        - consistency
+        - sources
+        - fusion
+        - rerank
+        - grouping
+        - cursor
+        - facets
+        - projection
+      properties:
+        path:
+          type: string
+          enum: [legacy_vector, legacy_bm25, algebra_single, algebra_hybrid]
+          description: Physical query path that executed.
+        candidate_k:
+          type: integer
+          minimum: 1
+          description: Effective request candidate_k after defaults.
+        first_stage_top_k:
+          type: integer
+          minimum: 1
+          description: Candidate frontier retained before final operators.
+        top_k:
+          type: integer
+          minimum: 1
+        consistency:
+          $ref: "#/components/schemas/ConsistencyLevel"
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryExplainSource"
+        fusion:
+          $ref: "#/components/schemas/QueryExplainFusion"
+        rerank:
+          nullable: true
+          oneOf:
+            - $ref: "#/components/schemas/QueryExplainRerank"
+        grouping:
+          nullable: true
+          oneOf:
+            - $ref: "#/components/schemas/QueryExplainGrouping"
+        cursor:
+          $ref: "#/components/schemas/QueryExplainCursor"
+        facets:
+          type: array
+          items:
+            type: string
+        projection:
+          $ref: "#/components/schemas/QueryExplainProjection"
+
+    QueryExplainSource:
+      type: object
+      required: [index, type, nprobe, candidate_k]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+        type:
+          type: string
+          enum: [ann, bm25]
+        nprobe:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: Effective IVF probe count for ANN sources; null for BM25.
+        candidate_k:
+          type: integer
+          minimum: 1
+
+    QueryExplainFusion:
+      oneOf:
+        - $ref: "#/components/schemas/QueryExplainFusionNone"
+        - $ref: "#/components/schemas/QueryExplainFusionRrf"
+        - $ref: "#/components/schemas/QueryExplainFusionWeighted"
+
+    QueryExplainFusionNone:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: none
+
+    QueryExplainFusionRrf:
+      type: object
+      required: [type, k]
+      properties:
+        type:
+          type: string
+          const: rrf
+        k:
+          type: integer
+          minimum: 1
+
+    QueryExplainFusionWeighted:
+      type: object
+      required: [type, weights]
+      properties:
+        type:
+          type: string
+          const: weighted
+        weights:
+          type: array
+          items:
+            type: number
+            format: float
+
+    QueryExplainRerank:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [default, none, vector, bm25]
+
+    QueryExplainGrouping:
+      oneOf:
+        - $ref: "#/components/schemas/QueryExplainGroupingNone"
+        - $ref: "#/components/schemas/QueryExplainGroupingField"
+
+    QueryExplainGroupingNone:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: none
+
+    QueryExplainGroupingField:
+      type: object
+      required: [type, field, max_per_group]
+      properties:
+        type:
+          type: string
+          const: field
+        field:
+          type: string
+        max_per_group:
+          type: integer
+          minimum: 1
+
+    QueryExplainCursor:
+      type: object
+      required: [requested, after]
+      properties:
+        requested:
+          type: boolean
+        after:
+          type: boolean
+
+    QueryExplainProjection:
+      type: object
+      required: [include_attributes]
+      properties:
+        include_attributes:
+          type: boolean
+
+    QueryExplainResult:
+      type: object
+      required: [id, sources, fused_score]
+      properties:
+        id:
+          type: string
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryExplainResultSource"
+        fused_score:
+          type: number
+          format: float
+          description: Score after fusion, before explicit rerank.
+        rerank_score:
+          type: number
+          format: float
+          description: Present only when explicit rerank ran for this hit.
+
+    QueryExplainResultSource:
+      type: object
+      required: [index, type, raw_score, contribution]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+        type:
+          type: string
+          enum: [ann, bm25]
+        raw_score:
+          type: number
+          format: float
+        normalized_score:
+          type: number
+          format: float
+          description: Present for weighted fusion.
+        contribution:
+          type: number
+          format: float
 
     QueryDebug:
       type: object

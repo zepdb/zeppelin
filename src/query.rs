@@ -50,6 +50,9 @@ pub struct QueryResponse {
     /// Facet counts, returned only when the request asks for facets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facets: Option<QueryFacets>,
+    /// Query execution explain output, returned only when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<QueryExplain>,
 }
 
 /// One grouped result bucket.
@@ -67,6 +70,189 @@ pub struct QueryFacets {
     /// Counts for each requested field.
     #[serde(flatten)]
     pub fields: BTreeMap<String, BTreeMap<String, usize>>,
+}
+
+/// Optional query explain output.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryExplain {
+    /// Explain verbosity.
+    pub mode: QueryExplainMode,
+    /// Executed query plan.
+    pub plan: QueryExplainPlan,
+    /// Per-result provenance, present only for `full` explain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub results: Option<Vec<QueryExplainResult>>,
+}
+
+/// Explain verbosity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryExplainMode {
+    /// Plan-only explain.
+    Plan,
+    /// Plan plus returned-result provenance.
+    Full,
+}
+
+/// Executed query plan details.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryExplainPlan {
+    /// Physical query path.
+    pub path: QueryExplainPath,
+    /// Client-visible candidate_k value after defaults.
+    pub candidate_k: usize,
+    /// Effective first-stage result count passed to each source/fusion stage.
+    pub first_stage_top_k: usize,
+    /// Client-visible top_k value after defaults.
+    pub top_k: usize,
+    /// Effective consistency level.
+    pub consistency: ConsistencyLevel,
+    /// Executed candidate sources.
+    pub sources: Vec<QueryExplainSource>,
+    /// Fusion strategy.
+    pub fusion: QueryExplainFusion,
+    /// Rerank strategy, or null when omitted.
+    pub rerank: Option<QueryExplainRerank>,
+    /// Grouping strategy, or null when omitted.
+    pub grouping: Option<QueryExplainGrouping>,
+    /// Cursor request details.
+    pub cursor: QueryExplainCursor,
+    /// Requested facet fields.
+    pub facets: Vec<String>,
+    /// Projection details.
+    pub projection: QueryExplainProjection,
+}
+
+/// Physical query path.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryExplainPath {
+    /// Legacy vector query path.
+    LegacyVector,
+    /// Legacy BM25 query path.
+    LegacyBm25,
+    /// Single-source retrieval-algebra query path.
+    AlgebraSingle,
+    /// Multi-source retrieval-algebra query path.
+    AlgebraHybrid,
+}
+
+/// Executed candidate source details.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryExplainSource {
+    /// Source position in the request.
+    pub index: usize,
+    /// Source kind.
+    #[serde(rename = "type")]
+    pub kind: QueryExplainSourceKind,
+    /// Effective IVF probe count for ANN sources.
+    pub nprobe: Option<usize>,
+    /// Candidate count requested from this source.
+    pub candidate_k: usize,
+}
+
+/// Explain source kind.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryExplainSourceKind {
+    /// ANN vector source.
+    Ann,
+    /// BM25 text source.
+    Bm25,
+}
+
+/// Fusion strategy in the explain plan.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum QueryExplainFusion {
+    /// No fusion.
+    None,
+    /// Reciprocal rank fusion.
+    Rrf {
+        /// RRF smoothing constant.
+        k: usize,
+    },
+    /// Weighted min-max normalized fusion.
+    Weighted {
+        /// Per-source weights.
+        weights: Vec<f32>,
+    },
+}
+
+/// Rerank strategy in the explain plan.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum QueryExplainRerank {
+    /// Engine default rerank behavior.
+    Default,
+    /// Explicitly disabled rerank.
+    None,
+    /// Vector rerank.
+    Vector,
+    /// BM25 rerank.
+    Bm25,
+}
+
+/// Grouping strategy in the explain plan.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum QueryExplainGrouping {
+    /// Explicitly disabled grouping.
+    None,
+    /// Field grouping.
+    Field {
+        /// Attribute field used for grouping.
+        field: String,
+        /// Maximum results retained per group.
+        max_per_group: usize,
+    },
+}
+
+/// Cursor details in the explain plan.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct QueryExplainCursor {
+    /// Whether the request included a cursor block.
+    pub requested: bool,
+    /// Whether an after-token was applied.
+    pub after: bool,
+}
+
+/// Projection details in the explain plan.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct QueryExplainProjection {
+    /// Whether result attributes are included in the response.
+    pub include_attributes: bool,
+}
+
+/// Per-result provenance for full explain output.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryExplainResult {
+    /// Result id.
+    pub id: String,
+    /// Per-source score details.
+    pub sources: Vec<QueryExplainResultSource>,
+    /// Fused score before explicit rerank, or the source score for single-source queries.
+    pub fused_score: f32,
+    /// Explicit rerank score, present only when an explicit rerank ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f32>,
+}
+
+/// Per-source score details for one result.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryExplainResultSource {
+    /// Source position in the request.
+    pub index: usize,
+    /// Source kind.
+    #[serde(rename = "type")]
+    pub kind: QueryExplainSourceKind,
+    /// Raw source score before fusion.
+    pub raw_score: f32,
+    /// Normalized score used by weighted fusion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalized_score: Option<f32>,
+    /// Score contribution after fusion weighting or RRF contribution.
+    pub contribution: f32,
 }
 
 /// Optional client-visible query diagnostics.
@@ -414,6 +600,7 @@ async fn execute_query_with_manifest_scoped(
         next_cursor: None,
         groups: None,
         facets: None,
+        explain: None,
     })
 }
 
@@ -1028,6 +1215,7 @@ async fn execute_bm25_query_with_manifest_scoped(
         next_cursor: None,
         groups: None,
         facets: None,
+        explain: None,
     })
 }
 

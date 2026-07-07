@@ -236,7 +236,7 @@ async fn test_query_rejects_rrf_fusion_with_single_source() {
 }
 
 #[tokio::test]
-async fn test_query_reserved_retrieval_algebra_paths_return_not_implemented() {
+async fn test_query_reserved_projection_paths_return_not_implemented() {
     let (base_url, harness) = common::server::start_test_server().await;
     let client = reqwest::Client::new();
     let ann_source = json!({
@@ -247,19 +247,11 @@ async fn test_query_reserved_retrieval_algebra_paths_return_not_implemented() {
     let cases = [
         json!({
             "sources": [ann_source.clone()],
-            "grouping": {"type": "field", "field": "category", "max_per_group": 2}
-        }),
-        json!({
-            "sources": [ann_source.clone()],
-            "cursor": {"type": "after", "token": "opaque"}
-        }),
-        json!({
-            "sources": [ann_source.clone()],
-            "explain": true
+            "projection": {"fields": ["category"]}
         }),
         json!({
             "sources": [ann_source],
-            "projection": {"fields": ["category"]}
+            "projection": {"include_vectors": true}
         }),
     ];
 

@@ -17,7 +17,12 @@ use crate::fts::FtsFieldConfig;
 use crate::index::distance::compute_distance;
 use crate::namespace::manager::NamespaceMetadata;
 use crate::query;
-use crate::query::{QueryDebug, QueryDebugCache, QueryFacets, QueryResponse, QueryResultGroup};
+use crate::query::{
+    QueryDebug, QueryDebugCache, QueryExplain, QueryExplainCursor, QueryExplainFusion,
+    QueryExplainGrouping, QueryExplainMode, QueryExplainPath, QueryExplainPlan,
+    QueryExplainProjection, QueryExplainRerank, QueryExplainResult, QueryExplainResultSource,
+    QueryExplainSource, QueryExplainSourceKind, QueryFacets, QueryResponse, QueryResultGroup,
+};
 use crate::runtime_config::QueryKnobs;
 use crate::server::{AppState, RateLimitClass, RateLimitIdentity};
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, SearchResult};
@@ -235,15 +240,6 @@ pub enum ExplainSpec {
     Mode(ExplainMode),
 }
 
-impl ExplainSpec {
-    fn is_enabled(&self) -> bool {
-        match self {
-            Self::Flag(enabled) => *enabled,
-            Self::Mode(mode) => !matches!(mode, ExplainMode::None),
-        }
-    }
-}
-
 /// Explain mode in the retrieval-algebra request AST.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -328,7 +324,7 @@ pub enum BatchQueryEntry {
         /// Always `true` for successful entries.
         ok: bool,
         /// Single-query-compatible response for this entry.
-        response: QueryResponse,
+        response: Box<QueryResponse>,
         /// Per-entry metadata.
         metadata: BatchQueryEntryMetadata,
     },
@@ -758,7 +754,6 @@ fn retrieval_algebra_without_sources(req: &QueryRequest) -> bool {
         || req.facets.is_some()
         || req.projection.is_some()
         || req.cursor.is_some()
-        || req.explain.is_some()
 }
 
 fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), ZeppelinError> {
@@ -802,13 +797,6 @@ fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), Zeppelin
             CursorSpec::After { token } => {
                 decode_cursor_token(token)?;
             }
-        }
-    }
-    if let Some(explain) = req.explain.as_ref() {
-        if explain.is_enabled() {
-            return Err(ZeppelinError::NotImplemented {
-                feature: "query explain",
-            });
         }
     }
     Ok(())
@@ -913,6 +901,15 @@ async fn execute_validated_query(
     let rerank_limit = rerank_output_k(req, validated, first_stage_top_k);
     let first_stage_include_attributes =
         first_stage_include_attributes(req, validated.include_attributes);
+    let explain_source =
+        explain_source_for_ref(0, &source_ref, validated.nprobe, first_stage_top_k);
+    let mut explain = build_explain_accumulator(
+        req,
+        validated,
+        explain_path(validated.source),
+        first_stage_top_k,
+        vec![explain_source],
+    );
     let source = execute_query_source_with_manifest(
         state,
         ns,
@@ -927,6 +924,9 @@ async fn execute_validated_query(
         emit_debug,
     )
     .await?;
+    if let Some(explain) = explain.as_mut() {
+        explain.capture_single_source(0, source.kind, &source.response.results);
+    }
     apply_rerank_if_requested(
         RerankExecutionContext {
             state,
@@ -939,6 +939,7 @@ async fn execute_validated_query(
             manifest,
         },
         source.response,
+        explain,
     )
     .await
 }
@@ -971,11 +972,18 @@ async fn execute_hybrid_query(
     let rerank_limit = rerank_output_k(req, validated, first_stage_top_k);
     let first_stage_include_attributes =
         first_stage_include_attributes(req, validated.include_attributes);
+    let mut explain_sources = Vec::with_capacity(source_count);
     for index in 0..source_count {
         let source_ref =
             resolve_algebra_source_ref(state, ns, req, index, manifest.clone()).await?;
         validate_query_source_metadata(ns, meta, &source_ref)?;
         let nprobe = nprobe_for_algebra_source(req, index, knobs.default_nprobe)?;
+        explain_sources.push(explain_source_for_request_source(
+            req,
+            index,
+            nprobe,
+            validated.candidate_k,
+        )?);
         let source_response = execute_query_source_with_manifest(
             state,
             ns,
@@ -993,6 +1001,16 @@ async fn execute_hybrid_query(
         source_responses.push(source_response);
     }
 
+    let mut explain = build_explain_accumulator(
+        req,
+        validated,
+        QueryExplainPath::AlgebraHybrid,
+        first_stage_top_k,
+        explain_sources,
+    );
+    if let Some(explain) = explain.as_mut() {
+        explain.capture_hybrid_sources(req.fusion.as_ref(), &source_responses)?;
+    }
     let response = fuse_source_responses(
         req.fusion.as_ref(),
         source_responses,
@@ -1012,6 +1030,7 @@ async fn execute_hybrid_query(
             manifest,
         },
         response,
+        explain,
     )
     .await
 }
@@ -1064,6 +1083,356 @@ fn grouping_requested(req: &QueryRequest) -> bool {
     matches!(req.grouping, Some(GroupingSpec::Field { .. }))
 }
 
+struct ExplainAccumulator {
+    mode: QueryExplainMode,
+    plan: QueryExplainPlan,
+    results: HashMap<String, QueryExplainResult>,
+}
+
+impl ExplainAccumulator {
+    fn new(mode: QueryExplainMode, plan: QueryExplainPlan) -> Self {
+        Self {
+            mode,
+            plan,
+            results: HashMap::new(),
+        }
+    }
+
+    fn capture_single_source(
+        &mut self,
+        source_index: usize,
+        kind: QuerySourceKind,
+        results: &[SearchResult],
+    ) {
+        if self.mode != QueryExplainMode::Full {
+            return;
+        }
+        for result in results {
+            self.record_source_score(
+                &result.id,
+                source_index,
+                kind,
+                result.score,
+                None,
+                result.score,
+            );
+        }
+    }
+
+    fn capture_hybrid_sources(
+        &mut self,
+        fusion: Option<&FusionSpec>,
+        sources: &[SourceQueryResponse],
+    ) -> Result<(), ZeppelinError> {
+        if self.mode != QueryExplainMode::Full {
+            return Ok(());
+        }
+        match fusion {
+            Some(FusionSpec::Weighted { weights }) => {
+                self.capture_weighted_sources(sources, weights)
+            }
+            Some(FusionSpec::Rrf { k }) => {
+                self.capture_rrf_sources(sources, k.unwrap_or(DEFAULT_RRF_K));
+                Ok(())
+            }
+            Some(FusionSpec::None) => Err(ZeppelinError::Validation(
+                "multiple candidate sources require a supported fusion strategy".into(),
+            )),
+            None => {
+                self.capture_rrf_sources(sources, DEFAULT_RRF_K);
+                Ok(())
+            }
+        }
+    }
+
+    fn capture_rrf_sources(&mut self, sources: &[SourceQueryResponse], k: usize) {
+        for (source_index, source) in sources.iter().enumerate() {
+            for (rank, result) in source.response.results.iter().enumerate() {
+                let contribution = 1.0_f32 / (k as f32 + (rank + 1) as f32);
+                self.record_source_score(
+                    &result.id,
+                    source_index,
+                    source.kind,
+                    result.score,
+                    None,
+                    contribution,
+                );
+            }
+        }
+    }
+
+    fn capture_weighted_sources(
+        &mut self,
+        sources: &[SourceQueryResponse],
+        weights: &[f32],
+    ) -> Result<(), ZeppelinError> {
+        if weights.len() != sources.len() {
+            return Err(ZeppelinError::Validation(
+                "fusion weights length must match sources length".into(),
+            ));
+        }
+        for (source_index, (source, weight)) in
+            sources.iter().zip(weights.iter().copied()).enumerate()
+        {
+            if !weight.is_finite() {
+                return Err(ZeppelinError::Validation(
+                    "fusion weights must be finite".into(),
+                ));
+            }
+            if source.response.results.is_empty() {
+                continue;
+            }
+            let (min_score, max_score) = source.response.results.iter().fold(
+                (f32::INFINITY, f32::NEG_INFINITY),
+                |(min_score, max_score), result| {
+                    (min_score.min(result.score), max_score.max(result.score))
+                },
+            );
+            for result in &source.response.results {
+                if !result.score.is_finite() {
+                    return Err(ZeppelinError::Validation(
+                        "source result scores must be finite".into(),
+                    ));
+                }
+                let normalized =
+                    normalize_source_score(source.kind, result.score, min_score, max_score);
+                self.record_source_score(
+                    &result.id,
+                    source_index,
+                    source.kind,
+                    result.score,
+                    Some(normalized),
+                    weight * normalized,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn record_source_score(
+        &mut self,
+        id: &str,
+        source_index: usize,
+        kind: QuerySourceKind,
+        raw_score: f32,
+        normalized_score: Option<f32>,
+        contribution: f32,
+    ) {
+        let entry = self
+            .results
+            .entry(id.to_string())
+            .or_insert_with(|| QueryExplainResult {
+                id: id.to_string(),
+                sources: Vec::new(),
+                fused_score: 0.0,
+                rerank_score: None,
+            });
+        entry.sources.push(QueryExplainResultSource {
+            index: source_index,
+            kind: explain_source_kind(kind),
+            raw_score,
+            normalized_score,
+            contribution,
+        });
+        entry.fused_score += contribution;
+    }
+
+    fn capture_rerank_scores(&mut self, results: &[SearchResult]) {
+        if self.mode != QueryExplainMode::Full {
+            return;
+        }
+        for result in results {
+            if let Some(explain_result) = self.results.get_mut(&result.id) {
+                explain_result.rerank_score = Some(result.score);
+            }
+        }
+    }
+
+    fn finish(mut self, results: &[SearchResult]) -> Result<QueryExplain, ZeppelinError> {
+        let results = if self.mode == QueryExplainMode::Full {
+            let mut explain_results = Vec::with_capacity(results.len());
+            for result in results {
+                let explain_result = self.results.remove(&result.id).ok_or_else(|| {
+                    ZeppelinError::Index(format!(
+                        "explain provenance missing for result {}",
+                        result.id
+                    ))
+                })?;
+                explain_results.push(explain_result);
+            }
+            Some(explain_results)
+        } else {
+            None
+        };
+        Ok(QueryExplain {
+            mode: self.mode,
+            plan: self.plan,
+            results,
+        })
+    }
+}
+
+fn requested_explain_mode(req: &QueryRequest) -> Option<QueryExplainMode> {
+    match req.explain.as_ref()? {
+        ExplainSpec::Flag(false) => None,
+        ExplainSpec::Flag(true) => Some(QueryExplainMode::Plan),
+        ExplainSpec::Mode(ExplainMode::None) => None,
+        ExplainSpec::Mode(ExplainMode::Plan) => Some(QueryExplainMode::Plan),
+        ExplainSpec::Mode(ExplainMode::Full) => Some(QueryExplainMode::Full),
+    }
+}
+
+fn build_explain_accumulator(
+    req: &QueryRequest,
+    validated: ValidatedQuery,
+    path: QueryExplainPath,
+    first_stage_top_k: usize,
+    sources: Vec<QueryExplainSource>,
+) -> Option<ExplainAccumulator> {
+    let mode = requested_explain_mode(req)?;
+    Some(ExplainAccumulator::new(
+        mode,
+        QueryExplainPlan {
+            path,
+            candidate_k: validated.candidate_k,
+            first_stage_top_k,
+            top_k: validated.top_k,
+            consistency: req.consistency,
+            sources,
+            fusion: explain_fusion(req),
+            rerank: explain_rerank(req.rerank.as_ref()),
+            grouping: explain_grouping(req.grouping.as_ref()),
+            cursor: explain_cursor(req.cursor.as_ref()),
+            facets: explain_facets(req.facets.as_deref()),
+            projection: QueryExplainProjection {
+                include_attributes: validated.include_attributes,
+            },
+        },
+    ))
+}
+
+fn explain_fusion(req: &QueryRequest) -> QueryExplainFusion {
+    match req.fusion.as_ref() {
+        Some(FusionSpec::None) => QueryExplainFusion::None,
+        Some(FusionSpec::Rrf { k }) => QueryExplainFusion::Rrf {
+            k: k.unwrap_or(DEFAULT_RRF_K),
+        },
+        Some(FusionSpec::Weighted { weights }) => QueryExplainFusion::Weighted {
+            weights: weights.clone(),
+        },
+        None if req.sources.as_ref().map_or(0, Vec::len) > 1 => {
+            QueryExplainFusion::Rrf { k: DEFAULT_RRF_K }
+        }
+        None => QueryExplainFusion::None,
+    }
+}
+
+fn explain_rerank(rerank: Option<&RerankSpec>) -> Option<QueryExplainRerank> {
+    rerank.map(|rerank| match rerank {
+        RerankSpec::Default => QueryExplainRerank::Default,
+        RerankSpec::None => QueryExplainRerank::None,
+        RerankSpec::Vector { .. } => QueryExplainRerank::Vector,
+        RerankSpec::Bm25 { .. } => QueryExplainRerank::Bm25,
+    })
+}
+
+fn explain_grouping(grouping: Option<&GroupingSpec>) -> Option<QueryExplainGrouping> {
+    grouping.map(|grouping| match grouping {
+        GroupingSpec::None => QueryExplainGrouping::None,
+        GroupingSpec::Field {
+            field,
+            max_per_group,
+        } => QueryExplainGrouping::Field {
+            field: field.clone(),
+            max_per_group: *max_per_group,
+        },
+    })
+}
+
+fn explain_cursor(cursor: Option<&CursorSpec>) -> QueryExplainCursor {
+    QueryExplainCursor {
+        requested: cursor.is_some(),
+        after: matches!(cursor, Some(CursorSpec::After { .. })),
+    }
+}
+
+fn explain_facets(facets: Option<&[FacetSpec]>) -> Vec<String> {
+    facets
+        .unwrap_or_default()
+        .iter()
+        .map(|facet| facet.field().to_string())
+        .collect()
+}
+
+fn explain_source_for_ref(
+    index: usize,
+    source_ref: &QuerySourceRef<'_>,
+    nprobe: usize,
+    candidate_k: usize,
+) -> QueryExplainSource {
+    match source_ref {
+        QuerySourceRef::Ann { .. } => QueryExplainSource {
+            index,
+            kind: QueryExplainSourceKind::Ann,
+            nprobe: Some(nprobe),
+            candidate_k,
+        },
+        QuerySourceRef::Bm25 { .. } => QueryExplainSource {
+            index,
+            kind: QueryExplainSourceKind::Bm25,
+            nprobe: None,
+            candidate_k,
+        },
+    }
+}
+
+fn explain_source_for_request_source(
+    req: &QueryRequest,
+    index: usize,
+    nprobe: usize,
+    candidate_k: usize,
+) -> Result<QueryExplainSource, ZeppelinError> {
+    let sources = req
+        .sources
+        .as_ref()
+        .ok_or_else(|| ZeppelinError::Validation("retrieval algebra sources missing".into()))?;
+    match sources.get(index) {
+        Some(CandidateSource::Ann { .. }) => Ok(QueryExplainSource {
+            index,
+            kind: QueryExplainSourceKind::Ann,
+            nprobe: Some(nprobe),
+            candidate_k,
+        }),
+        Some(CandidateSource::Bm25 { .. }) => Ok(QueryExplainSource {
+            index,
+            kind: QueryExplainSourceKind::Bm25,
+            nprobe: None,
+            candidate_k,
+        }),
+        None => Err(ZeppelinError::Validation(
+            "validated algebra source is missing".into(),
+        )),
+    }
+}
+
+fn explain_source_kind(kind: QuerySourceKind) -> QueryExplainSourceKind {
+    match kind {
+        QuerySourceKind::Ann => QueryExplainSourceKind::Ann,
+        QuerySourceKind::Bm25 => QueryExplainSourceKind::Bm25,
+    }
+}
+
+fn explain_path(source: ValidatedSource) -> QueryExplainPath {
+    match source {
+        ValidatedSource::LegacyVector => QueryExplainPath::LegacyVector,
+        ValidatedSource::LegacyBm25 => QueryExplainPath::LegacyBm25,
+        ValidatedSource::AlgebraAnn { .. } | ValidatedSource::AlgebraBm25 { .. } => {
+            QueryExplainPath::AlgebraSingle
+        }
+        ValidatedSource::AlgebraHybrid { .. } => QueryExplainPath::AlgebraHybrid,
+    }
+}
+
 struct RerankExecutionContext<'a> {
     state: &'a AppState,
     ns: &'a str,
@@ -1078,6 +1447,7 @@ struct RerankExecutionContext<'a> {
 async fn apply_rerank_if_requested(
     ctx: RerankExecutionContext<'_>,
     response: QueryResponse,
+    mut explain: Option<ExplainAccumulator>,
 ) -> Result<QueryResponse, ZeppelinError> {
     let facets = compute_facets_if_requested(ctx.req, &response.results)?;
     let keep_attrs_after_rerank = ctx.include_attributes || grouping_requested(ctx.req);
@@ -1092,6 +1462,11 @@ async fn apply_rerank_if_requested(
         )?,
         _ => response,
     };
+    if ctx.req.rerank.as_ref().is_some_and(RerankSpec::is_explicit) {
+        if let Some(explain) = explain.as_mut() {
+            explain.capture_rerank_scores(&response.results);
+        }
+    }
     let response =
         apply_grouping_if_requested(ctx.req, response, ctx.top_k, ctx.include_attributes)?;
     let mut response = apply_cursor_if_requested(ctx.ns, ctx.req, response, ctx.top_k)?;
@@ -1100,6 +1475,9 @@ async fn apply_rerank_if_requested(
     }
     strip_attributes_if_needed(&mut response, ctx.include_attributes);
     response.facets = facets;
+    if let Some(explain) = explain {
+        response.explain = Some(explain.finish(&response.results)?);
+    }
     Ok(response)
 }
 
@@ -1859,6 +2237,7 @@ fn fuse_source_responses(
         next_cursor: None,
         groups: None,
         facets: None,
+        explain: None,
     })
 }
 
@@ -2154,7 +2533,7 @@ fn strongest_consistency(
 fn batch_success_entry(response: QueryResponse, start: Instant) -> BatchQueryEntry {
     BatchQueryEntry::Success {
         ok: true,
-        response,
+        response: Box::new(response),
         metadata: BatchQueryEntryMetadata {
             latency_ms: start.elapsed().as_millis() as u64,
         },
