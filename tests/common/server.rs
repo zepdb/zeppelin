@@ -110,6 +110,63 @@ pub async fn start_test_server_with_config(
     (base_url, harness, cache, cache_dir)
 }
 
+/// Start a test server on an already-constructed store.
+///
+/// Used by tests that wrap the harness store with instrumentation while still
+/// relying on the harness's random prefix and cleanup.
+pub async fn start_test_server_on_store(
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+) -> (String, Arc<DiskCache>, tempfile::TempDir) {
+    zeppelin::metrics::init();
+
+    let mut config = Config::load(None).unwrap();
+    configure_test_server_limits(&mut config);
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+
+    let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        config.server.max_concurrent_queries,
+    ));
+    let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
+    let hydrator = maybe_hydrator(&config, &store, &cache);
+    let state = AppState {
+        store: store.clone(),
+        namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
+        namespace_name_prefix,
+        wal_writer: Arc::new(WalWriter::new(store.clone())),
+        wal_reader: Arc::new(WalReader::new(store.clone())),
+        config: Arc::new(config),
+        runtime_query_config,
+        query_knob_bounds,
+        cache: cache.clone(),
+        manifest_cache: Arc::new(ManifestCache::new(Duration::from_millis(500))),
+        hydrator,
+        fts_cache: Arc::new(WalFtsCache::new()),
+        query_semaphore,
+        rate_limiters: Arc::new(DashMap::new()),
+    };
+
+    let app = build_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    (base_url, cache, cache_dir)
+}
+
 /// Start a test server that also returns the `Arc<Compactor>` for manual compaction triggering.
 /// Avoids config mismatch from constructing a separate compactor in tests.
 pub async fn start_test_server_with_compactor(

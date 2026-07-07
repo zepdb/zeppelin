@@ -1,6 +1,8 @@
 mod common;
 
-use common::server::{cleanup_ns, create_ns_api, start_test_server};
+use common::counting::{counting_store, ArtifactClass};
+use common::harness::TestHarness;
+use common::server::{cleanup_ns, create_ns_api, start_test_server, start_test_server_on_store};
 use common::vectors::random_vectors;
 
 #[tokio::test]
@@ -135,6 +137,121 @@ async fn test_vector_upsert() {
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_get_namespace_reports_manifest_stats_after_upsert() {
+    let harness = TestHarness::new().await;
+    let (store, _counter) = counting_store(&harness.store);
+    let (base_url, _cache, cache_dir) =
+        start_test_server_on_store(store, Some(harness.prefix.clone())).await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api(&client, &base_url, 16).await;
+
+    let vectors = random_vectors(7, 16);
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({ "vectors": vectors }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .get(format!("{base_url}/v1/namespaces/{ns}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["name"], ns);
+    assert_eq!(
+        body["vector_count"], 7,
+        "GET namespace must derive vector_count from the manifest after upsert"
+    );
+    assert_eq!(body["uncompacted_fragments"], 1);
+    assert_eq!(body["segment_count"], 0);
+    assert!(
+        body["approximate_storage_bytes"].as_u64().unwrap() > 0,
+        "WAL fragment size_bytes must contribute to approximate storage bytes"
+    );
+    assert_eq!(body["quantization"], serde_json::Value::Null);
+    assert_eq!(body["distance_metric"], "cosine");
+    assert_eq!(body["index_kind"], "ivf_flat");
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+    drop(cache_dir);
+}
+
+#[tokio::test]
+async fn test_get_namespace_stats_reuses_manifest_freshness_get_without_listing_or_head() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let (base_url, _cache, cache_dir) =
+        start_test_server_on_store(store, Some(harness.prefix.clone())).await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api(&client, &base_url, 8).await;
+
+    let vectors = random_vectors(3, 8);
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({ "vectors": vectors }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    counter.reset();
+    let resp = client
+        .get(format!("{base_url}/v1/namespaces/{ns}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["vector_count"], 3);
+
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Manifest),
+        1,
+        "strong namespace stats read should perform exactly the manifest freshness GET"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Wal),
+        0,
+        "stats must not read WAL fragments"
+    );
+    assert_eq!(
+        counter.gets_for(ArtifactClass::Cluster),
+        0,
+        "stats must not read segment objects"
+    );
+    assert_eq!(
+        counter.heads_matching(&ns),
+        0,
+        "stats must not HEAD namespace objects"
+    );
+    assert_eq!(
+        counter.list_calls_for_prefix(&format!("{ns}/")),
+        0,
+        "stats must not recursively list namespace objects"
+    );
+    assert_eq!(
+        counter.delimiter_list_calls_for_prefix(&format!("{ns}/")),
+        0,
+        "stats must not delimiter-list namespace objects"
+    );
+    assert_eq!(
+        counter.total_heads(),
+        0,
+        "stats must not issue any HEAD requests"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+    drop(cache_dir);
 }
 
 #[tokio::test]
