@@ -7,17 +7,19 @@ use common::server::{
 use common::vectors::random_vectors;
 
 use zeppelin::config::Config;
+use zeppelin::wal::Manifest;
 
-// --- Test 1: Oversized batch returns 400 ---
+// --- Test 1: Oversized batch returns 413 without durable side effects ---
 
 #[tokio::test]
-async fn test_oversized_batch_400() {
+async fn test_oversized_upsert_batch_413_without_wal_refs() {
     let mut config = Config::load(None).unwrap();
     config.server.max_batch_size = 10;
 
     let (base_url, harness, _cache, _dir) = start_test_server_with_config(Some(config)).await;
     let client = reqwest::Client::new();
     let ns = create_ns_api(&client, &base_url, 4).await;
+    let before = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
 
     // Upsert 11 vectors (exceeds configured max_batch_size of 10)
     let vectors: Vec<serde_json::Value> = (0..11)
@@ -35,13 +37,62 @@ async fn test_oversized_batch_400() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.status(), 413);
     let body: serde_json::Value = resp.json().await.unwrap();
     // Task 11: clients key off the stable `code`, not the human message.
-    assert_eq!(body["code"], "VALIDATION_ERROR");
+    assert_eq!(body["code"], "PAYLOAD_TOO_LARGE");
     assert_eq!(body["retryable"], false);
     let error_msg = body["error"].as_str().unwrap().to_lowercase();
     assert!(error_msg.contains("batch size"), "got: {error_msg}");
+    let after = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(
+        after.fragments, before.fragments,
+        "oversized upsert must not add WAL refs"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_max_sized_upsert_batch_writes_one_bounded_wal_fragment() {
+    let mut config = Config::load(None).unwrap();
+    config.server.max_batch_size = 3;
+
+    let (base_url, harness, _cache, _dir) = start_test_server_with_config(Some(config)).await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api(&client, &base_url, 4).await;
+
+    let vectors: Vec<serde_json::Value> = (0..3)
+        .map(|i| {
+            serde_json::json!({
+                "id": format!("v_{i}"),
+                "values": [1.0, 0.0, 0.0, 0.0],
+            })
+        })
+        .collect();
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({ "vectors": vectors }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["upserted"], 3);
+
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(
+        manifest.fragments.len(),
+        1,
+        "accepted upsert should commit exactly one WAL fragment"
+    );
+    assert_eq!(manifest.fragments[0].vector_count, 3);
+    assert!(
+        manifest.fragments[0].vector_count <= 3,
+        "fragment vector count must stay within configured max_batch_size"
+    );
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;

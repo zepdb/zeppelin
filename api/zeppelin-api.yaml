@@ -240,7 +240,13 @@ paths:
     post:
       operationId: upsertVectors
       summary: Upsert vectors
-      description: Insert or update vectors in a namespace. Vectors with existing IDs are overwritten.
+      description: |
+        Insert or update vectors in a namespace. Vectors with existing IDs are
+        overwritten. The request body is bounded by `server.max_request_body_mb`
+        and the logical `vectors` array is bounded by `server.max_batch_size`.
+        Accepted requests are committed all-or-nothing as one bounded WAL
+        fragment; oversized bodies or batches return the canonical 413
+        `PAYLOAD_TOO_LARGE` envelope before any WAL ref is committed.
       tags: [Vectors]
       requestBody:
         required: true
@@ -1130,6 +1136,10 @@ components:
             $ref: "#/components/schemas/VectorEntry"
           minItems: 1
           maxItems: 50000
+          description: |
+            Maximum item count is the default `server.max_batch_size`; servers
+            may advertise a different configured cap operationally. Batches
+            above the cap return 413 and are not partially committed.
 
     DeleteVectorsRequest:
       type: object

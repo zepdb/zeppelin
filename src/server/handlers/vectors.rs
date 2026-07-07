@@ -116,11 +116,11 @@ pub async fn upsert_vectors(
         )));
     }
     if req.vectors.len() > state.config.server.max_batch_size {
-        return Err(ApiError(ZeppelinError::Validation(format!(
-            "batch size {} exceeds maximum of {}",
-            req.vectors.len(),
-            state.config.server.max_batch_size
-        ))));
+        return Err(ApiError(ZeppelinError::PayloadTooLarge {
+            resource: "upsert batch",
+            actual: req.vectors.len(),
+            limit: state.config.server.max_batch_size,
+        }));
     }
 
     for vec in &req.vectors {

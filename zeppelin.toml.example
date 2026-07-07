@@ -8,13 +8,13 @@
 # port = 8080                        # ZEPPELIN_PORT; must be > 0
 # request_timeout_secs = 30          # ZEPPELIN_REQUEST_TIMEOUT_SECS; must be > 0
 # max_concurrent_queries = 64        # ZEPPELIN_MAX_CONCURRENT_QUERIES
-# max_batch_size = 50000             # ZEPPELIN_MAX_BATCH_SIZE
+# max_batch_size = 50000             # ZEPPELIN_MAX_BATCH_SIZE; max vectors per accepted upsert/WAL fragment
 # max_top_k = 10000                  # ZEPPELIN_MAX_TOP_K; must be > 0
 # default_top_k = 10                 # ZEPPELIN_DEFAULT_TOP_K; must be in 1..=max_top_k
 # shutdown_timeout_secs = 30         # ZEPPELIN_SHUTDOWN_TIMEOUT_SECS; must be > 0
 # max_dimensions = 65536             # ZEPPELIN_MAX_DIMENSIONS
 # max_vector_id_length = 1024        # ZEPPELIN_MAX_VECTOR_ID_LENGTH
-# max_request_body_mb = 512          # ZEPPELIN_MAX_REQUEST_BODY_MB
+# max_request_body_mb = 512          # ZEPPELIN_MAX_REQUEST_BODY_MB; oversized bodies fail before handler side effects
 # rate_limit_rps = 100               # ZEPPELIN_RATE_LIMIT_RPS; read/query rps per client, 0 disables reads
 # rate_limit_burst = 200             # ZEPPELIN_RATE_LIMIT_BURST; read/query burst, must be >= 1 when read limiting is enabled
 # write_rate_limit_rps = 50          # ZEPPELIN_WRITE_RATE_LIMIT_RPS; write/admin rps per client, 0 disables writes

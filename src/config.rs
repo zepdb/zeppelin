@@ -729,7 +729,7 @@ pub struct ServerConfig {
     /// Maximum number of concurrent query handlers. Default: `64`.
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
-    /// Maximum vectors per upsert batch. Default: `50_000`.
+    /// Maximum vectors per accepted upsert batch/WAL fragment. Default: `50_000`.
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
     /// Maximum query entries per batch query request. Default: `256`.
