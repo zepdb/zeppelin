@@ -1,0 +1,5 @@
+{
+  "dimensions": 3,
+  "distance_metric": "euclidean",
+  "name": "contract-conflict"
+}

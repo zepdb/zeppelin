@@ -1,0 +1,144 @@
+{
+  "explain": {
+    "mode": "full",
+    "plan": {
+      "candidate_k": 5,
+      "consistency": "strong",
+      "cursor": {
+        "after": false,
+        "requested": false
+      },
+      "facets": [],
+      "first_stage_top_k": 3,
+      "fusion": {
+        "type": "weighted",
+        "weights": [
+          0.5,
+          0.5
+        ]
+      },
+      "grouping": null,
+      "path": "algebra_hybrid",
+      "projection": {
+        "include_attributes": true
+      },
+      "rerank": null,
+      "sources": [
+        {
+          "candidate_k": 5,
+          "index": 0,
+          "nprobe": 4,
+          "type": "ann"
+        },
+        {
+          "candidate_k": 5,
+          "index": 1,
+          "nprobe": null,
+          "type": "bm25"
+        }
+      ],
+      "top_k": 3
+    },
+    "results": [
+      {
+        "fused_score": 1.0,
+        "id": "seed",
+        "sources": [
+          {
+            "contribution": 0.5,
+            "index": 0,
+            "normalized_score": 1.0,
+            "raw_score": 0.0,
+            "type": "ann"
+          },
+          {
+            "contribution": 0.5,
+            "index": 1,
+            "normalized_score": 1.0,
+            "raw_score": 0.2876821,
+            "type": "bm25"
+          }
+        ]
+      },
+      {
+        "fused_score": 0.995,
+        "id": "near",
+        "sources": [
+          {
+            "contribution": 0.495,
+            "index": 0,
+            "normalized_score": 0.99,
+            "raw_score": 0.010000001,
+            "type": "ann"
+          },
+          {
+            "contribution": 0.5,
+            "index": 1,
+            "normalized_score": 1.0,
+            "raw_score": 0.2876821,
+            "type": "bm25"
+          }
+        ]
+      },
+      {
+        "fused_score": 0.98,
+        "id": "mid",
+        "sources": [
+          {
+            "contribution": 0.48,
+            "index": 0,
+            "normalized_score": 0.96,
+            "raw_score": 0.040000003,
+            "type": "ann"
+          },
+          {
+            "contribution": 0.5,
+            "index": 1,
+            "normalized_score": 1.0,
+            "raw_score": 0.2876821,
+            "type": "bm25"
+          }
+        ]
+      }
+    ]
+  },
+  "results": [
+    {
+      "attributes": {
+        "category": "anchor",
+        "tags": [
+          "blue"
+        ],
+        "title": "anchor search"
+      },
+      "id": "seed",
+      "score": 1.0
+    },
+    {
+      "attributes": {
+        "category": "alpha",
+        "tags": [
+          "fresh",
+          "red"
+        ],
+        "title": "alpha search"
+      },
+      "id": "near",
+      "score": 0.995
+    },
+    {
+      "attributes": {
+        "category": "alpha",
+        "tags": [
+          "fresh",
+          "blue"
+        ],
+        "title": "beta search"
+      },
+      "id": "mid",
+      "score": 0.98
+    }
+  ],
+  "scanned_fragments": 2,
+  "scanned_segments": 0
+}

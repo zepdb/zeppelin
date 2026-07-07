@@ -1,0 +1,19 @@
+{
+  "candidate_k": 5,
+  "consistency": "strong",
+  "grouping": {
+    "field": "category",
+    "max_per_group": 2,
+    "type": "field"
+  },
+  "sources": [
+    {
+      "type": "ann",
+      "vector": [
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "top_k": 2
+}

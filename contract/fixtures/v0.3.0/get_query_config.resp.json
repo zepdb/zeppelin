@@ -1,0 +1,7 @@
+{
+  "bm25_max_full_scan_clusters": 500,
+  "bm25_max_full_scan_vectors": 100000,
+  "default_nprobe": 4,
+  "default_top_k": 3,
+  "rerank_coalesce_gap_bytes": 1048576
+}

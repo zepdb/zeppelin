@@ -1,0 +1,7 @@
+{
+  "code": "NAMESPACE_ALREADY_EXISTS",
+  "error": "namespace already exists: contract-conflict",
+  "request_id": "contract-error_conflict_409",
+  "retryable": false,
+  "status": 409
+}

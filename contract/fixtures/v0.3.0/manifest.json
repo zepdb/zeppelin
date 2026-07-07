@@ -1,0 +1,254 @@
+{
+  "version": "v0.3.0",
+  "generated_by": "cargo test --test contract_tests contract_fixtures_match_real_engine_output",
+  "cases": [
+    {
+      "name": "create_namespace",
+      "method": "POST",
+      "path": "/v1/namespaces",
+      "status": 201,
+      "request": "create_namespace.req.json",
+      "response": "create_namespace.resp.json"
+    },
+    {
+      "name": "get_query_config",
+      "method": "GET",
+      "path": "/v1/config/query",
+      "status": 200,
+      "request": "get_query_config.req.json",
+      "response": "get_query_config.resp.json"
+    },
+    {
+      "name": "patch_query_config",
+      "method": "PATCH",
+      "path": "/v1/config/query",
+      "status": 200,
+      "request": "patch_query_config.req.json",
+      "response": "patch_query_config.resp.json"
+    },
+    {
+      "name": "patch_index_config",
+      "method": "PATCH",
+      "path": "/v1/namespaces/contract-main/index_config",
+      "status": 202,
+      "request": "patch_index_config.req.json",
+      "response": "patch_index_config.resp.json"
+    },
+    {
+      "name": "upsert_vectors",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/vectors",
+      "status": 200,
+      "request": "upsert_vectors.req.json",
+      "response": "upsert_vectors.resp.json"
+    },
+    {
+      "name": "get_namespace",
+      "method": "GET",
+      "path": "/v1/namespaces/contract-main",
+      "status": 200,
+      "request": "get_namespace.req.json",
+      "response": "get_namespace.resp.json"
+    },
+    {
+      "name": "get_vectors",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/vectors/get",
+      "status": 200,
+      "request": "get_vectors.req.json",
+      "response": "get_vectors.resp.json"
+    },
+    {
+      "name": "query_ann",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_ann.req.json",
+      "response": "query_ann.resp.json"
+    },
+    {
+      "name": "query_by_id",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_by_id.req.json",
+      "response": "query_by_id.resp.json"
+    },
+    {
+      "name": "query_hybrid_rrf",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_hybrid_rrf.req.json",
+      "response": "query_hybrid_rrf.resp.json"
+    },
+    {
+      "name": "query_weighted_fusion",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_weighted_fusion.req.json",
+      "response": "query_weighted_fusion.resp.json"
+    },
+    {
+      "name": "query_vector_rerank",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_vector_rerank.req.json",
+      "response": "query_vector_rerank.resp.json"
+    },
+    {
+      "name": "query_bm25_rerank",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_bm25_rerank.req.json",
+      "response": "query_bm25_rerank.resp.json"
+    },
+    {
+      "name": "query_cursor_page1",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_cursor_page1.req.json",
+      "response": "query_cursor_page1.resp.json"
+    },
+    {
+      "name": "query_cursor_page2",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_cursor_page2.req.json",
+      "response": "query_cursor_page2.resp.json"
+    },
+    {
+      "name": "query_grouping",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_grouping.req.json",
+      "response": "query_grouping.resp.json"
+    },
+    {
+      "name": "query_facets",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_facets.req.json",
+      "response": "query_facets.resp.json"
+    },
+    {
+      "name": "query_explain_plan",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_explain_plan.req.json",
+      "response": "query_explain_plan.resp.json"
+    },
+    {
+      "name": "query_explain_full",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 200,
+      "request": "query_explain_full.req.json",
+      "response": "query_explain_full.resp.json"
+    },
+    {
+      "name": "batch_query",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query/batch",
+      "status": 200,
+      "request": "batch_query.req.json",
+      "response": "batch_query.resp.json"
+    },
+    {
+      "name": "delete_vectors",
+      "method": "DELETE",
+      "path": "/v1/namespaces/contract-main/vectors",
+      "status": 204,
+      "request": "delete_vectors.req.json",
+      "response": "delete_vectors.resp.json"
+    },
+    {
+      "name": "compact_status",
+      "method": "GET",
+      "path": "/v1/namespaces/contract-compact/compact/status",
+      "status": 200,
+      "request": "compact_status.req.json",
+      "response": "compact_status.resp.json"
+    },
+    {
+      "name": "compact_namespace_accepted",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-compact/compact",
+      "status": 202,
+      "request": "compact_namespace_accepted.req.json",
+      "response": "compact_namespace_accepted.resp.json"
+    },
+    {
+      "name": "hydrate_namespace_disabled",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/hydrate",
+      "status": 409,
+      "request": "hydrate_namespace_disabled.req.json",
+      "response": "hydrate_namespace_disabled.resp.json"
+    },
+    {
+      "name": "delete_namespace_accepted",
+      "method": "DELETE",
+      "path": "/v1/namespaces/contract-delete",
+      "status": 202,
+      "request": "delete_namespace_accepted.req.json",
+      "response": "delete_namespace_accepted.resp.json"
+    },
+    {
+      "name": "error_validation_400",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 400,
+      "request": "error_validation_400.req.json",
+      "response": "error_validation_400.resp.json"
+    },
+    {
+      "name": "error_not_found_404",
+      "method": "GET",
+      "path": "/v1/namespaces/contract-missing",
+      "status": 404,
+      "request": "error_not_found_404.req.json",
+      "response": "error_not_found_404.resp.json"
+    },
+    {
+      "name": "error_conflict_409",
+      "method": "POST",
+      "path": "/v1/namespaces",
+      "status": 409,
+      "request": "error_conflict_409.req.json",
+      "response": "error_conflict_409.resp.json"
+    },
+    {
+      "name": "error_deleting_410",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-deleting/vectors",
+      "status": 410,
+      "request": "error_deleting_410.req.json",
+      "response": "error_deleting_410.resp.json"
+    },
+    {
+      "name": "error_payload_too_large_413",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query/batch",
+      "status": 413,
+      "request": "error_payload_too_large_413.req.json",
+      "response": "error_payload_too_large_413.resp.json"
+    },
+    {
+      "name": "error_not_implemented_501",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 501,
+      "request": "error_not_implemented_501.req.json",
+      "response": "error_not_implemented_501.resp.json"
+    }
+  ]
+}

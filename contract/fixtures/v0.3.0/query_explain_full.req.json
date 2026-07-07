@@ -1,0 +1,30 @@
+{
+  "candidate_k": 5,
+  "consistency": "strong",
+  "explain": "full",
+  "fusion": {
+    "type": "weighted",
+    "weights": [
+      0.5,
+      0.5
+    ]
+  },
+  "sources": [
+    {
+      "type": "ann",
+      "vector": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "rank_by": [
+        "title",
+        "BM25",
+        "search"
+      ],
+      "type": "bm25"
+    }
+  ],
+  "top_k": 3
+}

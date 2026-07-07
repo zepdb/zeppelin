@@ -1,0 +1,29 @@
+{
+  "missing": [
+    "missing"
+  ],
+  "results": [
+    {
+      "attributes": {
+        "category": "anchor",
+        "title": "anchor search"
+      },
+      "id": "seed",
+      "values": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "attributes": {
+        "category": "alpha",
+        "title": "alpha search"
+      },
+      "id": "near",
+      "values": [
+        0.1,
+        0.0
+      ]
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "candidate_k": 5,
+  "consistency": "strong",
+  "facets": [
+    "category",
+    "tags"
+  ],
+  "sources": [
+    {
+      "type": "ann",
+      "vector": [
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "top_k": 3
+}

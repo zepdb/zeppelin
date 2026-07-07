@@ -82,6 +82,78 @@ paths:
               schema:
                 type: string
 
+  /v1/config/query:
+    get:
+      operationId: getQueryConfig
+      summary: Get runtime query configuration
+      description: |
+        Returns the current runtime-mutable query knobs. The values are the
+        effective snapshot used by new queries until a subsequent PATCH or PUT
+        updates the snapshot.
+      tags: [Config]
+      responses:
+        "200":
+          description: Current runtime query configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryKnobs"
+
+    patch:
+      operationId: patchQueryConfig
+      summary: Patch runtime query configuration
+      description: |
+        Partially updates runtime query knobs. Omitted fields are left
+        unchanged. `rerank_coalesce_gap_bytes` and `cost_latency_profile` are
+        mutually exclusive in the same request.
+      tags: [Config]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryKnobsPatch"
+      responses:
+        "200":
+          description: Updated runtime query configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryKnobs"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+    put:
+      operationId: putQueryConfig
+      summary: Patch runtime query configuration
+      description: |
+        Alias of PATCH with the same partial-update semantics. Omitted fields
+        are left unchanged.
+      tags: [Config]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryKnobsPatch"
+      responses:
+        "200":
+          description: Updated runtime query configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryKnobs"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
   /v1/namespaces:
     post:
       operationId: createNamespace
@@ -644,6 +716,73 @@ components:
       type: string
       enum: [cosine, euclidean, dot_product]
       default: cosine
+
+    CostLatencyProfile:
+      type: string
+      enum: [low_cost, balanced, low_latency]
+      default: balanced
+      description: Preset that resolves to an effective rerank coalesce gap.
+
+    QueryKnobs:
+      type: object
+      required:
+        - rerank_coalesce_gap_bytes
+        - default_nprobe
+        - default_top_k
+        - bm25_max_full_scan_clusters
+        - bm25_max_full_scan_vectors
+      properties:
+        rerank_coalesce_gap_bytes:
+          type: integer
+          minimum: 0
+          description: Maximum byte gap merged between rerank f32 ranges.
+        default_nprobe:
+          type: integer
+          minimum: 1
+          description: Default IVF clusters probed when a query omits nprobe.
+        default_top_k:
+          type: integer
+          minimum: 1
+          description: Default result count when a query omits top_k.
+        bm25_max_full_scan_clusters:
+          type: integer
+          minimum: 0
+          description: BM25 full-scan cluster breaker; 0 disables it.
+        bm25_max_full_scan_vectors:
+          type: integer
+          minimum: 0
+          description: BM25 full-scan vector breaker; 0 disables it.
+
+    QueryKnobsPatch:
+      type: object
+      additionalProperties: false
+      description: |
+        Partial runtime query config update. Omitted fields are left unchanged.
+        `rerank_coalesce_gap_bytes` and `cost_latency_profile` cannot appear
+        together.
+      properties:
+        rerank_coalesce_gap_bytes:
+          type: integer
+          minimum: 0
+          description: Explicit rerank coalesce gap in bytes.
+        cost_latency_profile:
+          $ref: "#/components/schemas/CostLatencyProfile"
+        default_nprobe:
+          type: integer
+          minimum: 1
+          description: Default IVF clusters probed when a query omits nprobe.
+        default_top_k:
+          type: integer
+          minimum: 1
+          description: Default result count when a query omits top_k.
+        bm25_max_full_scan_clusters:
+          type: integer
+          minimum: 0
+          description: BM25 full-scan cluster breaker; 0 disables it.
+        bm25_max_full_scan_vectors:
+          type: integer
+          minimum: 0
+          description: BM25 full-scan vector breaker; 0 disables it.
 
     QuantizationType:
       type: string
@@ -2084,7 +2223,7 @@ components:
         - cache
         - consistency_effective
         - underfill_reason
-      description: Present only when the request sets `debug: true`.
+      description: "Present only when the request sets `debug: true`."
       properties:
         wal_ms:
           type: integer

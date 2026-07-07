@@ -1,0 +1,37 @@
+{
+  "queries": [
+    {
+      "sources": [
+        {
+          "type": "ann",
+          "vector": [
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "sources": [
+        {
+          "type": "ann",
+          "vector": [
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "sources": [
+        {
+          "type": "ann",
+          "vector": [
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "candidate_k": 5,
+  "consistency": "strong",
+  "explain": "plan",
+  "fusion": {
+    "k": 20,
+    "type": "rrf"
+  },
+  "sources": [
+    {
+      "type": "ann",
+      "vector": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "rank_by": [
+        "title",
+        "BM25",
+        "search"
+      ],
+      "type": "bm25"
+    }
+  ],
+  "top_k": 3
+}

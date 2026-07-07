@@ -1,0 +1,8 @@
+{
+  "dimensions": 2,
+  "distance_metric": "euclidean",
+  "full_text_search": {
+    "title": {}
+  },
+  "name": "contract-main"
+}

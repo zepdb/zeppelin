@@ -1,0 +1,38 @@
+{
+  "active_segment_vector_count": 0,
+  "approximate_storage_bytes": 372,
+  "consecutive_compaction_failures": 0,
+  "created_at": "2026-01-01T00:00:00+00:00",
+  "dimensions": 2,
+  "distance_metric": "euclidean",
+  "full_text_search": {
+    "title": {
+      "b": 0.75,
+      "case_sensitive": false,
+      "k1": 1.2,
+      "language": "english",
+      "max_token_length": 40,
+      "remove_stopwords": true,
+      "stemming": true
+    }
+  },
+  "index_config": {
+    "bitmap_index": true,
+    "fts_index": false,
+    "hierarchical": false,
+    "nlist": 4,
+    "pq_m": 8,
+    "quantization": "scalar"
+  },
+  "index_degraded": false,
+  "index_kind": "ivf_flat",
+  "last_compaction_at": null,
+  "last_compaction_status": "never",
+  "name": "contract-main",
+  "quantization": null,
+  "segment_count": 0,
+  "state": "active",
+  "uncompacted_fragments": 1,
+  "updated_at": "2026-01-01T00:00:00+00:00",
+  "vector_count": 5
+}

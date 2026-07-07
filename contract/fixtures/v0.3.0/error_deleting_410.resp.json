@@ -1,0 +1,7 @@
+{
+  "code": "NAMESPACE_DELETING",
+  "error": "namespace is being deleted: contract-deleting",
+  "request_id": "contract-error_deleting_410",
+  "retryable": false,
+  "status": 410
+}

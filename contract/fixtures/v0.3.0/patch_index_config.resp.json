@@ -1,0 +1,13 @@
+{
+  "index_config": {
+    "bitmap_index": true,
+    "fts_index": false,
+    "hierarchical": false,
+    "nlist": 4,
+    "pq_m": 8,
+    "quantization": "scalar"
+  },
+  "namespace": "contract-main",
+  "observe": "applies asynchronously on the next compaction; observe GET /v1/namespaces/contract-main",
+  "status": "accepted"
+}

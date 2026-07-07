@@ -1,0 +1,9 @@
+{
+  "active_segment": null,
+  "active_segment_vector_count": 0,
+  "manifest_generation": 2,
+  "namespace": "contract-compact",
+  "ready": false,
+  "segment_count": 0,
+  "uncompacted_fragments": 1
+}

@@ -1,0 +1,21 @@
+{
+  "candidate_k": 3,
+  "consistency": "strong",
+  "cursor": {
+    "token": "contract-cursor-page-1",
+    "type": "after"
+  },
+  "projection": {
+    "include_attributes": false
+  },
+  "sources": [
+    {
+      "type": "ann",
+      "vector": [
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "top_k": 2
+}

@@ -1,0 +1,17 @@
+{
+  "next_cursor": "contract-cursor-page-1",
+  "results": [
+    {
+      "attributes": null,
+      "id": "seed",
+      "score": 0.0
+    },
+    {
+      "attributes": null,
+      "id": "near",
+      "score": 0.010000001
+    }
+  ],
+  "scanned_fragments": 1,
+  "scanned_segments": 0
+}

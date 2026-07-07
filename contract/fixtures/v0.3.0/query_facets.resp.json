@@ -1,0 +1,54 @@
+{
+  "facets": {
+    "category": {
+      "alpha": 2,
+      "anchor": 1,
+      "beta": 2
+    },
+    "tags": {
+      "archive": 1,
+      "blue": 2,
+      "fresh": 3,
+      "red": 1
+    }
+  },
+  "results": [
+    {
+      "attributes": {
+        "category": "anchor",
+        "tags": [
+          "blue"
+        ],
+        "title": "anchor search"
+      },
+      "id": "seed",
+      "score": 0.0
+    },
+    {
+      "attributes": {
+        "category": "alpha",
+        "tags": [
+          "fresh",
+          "red"
+        ],
+        "title": "alpha search"
+      },
+      "id": "near",
+      "score": 0.010000001
+    },
+    {
+      "attributes": {
+        "category": "alpha",
+        "tags": [
+          "fresh",
+          "blue"
+        ],
+        "title": "beta search"
+      },
+      "id": "mid",
+      "score": 0.040000003
+    }
+  ],
+  "scanned_fragments": 1,
+  "scanned_segments": 0
+}

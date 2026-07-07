@@ -1,0 +1,7 @@
+{
+  "code": "NAMESPACE_NOT_FOUND",
+  "error": "namespace not found: contract-missing",
+  "request_id": "contract-error_not_found_404",
+  "retryable": false,
+  "status": 404
+}

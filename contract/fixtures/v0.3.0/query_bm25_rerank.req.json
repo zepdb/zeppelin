@@ -1,0 +1,22 @@
+{
+  "candidate_k": 5,
+  "consistency": "strong",
+  "rerank": {
+    "rank_by": [
+      "title",
+      "BM25",
+      "search"
+    ],
+    "type": "bm25"
+  },
+  "sources": [
+    {
+      "type": "ann",
+      "vector": [
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "top_k": 3
+}

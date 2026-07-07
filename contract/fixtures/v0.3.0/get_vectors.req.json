@@ -1,0 +1,14 @@
+{
+  "attribute_fields": [
+    "category",
+    "title"
+  ],
+  "consistency": "strong",
+  "ids": [
+    "seed",
+    "near",
+    "missing"
+  ],
+  "include_attributes": true,
+  "include_vector": true
+}

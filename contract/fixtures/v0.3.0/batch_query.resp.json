@@ -1,0 +1,39 @@
+{
+  "results": [
+    {
+      "metadata": {
+        "latency_ms": 0
+      },
+      "ok": true,
+      "response": {
+        "results": [
+          {
+            "attributes": {
+              "category": "anchor",
+              "tags": [
+                "blue"
+              ],
+              "title": "anchor search"
+            },
+            "id": "seed",
+            "score": 0.0
+          }
+        ],
+        "scanned_fragments": 1,
+        "scanned_segments": 0
+      }
+    },
+    {
+      "error": {
+        "code": "DIMENSION_MISMATCH",
+        "error": "dimension mismatch: expected 2, got 1",
+        "retryable": false,
+        "status": 400
+      },
+      "metadata": {
+        "latency_ms": 0
+      },
+      "ok": false
+    }
+  ]
+}

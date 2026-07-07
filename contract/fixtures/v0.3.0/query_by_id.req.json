@@ -1,0 +1,14 @@
+{
+  "candidate_k": 5,
+  "consistency": "strong",
+  "projection": {
+    "include_attributes": false
+  },
+  "sources": [
+    {
+      "id": "seed",
+      "type": "ann"
+    }
+  ],
+  "top_k": 3
+}

@@ -1,0 +1,41 @@
+{
+  "results": [
+    {
+      "attributes": {
+        "category": "anchor",
+        "tags": [
+          "blue"
+        ],
+        "title": "anchor search"
+      },
+      "id": "seed",
+      "score": 1.0
+    },
+    {
+      "attributes": {
+        "category": "alpha",
+        "tags": [
+          "fresh",
+          "red"
+        ],
+        "title": "alpha search"
+      },
+      "id": "near",
+      "score": 0.99300003
+    },
+    {
+      "attributes": {
+        "category": "alpha",
+        "tags": [
+          "fresh",
+          "blue"
+        ],
+        "title": "beta search"
+      },
+      "id": "mid",
+      "score": 0.972
+    }
+  ],
+  "scanned_fragments": 2,
+  "scanned_segments": 0
+}

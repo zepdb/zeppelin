@@ -1,0 +1,7 @@
+{
+  "code": "HYDRATION_DISABLED",
+  "error": "hydration is disabled by config",
+  "request_id": "contract-hydrate_namespace_disabled",
+  "retryable": false,
+  "status": 409
+}

@@ -1,0 +1,4 @@
+{
+  "cost_latency_profile": "low_latency",
+  "default_top_k": 3
+}

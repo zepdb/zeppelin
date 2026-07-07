@@ -1,0 +1,7 @@
+{
+  "code": "PAYLOAD_TOO_LARGE",
+  "error": "query batch size 3 exceeds maximum of 2",
+  "request_id": "contract-error_payload_too_large_413",
+  "retryable": false,
+  "status": 413
+}

@@ -1,0 +1,76 @@
+{
+  "vectors": [
+    {
+      "attributes": {
+        "category": "anchor",
+        "tags": [
+          "blue"
+        ],
+        "title": "anchor search"
+      },
+      "id": "seed",
+      "values": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "attributes": {
+        "category": "alpha",
+        "tags": [
+          "fresh",
+          "red"
+        ],
+        "title": "alpha search"
+      },
+      "id": "near",
+      "values": [
+        0.1,
+        0.0
+      ]
+    },
+    {
+      "attributes": {
+        "category": "alpha",
+        "tags": [
+          "fresh",
+          "blue"
+        ],
+        "title": "beta search"
+      },
+      "id": "mid",
+      "values": [
+        0.2,
+        0.0
+      ]
+    },
+    {
+      "attributes": {
+        "category": "beta",
+        "tags": [
+          "archive"
+        ],
+        "title": "gamma archive"
+      },
+      "id": "far",
+      "values": [
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "attributes": {
+        "category": "beta",
+        "tags": [
+          "fresh"
+        ],
+        "title": "search document"
+      },
+      "id": "other",
+      "values": [
+        0.0,
+        1.0
+      ]
+    }
+  ]
+}

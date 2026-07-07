@@ -1,0 +1,41 @@
+{
+  "results": [
+    {
+      "attributes": {
+        "category": "alpha",
+        "tags": [
+          "fresh",
+          "blue"
+        ],
+        "title": "beta search"
+      },
+      "id": "mid",
+      "score": 0.2876821
+    },
+    {
+      "attributes": {
+        "category": "alpha",
+        "tags": [
+          "fresh",
+          "red"
+        ],
+        "title": "alpha search"
+      },
+      "id": "near",
+      "score": 0.2876821
+    },
+    {
+      "attributes": {
+        "category": "beta",
+        "tags": [
+          "fresh"
+        ],
+        "title": "search document"
+      },
+      "id": "other",
+      "score": 0.2876821
+    }
+  ],
+  "scanned_fragments": 1,
+  "scanned_segments": 0
+}

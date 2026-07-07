@@ -1,0 +1,21 @@
+{
+  "results": [
+    {
+      "attributes": null,
+      "id": "near",
+      "score": 0.010000001
+    },
+    {
+      "attributes": null,
+      "id": "mid",
+      "score": 0.040000003
+    },
+    {
+      "attributes": null,
+      "id": "far",
+      "score": 1.0
+    }
+  ],
+  "scanned_fragments": 1,
+  "scanned_segments": 0
+}
