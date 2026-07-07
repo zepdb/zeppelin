@@ -306,6 +306,9 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/UpsertVectorsRequest"
+          application/msgpack:
+            schema:
+              $ref: "#/components/schemas/MessagePackUpsertRequest"
       responses:
         "200":
           description: Vectors upserted
@@ -1247,6 +1250,53 @@ components:
             Maximum item count is the default `server.max_batch_size`; servers
             may advertise a different configured cap operationally. Batches
             above the cap return 413 and are not partially committed.
+
+    MessagePackUpsertRequest:
+      oneOf:
+        - $ref: "#/components/schemas/UpsertVectorsRequest"
+        - $ref: "#/components/schemas/ColumnarUpsertEnvelope"
+      description: |
+        MessagePack upsert body. The row form is the same logical schema as
+        JSON (`vectors`). The columnar form carries the same logical vectors as
+        ids plus one row-major little-endian f32 byte buffer.
+
+    ColumnarUpsertEnvelope:
+      type: object
+      required: [columnar]
+      additionalProperties: false
+      properties:
+        columnar:
+          $ref: "#/components/schemas/ColumnarUpsertRequest"
+
+    ColumnarUpsertRequest:
+      type: object
+      required: [ids, dimensions, values_f32_le]
+      additionalProperties: false
+      properties:
+        ids:
+          type: array
+          items:
+            type: string
+          description: Vector ids in row order.
+        dimensions:
+          type: integer
+          minimum: 1
+          description: Number of f32 dimensions per vector.
+        values_f32_le:
+          type: string
+          format: binary
+          description: |
+            Row-major little-endian f32 bytes. Byte length must equal
+            `ids.length * dimensions * 4`.
+        attributes:
+          type: array
+          items:
+            anyOf:
+              - type: "null"
+              - type: object
+                additionalProperties:
+                  $ref: "#/components/schemas/AttributeValue"
+          description: Optional per-vector attributes in row order.
 
     DeleteVectorsRequest:
       type: object

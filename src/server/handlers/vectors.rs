@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{info, instrument};
 
 use crate::error::ZeppelinError;
@@ -24,6 +26,24 @@ use super::ApiError;
 pub struct UpsertVectorsRequest {
     /// Vectors to upsert (insert or update by ID).
     pub vectors: Vec<VectorEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessagePackUpsertRequest {
+    vectors: Option<Vec<VectorEntry>>,
+    columnar: Option<ColumnarUpsertRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColumnarUpsertRequest {
+    ids: Vec<VectorId>,
+    dimensions: usize,
+    #[serde(deserialize_with = "deserialize_f32_le_bytes")]
+    values_f32_le: Vec<f32>,
+    #[serde(default)]
+    attributes: Option<Vec<Option<HashMap<String, AttributeValue>>>>,
 }
 
 /// Response body confirming the number of vectors upserted.
@@ -103,13 +123,10 @@ fn default_true() -> bool {
 pub async fn upsert_vectors(
     State(state): State<AppState>,
     Path(ns): Path<String>,
+    headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<(StatusCode, Json<UpsertVectorsResponse>), ApiError> {
-    let req: UpsertVectorsRequest = serde_json::from_slice(&body).map_err(|e| {
-        ApiError(ZeppelinError::Validation(format!(
-            "invalid request body: {e}"
-        )))
-    })?;
+    let req = parse_upsert_request(&headers, &body)?;
     if req.vectors.is_empty() {
         return Err(ApiError(ZeppelinError::Validation(
             "vectors array cannot be empty".into(),
@@ -193,6 +210,153 @@ pub async fn upsert_vectors(
         StatusCode::OK,
         Json(UpsertVectorsResponse { upserted: count }),
     ))
+}
+
+fn parse_upsert_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<UpsertVectorsRequest, ApiError> {
+    if is_msgpack_content_type(headers) {
+        parse_msgpack_upsert_request(body)
+    } else {
+        serde_json::from_slice(body).map_err(|e| {
+            ApiError(ZeppelinError::Validation(format!(
+                "invalid request body: {e}"
+            )))
+        })
+    }
+}
+
+fn is_msgpack_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/msgpack"))
+}
+
+fn parse_msgpack_upsert_request(body: &[u8]) -> Result<UpsertVectorsRequest, ApiError> {
+    let req: MessagePackUpsertRequest = rmp_serde::from_slice(body).map_err(|e| {
+        ApiError(ZeppelinError::Validation(format!(
+            "invalid request body: {e}"
+        )))
+    })?;
+
+    match (req.vectors, req.columnar) {
+        (Some(vectors), None) => Ok(UpsertVectorsRequest { vectors }),
+        (None, Some(columnar)) => columnar.into_upsert_request(),
+        (Some(_), Some(_)) | (None, None) => Err(ApiError(ZeppelinError::Validation(
+            "msgpack upsert body must contain exactly one of vectors or columnar".into(),
+        ))),
+    }
+}
+
+impl ColumnarUpsertRequest {
+    fn into_upsert_request(self) -> Result<UpsertVectorsRequest, ApiError> {
+        if self.dimensions == 0 {
+            return Err(ApiError(ZeppelinError::Validation(
+                "columnar dimensions must be greater than zero".into(),
+            )));
+        }
+        let expected_values = self.ids.len().checked_mul(self.dimensions).ok_or_else(|| {
+            ApiError(ZeppelinError::Validation(
+                "columnar values length overflows usize".into(),
+            ))
+        })?;
+        if self.values_f32_le.len() != expected_values {
+            return Err(ApiError(ZeppelinError::Validation(format!(
+                "columnar values_f32_le contains {} floats, expected {} ({} ids * {} dimensions)",
+                self.values_f32_le.len(),
+                expected_values,
+                self.ids.len(),
+                self.dimensions
+            ))));
+        }
+        if let Some(attributes) = self.attributes.as_ref() {
+            if attributes.len() != self.ids.len() {
+                return Err(ApiError(ZeppelinError::Validation(format!(
+                    "columnar attributes contains {} entries, expected {}",
+                    attributes.len(),
+                    self.ids.len()
+                ))));
+            }
+        }
+
+        let attributes = self
+            .attributes
+            .unwrap_or_else(|| vec![None; self.ids.len()]);
+        let vectors = self
+            .ids
+            .into_iter()
+            .zip(self.values_f32_le.chunks_exact(self.dimensions))
+            .zip(attributes)
+            .map(|((id, values), attributes)| VectorEntry {
+                id,
+                values: values.to_vec(),
+                attributes,
+            })
+            .collect();
+        Ok(UpsertVectorsRequest { vectors })
+    }
+}
+
+fn deserialize_f32_le_bytes<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct F32LeVisitor;
+
+    impl<'de> Visitor<'de> for F32LeVisitor {
+        type Value = Vec<f32>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("little-endian f32 bytes")
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            f32_values_from_le_bytes(value)
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            f32_values_from_le_bytes(&value)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut bytes = Vec::new();
+            while let Some(byte) = seq.next_element()? {
+                bytes.push(byte);
+            }
+            f32_values_from_le_bytes(&bytes)
+        }
+    }
+
+    deserializer.deserialize_bytes(F32LeVisitor)
+}
+
+fn f32_values_from_le_bytes<E>(bytes: &[u8]) -> Result<Vec<f32>, E>
+where
+    E: de::Error,
+{
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+        return Err(E::custom(format!(
+            "values_f32_le byte length {} is not divisible by {}",
+            bytes.len(),
+            std::mem::size_of::<f32>()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
 }
 
 /// Deletes vectors by ID from the specified namespace via the WAL.
