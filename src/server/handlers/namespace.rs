@@ -9,7 +9,10 @@ use uuid::Uuid;
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
-use crate::namespace::manager::{CreateNamespaceOutcome, NamespaceMetadata};
+use crate::namespace::manager::{
+    CreateNamespaceOutcome, NamespaceIndexConfig, NamespaceMetadata,
+    COMPACTION_DEGRADED_FAILURE_THRESHOLD,
+};
 use crate::server::AppState;
 use crate::types::{DistanceMetric, IndexType};
 use crate::wal::manifest::SegmentRef;
@@ -30,7 +33,47 @@ pub struct CreateNamespaceRequest {
     /// Full-text search field configurations (empty map disables FTS).
     #[serde(default)]
     pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
+    /// Optional per-namespace index configuration for future compactions.
+    #[serde(default)]
+    pub index_config: Option<CreateNamespaceIndexConfig>,
 }
+
+/// Optional index config overrides accepted at namespace creation.
+#[derive(Debug, Deserialize)]
+pub struct CreateNamespaceIndexConfig {
+    /// Number of IVF centroids/clusters.
+    #[serde(default)]
+    pub nlist: Option<usize>,
+    /// Quantization mode.
+    #[serde(default)]
+    pub quantization: Option<QuantizationType>,
+    /// Number of product-quantization subquantizers.
+    #[serde(default)]
+    pub pq_m: Option<usize>,
+    /// Build hierarchical indexes for future compactions.
+    #[serde(default)]
+    pub hierarchical: Option<bool>,
+    /// Build FTS indexes for configured full-text fields.
+    #[serde(default)]
+    pub fts_index: Option<bool>,
+    /// Build bitmap indexes for future compactions.
+    #[serde(default)]
+    pub bitmap_index: Option<bool>,
+}
+
+impl CreateNamespaceIndexConfig {
+    fn is_empty(&self) -> bool {
+        self.nlist.is_none()
+            && self.quantization.is_none()
+            && self.pq_m.is_none()
+            && self.hierarchical.is_none()
+            && self.fts_index.is_none()
+            && self.bitmap_index.is_none()
+    }
+}
+
+/// Partial index config patch staged for the next compaction.
+pub type PatchNamespaceIndexConfigRequest = CreateNamespaceIndexConfig;
 
 fn default_distance_metric() -> DistanceMetric {
     DistanceMetric::Cosine
@@ -57,6 +100,21 @@ pub struct NamespaceResponse {
     pub quantization: Option<QuantizationType>,
     /// Index kind used by the namespace's active segment.
     pub index_kind: IndexType,
+    /// Effective index parameters for future compactions.
+    pub index_config: NamespaceIndexConfig,
+    /// Vector count in the active segment only.
+    pub active_segment_vector_count: usize,
+    /// RFC 3339 timestamp of the last compaction outcome, if any.
+    pub last_compaction_at: Option<String>,
+    /// Last recorded compaction status.
+    pub last_compaction_status: String,
+    /// Last compaction error, present only after a failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_compaction_error: Option<String>,
+    /// Consecutive compaction failures since the last success.
+    pub consecutive_compaction_failures: u32,
+    /// True after repeated compaction failures.
+    pub index_degraded: bool,
     /// RFC 3339 timestamp of namespace creation.
     pub created_at: String,
     /// RFC 3339 timestamp of the last update.
@@ -84,6 +142,19 @@ pub struct HydrateNamespaceResponse {
     pub segment_id: String,
 }
 
+/// Response body for an index config update.
+#[derive(Debug, Serialize)]
+pub struct UpdateIndexConfigResponse {
+    /// Namespace whose desired index config was updated.
+    pub namespace: String,
+    /// Effective index config staged for the next compaction.
+    pub index_config: NamespaceIndexConfig,
+    /// Stable status string for clients.
+    pub status: &'static str,
+    /// How to observe the asynchronous rewrite.
+    pub observe: String,
+}
+
 /// Response body for namespace creation.
 #[derive(Debug, Serialize)]
 pub struct CreateNamespaceResponse {
@@ -97,8 +168,14 @@ pub struct CreateNamespaceResponse {
 impl NamespaceResponse {
     /// Converts namespace metadata plus the authoritative manifest into the API response.
     #[must_use]
-    pub fn from_manifest(meta: NamespaceMetadata, manifest: &Manifest) -> Self {
+    pub fn from_manifest(
+        meta: NamespaceMetadata,
+        manifest: &Manifest,
+        default_indexing: &crate::config::IndexingConfig,
+    ) -> Self {
         let index_kind = namespace_index_kind(&meta, manifest);
+        let active_segment = active_segment_ref(manifest);
+        let compaction_health = meta.compaction_health.clone();
         Self {
             name: meta.name,
             dimensions: meta.dimensions,
@@ -107,8 +184,23 @@ impl NamespaceResponse {
             uncompacted_fragments: manifest.uncompacted_fragments().len(),
             segment_count: manifest.segments.len(),
             approximate_storage_bytes: manifest.approximate_storage_bytes(),
-            quantization: active_segment_ref(manifest).map(|segment| segment.quantization),
+            quantization: active_segment.map(|segment| segment.quantization),
             index_kind,
+            index_config: meta
+                .index_config
+                .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(default_indexing)),
+            active_segment_vector_count: active_segment.map_or(0, |segment| segment.vector_count),
+            last_compaction_at: compaction_health
+                .last_compaction_at
+                .map(|timestamp| timestamp.to_rfc3339()),
+            last_compaction_status: compaction_health
+                .last_compaction_status
+                .as_str()
+                .to_string(),
+            last_compaction_error: compaction_health.last_compaction_error,
+            consecutive_compaction_failures: compaction_health.consecutive_failures,
+            index_degraded: compaction_health.consecutive_failures
+                >= COMPACTION_DEGRADED_FAILURE_THRESHOLD,
             created_at: meta.created_at.to_rfc3339(),
             updated_at: meta.updated_at.to_rfc3339(),
             state: meta.state.as_str().to_string(),
@@ -129,16 +221,23 @@ pub async fn create_namespace(
             req.dimensions, state.config.server.max_dimensions
         ))));
     }
+    let index_config = resolve_namespace_index_config(
+        req.index_config.as_ref(),
+        &state.config.indexing,
+        req.dimensions,
+    )
+    .map_err(ApiError::from)?;
 
     if let Some(name) = req.name {
         info!(namespace = %name, dimensions = req.dimensions, "creating namespace by client name");
         let outcome = state
             .namespace_manager
-            .create_idempotent_with_fts(
+            .create_idempotent_with_fts_and_index_config(
                 &name,
                 req.dimensions,
                 req.distance_metric,
                 req.full_text_search,
+                Some(index_config),
             )
             .await
             .map_err(ApiError::from)?;
@@ -155,7 +254,11 @@ pub async fn create_namespace(
         return Ok((
             status,
             Json(CreateNamespaceResponse {
-                namespace: NamespaceResponse::from_manifest(meta, &Manifest::new()),
+                namespace: NamespaceResponse::from_manifest(
+                    meta,
+                    &Manifest::new(),
+                    &state.config.indexing,
+                ),
                 warning:
                     "Client-specified namespace names are idempotent for identical configuration."
                         .to_string(),
@@ -167,11 +270,12 @@ pub async fn create_namespace(
     info!(namespace = %name, dimensions = req.dimensions, "creating generated namespace");
     let meta = state
         .namespace_manager
-        .create_with_fts(
+        .create_with_fts_and_index_config(
             &name,
             req.dimensions,
             req.distance_metric,
             req.full_text_search,
+            Some(index_config),
         )
         .await
         .map_err(ApiError::from)?;
@@ -180,10 +284,71 @@ pub async fn create_namespace(
     Ok((
         StatusCode::CREATED,
         Json(CreateNamespaceResponse {
-            namespace: NamespaceResponse::from_manifest(meta, &Manifest::new()),
+            namespace: NamespaceResponse::from_manifest(
+                meta,
+                &Manifest::new(),
+                &state.config.indexing,
+            ),
             warning: "Save this namespace name. It cannot be recovered if lost.".to_string(),
         }),
     ))
+}
+
+fn resolve_namespace_index_config(
+    request: Option<&CreateNamespaceIndexConfig>,
+    defaults: &crate::config::IndexingConfig,
+    dimensions: usize,
+) -> Result<NamespaceIndexConfig, ZeppelinError> {
+    let mut config = NamespaceIndexConfig::from_indexing_config(defaults);
+    if let Some(request) = request {
+        if let Some(nlist) = request.nlist {
+            config.nlist = nlist;
+        }
+        if let Some(quantization) = request.quantization {
+            config.quantization = quantization;
+        }
+        if let Some(pq_m) = request.pq_m {
+            config.pq_m = pq_m;
+        }
+        if let Some(hierarchical) = request.hierarchical {
+            config.hierarchical = hierarchical;
+        }
+        if let Some(fts_index) = request.fts_index {
+            config.fts_index = fts_index;
+        }
+        if let Some(bitmap_index) = request.bitmap_index {
+            config.bitmap_index = bitmap_index;
+        }
+    }
+    config.validate(dimensions)?;
+    Ok(config)
+}
+
+fn apply_namespace_index_config_patch(
+    mut config: NamespaceIndexConfig,
+    request: &PatchNamespaceIndexConfigRequest,
+    dimensions: usize,
+) -> Result<NamespaceIndexConfig, ZeppelinError> {
+    if let Some(nlist) = request.nlist {
+        config.nlist = nlist;
+    }
+    if let Some(quantization) = request.quantization {
+        config.quantization = quantization;
+    }
+    if let Some(pq_m) = request.pq_m {
+        config.pq_m = pq_m;
+    }
+    if let Some(hierarchical) = request.hierarchical {
+        config.hierarchical = hierarchical;
+    }
+    if let Some(fts_index) = request.fts_index {
+        config.fts_index = fts_index;
+    }
+    if let Some(bitmap_index) = request.bitmap_index {
+        config.bitmap_index = bitmap_index;
+    }
+    config.validate(dimensions)?;
+    Ok(config)
 }
 
 fn generated_namespace_name(prefix: Option<&str>) -> String {
@@ -210,7 +375,7 @@ pub async fn list_namespaces(
     let empty_manifest = Manifest::new();
     let responses: Vec<NamespaceResponse> = namespaces
         .into_iter()
-        .map(|meta| NamespaceResponse::from_manifest(meta, &empty_manifest))
+        .map(|meta| NamespaceResponse::from_manifest(meta, &empty_manifest, &state.config.indexing))
         .collect();
     Ok(Json(responses))
 }
@@ -236,7 +401,58 @@ pub async fn get_namespace(
         .await
         .map_err(ApiError::from)?;
 
-    Ok(Json(NamespaceResponse::from_manifest(meta, &manifest)))
+    Ok(Json(NamespaceResponse::from_manifest(
+        meta,
+        &manifest,
+        &state.config.indexing,
+    )))
+}
+
+/// Stages a new per-namespace index config for the next compaction.
+#[instrument(skip(state), fields(namespace = %ns))]
+pub async fn patch_index_config(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+    Json(req): Json<PatchNamespaceIndexConfigRequest>,
+) -> Result<(StatusCode, Json<UpdateIndexConfigResponse>), ApiError> {
+    if req.is_empty() {
+        return Err(ApiError(ZeppelinError::Validation(
+            "index_config patch must include at least one field".into(),
+        )));
+    }
+    let meta = state
+        .namespace_manager
+        .get(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    let current = meta
+        .index_config
+        .clone()
+        .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(&state.config.indexing));
+    let next = apply_namespace_index_config_patch(current, &req, meta.dimensions)
+        .map_err(ApiError::from)?;
+    let updated = state
+        .namespace_manager
+        .update_index_config(&ns, next)
+        .await
+        .map_err(ApiError::from)?;
+    let index_config = updated.index_config.ok_or_else(|| {
+        ApiError(ZeppelinError::Index(
+            "index_config update did not persist index_config".into(),
+        ))
+    })?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(UpdateIndexConfigResponse {
+            namespace: ns.clone(),
+            index_config,
+            status: "accepted",
+            observe: format!(
+                "applies asynchronously on the next compaction; observe GET /v1/namespaces/{ns}"
+            ),
+        }),
+    ))
 }
 
 /// Deletes a namespace and cleans up associated in-memory state.

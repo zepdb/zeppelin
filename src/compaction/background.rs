@@ -433,6 +433,15 @@ pub async fn compaction_loop(
                             crate::metrics::COMPACTIONS_TOTAL
                                 .with_label_values(&[ns.name.as_str(), "success"])
                                 .inc();
+                            if let Err(e) =
+                                namespace_manager.record_compaction_success(&ns.name).await
+                            {
+                                warn!(
+                                    namespace = %ns.name,
+                                    error = %e,
+                                    "failed to record compaction success health"
+                                );
+                            }
                             // Invalidate manifest cache so queries see new segment.
                             manifest_cache.invalidate(&ns.name);
                             info!(
@@ -459,6 +468,16 @@ pub async fn compaction_loop(
                             crate::metrics::COMPACTIONS_TOTAL
                                 .with_label_values(&[ns.name.as_str(), "failure"])
                                 .inc();
+                            if let Err(health_error) = namespace_manager
+                                .record_compaction_failure(&ns.name, &e)
+                                .await
+                            {
+                                warn!(
+                                    namespace = %ns.name,
+                                    error = %health_error,
+                                    "failed to record compaction failure health"
+                                );
+                            }
                             warn!(namespace = %ns.name, error = %e, "compaction failed");
                         }
                     }

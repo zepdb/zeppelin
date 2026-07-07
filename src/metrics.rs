@@ -47,6 +47,11 @@ mod inner {
             "Incremental compactions that fell back to a full retrain",
             &["namespace", "reason"]
         ).unwrap();
+        pub static ref COMPACTION_NAMESPACE_DEGRADED: IntGaugeVec = register_int_gauge_vec!(
+            "zeppelin_compaction_namespace_degraded",
+            "Whether a namespace is degraded after repeated compaction failures",
+            &["namespace"]
+        ).unwrap();
 
         // New metrics — Phase 6
         pub static ref S3_OPERATION_DURATION: HistogramVec = register_histogram_vec!(
@@ -231,6 +236,7 @@ pub fn init() {
     lazy_static::initialize(&COMPACTION_READ_OPS_TOTAL);
     lazy_static::initialize(&COMPACTION_FULL_RETRAIN_TOTAL);
     lazy_static::initialize(&COMPACTION_INCREMENTAL_FALLBACK_TOTAL);
+    lazy_static::initialize(&COMPACTION_NAMESPACE_DEGRADED);
     lazy_static::initialize(&S3_OPERATION_DURATION);
     lazy_static::initialize(&S3_ERRORS_TOTAL);
     lazy_static::initialize(&COMPACTION_DURATION);

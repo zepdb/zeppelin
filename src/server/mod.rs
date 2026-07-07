@@ -9,7 +9,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, State};
 use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::Router;
 use dashmap::DashMap;
 use tokio::sync::Semaphore;
@@ -345,6 +345,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/namespaces/:ns",
             get(namespace::get_namespace).delete(namespace::delete_namespace),
+        )
+        .route(
+            "/v1/namespaces/:ns/index_config",
+            patch(namespace::patch_index_config),
         )
         .route(
             "/v1/namespaces/:ns/hydrate",

@@ -5,12 +5,16 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tracing::{info, instrument};
 
+use crate::config::IndexingConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
+use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, IndexType};
 
 const DEFAULT_NAMESPACE_REGISTRY_TTL: Duration = Duration::from_secs(5);
+/// Consecutive compaction failures before a namespace is reported degraded.
+pub const COMPACTION_DEGRADED_FAILURE_THRESHOLD: u32 = 5;
 
 /// Lifecycle state stored in `meta.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -32,6 +36,114 @@ impl NamespaceState {
             NamespaceState::Deleting => "deleting",
         }
     }
+}
+
+/// Per-namespace indexing parameters persisted in `meta.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamespaceIndexConfig {
+    /// Number of IVF centroids/clusters to train for future compactions.
+    pub nlist: usize,
+    /// Vector quantization mode.
+    pub quantization: QuantizationType,
+    /// Number of product-quantization subquantizers.
+    pub pq_m: usize,
+    /// Whether future compactions build a hierarchical index.
+    pub hierarchical: bool,
+    /// Whether future compactions build FTS segment indexes.
+    pub fts_index: bool,
+    /// Whether future compactions build bitmap segment indexes.
+    pub bitmap_index: bool,
+}
+
+impl NamespaceIndexConfig {
+    /// Build a persisted namespace config from the server default indexing config.
+    #[must_use]
+    pub fn from_indexing_config(config: &IndexingConfig) -> Self {
+        Self {
+            nlist: config.default_num_centroids,
+            quantization: config.quantization,
+            pq_m: config.pq_m,
+            hierarchical: config.hierarchical,
+            fts_index: config.fts_index,
+            bitmap_index: config.bitmap_index,
+        }
+    }
+
+    /// Overlay this namespace config onto a full server indexing config.
+    #[must_use]
+    pub fn apply_to_indexing_config(&self, base: &IndexingConfig) -> IndexingConfig {
+        let mut config = base.clone();
+        config.default_num_centroids = self.nlist;
+        config.quantization = self.quantization;
+        config.pq_m = self.pq_m;
+        config.hierarchical = self.hierarchical;
+        config.fts_index = self.fts_index;
+        config.bitmap_index = self.bitmap_index;
+        config
+    }
+
+    /// Validate parameters that depend on namespace shape.
+    pub fn validate(&self, dimensions: usize) -> Result<()> {
+        if self.nlist == 0 {
+            return Err(ZeppelinError::Validation(
+                "index_config.nlist must be >= 1".into(),
+            ));
+        }
+        if self.pq_m == 0 {
+            return Err(ZeppelinError::Validation(
+                "index_config.pq_m must be >= 1".into(),
+            ));
+        }
+        if self.quantization == QuantizationType::Product && dimensions % self.pq_m != 0 {
+            return Err(ZeppelinError::Validation(format!(
+                "index_config.pq_m ({}) must divide dimensions ({}) when quantization=product",
+                self.pq_m, dimensions
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Stable compaction status stored in namespace metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStatus {
+    /// No compaction outcome has been recorded yet.
+    #[default]
+    Never,
+    /// Last compaction completed successfully.
+    Success,
+    /// Last compaction failed.
+    Failure,
+}
+
+impl CompactionStatus {
+    /// Stable API string.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+/// Namespace compaction/index health persisted in `meta.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CompactionHealth {
+    /// Last compaction completion/failure time.
+    #[serde(default)]
+    pub last_compaction_at: Option<DateTime<Utc>>,
+    /// Last recorded compaction status.
+    #[serde(default)]
+    pub last_compaction_status: CompactionStatus,
+    /// Last failure message, cleared on success.
+    #[serde(default)]
+    pub last_compaction_error: Option<String>,
+    /// Consecutive failure count since the last success.
+    #[serde(default)]
+    pub consecutive_failures: u32,
 }
 
 /// Metadata for a namespace, stored as meta.json on S3.
@@ -58,6 +170,13 @@ pub struct NamespaceMetadata {
     /// Empty map means FTS is not enabled for this namespace.
     #[serde(default)]
     pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
+    /// Per-namespace indexing parameters. `None` means legacy metadata and is
+    /// resolved from the current server config by callers.
+    #[serde(default)]
+    pub index_config: Option<NamespaceIndexConfig>,
+    /// Compaction/index health surfaced through namespace reads.
+    #[serde(default)]
+    pub compaction_health: CompactionHealth,
 }
 
 impl NamespaceMetadata {
@@ -143,6 +262,26 @@ impl NamespaceManager {
         distance_metric: DistanceMetric,
         full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
     ) -> Result<NamespaceMetadata> {
+        self.create_with_fts_and_index_config(
+            name,
+            dimensions,
+            distance_metric,
+            full_text_search,
+            None,
+        )
+        .await
+    }
+
+    /// Create a new namespace with optional FTS and per-namespace index config.
+    #[instrument(skip(self, full_text_search), fields(namespace = name))]
+    pub async fn create_with_fts_and_index_config(
+        &self,
+        name: &str,
+        dimensions: usize,
+        distance_metric: DistanceMetric,
+        full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
+        index_config: Option<NamespaceIndexConfig>,
+    ) -> Result<NamespaceMetadata> {
         // Validate namespace name
         if !is_valid_namespace_name(name) {
             return Err(ZeppelinError::Validation(format!(
@@ -158,6 +297,9 @@ impl NamespaceManager {
         }
         for (field, config) in &full_text_search {
             config.validate(&format!("full_text_search.{field}"))?;
+        }
+        if let Some(index_config) = index_config.as_ref() {
+            index_config.validate(dimensions)?;
         }
 
         // Atomic create: write meta.json only if it doesn't already exist.
@@ -177,6 +319,8 @@ impl NamespaceManager {
             updated_at: now,
             state: NamespaceState::Active,
             full_text_search,
+            index_config,
+            compaction_health: CompactionHealth::default(),
         };
 
         // Atomic write — returns NamespaceAlreadyExists if meta.json exists
@@ -226,8 +370,37 @@ impl NamespaceManager {
         distance_metric: DistanceMetric,
         full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
     ) -> Result<CreateNamespaceOutcome> {
+        self.create_idempotent_with_fts_and_index_config(
+            name,
+            dimensions,
+            distance_metric,
+            full_text_search,
+            None,
+        )
+        .await
+    }
+
+    /// Idempotently create a namespace by client name, including index config.
+    #[instrument(skip(self, full_text_search), fields(namespace = name))]
+    pub async fn create_idempotent_with_fts_and_index_config(
+        &self,
+        name: &str,
+        dimensions: usize,
+        distance_metric: DistanceMetric,
+        full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
+        index_config: Option<NamespaceIndexConfig>,
+    ) -> Result<CreateNamespaceOutcome> {
+        if let Some(index_config) = index_config.as_ref() {
+            index_config.validate(dimensions)?;
+        }
         match self
-            .create_with_fts(name, dimensions, distance_metric, full_text_search.clone())
+            .create_with_fts_and_index_config(
+                name,
+                dimensions,
+                distance_metric,
+                full_text_search.clone(),
+                index_config.clone(),
+            )
             .await
         {
             Ok(meta) => Ok(CreateNamespaceOutcome::Created(meta)),
@@ -243,6 +416,7 @@ impl NamespaceManager {
                     dimensions,
                     distance_metric,
                     &full_text_search,
+                    &index_config,
                 )? {
                     return Ok(CreateNamespaceOutcome::Existing(existing));
                 }
@@ -466,6 +640,109 @@ impl NamespaceManager {
         Ok(outcome)
     }
 
+    /// Persist a new desired index config for future compactions.
+    #[instrument(skip(self, index_config), fields(namespace = name))]
+    pub async fn update_index_config(
+        &self,
+        name: &str,
+        index_config: NamespaceIndexConfig,
+    ) -> Result<NamespaceMetadata> {
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..10 {
+            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+            let meta_name = meta.name.clone();
+            self.ensure_active(meta.clone())?;
+            index_config.validate(meta.dimensions)?;
+
+            meta.index_config = Some(index_config.clone());
+            meta.updated_at = Utc::now();
+            let etag = etag.unwrap_or_default();
+            match self
+                .store
+                .put_if_match(&key, meta.to_bytes()?, &etag, &meta_name)
+                .await
+            {
+                Ok(()) => {
+                    self.insert_registry(meta.clone());
+                    return Ok(meta);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(ZeppelinError::ManifestConflict {
+            namespace: name.to_string(),
+        })
+    }
+
+    /// Record a successful compaction outcome in namespace health metadata.
+    #[instrument(skip(self), fields(namespace = name))]
+    pub async fn record_compaction_success(&self, name: &str) -> Result<NamespaceMetadata> {
+        self.update_compaction_health(name, |health| {
+            health.last_compaction_at = Some(Utc::now());
+            health.last_compaction_status = CompactionStatus::Success;
+            health.last_compaction_error = None;
+            health.consecutive_failures = 0;
+        })
+        .await
+    }
+
+    /// Record a failed compaction outcome in namespace health metadata.
+    #[instrument(skip(self), fields(namespace = name))]
+    pub async fn record_compaction_failure(
+        &self,
+        name: &str,
+        error: &ZeppelinError,
+    ) -> Result<NamespaceMetadata> {
+        let message = error.to_string();
+        self.update_compaction_health(name, |health| {
+            health.last_compaction_at = Some(Utc::now());
+            health.last_compaction_status = CompactionStatus::Failure;
+            health.last_compaction_error = Some(message.clone());
+            health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        })
+        .await
+    }
+
+    async fn update_compaction_health(
+        &self,
+        name: &str,
+        update: impl Fn(&mut CompactionHealth),
+    ) -> Result<NamespaceMetadata> {
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..10 {
+            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+            let meta_name = meta.name.clone();
+            self.ensure_active(meta.clone())?;
+
+            update(&mut meta.compaction_health);
+            meta.updated_at = Utc::now();
+            let degraded = meta.compaction_health.consecutive_failures
+                >= COMPACTION_DEGRADED_FAILURE_THRESHOLD;
+            let etag = etag.unwrap_or_default();
+            match self
+                .store
+                .put_if_match(&key, meta.to_bytes()?, &etag, &meta_name)
+                .await
+            {
+                Ok(()) => {
+                    self.insert_registry(meta.clone());
+                    crate::metrics::COMPACTION_NAMESPACE_DEGRADED
+                        .with_label_values(&[name])
+                        .set(i64::from(degraded));
+                    return Ok(meta);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(ZeppelinError::ManifestConflict {
+            namespace: name.to_string(),
+        })
+    }
+
     async fn mark_deleting(&self, name: &str) -> Result<NamespaceMetadata> {
         let key = NamespaceMetadata::s3_key(name);
         for _ in 0..2 {
@@ -551,10 +828,12 @@ fn namespace_config_matches(
     dimensions: usize,
     distance_metric: DistanceMetric,
     full_text_search: &std::collections::HashMap<String, FtsFieldConfig>,
+    index_config: &Option<NamespaceIndexConfig>,
 ) -> Result<bool> {
     Ok(existing.dimensions == dimensions
         && existing.distance_metric == distance_metric
-        && fts_config_value(&existing.full_text_search)? == fts_config_value(full_text_search)?)
+        && fts_config_value(&existing.full_text_search)? == fts_config_value(full_text_search)?
+        && existing.index_config == *index_config)
 }
 
 fn fts_config_value(

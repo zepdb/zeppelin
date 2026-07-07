@@ -164,6 +164,43 @@ paths:
         "404":
           $ref: "#/components/responses/NotFoundError"
 
+  /v1/namespaces/{ns}/index_config:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    patch:
+      operationId: updateNamespaceIndexConfig
+      summary: Stage namespace index config
+      description: |
+        Stages per-namespace indexing parameters for future compactions. The
+        response returns after `meta.json` is updated; the active segment is
+        rewritten asynchronously on the next compaction. Observe progress and
+        health with `GET /v1/namespaces/{ns}`.
+      tags: [Namespaces]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchNamespaceIndexConfigRequest"
+      responses:
+        "202":
+          description: Index config update accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateIndexConfigResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "410":
+          $ref: "#/components/responses/NamespaceDeletingError"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
   /v1/namespaces/{ns}/hydrate:
     parameters:
       - $ref: "#/components/parameters/NamespacePath"
@@ -524,6 +561,55 @@ components:
       enum: [none, scalar, product]
       description: Quantization mode recorded on the active segment.
 
+    NamespaceIndexConfig:
+      type: object
+      required: [nlist, quantization, pq_m, hierarchical, fts_index, bitmap_index]
+      properties:
+        nlist:
+          type: integer
+          minimum: 1
+          description: Number of IVF centroids/clusters used by future compactions.
+        quantization:
+          $ref: "#/components/schemas/QuantizationType"
+        pq_m:
+          type: integer
+          minimum: 1
+          description: Product-quantization subquantizers; must divide namespace dimensions when quantization is `product`.
+        hierarchical:
+          type: boolean
+          description: Whether future compactions build a hierarchical index.
+        fts_index:
+          type: boolean
+          description: Whether future compactions build segment FTS indexes.
+        bitmap_index:
+          type: boolean
+          description: Whether future compactions build bitmap prefilter indexes.
+
+    CreateNamespaceIndexConfig:
+      type: object
+      properties:
+        nlist:
+          type: integer
+          minimum: 1
+        quantization:
+          $ref: "#/components/schemas/QuantizationType"
+        pq_m:
+          type: integer
+          minimum: 1
+        hierarchical:
+          type: boolean
+        fts_index:
+          type: boolean
+        bitmap_index:
+          type: boolean
+      description: Partial per-namespace index config overlay.
+
+    PatchNamespaceIndexConfigRequest:
+      allOf:
+        - $ref: "#/components/schemas/CreateNamespaceIndexConfig"
+      minProperties: 1
+      description: Partial per-namespace index config update; at least one field is required.
+
     IndexKind:
       type: string
       enum: [ivf_flat, ivf_sq, ivf_pq, hierarchical]
@@ -871,6 +957,9 @@ components:
           additionalProperties:
             $ref: "#/components/schemas/FtsFieldConfig"
           description: Per-field FTS configuration. Keys are attribute field names.
+        index_config:
+          $ref: "#/components/schemas/CreateNamespaceIndexConfig"
+          description: Optional per-namespace index config. Missing fields inherit server defaults.
 
     CreateNamespaceResponse:
       description: Response from namespace creation or idempotent create-by-name.
@@ -896,6 +985,12 @@ components:
         - approximate_storage_bytes
         - quantization
         - index_kind
+        - index_config
+        - active_segment_vector_count
+        - last_compaction_at
+        - last_compaction_status
+        - consecutive_compaction_failures
+        - index_degraded
         - created_at
         - updated_at
         - state
@@ -936,6 +1031,30 @@ components:
           description: Active segment quantization mode, or null before first compaction.
         index_kind:
           $ref: "#/components/schemas/IndexKind"
+        index_config:
+          $ref: "#/components/schemas/NamespaceIndexConfig"
+          description: Effective desired index parameters for future compactions.
+        active_segment_vector_count:
+          type: integer
+          description: Vector count in the active segment only, excluding uncompacted WAL.
+        last_compaction_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Last recorded compaction completion or failure timestamp.
+        last_compaction_status:
+          type: string
+          enum: [never, success, failure]
+          description: Last recorded compaction status.
+        last_compaction_error:
+          type: string
+          description: Last compaction failure message. Omitted unless the last compaction failed.
+        consecutive_compaction_failures:
+          type: integer
+          description: Consecutive compaction failures since the last success.
+        index_degraded:
+          type: boolean
+          description: True after five consecutive compaction failures.
         created_at:
           type: string
           format: date-time
@@ -974,6 +1093,21 @@ components:
         segment_id:
           type: string
           description: Active segment id queued into the hydrator pipeline.
+
+    UpdateIndexConfigResponse:
+      type: object
+      required: [namespace, index_config, status, observe]
+      properties:
+        namespace:
+          type: string
+        index_config:
+          $ref: "#/components/schemas/NamespaceIndexConfig"
+        status:
+          type: string
+          const: accepted
+        observe:
+          type: string
+          description: Human-readable observation hint for the asynchronous compaction rewrite.
 
     UpsertVectorsRequest:
       type: object

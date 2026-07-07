@@ -22,6 +22,7 @@ use crate::index::ivf_flat::build::{
 use crate::index::ivf_flat::membership::{
     build_membership_artifact, deserialize_membership, MembershipData,
 };
+use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
 use crate::storage::ZeppelinStore;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
@@ -53,6 +54,30 @@ async fn get_compaction_read(
         .with_label_values(&[namespace, class])
         .inc_by(data.len() as u64);
     Ok(data)
+}
+
+fn active_segment_ref(manifest: &Manifest) -> Option<&SegmentRef> {
+    let active_segment = manifest.active_segment.as_ref()?;
+    manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == *active_segment)
+}
+
+fn manifest_needs_index_rewrite(manifest: &Manifest, config: &IndexingConfig) -> bool {
+    active_segment_ref(manifest)
+        .is_some_and(|segment| !segment_matches_index_config(segment, config))
+}
+
+fn segment_matches_index_config(segment: &SegmentRef, config: &IndexingConfig) -> bool {
+    if segment.quantization != config.quantization || segment.hierarchical != config.hierarchical {
+        return false;
+    }
+    if segment.hierarchical {
+        return true;
+    }
+    let expected_clusters = config.default_num_centroids.min(segment.vector_count);
+    segment.cluster_count == expected_clusters
 }
 
 /// Result of a compaction run.
@@ -145,19 +170,41 @@ impl Compactor {
         &self.store
     }
 
+    async fn effective_indexing_config(&self, namespace: &str) -> Result<IndexingConfig> {
+        let key = NamespaceMetadata::s3_key(namespace);
+        match self.store.get(&key).await {
+            Ok(data) => {
+                let meta = NamespaceMetadata::from_bytes(&data)?;
+                if meta.state == NamespaceState::Deleting {
+                    return Err(ZeppelinError::NamespaceDeleting {
+                        namespace: namespace.to_string(),
+                    });
+                }
+                if let Some(namespace_config) = meta.index_config.as_ref() {
+                    namespace_config.validate(meta.dimensions)?;
+                    return Ok(namespace_config.apply_to_indexing_config(&self.indexing_config));
+                }
+                Ok(self.indexing_config.clone())
+            }
+            Err(ZeppelinError::NotFound { .. }) => Ok(self.indexing_config.clone()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Check whether compaction should be triggered for a namespace.
     ///
-    /// Three independent triggers, evaluated from the manifest alone (no
-    /// additional S3 reads):
+    /// Four independent triggers:
     /// - **count**: uncompacted fragments >= `max_wal_fragments_before_compact`
     /// - **age**: oldest uncompacted fragment (from its ULID timestamp) is
     ///   >= `max_wal_age_before_compact_secs` old — guarantees any namespace
     ///   with pending WAL data converges within a bounded window
     /// - **bytes**: total uncompacted WAL bytes (recorded at write time in
     ///   `FragmentRef.size_bytes`) >= `max_wal_bytes_before_compact`
+    /// - **index config**: the active segment's manifest-visible layout no
+    ///   longer matches the namespace's desired index config.
     ///
-    /// A namespace with zero uncompacted fragments never triggers, regardless
-    /// of configuration.
+    /// A namespace with zero uncompacted fragments only triggers when an
+    /// active-segment rewrite is needed for a staged index config change.
     #[instrument(skip(self), fields(namespace = namespace))]
     pub async fn should_compact(&self, namespace: &str) -> Result<bool> {
         let manifest = Manifest::read(&self.store, namespace)
@@ -168,6 +215,11 @@ impl Compactor {
         // Idle namespace: nothing to compact, never trigger (no busy work,
         // no S3 churn on quiet namespaces).
         if fragments.is_empty() {
+            let indexing_config = self.effective_indexing_config(namespace).await?;
+            if manifest_needs_index_rewrite(&manifest, &indexing_config) {
+                info!("compaction triggered by index config layout change");
+                return Ok(true);
+            }
             debug!("no uncompacted fragments, compaction not needed");
             return Ok(false);
         }
@@ -279,9 +331,11 @@ impl Compactor {
         let manifest = Manifest::read(&self.store, namespace)
             .await?
             .unwrap_or_default();
+        let indexing_config = self.effective_indexing_config(namespace).await?;
+        let rewrite_for_index_config = manifest_needs_index_rewrite(&manifest, &indexing_config);
 
         // 2. If no uncompacted fragments → no-op
-        if manifest.uncompacted_fragments().is_empty() {
+        if manifest.uncompacted_fragments().is_empty() && !rewrite_for_index_config {
             debug!("no uncompacted fragments, skipping");
             return Ok(CompactionResult {
                 segment_id: None,
@@ -298,11 +352,14 @@ impl Compactor {
         // appended concurrently can sort <= the snapshot max (same-ms ULIDs
         // or clock skew) and a watermark comparison would silently drop it.
         let compacted_ids: HashSet<Ulid> = fragment_refs.iter().map(|f| f.id).collect();
-        if compacted_ids.is_empty() {
+        if compacted_ids.is_empty() && !rewrite_for_index_config {
             return Err(ZeppelinError::Index("no fragments to compact".into()));
         }
 
-        info!(fragment_count = fragments_removed, "starting compaction");
+        info!(
+            fragment_count = fragments_removed,
+            rewrite_for_index_config, "starting compaction"
+        );
 
         // 3. Read fragments using snapshot refs (not re-reading manifest).
         // Uses unchecked read — fragments were validated on write.
@@ -366,8 +423,9 @@ impl Compactor {
         } else {
             new_from_wal as f64 / existing_count as f64
         };
-        let should_retrain =
-            existing_count == 0 || retrain_ratio > self.config.retrain_imbalance_threshold;
+        let should_retrain = rewrite_for_index_config
+            || existing_count == 0
+            || retrain_ratio > self.config.retrain_imbalance_threshold;
         if should_retrain {
             crate::metrics::COMPACTION_FULL_RETRAIN_TOTAL
                 .with_label_values(&[namespace])
@@ -385,7 +443,7 @@ impl Compactor {
             && old_segment_ref
                 .as_ref()
                 .is_some_and(|segment| !segment.hierarchical)
-            && !self.indexing_config.hierarchical;
+            && !indexing_config.hierarchical;
         let bounded_incremental = if incremental_candidate {
             if !fts_configs.is_empty() {
                 crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
@@ -588,6 +646,7 @@ impl Compactor {
                     old_segment_id.as_deref().ok_or_else(|| {
                         ZeppelinError::Index("no old segment for bounded incremental build".into())
                     })?,
+                    &indexing_config,
                     &segment_id,
                     &latest_vectors,
                     &deleted_ids,
@@ -656,7 +715,7 @@ impl Compactor {
                     vectors_compacted = full_vectors.len();
                     let index = build_ivf_flat(
                         &full_vectors,
-                        &self.indexing_config,
+                        &indexing_config,
                         &self.store,
                         namespace,
                         &segment_id,
@@ -683,6 +742,7 @@ impl Compactor {
                     old_segment_id.as_deref().ok_or_else(|| {
                         ZeppelinError::Index("no old segment for incremental build".into())
                     })?,
+                    &indexing_config,
                     &segment_id,
                     &vectors,
                     &wal_touched_ids,
@@ -739,7 +799,7 @@ impl Compactor {
                     warn!(error = %e, "incremental build failed, falling back to full retrain");
                     let index = build_ivf_flat(
                         &vectors,
-                        &self.indexing_config,
+                        &indexing_config,
                         &self.store,
                         namespace,
                         &segment_id,
@@ -758,10 +818,10 @@ impl Compactor {
                     )
                 }
             }
-        } else if self.indexing_config.hierarchical {
+        } else if indexing_config.hierarchical {
             let h_index = build_hierarchical(
                 &vectors,
-                &self.indexing_config,
+                &indexing_config,
                 &self.store,
                 namespace,
                 &segment_id,
@@ -781,7 +841,7 @@ impl Compactor {
         } else {
             let index = build_ivf_flat(
                 &vectors,
-                &self.indexing_config,
+                &indexing_config,
                 &self.store,
                 namespace,
                 &segment_id,
@@ -869,7 +929,7 @@ impl Compactor {
 
         // 8b. Build FTS inverted indexes (if FTS fields configured)
         let mut has_global_fts = false;
-        let fts_fields: Vec<String> = if !fts_configs.is_empty() && self.indexing_config.fts_index {
+        let fts_fields: Vec<String> = if !fts_configs.is_empty() && indexing_config.fts_index {
             let fts_start = std::time::Instant::now();
             let mut fts_field_names = Vec::new();
 
@@ -1047,7 +1107,7 @@ impl Compactor {
                     id: segment_id.clone(),
                     vector_count: vectors_compacted,
                     cluster_count,
-                    quantization: self.indexing_config.quantization,
+                    quantization: indexing_config.quantization,
                     hierarchical: is_hierarchical,
                     bitmap_fields: bitmap_fields.clone(),
                     fts_fields: fts_fields.clone(),
@@ -1156,6 +1216,7 @@ impl Compactor {
         &self,
         namespace: &str,
         old_segment_id: &str,
+        indexing_config: &IndexingConfig,
         new_segment_id: &str,
         vectors: &[VectorEntry],
         wal_touched_ids: &HashSet<String>,
@@ -1176,7 +1237,7 @@ impl Compactor {
     )> {
         use crate::index::distance::euclidean_distance;
         let centroid_state = self
-            .load_incremental_centroid_state(namespace, old_segment_id)
+            .load_incremental_centroid_state(namespace, old_segment_id, indexing_config)
             .await?;
         let IncrementalCentroidState {
             centroids,
@@ -1258,6 +1319,7 @@ impl Compactor {
             old_sketch_ref,
             None,
             true,
+            indexing_config,
         )
         .await
     }
@@ -1266,6 +1328,7 @@ impl Compactor {
         &self,
         namespace: &str,
         old_segment_id: &str,
+        indexing_config: &IndexingConfig,
     ) -> Result<IncrementalCentroidState> {
         use crate::index::ivf_flat::build::{centroids_key, deserialize_centroids_data};
 
@@ -1282,7 +1345,7 @@ impl Compactor {
         let dim = decoded_centroids.dim;
         let mut sq_calibration_bytes = decoded_centroids.sq_calibration;
         if matches!(
-            self.indexing_config.quantization,
+            indexing_config.quantization,
             crate::index::quantization::QuantizationType::Scalar
         ) && sq_calibration_bytes.is_none()
         {
@@ -1315,6 +1378,7 @@ impl Compactor {
         &self,
         namespace: &str,
         old_segment_id: &str,
+        indexing_config: &IndexingConfig,
         new_segment_id: &str,
         latest_vectors: &HashMap<String, VectorEntry>,
         deleted_ids: &HashSet<String>,
@@ -1336,7 +1400,7 @@ impl Compactor {
         use crate::index::ivf_flat::sketch::ResidentSketch;
 
         let centroid_state = self
-            .load_incremental_centroid_state(namespace, old_segment_id)
+            .load_incremental_centroid_state(namespace, old_segment_id, indexing_config)
             .await?;
         let num_clusters = centroid_state.centroids.len();
         if old_membership.cluster_count as usize != num_clusters {
@@ -1499,6 +1563,7 @@ impl Compactor {
             Some(old_sketch_ref),
             Some(old_sketch),
             false,
+            indexing_config,
         )
         .await
     }
@@ -1517,6 +1582,7 @@ impl Compactor {
         old_sketch_ref: Option<&crate::wal::manifest::SketchRef>,
         preloaded_old_sketch: Option<crate::index::ivf_flat::sketch::ResidentSketch>,
         allow_sketch_rebuild: bool,
+        indexing_config: &IndexingConfig,
     ) -> Result<(
         usize,
         Vec<String>,
@@ -1598,7 +1664,7 @@ impl Compactor {
         // every cluster is rewritten, so this seed is a harmless superset that
         // the rewritten-cluster scan reproduces anyway.
         let mut bitmap_fields_set: std::collections::HashSet<String> =
-            if carries_clusters && self.indexing_config.bitmap_index {
+            if carries_clusters && indexing_config.bitmap_index {
                 old_bitmap_fields.iter().cloned().collect()
             } else {
                 std::collections::HashSet::new()
@@ -1742,7 +1808,7 @@ impl Compactor {
             payloads.push((cvec_key, cvec_payload));
             payloads.push((cattr_key, cattr_data));
 
-            if self.indexing_config.bitmap_index {
+            if indexing_config.bitmap_index {
                 let attr_refs: Vec<Option<&HashMap<String, crate::types::AttributeValue>>> =
                     cluster_attrs[i].iter().map(|a| a.as_ref()).collect();
                 let bitmap_index = crate::index::bitmap::build::build_cluster_bitmaps(&attr_refs);
@@ -1762,7 +1828,7 @@ impl Compactor {
         // corrupt every carried cluster's approximate distances. So we COPY the
         // old calibration/codebook to the new segment and re-encode only the
         // rewritten clusters against it.
-        match self.indexing_config.quantization {
+        match indexing_config.quantization {
             crate::index::quantization::QuantizationType::Scalar => {
                 debug!(
                     "incremental SQ8 build embedded calibration and co-located rewritten clusters"
