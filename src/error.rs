@@ -196,6 +196,10 @@ pub enum ZeppelinError {
         field: String,
     },
 
+    /// A server-side index required to answer the query is not available yet.
+    #[error("index unavailable: {0}")]
+    IndexUnavailable(String),
+
     /// The query concurrency semaphore is exhausted; the caller should retry.
     #[error("query concurrency limit reached, try again later")]
     QueryConcurrencyExhausted,
@@ -248,7 +252,7 @@ impl ZeppelinError {
 
             ZeppelinError::NotImplemented { .. } => 501,
 
-            ZeppelinError::QueryConcurrencyExhausted => 503,
+            ZeppelinError::IndexUnavailable(_) | ZeppelinError::QueryConcurrencyExhausted => 503,
 
             ZeppelinError::RateLimitExceeded { .. } => 429,
 
@@ -296,6 +300,7 @@ impl ZeppelinError {
             ZeppelinError::HydrationDisabled => "HYDRATION_DISABLED",
             ZeppelinError::FullTextSearch(_) => "INTERNAL_ERROR",
             ZeppelinError::FtsFieldNotConfigured { .. } => "FTS_FIELD_NOT_CONFIGURED",
+            ZeppelinError::IndexUnavailable(_) => "INDEX_UNAVAILABLE",
             ZeppelinError::QueryConcurrencyExhausted => "CONCURRENCY_LIMIT",
             ZeppelinError::RateLimitExceeded { .. } => "RATE_LIMITED",
         }
@@ -390,6 +395,7 @@ impl ZeppelinError {
             | ZeppelinError::NotImplemented { .. }
             | ZeppelinError::HydrationDisabled
             | ZeppelinError::FtsFieldNotConfigured { .. }
+            | ZeppelinError::IndexUnavailable(_)
             | ZeppelinError::QueryConcurrencyExhausted
             | ZeppelinError::RateLimitExceeded { .. } => self.to_string(),
         }
@@ -581,6 +587,7 @@ mod tests {
                 namespace: "n".into(),
                 field: "f".into(),
             },
+            ZeppelinError::IndexUnavailable("fts missing".into()),
             ZeppelinError::QueryConcurrencyExhausted,
             ZeppelinError::RateLimitExceeded {
                 retry_after_secs: 1,

@@ -5,7 +5,10 @@ use common::server::{cleanup_ns, create_ns_api_fts, start_test_server_with_compa
 use std::collections::HashMap;
 use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
 use zeppelin::fts::FtsFieldConfig;
+use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{AttributeValue, VectorEntry};
+use zeppelin::wal::manifest::SegmentRef;
+use zeppelin::wal::Manifest;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -23,6 +26,7 @@ fn fts_test_config() -> Config {
         kmeans_max_iterations: 10,
         fts_index: true,
         bitmap_index: false,
+        bm25_max_full_scan_vectors: 10_000,
         ..Default::default()
     };
     config
@@ -145,6 +149,57 @@ async fn bm25_query(
         resp.text().await.unwrap()
     );
     resp.json().await.unwrap()
+}
+
+/// Execute a BM25 query expected to fail and return the parsed error envelope.
+async fn bm25_query_error(
+    client: &reqwest::Client,
+    base_url: &str,
+    ns: &str,
+    body: serde_json::Value,
+    expected_status: u16,
+) -> serde_json::Value {
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        expected_status,
+        "BM25 query returned unexpected status: {}",
+        resp.text().await.unwrap()
+    );
+    resp.json().await.unwrap()
+}
+
+fn assert_index_unavailable(body: &serde_json::Value) {
+    assert_eq!(body["code"], "INDEX_UNAVAILABLE", "body: {body}");
+    assert_eq!(body["status"], 503, "body: {body}");
+    let message = body["error"].as_str().unwrap_or("");
+    assert!(
+        message.contains("FTS index") && message.contains("operator"),
+        "INDEX_UNAVAILABLE must tell operators to build the FTS index, got: {message}"
+    );
+}
+
+async fn mutate_active_segment<F>(store: &ZeppelinStore, ns: &str, mutate: F)
+where
+    F: FnOnce(&mut SegmentRef),
+{
+    let (mut manifest, version) = Manifest::read_versioned(store, ns).await.unwrap().unwrap();
+    let active_id = manifest.active_segment.clone().unwrap();
+    let active = manifest
+        .segments
+        .iter_mut()
+        .find(|segment| segment.id == active_id)
+        .unwrap();
+    mutate(active);
+    manifest
+        .write_conditional(store, ns, &version)
+        .await
+        .unwrap();
 }
 
 /// Extract result IDs from a query response.
@@ -570,6 +625,133 @@ async fn test_fts_segment_search_after_compaction() {
     // Should have scanned segments, not fragments
     assert_eq!(body["scanned_fragments"].as_u64().unwrap(), 0);
     assert!(body["scanned_segments"].as_u64().unwrap() >= 1);
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_bm25_missing_global_fts_over_cap_returns_index_unavailable() {
+    let mut config = fts_test_config();
+    config.indexing.bm25_max_full_scan_clusters = 1;
+    config.indexing.bm25_max_full_scan_vectors = 10_000;
+    let (base_url, harness, _cache, _dir, compactor) =
+        start_test_server_with_compactor(Some(config)).await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "content": {"language": "english", "stemming": true, "remove_stopwords": true}
+        }),
+    )
+    .await;
+
+    let docs: Vec<_> = (0..24)
+        .map(|idx| content_doc(&format!("doc{idx}"), "rust programming language"))
+        .collect();
+    upsert_docs(&client, &base_url, &ns, &docs).await;
+
+    compactor
+        .compact_with_fts(&ns, None, &content_fts_configs())
+        .await
+        .unwrap();
+    mutate_active_segment(&harness.store, &ns, |segment| {
+        assert!(
+            segment.cluster_count > 1,
+            "test fixture must exceed the full-scan cluster cap"
+        );
+        assert!(
+            segment.fts_fields.contains(&"content".to_string()),
+            "test fixture must retain per-field FTS metadata"
+        );
+        segment.has_global_fts = false;
+    })
+    .await;
+
+    let body = bm25_query_error(
+        &client,
+        &base_url,
+        &ns,
+        serde_json::json!({
+            "rank_by": ["content", "BM25", "rust"],
+            "top_k": 10,
+            "consistency": "eventual",
+        }),
+        503,
+    )
+    .await;
+    assert_index_unavailable(&body);
+
+    let namespace = client
+        .get(format!("{base_url}/v1/namespaces/{ns}"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        namespace["index_config"]["fts_index"], true,
+        "namespace health surface must show FTS indexing is desired: {namespace}"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_bm25_segment_without_fts_fields_returns_index_unavailable() {
+    let config = fts_test_config();
+    let (base_url, harness, _cache, _dir, compactor) =
+        start_test_server_with_compactor(Some(config)).await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "content": {"language": "english", "stemming": true, "remove_stopwords": true}
+        }),
+    )
+    .await;
+
+    let docs = vec![
+        content_doc("old1", "rust programming language"),
+        content_doc("old2", "systems programming with rust"),
+    ];
+    upsert_docs(&client, &base_url, &ns, &docs).await;
+
+    compactor
+        .compact_with_fts(&ns, None, &HashMap::new())
+        .await
+        .unwrap();
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    let active_id = manifest.active_segment.as_ref().unwrap();
+    let active = manifest
+        .segments
+        .iter()
+        .find(|segment| &segment.id == active_id)
+        .unwrap();
+    assert!(
+        active.fts_fields.is_empty(),
+        "test fixture must simulate a segment predating FTS indexing"
+    );
+
+    let body = bm25_query_error(
+        &client,
+        &base_url,
+        &ns,
+        serde_json::json!({
+            "rank_by": ["content", "BM25", "rust"],
+            "top_k": 10,
+            "consistency": "eventual",
+        }),
+        503,
+    )
+    .await;
+    assert_index_unavailable(&body);
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;

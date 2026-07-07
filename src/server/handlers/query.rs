@@ -1013,6 +1013,7 @@ async fn execute_query_source_with_manifest(
                 Some(&state.fts_cache),
                 Some(&state.cache),
                 knobs.bm25_max_full_scan_clusters,
+                knobs.bm25_max_full_scan_vectors,
                 include_attributes,
                 manifest,
             )

@@ -545,6 +545,7 @@ async fn test_hydration_includes_global_fts_index() {
         None,
         Some(&cache),
         0,
+        0,
         false,
     )
     .await

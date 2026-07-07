@@ -513,6 +513,7 @@ pub async fn execute_bm25_query(
     fts_cache: Option<&Arc<WalFtsCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
+    max_full_scan_vectors: usize,
     include_attributes: bool,
 ) -> Result<QueryResponse> {
     let manifest = read_manifest_for_query(store, namespace, consistency, manifest_cache).await?;
@@ -529,6 +530,7 @@ pub async fn execute_bm25_query(
         fts_cache,
         cache,
         max_full_scan_clusters,
+        max_full_scan_vectors,
         include_attributes,
         manifest,
     )
@@ -552,6 +554,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
     fts_cache: Option<&Arc<WalFtsCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
+    max_full_scan_vectors: usize,
     include_attributes: bool,
     manifest: Manifest,
 ) -> Result<QueryResponse> {
@@ -631,7 +634,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
                 .cloned()
         });
         let (results, scanned) = match segment_ref {
-            Some(seg_ref) if !seg_ref.fts_fields.is_empty() => {
+            Some(seg_ref) => {
                 let segment_top_k = if manifest.uncompacted_fragments().is_empty() {
                     top_k
                 } else {
@@ -647,6 +650,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
                     last_as_prefix,
                     cache,
                     max_full_scan_clusters,
+                    max_full_scan_vectors,
                     segment_top_k,
                     include_attributes,
                 )
@@ -702,6 +706,74 @@ async fn fetch_query_object(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bm25FullScanBudget {
+    max_clusters: usize,
+    max_vectors: usize,
+}
+
+fn bm25_index_unavailable(namespace: &str, reason: impl AsRef<str>) -> crate::error::ZeppelinError {
+    crate::error::ZeppelinError::IndexUnavailable(format!(
+        "BM25 FTS index unavailable for namespace {namespace}: {}. \
+         Build the namespace FTS index with compaction; this is a server/operator condition, \
+         not a request validation error.",
+        reason.as_ref()
+    ))
+}
+
+fn ensure_segment_fts_fields_available(
+    namespace: &str,
+    segment_ref: &SegmentRef,
+    rank_by: &RankBy,
+) -> Result<()> {
+    let field_queries = rank_by.extract_field_queries();
+    let missing_fields: Vec<String> = field_queries
+        .iter()
+        .map(|(field, _)| field)
+        .filter(|field| !segment_ref.fts_fields.contains(*field))
+        .cloned()
+        .collect();
+    if missing_fields.is_empty() {
+        return Ok(());
+    }
+
+    let reason = if segment_ref.fts_fields.is_empty() {
+        "active segment has no FTS fields; it predates FTS index construction".to_string()
+    } else {
+        format!(
+            "active segment is missing FTS fields [{}]",
+            missing_fields.join(", ")
+        )
+    };
+    Err(bm25_index_unavailable(namespace, reason))
+}
+
+fn validate_bm25_full_scan_budget(
+    namespace: &str,
+    segment_ref: &SegmentRef,
+    budget: Bm25FullScanBudget,
+) -> Result<()> {
+    if budget.max_clusters > 0 && segment_ref.cluster_count > budget.max_clusters {
+        return Err(bm25_index_unavailable(
+            namespace,
+            format!(
+                "global FTS index is missing and fallback would scan {} clusters (limit {})",
+                segment_ref.cluster_count, budget.max_clusters
+            ),
+        ));
+    }
+    if budget.max_vectors > 0 && segment_ref.vector_count > budget.max_vectors {
+        return Err(bm25_index_unavailable(
+            namespace,
+            format!(
+                "global FTS index is missing and fallback would scan {} vectors (limit {})",
+                segment_ref.vector_count, budget.max_vectors
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Search a segment's inverted indexes for a BM25 query.
 ///
 /// Uses the global FTS index when available (1 S3 GET instead of N),
@@ -720,9 +792,12 @@ async fn segment_bm25_search(
     last_as_prefix: bool,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
+    max_full_scan_vectors: usize,
     top_k: usize,
     include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
+    ensure_segment_fts_fields_available(namespace, segment_ref, rank_by)?;
+
     if segment_ref.has_global_fts {
         return segment_bm25_search_global(
             store,
@@ -738,14 +813,16 @@ async fn segment_bm25_search(
         )
         .await;
     }
-    // Circuit breaker: reject full-scan if cluster count exceeds limit
-    if max_full_scan_clusters > 0 && segment_ref.cluster_count > max_full_scan_clusters {
-        return Err(crate::error::ZeppelinError::Validation(format!(
-            "BM25 query on segment {} requires full scan of {} clusters (limit: {}). \
-             Recompact with fts_index=true.",
-            segment_ref.id, segment_ref.cluster_count, max_full_scan_clusters
-        )));
-    }
+
+    validate_bm25_full_scan_budget(
+        namespace,
+        segment_ref,
+        Bm25FullScanBudget {
+            max_clusters: max_full_scan_clusters,
+            max_vectors: max_full_scan_vectors,
+        },
+    )?;
+
     tracing::warn!(
         namespace = namespace,
         segment_id = %segment_ref.id,
@@ -957,12 +1034,12 @@ async fn fetch_bm25_cluster_attrs_and_ids(
         for (cluster_idx, attrs_res, cluster_res) in cluster_attrs_results {
             let attrs = match attrs_res {
                 Some(Ok(data)) => Some(deserialize_attrs(&data)?),
-                Some(Err(_)) => continue,
+                Some(Err(e)) => return Err(e),
                 None => None,
             };
             let cluster = match cluster_res {
                 Ok(data) => deserialize_cluster(&data)?,
-                Err(_) => continue,
+                Err(e) => return Err(e),
             };
             cluster_data.insert(cluster_idx, (attrs, cluster.ids));
         }
@@ -980,7 +1057,7 @@ async fn fetch_bm25_cluster_attrs_and_ids(
         for (cluster_idx, attrs_res) in attrs_results {
             let attrs = match attrs_res {
                 Ok(data) => deserialize_attrs(&data)?,
-                Err(_) => continue,
+                Err(e) => return Err(e),
             };
             attrs_by_cluster.insert(cluster_idx, attrs);
         }
@@ -1010,15 +1087,16 @@ async fn fetch_bm25_cluster_attrs_and_ids(
     for (clusters, object_res) in object_results {
         let object_data = match object_res {
             Ok(data) => data,
-            Err(_) => continue,
+            Err(e) => return Err(e),
         };
         if cluster_object_sections(&object_data)?.is_some() {
             for cluster_idx in clusters {
                 let attrs = if load_attrs {
-                    let Some(attrs) = attrs_by_cluster.remove(&cluster_idx) else {
-                        continue;
-                    };
-                    Some(attrs)
+                    Some(attrs_by_cluster.remove(&cluster_idx).ok_or_else(|| {
+                        crate::error::ZeppelinError::Index(format!(
+                            "missing attrs for BM25 cluster {cluster_idx}"
+                        ))
+                    })?)
                 } else {
                     None
                 };
@@ -1034,10 +1112,11 @@ async fn fetch_bm25_cluster_attrs_and_ids(
             }
             let cluster_idx = clusters[0];
             let attrs = if load_attrs {
-                let Some(attrs) = attrs_by_cluster.remove(&cluster_idx) else {
-                    continue;
-                };
-                Some(attrs)
+                Some(attrs_by_cluster.remove(&cluster_idx).ok_or_else(|| {
+                    crate::error::ZeppelinError::Index(format!(
+                        "missing attrs for BM25 cluster {cluster_idx}"
+                    ))
+                })?)
             } else {
                 None
             };
@@ -1125,7 +1204,6 @@ async fn segment_bm25_search_full_scan(
     for (_cluster_idx, fts_res, attrs_res, cluster_res) in prefetched {
         let fts_data = match fts_res {
             Ok(data) => data,
-            Err(crate::error::ZeppelinError::NotFound { .. }) => continue,
             Err(e) => return Err(e),
         };
 
@@ -1133,7 +1211,7 @@ async fn segment_bm25_search_full_scan(
 
         let cluster_attrs = match attrs_res {
             Some(Ok(data)) => Some(deserialize_attrs(&data)?),
-            Some(Err(_)) => continue,
+            Some(Err(e)) => return Err(e),
             None => None,
         };
 
@@ -1539,6 +1617,7 @@ mod tests {
             false,
             None,
             500,
+            100_000,
             10,
             true,
         )
@@ -1547,11 +1626,37 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         match err {
-            crate::error::ZeppelinError::Validation(msg) => {
+            crate::error::ZeppelinError::IndexUnavailable(msg) => {
                 assert!(msg.contains("600 clusters"));
-                assert!(msg.contains("limit: 500"));
+                assert!(msg.contains("limit 500"));
+                assert!(msg.contains("operator"));
             }
-            _ => panic!("expected Validation error, got: {err:?}"),
+            _ => panic!("expected IndexUnavailable error, got: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bm25_full_scan_budget_rejects_vector_count_before_io() {
+        let mut seg = make_segment_ref(4, false);
+        seg.vector_count = 20_001;
+
+        let err = validate_bm25_full_scan_budget(
+            "ns",
+            &seg,
+            Bm25FullScanBudget {
+                max_clusters: 10,
+                max_vectors: 20_000,
+            },
+        )
+        .unwrap_err();
+
+        match err {
+            crate::error::ZeppelinError::IndexUnavailable(msg) => {
+                assert!(msg.contains("FTS index"));
+                assert!(msg.contains("20,001 vectors") || msg.contains("20001 vectors"));
+                assert!(msg.contains("operator"));
+            }
+            _ => panic!("expected IndexUnavailable error, got: {err:?}"),
         }
     }
 
@@ -1578,14 +1683,16 @@ mod tests {
             false,
             None,
             500,
+            100_000,
             10,
             true,
         )
         .await;
 
-        // Should NOT be a Validation error (it'll be NotFound or similar from missing data)
+        // Should NOT be an availability/budget error (it'll be NotFound or similar
+        // from missing data).
         match &result {
-            Err(crate::error::ZeppelinError::Validation(_)) => {
+            Err(crate::error::ZeppelinError::IndexUnavailable(_)) => {
                 panic!("should not have triggered circuit breaker");
             }
             _ => {} // Any other result is fine (expected to fail on missing data)
@@ -1614,13 +1721,14 @@ mod tests {
             false,
             None,
             0,
+            0,
             10,
             true,
         )
         .await;
 
         match &result {
-            Err(crate::error::ZeppelinError::Validation(_)) => {
+            Err(crate::error::ZeppelinError::IndexUnavailable(_)) => {
                 panic!("should not have triggered circuit breaker when limit=0");
             }
             _ => {} // Expected to fail on missing data, not circuit breaker

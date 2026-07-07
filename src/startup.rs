@@ -295,6 +295,7 @@ pub async fn build_app(
         default_nprobe = query_knobs.default_nprobe,
         default_top_k = query_knobs.default_top_k,
         bm25_max_full_scan_clusters = query_knobs.bm25_max_full_scan_clusters,
+        bm25_max_full_scan_vectors = query_knobs.bm25_max_full_scan_vectors,
         "effective runtime query config"
     );
     drop(query_knobs);

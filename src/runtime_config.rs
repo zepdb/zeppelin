@@ -19,6 +19,8 @@ pub struct QueryKnobs {
     pub default_top_k: usize,
     /// Maximum clusters for BM25 full-scan fallback; 0 disables the breaker.
     pub bm25_max_full_scan_clusters: usize,
+    /// Maximum vectors for BM25 full-scan fallback; 0 disables the breaker.
+    pub bm25_max_full_scan_vectors: usize,
 }
 
 /// Partial update for runtime query knobs.
@@ -40,6 +42,9 @@ pub struct QueryKnobsPatch {
     /// Maximum clusters for BM25 full-scan fallback; 0 disables the breaker.
     #[serde(default)]
     pub bm25_max_full_scan_clusters: Option<usize>,
+    /// Maximum vectors for BM25 full-scan fallback; 0 disables the breaker.
+    #[serde(default)]
+    pub bm25_max_full_scan_vectors: Option<usize>,
 }
 
 /// Immutable bounds for runtime query knob validation.
@@ -77,6 +82,7 @@ impl RuntimeQueryConfig {
                 default_nprobe: config.indexing.default_nprobe,
                 default_top_k: config.server.default_top_k,
                 bm25_max_full_scan_clusters: config.indexing.bm25_max_full_scan_clusters,
+                bm25_max_full_scan_vectors: config.indexing.bm25_max_full_scan_vectors,
             })),
         }
     }
@@ -143,6 +149,9 @@ impl RuntimeQueryConfig {
         if let Some(limit) = patch.bm25_max_full_scan_clusters {
             new.bm25_max_full_scan_clusters = limit;
         }
+        if let Some(limit) = patch.bm25_max_full_scan_vectors {
+            new.bm25_max_full_scan_vectors = limit;
+        }
 
         let new_snapshot = Arc::new(new);
         log_changes(old, new_snapshot.as_ref());
@@ -186,6 +195,14 @@ fn log_changes(old: &QueryKnobs, new: &QueryKnobs) {
             "runtime query knob updated"
         );
     }
+    if old.bm25_max_full_scan_vectors != new.bm25_max_full_scan_vectors {
+        info!(
+            knob = "bm25_max_full_scan_vectors",
+            old_value = old.bm25_max_full_scan_vectors,
+            new_value = new.bm25_max_full_scan_vectors,
+            "runtime query knob updated"
+        );
+    }
 }
 
 #[allow(clippy::unwrap_used)]
@@ -202,6 +219,7 @@ mod tests {
         config.server.default_top_k = 10;
         config.server.max_top_k = 100;
         config.indexing.bm25_max_full_scan_clusters = 500;
+        config.indexing.bm25_max_full_scan_vectors = 100_000;
         (
             RuntimeQueryConfig::from_config(&config),
             QueryKnobBounds::from_config(&config),

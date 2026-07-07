@@ -224,6 +224,7 @@ mod tests {
                 "ZEPPELIN_BITMAP_INDEX",
                 "ZEPPELIN_FTS_INDEX",
                 "ZEPPELIN_BM25_MAX_FULL_SCAN_CLUSTERS",
+                "ZEPPELIN_BM25_MAX_FULL_SCAN_VECTORS",
                 "ZEPPELIN_HIERARCHICAL",
                 "ZEPPELIN_LEAF_SIZE",
                 "ZEPPELIN_COMPACTION_INTERVAL_SECS",
@@ -973,6 +974,10 @@ pub struct IndexingConfig {
     /// Set to 0 to disable the circuit breaker (allow unlimited scan). Default: 500.
     #[serde(default = "default_bm25_max_full_scan_clusters")]
     pub bm25_max_full_scan_clusters: usize,
+    /// Maximum vectors to scan in BM25 full-scan fallback before returning an error.
+    /// Set to 0 to disable the vector-count breaker. Default: 100000.
+    #[serde(default = "default_bm25_max_full_scan_vectors")]
+    pub bm25_max_full_scan_vectors: usize,
 }
 
 /// Background WAL-to-segment compaction schedule and thresholds.
@@ -1144,6 +1149,9 @@ fn default_retrain_threshold() -> f64 {
 fn default_bm25_max_full_scan_clusters() -> usize {
     500
 }
+fn default_bm25_max_full_scan_vectors() -> usize {
+    100_000
+}
 fn default_max_pending_deletes() -> usize {
     1000
 }
@@ -1246,6 +1254,7 @@ impl Default for IndexingConfig {
             bitmap_index: default_bitmap_index(),
             fts_index: false,
             bm25_max_full_scan_clusters: default_bm25_max_full_scan_clusters(),
+            bm25_max_full_scan_vectors: default_bm25_max_full_scan_vectors(),
         }
     }
 }
@@ -1743,6 +1752,9 @@ impl Config {
         }
         if let Some(v) = env_override("ZEPPELIN_BM25_MAX_FULL_SCAN_CLUSTERS")? {
             self.indexing.bm25_max_full_scan_clusters = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_BM25_MAX_FULL_SCAN_VECTORS")? {
+            self.indexing.bm25_max_full_scan_vectors = v;
         }
         if let Some(v) = env_override("ZEPPELIN_HIERARCHICAL")? {
             self.indexing.hierarchical = v;
