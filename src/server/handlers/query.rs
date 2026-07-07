@@ -7,6 +7,7 @@ use axum::extract::{Extension, Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::error::ZeppelinError;
 use crate::fts::bm25::{self, Bm25Params};
@@ -26,7 +27,7 @@ use crate::wal::Manifest;
 use super::ApiError;
 
 /// Request body for querying vectors by ANN or BM25 ranking.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryRequest {
     /// Vector for legacy ANN search. Required unless `rank_by` or `sources` is provided.
@@ -84,7 +85,7 @@ pub struct QueryRequest {
 }
 
 /// A typed candidate source in the retrieval-algebra request AST.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CandidateSource {
     /// ANN vector candidate source.
@@ -110,7 +111,7 @@ pub enum CandidateSource {
 }
 
 /// Candidate fusion strategy in the retrieval-algebra request AST.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FusionSpec {
     /// No fusion. Valid only with one source.
@@ -135,7 +136,7 @@ impl FusionSpec {
 }
 
 /// Reranking strategy in the retrieval-algebra request AST.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RerankSpec {
     /// Use the engine default rerank behavior.
@@ -168,7 +169,7 @@ impl RerankSpec {
 }
 
 /// Grouping strategy in the retrieval-algebra request AST.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GroupingSpec {
     /// Do not group results.
@@ -183,7 +184,7 @@ pub enum GroupingSpec {
 }
 
 /// Projection settings in the retrieval-algebra request AST.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectionSpec {
     /// Whether result attributes should be included. Defaults to true.
@@ -198,7 +199,7 @@ pub struct ProjectionSpec {
 }
 
 /// Cursor strategy in the retrieval-algebra request AST.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CursorSpec {
     /// No cursor.
@@ -210,14 +211,8 @@ pub enum CursorSpec {
     },
 }
 
-impl CursorSpec {
-    fn is_none(&self) -> bool {
-        matches!(self, Self::None)
-    }
-}
-
 /// Explain request in the retrieval-algebra request AST.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ExplainSpec {
     /// Boolean explain toggle.
@@ -236,7 +231,7 @@ impl ExplainSpec {
 }
 
 /// Explain mode in the retrieval-algebra request AST.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExplainMode {
     /// Do not include explain output.
@@ -782,10 +777,11 @@ fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), Zeppelin
         }
     }
     if let Some(cursor) = req.cursor.as_ref() {
-        if !cursor.is_none() {
-            return Err(ZeppelinError::NotImplemented {
-                feature: "cursor pagination",
-            });
+        match cursor {
+            CursorSpec::None => {}
+            CursorSpec::After { token } => {
+                decode_cursor_token(token)?;
+            }
         }
     }
     if let Some(explain) = req.explain.as_ref() {
@@ -894,6 +890,7 @@ async fn execute_validated_query(
     validate_query_source_metadata(ns, meta, &source_ref)?;
     let emit_debug = req.debug.unwrap_or(false);
     let first_stage_top_k = first_stage_top_k(req, validated);
+    let rerank_limit = rerank_output_k(req, validated, first_stage_top_k);
     let first_stage_include_attributes =
         first_stage_include_attributes(req, validated.include_attributes);
     let source = execute_query_source_with_manifest(
@@ -917,6 +914,7 @@ async fn execute_validated_query(
             meta,
             req,
             top_k: validated.top_k,
+            rerank_limit,
             include_attributes: validated.include_attributes,
             manifest,
         },
@@ -950,6 +948,7 @@ async fn execute_hybrid_query(
     let mut source_responses = Vec::with_capacity(source_count);
     let emit_debug = req.debug.unwrap_or(false);
     let first_stage_top_k = first_stage_top_k(req, validated);
+    let rerank_limit = rerank_output_k(req, validated, first_stage_top_k);
     let first_stage_include_attributes =
         first_stage_include_attributes(req, validated.include_attributes);
     for index in 0..source_count {
@@ -988,6 +987,7 @@ async fn execute_hybrid_query(
             meta,
             req,
             top_k: validated.top_k,
+            rerank_limit,
             include_attributes: validated.include_attributes,
             manifest,
         },
@@ -997,8 +997,25 @@ async fn execute_hybrid_query(
 }
 
 fn first_stage_top_k(req: &QueryRequest, validated: ValidatedQuery) -> usize {
-    if req.rerank.as_ref().is_some_and(RerankSpec::is_explicit) {
-        validated.candidate_k
+    if req.rerank.as_ref().is_some_and(RerankSpec::is_explicit) || cursor_requested(req) {
+        let min_cursor_frontier = validated.top_k.saturating_add(1);
+        if cursor_requested(req) {
+            validated.candidate_k.max(min_cursor_frontier)
+        } else {
+            validated.candidate_k
+        }
+    } else {
+        validated.top_k
+    }
+}
+
+fn rerank_output_k(
+    req: &QueryRequest,
+    validated: ValidatedQuery,
+    first_stage_top_k: usize,
+) -> usize {
+    if cursor_requested(req) {
+        first_stage_top_k
     } else {
         validated.top_k
     }
@@ -1008,12 +1025,17 @@ fn first_stage_include_attributes(req: &QueryRequest, include_attributes: bool) 
     include_attributes || matches!(req.rerank, Some(RerankSpec::Bm25 { .. }))
 }
 
+fn cursor_requested(req: &QueryRequest) -> bool {
+    req.cursor.is_some()
+}
+
 struct RerankExecutionContext<'a> {
     state: &'a AppState,
     ns: &'a str,
     meta: &'a NamespaceMetadata,
     req: &'a QueryRequest,
     top_k: usize,
+    rerank_limit: usize,
     include_attributes: bool,
     manifest: Manifest,
 }
@@ -1022,21 +1044,22 @@ async fn apply_rerank_if_requested(
     ctx: RerankExecutionContext<'_>,
     response: QueryResponse,
 ) -> Result<QueryResponse, ZeppelinError> {
-    match ctx.req.rerank.as_ref() {
-        Some(RerankSpec::Vector { vector }) => apply_vector_rerank(ctx, response, vector).await,
+    let response = match ctx.req.rerank.as_ref() {
+        Some(RerankSpec::Vector { vector }) => apply_vector_rerank(&ctx, response, vector).await?,
         Some(RerankSpec::Bm25 { rank_by }) => apply_bm25_rerank(
             ctx.meta,
             response,
-            ctx.top_k,
+            ctx.rerank_limit,
             ctx.include_attributes,
             rank_by,
-        ),
-        _ => Ok(response),
-    }
+        )?,
+        _ => response,
+    };
+    apply_cursor_if_requested(ctx.ns, ctx.req, response, ctx.top_k)
 }
 
 async fn apply_vector_rerank(
-    ctx: RerankExecutionContext<'_>,
+    ctx: &RerankExecutionContext<'_>,
     mut response: QueryResponse,
     rerank_vector: &[f32],
 ) -> Result<QueryResponse, ZeppelinError> {
@@ -1065,7 +1088,7 @@ async fn apply_vector_rerank(
         ctx.ns,
         &ids,
         ctx.req.consistency,
-        ctx.manifest,
+        ctx.manifest.clone(),
     )
     .await?;
 
@@ -1081,8 +1104,140 @@ async fn apply_vector_rerank(
     response
         .results
         .sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
-    response.results.truncate(ctx.top_k);
+    response.results.truncate(ctx.rerank_limit);
     Ok(response)
+}
+
+struct DecodedCursor {
+    fingerprint: u64,
+    score_bits: u32,
+    id: String,
+}
+
+fn apply_cursor_if_requested(
+    ns: &str,
+    req: &QueryRequest,
+    mut response: QueryResponse,
+    top_k: usize,
+) -> Result<QueryResponse, ZeppelinError> {
+    let Some(cursor) = req.cursor.as_ref() else {
+        response.next_cursor = None;
+        return Ok(response);
+    };
+
+    response.results.sort_by(fused_result_cmp);
+    let fingerprint = cursor_fingerprint(ns, req)?;
+    if let CursorSpec::After { token } = cursor {
+        let decoded = decode_cursor_token(token)?;
+        if decoded.fingerprint != fingerprint {
+            return Err(ZeppelinError::Validation(
+                "cursor token does not match query".into(),
+            ));
+        }
+        let marker = SearchResult {
+            id: decoded.id,
+            score: f32::from_bits(decoded.score_bits),
+            attributes: None,
+        };
+        response
+            .results
+            .retain(|result| fused_result_cmp(result, &marker) == Ordering::Greater);
+    }
+
+    let has_more = response.results.len() > top_k;
+    response.results.truncate(top_k);
+    response.next_cursor = if has_more {
+        response
+            .results
+            .last()
+            .map(|result| encode_cursor_token(fingerprint, result))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(response)
+}
+
+fn cursor_fingerprint(ns: &str, req: &QueryRequest) -> Result<u64, ZeppelinError> {
+    let mut value = serde_json::to_value(req)?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        ZeppelinError::Validation("cursor fingerprint requires object query".into())
+    })?;
+    object.remove("cursor");
+    let payload = serde_json::to_vec(&(ns, value))?;
+    Ok(xxh3_64(&payload))
+}
+
+fn encode_cursor_token(fingerprint: u64, result: &SearchResult) -> Result<String, ZeppelinError> {
+    if !result.score.is_finite() {
+        return Err(ZeppelinError::Validation(
+            "cursor cannot encode non-finite score".into(),
+        ));
+    }
+    Ok(format!(
+        "zp1:{fingerprint:016x}:{:08x}:{}",
+        result.score.to_bits(),
+        hex_encode(result.id.as_bytes())
+    ))
+}
+
+fn decode_cursor_token(token: &str) -> Result<DecodedCursor, ZeppelinError> {
+    let parts: Vec<&str> = token.split(':').collect();
+    if parts.len() != 4 || parts[0] != "zp1" {
+        return Err(ZeppelinError::Validation("invalid cursor token".into()));
+    }
+    let fingerprint = u64::from_str_radix(parts[1], 16)
+        .map_err(|_| ZeppelinError::Validation("invalid cursor token".into()))?;
+    let score_bits = u32::from_str_radix(parts[2], 16)
+        .map_err(|_| ZeppelinError::Validation("invalid cursor token".into()))?;
+    let score = f32::from_bits(score_bits);
+    if !score.is_finite() {
+        return Err(ZeppelinError::Validation(
+            "invalid cursor token score".into(),
+        ));
+    }
+    let id_bytes = hex_decode(parts[3])?;
+    let id = String::from_utf8(id_bytes)
+        .map_err(|_| ZeppelinError::Validation("invalid cursor token id".into()))?;
+    Ok(DecodedCursor {
+        fingerprint,
+        score_bits,
+        id,
+    })
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(input: &str) -> Result<Vec<u8>, ZeppelinError> {
+    if input.len() % 2 != 0 {
+        return Err(ZeppelinError::Validation("invalid cursor token hex".into()));
+    }
+    input
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let hi = hex_value(chunk[0])?;
+            let lo = hex_value(chunk[1])?;
+            Ok((hi << 4) | lo)
+        })
+        .collect()
+}
+
+fn hex_value(byte: u8) -> Result<u8, ZeppelinError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(ZeppelinError::Validation("invalid cursor token hex".into())),
+    }
 }
 
 struct RerankFieldQuery {
@@ -1477,6 +1632,7 @@ fn fuse_source_responses(
         scanned_fragments,
         scanned_segments,
         debug,
+        next_cursor: None,
     })
 }
 

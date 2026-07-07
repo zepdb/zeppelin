@@ -1399,11 +1399,11 @@ components:
         - multi-source RRF fusion (`fusion` omitted defaults to RRF k=60)
         - multi-source weighted normalized score fusion
         - explicit vector and BM25 rerank over the candidate frontier
+        - opaque cursor pagination
         - `projection.include_attributes`
 
         Reserved today (returns code `NOT_IMPLEMENTED`):
         - grouped results
-        - cursor pagination
         - enabled explain output
         - field/vector projection
       properties:
@@ -1431,8 +1431,9 @@ components:
           description: |
             Per-source candidate count before multi-source fusion. Defaults
             to `max(top_k * 4, 100)`. Multi-source fusion and explicit
-            rerank use this as the first-stage frontier, then truncate to
-            `top_k` after fusion or rerank.
+            rerank and cursor pagination use this as the first-stage
+            frontier, then truncate to `top_k` after fusion, rerank, or
+            cursor windowing.
         filter:
           $ref: "#/components/schemas/Filter"
         consistency:
@@ -1709,7 +1710,12 @@ components:
           description: Reserved for returning vector values in query results.
 
     CursorSpec:
-      description: Cursor continuation strategy. Opaque cursors are typed but not executable yet.
+      description: |
+        Cursor continuation strategy. Use `{"type":"none"}` on the first
+        page to request a `next_cursor`; pass that value back with
+        `{"type":"after","token":"..."}` to continue after the last item
+        from the previous page. Cursor tokens are stateless, opaque, and
+        bound to the namespace plus query shape.
       discriminator:
         propertyName: type
         mapping:
@@ -1776,6 +1782,12 @@ components:
           description: Number of index segments scanned
         debug:
           $ref: "#/components/schemas/QueryDebug"
+        next_cursor:
+          type: string
+          description: |
+            Opaque cursor for the next page. Present only when cursor
+            pagination is enabled and more ranked results remain in the
+            current candidate frontier.
 
     QueryDebug:
       type: object

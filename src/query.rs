@@ -40,6 +40,10 @@ pub struct QueryResponse {
     /// Optional query diagnostics, returned only when the request asks for them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug: Option<QueryDebug>,
+    /// Opaque pagination cursor, returned only when cursor paging is enabled
+    /// and more ranked results remain in the current candidate frontier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Optional client-visible query diagnostics.
@@ -384,6 +388,7 @@ async fn execute_query_with_manifest_scoped(
         scanned_fragments,
         scanned_segments,
         debug,
+        next_cursor: None,
     })
 }
 
@@ -995,6 +1000,7 @@ async fn execute_bm25_query_with_manifest_scoped(
         scanned_fragments,
         scanned_segments,
         debug,
+        next_cursor: None,
     })
 }
 
