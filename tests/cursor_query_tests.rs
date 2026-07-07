@@ -63,6 +63,20 @@ fn page_request(top_k: usize, cursor: Value) -> Value {
     })
 }
 
+fn bounded_page_request(top_k: usize, candidate_k: usize, cursor: Value) -> Value {
+    json!({
+        "sources": [{
+            "type": "ann",
+            "vector": [0.0, 0.0]
+        }],
+        "candidate_k": candidate_k,
+        "top_k": top_k,
+        "cursor": cursor,
+        "consistency": "strong",
+        "projection": {"include_attributes": false}
+    })
+}
+
 fn same_fingerprint_token_for_id(template: &str, id: &str) -> String {
     let parts: Vec<&str> = template.split(':').collect();
     assert_eq!(parts.len(), 4);
@@ -174,6 +188,103 @@ async fn cursor_pages_continue_without_overlap_or_gaps() {
     assert_eq!(ids(&full), vec!["a", "b", "c", "d", "e"]);
     assert_eq!(paged, ids(&full));
     assert!(page3.get("next_cursor").is_none());
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn cursor_ignores_non_result_response_options() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_namespace(&client, &base_url).await;
+
+    upsert(
+        &client,
+        &base_url,
+        &ns,
+        json!([
+            {"id": "a", "values": [0.1, 0.0]},
+            {"id": "b", "values": [0.2, 0.0]},
+            {"id": "c", "values": [0.3, 0.0]}
+        ]),
+    )
+    .await;
+
+    let page1 = query(
+        &client,
+        &base_url,
+        &ns,
+        json!({
+            "sources": [{
+                "type": "ann",
+                "vector": [0.0, 0.0]
+            }],
+            "top_k": 1,
+            "cursor": {"type": "none"},
+            "consistency": "strong",
+            "projection": {"include_attributes": false},
+            "debug": true,
+            "explain": "plan"
+        }),
+    )
+    .await;
+    let cursor = page1["next_cursor"].as_str().unwrap();
+    let page2 = query(
+        &client,
+        &base_url,
+        &ns,
+        page_request(1, json!({"type": "after", "token": cursor})),
+    )
+    .await;
+
+    assert_eq!(ids(&page1), vec!["a"]);
+    assert_eq!(ids(&page2), vec!["b"]);
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn cursor_pages_are_bounded_by_candidate_k_frontier() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_namespace(&client, &base_url).await;
+
+    upsert(
+        &client,
+        &base_url,
+        &ns,
+        json!([
+            {"id": "a", "values": [0.1, 0.0]},
+            {"id": "b", "values": [0.2, 0.0]},
+            {"id": "c", "values": [0.3, 0.0]},
+            {"id": "d", "values": [0.4, 0.0]},
+            {"id": "e", "values": [0.5, 0.0]}
+        ]),
+    )
+    .await;
+
+    let page1 = query(
+        &client,
+        &base_url,
+        &ns,
+        bounded_page_request(2, 3, json!({"type": "none"})),
+    )
+    .await;
+    let cursor = page1["next_cursor"].as_str().unwrap();
+    let page2 = query(
+        &client,
+        &base_url,
+        &ns,
+        bounded_page_request(2, 3, json!({"type": "after", "token": cursor})),
+    )
+    .await;
+
+    let mut paged = ids(&page1);
+    paged.extend(ids(&page2));
+    assert_eq!(paged, vec!["a", "b", "c"]);
+    assert!(page2.get("next_cursor").is_none());
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;

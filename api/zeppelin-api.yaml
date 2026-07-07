@@ -1737,8 +1737,10 @@ components:
         page to request a `next_cursor`; pass that value back with
         `{"type":"after","token":"..."}` to continue after the last item
         from the previous page. Cursor tokens are stateless, opaque, and
-        bound to the namespace plus query shape. Cursor pagination cannot
-        be combined with field grouping.
+        bound to the namespace plus result-affecting query shape. Response
+        options such as debug, explain, facets, projection, and consistency
+        do not change the token fingerprint. Cursor pagination cannot be
+        combined with field grouping.
       discriminator:
         propertyName: type
         mapping:

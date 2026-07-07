@@ -164,13 +164,6 @@ pub enum RerankSpec {
 }
 
 impl RerankSpec {
-    fn is_supported_contract_only(&self) -> bool {
-        matches!(
-            self,
-            Self::Default | Self::None | Self::Vector { .. } | Self::Bm25 { .. }
-        )
-    }
-
     fn is_explicit(&self) -> bool {
         matches!(self, Self::Vector { .. } | Self::Bm25 { .. })
     }
@@ -762,13 +755,6 @@ fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), Zeppelin
             return Err(ZeppelinError::Validation(
                 "fusion requires at least two candidate sources".into(),
             ));
-        }
-    }
-    if let Some(rerank) = req.rerank.as_ref() {
-        if !rerank.is_supported_contract_only() {
-            return Err(ZeppelinError::NotImplemented {
-                feature: "explicit rerank",
-            });
         }
     }
     if let Some(grouping) = req.grouping.as_ref() {
@@ -1829,6 +1815,12 @@ fn cursor_fingerprint(ns: &str, req: &QueryRequest) -> Result<u64, ZeppelinError
         ZeppelinError::Validation("cursor fingerprint requires object query".into())
     })?;
     object.remove("cursor");
+    object.remove("debug");
+    object.remove("explain");
+    object.remove("facets");
+    object.remove("include_attributes");
+    object.remove("projection");
+    object.remove("consistency");
     let payload = serde_json::to_vec(&(ns, value))?;
     Ok(xxh3_64(&payload))
 }
