@@ -296,6 +296,13 @@ pub struct Manifest {
     pub fencing_token: u64,
     /// Last time the manifest was updated.
     pub updated_at: DateTime<Utc>,
+    /// Monotonic manifest generation persisted with each manifest commit.
+    ///
+    /// Legacy manifests decode as `0`; each successful manifest write stores
+    /// the next generation. Keep this field last for MessagePack array
+    /// decode compatibility with older manifests.
+    #[serde(default)]
+    version: u64,
 }
 
 impl Manifest {
@@ -310,12 +317,25 @@ impl Manifest {
             pending_deletes: Vec::new(),
             fencing_token: 0,
             updated_at: Utc::now(),
+            version: 0,
         }
     }
 
     /// Get the S3 key for the manifest of a namespace.
     pub fn s3_key(namespace: &str) -> String {
         format!("{namespace}/manifest.json")
+    }
+
+    /// Return the persisted manifest generation.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    fn next_committed_version(&self) -> Result<u64> {
+        self.version
+            .checked_add(1)
+            .ok_or_else(|| ZeppelinError::Serialization("manifest version overflow".to_string()))
     }
 
     /// Add a fragment reference, assigning the next monotonic sequence number.
@@ -511,7 +531,9 @@ impl Manifest {
     /// Write manifest to S3.
     pub async fn write(&self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
         let key = Self::s3_key(namespace);
-        let data = self.to_bytes()?;
+        let mut committed = self.clone();
+        committed.version = self.next_committed_version()?;
+        let data = committed.to_bytes()?;
         store.put(&key, data).await
     }
 
@@ -536,17 +558,24 @@ impl Manifest {
     /// If version has an ETag, uses put_if_match for optimistic concurrency.
     /// For first-writes (no ETag), falls back to unconditional put.
     pub async fn write_conditional(
-        &self,
+        &mut self,
         store: &ZeppelinStore,
         namespace: &str,
         version: &ManifestVersion,
     ) -> Result<()> {
         let key = Self::s3_key(namespace);
-        let data = self.to_bytes()?;
-        match &version.0 {
+        let next_version = self.next_committed_version()?;
+        let mut committed = self.clone();
+        committed.version = next_version;
+        let data = committed.to_bytes()?;
+        let result = match &version.0 {
             Some(etag) => store.put_if_match(&key, data, etag, namespace).await,
             None => store.put(&key, data).await,
+        };
+        if result.is_ok() {
+            self.version = next_version;
         }
+        result
     }
 }
 
@@ -564,6 +593,10 @@ impl Default for Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
+
+    use crate::storage::ZeppelinStore;
 
     fn make_segment(id: &str) -> SegmentRef {
         SegmentRef {
@@ -581,6 +614,48 @@ mod tests {
             bootstrap: None,
             membership: None,
         }
+    }
+
+    #[tokio::test]
+    async fn manifest_version_increments_across_conditional_writes() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let ns = "manifest_version_epoch";
+        Manifest::new().write(&store, ns).await.unwrap();
+
+        let (mut first, first_etag) = Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+        assert_eq!(first.version(), 1);
+
+        first.add_fragment(FragmentRef {
+            id: Ulid::from_parts(10_000, 1),
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 8,
+        });
+        first
+            .write_conditional(&store, ns, &first_etag)
+            .await
+            .unwrap();
+        assert_eq!(first.version(), 2);
+
+        let (mut second, second_etag) =
+            Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+        assert_eq!(second.version(), 2);
+
+        second.add_fragment(FragmentRef {
+            id: Ulid::from_parts(10_001, 2),
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 8,
+        });
+        second
+            .write_conditional(&store, ns, &second_etag)
+            .await
+            .unwrap();
+
+        let (third, _) = Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+        assert_eq!(third.version(), 3);
     }
 
     #[test]

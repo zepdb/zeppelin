@@ -86,7 +86,7 @@ async fn test_compaction_safety_cas_prevents_stale_overwrite() {
         .unwrap();
 
     // 3. Read manifest with version (simulating compactor's initial read)
-    let (stale_manifest, stale_version) =
+    let (mut stale_manifest, stale_version) =
         Manifest::read_versioned(store, &ns).await.unwrap().unwrap();
     assert_eq!(stale_manifest.fragments.len(), 2);
 

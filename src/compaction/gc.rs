@@ -146,6 +146,12 @@ pub struct GcCandidate {
     pub key: String,
     /// Manifest commit time at which the key was first observed unreachable.
     pub first_seen_unreachable_at: DateTime<Utc>,
+    /// Manifest generation at which the key was first observed unreachable.
+    ///
+    /// Legacy candidate records decode as `0`, treating them as logically
+    /// very old while still requiring the wall-clock horizon before delete.
+    #[serde(default)]
+    pub unreachable_since_manifest_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +180,7 @@ enum SkipReason {
     ReachableNow,
     UlidTooYoung,
     NewerThanInflightCompaction,
+    NotEnoughManifestGenerations,
     NotListedThisCycle,
     DeleteFailed,
 }
@@ -186,6 +193,7 @@ impl SkipReason {
             Self::ReachableNow => "reachable_now",
             Self::UlidTooYoung => "ulid_age_floor",
             Self::NewerThanInflightCompaction => "inflight_watermark",
+            Self::NotEnoughManifestGenerations => "manifest_generation_guard",
             Self::NotListedThisCycle => "not_listed",
             Self::DeleteFailed => "delete_failed",
         }
@@ -196,6 +204,15 @@ impl SkipReason {
 enum DeleteDecision {
     Delete,
     Skip(SkipReason),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeletePredicateContext {
+    horizon_secs: u64,
+    now: DateTime<Utc>,
+    oldest_inflight_ulid_ms: Option<u64>,
+    current_manifest_version: u64,
+    min_newer_manifest_versions: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +286,7 @@ pub fn mark_gc_candidates(
     reachable: &BTreeSet<String>,
     existing: &[GcCandidate],
     now: DateTime<Utc>,
+    manifest_version: u64,
 ) -> Vec<GcCandidate> {
     let mut by_key = BTreeMap::new();
     for candidate in existing {
@@ -276,7 +294,13 @@ pub fn mark_gc_candidates(
             continue;
         }
         if parse_gc_artifact_key(namespace, &candidate.key).is_some() {
-            by_key.insert(candidate.key.clone(), candidate.first_seen_unreachable_at);
+            by_key.insert(
+                candidate.key.clone(),
+                (
+                    candidate.first_seen_unreachable_at,
+                    candidate.unreachable_since_manifest_version,
+                ),
+            );
         }
     }
 
@@ -287,15 +311,18 @@ pub fn mark_gc_candidates(
         if parse_gc_artifact_key(namespace, key).is_none() {
             continue;
         }
-        by_key.entry(key.clone()).or_insert(now);
+        by_key.entry(key.clone()).or_insert((now, manifest_version));
     }
 
     by_key
         .into_iter()
-        .map(|(key, first_seen_unreachable_at)| GcCandidate {
-            key,
-            first_seen_unreachable_at,
-        })
+        .map(
+            |(key, (first_seen_unreachable_at, unreachable_since_manifest_version))| GcCandidate {
+                key,
+                first_seen_unreachable_at,
+                unreachable_since_manifest_version,
+            },
+        )
         .collect()
 }
 
@@ -352,8 +379,14 @@ pub async fn run_gc_cycle(
         .filter(|key| parse_gc_artifact_key(namespace, key).is_none())
         .inspect(|key| log_gc_skip(namespace, key, SkipReason::UnknownShape))
         .count();
-    let marked_candidates =
-        mark_gc_candidates(namespace, &listed_keys, &mark_reachable, &persisted, now);
+    let marked_candidates = mark_gc_candidates(
+        namespace,
+        &listed_keys,
+        &mark_reachable,
+        &persisted,
+        now,
+        mark_manifest.version(),
+    );
     let candidates_marked = marked_candidates.len().saturating_sub(
         persisted
             .iter()
@@ -430,9 +463,13 @@ pub async fn run_gc_cycle(
             namespace,
             &candidate,
             &sweep_reachable,
-            gc.horizon_secs,
-            now,
-            oldest_inflight_ms,
+            DeletePredicateContext {
+                horizon_secs: gc.horizon_secs,
+                now,
+                oldest_inflight_ulid_ms: oldest_inflight_ms,
+                current_manifest_version: sweep_manifest.version(),
+                min_newer_manifest_versions: None,
+            },
         ) {
             DeleteDecision::Delete => match store.delete(&candidate.key).await {
                 Ok(()) | Err(crate::error::ZeppelinError::NotFound { .. }) => {
@@ -517,9 +554,7 @@ fn should_delete_candidate(
     namespace: &str,
     candidate: &GcCandidate,
     reachable: &BTreeSet<String>,
-    horizon_secs: u64,
-    now: DateTime<Utc>,
-    oldest_inflight_ulid_ms: Option<u64>,
+    context: DeletePredicateContext,
 ) -> DeleteDecision {
     let Some(parsed) = parse_gc_artifact_key(namespace, &candidate.key) else {
         return DeleteDecision::Skip(SkipReason::UnknownShape);
@@ -527,20 +562,33 @@ fn should_delete_candidate(
     if reachable.contains(&candidate.key) {
         return DeleteDecision::Skip(SkipReason::ReachableNow);
     }
-    let unreachable_for = now
+    let unreachable_for = context
+        .now
         .signed_duration_since(candidate.first_seen_unreachable_at)
         .num_seconds();
-    if unreachable_for < i64::try_from(horizon_secs).unwrap_or(i64::MAX) {
+    if unreachable_for < i64::try_from(context.horizon_secs).unwrap_or(i64::MAX) {
         return DeleteDecision::Skip(SkipReason::NotPersistedLongEnough);
     }
+    // The manifest generation is an additional retention guard only. It makes
+    // "unreachable since version V" auditable, but cannot replace the
+    // wall-clock horizon above because stale cached readers do not announce
+    // their observed manifest epochs.
+    if let Some(min_newer_manifest_versions) = context.min_newer_manifest_versions {
+        let newer_versions = context
+            .current_manifest_version
+            .saturating_sub(candidate.unreachable_since_manifest_version);
+        if newer_versions < min_newer_manifest_versions {
+            return DeleteDecision::Skip(SkipReason::NotEnoughManifestGenerations);
+        }
+    }
 
-    let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+    let now_ms = u64::try_from(context.now.timestamp_millis()).unwrap_or(0);
     let artifact_ulid = parsed.ulid();
     let ulid_age_secs = super::fragment_age_secs(&artifact_ulid, now_ms);
-    if ulid_age_secs < horizon_secs {
+    if ulid_age_secs < context.horizon_secs {
         return DeleteDecision::Skip(SkipReason::UlidTooYoung);
     }
-    if let Some(oldest_ms) = oldest_inflight_ulid_ms {
+    if let Some(oldest_ms) = context.oldest_inflight_ulid_ms {
         if artifact_ulid.timestamp_ms() > oldest_ms {
             return DeleteDecision::Skip(SkipReason::NewerThanInflightCompaction);
         }
@@ -652,6 +700,7 @@ pub fn gc_candidates_from_manifest_delta(
         .map(|key| GcCandidate {
             key: key.clone(),
             first_seen_unreachable_at: commit_time,
+            unreachable_since_manifest_version: new_manifest.version(),
         })
         .collect()
 }
@@ -1142,10 +1191,12 @@ mod tests {
             GcCandidate {
                 key: live_key,
                 first_seen_unreachable_at: commit_time,
+                unreachable_since_manifest_version: 3,
             },
             GcCandidate {
                 key: dead_key.clone(),
                 first_seen_unreachable_at: commit_time,
+                unreachable_since_manifest_version: 3,
             },
         ];
 
@@ -1185,6 +1236,16 @@ mod tests {
         Ulid::from_parts(ts, entropy)
     }
 
+    fn delete_context(horizon_secs: u64, now: DateTime<Utc>) -> DeletePredicateContext {
+        DeletePredicateContext {
+            horizon_secs,
+            now,
+            oldest_inflight_ulid_ms: None,
+            current_manifest_version: 10,
+            min_newer_manifest_versions: None,
+        }
+    }
+
     #[test]
     fn delete_predicate_table_is_fail_closed() {
         let now = Utc::now();
@@ -1193,6 +1254,7 @@ mod tests {
         let candidate = GcCandidate {
             key: old_key.clone(),
             first_seen_unreachable_at: now - chrono::Duration::seconds(10),
+            unreachable_since_manifest_version: 2,
         };
 
         let cases = [
@@ -1201,6 +1263,7 @@ mod tests {
                 GcCandidate {
                     key: format!("{NS}/segments/not-a-segment/centroids.bin"),
                     first_seen_unreachable_at: now - chrono::Duration::seconds(10),
+                    unreachable_since_manifest_version: 2,
                 },
                 BTreeSet::new(),
                 5,
@@ -1211,6 +1274,7 @@ mod tests {
                 GcCandidate {
                     key: old_key.clone(),
                     first_seen_unreachable_at: now - chrono::Duration::seconds(2),
+                    unreachable_since_manifest_version: 2,
                 },
                 BTreeSet::new(),
                 5,
@@ -1240,7 +1304,8 @@ mod tests {
         ];
 
         for (name, candidate, reachable, horizon, expected) in cases {
-            let actual = should_delete_candidate(NS, &candidate, &reachable, horizon, now, None);
+            let actual =
+                should_delete_candidate(NS, &candidate, &reachable, delete_context(horizon, now));
             assert_eq!(actual, expected, "{name}");
         }
     }
@@ -1252,9 +1317,15 @@ mod tests {
         let young_candidate = GcCandidate {
             key: WalFragment::s3_key(NS, &young_id),
             first_seen_unreachable_at: now - chrono::Duration::seconds(10),
+            unreachable_since_manifest_version: 2,
         };
         assert_eq!(
-            should_delete_candidate(NS, &young_candidate, &BTreeSet::new(), 5, now, None),
+            should_delete_candidate(
+                NS,
+                &young_candidate,
+                &BTreeSet::new(),
+                delete_context(5, now),
+            ),
             DeleteDecision::Skip(SkipReason::UlidTooYoung)
         );
 
@@ -1263,17 +1334,81 @@ mod tests {
         let candidate = GcCandidate {
             key: WalFragment::s3_key(NS, &newer_than_inflight),
             first_seen_unreachable_at: now - chrono::Duration::seconds(30),
+            unreachable_since_manifest_version: 2,
         };
         assert_eq!(
             should_delete_candidate(
                 NS,
                 &candidate,
                 &BTreeSet::new(),
-                5,
-                now,
-                Some(oldest_inflight.timestamp_ms()),
+                DeletePredicateContext {
+                    oldest_inflight_ulid_ms: Some(oldest_inflight.timestamp_ms()),
+                    ..delete_context(5, now)
+                },
             ),
             DeleteDecision::Skip(SkipReason::NewerThanInflightCompaction)
+        );
+    }
+
+    #[test]
+    fn delete_predicate_epoch_guard_is_additional_to_time_horizon() {
+        let now = Utc::now();
+        let old_id = ulid_seconds_ago(30, 190);
+        let key = WalFragment::s3_key(NS, &old_id);
+
+        let time_and_epoch_ok = GcCandidate {
+            key: key.clone(),
+            first_seen_unreachable_at: now - chrono::Duration::seconds(30),
+            unreachable_since_manifest_version: 7,
+        };
+        assert_eq!(
+            should_delete_candidate(
+                NS,
+                &time_and_epoch_ok,
+                &BTreeSet::new(),
+                DeletePredicateContext {
+                    min_newer_manifest_versions: Some(3),
+                    ..delete_context(5, now)
+                },
+            ),
+            DeleteDecision::Delete
+        );
+
+        let time_not_ok = GcCandidate {
+            key: key.clone(),
+            first_seen_unreachable_at: now - chrono::Duration::seconds(2),
+            unreachable_since_manifest_version: 7,
+        };
+        assert_eq!(
+            should_delete_candidate(
+                NS,
+                &time_not_ok,
+                &BTreeSet::new(),
+                DeletePredicateContext {
+                    min_newer_manifest_versions: Some(3),
+                    ..delete_context(5, now)
+                },
+            ),
+            DeleteDecision::Skip(SkipReason::NotPersistedLongEnough),
+            "a satisfied generation guard must not bypass the wall-clock horizon"
+        );
+
+        let epoch_not_ok = GcCandidate {
+            key,
+            first_seen_unreachable_at: now - chrono::Duration::seconds(30),
+            unreachable_since_manifest_version: 8,
+        };
+        assert_eq!(
+            should_delete_candidate(
+                NS,
+                &epoch_not_ok,
+                &BTreeSet::new(),
+                DeletePredicateContext {
+                    min_newer_manifest_versions: Some(3),
+                    ..delete_context(5, now)
+                },
+            ),
+            DeleteDecision::Skip(SkipReason::NotEnoughManifestGenerations)
         );
     }
 
@@ -1284,6 +1419,7 @@ mod tests {
         let candidate = GcCandidate {
             key: WalFragment::s3_key(NS, &ulid_seconds_ago(30, 95)),
             first_seen_unreachable_at: Utc::now(),
+            unreachable_since_manifest_version: 42,
         };
         let versioned = serde_json::to_vec(&GcCandidateStore {
             version: GC_CANDIDATE_STORE_VERSION,
@@ -1299,12 +1435,49 @@ mod tests {
         assert_eq!(decode_gc_candidates(&legacy).unwrap(), vec![candidate]);
     }
 
+    #[test]
+    fn legacy_candidate_without_epoch_decodes_as_very_old_generation() {
+        #[derive(Serialize)]
+        struct LegacyCandidateStore<'a> {
+            version: u32,
+            candidates: Vec<LegacyCandidate<'a>>,
+        }
+
+        #[derive(Serialize)]
+        struct LegacyCandidate<'a> {
+            key: &'a str,
+            first_seen_unreachable_at: DateTime<Utc>,
+        }
+
+        let key = WalFragment::s3_key(NS, &ulid_seconds_ago(30, 191));
+        let first_seen_unreachable_at = Utc::now() - chrono::Duration::seconds(60);
+        let legacy = serde_json::to_vec(&LegacyCandidateStore {
+            version: GC_CANDIDATE_STORE_VERSION,
+            candidates: vec![LegacyCandidate {
+                key: &key,
+                first_seen_unreachable_at,
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(
+            decode_gc_candidates(&legacy).unwrap(),
+            vec![GcCandidate {
+                key,
+                first_seen_unreachable_at,
+                unreachable_since_manifest_version: 0,
+            }],
+            "legacy candidates default to epoch 0, which is still time-gated"
+        );
+    }
+
     #[tokio::test]
     async fn candidate_store_round_trips_on_storage() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let candidate = GcCandidate {
             key: WalFragment::s3_key(NS, &ulid_seconds_ago(30, 96)),
             first_seen_unreachable_at: Utc::now(),
+            unreachable_since_manifest_version: 42,
         };
 
         save_gc_candidates(&store, NS, std::slice::from_ref(&candidate))
@@ -1326,17 +1499,38 @@ mod tests {
             GcCandidate {
                 key: resurrected.clone(),
                 first_seen_unreachable_at: now - chrono::Duration::seconds(10),
+                unreachable_since_manifest_version: 5,
             },
             GcCandidate {
                 key: still_dead.clone(),
                 first_seen_unreachable_at: now - chrono::Duration::seconds(10),
+                unreachable_since_manifest_version: 5,
             },
         ];
         let listed = BTreeSet::from([resurrected.clone(), still_dead.clone()]);
         let reachable = BTreeSet::from([resurrected]);
 
-        let marked = mark_gc_candidates(NS, &listed, &reachable, &existing, now);
+        let marked = mark_gc_candidates(NS, &listed, &reachable, &existing, now, 9);
 
         assert_eq!(candidate_keys(&marked), BTreeSet::from([still_dead]));
+        assert_eq!(marked[0].unreachable_since_manifest_version, 5);
+    }
+
+    #[test]
+    fn mark_pass_stamps_new_candidates_with_manifest_version() {
+        let now = Utc::now();
+        let newly_dead = WalFragment::s3_key(NS, &ulid_seconds_ago(30, 99));
+        let listed = BTreeSet::from([newly_dead.clone()]);
+
+        let marked = mark_gc_candidates(NS, &listed, &BTreeSet::new(), &[], now, 12);
+
+        assert_eq!(
+            marked,
+            vec![GcCandidate {
+                key: newly_dead,
+                first_seen_unreachable_at: now,
+                unreachable_since_manifest_version: 12,
+            }]
+        );
     }
 }
