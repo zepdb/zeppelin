@@ -314,6 +314,16 @@ pub struct ManifestHistoryRef {
     pub key: String,
 }
 
+enum HistorySnapshotWrite {
+    Stored,
+    AlreadyExistsWithDifferentBytes { key: String },
+}
+
+enum ReferencedHistoryConflict {
+    Serialization,
+    ManifestConflict,
+}
+
 impl Manifest {
     /// Create an empty manifest.
     pub fn new() -> Self {
@@ -554,7 +564,7 @@ impl Manifest {
     }
 
     /// Write manifest to S3.
-    pub async fn write(&self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
+    pub async fn write(&mut self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
         let key = Self::s3_key(namespace);
         let current_version = Self::read(store, namespace)
             .await?
@@ -563,8 +573,17 @@ impl Manifest {
         let mut committed = self.clone();
         committed.version = Self::checked_next_version(base_version)?;
         let data = committed.to_bytes()?;
+        Self::write_history_snapshot_for_commit(
+            store,
+            namespace,
+            &committed,
+            data.clone(),
+            ReferencedHistoryConflict::Serialization,
+        )
+        .await?;
         store.put(&key, data).await?;
-        Self::write_history_snapshot(store, namespace, &committed).await
+        self.version = committed.version;
+        Ok(())
     }
 
     /// Read manifest from S3, returning the manifest along with its ETag version.
@@ -598,15 +617,20 @@ impl Manifest {
         let mut committed = self.clone();
         committed.version = next_version;
         let data = committed.to_bytes()?;
-        let result = match &version.0 {
+        Self::write_history_snapshot_for_commit(
+            store,
+            namespace,
+            &committed,
+            data.clone(),
+            ReferencedHistoryConflict::ManifestConflict,
+        )
+        .await?;
+        match &version.0 {
             Some(etag) => store.put_if_match(&key, data, etag, namespace).await,
             None => store.put(&key, data).await,
-        };
-        if result.is_ok() {
-            Self::write_history_snapshot(store, namespace, &committed).await?;
-            self.version = next_version;
-        }
-        result
+        }?;
+        self.version = next_version;
+        Ok(())
     }
 
     /// List retained manifest history snapshots in ascending generation order.
@@ -673,11 +697,41 @@ impl Manifest {
         Ok(prune_count)
     }
 
-    async fn write_history_snapshot(
+    async fn write_history_snapshot_for_commit(
         store: &ZeppelinStore,
         namespace: &str,
         committed: &Self,
+        data: Bytes,
+        referenced_conflict: ReferencedHistoryConflict,
     ) -> Result<()> {
+        match Self::try_write_history_snapshot(store, namespace, committed).await? {
+            HistorySnapshotWrite::Stored => Ok(()),
+            HistorySnapshotWrite::AlreadyExistsWithDifferentBytes { key } => {
+                let live_version = Self::read(store, namespace)
+                    .await?
+                    .map_or(0, |live| live.version());
+                if live_version >= committed.version() {
+                    return match referenced_conflict {
+                        ReferencedHistoryConflict::Serialization => {
+                            Err(Self::history_snapshot_mismatch_error(&key))
+                        }
+                        ReferencedHistoryConflict::ManifestConflict => {
+                            Err(ZeppelinError::ManifestConflict {
+                                namespace: namespace.to_string(),
+                            })
+                        }
+                    };
+                }
+                store.put(&key, data).await
+            }
+        }
+    }
+
+    async fn try_write_history_snapshot(
+        store: &ZeppelinStore,
+        namespace: &str,
+        committed: &Self,
+    ) -> Result<HistorySnapshotWrite> {
         let version = committed.version();
         if version == 0 {
             return Err(ZeppelinError::Serialization(
@@ -688,19 +742,23 @@ impl Manifest {
         let key = Self::history_key(namespace, version);
         let data = committed.to_bytes()?;
         match store.put_if_not_exists(&key, data.clone(), namespace).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(HistorySnapshotWrite::Stored),
             Err(ZeppelinError::NamespaceAlreadyExists { .. }) => {
                 let existing = store.get(&key).await?;
                 if existing == data {
-                    Ok(())
+                    Ok(HistorySnapshotWrite::Stored)
                 } else {
-                    Err(ZeppelinError::Serialization(format!(
-                        "manifest history key {key} already exists with different bytes"
-                    )))
+                    Ok(HistorySnapshotWrite::AlreadyExistsWithDifferentBytes { key })
                 }
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn history_snapshot_mismatch_error(key: &str) -> ZeppelinError {
+        ZeppelinError::Serialization(format!(
+            "manifest history key {key} already exists with different bytes"
+        ))
     }
 
     fn history_version_from_key(namespace: &str, key: &str) -> Result<u64> {

@@ -3,6 +3,8 @@ pub mod assertions;
 #[allow(dead_code)]
 pub mod counting;
 #[allow(dead_code)]
+pub mod fault_injection;
+#[allow(dead_code)]
 pub mod harness;
 #[allow(dead_code)]
 pub mod server;

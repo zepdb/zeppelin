@@ -398,7 +398,7 @@ async fn test_tla_cache_staleness_during_compaction() {
     let cache = ManifestCache::new(Duration::from_secs(300));
 
     // State 1: Initialize manifest v1 on S3
-    let manifest_v1 = Manifest::new();
+    let mut manifest_v1 = Manifest::new();
     manifest_v1.write(&store, ns).await.unwrap();
 
     // States 2-4: W1 appends frag1, CAS writes (v1→v2), write-through
@@ -554,7 +554,7 @@ async fn test_tla_compaction_retry_starvation() {
     let ns = "tla-compact-starve";
 
     // State 1: Create namespace with initial fragments
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&store, ns).await.unwrap();
 
     let writer = WalWriter::new(store.clone());

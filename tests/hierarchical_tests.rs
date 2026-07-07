@@ -411,7 +411,7 @@ async fn test_compact_hierarchical() {
     let writer = WalWriter::new(store.clone());
 
     // Create namespace manifest.
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append 2 WAL fragments with unique ID prefixes.
@@ -486,7 +486,7 @@ async fn test_query_hierarchical_detection() {
     let writer = WalWriter::new(store.clone());
 
     // Create namespace manifest.
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append vectors.

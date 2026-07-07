@@ -39,7 +39,7 @@ async fn test_lease_acquire_and_release() {
     let ns = harness.key("lease-roundtrip");
 
     // Initialize namespace manifest
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let manager = LeaseManager::new(
@@ -74,7 +74,7 @@ async fn test_lease_double_acquire_rejected() {
     let harness = TestHarness::new().await;
     let ns = harness.key("lease-double");
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let manager1 = LeaseManager::new(
@@ -112,7 +112,7 @@ async fn test_lease_expired_takeover() {
     let harness = TestHarness::new().await;
     let ns = harness.key("lease-expiry");
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let manager1 = LeaseManager::new(
@@ -182,7 +182,7 @@ async fn test_fencing_rejects_zombie_writer() {
     let ns = harness.key("lease-zombie");
 
     // Set up initial manifest with fencing_token = 0
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let zombie_manager = LeaseManager::new(
@@ -245,7 +245,7 @@ async fn test_compactor_lease_prevents_double_compaction() {
     let harness = TestHarness::new().await;
     let ns = harness.key("lease-compactor");
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let compactor1 = LeaseManager::new(
@@ -281,7 +281,7 @@ async fn test_sequential_writers_with_leases() {
     let harness = TestHarness::new().await;
     let ns = harness.key("lease-sequential");
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let manager1 = LeaseManager::new(
@@ -332,7 +332,7 @@ async fn test_fragment_orphan_on_lease_expiry() {
     let harness = TestHarness::new().await;
     let ns = harness.key("lease-orphan");
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     // Write a fragment directly to S3 (simulating a writer whose lease expired
@@ -806,7 +806,7 @@ async fn test_tla_graceful_release_after_lease_expiry() {
     let ns = harness.key("tla-graceful-release");
     let store = &harness.store;
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // State 2: W1 acquires lease (token=1, 1s duration)

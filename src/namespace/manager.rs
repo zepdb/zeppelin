@@ -346,7 +346,7 @@ impl NamespaceManager {
         }
 
         // Also initialize an empty manifest
-        let manifest = crate::wal::Manifest::new();
+        let mut manifest = crate::wal::Manifest::new();
         manifest.write(&self.store, name).await?;
 
         // Add to registry

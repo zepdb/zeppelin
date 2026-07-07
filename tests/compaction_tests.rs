@@ -45,7 +45,7 @@ async fn test_compact_single_fragment() {
     let writer = WalWriter::new(store.clone());
 
     // Create namespace manifest
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append 1 fragment with 50 vectors
@@ -81,7 +81,7 @@ async fn test_compact_multiple_fragments() {
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append 3 fragments with unique IDs
@@ -148,7 +148,7 @@ async fn test_compact_with_deletes() {
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append 10 vectors
@@ -180,7 +180,7 @@ async fn test_compact_deduplication() {
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append vec id="dup" with values=[1,0,0,...,0]
@@ -257,7 +257,7 @@ async fn test_compact_updates_manifest() {
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append 2 fragments
@@ -292,7 +292,7 @@ async fn test_compact_cleans_up_fragments() {
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append 3 fragments, record their S3 keys
@@ -347,7 +347,7 @@ async fn test_compact_preserves_new_fragments() {
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append A, compact
@@ -464,7 +464,7 @@ async fn test_query_after_compaction() {
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append 100 vecs
@@ -562,7 +562,7 @@ async fn test_delete_after_compaction_not_returned_strong() {
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Upsert 50 vectors and compact them into a segment
@@ -665,7 +665,7 @@ async fn test_compact_empty_namespace() {
     let store = &harness.store;
 
     // Create manifest with no fragments
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     let compactor = test_compactor(store);
@@ -690,7 +690,7 @@ async fn test_compact_trigger_by_fragment_count() {
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     let compactor = test_compactor(store); // max_wal_fragments_before_compact: 3
@@ -733,7 +733,7 @@ async fn test_age_trigger_compacts_quiet_namespace() {
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // 2 fragments — far below the count threshold of 100.
@@ -806,7 +806,7 @@ async fn test_idle_namespace_untouched_across_intervals() {
     let ns = harness.key("idle-untouched");
     let store = &harness.store;
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     let manifest_key = Manifest::s3_key(&ns);
@@ -859,7 +859,7 @@ async fn test_bytes_trigger_uses_recorded_sizes() {
     let store = &harness.store;
     let writer = WalWriter::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // One fragment with real payload — its serialized size is recorded in
@@ -1709,7 +1709,7 @@ async fn test_compact_attributes_preserved() {
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
 
     // Append vecs with simple_attributes

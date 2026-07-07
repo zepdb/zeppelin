@@ -53,7 +53,7 @@ async fn test_wal_writer_append_single_fragment() {
     let ns = harness.key("wal-single");
 
     // Initialize namespace manifest so writer can read it
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let writer = WalWriter::new(harness.store.clone());
@@ -79,7 +79,7 @@ async fn test_wal_writer_append_multiple_fragments() {
     let harness = TestHarness::new().await;
     let ns = harness.key("wal-multi");
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let writer = WalWriter::new(harness.store.clone());
@@ -113,7 +113,7 @@ async fn test_wal_reader_read_uncompacted_fragments() {
     let harness = TestHarness::new().await;
     let ns = harness.key("wal-read");
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let writer = WalWriter::new(harness.store.clone());
@@ -157,7 +157,7 @@ async fn test_wal_fragment_key_listing() {
     let harness = TestHarness::new().await;
     let ns = harness.key("wal-list");
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let writer = WalWriter::new(harness.store.clone());
@@ -185,7 +185,7 @@ async fn test_wal_writer_concurrent_appends() {
     let harness = TestHarness::new().await;
     let ns = harness.key("wal-concurrent");
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let writer = Arc::new(WalWriter::new(harness.store.clone()));
@@ -228,7 +228,7 @@ async fn test_wal_writer_sequential_consistency() {
     let harness = TestHarness::new().await;
     let ns = harness.key("wal-sequential");
 
-    let manifest = Manifest::new();
+    let mut manifest = Manifest::new();
     manifest.write(&harness.store, &ns).await.unwrap();
 
     let writer = WalWriter::new(harness.store.clone());
