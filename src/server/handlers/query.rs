@@ -782,6 +782,11 @@ fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), Zeppelin
             GroupingSpec::Field { .. } => {}
         }
     }
+    if grouping_requested(req) && cursor_requested(req) {
+        return Err(ZeppelinError::Validation(
+            "grouping cannot be combined with cursor pagination".into(),
+        ));
+    }
     if let Some(facets) = req.facets.as_ref() {
         for facet in facets {
             if facet.field().is_empty() {

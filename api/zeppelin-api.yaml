@@ -1670,7 +1670,8 @@ components:
         Result grouping strategy. Field grouping collapses hits by an
         attribute value, keeps at most `max_per_group` hits in each group,
         and applies `top_k` to the number of groups. Hits missing the group
-        field form singleton groups keyed by their own ids.
+        field form singleton groups keyed by their own ids. Field grouping
+        cannot be combined with cursor pagination.
       discriminator:
         propertyName: type
         mapping:
@@ -1735,7 +1736,8 @@ components:
         page to request a `next_cursor`; pass that value back with
         `{"type":"after","token":"..."}` to continue after the last item
         from the previous page. Cursor tokens are stateless, opaque, and
-        bound to the namespace plus query shape.
+        bound to the namespace plus query shape. Cursor pagination cannot
+        be combined with field grouping.
       discriminator:
         propertyName: type
         mapping:
