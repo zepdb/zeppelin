@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -47,6 +47,9 @@ pub struct QueryResponse {
     /// Grouped result hits, returned only when the request asks for grouping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<QueryResultGroup>>,
+    /// Facet counts, returned only when the request asks for facets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facets: Option<QueryFacets>,
 }
 
 /// One grouped result bucket.
@@ -56,6 +59,14 @@ pub struct QueryResultGroup {
     pub key: String,
     /// Ranked hits in this group.
     pub results: Vec<SearchResult>,
+}
+
+/// Per-field facet counts keyed by stringified attribute value.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryFacets {
+    /// Counts for each requested field.
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
 /// Optional client-visible query diagnostics.
@@ -402,6 +413,7 @@ async fn execute_query_with_manifest_scoped(
         debug,
         next_cursor: None,
         groups: None,
+        facets: None,
     })
 }
 
@@ -1015,6 +1027,7 @@ async fn execute_bm25_query_with_manifest_scoped(
         debug,
         next_cursor: None,
         groups: None,
+        facets: None,
     })
 }
 

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use axum::extract::{Extension, Path, State};
@@ -17,7 +17,7 @@ use crate::fts::FtsFieldConfig;
 use crate::index::distance::compute_distance;
 use crate::namespace::manager::NamespaceMetadata;
 use crate::query;
-use crate::query::{QueryDebug, QueryDebugCache, QueryResponse, QueryResultGroup};
+use crate::query::{QueryDebug, QueryDebugCache, QueryFacets, QueryResponse, QueryResultGroup};
 use crate::runtime_config::QueryKnobs;
 use crate::server::{AppState, RateLimitClass, RateLimitIdentity};
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, SearchResult};
@@ -70,6 +70,9 @@ pub struct QueryRequest {
     /// Optional grouping strategy.
     #[serde(default)]
     pub grouping: Option<GroupingSpec>,
+    /// Attribute fields to facet over the filtered candidate frontier.
+    #[serde(default)]
+    pub facets: Option<Vec<FacetSpec>>,
     /// Response projection settings.
     #[serde(default)]
     pub projection: Option<ProjectionSpec>,
@@ -181,6 +184,17 @@ pub enum GroupingSpec {
         /// Maximum results per group.
         max_per_group: usize,
     },
+}
+
+/// Facet field request in the retrieval-algebra request AST.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct FacetSpec(String);
+
+impl FacetSpec {
+    fn field(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Projection settings in the retrieval-algebra request AST.
@@ -741,6 +755,7 @@ fn retrieval_algebra_without_sources(req: &QueryRequest) -> bool {
         || req.fusion.is_some()
         || req.rerank.is_some()
         || req.grouping.is_some()
+        || req.facets.is_some()
         || req.projection.is_some()
         || req.cursor.is_some()
         || req.explain.is_some()
@@ -770,6 +785,15 @@ fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), Zeppelin
                 ));
             }
             GroupingSpec::Field { .. } => {}
+        }
+    }
+    if let Some(facets) = req.facets.as_ref() {
+        for facet in facets {
+            if facet.field().is_empty() {
+                return Err(ZeppelinError::Validation(
+                    "facet field must not be empty".into(),
+                ));
+            }
         }
     }
     if let Some(cursor) = req.cursor.as_ref() {
@@ -995,6 +1019,7 @@ async fn execute_hybrid_query(
 fn first_stage_top_k(req: &QueryRequest, validated: ValidatedQuery) -> usize {
     if req.rerank.as_ref().is_some_and(RerankSpec::is_explicit)
         || grouping_requested(req)
+        || facet_counts_requested(req)
         || cursor_requested(req)
     {
         let min_cursor_frontier = validated.top_k.saturating_add(1);
@@ -1024,10 +1049,15 @@ fn first_stage_include_attributes(req: &QueryRequest, include_attributes: bool) 
     include_attributes
         || matches!(req.rerank, Some(RerankSpec::Bm25 { .. }))
         || grouping_requested(req)
+        || facet_counts_requested(req)
 }
 
 fn cursor_requested(req: &QueryRequest) -> bool {
     req.cursor.is_some()
+}
+
+fn facet_counts_requested(req: &QueryRequest) -> bool {
+    req.facets.as_ref().is_some_and(|facets| !facets.is_empty())
 }
 
 fn grouping_requested(req: &QueryRequest) -> bool {
@@ -1049,6 +1079,7 @@ async fn apply_rerank_if_requested(
     ctx: RerankExecutionContext<'_>,
     response: QueryResponse,
 ) -> Result<QueryResponse, ZeppelinError> {
+    let facets = compute_facets_if_requested(ctx.req, &response.results)?;
     let keep_attrs_after_rerank = ctx.include_attributes || grouping_requested(ctx.req);
     let response = match ctx.req.rerank.as_ref() {
         Some(RerankSpec::Vector { vector }) => apply_vector_rerank(&ctx, response, vector).await?,
@@ -1063,7 +1094,94 @@ async fn apply_rerank_if_requested(
     };
     let response =
         apply_grouping_if_requested(ctx.req, response, ctx.top_k, ctx.include_attributes)?;
-    apply_cursor_if_requested(ctx.ns, ctx.req, response, ctx.top_k)
+    let mut response = apply_cursor_if_requested(ctx.ns, ctx.req, response, ctx.top_k)?;
+    if !grouping_requested(ctx.req) && !cursor_requested(ctx.req) {
+        response.results.truncate(ctx.top_k);
+    }
+    strip_attributes_if_needed(&mut response, ctx.include_attributes);
+    response.facets = facets;
+    Ok(response)
+}
+
+fn strip_attributes_if_needed(response: &mut QueryResponse, include_attributes: bool) {
+    if include_attributes {
+        return;
+    }
+    for result in &mut response.results {
+        result.attributes = None;
+    }
+    if let Some(groups) = response.groups.as_mut() {
+        for group in groups {
+            for result in &mut group.results {
+                result.attributes = None;
+            }
+        }
+    }
+}
+
+fn compute_facets_if_requested(
+    req: &QueryRequest,
+    results: &[SearchResult],
+) -> Result<Option<QueryFacets>, ZeppelinError> {
+    let Some(facets) = req.facets.as_ref() else {
+        return Ok(None);
+    };
+
+    let mut fields = BTreeMap::<String, BTreeMap<String, usize>>::new();
+    let mut requested_fields = Vec::<String>::new();
+    for facet in facets {
+        let field = facet.field();
+        if fields.contains_key(field) {
+            continue;
+        }
+        fields.insert(field.to_string(), BTreeMap::new());
+        requested_fields.push(field.to_string());
+    }
+
+    for result in results {
+        let Some(attrs) = result.attributes.as_ref() else {
+            continue;
+        };
+        for field in &requested_fields {
+            let Some(value) = attrs.get(field) else {
+                continue;
+            };
+            for facet_value in facet_attribute_values(value)? {
+                let counts = fields.get_mut(field).ok_or_else(|| {
+                    ZeppelinError::Index("requested facet field missing from accumulator".into())
+                })?;
+                *counts.entry(facet_value).or_insert(0) += 1;
+            }
+        }
+    }
+
+    Ok(Some(QueryFacets { fields }))
+}
+
+fn facet_attribute_values(value: &AttributeValue) -> Result<Vec<String>, ZeppelinError> {
+    match value {
+        AttributeValue::String(value) => Ok(vec![value.clone()]),
+        AttributeValue::Integer(value) => Ok(vec![value.to_string()]),
+        AttributeValue::Float(value) => {
+            if !value.is_finite() {
+                return Err(ZeppelinError::Validation(
+                    "facet field contains a non-finite value".into(),
+                ));
+            }
+            Ok(vec![value.to_string()])
+        }
+        AttributeValue::Bool(value) => Ok(vec![value.to_string()]),
+        AttributeValue::StringList(values) => Ok(values.clone()),
+        AttributeValue::IntegerList(values) => Ok(values.iter().map(i64::to_string).collect()),
+        AttributeValue::FloatList(values) => {
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(ZeppelinError::Validation(
+                    "facet field contains a non-finite value".into(),
+                ));
+            }
+            Ok(values.iter().map(f64::to_string).collect())
+        }
+    }
 }
 
 async fn apply_vector_rerank(
@@ -1740,6 +1858,7 @@ fn fuse_source_responses(
         debug,
         next_cursor: None,
         groups: None,
+        facets: None,
     })
 }
 

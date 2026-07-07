@@ -1389,7 +1389,7 @@ components:
         Query request contract. Legacy requests continue to provide exactly
         one of `vector` or `rank_by`. Retrieval-algebra requests provide
         `sources` and may include typed `fusion`, `rerank`, `grouping`,
-        `projection`, `cursor`, and `explain` contracts.
+        `facets`, `projection`, `cursor`, and `explain` contracts.
 
         Implemented today:
         - legacy `vector`
@@ -1401,6 +1401,7 @@ components:
         - explicit vector and BM25 rerank over the candidate frontier
         - opaque cursor pagination
         - field grouping
+        - lightweight facet counts over the filtered candidate frontier
         - `projection.include_attributes`
 
         Reserved today (returns code `NOT_IMPLEMENTED`):
@@ -1430,10 +1431,10 @@ components:
           minimum: 1
           description: |
             Per-source candidate count before multi-source fusion. Defaults
-            to `max(top_k * 4, 100)`. Multi-source fusion and explicit
-            rerank and cursor pagination use this as the first-stage
-            frontier, then truncate to `top_k` after fusion, rerank, or
-            cursor windowing.
+            to `max(top_k * 4, 100)`. Multi-source fusion, explicit rerank,
+            grouping, facets, and cursor pagination use this as the
+            first-stage frontier, then truncate to `top_k` after fusion,
+            rerank, cursor windowing, or facet counting where applicable.
         filter:
           $ref: "#/components/schemas/Filter"
         consistency:
@@ -1465,6 +1466,16 @@ components:
           $ref: "#/components/schemas/RerankSpec"
         grouping:
           $ref: "#/components/schemas/GroupingSpec"
+        facets:
+          type: array
+          description: |
+            Attribute fields to count. Counts are computed over vectors that
+            match the query filter within the retrieved/filtered candidate
+            frontier, not over the whole namespace and not only over the
+            returned `top_k`. Unknown or absent fields return empty counts.
+            List-valued attributes contribute once for each listed value.
+          items:
+            $ref: "#/components/schemas/FacetSpec"
         projection:
           $ref: "#/components/schemas/ProjectionSpec"
         cursor:
@@ -1692,6 +1703,11 @@ components:
           type: integer
           minimum: 1
 
+    FacetSpec:
+      type: string
+      minLength: 1
+      description: Attribute field name to count by value.
+
     ProjectionSpec:
       type: object
       additionalProperties: false
@@ -1797,6 +1813,8 @@ components:
           description: Present only when result grouping is requested.
           items:
             $ref: "#/components/schemas/QueryResultGroup"
+        facets:
+          $ref: "#/components/schemas/QueryFacets"
 
     QueryResultGroup:
       type: object
@@ -1810,6 +1828,20 @@ components:
           description: Ranked hits retained for this group.
           items:
             $ref: "#/components/schemas/SearchResult"
+
+    QueryFacets:
+      type: object
+      description: |
+        Present only when `facets` is requested. Top-level keys are the
+        requested facet fields. Nested keys are stringified attribute values
+        and nested values are counts within the retrieved/filtered candidate
+        frontier. List-valued attributes contribute once for each listed
+        value; hits missing a requested field do not contribute.
+      additionalProperties:
+        type: object
+        additionalProperties:
+          type: integer
+          minimum: 0
 
     QueryDebug:
       type: object
