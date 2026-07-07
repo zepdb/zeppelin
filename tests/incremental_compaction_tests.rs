@@ -64,6 +64,7 @@ fn incremental_compactor(store: &ZeppelinStore) -> Compactor {
         wal_reader,
         compaction_config,
         indexing_config,
+        common::default_gc_upload_window(),
     )
 }
 
@@ -88,6 +89,7 @@ fn baseline_compactor(store: &ZeppelinStore) -> Compactor {
         wal_reader,
         compaction_config,
         indexing_config,
+        common::default_gc_upload_window(),
     )
 }
 
@@ -623,6 +625,7 @@ fn compactor_with_clusters(store: &ZeppelinStore, n_clusters: usize) -> Compacto
         wal_reader,
         compaction_config,
         indexing_config,
+        common::default_gc_upload_window(),
     )
 }
 
@@ -800,6 +803,7 @@ fn incremental_compactor_quantized(
         wal_reader,
         compaction_config,
         indexing_config,
+        common::default_gc_upload_window(),
     )
 }
 
@@ -2285,7 +2289,13 @@ async fn test_incremental_matches_full_rewrite_results() {
             retrain_imbalance_threshold: 0.0, // always retrain
             ..Default::default()
         };
-        Compactor::new(store.clone(), wal_reader, cfg, indexing_config.clone())
+        Compactor::new(
+            store.clone(),
+            wal_reader,
+            cfg,
+            indexing_config.clone(),
+            common::default_gc_upload_window(),
+        )
     };
     full_compactor.compact(&ns_full).await.unwrap();
 

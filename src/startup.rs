@@ -253,6 +253,7 @@ pub async fn build_app(
         WalReader::new(store.clone()),
         config.compaction.clone(),
         config.indexing.clone(),
+        Duration::from_secs(config.gc.compaction_upload_window_secs),
     ));
 
     // Per-namespace compaction lease: only one node compacts a namespace at

@@ -217,6 +217,7 @@ async fn test_wal_fragment_notfound_tolerated_only_after_manifest_reread_and_met
         WalReader::new(harness.store.clone()),
         Default::default(),
         one_cluster_flat_config().indexing,
+        common::default_gc_upload_window(),
     );
     compactor.compact(&ns).await.unwrap();
 

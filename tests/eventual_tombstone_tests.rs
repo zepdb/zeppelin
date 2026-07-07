@@ -47,6 +47,7 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore, fts_index: bool) -> 
             bitmap_index: false,
             ..Default::default()
         },
+        common::default_gc_upload_window(),
     )
 }
 

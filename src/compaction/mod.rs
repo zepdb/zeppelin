@@ -74,6 +74,7 @@ pub struct Compactor {
     wal_reader: WalReader,
     config: CompactionConfig,
     indexing_config: IndexingConfig,
+    upload_window: Duration,
     /// Test-only hook: artificial delay injected after index build and
     /// before the final manifest CAS loop, simulating a compaction whose
     /// build phase outlasts the lease duration. Always `None` in production
@@ -108,12 +109,14 @@ impl Compactor {
         wal_reader: WalReader,
         config: CompactionConfig,
         indexing_config: IndexingConfig,
+        upload_window: Duration,
     ) -> Self {
         Self {
             store,
             wal_reader,
             config,
             indexing_config,
+            upload_window,
             test_pre_cas_delay: None,
         }
     }
@@ -129,6 +132,12 @@ impl Compactor {
     /// Return a reference to the compaction configuration.
     pub fn config(&self) -> &CompactionConfig {
         &self.config
+    }
+
+    /// Return the GC-owned compaction upload window.
+    #[must_use]
+    pub fn compaction_upload_window(&self) -> Duration {
+        self.upload_window
     }
 
     /// Return a reference to the underlying store.
@@ -1029,7 +1038,7 @@ impl Compactor {
             if let Err(e) = check_upload_window(
                 namespace,
                 upload_phase_start,
-                compaction_upload_window(&self.config),
+                self.compaction_upload_window(),
             ) {
                 if let Some(token) = fencing_token {
                     drop_compaction_staging(&self.store, namespace, token).await;
@@ -2286,10 +2295,6 @@ async fn drop_compaction_staging(store: &ZeppelinStore, namespace: &str, fencing
     }
 }
 
-fn compaction_upload_window(config: &CompactionConfig) -> Duration {
-    Duration::from_secs(config.compaction_upload_window_secs)
-}
-
 fn check_upload_window(
     namespace: &str,
     upload_phase_start: std::time::Instant,
@@ -2473,13 +2478,20 @@ async fn load_segment_vectors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Config, GcConfig};
     use crate::wal::manifest::FragmentRef;
 
     fn mem_compactor(config: CompactionConfig) -> Compactor {
         let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
         let store = ZeppelinStore::new(mem);
         let wal_reader = WalReader::new(store.clone());
-        Compactor::new(store, wal_reader, config, IndexingConfig::default())
+        Compactor::new(
+            store,
+            wal_reader,
+            config,
+            IndexingConfig::default(),
+            Duration::from_secs(GcConfig::default().compaction_upload_window_secs),
+        )
     }
 
     fn now_ms() -> u64 {
@@ -2497,6 +2509,44 @@ mod tests {
             sequence_number: 0,
             size_bytes,
         }
+    }
+
+    #[test]
+    fn gc_upload_window_drives_horizon_floor_and_compactor_abort_window() {
+        let mut config = Config::default();
+        config.cache.manifest_cache_ttl_ms = 2_500;
+        config.server.request_timeout_secs = 30;
+        config.gc.compaction_upload_window_secs = 42;
+        config.gc.skew_slop_secs = 3;
+        config.gc.horizon_secs = 78;
+
+        config.validate().unwrap();
+        assert_eq!(config.gc_horizon_floor_secs(), Some(78));
+
+        let compactor = mem_compactor_with_upload_window(
+            config.compaction.clone(),
+            Duration::from_secs(config.gc.compaction_upload_window_secs),
+        );
+        assert_eq!(
+            compactor.compaction_upload_window(),
+            Duration::from_secs(42)
+        );
+    }
+
+    fn mem_compactor_with_upload_window(
+        config: CompactionConfig,
+        upload_window: Duration,
+    ) -> Compactor {
+        let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store = ZeppelinStore::new(mem);
+        let wal_reader = WalReader::new(store.clone());
+        Compactor::new(
+            store,
+            wal_reader,
+            config,
+            IndexingConfig::default(),
+            upload_window,
+        )
     }
 
     async fn write_manifest(compactor: &Compactor, ns: &str, fragments: Vec<FragmentRef>) {

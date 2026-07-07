@@ -301,6 +301,7 @@ async fn test_tla_namespace_delete_compaction_zombie() {
             kmeans_max_iterations: 5,
             ..Default::default()
         },
+        common::default_gc_upload_window(),
     );
     let _ = compactor.compact(ns).await;
 

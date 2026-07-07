@@ -50,6 +50,7 @@ fn test_compactor(store: &ZeppelinStore) -> Compactor {
             bitmap_index: false,
             ..Default::default()
         },
+        common::default_gc_upload_window(),
     )
 }
 

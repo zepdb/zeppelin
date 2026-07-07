@@ -974,6 +974,7 @@ async fn prepare_namespace(
         WalReader::new(store.clone()),
         config.compaction.clone(),
         config.indexing.clone(),
+        std::time::Duration::from_secs(config.gc.compaction_upload_window_secs),
     );
     let result = compactor.compact(&namespace).await?;
     if result.segment_id.is_none() {

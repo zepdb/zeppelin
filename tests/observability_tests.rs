@@ -212,6 +212,7 @@ async fn test_compaction_duration_metric() {
         WalReader::new(harness.store.clone()),
         zeppelin::config::CompactionConfig::default(),
         zeppelin::config::IndexingConfig::default(),
+        common::default_gc_upload_window(),
     );
     let compact_result = compactor.compact(&ns).await;
 

@@ -394,6 +394,7 @@ fn slow_compactor(store: &zeppelin::storage::ZeppelinStore, pre_cas_delay: Durat
             kmeans_max_iterations: 5,
             ..Default::default()
         },
+        common::default_gc_upload_window(),
     );
     compactor.set_test_pre_cas_delay(pre_cas_delay);
     compactor

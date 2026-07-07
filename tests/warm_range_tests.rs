@@ -36,6 +36,7 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
             kmeans_max_iterations: 10,
             ..Default::default()
         },
+        common::default_gc_upload_window(),
     )
 }
 

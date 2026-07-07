@@ -54,6 +54,7 @@ fn test_compactor_with(
             ..Default::default()
         },
         indexing,
+        common::default_gc_upload_window(),
     )
 }
 

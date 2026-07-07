@@ -32,6 +32,7 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
         wal_reader,
         compaction_config,
         indexing_config,
+        common::default_gc_upload_window(),
     )
 }
 
@@ -762,6 +763,7 @@ async fn test_age_trigger_compacts_quiet_namespace() {
         wal_reader,
         compaction_config,
         indexing_config,
+        common::default_gc_upload_window(),
     );
 
     // Mirror the background loop: poll every interval, compact when the
@@ -826,6 +828,7 @@ async fn test_idle_namespace_untouched_across_intervals() {
             kmeans_max_iterations: 10,
             ..Default::default()
         },
+        common::default_gc_upload_window(),
     );
 
     // Several intervals: the trigger must never fire with 0 fragments.
@@ -885,6 +888,7 @@ async fn test_bytes_trigger_uses_recorded_sizes() {
                 ..Default::default()
             },
             IndexingConfig::default(),
+            common::default_gc_upload_window(),
         )
     };
     assert!(
@@ -1302,6 +1306,7 @@ async fn test_compaction_warms_new_segment_centroids() {
         WalReader::new(store.clone()),
         compaction_config.clone(),
         indexing_config,
+        common::default_gc_upload_window(),
     ));
     let manifest_cache = Arc::new(zeppelin::cache::manifest_cache::ManifestCache::new(
         Duration::from_millis(500),
@@ -1410,6 +1415,7 @@ async fn test_background_compaction_discovery_is_delimited_and_prefix_scoped() {
             kmeans_max_iterations: 10,
             ..Default::default()
         },
+        common::default_gc_upload_window(),
     ));
     let manifest_cache = Arc::new(zeppelin::cache::manifest_cache::ManifestCache::new(
         Duration::from_millis(500),

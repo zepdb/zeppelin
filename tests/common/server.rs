@@ -194,6 +194,7 @@ pub async fn start_test_server_with_compactor(
         WalReader::new(harness.store.clone()),
         config.compaction.clone(),
         config.indexing.clone(),
+        Duration::from_secs(config.gc.compaction_upload_window_secs),
     ));
     let manifest_cache = Arc::new(ManifestCache::new(Duration::ZERO));
 
@@ -266,6 +267,7 @@ pub async fn start_test_server_with_compaction(
         WalReader::new(harness.store.clone()),
         config.compaction.clone(),
         config.indexing.clone(),
+        Duration::from_secs(config.gc.compaction_upload_window_secs),
     ));
 
     // Spawn background compaction loop (mirrors main.rs)

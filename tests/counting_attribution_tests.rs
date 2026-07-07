@@ -75,6 +75,7 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
         wal_reader,
         compaction_config,
         indexing_config,
+        common::default_gc_upload_window(),
     )
 }
 

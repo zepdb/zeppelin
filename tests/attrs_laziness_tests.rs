@@ -79,6 +79,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         WalReader::new(store.clone()),
         config.compaction.clone(),
         config.indexing.clone(),
+        Duration::from_secs(config.gc.compaction_upload_window_secs),
     ));
     let manifest_cache = Arc::new(ManifestCache::new(Duration::ZERO));
     let runtime_query_config = Arc::new(RuntimeQueryConfig::from_config(&config));

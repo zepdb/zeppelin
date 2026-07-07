@@ -82,6 +82,7 @@ async fn start_api_server(config: Config) -> ApiServer {
         WalReader::new(store.clone()),
         config.compaction.clone(),
         config.indexing.clone(),
+        Duration::from_secs(config.gc.compaction_upload_window_secs),
     ));
     let oversample_factor = config.indexing.oversample_factor;
     let hydrator = if config.cache.hydration_enabled {

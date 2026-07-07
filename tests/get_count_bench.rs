@@ -94,6 +94,7 @@ fn test_compactor(store: &ZeppelinStore) -> Compactor {
             ..Default::default()
         },
         indexing_config(),
+        common::default_gc_upload_window(),
     )
 }
 

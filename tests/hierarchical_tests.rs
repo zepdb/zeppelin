@@ -457,6 +457,7 @@ async fn test_compact_hierarchical() {
         wal_reader,
         compaction_config,
         indexing_config,
+        common::default_gc_upload_window(),
     );
 
     let result = compactor.compact(&ns).await.unwrap();
@@ -510,6 +511,7 @@ async fn test_query_hierarchical_detection() {
         wal_reader,
         compaction_config,
         indexing_config,
+        common::default_gc_upload_window(),
     );
     compactor.compact(&ns).await.unwrap();
 
@@ -570,6 +572,7 @@ async fn test_repeat_query_zero_tree_meta_gets() {
             ..Default::default()
         },
         hierarchical_test_config(),
+        common::default_gc_upload_window(),
     );
     compactor.compact(&ns).await.unwrap();
 

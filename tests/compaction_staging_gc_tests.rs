@@ -40,7 +40,6 @@ fn staging_compactor(
         WalReader::new(store.clone()),
         CompactionConfig {
             max_wal_fragments_before_compact: 1,
-            compaction_upload_window_secs: upload_window_secs,
             ..Default::default()
         },
         IndexingConfig {
@@ -48,6 +47,7 @@ fn staging_compactor(
             kmeans_max_iterations: 5,
             ..Default::default()
         },
+        Duration::from_secs(upload_window_secs),
     );
     compactor.set_test_pre_cas_delay(pre_cas_delay);
     compactor
