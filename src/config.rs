@@ -580,6 +580,7 @@ mod tests {
         let mut config = Config::default();
         config.cache.manifest_cache_ttl_ms = 1_000;
         config.server.request_timeout_secs = 30;
+        config.compaction.compaction_upload_window_secs = 20;
         config.gc.compaction_upload_window_secs = 20;
         config.gc.skew_slop_secs = 5;
         config.gc.horizon_secs = 10;
@@ -607,6 +608,9 @@ mod tests {
 
         let config = load_toml(
             r#"
+            [compaction]
+            compaction_upload_window_secs = 15
+
             [gc]
             horizon_secs = 120
             compaction_upload_window_secs = 15
@@ -904,6 +908,11 @@ pub struct CompactionConfig {
     /// prevent a stale commit. Default: `300`.
     #[serde(default = "default_compaction_lease_secs")]
     pub lease_duration_secs: u64,
+    /// Maximum allowed duration between compaction segment upload start and
+    /// final manifest CAS, in seconds. This is a local compatibility field
+    /// until Task 19A owns the canonical GC horizon config.
+    #[serde(default = "default_compaction_upload_window_secs")]
+    pub compaction_upload_window_secs: u64,
 }
 
 /// Structured logging configuration.
@@ -1040,6 +1049,9 @@ fn default_max_old_segments() -> usize {
 fn default_compaction_lease_secs() -> u64 {
     300
 }
+fn default_compaction_upload_window_secs() -> u64 {
+    300
+}
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -1141,6 +1153,7 @@ impl Default for CompactionConfig {
             max_pending_deletes: default_max_pending_deletes(),
             max_old_segments: default_max_old_segments(),
             lease_duration_secs: default_compaction_lease_secs(),
+            compaction_upload_window_secs: default_compaction_upload_window_secs(),
         }
     }
 }
@@ -1293,6 +1306,23 @@ impl Config {
         }
         if self.compaction.lease_duration_secs == 0 {
             violations.push("compaction.lease_duration_secs must be greater than zero".to_string());
+        }
+        if self.compaction.compaction_upload_window_secs == 0 {
+            violations.push(
+                "compaction.compaction_upload_window_secs must be greater than zero".to_string(),
+            );
+        }
+        // The GC horizon floor (gc.compaction_upload_window_secs) must match the window
+        // compaction actually enforces (compaction.compaction_upload_window_secs); otherwise
+        // the floor could be sized against a different upload window than reality. These are two
+        // knobs for one concept today — TODO: unify to a single source (needs the gc window
+        // threaded into CompactionConfig). Until then, forbid divergence.
+        if self.compaction.compaction_upload_window_secs != self.gc.compaction_upload_window_secs {
+            violations.push(format!(
+                "compaction.compaction_upload_window_secs ({}) must equal gc.compaction_upload_window_secs ({})",
+                self.compaction.compaction_upload_window_secs,
+                self.gc.compaction_upload_window_secs,
+            ));
         }
 
         if self.cache.hydration_heat_queries == 0 {

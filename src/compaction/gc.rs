@@ -2,8 +2,11 @@
 
 use std::collections::BTreeSet;
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
+use crate::error::Result;
 use crate::fts::global_index::global_fts_key;
 use crate::fts::inverted_index::fts_index_key;
 use crate::index::bitmap::bitmap_key;
@@ -12,12 +15,41 @@ use crate::index::ivf_flat::build::{attrs_key, centroids_key, cluster_key};
 use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
 use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
 use crate::index::quantization::QuantizationType;
+use crate::storage::ZeppelinStore;
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::Manifest;
+use crate::wal::Lease;
+
+/// Lease-scoped side-object recording compaction uploads that have not yet
+/// been committed into the manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionStaging {
+    /// Fencing token of the lease that owns these in-flight uploads.
+    pub fencing_token: u64,
+    /// Exact S3 keys uploaded by the compaction and not yet manifest-live.
+    #[serde(default)]
+    pub keys: BTreeSet<String>,
+}
+
+/// S3 key for a compaction staging side object.
+#[must_use]
+pub fn staging_key(namespace: &str, fencing_token: u64) -> String {
+    format!("{namespace}/_staging/{fencing_token}.json")
+}
 
 /// Exact-key set of every S3 object still referenced by `manifest`.
 #[must_use]
 pub fn reachable_keys(namespace: &str, manifest: &Manifest) -> BTreeSet<String> {
+    reachable_keys_with_staging(namespace, manifest, &BTreeSet::new())
+}
+
+/// Exact-key set of every manifest-referenced object plus active staged uploads.
+#[must_use]
+pub fn reachable_keys_with_staging(
+    namespace: &str,
+    manifest: &Manifest,
+    staging: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
 
     for fragment in &manifest.fragments {
@@ -94,6 +126,7 @@ pub fn reachable_keys(namespace: &str, manifest: &Manifest) -> BTreeSet<String> 
     }
 
     keys.extend(manifest.pending_deletes.iter().cloned());
+    keys.extend(staging.iter().cloned());
     keys
 }
 
@@ -153,6 +186,64 @@ pub fn revalidate_unreachable_candidates(
         .filter(|candidate| !reachable.contains(&candidate.key))
         .cloned()
         .collect()
+}
+
+/// Write the exact staged-key set for the current compaction lease.
+pub async fn write_compaction_staging(
+    store: &ZeppelinStore,
+    namespace: &str,
+    fencing_token: u64,
+    keys: BTreeSet<String>,
+) -> Result<()> {
+    let staging = CompactionStaging {
+        fencing_token,
+        keys,
+    };
+    let data = Bytes::from(serde_json::to_vec_pretty(&staging)?);
+    store
+        .put(&staging_key(namespace, fencing_token), data)
+        .await
+}
+
+/// Clear the staged-key side object for a compaction lease.
+pub async fn clear_compaction_staging(
+    store: &ZeppelinStore,
+    namespace: &str,
+    fencing_token: u64,
+) -> Result<()> {
+    match store.delete(&staging_key(namespace, fencing_token)).await {
+        Ok(()) => Ok(()),
+        Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Return staged keys for the currently active lease, excluding stale or
+/// expired lease records so a dead compactor cannot pin uploads forever.
+pub async fn active_staged_keys(
+    store: &ZeppelinStore,
+    namespace: &str,
+) -> Result<BTreeSet<String>> {
+    let lease_data = match store.get(&format!("{namespace}/lease.json")).await {
+        Ok(data) => data,
+        Err(crate::error::ZeppelinError::NotFound { .. }) => return Ok(BTreeSet::new()),
+        Err(e) => return Err(e),
+    };
+    let lease: Lease = serde_json::from_slice(&lease_data)?;
+    if lease.expires_at <= Utc::now() {
+        return Ok(BTreeSet::new());
+    }
+
+    let mut staged = BTreeSet::new();
+    let prefix = format!("{namespace}/_staging/");
+    for key in store.list_prefix(&prefix).await? {
+        let data = store.get(&key).await?;
+        let entry: CompactionStaging = serde_json::from_slice(&data)?;
+        if entry.fencing_token == lease.fencing_token {
+            staged.extend(entry.keys);
+        }
+    }
+    Ok(staged)
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -576,5 +667,27 @@ mod tests {
             BTreeSet::from([dead_key]),
             "delete decisions must re-read exact manifest reachability, not trust candidate state"
         );
+    }
+
+    #[test]
+    fn reachable_keys_with_staging_unions_active_staged_keys() {
+        let mut manifest = Manifest::new();
+        manifest.segments.push(segment_ref("seg_live", 1));
+        let staged: BTreeSet<String> = [
+            format!("{NS}/segments/seg_staged/centroids.bin"),
+            format!("{NS}/segments/seg_staged/cluster_group_0.bin"),
+        ]
+        .into_iter()
+        .collect();
+
+        let reachable = reachable_keys_with_staging(NS, &manifest, &staged);
+
+        assert!(reachable.contains(&centroids_key(NS, "seg_live")));
+        for key in staged {
+            assert!(
+                reachable.contains(&key),
+                "active lease staged key must be treated as reachable: {key}"
+            );
+        }
     }
 }
