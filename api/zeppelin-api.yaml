@@ -263,9 +263,11 @@ paths:
       operationId: queryNamespace
       summary: Query vectors
       description: |
-        Run a vector similarity search or BM25 full-text search. Legacy
-        requests provide exactly one of `vector` or `rank_by`; retrieval
-        algebra requests provide typed `sources`.
+        Run vector similarity search, BM25 full-text search, or typed
+        retrieval-algebra search. Legacy requests provide exactly one of
+        `vector` or `rank_by`; retrieval-algebra requests provide typed
+        `sources`, with multi-source `ann` + `bm25` fusion supported by RRF
+        or weighted normalized score.
       tags: [Query]
       requestBody:
         required: true
@@ -969,10 +971,11 @@ components:
         - legacy `rank_by`
         - single-source `ann`
         - single-source `bm25`
+        - multi-source RRF fusion (`fusion` omitted defaults to RRF k=60)
+        - multi-source weighted normalized score fusion
         - `projection.include_attributes`
 
         Reserved today (returns code `NOT_IMPLEMENTED`):
-        - multi-source fusion
         - explicit vector/BM25 rerank
         - grouped results
         - cursor pagination
@@ -997,6 +1000,13 @@ components:
           minimum: 1
           maximum: 10000
           description: Number of results to return
+        candidate_k:
+          type: integer
+          minimum: 1
+          description: |
+            Per-source candidate count before multi-source fusion. Defaults
+            to `max(top_k * 4, 100)`. The fused list is then truncated to
+            `top_k`. Only used by multi-source retrieval-algebra execution.
         filter:
           $ref: "#/components/schemas/Filter"
         consistency:
@@ -1083,8 +1093,9 @@ components:
 
     FusionSpec:
       description: |
-        Multi-source fusion strategy. `none` is accepted with a single source;
-        executable multi-source fusion is not supported yet.
+        Multi-source fusion strategy. Omitted `fusion` defaults to RRF with
+        `k=60` for multi-source requests. `none` is accepted with a single
+        source only.
       discriminator:
         propertyName: type
         mapping:
@@ -1116,6 +1127,7 @@ components:
         k:
           type: integer
           minimum: 1
+          default: 60
           description: Reciprocal rank fusion smoothing constant.
 
     FusionWeighted:
@@ -1128,10 +1140,15 @@ components:
           const: weighted
         weights:
           type: array
+          minItems: 1
           items:
             type: number
             format: float
-          description: Per-source weights in `sources` order.
+          description: |
+            Per-source weights in `sources` order. The length must equal the
+            number of sources. Each source score list is min-max normalized
+            to [0,1] before weighting; ANN distances are inverted so lower
+            distance contributes a higher normalized score.
 
     RerankSpec:
       description: |

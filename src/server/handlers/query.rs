@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -13,7 +15,7 @@ use crate::query;
 use crate::query::QueryResponse;
 use crate::runtime_config::QueryKnobs;
 use crate::server::AppState;
-use crate::types::{ConsistencyLevel, Filter};
+use crate::types::{ConsistencyLevel, Filter, SearchResult};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 
@@ -36,6 +38,9 @@ pub struct QueryRequest {
     /// Maximum number of results to return (defaults to server config).
     #[serde(default)]
     pub top_k: Option<usize>,
+    /// Per-source candidate count before multi-source fusion.
+    #[serde(default)]
+    pub candidate_k: Option<usize>,
     /// Optional attribute filter applied before ranking.
     #[serde(default)]
     pub filter: Option<Filter>,
@@ -235,6 +240,7 @@ pub struct BatchQueryRequest {
 #[derive(Debug, Clone, Copy)]
 struct ValidatedQuery {
     top_k: usize,
+    candidate_k: usize,
     nprobe: usize,
     include_attributes: bool,
     source: ValidatedSource,
@@ -246,8 +252,16 @@ enum ValidatedSource {
     LegacyBm25,
     AlgebraAnn { index: usize },
     AlgebraBm25 { index: usize },
+    AlgebraHybrid { source_count: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuerySourceKind {
+    Ann,
+    Bm25,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum QuerySourceRef<'a> {
     Ann {
         vector: &'a [f32],
@@ -257,6 +271,13 @@ enum QuerySourceRef<'a> {
         last_as_prefix: bool,
     },
 }
+
+struct SourceQueryResponse {
+    kind: QuerySourceKind,
+    response: QueryResponse,
+}
+
+const DEFAULT_RRF_K: usize = 60;
 
 struct QueryExecutionOptions {
     manifest: Option<Manifest>,
@@ -528,6 +549,7 @@ fn validate_query_shape(
     let (source, source_nprobe) = validate_query_source(req)?;
     validate_retrieval_algebra_options(req)?;
     let include_attributes = validate_projection(req)?;
+    let candidate_k = validate_candidate_k(req, top_k)?;
 
     // top_k bounds (api yaml: minimum 1, maximum max_top_k).
     if top_k == 0 {
@@ -544,21 +566,12 @@ fn validate_query_shape(
     // only, but the bound is a request-shape property so it's validated here
     // regardless of path: nprobe:0 previously slipped through and probed zero
     // clusters, returning an empty 200 (Task 14 I1).
+    validate_nprobe_requests(req, state.config.indexing.max_nprobe)?;
     let nprobe = source_nprobe.or(req.nprobe).unwrap_or(knobs.default_nprobe);
-    if let Some(requested) = source_nprobe.or(req.nprobe) {
-        if requested == 0 {
-            return Err(ZeppelinError::Validation("nprobe must be >= 1".into()));
-        }
-    }
-    if nprobe > state.config.indexing.max_nprobe {
-        return Err(ZeppelinError::Validation(format!(
-            "nprobe {} exceeds maximum of {}",
-            nprobe, state.config.indexing.max_nprobe
-        )));
-    }
 
     Ok(ValidatedQuery {
         top_k,
+        candidate_k,
         nprobe,
         include_attributes,
         source,
@@ -628,28 +641,64 @@ fn validate_multi_source_request(
     req: &QueryRequest,
     sources: &[CandidateSource],
 ) -> Result<(ValidatedSource, Option<usize>), ZeppelinError> {
+    if req.nprobe.is_some()
+        && sources.iter().any(|source| {
+            matches!(
+                source,
+                CandidateSource::Ann {
+                    nprobe: Some(_),
+                    ..
+                }
+            )
+        })
+    {
+        return Err(ZeppelinError::Validation(
+            "cannot provide both top-level 'nprobe' and source 'nprobe'".into(),
+        ));
+    }
+
     match req.fusion.as_ref() {
-        Some(FusionSpec::Rrf { .. }) => Err(ZeppelinError::NotImplemented {
-            feature: "multi-source RRF fusion",
-        }),
+        Some(FusionSpec::Rrf { k }) => {
+            if matches!(k, Some(0)) {
+                return Err(ZeppelinError::Validation(
+                    "fusion.rrf.k must be >= 1".into(),
+                ));
+            }
+            Ok((
+                ValidatedSource::AlgebraHybrid {
+                    source_count: sources.len(),
+                },
+                None,
+            ))
+        }
         Some(FusionSpec::Weighted { weights }) => {
             if weights.len() != sources.len() {
                 return Err(ZeppelinError::Validation(
                     "fusion weights length must match sources length".into(),
                 ));
             }
-            Err(ZeppelinError::NotImplemented {
-                feature: "multi-source weighted fusion",
-            })
+            Ok((
+                ValidatedSource::AlgebraHybrid {
+                    source_count: sources.len(),
+                },
+                None,
+            ))
         }
-        Some(FusionSpec::None) | None => Err(ZeppelinError::Validation(
+        None => Ok((
+            ValidatedSource::AlgebraHybrid {
+                source_count: sources.len(),
+            },
+            None,
+        )),
+        Some(FusionSpec::None) => Err(ZeppelinError::Validation(
             "multiple candidate sources require a supported fusion strategy".into(),
         )),
     }
 }
 
 fn retrieval_algebra_without_sources(req: &QueryRequest) -> bool {
-    req.fusion.is_some()
+    req.candidate_k.is_some()
+        || req.fusion.is_some()
         || req.rerank.is_some()
         || req.grouping.is_some()
         || req.projection.is_some()
@@ -704,6 +753,48 @@ fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), Zeppelin
     Ok(())
 }
 
+fn validate_candidate_k(req: &QueryRequest, top_k: usize) -> Result<usize, ZeppelinError> {
+    if let Some(candidate_k) = req.candidate_k {
+        if candidate_k == 0 {
+            return Err(ZeppelinError::Validation("candidate_k must be >= 1".into()));
+        }
+        return Ok(candidate_k);
+    }
+
+    Ok(top_k.saturating_mul(4).max(100))
+}
+
+fn validate_nprobe_requests(req: &QueryRequest, max_nprobe: usize) -> Result<(), ZeppelinError> {
+    if let Some(nprobe) = req.nprobe {
+        validate_nprobe(nprobe, max_nprobe)?;
+    }
+    if let Some(sources) = req.sources.as_ref() {
+        for source in sources {
+            if let CandidateSource::Ann {
+                nprobe: Some(nprobe),
+                ..
+            } = source
+            {
+                validate_nprobe(*nprobe, max_nprobe)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_nprobe(nprobe: usize, max_nprobe: usize) -> Result<(), ZeppelinError> {
+    if nprobe == 0 {
+        return Err(ZeppelinError::Validation("nprobe must be >= 1".into()));
+    }
+    if nprobe > max_nprobe {
+        return Err(ZeppelinError::Validation(format!(
+            "nprobe {} exceeds maximum of {}",
+            nprobe, max_nprobe
+        )));
+    }
+    Ok(())
+}
+
 fn validate_projection(req: &QueryRequest) -> Result<bool, ZeppelinError> {
     let Some(projection) = req.projection.as_ref() else {
         return Ok(req.include_attributes.unwrap_or(true));
@@ -738,7 +829,160 @@ async fn execute_validated_query(
     knobs: &QueryKnobs,
     options: QueryExecutionOptions,
 ) -> Result<QueryResponse, ZeppelinError> {
-    match query_source_ref(req, validated.source)? {
+    if let ValidatedSource::AlgebraHybrid { source_count } = validated.source {
+        return execute_hybrid_query(
+            state,
+            ns,
+            meta,
+            req,
+            validated,
+            source_count,
+            knobs,
+            options,
+        )
+        .await;
+    }
+
+    let source_ref = query_source_ref(req, validated.source)?;
+    validate_query_source_metadata(ns, meta, source_ref)?;
+    let manifest = read_manifest_for_execution(state, ns, req.consistency, options).await?;
+    execute_query_source_with_manifest(
+        state,
+        ns,
+        meta,
+        req,
+        source_ref,
+        validated.top_k,
+        validated.nprobe,
+        validated.include_attributes,
+        knobs,
+        manifest,
+    )
+    .await
+    .map(|source| source.response)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_hybrid_query(
+    state: &AppState,
+    ns: &str,
+    meta: &NamespaceMetadata,
+    req: &QueryRequest,
+    validated: ValidatedQuery,
+    source_count: usize,
+    knobs: &QueryKnobs,
+    options: QueryExecutionOptions,
+) -> Result<QueryResponse, ZeppelinError> {
+    let sources = req
+        .sources
+        .as_ref()
+        .ok_or_else(|| ZeppelinError::Validation("retrieval algebra sources missing".into()))?;
+    if sources.len() != source_count {
+        return Err(ZeppelinError::Validation(
+            "validated source count does not match request".into(),
+        ));
+    }
+
+    for index in 0..source_count {
+        validate_query_source_metadata(ns, meta, algebra_source_ref(req, index)?)?;
+    }
+
+    let manifest = read_manifest_for_execution(state, ns, req.consistency, options).await?;
+    let mut source_responses = Vec::with_capacity(source_count);
+    for index in 0..source_count {
+        let source_ref = algebra_source_ref(req, index)?;
+        let nprobe = nprobe_for_algebra_source(req, index, knobs.default_nprobe)?;
+        let source_response = execute_query_source_with_manifest(
+            state,
+            ns,
+            meta,
+            req,
+            source_ref,
+            validated.candidate_k,
+            nprobe,
+            validated.include_attributes,
+            knobs,
+            manifest.clone(),
+        )
+        .await?;
+        source_responses.push(source_response);
+    }
+
+    fuse_source_responses(req.fusion.as_ref(), source_responses, validated.top_k)
+}
+
+fn validate_query_source_metadata(
+    ns: &str,
+    meta: &NamespaceMetadata,
+    source_ref: QuerySourceRef<'_>,
+) -> Result<(), ZeppelinError> {
+    match source_ref {
+        QuerySourceRef::Bm25 { rank_by, .. } => {
+            for (field, _) in rank_by.extract_field_queries() {
+                if !meta.full_text_search.contains_key(&field) {
+                    return Err(ZeppelinError::FtsFieldNotConfigured {
+                        namespace: ns.to_string(),
+                        field,
+                    });
+                }
+            }
+            Ok(())
+        }
+        QuerySourceRef::Ann { vector } => {
+            if vector.len() != meta.dimensions {
+                return Err(ZeppelinError::DimensionMismatch {
+                    expected: meta.dimensions,
+                    actual: vector.len(),
+                });
+            }
+            if let Some((dim_idx, kind)) = super::find_non_finite(vector) {
+                return Err(ZeppelinError::Validation(format!(
+                    "query vector contains a non-finite value ({kind}) at dimension {dim_idx}"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn read_manifest_for_execution(
+    state: &AppState,
+    ns: &str,
+    consistency: ConsistencyLevel,
+    options: QueryExecutionOptions,
+) -> Result<Manifest, ZeppelinError> {
+    let manifest = match options.manifest {
+        Some(manifest) => manifest,
+        None => {
+            query::read_manifest_for_query(
+                &state.store,
+                ns,
+                consistency,
+                Some(&state.manifest_cache),
+            )
+            .await?
+        }
+    };
+    if options.notify_hydration {
+        notify_hydrator(state, ns, &manifest);
+    }
+    Ok(manifest)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_query_source_with_manifest(
+    state: &AppState,
+    ns: &str,
+    meta: &NamespaceMetadata,
+    req: &QueryRequest,
+    source_ref: QuerySourceRef<'_>,
+    top_k: usize,
+    nprobe: usize,
+    include_attributes: bool,
+    knobs: &QueryKnobs,
+    manifest: Manifest,
+) -> Result<SourceQueryResponse, ZeppelinError> {
+    match source_ref {
         QuerySourceRef::Bm25 {
             rank_by,
             last_as_prefix,
@@ -756,39 +1000,27 @@ async fn execute_validated_query(
                 .with_label_values(&[ns])
                 .inc();
 
-            let manifest = match options.manifest {
-                Some(manifest) => manifest,
-                None => {
-                    query::read_manifest_for_query(
-                        &state.store,
-                        ns,
-                        req.consistency,
-                        Some(&state.manifest_cache),
-                    )
-                    .await?
-                }
-            };
-            if options.notify_hydration {
-                notify_hydrator(state, ns, &manifest);
-            }
-
             query::execute_bm25_query_with_manifest(
                 &state.store,
                 &state.wal_reader,
                 ns,
                 rank_by,
                 &meta.full_text_search,
-                validated.top_k,
+                top_k,
                 req.filter.as_ref(),
                 req.consistency,
                 last_as_prefix,
                 Some(&state.fts_cache),
                 Some(&state.cache),
                 knobs.bm25_max_full_scan_clusters,
-                validated.include_attributes,
+                include_attributes,
                 manifest,
             )
             .await
+            .map(|response| SourceQueryResponse {
+                kind: QuerySourceKind::Bm25,
+                response,
+            })
         }
         QuerySourceRef::Ann { vector } => {
             if vector.len() != meta.dimensions {
@@ -810,8 +1042,8 @@ async fn execute_validated_query(
                 wal_reader: &state.wal_reader,
                 namespace: ns,
                 query: vector,
-                top_k: validated.top_k,
-                nprobe: validated.nprobe,
+                top_k,
+                nprobe,
                 filter: req.filter.as_ref(),
                 consistency: req.consistency,
                 distance_metric: meta.distance_metric,
@@ -819,27 +1051,155 @@ async fn execute_validated_query(
                 rerank_coalesce_gap_bytes: knobs.rerank_coalesce_gap_bytes,
                 cache: Some(&state.cache),
                 manifest_cache: Some(&state.manifest_cache),
-                include_attributes: validated.include_attributes,
+                include_attributes,
             };
 
-            let manifest = match options.manifest {
-                Some(manifest) => manifest,
-                None => {
-                    query::read_manifest_for_query(
-                        &state.store,
-                        ns,
-                        req.consistency,
-                        Some(&state.manifest_cache),
-                    )
-                    .await?
-                }
-            };
-            if options.notify_hydration {
-                notify_hydrator(state, ns, &manifest);
-            }
-            query::execute_query_with_manifest(params, manifest).await
+            query::execute_query_with_manifest(params, manifest)
+                .await
+                .map(|response| SourceQueryResponse {
+                    kind: QuerySourceKind::Ann,
+                    response,
+                })
         }
     }
+}
+
+fn fuse_source_responses(
+    fusion: Option<&FusionSpec>,
+    sources: Vec<SourceQueryResponse>,
+    top_k: usize,
+) -> Result<QueryResponse, ZeppelinError> {
+    let scanned_fragments = sources
+        .iter()
+        .map(|source| source.response.scanned_fragments)
+        .sum();
+    let scanned_segments = sources
+        .iter()
+        .map(|source| source.response.scanned_segments)
+        .sum();
+
+    let results = match fusion {
+        Some(FusionSpec::None) => {
+            return Err(ZeppelinError::Validation(
+                "multiple candidate sources require a supported fusion strategy".into(),
+            ));
+        }
+        Some(FusionSpec::Weighted { weights }) => fuse_weighted_results(sources, weights, top_k)?,
+        Some(FusionSpec::Rrf { k }) => fuse_rrf_results(sources, k.unwrap_or(DEFAULT_RRF_K), top_k),
+        None => fuse_rrf_results(sources, DEFAULT_RRF_K, top_k),
+    };
+
+    Ok(QueryResponse {
+        results,
+        scanned_fragments,
+        scanned_segments,
+    })
+}
+
+fn fuse_rrf_results(
+    sources: Vec<SourceQueryResponse>,
+    k: usize,
+    top_k: usize,
+) -> Vec<SearchResult> {
+    let mut fused = HashMap::new();
+    for source in sources {
+        for (rank, result) in source.response.results.into_iter().enumerate() {
+            let contribution = 1.0_f32 / (k as f32 + (rank + 1) as f32);
+            add_fused_candidate(&mut fused, result, contribution);
+        }
+    }
+    sorted_fused_results(fused, top_k)
+}
+
+fn fuse_weighted_results(
+    sources: Vec<SourceQueryResponse>,
+    weights: &[f32],
+    top_k: usize,
+) -> Result<Vec<SearchResult>, ZeppelinError> {
+    if weights.len() != sources.len() {
+        return Err(ZeppelinError::Validation(
+            "fusion weights length must match sources length".into(),
+        ));
+    }
+
+    let mut fused = HashMap::new();
+    for (source, weight) in sources.into_iter().zip(weights.iter().copied()) {
+        if !weight.is_finite() {
+            return Err(ZeppelinError::Validation(
+                "fusion weights must be finite".into(),
+            ));
+        }
+        if source.response.results.is_empty() {
+            continue;
+        }
+
+        let (min_score, max_score) = source.response.results.iter().fold(
+            (f32::INFINITY, f32::NEG_INFINITY),
+            |(min_score, max_score), result| {
+                (min_score.min(result.score), max_score.max(result.score))
+            },
+        );
+
+        for result in source.response.results {
+            if !result.score.is_finite() {
+                return Err(ZeppelinError::Validation(
+                    "source result scores must be finite".into(),
+                ));
+            }
+            let normalized =
+                normalize_source_score(source.kind, result.score, min_score, max_score);
+            add_fused_candidate(&mut fused, result, weight * normalized);
+        }
+    }
+
+    Ok(sorted_fused_results(fused, top_k))
+}
+
+fn normalize_source_score(
+    kind: QuerySourceKind,
+    score: f32,
+    min_score: f32,
+    max_score: f32,
+) -> f32 {
+    if (max_score - min_score).abs() < f32::EPSILON {
+        return 1.0;
+    }
+
+    match kind {
+        QuerySourceKind::Ann => (max_score - score) / (max_score - min_score),
+        QuerySourceKind::Bm25 => (score - min_score) / (max_score - min_score),
+    }
+}
+
+fn add_fused_candidate(
+    fused: &mut HashMap<String, SearchResult>,
+    mut result: SearchResult,
+    contribution: f32,
+) {
+    match fused.entry(result.id.clone()) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let existing = entry.get_mut();
+            existing.score += contribution;
+            if existing.attributes.is_none() {
+                existing.attributes = result.attributes.take();
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            result.score = contribution;
+            entry.insert(result);
+        }
+    }
+}
+
+fn sorted_fused_results(fused: HashMap<String, SearchResult>, top_k: usize) -> Vec<SearchResult> {
+    let mut results: Vec<SearchResult> = fused.into_values().collect();
+    results.sort_by(fused_result_cmp);
+    results.truncate(top_k);
+    results
+}
+
+fn fused_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
+    b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
 }
 
 fn query_source_ref<'a>(
@@ -860,34 +1220,54 @@ fn query_source_ref<'a>(
                 last_as_prefix: req.last_as_prefix.unwrap_or(false),
             })
             .ok_or_else(|| ZeppelinError::Validation("rank_by must be provided".into())),
-        ValidatedSource::AlgebraAnn { index } => {
-            let sources = req.sources.as_ref().ok_or_else(|| {
-                ZeppelinError::Validation("retrieval algebra sources missing".into())
-            })?;
-            match sources.get(index) {
-                Some(CandidateSource::Ann { vector, .. }) => Ok(QuerySourceRef::Ann { vector }),
-                _ => Err(ZeppelinError::Validation(
-                    "validated ANN source is missing".into(),
-                )),
-            }
+        ValidatedSource::AlgebraAnn { index } => algebra_source_ref(req, index),
+        ValidatedSource::AlgebraBm25 { index } => algebra_source_ref(req, index),
+        ValidatedSource::AlgebraHybrid { .. } => Err(ZeppelinError::Validation(
+            "hybrid query must execute through all algebra sources".into(),
+        )),
+    }
+}
+
+fn algebra_source_ref<'a>(
+    req: &'a QueryRequest,
+    index: usize,
+) -> Result<QuerySourceRef<'a>, ZeppelinError> {
+    let sources = req
+        .sources
+        .as_ref()
+        .ok_or_else(|| ZeppelinError::Validation("retrieval algebra sources missing".into()))?;
+    match sources.get(index) {
+        Some(CandidateSource::Ann { vector, .. }) => Ok(QuerySourceRef::Ann { vector }),
+        Some(CandidateSource::Bm25 {
+            rank_by,
+            last_as_prefix,
+        }) => Ok(QuerySourceRef::Bm25 {
+            rank_by,
+            last_as_prefix: last_as_prefix.or(req.last_as_prefix).unwrap_or(false),
+        }),
+        None => Err(ZeppelinError::Validation(
+            "validated algebra source is missing".into(),
+        )),
+    }
+}
+
+fn nprobe_for_algebra_source(
+    req: &QueryRequest,
+    index: usize,
+    default_nprobe: usize,
+) -> Result<usize, ZeppelinError> {
+    let sources = req
+        .sources
+        .as_ref()
+        .ok_or_else(|| ZeppelinError::Validation("retrieval algebra sources missing".into()))?;
+    match sources.get(index) {
+        Some(CandidateSource::Ann { nprobe, .. }) => {
+            Ok(nprobe.or(req.nprobe).unwrap_or(default_nprobe))
         }
-        ValidatedSource::AlgebraBm25 { index } => {
-            let sources = req.sources.as_ref().ok_or_else(|| {
-                ZeppelinError::Validation("retrieval algebra sources missing".into())
-            })?;
-            match sources.get(index) {
-                Some(CandidateSource::Bm25 {
-                    rank_by,
-                    last_as_prefix,
-                }) => Ok(QuerySourceRef::Bm25 {
-                    rank_by,
-                    last_as_prefix: last_as_prefix.or(req.last_as_prefix).unwrap_or(false),
-                }),
-                _ => Err(ZeppelinError::Validation(
-                    "validated BM25 source is missing".into(),
-                )),
-            }
-        }
+        Some(CandidateSource::Bm25 { .. }) => Ok(default_nprobe),
+        None => Err(ZeppelinError::Validation(
+            "validated algebra source is missing".into(),
+        )),
     }
 }
 

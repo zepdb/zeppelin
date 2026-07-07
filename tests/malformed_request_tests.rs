@@ -246,13 +246,6 @@ async fn test_query_reserved_retrieval_algebra_paths_return_not_implemented() {
 
     let cases = [
         json!({
-            "sources": [
-                ann_source.clone(),
-                {"type": "bm25", "rank_by": ["title", "BM25", "hello"]}
-            ],
-            "fusion": {"type": "rrf", "k": 60}
-        }),
-        json!({
             "sources": [ann_source.clone()],
             "grouping": {"type": "field", "field": "category", "max_per_group": 2}
         }),
