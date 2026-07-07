@@ -9,13 +9,17 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 
 use crate::error::ZeppelinError;
+use crate::fts::bm25::{self, Bm25Params};
 use crate::fts::rank_by::RankBy;
+use crate::fts::tokenizer::tokenize_text;
+use crate::fts::FtsFieldConfig;
+use crate::index::distance::compute_distance;
 use crate::namespace::manager::NamespaceMetadata;
 use crate::query;
 use crate::query::{QueryDebug, QueryDebugCache, QueryResponse};
 use crate::runtime_config::QueryKnobs;
 use crate::server::{AppState, RateLimitClass, RateLimitIdentity};
-use crate::types::{ConsistencyLevel, Filter, SearchResult};
+use crate::types::{AttributeValue, ConsistencyLevel, Filter, SearchResult};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 
@@ -152,7 +156,14 @@ pub enum RerankSpec {
 
 impl RerankSpec {
     fn is_supported_contract_only(&self) -> bool {
-        matches!(self, Self::Default | Self::None)
+        matches!(
+            self,
+            Self::Default | Self::None | Self::Vector { .. } | Self::Bm25 { .. }
+        )
+    }
+
+    fn is_explicit(&self) -> bool {
+        matches!(self, Self::Vector { .. } | Self::Bm25 { .. })
     }
 }
 
@@ -882,21 +893,36 @@ async fn execute_validated_query(
         resolve_query_source_ref(state, ns, req, validated.source, manifest.clone()).await?;
     validate_query_source_metadata(ns, meta, &source_ref)?;
     let emit_debug = req.debug.unwrap_or(false);
-    execute_query_source_with_manifest(
+    let first_stage_top_k = first_stage_top_k(req, validated);
+    let first_stage_include_attributes =
+        first_stage_include_attributes(req, validated.include_attributes);
+    let source = execute_query_source_with_manifest(
         state,
         ns,
         meta,
         req,
         source_ref,
-        validated.top_k,
+        first_stage_top_k,
         validated.nprobe,
-        validated.include_attributes,
+        first_stage_include_attributes,
         knobs,
-        manifest,
+        manifest.clone(),
         emit_debug,
     )
+    .await?;
+    apply_rerank_if_requested(
+        RerankExecutionContext {
+            state,
+            ns,
+            meta,
+            req,
+            top_k: validated.top_k,
+            include_attributes: validated.include_attributes,
+            manifest,
+        },
+        source.response,
+    )
     .await
-    .map(|source| source.response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -923,6 +949,9 @@ async fn execute_hybrid_query(
     let manifest = read_manifest_for_execution(state, ns, req.consistency, options).await?;
     let mut source_responses = Vec::with_capacity(source_count);
     let emit_debug = req.debug.unwrap_or(false);
+    let first_stage_top_k = first_stage_top_k(req, validated);
+    let first_stage_include_attributes =
+        first_stage_include_attributes(req, validated.include_attributes);
     for index in 0..source_count {
         let source_ref =
             resolve_algebra_source_ref(state, ns, req, index, manifest.clone()).await?;
@@ -936,7 +965,7 @@ async fn execute_hybrid_query(
             source_ref,
             validated.candidate_k,
             nprobe,
-            validated.include_attributes,
+            first_stage_include_attributes,
             knobs,
             manifest.clone(),
             emit_debug,
@@ -945,13 +974,268 @@ async fn execute_hybrid_query(
         source_responses.push(source_response);
     }
 
-    fuse_source_responses(
+    let response = fuse_source_responses(
         req.fusion.as_ref(),
         source_responses,
-        validated.top_k,
+        first_stage_top_k,
         req.consistency,
         emit_debug,
+    )?;
+    apply_rerank_if_requested(
+        RerankExecutionContext {
+            state,
+            ns,
+            meta,
+            req,
+            top_k: validated.top_k,
+            include_attributes: validated.include_attributes,
+            manifest,
+        },
+        response,
     )
+    .await
+}
+
+fn first_stage_top_k(req: &QueryRequest, validated: ValidatedQuery) -> usize {
+    if req.rerank.as_ref().is_some_and(RerankSpec::is_explicit) {
+        validated.candidate_k
+    } else {
+        validated.top_k
+    }
+}
+
+fn first_stage_include_attributes(req: &QueryRequest, include_attributes: bool) -> bool {
+    include_attributes || matches!(req.rerank, Some(RerankSpec::Bm25 { .. }))
+}
+
+struct RerankExecutionContext<'a> {
+    state: &'a AppState,
+    ns: &'a str,
+    meta: &'a NamespaceMetadata,
+    req: &'a QueryRequest,
+    top_k: usize,
+    include_attributes: bool,
+    manifest: Manifest,
+}
+
+async fn apply_rerank_if_requested(
+    ctx: RerankExecutionContext<'_>,
+    response: QueryResponse,
+) -> Result<QueryResponse, ZeppelinError> {
+    match ctx.req.rerank.as_ref() {
+        Some(RerankSpec::Vector { vector }) => apply_vector_rerank(ctx, response, vector).await,
+        Some(RerankSpec::Bm25 { rank_by }) => apply_bm25_rerank(
+            ctx.meta,
+            response,
+            ctx.top_k,
+            ctx.include_attributes,
+            rank_by,
+        ),
+        _ => Ok(response),
+    }
+}
+
+async fn apply_vector_rerank(
+    ctx: RerankExecutionContext<'_>,
+    mut response: QueryResponse,
+    rerank_vector: &[f32],
+) -> Result<QueryResponse, ZeppelinError> {
+    if rerank_vector.len() != ctx.meta.dimensions {
+        return Err(ZeppelinError::DimensionMismatch {
+            expected: ctx.meta.dimensions,
+            actual: rerank_vector.len(),
+        });
+    }
+    if let Some((dim_idx, kind)) = super::find_non_finite(rerank_vector) {
+        return Err(ZeppelinError::Validation(format!(
+            "rerank vector contains a non-finite value ({kind}) at dimension {dim_idx}"
+        )));
+    }
+    if response.results.is_empty() {
+        return Ok(response);
+    }
+
+    let ids: Vec<String> = response
+        .results
+        .iter()
+        .map(|result| result.id.clone())
+        .collect();
+    let values = super::vectors::fetch_vector_values_by_ids(
+        ctx.state,
+        ctx.ns,
+        &ids,
+        ctx.req.consistency,
+        ctx.manifest,
+    )
+    .await?;
+
+    for result in &mut response.results {
+        let vector = values.get(&result.id).ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "rerank candidate {} missing vector values",
+                result.id
+            ))
+        })?;
+        result.score = compute_distance(rerank_vector, vector, ctx.meta.distance_metric);
+    }
+    response
+        .results
+        .sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
+    response.results.truncate(ctx.top_k);
+    Ok(response)
+}
+
+struct RerankFieldQuery {
+    field: String,
+    query_tokens: Vec<String>,
+    params: Bm25Params,
+    config: FtsFieldConfig,
+}
+
+struct RerankCorpusStats {
+    doc_count: u32,
+    avg_doc_length: f32,
+    term_doc_freqs: HashMap<String, u32>,
+}
+
+type RerankFieldData = HashMap<String, HashMap<String, (u32, HashMap<String, u32>)>>;
+
+fn apply_bm25_rerank(
+    meta: &NamespaceMetadata,
+    mut response: QueryResponse,
+    top_k: usize,
+    include_attributes: bool,
+    rank_by: &RankBy,
+) -> Result<QueryResponse, ZeppelinError> {
+    let field_queries = bm25_rerank_field_queries(meta, rank_by)?;
+    let field_data = bm25_rerank_field_data(&response.results, &field_queries);
+    let corpus_stats = bm25_rerank_corpus_stats(&field_data);
+
+    for result in &mut response.results {
+        let doc_data = field_data.get(result.id.as_str());
+        let mut field_scores = HashMap::new();
+        for field_query in &field_queries {
+            let Some(corpus) = corpus_stats.get(field_query.field.as_str()) else {
+                continue;
+            };
+            let Some((doc_length, tf_map)) =
+                doc_data.and_then(|data| data.get(field_query.field.as_str()))
+            else {
+                continue;
+            };
+            let term_data: Vec<(f32, u32)> = field_query
+                .query_tokens
+                .iter()
+                .map(|token| {
+                    let doc_freq = corpus.term_doc_freqs.get(token).copied().unwrap_or(0);
+                    let term_idf = bm25::idf(corpus.doc_count, doc_freq);
+                    let tf = tf_map.get(token).copied().unwrap_or(0);
+                    (term_idf, tf)
+                })
+                .collect();
+            let score = bm25::bm25_score(
+                &term_data,
+                *doc_length,
+                corpus.avg_doc_length,
+                &field_query.params,
+            );
+            *field_scores.entry(field_query.field.clone()).or_insert(0.0) += score;
+        }
+        result.score = crate::fts::rank_by::evaluate_rank_by(rank_by, &field_scores);
+    }
+
+    response.results.sort_by(fused_result_cmp);
+    response.results.truncate(top_k);
+    if !include_attributes {
+        for result in &mut response.results {
+            result.attributes = None;
+        }
+    }
+    Ok(response)
+}
+
+fn bm25_rerank_field_queries(
+    meta: &NamespaceMetadata,
+    rank_by: &RankBy,
+) -> Result<Vec<RerankFieldQuery>, ZeppelinError> {
+    rank_by
+        .extract_field_queries()
+        .into_iter()
+        .map(|(field, query)| {
+            let config = meta.full_text_search.get(&field).ok_or_else(|| {
+                ZeppelinError::FtsFieldNotConfigured {
+                    namespace: meta.name.clone(),
+                    field: field.clone(),
+                }
+            })?;
+            Ok(RerankFieldQuery {
+                field,
+                query_tokens: tokenize_text(&query, config, false),
+                params: Bm25Params {
+                    k1: config.k1,
+                    b: config.b,
+                },
+                config: config.clone(),
+            })
+        })
+        .collect()
+}
+
+fn bm25_rerank_field_data(
+    results: &[SearchResult],
+    field_queries: &[RerankFieldQuery],
+) -> RerankFieldData {
+    let mut field_data = HashMap::new();
+    for result in results {
+        let Some(attrs) = result.attributes.as_ref() else {
+            continue;
+        };
+        for field_query in field_queries {
+            let Some(AttributeValue::String(text)) = attrs.get(&field_query.field) else {
+                continue;
+            };
+            let tokens = tokenize_text(text, &field_query.config, false);
+            let doc_length = tokens.len() as u32;
+            if doc_length == 0 {
+                continue;
+            }
+            let mut tf_map = HashMap::new();
+            for token in tokens {
+                *tf_map.entry(token).or_insert(0) += 1;
+            }
+            field_data
+                .entry(result.id.clone())
+                .or_insert_with(HashMap::new)
+                .insert(field_query.field.clone(), (doc_length, tf_map));
+        }
+    }
+    field_data
+}
+
+fn bm25_rerank_corpus_stats(field_data: &RerankFieldData) -> HashMap<String, RerankCorpusStats> {
+    let mut stats_by_field = HashMap::new();
+    for doc_data in field_data.values() {
+        for (field, (doc_length, tf_map)) in doc_data {
+            let stats = stats_by_field
+                .entry(field.clone())
+                .or_insert_with(|| RerankCorpusStats {
+                    doc_count: 0,
+                    avg_doc_length: 0.0,
+                    term_doc_freqs: HashMap::new(),
+                });
+            stats.doc_count += 1;
+            stats.avg_doc_length += *doc_length as f32;
+            for token in tf_map.keys() {
+                *stats.term_doc_freqs.entry(token.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    for stats in stats_by_field.values_mut() {
+        if stats.doc_count > 0 {
+            stats.avg_doc_length /= stats.doc_count as f32;
+        }
+    }
+    stats_by_field
 }
 
 fn validate_query_source_metadata(

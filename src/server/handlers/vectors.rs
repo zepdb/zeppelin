@@ -522,30 +522,37 @@ pub(crate) async fn fetch_vector_values_by_id(
     consistency: ConsistencyLevel,
     manifest: Manifest,
 ) -> Result<Option<Vec<f32>>, ZeppelinError> {
+    let values =
+        fetch_vector_values_by_ids(state, ns, &[id.to_string()], consistency, manifest).await?;
+    Ok(values.into_iter().next().map(|(_, values)| values))
+}
+
+pub(crate) async fn fetch_vector_values_by_ids(
+    state: &AppState,
+    ns: &str,
+    ids: &[VectorId],
+    consistency: ConsistencyLevel,
+    manifest: Manifest,
+) -> Result<HashMap<VectorId, Vec<f32>>, ZeppelinError> {
     let projection = FetchProjection {
         include_vector: true,
         include_attributes: false,
         attribute_fields: None,
     };
-    let response = fetch_vectors_by_id(
-        state,
-        ns,
-        &[id.to_string()],
-        consistency,
-        projection,
-        manifest,
-    )
-    .await?;
+    let response = fetch_vectors_by_id(state, ns, ids, consistency, projection, manifest).await?;
     response
         .results
         .into_iter()
-        .next()
         .map(|record| {
-            record.values.ok_or_else(|| {
-                ZeppelinError::Index(format!("fetch by id returned no vector values for {id}"))
-            })
+            let values = record.values.ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "fetch by id returned no vector values for {}",
+                    record.id
+                ))
+            })?;
+            Ok((record.id, values))
         })
-        .transpose()
+        .collect()
 }
 
 async fn fetch_vectors_by_id(

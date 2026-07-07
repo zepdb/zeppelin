@@ -1398,10 +1398,10 @@ components:
         - single-source `bm25`
         - multi-source RRF fusion (`fusion` omitted defaults to RRF k=60)
         - multi-source weighted normalized score fusion
+        - explicit vector and BM25 rerank over the candidate frontier
         - `projection.include_attributes`
 
         Reserved today (returns code `NOT_IMPLEMENTED`):
-        - explicit vector/BM25 rerank
         - grouped results
         - cursor pagination
         - enabled explain output
@@ -1430,8 +1430,9 @@ components:
           minimum: 1
           description: |
             Per-source candidate count before multi-source fusion. Defaults
-            to `max(top_k * 4, 100)`. The fused list is then truncated to
-            `top_k`. Only used by multi-source retrieval-algebra execution.
+            to `max(top_k * 4, 100)`. Multi-source fusion and explicit
+            rerank use this as the first-stage frontier, then truncate to
+            `top_k` after fusion or rerank.
         filter:
           $ref: "#/components/schemas/Filter"
         consistency:
@@ -1591,8 +1592,11 @@ components:
 
     RerankSpec:
       description: |
-        Explicit rerank strategy. `default` and `none` are accepted as contract
-        no-ops today; vector/BM25 rerank variants are reserved.
+        Explicit rerank strategy over the first-stage candidate frontier.
+        `vector` rescoring uses the namespace distance metric against the
+        supplied rerank vector. `bm25` rescoring uses the configured FTS
+        tokenization and BM25 parameters over the materialized candidate set.
+        `default` and `none` preserve the normal source execution order.
       discriminator:
         propertyName: type
         mapping:
