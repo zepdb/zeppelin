@@ -19,6 +19,7 @@ use zeppelin::wal::manifest::{FragmentRef, Manifest};
 use zeppelin::wal::{LeaseManager, WalReader};
 
 use common::assertions::{assert_s3_object_exists, assert_s3_object_not_exists};
+use common::counting::counting_store;
 use common::harness::TestHarness;
 
 fn unsafe_short_gc(horizon_secs: u64) -> GcConfig {
@@ -220,6 +221,82 @@ async fn gc_cycle_retains_pending_deletes_referenced_by_manifest_history() {
     assert_s3_object_exists(&store, &old_key).await;
     let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
     assert_eq!(manifest.pending_deletes, vec![old_key]);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_cycle_reads_retained_manifest_history_once() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("storage-gc-history-cost");
+    let store = harness.store.clone();
+    let history_snapshots = 4;
+    let history_prefix = Manifest::history_prefix(&ns);
+    let old_id = old_ulid(60, 69);
+    let old_key = WalFragment::s3_key(&ns, &old_id);
+    let orphan_id = old_ulid(60, 79);
+    let orphan_key = WalFragment::s3_key(&ns, &orphan_id);
+
+    store
+        .put(&old_key, Bytes::from_static(b"history reachable body"))
+        .await
+        .unwrap();
+    store
+        .put(&orphan_key, Bytes::from_static(b"true orphan body"))
+        .await
+        .unwrap();
+
+    let mut manifest = Manifest::new();
+    manifest.add_fragment(FragmentRef {
+        id: old_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 22,
+    });
+    manifest.write(&store, &ns).await.unwrap();
+
+    for _ in 1..history_snapshots {
+        let (mut current, etag) = Manifest::read_versioned(&store, &ns)
+            .await
+            .unwrap()
+            .unwrap();
+        current.fragments.clear();
+        current.pending_deletes = vec![old_key.clone()];
+        current.updated_at = Utc::now();
+        current.write_conditional(&store, &ns, &etag).await.unwrap();
+    }
+
+    let (counted_store, counter) = counting_store(&store);
+    let report = run_gc_cycle(
+        &counted_store,
+        &ns,
+        &GcConfig {
+            manifest_history_keep_count: history_snapshots,
+            ..unsafe_short_gc(0)
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.pending_deletes_deleted, 0);
+    assert_eq!(report.pending_deletes_pruned, 0);
+    assert_eq!(report.pending_deletes_retained, 1);
+    assert_eq!(report.objects_deleted, 1);
+    assert_s3_object_exists(&counted_store, &old_key).await;
+    assert_s3_object_not_exists(&counted_store, &orphan_key).await;
+    let manifest = Manifest::read(&counted_store, &ns).await.unwrap().unwrap();
+    assert_eq!(manifest.pending_deletes, vec![old_key]);
+
+    assert_eq!(
+        counter.gets_matching(&history_prefix),
+        history_snapshots as u64,
+        "one GC cycle must GET each retained history snapshot at most once"
+    );
+    assert!(
+        counter.list_calls_for_prefix(&history_prefix) <= 2,
+        "one GC cycle should list retained history only for pruning and one shared reachability pass"
+    );
 
     harness.cleanup().await;
 }

@@ -158,9 +158,24 @@ pub async fn reachable_keys_with_retained_history_and_staging(
     manifest: &Manifest,
     staging: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>> {
+    let retained_history = retained_manifest_history_reachable_keys(store, namespace).await?;
+    Ok(reachable_keys_with_retained_history_and_staging_keys(
+        namespace,
+        manifest,
+        staging,
+        &retained_history,
+    ))
+}
+
+fn reachable_keys_with_retained_history_and_staging_keys(
+    namespace: &str,
+    manifest: &Manifest,
+    staging: &BTreeSet<String>,
+    retained_history: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut keys = reachable_keys_with_staging(namespace, manifest, staging);
-    keys.extend(retained_manifest_history_reachable_keys(store, namespace).await?);
-    Ok(keys)
+    keys.extend(retained_history.iter().cloned());
+    keys
 }
 
 /// A manifest-derived orphan candidate for the future two-pass GC sweep.
@@ -320,6 +335,16 @@ pub async fn drain_pending_deletes(
     namespace: &str,
     gc: &GcConfig,
 ) -> Result<PendingDeleteDrainReport> {
+    let history_reachable = retained_manifest_history_reachable_keys(store, namespace).await?;
+    drain_pending_deletes_with_retained_history(store, namespace, gc, &history_reachable).await
+}
+
+async fn drain_pending_deletes_with_retained_history(
+    store: &ZeppelinStore,
+    namespace: &str,
+    gc: &GcConfig,
+    retained_history: &BTreeSet<String>,
+) -> Result<PendingDeleteDrainReport> {
     let now = Utc::now();
     let mut deleted_keys = BTreeSet::new();
 
@@ -340,12 +365,11 @@ pub async fn drain_pending_deletes(
         }
 
         let pending = manifest.pending_deletes.clone();
-        let history_reachable = retained_manifest_history_reachable_keys(store, namespace).await?;
         let mut confirmed_absent = BTreeSet::new();
         let mut retained = BTreeSet::new();
 
         for key in &pending {
-            if history_reachable.contains(key) {
+            if retained_history.contains(key) {
                 retained.insert(key.clone());
                 continue;
             }
@@ -546,17 +570,31 @@ pub async fn run_gc_cycle(
                 return Ok(GcCycleReport::default());
             }
         };
-    let pending_report = match drain_pending_deletes(store, namespace, gc).await {
-        Ok(report) => report,
+    let retained_history = match retained_manifest_history_reachable_keys(store, namespace).await {
+        Ok(reachable) => reachable,
         Err(e) => {
             warn!(
                 namespace,
                 error = %e,
-                "gc pending-delete drain failed; aborting cycle"
+                "gc manifest-history reachability read failed; aborting cycle"
             );
             return Ok(GcCycleReport::default());
         }
     };
+    let pending_report =
+        match drain_pending_deletes_with_retained_history(store, namespace, gc, &retained_history)
+            .await
+        {
+            Ok(report) => report,
+            Err(e) => {
+                warn!(
+                    namespace,
+                    error = %e,
+                    "gc pending-delete drain failed; aborting cycle"
+                );
+                return Ok(GcCycleReport::default());
+            }
+        };
     let base_report = GcCycleReport {
         objects_deleted: pending_report.objects_deleted,
         pending_deletes_deleted: pending_report.objects_deleted,
@@ -600,24 +638,12 @@ pub async fn run_gc_cycle(
             return Ok(base_report);
         }
     };
-    let mark_reachable = match reachable_keys_with_retained_history_and_staging(
-        store,
+    let mark_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         &mark_manifest,
         &mark_staging,
-    )
-    .await
-    {
-        Ok(reachable) => reachable,
-        Err(e) => {
-            warn!(
-                namespace,
-                error = %e,
-                "gc manifest-history reachability read failed; aborting cycle"
-            );
-            return Ok(base_report);
-        }
-    };
+        &retained_history,
+    );
     let unknown_shape_skips = listed_keys
         .iter()
         .filter(|key| !mark_reachable.contains(*key))
@@ -684,27 +710,12 @@ pub async fn run_gc_cycle(
             return Ok(report);
         }
     };
-    let sweep_reachable = match reachable_keys_with_retained_history_and_staging(
-        store,
+    let sweep_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         &sweep_manifest,
         &sweep_staging,
-    )
-    .await
-    {
-        Ok(reachable) => reachable,
-        Err(e) => {
-            warn!(
-                namespace,
-                error = %e,
-                "gc manifest-history reachability re-read failed; skipping sweep"
-            );
-            let mut report = base_report;
-            report.candidates_marked = candidates_marked;
-            report.candidates_skipped = unknown_shape_skips;
-            return Ok(report);
-        }
-    };
+        &retained_history,
+    );
     let oldest_inflight_ms = oldest_inflight_ulid_ms(namespace, &sweep_staging);
     let known_sizes = known_reclaimable_sizes(namespace, &sweep_manifest);
 
