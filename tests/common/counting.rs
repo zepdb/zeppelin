@@ -202,6 +202,7 @@ impl ClassCounters {
 pub struct GetCounter {
     gets: Arc<DashMap<String, u64>>,
     puts: Arc<DashMap<String, u64>>,
+    heads: Arc<DashMap<String, u64>>,
     lists: Arc<DashMap<String, u64>>,
     delimiter_lists: Arc<DashMap<String, u64>>,
     classes: Arc<ClassCounters>,
@@ -224,6 +225,22 @@ impl GetCounter {
             .filter(|r| r.key().contains(substr))
             .map(|r| *r.value())
             .sum()
+    }
+
+    /// Total number of HEADs whose key contains `substr`.
+    #[must_use]
+    pub fn heads_matching(&self, substr: &str) -> u64 {
+        self.heads
+            .iter()
+            .filter(|r| r.key().contains(substr))
+            .map(|r| *r.value())
+            .sum()
+    }
+
+    /// Total HEAD operations across all keys.
+    #[must_use]
+    pub fn total_heads(&self) -> u64 {
+        self.heads.iter().map(|r| *r.value()).sum()
     }
 
     /// Total recursive list calls whose prefix exactly matches `prefix`.
@@ -330,6 +347,7 @@ impl GetCounter {
     pub fn reset(&self) {
         self.gets.clear();
         self.puts.clear();
+        self.heads.clear();
         self.lists.clear();
         self.delimiter_lists.clear();
         self.classes.reset();
@@ -418,6 +436,11 @@ impl ObjectStore for CountingStore {
     }
 
     async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.counter
+            .heads
+            .entry(location.to_string())
+            .and_modify(|v| *v += 1)
+            .or_insert(1);
         self.inner.head(location).await
     }
 

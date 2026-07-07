@@ -464,6 +464,16 @@ components:
       enum: [cosine, euclidean, dot_product]
       default: cosine
 
+    QuantizationType:
+      type: string
+      enum: [none, scalar, product]
+      description: Quantization mode recorded on the active segment.
+
+    IndexKind:
+      type: string
+      enum: [ivf_flat, ivf_sq, ivf_pq, hierarchical]
+      description: Index kind used by the namespace's active segment.
+
     ConsistencyLevel:
       type: string
       description: |
@@ -821,7 +831,19 @@ components:
 
     NamespaceResponse:
       type: object
-      required: [name, dimensions, distance_metric, vector_count, created_at, updated_at, state]
+      required:
+        - name
+        - dimensions
+        - distance_metric
+        - vector_count
+        - uncompacted_fragments
+        - segment_count
+        - approximate_storage_bytes
+        - quantization
+        - index_kind
+        - created_at
+        - updated_at
+        - state
       properties:
         name:
           type: string
@@ -832,6 +854,33 @@ components:
         vector_count:
           type: integer
           format: int64
+          description: |
+            Manifest-derived live entry count: compacted segment vector counts
+            plus uncompacted WAL vector entries minus uncompacted WAL tombstones,
+            lower-bounded at zero. Exact for the manifest aggregate; an upper
+            bound on unique live vector IDs until compaction resolves duplicate
+            upserts by ID.
+        uncompacted_fragments:
+          type: integer
+          description: Number of WAL fragments currently referenced by the manifest.
+        segment_count:
+          type: integer
+          description: Number of segment refs currently tracked by the manifest.
+        approximate_storage_bytes:
+          type: integer
+          format: int64
+          description: |
+            Approximate live storage bytes known from manifest refs
+            (`FragmentRef.size_bytes` and segment artifact size refs). This value
+            is derived without object listing or HEAD calls; legacy refs with
+            unknown sizes contribute zero for those artifacts.
+        quantization:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/QuantizationType"
+          description: Active segment quantization mode, or null before first compaction.
+        index_kind:
+          $ref: "#/components/schemas/IndexKind"
         created_at:
           type: string
           format: date-time

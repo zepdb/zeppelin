@@ -8,9 +8,12 @@ use uuid::Uuid;
 
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
+use crate::index::quantization::QuantizationType;
 use crate::namespace::manager::{CreateNamespaceOutcome, NamespaceMetadata};
 use crate::server::AppState;
-use crate::types::DistanceMetric;
+use crate::types::{DistanceMetric, IndexType};
+use crate::wal::manifest::SegmentRef;
+use crate::wal::Manifest;
 
 use super::ApiError;
 
@@ -44,6 +47,16 @@ pub struct NamespaceResponse {
     pub distance_metric: DistanceMetric,
     /// Total number of vectors in this namespace.
     pub vector_count: u64,
+    /// Number of uncompacted WAL fragments currently referenced by the manifest.
+    pub uncompacted_fragments: usize,
+    /// Number of segment references currently tracked by the manifest.
+    pub segment_count: usize,
+    /// Approximate live storage bytes known from manifest object-size refs.
+    pub approximate_storage_bytes: u64,
+    /// Quantization mode of the active segment, or null before first compaction.
+    pub quantization: Option<QuantizationType>,
+    /// Index kind used by the namespace's active segment.
+    pub index_kind: IndexType,
     /// RFC 3339 timestamp of namespace creation.
     pub created_at: String,
     /// RFC 3339 timestamp of the last update.
@@ -81,14 +94,21 @@ pub struct CreateNamespaceResponse {
     pub warning: String,
 }
 
-/// Converts internal `NamespaceMetadata` into the API response representation.
-impl From<NamespaceMetadata> for NamespaceResponse {
-    fn from(meta: NamespaceMetadata) -> Self {
+impl NamespaceResponse {
+    /// Converts namespace metadata plus the authoritative manifest into the API response.
+    #[must_use]
+    pub fn from_manifest(meta: NamespaceMetadata, manifest: &Manifest) -> Self {
+        let index_kind = namespace_index_kind(&meta, manifest);
         Self {
             name: meta.name,
             dimensions: meta.dimensions,
             distance_metric: meta.distance_metric,
-            vector_count: meta.vector_count,
+            vector_count: manifest.vector_count(),
+            uncompacted_fragments: manifest.uncompacted_fragments().len(),
+            segment_count: manifest.segments.len(),
+            approximate_storage_bytes: manifest.approximate_storage_bytes(),
+            quantization: active_segment_ref(manifest).map(|segment| segment.quantization),
+            index_kind,
             created_at: meta.created_at.to_rfc3339(),
             updated_at: meta.updated_at.to_rfc3339(),
             state: meta.state.as_str().to_string(),
@@ -135,7 +155,7 @@ pub async fn create_namespace(
         return Ok((
             status,
             Json(CreateNamespaceResponse {
-                namespace: NamespaceResponse::from(meta),
+                namespace: NamespaceResponse::from_manifest(meta, &Manifest::new()),
                 warning:
                     "Client-specified namespace names are idempotent for identical configuration."
                         .to_string(),
@@ -160,7 +180,7 @@ pub async fn create_namespace(
     Ok((
         StatusCode::CREATED,
         Json(CreateNamespaceResponse {
-            namespace: NamespaceResponse::from(meta),
+            namespace: NamespaceResponse::from_manifest(meta, &Manifest::new()),
             warning: "Save this namespace name. It cannot be recovered if lost.".to_string(),
         }),
     ))
@@ -187,7 +207,11 @@ pub async fn list_namespaces(
         .map_err(ApiError::from)?;
 
     info!(count = namespaces.len(), "listed namespaces");
-    let responses: Vec<NamespaceResponse> = namespaces.into_iter().map(Into::into).collect();
+    let empty_manifest = Manifest::new();
+    let responses: Vec<NamespaceResponse> = namespaces
+        .into_iter()
+        .map(|meta| NamespaceResponse::from_manifest(meta, &empty_manifest))
+        .collect();
     Ok(Json(responses))
 }
 
@@ -203,7 +227,16 @@ pub async fn get_namespace(
         .await
         .map_err(ApiError::from)?;
 
-    Ok(Json(NamespaceResponse::from(meta)))
+    // Stats are manifest aggregates. This strong read is the same manifest
+    // freshness path used by read handlers; the response below does not list,
+    // HEAD, or fetch WAL/segment objects.
+    let manifest = state
+        .manifest_cache
+        .get_strong(&state.store, &ns)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(NamespaceResponse::from_manifest(meta, &manifest)))
 }
 
 /// Deletes a namespace and cleans up associated in-memory state.
@@ -308,10 +341,21 @@ pub async fn trigger_hydration(
 fn active_segment_snapshot(
     manifest: &crate::wal::Manifest,
 ) -> Option<crate::wal::manifest::SegmentRef> {
+    active_segment_ref(manifest).cloned()
+}
+
+fn active_segment_ref(manifest: &Manifest) -> Option<&SegmentRef> {
     let active_segment = manifest.active_segment.as_ref()?;
     manifest
         .segments
         .iter()
         .find(|segment| segment.id == *active_segment)
-        .cloned()
+}
+
+fn namespace_index_kind(meta: &NamespaceMetadata, manifest: &Manifest) -> IndexType {
+    if active_segment_ref(manifest).is_some_and(|segment| segment.hierarchical) {
+        IndexType::Hierarchical
+    } else {
+        meta.index_type
+    }
 }

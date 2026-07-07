@@ -245,6 +245,27 @@ impl SegmentRef {
             .map(String::as_str)
             .unwrap_or(&self.id)
     }
+
+    /// Approximate bytes for segment artifacts whose sizes are recorded in the manifest.
+    #[must_use]
+    pub fn approximate_storage_bytes(&self) -> u64 {
+        let cluster_bytes: u64 = self
+            .cluster_objects
+            .iter()
+            .map(|object| object.size_bytes)
+            .sum();
+        let sketch_bytes = self.sketch.as_ref().map_or(0, |sketch| sketch.size_bytes);
+        let bootstrap_bytes = self
+            .bootstrap
+            .as_ref()
+            .map_or(0, |bootstrap| bootstrap.size_bytes);
+        let membership_bytes = self
+            .membership
+            .as_ref()
+            .map_or(0, |membership| membership.size_bytes);
+
+        cluster_bytes + sketch_bytes + bootstrap_bytes + membership_bytes
+    }
 }
 
 /// The manifest is the single source of truth for what data exists
@@ -390,6 +411,55 @@ impl Manifest {
     /// Total vector count across all segments.
     pub fn segment_vector_count(&self) -> usize {
         self.segments.iter().map(|s| s.vector_count).sum()
+    }
+
+    /// Manifest-derived vector count exposed by namespace metadata.
+    ///
+    /// This is exact for the manifest's aggregate entries:
+    /// compacted segment vectors plus uncompacted WAL vector entries minus
+    /// uncompacted WAL tombstones, lower-bounded at zero. Until compaction
+    /// resolves duplicate upserts by ID, it is an upper bound on unique live
+    /// vector IDs.
+    #[must_use]
+    pub fn vector_count(&self) -> u64 {
+        let entries = self
+            .segments
+            .iter()
+            .map(|segment| segment.vector_count as u64)
+            .sum::<u64>()
+            + self
+                .fragments
+                .iter()
+                .map(|fragment| fragment.vector_count as u64)
+                .sum::<u64>();
+        let tombstones = self
+            .fragments
+            .iter()
+            .map(|fragment| fragment.delete_count as u64)
+            .sum::<u64>();
+
+        entries.saturating_sub(tombstones)
+    }
+
+    /// Approximate live storage bytes from sizes recorded in manifest refs.
+    ///
+    /// This never lists or HEADs S3 objects. Legacy refs whose sizes were not
+    /// recorded contribute zero for unknown artifacts, so the value is a known
+    /// lower-bound approximation rather than an object-store inventory.
+    #[must_use]
+    pub fn approximate_storage_bytes(&self) -> u64 {
+        let fragment_bytes: u64 = self
+            .fragments
+            .iter()
+            .map(|fragment| fragment.size_bytes)
+            .sum();
+        let segment_bytes: u64 = self
+            .segments
+            .iter()
+            .map(SegmentRef::approximate_storage_bytes)
+            .sum();
+
+        fragment_bytes + segment_bytes
     }
 
     /// Serialize to MessagePack bytes with a version header.
@@ -572,6 +642,57 @@ mod tests {
             manifest.compaction_watermark,
             Some(newer),
             "watermark is observability metadata and must not move backwards"
+        );
+    }
+
+    #[test]
+    fn test_vector_count_includes_segments_fragments_minus_tombstones() {
+        let mut manifest = Manifest::new();
+
+        let mut seg_a = make_segment("seg_a");
+        seg_a.vector_count = 100;
+        let mut seg_b = make_segment("seg_b");
+        seg_b.vector_count = 25;
+        manifest.add_segment(seg_a);
+        manifest.add_segment(seg_b);
+
+        manifest.add_fragment(FragmentRef {
+            id: Ulid::from_parts(3000, 1),
+            vector_count: 10,
+            delete_count: 3,
+            sequence_number: 0,
+            size_bytes: 111,
+        });
+        manifest.add_fragment(FragmentRef {
+            id: Ulid::from_parts(3000, 2),
+            vector_count: 5,
+            delete_count: 1,
+            sequence_number: 0,
+            size_bytes: 222,
+        });
+
+        assert_eq!(
+            manifest.vector_count(),
+            136,
+            "namespace vector_count is the manifest aggregate: segment vectors + WAL entries - tombstones"
+        );
+    }
+
+    #[test]
+    fn test_vector_count_is_zero_when_tombstones_exceed_entries() {
+        let mut manifest = Manifest::new();
+        manifest.add_fragment(FragmentRef {
+            id: Ulid::from_parts(4000, 1),
+            vector_count: 1,
+            delete_count: 3,
+            sequence_number: 0,
+            size_bytes: 10,
+        });
+
+        assert_eq!(
+            manifest.vector_count(),
+            0,
+            "manifest-derived counts are lower-bounded at zero for deletes of absent IDs"
         );
     }
 
