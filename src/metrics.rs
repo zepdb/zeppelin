@@ -181,6 +181,27 @@ mod inner {
             "WAL fragment NotFound reads skipped after a fresh manifest confirmed compaction removed the fragment",
             &["namespace"]
         ).unwrap();
+
+        pub static ref GC_OBJECTS_DELETED_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_gc_objects_deleted_total",
+            "Objects deleted by storage garbage collection",
+            &["namespace"]
+        ).unwrap();
+        pub static ref GC_BYTES_RECLAIMED_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_gc_bytes_reclaimed_total",
+            "Known bytes reclaimed by storage garbage collection",
+            &["namespace"]
+        ).unwrap();
+        pub static ref GC_CANDIDATES_MARKED_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_gc_candidates_marked_total",
+            "Unreachable object candidates marked by storage garbage collection",
+            &["namespace"]
+        ).unwrap();
+        pub static ref GC_CANDIDATES_SKIPPED_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_gc_candidates_skipped_total",
+            "Garbage-collection candidates skipped instead of deleted",
+            &["namespace", "reason"]
+        ).unwrap();
     }
 }
 
@@ -237,4 +258,8 @@ pub fn init() {
     lazy_static::initialize(&COMPACTION_LEASE_RENEWALS_TOTAL);
     lazy_static::initialize(&COMPACTION_LEASE_LOST_TOTAL);
     lazy_static::initialize(&WAL_FRAGMENT_GC_RACE_SKIPPED_TOTAL);
+    lazy_static::initialize(&GC_OBJECTS_DELETED_TOTAL);
+    lazy_static::initialize(&GC_BYTES_RECLAIMED_TOTAL);
+    lazy_static::initialize(&GC_CANDIDATES_MARKED_TOTAL);
+    lazy_static::initialize(&GC_CANDIDATES_SKIPPED_TOTAL);
 }

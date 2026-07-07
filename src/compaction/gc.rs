@@ -1,11 +1,14 @@
-//! Exact-key reachability for storage garbage collection.
+//! Exact-key reachability and two-pass storage garbage collection.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
+use ulid::Ulid;
 
+use crate::config::GcConfig;
 use crate::error::Result;
 use crate::fts::global_index::global_fts_key;
 use crate::fts::inverted_index::fts_index_key;
@@ -19,6 +22,8 @@ use crate::storage::ZeppelinStore;
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::Manifest;
 use crate::wal::Lease;
+
+const GC_CANDIDATE_STORE_VERSION: u32 = 1;
 
 /// Lease-scoped side-object recording compaction uploads that have not yet
 /// been committed into the manifest.
@@ -135,12 +140,494 @@ pub fn reachable_keys_with_staging(
 /// This is not an authoritative refcount. It only records that `key` left the
 /// exact reachable union at a manifest CAS time; delete decisions must still
 /// revalidate against `reachable_keys()` from a fresh manifest snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GcCandidate {
     /// Exact S3 key that left the manifest-derived reachable union.
     pub key: String,
     /// Manifest commit time at which the key was first observed unreachable.
     pub first_seen_unreachable_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GcCandidateStore {
+    version: u32,
+    candidates: Vec<GcCandidate>,
+}
+
+/// Summary of one mark/sweep GC cycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcCycleReport {
+    /// Number of newly-unreachable objects added to the candidate ledger.
+    pub candidates_marked: usize,
+    /// Number of objects deleted from storage.
+    pub objects_deleted: usize,
+    /// Known bytes reclaimed from manifest-recorded artifact sizes.
+    pub bytes_reclaimed: u64,
+    /// Number of candidates skipped instead of deleted.
+    pub candidates_skipped: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    UnknownShape,
+    NotPersistedLongEnough,
+    ReachableNow,
+    UlidTooYoung,
+    NewerThanInflightCompaction,
+    NotListedThisCycle,
+    DeleteFailed,
+}
+
+impl SkipReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UnknownShape => "unknown_shape",
+            Self::NotPersistedLongEnough => "unreachable_horizon",
+            Self::ReachableNow => "reachable_now",
+            Self::UlidTooYoung => "ulid_age_floor",
+            Self::NewerThanInflightCompaction => "inflight_watermark",
+            Self::NotListedThisCycle => "not_listed",
+            Self::DeleteFailed => "delete_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteDecision {
+    Delete,
+    Skip(SkipReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedGcArtifact {
+    WalFragment { ulid: Ulid },
+    SegmentArtifact { ulid: Ulid },
+}
+
+impl ParsedGcArtifact {
+    fn ulid(self) -> Ulid {
+        match self {
+            Self::WalFragment { ulid } | Self::SegmentArtifact { ulid } => ulid,
+        }
+    }
+}
+
+/// S3 key for the persisted per-namespace GC candidate ledger.
+#[must_use]
+pub fn gc_candidate_store_key(namespace: &str) -> String {
+    format!("{namespace}/_gc/candidates.json")
+}
+
+/// Load the persisted per-namespace GC candidate ledger.
+pub async fn load_gc_candidates(
+    store: &ZeppelinStore,
+    namespace: &str,
+) -> Result<Vec<GcCandidate>> {
+    match store.get(&gc_candidate_store_key(namespace)).await {
+        Ok(data) => decode_gc_candidates(&data),
+        Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Persist the per-namespace GC candidate ledger as JSON.
+pub async fn save_gc_candidates(
+    store: &ZeppelinStore,
+    namespace: &str,
+    candidates: &[GcCandidate],
+) -> Result<()> {
+    let store_doc = GcCandidateStore {
+        version: GC_CANDIDATE_STORE_VERSION,
+        candidates: candidates.to_vec(),
+    };
+    store
+        .put(
+            &gc_candidate_store_key(namespace),
+            Bytes::from(serde_json::to_vec_pretty(&store_doc)?),
+        )
+        .await
+}
+
+fn decode_gc_candidates(data: &[u8]) -> Result<Vec<GcCandidate>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    match serde_json::from_slice::<GcCandidateStore>(data) {
+        Ok(store) => Ok(store.candidates),
+        Err(wrapper_error) => match serde_json::from_slice::<Vec<GcCandidate>>(data) {
+            Ok(candidates) => Ok(candidates),
+            Err(_) => Err(wrapper_error.into()),
+        },
+    }
+}
+
+/// Pure mark pass: add newly unreachable known artifacts and drop resurrected candidates.
+#[must_use]
+pub fn mark_gc_candidates(
+    namespace: &str,
+    listed_keys: &BTreeSet<String>,
+    reachable: &BTreeSet<String>,
+    existing: &[GcCandidate],
+    now: DateTime<Utc>,
+) -> Vec<GcCandidate> {
+    let mut by_key = BTreeMap::new();
+    for candidate in existing {
+        if reachable.contains(&candidate.key) {
+            continue;
+        }
+        if parse_gc_artifact_key(namespace, &candidate.key).is_some() {
+            by_key.insert(candidate.key.clone(), candidate.first_seen_unreachable_at);
+        }
+    }
+
+    for key in listed_keys {
+        if reachable.contains(key) {
+            continue;
+        }
+        if parse_gc_artifact_key(namespace, key).is_none() {
+            continue;
+        }
+        by_key.entry(key.clone()).or_insert(now);
+    }
+
+    by_key
+        .into_iter()
+        .map(|(key, first_seen_unreachable_at)| GcCandidate {
+            key,
+            first_seen_unreachable_at,
+        })
+        .collect()
+}
+
+/// Run one complete two-pass mark/sweep GC cycle for a namespace.
+///
+/// The cycle lists namespace objects, persists newly-unreachable candidates,
+/// then deletes only candidates that have remained unreachable for
+/// `gc.horizon_secs` and still fail the fresh reachability check.
+pub async fn run_gc_cycle(
+    store: &ZeppelinStore,
+    namespace: &str,
+    gc: &GcConfig,
+) -> Result<GcCycleReport> {
+    let now = Utc::now();
+    let prefix = format!("{namespace}/");
+    let listed_keys = match store.list_prefix(&prefix).await {
+        Ok(keys) => keys.into_iter().collect::<BTreeSet<_>>(),
+        Err(e) => {
+            warn!(namespace, error = %e, "gc listing failed; aborting cycle");
+            return Ok(GcCycleReport::default());
+        }
+    };
+
+    let persisted = match load_gc_candidates(store, namespace).await {
+        Ok(candidates) => candidates,
+        Err(e) => {
+            warn!(namespace, error = %e, "gc candidate load failed; aborting cycle");
+            return Ok(GcCycleReport::default());
+        }
+    };
+
+    let mark_manifest = match read_manifest_for_gc(store, namespace).await {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            warn!(namespace, "gc manifest missing; skipping namespace");
+            return Ok(GcCycleReport::default());
+        }
+        Err(e) => {
+            warn!(namespace, error = %e, "gc manifest read failed; aborting cycle");
+            return Ok(GcCycleReport::default());
+        }
+    };
+    let mark_staging = match active_staged_keys(store, namespace).await {
+        Ok(staging) => staging,
+        Err(e) => {
+            warn!(namespace, error = %e, "gc active staging read failed; aborting cycle");
+            return Ok(GcCycleReport::default());
+        }
+    };
+    let mark_reachable = reachable_keys_with_staging(namespace, &mark_manifest, &mark_staging);
+    let unknown_shape_skips = listed_keys
+        .iter()
+        .filter(|key| !mark_reachable.contains(*key))
+        .filter(|key| parse_gc_artifact_key(namespace, key).is_none())
+        .inspect(|key| log_gc_skip(namespace, key, SkipReason::UnknownShape))
+        .count();
+    let marked_candidates =
+        mark_gc_candidates(namespace, &listed_keys, &mark_reachable, &persisted, now);
+    let candidates_marked = marked_candidates.len().saturating_sub(
+        persisted
+            .iter()
+            .filter(|candidate| {
+                marked_candidates
+                    .iter()
+                    .any(|next| next.key == candidate.key)
+            })
+            .count(),
+    );
+
+    if let Err(e) = save_gc_candidates(store, namespace, &marked_candidates).await {
+        warn!(namespace, error = %e, "gc candidate mark persist failed; skipping sweep");
+        return Ok(GcCycleReport {
+            candidates_marked: 0,
+            objects_deleted: 0,
+            bytes_reclaimed: 0,
+            candidates_skipped: marked_candidates.len(),
+        });
+    }
+    crate::metrics::GC_CANDIDATES_MARKED_TOTAL
+        .with_label_values(&[namespace])
+        .inc_by(candidates_marked as u64);
+
+    let sweep_manifest = match read_manifest_for_gc(store, namespace).await {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            warn!(
+                namespace,
+                "gc manifest missing before sweep; skipping deletes"
+            );
+            return Ok(GcCycleReport {
+                candidates_marked,
+                candidates_skipped: unknown_shape_skips,
+                ..GcCycleReport::default()
+            });
+        }
+        Err(e) => {
+            warn!(namespace, error = %e, "gc manifest re-read failed; skipping deletes");
+            return Ok(GcCycleReport {
+                candidates_marked,
+                candidates_skipped: unknown_shape_skips,
+                ..GcCycleReport::default()
+            });
+        }
+    };
+    let sweep_staging = match active_staged_keys(store, namespace).await {
+        Ok(staging) => staging,
+        Err(e) => {
+            warn!(namespace, error = %e, "gc active staging re-read failed; skipping sweep");
+            return Ok(GcCycleReport {
+                candidates_marked,
+                candidates_skipped: unknown_shape_skips,
+                ..GcCycleReport::default()
+            });
+        }
+    };
+    let sweep_reachable = reachable_keys_with_staging(namespace, &sweep_manifest, &sweep_staging);
+    let oldest_inflight_ms = oldest_inflight_ulid_ms(namespace, &sweep_staging);
+    let known_sizes = known_reclaimable_sizes(namespace, &sweep_manifest);
+
+    let mut retained = Vec::new();
+    let mut objects_deleted = 0usize;
+    let mut bytes_reclaimed = 0u64;
+    let mut candidates_skipped = unknown_shape_skips;
+
+    for candidate in marked_candidates {
+        if !listed_keys.contains(&candidate.key) {
+            log_gc_skip(namespace, &candidate.key, SkipReason::NotListedThisCycle);
+            candidates_skipped += 1;
+            continue;
+        }
+        match should_delete_candidate(
+            namespace,
+            &candidate,
+            &sweep_reachable,
+            gc.horizon_secs,
+            now,
+            oldest_inflight_ms,
+        ) {
+            DeleteDecision::Delete => match store.delete(&candidate.key).await {
+                Ok(()) | Err(crate::error::ZeppelinError::NotFound { .. }) => {
+                    let reclaimed = known_sizes.get(&candidate.key).copied().unwrap_or(0);
+                    objects_deleted += 1;
+                    bytes_reclaimed += reclaimed;
+                    crate::metrics::GC_OBJECTS_DELETED_TOTAL
+                        .with_label_values(&[namespace])
+                        .inc();
+                    crate::metrics::GC_BYTES_RECLAIMED_TOTAL
+                        .with_label_values(&[namespace])
+                        .inc_by(reclaimed);
+                    info!(
+                        namespace,
+                        key = %candidate.key,
+                        reclaimed_bytes = reclaimed,
+                        "gc deleted unreachable object"
+                    );
+                }
+                Err(e) => {
+                    log_gc_skip(namespace, &candidate.key, SkipReason::DeleteFailed);
+                    warn!(
+                        namespace,
+                        key = %candidate.key,
+                        error = %e,
+                        "gc delete failed; retaining candidate"
+                    );
+                    candidates_skipped += 1;
+                    retained.push(candidate);
+                }
+            },
+            DeleteDecision::Skip(reason) => {
+                log_gc_skip(namespace, &candidate.key, reason);
+                candidates_skipped += 1;
+                retained.push(candidate);
+            }
+        }
+    }
+
+    if let Err(e) = save_gc_candidates(store, namespace, &retained).await {
+        warn!(
+            namespace,
+            error = %e,
+            "gc candidate cleanup persist failed after sweep"
+        );
+    }
+
+    info!(
+        namespace,
+        candidates_marked,
+        objects_deleted,
+        bytes_reclaimed,
+        candidates_skipped,
+        "gc cycle complete"
+    );
+
+    Ok(GcCycleReport {
+        candidates_marked,
+        objects_deleted,
+        bytes_reclaimed,
+        candidates_skipped,
+    })
+}
+
+async fn read_manifest_for_gc(store: &ZeppelinStore, namespace: &str) -> Result<Option<Manifest>> {
+    Manifest::read(store, namespace).await
+}
+
+fn log_gc_skip(namespace: &str, key: &str, reason: SkipReason) {
+    crate::metrics::GC_CANDIDATES_SKIPPED_TOTAL
+        .with_label_values(&[namespace, reason.label()])
+        .inc();
+    warn!(
+        namespace,
+        key,
+        reason = reason.label(),
+        "gc skipped candidate"
+    );
+}
+
+fn should_delete_candidate(
+    namespace: &str,
+    candidate: &GcCandidate,
+    reachable: &BTreeSet<String>,
+    horizon_secs: u64,
+    now: DateTime<Utc>,
+    oldest_inflight_ulid_ms: Option<u64>,
+) -> DeleteDecision {
+    let Some(parsed) = parse_gc_artifact_key(namespace, &candidate.key) else {
+        return DeleteDecision::Skip(SkipReason::UnknownShape);
+    };
+    if reachable.contains(&candidate.key) {
+        return DeleteDecision::Skip(SkipReason::ReachableNow);
+    }
+    let unreachable_for = now
+        .signed_duration_since(candidate.first_seen_unreachable_at)
+        .num_seconds();
+    if unreachable_for < i64::try_from(horizon_secs).unwrap_or(i64::MAX) {
+        return DeleteDecision::Skip(SkipReason::NotPersistedLongEnough);
+    }
+
+    let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+    let artifact_ulid = parsed.ulid();
+    let ulid_age_secs = super::fragment_age_secs(&artifact_ulid, now_ms);
+    if ulid_age_secs < horizon_secs {
+        return DeleteDecision::Skip(SkipReason::UlidTooYoung);
+    }
+    if let Some(oldest_ms) = oldest_inflight_ulid_ms {
+        if artifact_ulid.timestamp_ms() > oldest_ms {
+            return DeleteDecision::Skip(SkipReason::NewerThanInflightCompaction);
+        }
+    }
+
+    DeleteDecision::Delete
+}
+
+fn oldest_inflight_ulid_ms(namespace: &str, staged: &BTreeSet<String>) -> Option<u64> {
+    staged
+        .iter()
+        .filter_map(|key| parse_gc_artifact_key(namespace, key))
+        .map(|artifact| artifact.ulid().timestamp_ms())
+        .min()
+}
+
+fn known_reclaimable_sizes(namespace: &str, manifest: &Manifest) -> BTreeMap<String, u64> {
+    let mut sizes = BTreeMap::new();
+    for fragment in &manifest.fragments {
+        sizes.insert(
+            WalFragment::s3_key(namespace, &fragment.id),
+            fragment.size_bytes,
+        );
+    }
+    for segment in &manifest.segments {
+        if let Some(sketch) = &segment.sketch {
+            sizes.insert(sketch.key.clone(), sketch.size_bytes);
+        }
+    }
+    sizes
+}
+
+fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact> {
+    let wal_prefix = format!("{namespace}/wal/");
+    if let Some(name) = key.strip_prefix(&wal_prefix) {
+        let id = name.strip_suffix(".wal")?;
+        if id.contains('/') {
+            return None;
+        }
+        return Ulid::from_string(id)
+            .ok()
+            .map(|ulid| ParsedGcArtifact::WalFragment { ulid });
+    }
+
+    let segment_prefix = format!("{namespace}/segments/");
+    let rest = key.strip_prefix(&segment_prefix)?;
+    let (segment_id, file_name) = rest.split_once('/')?;
+    if file_name.contains('/') {
+        return None;
+    }
+    let ulid_text = segment_id.strip_prefix("seg_")?;
+    let ulid = Ulid::from_string(ulid_text).ok()?;
+    if is_known_segment_artifact_name(file_name) {
+        Some(ParsedGcArtifact::SegmentArtifact { ulid })
+    } else {
+        None
+    }
+}
+
+fn is_known_segment_artifact_name(file_name: &str) -> bool {
+    matches!(
+        file_name,
+        "centroids.bin"
+            | "tree_meta.json"
+            | "coarse_sketch.bin"
+            | "bootstrap.bin"
+            | "membership.bin"
+            | "pq_codebook.bin"
+            | "sq_calibration.bin"
+            | "global_fts.bin"
+    ) || numbered_bin(file_name, "cluster_")
+        || numbered_bin(file_name, "cluster_group_")
+        || numbered_bin(file_name, "attrs_")
+        || numbered_bin(file_name, "bitmap_")
+        || numbered_bin(file_name, "fts_index_")
+        || numbered_bin(file_name, "sq_cluster_")
+        || numbered_bin(file_name, "pq_cluster_")
+}
+
+fn numbered_bin(file_name: &str, prefix: &str) -> bool {
+    let Some(number) = file_name
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(".bin"))
+    else {
+        return false;
+    };
+    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Build GC candidates from the exact key delta across a manifest CAS.
@@ -252,6 +739,8 @@ mod tests {
     use super::*;
 
     use chrono::Utc;
+    use object_store::memory::InMemory;
+    use std::sync::Arc;
     use ulid::Ulid;
 
     use crate::fts::global_index::global_fts_key;
@@ -689,5 +1178,165 @@ mod tests {
                 "active lease staged key must be treated as reachable: {key}"
             );
         }
+    }
+
+    fn ulid_seconds_ago(seconds: i64, entropy: u128) -> Ulid {
+        let ts = (Utc::now() - chrono::Duration::seconds(seconds)).timestamp_millis() as u64;
+        Ulid::from_parts(ts, entropy)
+    }
+
+    #[test]
+    fn delete_predicate_table_is_fail_closed() {
+        let now = Utc::now();
+        let old_id = ulid_seconds_ago(30, 91);
+        let old_key = WalFragment::s3_key(NS, &old_id);
+        let candidate = GcCandidate {
+            key: old_key.clone(),
+            first_seen_unreachable_at: now - chrono::Duration::seconds(10),
+        };
+
+        let cases = [
+            (
+                "unknown key shape",
+                GcCandidate {
+                    key: format!("{NS}/segments/not-a-segment/centroids.bin"),
+                    first_seen_unreachable_at: now - chrono::Duration::seconds(10),
+                },
+                BTreeSet::new(),
+                5,
+                DeleteDecision::Skip(SkipReason::UnknownShape),
+            ),
+            (
+                "unreachable for less than horizon",
+                GcCandidate {
+                    key: old_key.clone(),
+                    first_seen_unreachable_at: now - chrono::Duration::seconds(2),
+                },
+                BTreeSet::new(),
+                5,
+                DeleteDecision::Skip(SkipReason::NotPersistedLongEnough),
+            ),
+            (
+                "reachable again now",
+                candidate.clone(),
+                BTreeSet::from([old_key.clone()]),
+                5,
+                DeleteDecision::Skip(SkipReason::ReachableNow),
+            ),
+            (
+                "active staged key is reachable",
+                candidate.clone(),
+                BTreeSet::from([old_key.clone()]),
+                5,
+                DeleteDecision::Skip(SkipReason::ReachableNow),
+            ),
+            (
+                "all conditions met",
+                candidate,
+                BTreeSet::new(),
+                5,
+                DeleteDecision::Delete,
+            ),
+        ];
+
+        for (name, candidate, reachable, horizon, expected) in cases {
+            let actual = should_delete_candidate(NS, &candidate, &reachable, horizon, now, None);
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn delete_predicate_honors_ulid_age_floor_and_inflight_watermark() {
+        let now = Utc::now();
+        let young_id = ulid_seconds_ago(1, 92);
+        let young_candidate = GcCandidate {
+            key: WalFragment::s3_key(NS, &young_id),
+            first_seen_unreachable_at: now - chrono::Duration::seconds(10),
+        };
+        assert_eq!(
+            should_delete_candidate(NS, &young_candidate, &BTreeSet::new(), 5, now, None),
+            DeleteDecision::Skip(SkipReason::UlidTooYoung)
+        );
+
+        let newer_than_inflight = ulid_seconds_ago(10, 93);
+        let oldest_inflight = ulid_seconds_ago(20, 94);
+        let candidate = GcCandidate {
+            key: WalFragment::s3_key(NS, &newer_than_inflight),
+            first_seen_unreachable_at: now - chrono::Duration::seconds(30),
+        };
+        assert_eq!(
+            should_delete_candidate(
+                NS,
+                &candidate,
+                &BTreeSet::new(),
+                5,
+                now,
+                Some(oldest_inflight.timestamp_ms()),
+            ),
+            DeleteDecision::Skip(SkipReason::NewerThanInflightCompaction)
+        );
+    }
+
+    #[test]
+    fn candidate_store_decodes_empty_versioned_and_legacy_json() {
+        assert!(decode_gc_candidates(b"").unwrap().is_empty());
+
+        let candidate = GcCandidate {
+            key: WalFragment::s3_key(NS, &ulid_seconds_ago(30, 95)),
+            first_seen_unreachable_at: Utc::now(),
+        };
+        let versioned = serde_json::to_vec(&GcCandidateStore {
+            version: GC_CANDIDATE_STORE_VERSION,
+            candidates: vec![candidate.clone()],
+        })
+        .unwrap();
+        assert_eq!(
+            decode_gc_candidates(&versioned).unwrap(),
+            vec![candidate.clone()]
+        );
+
+        let legacy = serde_json::to_vec(&vec![candidate.clone()]).unwrap();
+        assert_eq!(decode_gc_candidates(&legacy).unwrap(), vec![candidate]);
+    }
+
+    #[tokio::test]
+    async fn candidate_store_round_trips_on_storage() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let candidate = GcCandidate {
+            key: WalFragment::s3_key(NS, &ulid_seconds_ago(30, 96)),
+            first_seen_unreachable_at: Utc::now(),
+        };
+
+        save_gc_candidates(&store, NS, std::slice::from_ref(&candidate))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_gc_candidates(&store, NS).await.unwrap(),
+            vec![candidate]
+        );
+    }
+
+    #[test]
+    fn mark_pass_drops_candidate_that_became_reachable_again() {
+        let now = Utc::now();
+        let resurrected = WalFragment::s3_key(NS, &ulid_seconds_ago(30, 97));
+        let still_dead = WalFragment::s3_key(NS, &ulid_seconds_ago(30, 98));
+        let existing = vec![
+            GcCandidate {
+                key: resurrected.clone(),
+                first_seen_unreachable_at: now - chrono::Duration::seconds(10),
+            },
+            GcCandidate {
+                key: still_dead.clone(),
+                first_seen_unreachable_at: now - chrono::Duration::seconds(10),
+            },
+        ];
+        let listed = BTreeSet::from([resurrected.clone(), still_dead.clone()]);
+        let reachable = BTreeSet::from([resurrected]);
+
+        let marked = mark_gc_candidates(NS, &listed, &reachable, &existing, now);
+
+        assert_eq!(candidate_keys(&marked), BTreeSet::from([still_dead]));
     }
 }
