@@ -374,13 +374,7 @@ async fn drain_pending_deletes_with_retained_history(
                 continue;
             }
 
-            if !pending_delete_horizon_satisfied(
-                namespace,
-                key,
-                manifest.updated_at,
-                now,
-                gc.horizon_secs,
-            ) {
+            if !pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs) {
                 retained.insert(key.clone());
                 continue;
             }
@@ -453,7 +447,6 @@ async fn drain_pending_deletes_with_retained_history(
 fn pending_delete_horizon_satisfied(
     namespace: &str,
     key: &str,
-    pending_since: DateTime<Utc>,
     now: DateTime<Utc>,
     horizon_secs: u64,
 ) -> bool {
@@ -461,15 +454,11 @@ fn pending_delete_horizon_satisfied(
         return true;
     }
 
-    // `pending_deletes` predates per-entry enqueue timestamps. The manifest
-    // update time is therefore a conservative lower bound for how long every
-    // pending key has been retained as history. Later manifest writes may
-    // delay deletion, but they cannot make it happen too early.
-    let retained_for = now.signed_duration_since(pending_since).num_seconds();
-    if retained_for < i64::try_from(horizon_secs).unwrap_or(i64::MAX) {
-        return false;
-    }
-
+    // Pending-delete artifacts carry their creation ULID in the key itself:
+    // WAL fragments use the fragment ID, and segment artifacts live under
+    // `segments/seg_<ulid>/`. That per-artifact creation clock is the
+    // authoritative age; manifest.updated_at moves on every write and must not
+    // gate deletion in a busy namespace. Unknown key shapes stay retained.
     let Some(parsed) = parse_gc_artifact_key(namespace, key) else {
         return false;
     };
@@ -1522,6 +1511,52 @@ mod tests {
             current_manifest_version: 10,
             min_newer_manifest_versions: None,
         }
+    }
+
+    #[test]
+    fn pending_delete_horizon_uses_key_ulid_age_not_manifest_update_time() {
+        let now = Utc::now();
+        let old_id = ulid_seconds_ago(30, 201);
+        let key = WalFragment::s3_key(NS, &old_id);
+
+        assert!(
+            pending_delete_horizon_satisfied(NS, &key, now, 5),
+            "a busy namespace must drain old pending deletes even when manifest.updated_at is fresh"
+        );
+    }
+
+    #[test]
+    fn pending_delete_horizon_retains_young_key_even_with_old_manifest_update_time() {
+        let now = Utc::now();
+        let young_id = ulid_seconds_ago(1, 202);
+        let key = WalFragment::s3_key(NS, &young_id);
+
+        assert!(
+            !pending_delete_horizon_satisfied(NS, &key, now, 5),
+            "manifest.updated_at must not allow a key younger than the horizon to drain"
+        );
+    }
+
+    #[test]
+    fn pending_delete_horizon_retains_unparseable_key() {
+        let now = Utc::now();
+        let key = format!("{NS}/wal/not-a-ulid.wal");
+
+        assert!(
+            !pending_delete_horizon_satisfied(NS, &key, now, 5),
+            "keys without parseable artifact ULIDs must be retained fail-closed"
+        );
+    }
+
+    #[test]
+    fn pending_delete_horizon_zero_drains_immediately() {
+        let now = Utc::now();
+        let key = format!("{NS}/wal/not-a-ulid.wal");
+
+        assert!(
+            pending_delete_horizon_satisfied(NS, &key, now, 0),
+            "zero horizon remains the test hook for immediate drain"
+        );
     }
 
     #[test]
