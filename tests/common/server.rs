@@ -36,6 +36,13 @@ fn runtime_query_state(config: &Config) -> (Arc<RuntimeQueryConfig>, QueryKnobBo
     )
 }
 
+fn namespace_manager(config: &Config, store: &ZeppelinStore) -> Arc<NamespaceManager> {
+    Arc::new(NamespaceManager::new_with_registry_ttl(
+        store.clone(),
+        Duration::from_millis(config.cache.namespace_registry_ttl_ms),
+    ))
+}
+
 fn maybe_hydrator(
     config: &Config,
     store: &ZeppelinStore,
@@ -78,7 +85,7 @@ pub async fn start_test_server_with_config(
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
     let state = AppState {
         store: harness.store.clone(),
-        namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
+        namespace_manager: namespace_manager(&config, &harness.store),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
@@ -135,7 +142,7 @@ pub async fn start_test_server_on_store(
     let hydrator = maybe_hydrator(&config, &store, &cache);
     let state = AppState {
         store: store.clone(),
-        namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
+        namespace_manager: namespace_manager(&config, &store),
         namespace_name_prefix,
         wal_writer: Arc::new(WalWriter::new(store.clone())),
         wal_reader: Arc::new(WalReader::new(store.clone())),
@@ -205,7 +212,7 @@ pub async fn start_test_server_with_compactor(
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
     let state = AppState {
         store: harness.store.clone(),
-        namespace_manager: Arc::new(NamespaceManager::new(harness.store.clone())),
+        namespace_manager: namespace_manager(&config, &harness.store),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
@@ -260,7 +267,7 @@ pub async fn start_test_server_with_compaction(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
     );
 
-    let namespace_manager = Arc::new(NamespaceManager::new(harness.store.clone()));
+    let namespace_manager = namespace_manager(&config, &harness.store);
 
     let compactor = Arc::new(Compactor::new(
         harness.store.clone(),
