@@ -31,7 +31,7 @@ use zeppelin::config::Config;
 use zeppelin::index::quantization::QuantizationType;
 
 const DIM: usize = 8;
-const NCLUSTERS: usize = 16; // <= max_nprobe (128) so a query can probe ALL clusters
+const NCLUSTERS: usize = 16; // <= max_nprobe (256) so a query can probe ALL clusters
 
 const MATCHING: usize = 200; // "tenant=hot" vectors, placed FAR from the query
 const NEAR_DECOYS: usize = 2000; // "tenant=cold" vectors placed NEAR the query

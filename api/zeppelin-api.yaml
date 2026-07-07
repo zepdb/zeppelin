@@ -973,8 +973,12 @@ components:
         nprobe:
           type: integer
           minimum: 1
-          maximum: 128
-          description: Number of IVF clusters to probe (vector search only)
+          maximum: 256
+          description: |
+            Number of IVF clusters to probe (vector search only). Values
+            above the configured `indexing.max_nprobe` cap return 400 with
+            the canonical error envelope; values above the segment's actual
+            cluster count behave as probing all clusters.
         include_attributes:
           type: boolean
           default: true

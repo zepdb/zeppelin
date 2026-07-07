@@ -2,8 +2,12 @@ mod common;
 
 use common::counting::{counting_store, ArtifactClass};
 use common::harness::TestHarness;
-use common::server::{cleanup_ns, create_ns_api, start_test_server, start_test_server_on_store};
+use common::server::{
+    cleanup_ns, create_ns_api, create_ns_api_with, start_test_server, start_test_server_on_store,
+    start_test_server_with_compactor,
+};
 use common::vectors::random_vectors;
+use zeppelin::config::Config;
 
 #[tokio::test]
 async fn test_health_check() {
@@ -137,6 +141,77 @@ async fn test_vector_upsert() {
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_nprobe_above_cluster_count_matches_probe_all() {
+    let mut config = Config::load(None).unwrap();
+    config.indexing.default_num_centroids = 4;
+    config.indexing.default_nprobe = 1;
+    config.indexing.max_nprobe = 256;
+
+    let (base_url, harness, _cache, cache_dir, compactor) =
+        start_test_server_with_compactor(Some(config)).await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
+            "dimensions": 4,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+
+    let vectors = random_vectors(64, 4);
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({ "vectors": vectors }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    compactor.compact(&ns).await.unwrap();
+
+    let all_clusters = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "vector": [0.0, 0.0, 0.0, 0.0],
+            "top_k": 10,
+            "consistency": "strong",
+            "nprobe": 4,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(all_clusters.status(), 200);
+    let all_body: serde_json::Value = all_clusters.json().await.unwrap();
+    assert_eq!(all_body["scanned_segments"].as_u64(), Some(1));
+    assert_eq!(all_body["scanned_fragments"].as_u64(), Some(0));
+
+    let over_cluster_count = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "vector": [0.0, 0.0, 0.0, 0.0],
+            "top_k": 10,
+            "consistency": "strong",
+            "nprobe": 200,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(over_cluster_count.status(), 200);
+    let over_body: serde_json::Value = over_cluster_count.json().await.unwrap();
+
+    assert_eq!(
+        over_body["results"], all_body["results"],
+        "nprobe above the segment cluster count must behave as probing all clusters"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+    drop(cache_dir);
 }
 
 #[tokio::test]

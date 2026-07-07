@@ -215,6 +215,39 @@ async fn test_invalid_vector_id_characters() {
 }
 
 #[tokio::test]
+async fn test_default_config_allows_nprobe_at_default_centroid_count() {
+    let (base_url, harness) = common::server::start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        json!({
+            "dimensions": 4,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&json!({
+            "vector": [1.0, 2.0, 3.0, 4.0],
+            "nprobe": 200
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "default max_nprobe must allow high-recall probes up to the default centroid count"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn test_nprobe_exceeds_max() {
     let (base_url, harness) = common::server::start_test_server().await;
     let client = reqwest::Client::new();
@@ -240,6 +273,12 @@ async fn test_nprobe_exceeds_max() {
 
     // nprobe exceeding max should return 400
     assert_eq!(resp.status().as_u16(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+    assert!(
+        body["error"].as_str().unwrap().contains("256"),
+        "error envelope must state the configured nprobe cap: {body}"
+    );
 
     harness.cleanup().await;
 }

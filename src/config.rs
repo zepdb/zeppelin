@@ -410,6 +410,17 @@ mod tests {
     }
 
     #[test]
+    fn default_max_nprobe_covers_default_centroid_count() {
+        let config = Config::default();
+
+        assert_eq!(config.indexing.default_num_centroids, 256);
+        assert!(
+            config.indexing.max_nprobe >= config.indexing.default_num_centroids,
+            "default max_nprobe must allow probing all default centroids"
+        );
+    }
+
+    #[test]
     fn query_config_parses_explicit_gap_and_defaults_when_absent() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::clear();
@@ -844,7 +855,7 @@ pub struct IndexingConfig {
     /// Default number of clusters to probe at query time. Default: `16`.
     #[serde(default = "default_nprobe")]
     pub default_nprobe: usize,
-    /// Hard upper bound on nprobe to prevent expensive full scans. Default: `128`.
+    /// Hard upper bound on nprobe to prevent expensive full scans. Default: `256`.
     #[serde(default = "default_max_nprobe")]
     pub max_nprobe: usize,
     /// Maximum k-means iterations during centroid training. Default: `25`.
@@ -1018,7 +1029,7 @@ fn default_nprobe() -> usize {
     16
 }
 fn default_max_nprobe() -> usize {
-    128
+    256
 }
 fn default_kmeans_max_iterations() -> usize {
     25

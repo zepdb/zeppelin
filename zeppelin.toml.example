@@ -49,7 +49,7 @@
 [indexing]
 # default_num_centroids = 256        # ZEPPELIN_DEFAULT_NUM_CENTROIDS
 # default_nprobe = 16                # ZEPPELIN_DEFAULT_NPROBE; must be > 0 and <= max_nprobe
-# max_nprobe = 128                   # must be > 0
+# max_nprobe = 256                   # must be > 0
 # kmeans_max_iterations = 25
 # kmeans_convergence_epsilon = 0.0001
 # oversample_factor = 3
