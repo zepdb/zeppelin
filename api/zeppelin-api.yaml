@@ -263,8 +263,9 @@ paths:
       operationId: queryNamespace
       summary: Query vectors
       description: |
-        Run a vector similarity search or BM25 full-text search.
-        Exactly one of `vector` or `rank_by` must be provided.
+        Run a vector similarity search or BM25 full-text search. Legacy
+        requests provide exactly one of `vector` or `rank_by`; retrieval
+        algebra requests provide typed `sources`.
       tags: [Query]
       requestBody:
         required: true
@@ -285,6 +286,8 @@ paths:
           $ref: "#/components/responses/NotFoundError"
         "410":
           $ref: "#/components/responses/NamespaceDeletingError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
 
   /v1/namespaces/{ns}/query/batch:
     parameters:
@@ -321,6 +324,8 @@ paths:
           $ref: "#/components/responses/PayloadTooLarge"
         "429":
           $ref: "#/components/responses/RateLimited"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
 
 components:
   parameters:
@@ -368,6 +373,14 @@ components:
         Request body exceeds the configured byte limit, or a logical request
         batch exceeds its configured item cap (413). Canonical error envelope
         with code `PAYLOAD_TOO_LARGE`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotImplemented:
+      description: |
+        Recognized request contract reserved for a later implementation (501).
+        Canonical error envelope with code `NOT_IMPLEMENTED`.
       content:
         application/json:
           schema:
@@ -427,6 +440,7 @@ components:
             - CONCURRENCY_LIMIT
             - REQUEST_TIMEOUT
             - PAYLOAD_TOO_LARGE
+            - NOT_IMPLEMENTED
             - NOT_FOUND
             - METHOD_NOT_ALLOWED
             - INTERNAL_DATA_MISSING
@@ -943,10 +957,27 @@ components:
 
     QueryRequest:
       type: object
+      additionalProperties: false
       description: |
-        Exactly one of `vector` or `rank_by` must be provided.
-        - `vector`: Run ANN vector similarity search
-        - `rank_by`: Run BM25 full-text search
+        Query request contract. Legacy requests continue to provide exactly
+        one of `vector` or `rank_by`. Retrieval-algebra requests provide
+        `sources` and may include typed `fusion`, `rerank`, `grouping`,
+        `projection`, `cursor`, and `explain` contracts.
+
+        Implemented today:
+        - legacy `vector`
+        - legacy `rank_by`
+        - single-source `ann`
+        - single-source `bm25`
+        - `projection.include_attributes`
+
+        Reserved today (returns code `NOT_IMPLEMENTED`):
+        - multi-source fusion
+        - explicit vector/BM25 rerank
+        - grouped results
+        - cursor pagination
+        - enabled explain output
+        - field/vector projection
       properties:
         vector:
           type: array
@@ -986,6 +1017,276 @@ components:
             When false, result `attributes` are returned as null. Unfiltered
             ANN queries skip final attribute enrichment, and unfiltered BM25
             segment queries skip attribute-object reads.
+        sources:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/CandidateSource"
+        fusion:
+          $ref: "#/components/schemas/FusionSpec"
+        rerank:
+          $ref: "#/components/schemas/RerankSpec"
+        grouping:
+          $ref: "#/components/schemas/GroupingSpec"
+        projection:
+          $ref: "#/components/schemas/ProjectionSpec"
+        cursor:
+          $ref: "#/components/schemas/CursorSpec"
+        explain:
+          $ref: "#/components/schemas/ExplainSpec"
+
+    CandidateSource:
+      description: Typed retrieval-algebra candidate source.
+      discriminator:
+        propertyName: type
+        mapping:
+          ann: "#/components/schemas/AnnCandidateSource"
+          bm25: "#/components/schemas/Bm25CandidateSource"
+      oneOf:
+        - $ref: "#/components/schemas/AnnCandidateSource"
+        - $ref: "#/components/schemas/Bm25CandidateSource"
+
+    AnnCandidateSource:
+      type: object
+      required: [type, vector]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: ann
+        vector:
+          type: array
+          items:
+            type: number
+            format: float
+          description: Query vector for ANN search.
+        nprobe:
+          type: integer
+          minimum: 1
+          maximum: 256
+          description: Source-local IVF probe count.
+
+    Bm25CandidateSource:
+      type: object
+      required: [type, rank_by]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: bm25
+        rank_by:
+          $ref: "#/components/schemas/RankByExpression"
+        last_as_prefix:
+          type: boolean
+          default: false
+          description: Treat the last token of each BM25 query as a prefix.
+
+    FusionSpec:
+      description: |
+        Multi-source fusion strategy. `none` is accepted with a single source;
+        executable multi-source fusion is not supported yet.
+      discriminator:
+        propertyName: type
+        mapping:
+          none: "#/components/schemas/FusionNone"
+          rrf: "#/components/schemas/FusionRrf"
+          weighted: "#/components/schemas/FusionWeighted"
+      oneOf:
+        - $ref: "#/components/schemas/FusionNone"
+        - $ref: "#/components/schemas/FusionRrf"
+        - $ref: "#/components/schemas/FusionWeighted"
+
+    FusionNone:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: none
+
+    FusionRrf:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: rrf
+        k:
+          type: integer
+          minimum: 1
+          description: Reciprocal rank fusion smoothing constant.
+
+    FusionWeighted:
+      type: object
+      required: [type, weights]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: weighted
+        weights:
+          type: array
+          items:
+            type: number
+            format: float
+          description: Per-source weights in `sources` order.
+
+    RerankSpec:
+      description: |
+        Explicit rerank strategy. `default` and `none` are accepted as contract
+        no-ops today; vector/BM25 rerank variants are reserved.
+      discriminator:
+        propertyName: type
+        mapping:
+          default: "#/components/schemas/RerankDefault"
+          none: "#/components/schemas/RerankNone"
+          vector: "#/components/schemas/RerankVector"
+          bm25: "#/components/schemas/RerankBm25"
+      oneOf:
+        - $ref: "#/components/schemas/RerankDefault"
+        - $ref: "#/components/schemas/RerankNone"
+        - $ref: "#/components/schemas/RerankVector"
+        - $ref: "#/components/schemas/RerankBm25"
+
+    RerankDefault:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: default
+
+    RerankNone:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: none
+
+    RerankVector:
+      type: object
+      required: [type, vector]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: vector
+        vector:
+          type: array
+          items:
+            type: number
+            format: float
+
+    RerankBm25:
+      type: object
+      required: [type, rank_by]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: bm25
+        rank_by:
+          $ref: "#/components/schemas/RankByExpression"
+
+    GroupingSpec:
+      description: Result grouping strategy. Field grouping is typed but not executable yet.
+      discriminator:
+        propertyName: type
+        mapping:
+          none: "#/components/schemas/GroupingNone"
+          field: "#/components/schemas/GroupingField"
+      oneOf:
+        - $ref: "#/components/schemas/GroupingNone"
+        - $ref: "#/components/schemas/GroupingField"
+
+    GroupingNone:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: none
+
+    GroupingField:
+      type: object
+      required: [type, field, max_per_group]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: field
+        field:
+          type: string
+        max_per_group:
+          type: integer
+          minimum: 1
+
+    ProjectionSpec:
+      type: object
+      additionalProperties: false
+      description: |
+        Response projection. `include_attributes` is executable today and is
+        mutually exclusive with the legacy top-level `include_attributes`.
+        Field-level projection and vector inclusion are reserved.
+      properties:
+        include_attributes:
+          type: boolean
+          default: true
+        fields:
+          type: array
+          items:
+            type: string
+          description: Reserved for field-level attribute projection.
+        include_vectors:
+          type: boolean
+          default: false
+          description: Reserved for returning vector values in query results.
+
+    CursorSpec:
+      description: Cursor continuation strategy. Opaque cursors are typed but not executable yet.
+      discriminator:
+        propertyName: type
+        mapping:
+          none: "#/components/schemas/CursorNone"
+          after: "#/components/schemas/CursorAfter"
+      oneOf:
+        - $ref: "#/components/schemas/CursorNone"
+        - $ref: "#/components/schemas/CursorAfter"
+
+    CursorNone:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: none
+
+    CursorAfter:
+      type: object
+      required: [type, token]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: after
+        token:
+          type: string
+
+    ExplainSpec:
+      description: |
+        Explain output request. `false` and `"none"` are accepted; enabled
+        explain output is rejected until responses carry explain payloads.
+      oneOf:
+        - type: boolean
+        - type: string
+          enum: [none, plan, full]
 
     BatchQueryRequest:
       type: object

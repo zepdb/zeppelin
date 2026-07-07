@@ -156,6 +156,137 @@ async fn test_query_both_vector_and_rank_by() {
 }
 
 #[tokio::test]
+async fn test_query_rejects_unknown_top_level_field() {
+    let (base_url, harness) = common::server::start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/missing/query"))
+        .json(&json!({
+            "vector": [1.0, 2.0, 3.0, 4.0],
+            "unknown_contract_field": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_query_rejects_legacy_vector_with_algebra_sources() {
+    let (base_url, harness) = common::server::start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/missing/query"))
+        .json(&json!({
+            "vector": [1.0, 2.0, 3.0, 4.0],
+            "sources": [{
+                "type": "ann",
+                "vector": [1.0, 2.0, 3.0, 4.0]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot mix legacy query fields with retrieval algebra"));
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_query_rejects_rrf_fusion_with_single_source() {
+    let (base_url, harness) = common::server::start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/missing/query"))
+        .json(&json!({
+            "sources": [{
+                "type": "ann",
+                "vector": [1.0, 2.0, 3.0, 4.0]
+            }],
+            "fusion": {"type": "rrf", "k": 60}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("fusion requires at least two candidate sources"));
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_query_reserved_retrieval_algebra_paths_return_not_implemented() {
+    let (base_url, harness) = common::server::start_test_server().await;
+    let client = reqwest::Client::new();
+    let ann_source = json!({
+        "type": "ann",
+        "vector": [1.0, 2.0, 3.0, 4.0]
+    });
+
+    let cases = [
+        json!({
+            "sources": [
+                ann_source.clone(),
+                {"type": "bm25", "rank_by": ["title", "BM25", "hello"]}
+            ],
+            "fusion": {"type": "rrf", "k": 60}
+        }),
+        json!({
+            "sources": [ann_source.clone()],
+            "grouping": {"type": "field", "field": "category", "max_per_group": 2}
+        }),
+        json!({
+            "sources": [ann_source.clone()],
+            "cursor": {"type": "after", "token": "opaque"}
+        }),
+        json!({
+            "sources": [ann_source.clone()],
+            "explain": true
+        }),
+        json!({
+            "sources": [ann_source],
+            "projection": {"fields": ["category"]}
+        }),
+    ];
+
+    for body in cases {
+        let resp = client
+            .post(format!("{base_url}/v1/namespaces/missing/query"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 501);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], "NOT_IMPLEMENTED");
+    }
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn test_query_neither_vector_nor_rank_by() {
     let (base_url, harness) = common::server::start_test_server().await;
     let client = reqwest::Client::new();

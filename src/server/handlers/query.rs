@@ -21,16 +21,18 @@ use super::ApiError;
 
 /// Request body for querying vectors by ANN or BM25 ranking.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRequest {
-    /// Vector for ANN search. Required unless `rank_by` is provided.
+    /// Vector for legacy ANN search. Required unless `rank_by` or `sources` is provided.
     #[serde(default)]
     pub vector: Option<Vec<f32>>,
-    /// BM25 ranking expression. Required unless `vector` is provided.
+    /// BM25 ranking expression for legacy FTS search.
+    /// Required unless `vector` or `sources` is provided.
     #[serde(default)]
     pub rank_by: Option<RankBy>,
     /// Whether the last token of each BM25 query should be treated as a prefix.
     #[serde(default)]
-    pub last_as_prefix: bool,
+    pub last_as_prefix: Option<bool>,
     /// Maximum number of results to return (defaults to server config).
     #[serde(default)]
     pub top_k: Option<usize>,
@@ -46,10 +48,185 @@ pub struct QueryRequest {
     /// Whether result attributes should be included. Defaults to true.
     #[serde(default)]
     pub include_attributes: Option<bool>,
+    /// Typed retrieval-algebra candidate sources.
+    #[serde(default)]
+    pub sources: Option<Vec<CandidateSource>>,
+    /// Multi-source fusion strategy.
+    #[serde(default)]
+    pub fusion: Option<FusionSpec>,
+    /// Optional reranking strategy.
+    #[serde(default)]
+    pub rerank: Option<RerankSpec>,
+    /// Optional grouping strategy.
+    #[serde(default)]
+    pub grouping: Option<GroupingSpec>,
+    /// Response projection settings.
+    #[serde(default)]
+    pub projection: Option<ProjectionSpec>,
+    /// Pagination cursor.
+    #[serde(default)]
+    pub cursor: Option<CursorSpec>,
+    /// Explain output request.
+    #[serde(default)]
+    pub explain: Option<ExplainSpec>,
+}
+
+/// A typed candidate source in the retrieval-algebra request AST.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateSource {
+    /// ANN vector candidate source.
+    Ann {
+        /// Query vector for ANN search.
+        vector: Vec<f32>,
+        /// Number of IVF clusters to probe for this source.
+        #[serde(default)]
+        nprobe: Option<usize>,
+    },
+    /// BM25 full-text candidate source.
+    Bm25 {
+        /// BM25 ranking expression.
+        rank_by: RankBy,
+        /// Treat the last token of each BM25 query as a prefix.
+        #[serde(default)]
+        last_as_prefix: Option<bool>,
+    },
+}
+
+/// Candidate fusion strategy in the retrieval-algebra request AST.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FusionSpec {
+    /// No fusion. Valid only with one source.
+    None,
+    /// Reciprocal rank fusion. Reserved for multi-source retrieval.
+    Rrf {
+        /// RRF smoothing constant.
+        #[serde(default)]
+        k: Option<usize>,
+    },
+    /// Weighted score fusion. Reserved for multi-source retrieval.
+    Weighted {
+        /// Per-source weights, in the same order as `sources`.
+        weights: Vec<f32>,
+    },
+}
+
+impl FusionSpec {
+    fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// Reranking strategy in the retrieval-algebra request AST.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RerankSpec {
+    /// Use the engine default rerank behavior.
+    Default,
+    /// Disable explicit rerank. Vector execution still performs required exact rerank.
+    None,
+    /// Reserved for future vector reranking over a different vector.
+    Vector {
+        /// Reranking vector.
+        vector: Vec<f32>,
+    },
+    /// Reserved for future BM25 reranking.
+    Bm25 {
+        /// BM25 reranking expression.
+        rank_by: RankBy,
+    },
+}
+
+impl RerankSpec {
+    fn is_supported_contract_only(&self) -> bool {
+        matches!(self, Self::Default | Self::None)
+    }
+}
+
+/// Grouping strategy in the retrieval-algebra request AST.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GroupingSpec {
+    /// Do not group results.
+    None,
+    /// Reserved for field-based grouping.
+    Field {
+        /// Attribute field to group by.
+        field: String,
+        /// Maximum results per group.
+        max_per_group: usize,
+    },
+}
+
+/// Projection settings in the retrieval-algebra request AST.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionSpec {
+    /// Whether result attributes should be included. Defaults to true.
+    #[serde(default)]
+    pub include_attributes: Option<bool>,
+    /// Reserved for field-level attribute projection.
+    #[serde(default)]
+    pub fields: Option<Vec<String>>,
+    /// Reserved for returning vectors in query results.
+    #[serde(default)]
+    pub include_vectors: Option<bool>,
+}
+
+/// Cursor strategy in the retrieval-algebra request AST.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CursorSpec {
+    /// No cursor.
+    None,
+    /// Reserved for opaque continuation tokens.
+    After {
+        /// Opaque cursor token returned by a previous request.
+        token: String,
+    },
+}
+
+impl CursorSpec {
+    fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// Explain request in the retrieval-algebra request AST.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ExplainSpec {
+    /// Boolean explain toggle.
+    Flag(bool),
+    /// Named explain mode.
+    Mode(ExplainMode),
+}
+
+impl ExplainSpec {
+    fn is_enabled(&self) -> bool {
+        match self {
+            Self::Flag(enabled) => *enabled,
+            Self::Mode(mode) => !matches!(mode, ExplainMode::None),
+        }
+    }
+}
+
+/// Explain mode in the retrieval-algebra request AST.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainMode {
+    /// Do not include explain output.
+    None,
+    /// Reserved for physical/logical plan explain output.
+    Plan,
+    /// Reserved for per-result score/source details.
+    Full,
 }
 
 /// Request body for batch querying vectors or BM25 expressions.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatchQueryRequest {
     /// Positional list of query requests. Each entry uses the single-query body.
     pub queries: Vec<QueryRequest>,
@@ -60,6 +237,25 @@ struct ValidatedQuery {
     top_k: usize,
     nprobe: usize,
     include_attributes: bool,
+    source: ValidatedSource,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ValidatedSource {
+    LegacyVector,
+    LegacyBm25,
+    AlgebraAnn { index: usize },
+    AlgebraBm25 { index: usize },
+}
+
+enum QuerySourceRef<'a> {
+    Ann {
+        vector: &'a [f32],
+    },
+    Bm25 {
+        rank_by: &'a RankBy,
+        last_as_prefix: bool,
+    },
 }
 
 struct QueryExecutionOptions {
@@ -329,19 +525,9 @@ fn validate_query_shape(
     state: &AppState,
 ) -> Result<ValidatedQuery, ZeppelinError> {
     let top_k = req.top_k.unwrap_or(knobs.default_top_k);
-    let include_attributes = req.include_attributes.unwrap_or(true);
-
-    // Exactly one of vector or rank_by must be provided.
-    if req.vector.is_none() && req.rank_by.is_none() {
-        return Err(ZeppelinError::Validation(
-            "exactly one of 'vector' or 'rank_by' must be provided".into(),
-        ));
-    }
-    if req.vector.is_some() && req.rank_by.is_some() {
-        return Err(ZeppelinError::Validation(
-            "cannot provide both 'vector' and 'rank_by'".into(),
-        ));
-    }
+    let (source, source_nprobe) = validate_query_source(req)?;
+    validate_retrieval_algebra_options(req)?;
+    let include_attributes = validate_projection(req)?;
 
     // top_k bounds (api yaml: minimum 1, maximum max_top_k).
     if top_k == 0 {
@@ -358,8 +544,8 @@ fn validate_query_shape(
     // only, but the bound is a request-shape property so it's validated here
     // regardless of path: nprobe:0 previously slipped through and probed zero
     // clusters, returning an empty 200 (Task 14 I1).
-    let nprobe = req.nprobe.unwrap_or(knobs.default_nprobe);
-    if let Some(requested) = req.nprobe {
+    let nprobe = source_nprobe.or(req.nprobe).unwrap_or(knobs.default_nprobe);
+    if let Some(requested) = source_nprobe.or(req.nprobe) {
         if requested == 0 {
             return Err(ZeppelinError::Validation("nprobe must be >= 1".into()));
         }
@@ -375,7 +561,172 @@ fn validate_query_shape(
         top_k,
         nprobe,
         include_attributes,
+        source,
     })
+}
+
+fn validate_query_source(
+    req: &QueryRequest,
+) -> Result<(ValidatedSource, Option<usize>), ZeppelinError> {
+    if let Some(sources) = req.sources.as_ref() {
+        if req.vector.is_some() || req.rank_by.is_some() {
+            return Err(ZeppelinError::Validation(
+                "cannot mix legacy query fields with retrieval algebra 'sources'".into(),
+            ));
+        }
+        if sources.is_empty() {
+            return Err(ZeppelinError::Validation(
+                "sources must contain at least one candidate source".into(),
+            ));
+        }
+        if sources.len() > 1 {
+            return validate_multi_source_request(req, sources);
+        }
+        return match &sources[0] {
+            CandidateSource::Ann { nprobe, .. } => {
+                if nprobe.is_some() && req.nprobe.is_some() {
+                    return Err(ZeppelinError::Validation(
+                        "cannot provide both top-level 'nprobe' and source 'nprobe'".into(),
+                    ));
+                }
+                Ok((ValidatedSource::AlgebraAnn { index: 0 }, *nprobe))
+            }
+            CandidateSource::Bm25 { .. } => Ok((ValidatedSource::AlgebraBm25 { index: 0 }, None)),
+        };
+    }
+
+    if retrieval_algebra_without_sources(req) {
+        if req.vector.is_some() || req.rank_by.is_some() {
+            return Err(ZeppelinError::Validation(
+                "cannot mix legacy query fields with retrieval algebra".into(),
+            ));
+        }
+        return Err(ZeppelinError::Validation(
+            "retrieval algebra requests must provide 'sources'".into(),
+        ));
+    }
+
+    // Legacy contract: exactly one of vector or rank_by must be provided.
+    if req.vector.is_none() && req.rank_by.is_none() {
+        return Err(ZeppelinError::Validation(
+            "exactly one of 'vector' or 'rank_by' must be provided".into(),
+        ));
+    }
+    if req.vector.is_some() && req.rank_by.is_some() {
+        return Err(ZeppelinError::Validation(
+            "cannot provide both 'vector' and 'rank_by'".into(),
+        ));
+    }
+    if req.vector.is_some() {
+        Ok((ValidatedSource::LegacyVector, None))
+    } else {
+        Ok((ValidatedSource::LegacyBm25, None))
+    }
+}
+
+fn validate_multi_source_request(
+    req: &QueryRequest,
+    sources: &[CandidateSource],
+) -> Result<(ValidatedSource, Option<usize>), ZeppelinError> {
+    match req.fusion.as_ref() {
+        Some(FusionSpec::Rrf { .. }) => Err(ZeppelinError::NotImplemented {
+            feature: "multi-source RRF fusion",
+        }),
+        Some(FusionSpec::Weighted { weights }) => {
+            if weights.len() != sources.len() {
+                return Err(ZeppelinError::Validation(
+                    "fusion weights length must match sources length".into(),
+                ));
+            }
+            Err(ZeppelinError::NotImplemented {
+                feature: "multi-source weighted fusion",
+            })
+        }
+        Some(FusionSpec::None) | None => Err(ZeppelinError::Validation(
+            "multiple candidate sources require a supported fusion strategy".into(),
+        )),
+    }
+}
+
+fn retrieval_algebra_without_sources(req: &QueryRequest) -> bool {
+    req.fusion.is_some()
+        || req.rerank.is_some()
+        || req.grouping.is_some()
+        || req.projection.is_some()
+        || req.cursor.is_some()
+        || req.explain.is_some()
+}
+
+fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), ZeppelinError> {
+    if let Some(fusion) = req.fusion.as_ref() {
+        if req.sources.as_ref().map_or(0, Vec::len) < 2 && !fusion.is_none() {
+            return Err(ZeppelinError::Validation(
+                "fusion requires at least two candidate sources".into(),
+            ));
+        }
+    }
+    if let Some(rerank) = req.rerank.as_ref() {
+        if !rerank.is_supported_contract_only() {
+            return Err(ZeppelinError::NotImplemented {
+                feature: "explicit rerank",
+            });
+        }
+    }
+    if let Some(grouping) = req.grouping.as_ref() {
+        match grouping {
+            GroupingSpec::None => {}
+            GroupingSpec::Field { max_per_group, .. } if *max_per_group == 0 => {
+                return Err(ZeppelinError::Validation(
+                    "grouping.max_per_group must be >= 1".into(),
+                ));
+            }
+            GroupingSpec::Field { .. } => {
+                return Err(ZeppelinError::NotImplemented {
+                    feature: "grouped results",
+                });
+            }
+        }
+    }
+    if let Some(cursor) = req.cursor.as_ref() {
+        if !cursor.is_none() {
+            return Err(ZeppelinError::NotImplemented {
+                feature: "cursor pagination",
+            });
+        }
+    }
+    if let Some(explain) = req.explain.as_ref() {
+        if explain.is_enabled() {
+            return Err(ZeppelinError::NotImplemented {
+                feature: "query explain",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_projection(req: &QueryRequest) -> Result<bool, ZeppelinError> {
+    let Some(projection) = req.projection.as_ref() else {
+        return Ok(req.include_attributes.unwrap_or(true));
+    };
+    if req.include_attributes.is_some() && projection.include_attributes.is_some() {
+        return Err(ZeppelinError::Validation(
+            "cannot provide both 'include_attributes' and 'projection.include_attributes'".into(),
+        ));
+    }
+    if projection.fields.is_some() {
+        return Err(ZeppelinError::NotImplemented {
+            feature: "field projection",
+        });
+    }
+    if projection.include_vectors.unwrap_or(false) {
+        return Err(ZeppelinError::NotImplemented {
+            feature: "vector projection",
+        });
+    }
+    Ok(projection
+        .include_attributes
+        .or(req.include_attributes)
+        .unwrap_or(true))
 }
 
 async fn execute_validated_query(
@@ -387,108 +738,157 @@ async fn execute_validated_query(
     knobs: &QueryKnobs,
     options: QueryExecutionOptions,
 ) -> Result<QueryResponse, ZeppelinError> {
-    if let Some(ref rank_by) = req.rank_by {
-        // BM25 query path
-        // Validate all referenced fields are configured.
-        for (field, _) in rank_by.extract_field_queries() {
-            if !meta.full_text_search.contains_key(&field) {
-                return Err(ZeppelinError::FtsFieldNotConfigured {
-                    namespace: ns.to_string(),
-                    field,
+    match query_source_ref(req, validated.source)? {
+        QuerySourceRef::Bm25 {
+            rank_by,
+            last_as_prefix,
+        } => {
+            for (field, _) in rank_by.extract_field_queries() {
+                if !meta.full_text_search.contains_key(&field) {
+                    return Err(ZeppelinError::FtsFieldNotConfigured {
+                        namespace: ns.to_string(),
+                        field,
+                    });
+                }
+            }
+
+            crate::metrics::FTS_QUERIES_TOTAL
+                .with_label_values(&[ns])
+                .inc();
+
+            let manifest = match options.manifest {
+                Some(manifest) => manifest,
+                None => {
+                    query::read_manifest_for_query(
+                        &state.store,
+                        ns,
+                        req.consistency,
+                        Some(&state.manifest_cache),
+                    )
+                    .await?
+                }
+            };
+            if options.notify_hydration {
+                notify_hydrator(state, ns, &manifest);
+            }
+
+            query::execute_bm25_query_with_manifest(
+                &state.store,
+                &state.wal_reader,
+                ns,
+                rank_by,
+                &meta.full_text_search,
+                validated.top_k,
+                req.filter.as_ref(),
+                req.consistency,
+                last_as_prefix,
+                Some(&state.fts_cache),
+                Some(&state.cache),
+                knobs.bm25_max_full_scan_clusters,
+                validated.include_attributes,
+                manifest,
+            )
+            .await
+        }
+        QuerySourceRef::Ann { vector } => {
+            if vector.len() != meta.dimensions {
+                return Err(ZeppelinError::DimensionMismatch {
+                    expected: meta.dimensions,
+                    actual: vector.len(),
                 });
             }
-        }
-
-        crate::metrics::FTS_QUERIES_TOTAL
-            .with_label_values(&[ns])
-            .inc();
-
-        let manifest = match options.manifest {
-            Some(manifest) => manifest,
-            None => {
-                query::read_manifest_for_query(
-                    &state.store,
-                    ns,
-                    req.consistency,
-                    Some(&state.manifest_cache),
-                )
-                .await?
+            // Reject NaN/inf: non-finite query values make every distance
+            // comparison nondeterministic (partial_cmp falls back to Equal).
+            if let Some((dim_idx, kind)) = super::find_non_finite(vector) {
+                return Err(ZeppelinError::Validation(format!(
+                    "query vector contains a non-finite value ({kind}) at dimension {dim_idx}"
+                )));
             }
-        };
-        if options.notify_hydration {
-            notify_hydrator(state, ns, &manifest);
+
+            let params = query::QueryParams {
+                store: &state.store,
+                wal_reader: &state.wal_reader,
+                namespace: ns,
+                query: vector,
+                top_k: validated.top_k,
+                nprobe: validated.nprobe,
+                filter: req.filter.as_ref(),
+                consistency: req.consistency,
+                distance_metric: meta.distance_metric,
+                oversample_factor: state.config.indexing.oversample_factor,
+                rerank_coalesce_gap_bytes: knobs.rerank_coalesce_gap_bytes,
+                cache: Some(&state.cache),
+                manifest_cache: Some(&state.manifest_cache),
+                include_attributes: validated.include_attributes,
+            };
+
+            let manifest = match options.manifest {
+                Some(manifest) => manifest,
+                None => {
+                    query::read_manifest_for_query(
+                        &state.store,
+                        ns,
+                        req.consistency,
+                        Some(&state.manifest_cache),
+                    )
+                    .await?
+                }
+            };
+            if options.notify_hydration {
+                notify_hydrator(state, ns, &manifest);
+            }
+            query::execute_query_with_manifest(params, manifest).await
         }
-
-        return query::execute_bm25_query_with_manifest(
-            &state.store,
-            &state.wal_reader,
-            ns,
-            rank_by,
-            &meta.full_text_search,
-            validated.top_k,
-            req.filter.as_ref(),
-            req.consistency,
-            req.last_as_prefix,
-            Some(&state.fts_cache),
-            Some(&state.cache),
-            knobs.bm25_max_full_scan_clusters,
-            validated.include_attributes,
-            manifest,
-        )
-        .await;
     }
+}
 
-    // Vector query path
-    let vector = req.vector.as_ref().ok_or_else(|| {
-        ZeppelinError::Validation("vector must be provided for ANN search".into())
-    })?;
-    if vector.len() != meta.dimensions {
-        return Err(ZeppelinError::DimensionMismatch {
-            expected: meta.dimensions,
-            actual: vector.len(),
-        });
-    }
-    // Reject NaN/inf: non-finite query values make every distance comparison
-    // nondeterministic (partial_cmp falls back to Equal).
-    if let Some((dim_idx, kind)) = super::find_non_finite(vector) {
-        return Err(ZeppelinError::Validation(format!(
-            "query vector contains a non-finite value ({kind}) at dimension {dim_idx}"
-        )));
-    }
-
-    let params = query::QueryParams {
-        store: &state.store,
-        wal_reader: &state.wal_reader,
-        namespace: ns,
-        query: vector,
-        top_k: validated.top_k,
-        nprobe: validated.nprobe,
-        filter: req.filter.as_ref(),
-        consistency: req.consistency,
-        distance_metric: meta.distance_metric,
-        oversample_factor: state.config.indexing.oversample_factor,
-        rerank_coalesce_gap_bytes: knobs.rerank_coalesce_gap_bytes,
-        cache: Some(&state.cache),
-        manifest_cache: Some(&state.manifest_cache),
-        include_attributes: validated.include_attributes,
-    };
-
-    let manifest = match options.manifest {
-        Some(manifest) => manifest,
-        None => {
-            query::read_manifest_for_query(
-                &state.store,
-                ns,
-                req.consistency,
-                Some(&state.manifest_cache),
-            )
-            .await?
+fn query_source_ref<'a>(
+    req: &'a QueryRequest,
+    source: ValidatedSource,
+) -> Result<QuerySourceRef<'a>, ZeppelinError> {
+    match source {
+        ValidatedSource::LegacyVector => req
+            .vector
+            .as_deref()
+            .map(|vector| QuerySourceRef::Ann { vector })
+            .ok_or_else(|| ZeppelinError::Validation("vector must be provided".into())),
+        ValidatedSource::LegacyBm25 => req
+            .rank_by
+            .as_ref()
+            .map(|rank_by| QuerySourceRef::Bm25 {
+                rank_by,
+                last_as_prefix: req.last_as_prefix.unwrap_or(false),
+            })
+            .ok_or_else(|| ZeppelinError::Validation("rank_by must be provided".into())),
+        ValidatedSource::AlgebraAnn { index } => {
+            let sources = req.sources.as_ref().ok_or_else(|| {
+                ZeppelinError::Validation("retrieval algebra sources missing".into())
+            })?;
+            match sources.get(index) {
+                Some(CandidateSource::Ann { vector, .. }) => Ok(QuerySourceRef::Ann { vector }),
+                _ => Err(ZeppelinError::Validation(
+                    "validated ANN source is missing".into(),
+                )),
+            }
         }
-    };
-    if options.notify_hydration {
-        notify_hydrator(state, ns, &manifest);
+        ValidatedSource::AlgebraBm25 { index } => {
+            let sources = req.sources.as_ref().ok_or_else(|| {
+                ZeppelinError::Validation("retrieval algebra sources missing".into())
+            })?;
+            match sources.get(index) {
+                Some(CandidateSource::Bm25 {
+                    rank_by,
+                    last_as_prefix,
+                }) => Ok(QuerySourceRef::Bm25 {
+                    rank_by,
+                    last_as_prefix: last_as_prefix.or(req.last_as_prefix).unwrap_or(false),
+                }),
+                _ => Err(ZeppelinError::Validation(
+                    "validated BM25 source is missing".into(),
+                )),
+            }
+        }
     }
-    query::execute_query_with_manifest(params, manifest).await
 }
 
 fn notify_hydrator(state: &AppState, namespace: &str, manifest: &Manifest) {

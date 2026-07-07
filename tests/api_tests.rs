@@ -3,8 +3,8 @@ mod common;
 use common::counting::{counting_store, ArtifactClass};
 use common::harness::TestHarness;
 use common::server::{
-    cleanup_ns, create_ns_api, create_ns_api_with, start_test_server, start_test_server_on_store,
-    start_test_server_with_compactor,
+    cleanup_ns, create_ns_api, create_ns_api_fts, create_ns_api_with, start_test_server,
+    start_test_server_on_store, start_test_server_with_compactor,
 };
 use common::vectors::random_vectors;
 use zeppelin::config::Config;
@@ -383,6 +383,137 @@ async fn test_query_basic_wal_scan() {
     assert!(!results.is_empty());
     assert_eq!(results[0]["id"], "vec_0");
     assert!(body["scanned_fragments"].as_u64().unwrap() > 0);
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_query_algebra_single_ann_source_matches_legacy() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api(&client, &base_url, 8).await;
+
+    let vectors = random_vectors(10, 8);
+    let query_vec = vectors[0].values.clone();
+
+    client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({ "vectors": vectors }))
+        .send()
+        .await
+        .unwrap();
+
+    let legacy = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "vector": query_vec.clone(),
+            "top_k": 5,
+            "include_attributes": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), 200);
+    let legacy_body: serde_json::Value = legacy.json().await.unwrap();
+
+    let algebra = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "sources": [{
+                "type": "ann",
+                "vector": query_vec
+            }],
+            "top_k": 5,
+            "projection": {
+                "include_attributes": false
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(algebra.status(), 200);
+    let algebra_body: serde_json::Value = algebra.json().await.unwrap();
+
+    assert_eq!(algebra_body, legacy_body);
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_query_algebra_single_bm25_source_matches_legacy() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_fts(
+        &client,
+        &base_url,
+        4,
+        serde_json::json!({
+            "content": {
+                "stemming": false,
+                "remove_stopwords": false
+            }
+        }),
+    )
+    .await;
+
+    let docs = serde_json::json!({
+        "vectors": [
+            {
+                "id": "doc-rust",
+                "values": [0.1, 0.2, 0.3, 0.4],
+                "attributes": {"content": "rust programming systems"}
+            },
+            {
+                "id": "doc-cooking",
+                "values": [0.4, 0.3, 0.2, 0.1],
+                "attributes": {"content": "recipe cooking kitchen"}
+            }
+        ]
+    });
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let legacy = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "rank_by": ["content", "BM25", "rust programming"],
+            "top_k": 2,
+            "consistency": "strong",
+            "include_attributes": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), 200);
+    let legacy_body: serde_json::Value = legacy.json().await.unwrap();
+
+    let algebra = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "sources": [{
+                "type": "bm25",
+                "rank_by": ["content", "BM25", "rust programming"]
+            }],
+            "top_k": 2,
+            "consistency": "strong",
+            "projection": {
+                "include_attributes": false
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(algebra.status(), 200);
+    let algebra_body: serde_json::Value = algebra.json().await.unwrap();
+
+    assert_eq!(algebra_body, legacy_body);
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;

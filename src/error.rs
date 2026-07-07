@@ -156,6 +156,13 @@ pub enum ZeppelinError {
         limit: usize,
     },
 
+    /// The request selected a recognized feature that is reserved but not implemented yet.
+    #[error("not implemented: {feature}")]
+    NotImplemented {
+        /// Stable feature name or short description.
+        feature: &'static str,
+    },
+
     // Config errors
     /// An invalid or missing configuration value.
     #[error("config error: {0}")]
@@ -239,6 +246,8 @@ impl ZeppelinError {
 
             ZeppelinError::PayloadTooLarge { .. } => 413,
 
+            ZeppelinError::NotImplemented { .. } => 501,
+
             ZeppelinError::QueryConcurrencyExhausted => 503,
 
             ZeppelinError::RateLimitExceeded { .. } => 429,
@@ -280,6 +289,7 @@ impl ZeppelinError {
             ZeppelinError::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
             ZeppelinError::Validation(_) => "VALIDATION_ERROR",
             ZeppelinError::PayloadTooLarge { .. } => "PAYLOAD_TOO_LARGE",
+            ZeppelinError::NotImplemented { .. } => "NOT_IMPLEMENTED",
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
             ZeppelinError::Io(_) => "INTERNAL_ERROR",
             ZeppelinError::Cache(_) => "INTERNAL_ERROR",
@@ -377,6 +387,7 @@ impl ZeppelinError {
             | ZeppelinError::DimensionMismatch { .. }
             | ZeppelinError::Validation(_)
             | ZeppelinError::PayloadTooLarge { .. }
+            | ZeppelinError::NotImplemented { .. }
             | ZeppelinError::HydrationDisabled
             | ZeppelinError::FtsFieldNotConfigured { .. }
             | ZeppelinError::QueryConcurrencyExhausted
@@ -558,6 +569,9 @@ mod tests {
                 resource: "query batch",
                 actual: 257,
                 limit: 256,
+            },
+            ZeppelinError::NotImplemented {
+                feature: "retrieval algebra",
             },
             ZeppelinError::Config("c".into()),
             ZeppelinError::Cache("c".into()),
