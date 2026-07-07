@@ -84,6 +84,15 @@ struct RegistryEntry {
     fetched_at: Instant,
 }
 
+/// Result of an idempotent namespace create request.
+#[derive(Debug, Clone)]
+pub enum CreateNamespaceOutcome {
+    /// The namespace did not exist and was created by this request.
+    Created(NamespaceMetadata),
+    /// The namespace already existed with the same immutable configuration.
+    Existing(NamespaceMetadata),
+}
+
 /// Manages namespace CRUD operations with an in-memory cache backed by S3.
 pub struct NamespaceManager {
     store: ZeppelinStore,
@@ -201,6 +210,48 @@ impl NamespaceManager {
 
         info!(namespace = name, dimensions, %distance_metric, "created namespace");
         Ok(meta)
+    }
+
+    /// Idempotently create a namespace by client-specified name.
+    ///
+    /// Same name plus identical immutable configuration returns the existing
+    /// S3 metadata; same name plus different configuration remains a conflict.
+    /// This keeps create-by-name useful for multi-process clients without
+    /// silently changing an existing namespace's shape.
+    #[instrument(skip(self, full_text_search), fields(namespace = name))]
+    pub async fn create_idempotent_with_fts(
+        &self,
+        name: &str,
+        dimensions: usize,
+        distance_metric: DistanceMetric,
+        full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
+    ) -> Result<CreateNamespaceOutcome> {
+        match self
+            .create_with_fts(name, dimensions, distance_metric, full_text_search.clone())
+            .await
+        {
+            Ok(meta) => Ok(CreateNamespaceOutcome::Created(meta)),
+            Err(ZeppelinError::NamespaceAlreadyExists { .. }) => {
+                let existing = self.read_metadata_from_s3(name).await?;
+                if existing.state == NamespaceState::Deleting {
+                    return Err(ZeppelinError::NamespaceDeleting {
+                        namespace: name.to_string(),
+                    });
+                }
+                if namespace_config_matches(
+                    &existing,
+                    dimensions,
+                    distance_metric,
+                    &full_text_search,
+                )? {
+                    return Ok(CreateNamespaceOutcome::Existing(existing));
+                }
+                Err(ZeppelinError::NamespaceAlreadyExists {
+                    namespace: name.to_string(),
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Get namespace metadata.
@@ -477,9 +528,12 @@ impl NamespaceManager {
     }
 }
 
-/// Validate a namespace name: 1-255 chars, starts with alphanumeric,
-/// only contains `[a-zA-Z0-9._-]`.
-fn is_valid_namespace_name(name: &str) -> bool {
+/// Validate a namespace name as both an S3 top-level key prefix and one URL
+/// path segment. This deliberately matches the safe names produced by the
+/// test helpers: `TestHarness::key()` may contain `/` for raw S3 keys, while
+/// `api_ns()` produces slash-free namespace names suitable for HTTP paths.
+#[must_use]
+pub fn is_valid_namespace_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 255 {
         return false;
     }
@@ -490,4 +544,59 @@ fn is_valid_namespace_name(name: &str) -> bool {
     bytes
         .iter()
         .all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+fn namespace_config_matches(
+    existing: &NamespaceMetadata,
+    dimensions: usize,
+    distance_metric: DistanceMetric,
+    full_text_search: &std::collections::HashMap<String, FtsFieldConfig>,
+) -> Result<bool> {
+    Ok(existing.dimensions == dimensions
+        && existing.distance_metric == distance_metric
+        && fts_config_value(&existing.full_text_search)? == fts_config_value(full_text_search)?)
+}
+
+fn fts_config_value(
+    full_text_search: &std::collections::HashMap<String, FtsFieldConfig>,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(full_text_search)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_namespace_name;
+
+    #[test]
+    fn namespace_name_validator_accepts_s3_and_url_safe_names() {
+        for name in ["tenant-a", "tenant_a", "tenant.a", "TenantA-123"] {
+            assert!(
+                is_valid_namespace_name(name),
+                "expected namespace name to be valid: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_name_validator_rejects_unsafe_names_at_creation_boundary() {
+        let overlong = format!("a{}", "b".repeat(255));
+        let invalid = [
+            "",
+            "tenant/a",
+            "tenant a",
+            "tenant%2Fa",
+            "../tenant",
+            "-tenant",
+            "tenant?",
+            "tenant#fragment",
+            overlong.as_str(),
+        ];
+
+        for name in invalid {
+            assert!(
+                !is_valid_namespace_name(name),
+                "expected namespace name to be invalid: {name:?}"
+            );
+        }
+    }
 }
