@@ -442,6 +442,200 @@ async fn test_query_algebra_single_ann_source_matches_legacy() {
 }
 
 #[tokio::test]
+async fn test_query_algebra_ann_source_can_use_stored_seed_id() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
+            "dimensions": 2,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+
+    let vectors = serde_json::json!({
+        "vectors": [
+            {
+                "id": "seed",
+                "values": [0.0, 0.0],
+                "attributes": {"tenant": "red", "kind": "seed"}
+            },
+            {
+                "id": "near",
+                "values": [0.1, 0.0],
+                "attributes": {"tenant": "red", "kind": "neighbor"}
+            },
+            {
+                "id": "far",
+                "values": [3.0, 0.0],
+                "attributes": {"tenant": "red", "kind": "neighbor"}
+            },
+            {
+                "id": "filtered",
+                "values": [0.05, 0.0],
+                "attributes": {"tenant": "blue", "kind": "neighbor"}
+            }
+        ]
+    });
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&vectors)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let raw = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "sources": [{
+                "type": "ann",
+                "vector": [0.0, 0.0],
+                "nprobe": 4
+            }],
+            "top_k": 3,
+            "filter": {"op": "eq", "field": "tenant", "value": "red"},
+            "consistency": "strong",
+            "projection": {"include_attributes": true}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), 200);
+    let raw_body: serde_json::Value = raw.json().await.unwrap();
+    let expected: Vec<serde_json::Value> = raw_body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|result| result["id"] != "seed")
+        .cloned()
+        .collect();
+
+    let by_id = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "sources": [{
+                "type": "ann",
+                "id": "seed",
+                "nprobe": 4
+            }],
+            "top_k": 2,
+            "filter": {"op": "eq", "field": "tenant", "value": "red"},
+            "consistency": "strong",
+            "projection": {"include_attributes": true}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(by_id.status(), 200);
+    let by_id_body: serde_json::Value = by_id.json().await.unwrap();
+
+    assert_eq!(by_id_body["results"], serde_json::json!(expected));
+    let ids: Vec<&str> = by_id_body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["near", "far"]);
+    assert!(by_id_body["results"][0]["attributes"].is_object());
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_query_algebra_ann_seed_id_missing_or_deleted_is_404() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
+            "dimensions": 2,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({
+            "vectors": [
+                {"id": "live", "values": [0.0, 0.0]},
+                {"id": "deleted", "values": [1.0, 0.0]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .delete(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({ "ids": ["deleted"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    for seed_id in ["missing", "deleted"] {
+        let resp = client
+            .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+            .json(&serde_json::json!({
+                "sources": [{
+                    "type": "ann",
+                    "id": seed_id
+                }],
+                "top_k": 1,
+                "consistency": "strong"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], "VECTOR_NOT_FOUND");
+        assert!(body["error"].as_str().unwrap().contains(seed_id));
+    }
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_query_algebra_ann_source_rejects_id_and_vector_together() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/missing/query"))
+        .json(&serde_json::json!({
+            "sources": [{
+                "type": "ann",
+                "id": "seed",
+                "vector": [0.0, 0.0]
+            }],
+            "top_k": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("exactly one of 'vector' or 'id'"));
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn test_query_algebra_single_bm25_source_matches_legacy() {
     let (base_url, harness) = start_test_server().await;
     let client = reqwest::Client::new();

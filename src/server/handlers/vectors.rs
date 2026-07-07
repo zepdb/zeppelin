@@ -460,25 +460,7 @@ fn validate_get_vectors_request(
     }
     let mut seen = HashSet::with_capacity(req.ids.len());
     for id in &req.ids {
-        if id.is_empty() {
-            return Err(ZeppelinError::Validation(
-                "vector id cannot be empty".into(),
-            ));
-        }
-        if id.len() > max_vector_id_length {
-            return Err(ZeppelinError::Validation(format!(
-                "vector id length {} exceeds maximum of {}",
-                id.len(),
-                max_vector_id_length
-            )));
-        }
-        if !is_valid_vector_id(id) {
-            return Err(ZeppelinError::Validation(format!(
-                "vector id '{}' contains invalid characters; \
-                 only alphanumeric, dash, underscore, and dot are allowed",
-                id
-            )));
-        }
+        validate_vector_id_for_request(id, max_vector_id_length)?;
         if !seen.insert(id) {
             return Err(ZeppelinError::Validation(format!(
                 "duplicate vector id '{id}' in request"
@@ -505,6 +487,65 @@ fn validate_get_vectors_request(
     }
 
     Ok(())
+}
+
+pub(crate) fn validate_vector_id_for_request(
+    id: &str,
+    max_vector_id_length: usize,
+) -> Result<(), ZeppelinError> {
+    if id.is_empty() {
+        return Err(ZeppelinError::Validation(
+            "vector id cannot be empty".into(),
+        ));
+    }
+    if id.len() > max_vector_id_length {
+        return Err(ZeppelinError::Validation(format!(
+            "vector id length {} exceeds maximum of {}",
+            id.len(),
+            max_vector_id_length
+        )));
+    }
+    if !is_valid_vector_id(id) {
+        return Err(ZeppelinError::Validation(format!(
+            "vector id '{}' contains invalid characters; \
+             only alphanumeric, dash, underscore, and dot are allowed",
+            id
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) async fn fetch_vector_values_by_id(
+    state: &AppState,
+    ns: &str,
+    id: &str,
+    consistency: ConsistencyLevel,
+    manifest: Manifest,
+) -> Result<Option<Vec<f32>>, ZeppelinError> {
+    let projection = FetchProjection {
+        include_vector: true,
+        include_attributes: false,
+        attribute_fields: None,
+    };
+    let response = fetch_vectors_by_id(
+        state,
+        ns,
+        &[id.to_string()],
+        consistency,
+        projection,
+        manifest,
+    )
+    .await?;
+    response
+        .results
+        .into_iter()
+        .next()
+        .map(|record| {
+            record.values.ok_or_else(|| {
+                ZeppelinError::Index(format!("fetch by id returned no vector values for {id}"))
+            })
+        })
+        .transpose()
 }
 
 async fn fetch_vectors_by_id(

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -85,7 +86,11 @@ pub enum CandidateSource {
     /// ANN vector candidate source.
     Ann {
         /// Query vector for ANN search.
-        vector: Vec<f32>,
+        #[serde(default)]
+        vector: Option<Vec<f32>>,
+        /// Stored vector ID to load and use as the ANN query vector.
+        #[serde(default)]
+        id: Option<String>,
         /// Number of IVF clusters to probe for this source.
         #[serde(default)]
         nprobe: Option<usize>,
@@ -263,10 +268,11 @@ enum QuerySourceKind {
     Bm25,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum QuerySourceRef<'a> {
     Ann {
-        vector: &'a [f32],
+        vector: Cow<'a, [f32]>,
+        exclude_id: Option<String>,
     },
     Bm25 {
         rank_by: &'a RankBy,
@@ -551,7 +557,8 @@ fn validate_query_shape(
     state: &AppState,
 ) -> Result<ValidatedQuery, ZeppelinError> {
     let top_k = req.top_k.unwrap_or(knobs.default_top_k);
-    let (source, source_nprobe) = validate_query_source(req)?;
+    let (source, source_nprobe) =
+        validate_query_source(req, state.config.server.max_vector_id_length)?;
     validate_retrieval_algebra_options(req)?;
     let include_attributes = validate_projection(req)?;
     let candidate_k = validate_candidate_k(req, top_k)?;
@@ -585,6 +592,7 @@ fn validate_query_shape(
 
 fn validate_query_source(
     req: &QueryRequest,
+    max_vector_id_length: usize,
 ) -> Result<(ValidatedSource, Option<usize>), ZeppelinError> {
     if let Some(sources) = req.sources.as_ref() {
         if req.vector.is_some() || req.rank_by.is_some() {
@@ -596,6 +604,9 @@ fn validate_query_source(
             return Err(ZeppelinError::Validation(
                 "sources must contain at least one candidate source".into(),
             ));
+        }
+        for source in sources {
+            validate_candidate_source_shape(source, max_vector_id_length)?;
         }
         if sources.len() > 1 {
             return validate_multi_source_request(req, sources);
@@ -639,6 +650,24 @@ fn validate_query_source(
         Ok((ValidatedSource::LegacyVector, None))
     } else {
         Ok((ValidatedSource::LegacyBm25, None))
+    }
+}
+
+fn validate_candidate_source_shape(
+    source: &CandidateSource,
+    max_vector_id_length: usize,
+) -> Result<(), ZeppelinError> {
+    match source {
+        CandidateSource::Ann { vector, id, .. } => match (vector.is_some(), id.as_ref()) {
+            (true, None) => Ok(()),
+            (false, Some(id)) => {
+                super::vectors::validate_vector_id_for_request(id, max_vector_id_length)
+            }
+            _ => Err(ZeppelinError::Validation(
+                "ann source must provide exactly one of 'vector' or 'id'".into(),
+            )),
+        },
+        CandidateSource::Bm25 { .. } => Ok(()),
     }
 }
 
@@ -848,9 +877,10 @@ async fn execute_validated_query(
         .await;
     }
 
-    let source_ref = query_source_ref(req, validated.source)?;
-    validate_query_source_metadata(ns, meta, source_ref)?;
     let manifest = read_manifest_for_execution(state, ns, req.consistency, options).await?;
+    let source_ref =
+        resolve_query_source_ref(state, ns, req, validated.source, manifest.clone()).await?;
+    validate_query_source_metadata(ns, meta, &source_ref)?;
     let emit_debug = req.debug.unwrap_or(false);
     execute_query_source_with_manifest(
         state,
@@ -890,15 +920,13 @@ async fn execute_hybrid_query(
         ));
     }
 
-    for index in 0..source_count {
-        validate_query_source_metadata(ns, meta, algebra_source_ref(req, index)?)?;
-    }
-
     let manifest = read_manifest_for_execution(state, ns, req.consistency, options).await?;
     let mut source_responses = Vec::with_capacity(source_count);
     let emit_debug = req.debug.unwrap_or(false);
     for index in 0..source_count {
-        let source_ref = algebra_source_ref(req, index)?;
+        let source_ref =
+            resolve_algebra_source_ref(state, ns, req, index, manifest.clone()).await?;
+        validate_query_source_metadata(ns, meta, &source_ref)?;
         let nprobe = nprobe_for_algebra_source(req, index, knobs.default_nprobe)?;
         let source_response = execute_query_source_with_manifest(
             state,
@@ -929,7 +957,7 @@ async fn execute_hybrid_query(
 fn validate_query_source_metadata(
     ns: &str,
     meta: &NamespaceMetadata,
-    source_ref: QuerySourceRef<'_>,
+    source_ref: &QuerySourceRef<'_>,
 ) -> Result<(), ZeppelinError> {
     match source_ref {
         QuerySourceRef::Bm25 { rank_by, .. } => {
@@ -943,14 +971,14 @@ fn validate_query_source_metadata(
             }
             Ok(())
         }
-        QuerySourceRef::Ann { vector } => {
-            if vector.len() != meta.dimensions {
+        QuerySourceRef::Ann { vector, .. } => {
+            if vector.as_ref().len() != meta.dimensions {
                 return Err(ZeppelinError::DimensionMismatch {
                     expected: meta.dimensions,
-                    actual: vector.len(),
+                    actual: vector.as_ref().len(),
                 });
             }
-            if let Some((dim_idx, kind)) = super::find_non_finite(vector) {
+            if let Some((dim_idx, kind)) = super::find_non_finite(vector.as_ref()) {
                 return Err(ZeppelinError::Validation(format!(
                     "query vector contains a non-finite value ({kind}) at dimension {dim_idx}"
                 )));
@@ -1060,27 +1088,32 @@ async fn execute_query_source_with_manifest(
                 response,
             })
         }
-        QuerySourceRef::Ann { vector } => {
-            if vector.len() != meta.dimensions {
+        QuerySourceRef::Ann { vector, exclude_id } => {
+            if vector.as_ref().len() != meta.dimensions {
                 return Err(ZeppelinError::DimensionMismatch {
                     expected: meta.dimensions,
-                    actual: vector.len(),
+                    actual: vector.as_ref().len(),
                 });
             }
             // Reject NaN/inf: non-finite query values make every distance
             // comparison nondeterministic (partial_cmp falls back to Equal).
-            if let Some((dim_idx, kind)) = super::find_non_finite(vector) {
+            if let Some((dim_idx, kind)) = super::find_non_finite(vector.as_ref()) {
                 return Err(ZeppelinError::Validation(format!(
                     "query vector contains a non-finite value ({kind}) at dimension {dim_idx}"
                 )));
             }
 
+            let search_top_k = if exclude_id.is_some() {
+                top_k.saturating_add(1)
+            } else {
+                top_k
+            };
             let params = query::QueryParams {
                 store: &state.store,
                 wal_reader: &state.wal_reader,
                 namespace: ns,
-                query: vector,
-                top_k,
+                query: vector.as_ref(),
+                top_k: search_top_k,
                 nprobe,
                 filter: req.filter.as_ref(),
                 consistency: req.consistency,
@@ -1097,7 +1130,12 @@ async fn execute_query_source_with_manifest(
             } else {
                 query::execute_query_with_manifest(params, manifest).await
             };
-            response.map(|response| SourceQueryResponse {
+            let mut response = response?;
+            if let Some(exclude_id) = exclude_id {
+                response.results.retain(|result| result.id != exclude_id);
+                response.results.truncate(top_k);
+            }
+            Ok(SourceQueryResponse {
                 kind: QuerySourceKind::Ann,
                 response,
             })
@@ -1306,15 +1344,21 @@ fn fused_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
     b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
 }
 
-fn query_source_ref<'a>(
+async fn resolve_query_source_ref<'a>(
+    state: &AppState,
+    ns: &str,
     req: &'a QueryRequest,
     source: ValidatedSource,
+    manifest: Manifest,
 ) -> Result<QuerySourceRef<'a>, ZeppelinError> {
     match source {
         ValidatedSource::LegacyVector => req
             .vector
             .as_deref()
-            .map(|vector| QuerySourceRef::Ann { vector })
+            .map(|vector| QuerySourceRef::Ann {
+                vector: Cow::Borrowed(vector),
+                exclude_id: None,
+            })
             .ok_or_else(|| ZeppelinError::Validation("vector must be provided".into())),
         ValidatedSource::LegacyBm25 => req
             .rank_by
@@ -1324,24 +1368,54 @@ fn query_source_ref<'a>(
                 last_as_prefix: req.last_as_prefix.unwrap_or(false),
             })
             .ok_or_else(|| ZeppelinError::Validation("rank_by must be provided".into())),
-        ValidatedSource::AlgebraAnn { index } => algebra_source_ref(req, index),
-        ValidatedSource::AlgebraBm25 { index } => algebra_source_ref(req, index),
+        ValidatedSource::AlgebraAnn { index } | ValidatedSource::AlgebraBm25 { index } => {
+            resolve_algebra_source_ref(state, ns, req, index, manifest).await
+        }
         ValidatedSource::AlgebraHybrid { .. } => Err(ZeppelinError::Validation(
             "hybrid query must execute through all algebra sources".into(),
         )),
     }
 }
 
-fn algebra_source_ref<'a>(
+async fn resolve_algebra_source_ref<'a>(
+    state: &AppState,
+    ns: &str,
     req: &'a QueryRequest,
     index: usize,
+    manifest: Manifest,
 ) -> Result<QuerySourceRef<'a>, ZeppelinError> {
     let sources = req
         .sources
         .as_ref()
         .ok_or_else(|| ZeppelinError::Validation("retrieval algebra sources missing".into()))?;
     match sources.get(index) {
-        Some(CandidateSource::Ann { vector, .. }) => Ok(QuerySourceRef::Ann { vector }),
+        Some(CandidateSource::Ann { vector, id, .. }) => match (vector.as_deref(), id.as_deref()) {
+            (Some(vector), None) => Ok(QuerySourceRef::Ann {
+                vector: Cow::Borrowed(vector),
+                exclude_id: None,
+            }),
+            (None, Some(id)) => {
+                let vector = super::vectors::fetch_vector_values_by_id(
+                    state,
+                    ns,
+                    id,
+                    req.consistency,
+                    manifest,
+                )
+                .await?
+                .ok_or_else(|| ZeppelinError::VectorNotFound {
+                    namespace: ns.to_string(),
+                    id: id.to_string(),
+                })?;
+                Ok(QuerySourceRef::Ann {
+                    vector: Cow::Owned(vector),
+                    exclude_id: Some(id.to_string()),
+                })
+            }
+            _ => Err(ZeppelinError::Validation(
+                "ann source must provide exactly one of 'vector' or 'id'".into(),
+            )),
+        },
         Some(CandidateSource::Bm25 {
             rank_by,
             last_as_prefix,

@@ -1394,7 +1394,7 @@ components:
         Implemented today:
         - legacy `vector`
         - legacy `rank_by`
-        - single-source `ann`
+        - single-source `ann` with either raw `vector` or stored seed `id`
         - single-source `bm25`
         - multi-source RRF fusion (`fusion` omitted defaults to RRF k=60)
         - multi-source weighted normalized score fusion
@@ -1490,8 +1490,12 @@ components:
 
     AnnCandidateSource:
       type: object
-      required: [type, vector]
+      required: [type]
       additionalProperties: false
+      description: |
+        ANN candidate source. Provide exactly one of `vector` or `id`.
+        When `id` is used, Zeppelin loads that stored vector from the
+        namespace and excludes the seed id from returned neighbors.
       properties:
         type:
           type: string
@@ -1502,6 +1506,9 @@ components:
             type: number
             format: float
           description: Query vector for ANN search.
+        id:
+          type: string
+          description: Stored vector id to use as the ANN query seed.
         nprobe:
           type: integer
           minimum: 1

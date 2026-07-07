@@ -141,6 +141,15 @@ pub enum ZeppelinError {
         actual: usize,
     },
 
+    /// A requested vector ID does not exist in the namespace.
+    #[error("vector not found in namespace {namespace}: {id}")]
+    VectorNotFound {
+        /// Namespace searched for the vector.
+        namespace: String,
+        /// Vector ID that was absent or tombstoned.
+        id: String,
+    },
+
     /// A request failed input validation.
     #[error("validation error: {0}")]
     Validation(String),
@@ -233,7 +242,9 @@ impl ZeppelinError {
     /// went missing" (Task 11 I2).
     pub fn status_code(&self) -> u16 {
         match self {
-            ZeppelinError::NamespaceNotFound { .. } | ZeppelinError::ManifestNotFound { .. } => 404,
+            ZeppelinError::NamespaceNotFound { .. }
+            | ZeppelinError::ManifestNotFound { .. }
+            | ZeppelinError::VectorNotFound { .. } => 404,
 
             ZeppelinError::NamespaceDeleting { .. } => 410,
 
@@ -291,6 +302,7 @@ impl ZeppelinError {
             ZeppelinError::Membership(_) => "INTERNAL_ERROR",
             ZeppelinError::KMeansConvergence { .. } => "INTERNAL_ERROR",
             ZeppelinError::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
+            ZeppelinError::VectorNotFound { .. } => "VECTOR_NOT_FOUND",
             ZeppelinError::Validation(_) => "VALIDATION_ERROR",
             ZeppelinError::PayloadTooLarge { .. } => "PAYLOAD_TOO_LARGE",
             ZeppelinError::NotImplemented { .. } => "NOT_IMPLEMENTED",
@@ -390,6 +402,7 @@ impl ZeppelinError {
             }
             ZeppelinError::NamespaceAlreadyExists { .. }
             | ZeppelinError::DimensionMismatch { .. }
+            | ZeppelinError::VectorNotFound { .. }
             | ZeppelinError::Validation(_)
             | ZeppelinError::PayloadTooLarge { .. }
             | ZeppelinError::NotImplemented { .. }
@@ -569,6 +582,10 @@ mod tests {
             ZeppelinError::DimensionMismatch {
                 expected: 1,
                 actual: 2,
+            },
+            ZeppelinError::VectorNotFound {
+                namespace: "n".into(),
+                id: "v".into(),
             },
             ZeppelinError::Validation("v".into()),
             ZeppelinError::PayloadTooLarge {
