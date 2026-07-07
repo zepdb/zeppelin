@@ -9,13 +9,13 @@ use ulid::Ulid;
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{compaction_loop, CompactionLoopOptions};
-use zeppelin::compaction::gc::run_gc_cycle;
+use zeppelin::compaction::gc::{load_gc_candidates, run_gc_cycle};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, GcConfig, IndexingConfig};
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::types::DistanceMetric;
 use zeppelin::wal::fragment::WalFragment;
-use zeppelin::wal::manifest::Manifest;
+use zeppelin::wal::manifest::{FragmentRef, Manifest};
 use zeppelin::wal::{LeaseManager, WalReader};
 
 use common::assertions::{assert_s3_object_exists, assert_s3_object_not_exists};
@@ -27,6 +27,7 @@ fn unsafe_short_gc(horizon_secs: u64) -> GcConfig {
         compaction_upload_window_secs: 1,
         skew_slop_secs: 0,
         allow_unsafe_short_horizon: true,
+        ..GcConfig::default()
     }
 }
 
@@ -53,6 +54,9 @@ async fn gc_cycle_deletes_then_prunes_pending_deletes() {
     let mut manifest = Manifest::new();
     manifest.pending_deletes.push(pending_key.clone());
     manifest.write(&store, &ns).await.unwrap();
+    // Legacy namespaces created before manifest history have no retained
+    // snapshot pinning pending-delete keys.
+    store.delete(&Manifest::history_key(&ns, 1)).await.unwrap();
 
     run_gc_cycle(&store, &ns, &unsafe_short_gc(0))
         .await
@@ -121,6 +125,101 @@ async fn gc_cycle_retains_pending_deletes_inside_horizon() {
     assert_s3_object_exists(&store, &pending_key).await;
     let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
     assert_eq!(manifest.pending_deletes, vec![pending_key]);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_cycle_retains_objects_referenced_only_by_manifest_history() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("storage-gc-history-mark-sweep");
+    let store = harness.store.clone();
+    let old_id = old_ulid(60, 49);
+    let old_key = WalFragment::s3_key(&ns, &old_id);
+
+    store
+        .put(&old_key, Bytes::from_static(b"history-only fragment body"))
+        .await
+        .unwrap();
+    let mut manifest = Manifest::new();
+    manifest.add_fragment(FragmentRef {
+        id: old_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 26,
+    });
+    manifest.write(&store, &ns).await.unwrap();
+
+    let (mut current, etag) = Manifest::read_versioned(&store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    current.fragments.clear();
+    current.updated_at = Utc::now();
+    current.write_conditional(&store, &ns, &etag).await.unwrap();
+
+    run_gc_cycle(&store, &ns, &unsafe_short_gc(0))
+        .await
+        .unwrap();
+    run_gc_cycle(&store, &ns, &unsafe_short_gc(0))
+        .await
+        .unwrap();
+
+    assert_s3_object_exists(&store, &old_key).await;
+    assert!(
+        load_gc_candidates(&store, &ns)
+            .await
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.key != old_key),
+        "history-referenced objects must not enter the candidate ledger"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_cycle_retains_pending_deletes_referenced_by_manifest_history() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("storage-gc-history-pending");
+    let store = harness.store.clone();
+    let old_id = old_ulid(60, 59);
+    let old_key = WalFragment::s3_key(&ns, &old_id);
+
+    store
+        .put(&old_key, Bytes::from_static(b"history pending-delete body"))
+        .await
+        .unwrap();
+    let mut manifest = Manifest::new();
+    manifest.add_fragment(FragmentRef {
+        id: old_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 27,
+    });
+    manifest.write(&store, &ns).await.unwrap();
+
+    let (mut current, etag) = Manifest::read_versioned(&store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    current.fragments.clear();
+    current.pending_deletes.push(old_key.clone());
+    current.updated_at = Utc::now();
+    current.write_conditional(&store, &ns, &etag).await.unwrap();
+
+    let report = run_gc_cycle(&store, &ns, &unsafe_short_gc(0))
+        .await
+        .unwrap();
+
+    assert_eq!(report.pending_deletes_deleted, 0);
+    assert_eq!(report.pending_deletes_pruned, 0);
+    assert_eq!(report.pending_deletes_retained, 1);
+    assert_s3_object_exists(&store, &old_key).await;
+    let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    assert_eq!(manifest.pending_deletes, vec![old_key]);
 
     harness.cleanup().await;
 }

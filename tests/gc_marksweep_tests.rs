@@ -25,6 +25,7 @@ fn unsafe_short_gc(horizon_secs: u64) -> GcConfig {
         compaction_upload_window_secs: 1,
         skew_slop_secs: 0,
         allow_unsafe_short_horizon: true,
+        ..GcConfig::default()
     }
 }
 

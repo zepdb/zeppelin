@@ -13,6 +13,7 @@ const GC_HORIZON_SECS_ENV: &str = "ZEPPELIN_GC_HORIZON_SECS";
 const GC_COMPACTION_UPLOAD_WINDOW_SECS_ENV: &str = "ZEPPELIN_GC_COMPACTION_UPLOAD_WINDOW_SECS";
 const GC_SKEW_SLOP_SECS_ENV: &str = "ZEPPELIN_GC_SKEW_SLOP_SECS";
 const GC_ALLOW_UNSAFE_SHORT_HORIZON_ENV: &str = "ZEPPELIN_GC_ALLOW_UNSAFE_SHORT_HORIZON";
+const GC_MANIFEST_HISTORY_KEEP_COUNT_ENV: &str = "ZEPPELIN_GC_MANIFEST_HISTORY_KEEP_COUNT";
 
 /// Default maximum gap, in bytes, between rerank f32 ranges that are merged
 /// into one physical GET.
@@ -112,6 +113,13 @@ pub struct GcConfig {
     /// Boot logs a structured warning when this accepts an unsafe horizon.
     #[serde(default)]
     pub allow_unsafe_short_horizon: bool,
+    /// Number of committed manifest snapshots retained by the app-level history log.
+    ///
+    /// GC treats retained snapshots as live roots. Pruning happens during explicit
+    /// GC cycles; once a snapshot is pruned, objects referenced only by that snapshot
+    /// become collectible after the normal GC horizon. Default: `128`.
+    #[serde(default = "default_gc_manifest_history_keep_count")]
+    pub manifest_history_keep_count: usize,
 }
 
 /// Query-time configuration loaded at boot.
@@ -384,6 +392,11 @@ mod tests {
                 vec!["gc.compaction_upload_window_secs"],
             ),
             (
+                "gc manifest history keep count must be nonzero",
+                Box::new(|config| config.gc.manifest_history_keep_count = 0),
+                vec!["gc.manifest_history_keep_count"],
+            ),
+            (
                 "existing cache validation remains enforced",
                 Box::new(|config| config.cache.hydration_parallelism = 0),
                 vec!["cache.hydration_parallelism"],
@@ -651,6 +664,7 @@ mod tests {
             compaction_upload_window_secs = 15
             skew_slop_secs = 4
             allow_unsafe_short_horizon = true
+            manifest_history_keep_count = 7
             "#,
         )
         .unwrap();
@@ -659,6 +673,7 @@ mod tests {
         assert_eq!(config.gc.compaction_upload_window_secs, 15);
         assert_eq!(config.gc.skew_slop_secs, 4);
         assert!(config.gc.allow_unsafe_short_horizon);
+        assert_eq!(config.gc.manifest_history_keep_count, 7);
 
         let source = include_str!("config.rs");
         assert!(source.contains("manifest_cache_ttl_secs + request_timeout_secs + compaction_upload_window_secs + skew_slop_secs"));
@@ -1153,6 +1168,9 @@ fn default_gc_compaction_upload_window_secs() -> u64 {
 fn default_gc_skew_slop_secs() -> u64 {
     5
 }
+fn default_gc_manifest_history_keep_count() -> usize {
+    128
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -1263,6 +1281,7 @@ impl Default for GcConfig {
             compaction_upload_window_secs: default_gc_compaction_upload_window_secs(),
             skew_slop_secs: default_gc_skew_slop_secs(),
             allow_unsafe_short_horizon: false,
+            manifest_history_keep_count: default_gc_manifest_history_keep_count(),
         }
     }
 }
@@ -1416,6 +1435,9 @@ impl Config {
         if self.gc.compaction_upload_window_secs == 0 {
             violations
                 .push("gc.compaction_upload_window_secs must be greater than zero".to_string());
+        }
+        if self.gc.manifest_history_keep_count == 0 {
+            violations.push("gc.manifest_history_keep_count must be greater than zero".to_string());
         }
 
         if self.cache.hydration_heat_queries == 0 {
@@ -1772,6 +1794,9 @@ impl Config {
         }
         if let Some(v) = env_override(GC_ALLOW_UNSAFE_SHORT_HORIZON_ENV)? {
             self.gc.allow_unsafe_short_horizon = v;
+        }
+        if let Some(v) = env_override(GC_MANIFEST_HISTORY_KEEP_COUNT_ENV)? {
+            self.gc.manifest_history_keep_count = v;
         }
 
         Ok(())

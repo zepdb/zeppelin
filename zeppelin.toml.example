@@ -82,6 +82,8 @@
 # skew_slop_secs = 5                       # ZEPPELIN_GC_SKEW_SLOP_SECS
 # allow_unsafe_short_horizon = false       # ZEPPELIN_GC_ALLOW_UNSAFE_SHORT_HORIZON
 #                                          # true accepts a sub-floor horizon and emits a loud WARN at boot.
+# manifest_history_keep_count = 128        # ZEPPELIN_GC_MANIFEST_HISTORY_KEEP_COUNT
+#                                          # GC retains this many committed manifest snapshots as live roots.
 
 [compaction]
 # interval_secs = 30                 # ZEPPELIN_COMPACTION_INTERVAL_SECS

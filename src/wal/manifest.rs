@@ -305,6 +305,15 @@ pub struct Manifest {
     version: u64,
 }
 
+/// Addressable historical manifest snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestHistoryRef {
+    /// Persisted manifest generation.
+    pub version: u64,
+    /// Immutable S3 key containing the serialized manifest snapshot.
+    pub key: String,
+}
+
 impl Manifest {
     /// Create an empty manifest.
     pub fn new() -> Self {
@@ -326,16 +335,32 @@ impl Manifest {
         format!("{namespace}/manifest.json")
     }
 
+    /// Get the S3 prefix for immutable manifest history snapshots.
+    #[must_use]
+    pub fn history_prefix(namespace: &str) -> String {
+        format!("{namespace}/manifests/")
+    }
+
+    /// Get the S3 key for a retained manifest generation.
+    #[must_use]
+    pub fn history_key(namespace: &str, version: u64) -> String {
+        format!("{}{version:020}.msgpack", Self::history_prefix(namespace))
+    }
+
     /// Return the persisted manifest generation.
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    fn next_committed_version(&self) -> Result<u64> {
-        self.version
+    fn checked_next_version(version: u64) -> Result<u64> {
+        version
             .checked_add(1)
             .ok_or_else(|| ZeppelinError::Serialization("manifest version overflow".to_string()))
+    }
+
+    fn next_committed_version(&self) -> Result<u64> {
+        Self::checked_next_version(self.version)
     }
 
     /// Add a fragment reference, assigning the next monotonic sequence number.
@@ -531,10 +556,15 @@ impl Manifest {
     /// Write manifest to S3.
     pub async fn write(&self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
         let key = Self::s3_key(namespace);
+        let current_version = Self::read(store, namespace)
+            .await?
+            .map_or(0, |manifest| manifest.version());
+        let base_version = self.version.max(current_version);
         let mut committed = self.clone();
-        committed.version = self.next_committed_version()?;
+        committed.version = Self::checked_next_version(base_version)?;
         let data = committed.to_bytes()?;
-        store.put(&key, data).await
+        store.put(&key, data).await?;
+        Self::write_history_snapshot(store, namespace, &committed).await
     }
 
     /// Read manifest from S3, returning the manifest along with its ETag version.
@@ -573,9 +603,128 @@ impl Manifest {
             None => store.put(&key, data).await,
         };
         if result.is_ok() {
+            Self::write_history_snapshot(store, namespace, &committed).await?;
             self.version = next_version;
         }
         result
+    }
+
+    /// List retained manifest history snapshots in ascending generation order.
+    pub async fn list_history(
+        store: &ZeppelinStore,
+        namespace: &str,
+    ) -> Result<Vec<ManifestHistoryRef>> {
+        let prefix = Self::history_prefix(namespace);
+        let mut entries = store
+            .list_prefix(&prefix)
+            .await?
+            .into_iter()
+            .map(|key| {
+                Ok(ManifestHistoryRef {
+                    version: Self::history_version_from_key(namespace, &key)?,
+                    key,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.version);
+        Ok(entries)
+    }
+
+    /// Read a retained manifest history snapshot by persisted generation.
+    pub async fn read_history(
+        store: &ZeppelinStore,
+        namespace: &str,
+        version: u64,
+    ) -> Result<Option<Self>> {
+        let key = Self::history_key(namespace, version);
+        match store.get(&key).await {
+            Ok(data) => {
+                let manifest = Self::from_bytes(&data)?;
+                if manifest.version() != version {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "manifest history key {key} contains version {}, expected {version}",
+                        manifest.version()
+                    )));
+                }
+                Ok(Some(manifest))
+            }
+            Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Prune oldest manifest history snapshots, retaining the most recent `keep_count`.
+    pub async fn prune_history(
+        store: &ZeppelinStore,
+        namespace: &str,
+        keep_count: usize,
+    ) -> Result<usize> {
+        if keep_count == 0 {
+            return Err(ZeppelinError::Config(
+                "gc.manifest_history_keep_count must be greater than zero".to_string(),
+            ));
+        }
+
+        let history = Self::list_history(store, namespace).await?;
+        let prune_count = history.len().saturating_sub(keep_count);
+        for entry in history.iter().take(prune_count) {
+            store.delete(&entry.key).await?;
+        }
+        Ok(prune_count)
+    }
+
+    async fn write_history_snapshot(
+        store: &ZeppelinStore,
+        namespace: &str,
+        committed: &Self,
+    ) -> Result<()> {
+        let version = committed.version();
+        if version == 0 {
+            return Err(ZeppelinError::Serialization(
+                "manifest history requires a committed nonzero version".to_string(),
+            ));
+        }
+
+        let key = Self::history_key(namespace, version);
+        let data = committed.to_bytes()?;
+        match store.put_if_not_exists(&key, data.clone(), namespace).await {
+            Ok(()) => Ok(()),
+            Err(ZeppelinError::NamespaceAlreadyExists { .. }) => {
+                let existing = store.get(&key).await?;
+                if existing == data {
+                    Ok(())
+                } else {
+                    Err(ZeppelinError::Serialization(format!(
+                        "manifest history key {key} already exists with different bytes"
+                    )))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn history_version_from_key(namespace: &str, key: &str) -> Result<u64> {
+        let prefix = Self::history_prefix(namespace);
+        let Some(name) = key.strip_prefix(&prefix) else {
+            return Err(ZeppelinError::Serialization(format!(
+                "manifest history key {key} is outside prefix {prefix}"
+            )));
+        };
+        let Some(version_text) = name.strip_suffix(".msgpack") else {
+            return Err(ZeppelinError::Serialization(format!(
+                "manifest history key {key} must end with .msgpack"
+            )));
+        };
+        if version_text.len() != 20 || !version_text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ZeppelinError::Serialization(format!(
+                "manifest history key {key} has invalid generation component {version_text}"
+            )));
+        }
+        version_text.parse::<u64>().map_err(|e| {
+            ZeppelinError::Serialization(format!(
+                "manifest history key {key} has unparseable generation {version_text}: {e}"
+            ))
+        })
     }
 }
 
@@ -656,6 +805,89 @@ mod tests {
 
         let (third, _) = Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
         assert_eq!(third.version(), 3);
+    }
+
+    #[tokio::test]
+    async fn manifest_history_is_written_and_addressable_by_committed_version() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let ns = "manifest_history_addressable";
+
+        Manifest::new().write(&store, ns).await.unwrap();
+        let (mut first, first_etag) = Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+        first.add_fragment(FragmentRef {
+            id: Ulid::from_parts(20_000, 1),
+            vector_count: 3,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 32,
+        });
+        first
+            .write_conditional(&store, ns, &first_etag)
+            .await
+            .unwrap();
+
+        let history = Manifest::list_history(&store, ns).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.version)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let v1 = Manifest::read_history(&store, ns, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            v1.fragments.is_empty(),
+            "history version 1 must preserve the original empty manifest"
+        );
+
+        let v2 = Manifest::read_history(&store, ns, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v2.fragments.len(), 1);
+        assert_eq!(v2.fragments[0].vector_count, 3);
+    }
+
+    #[tokio::test]
+    async fn manifest_history_prune_removes_oldest_versions_only() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let ns = "manifest_history_prune";
+
+        Manifest::new().write(&store, ns).await.unwrap();
+        for version in 2..=4 {
+            let (mut manifest, etag) = Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+            manifest.add_fragment(FragmentRef {
+                id: Ulid::from_parts(30_000 + version, u128::from(version)),
+                vector_count: version as usize,
+                delete_count: 0,
+                sequence_number: 0,
+                size_bytes: 16,
+            });
+            manifest.write_conditional(&store, ns, &etag).await.unwrap();
+        }
+
+        let pruned = Manifest::prune_history(&store, ns, 2).await.unwrap();
+        assert_eq!(pruned, 2);
+        let history = Manifest::list_history(&store, ns).await.unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.version)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(Manifest::read_history(&store, ns, 2)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(Manifest::read_history(&store, ns, 4)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[test]
