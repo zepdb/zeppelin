@@ -246,6 +246,66 @@ async fn test_hybrid_candidate_k_bounds_each_source_before_fusion() {
 }
 
 #[tokio::test]
+async fn test_hybrid_query_by_id_excludes_seed_after_fusion() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_hybrid_namespace(&client, &base_url, 2).await;
+
+    upsert(
+        &client,
+        &base_url,
+        &ns,
+        serde_json::json!([
+            {
+                "id": "seed",
+                "values": [0.0, 0.0],
+                "attributes": {"content": "hybrid hybrid hybrid hybrid"}
+            },
+            {
+                "id": "neighbor",
+                "values": [0.1, 0.0],
+                "attributes": {"content": "plain vector"}
+            },
+            {
+                "id": "text-match",
+                "values": [10.0, 10.0],
+                "attributes": {"content": "hybrid hybrid"}
+            }
+        ]),
+    )
+    .await;
+
+    let body = query(
+        &client,
+        &base_url,
+        &ns,
+        serde_json::json!({
+            "sources": [
+                {
+                    "type": "ann",
+                    "id": "seed"
+                },
+                {
+                    "type": "bm25",
+                    "rank_by": ["content", "BM25", "hybrid"]
+                }
+            ],
+            "fusion": {"type": "rrf", "k": 60},
+            "candidate_k": 3,
+            "top_k": 3,
+            "consistency": "strong",
+            "projection": {"include_attributes": false}
+        }),
+    )
+    .await;
+
+    assert!(!result_ids(&body).contains(&"seed".to_string()));
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn test_hybrid_fusion_includes_wal_and_segment_candidates() {
     let (base_url, harness, _cache, _cache_dir, compactor) =
         start_test_server_with_compactor(Some(hybrid_compaction_config())).await;

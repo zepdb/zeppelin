@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use axum::extract::{Extension, Path, State};
@@ -977,6 +977,10 @@ async fn execute_hybrid_query(
     let rerank_limit = rerank_output_k(req, validated, first_stage_top_k);
     let first_stage_include_attributes =
         first_stage_include_attributes(req, validated.include_attributes);
+    let excluded_seed_ids = algebra_seed_exclusion_ids(req);
+    let source_candidate_k = validated
+        .candidate_k
+        .saturating_add(excluded_seed_ids.len());
     let mut explain_sources = Vec::with_capacity(source_count);
     for index in 0..source_count {
         let source_ref =
@@ -987,15 +991,15 @@ async fn execute_hybrid_query(
             req,
             index,
             nprobe,
-            validated.candidate_k,
+            source_candidate_k,
         )?);
-        let source_response = execute_query_source_with_manifest(
+        let mut source_response = execute_query_source_with_manifest(
             state,
             ns,
             meta,
             req,
             source_ref,
-            validated.candidate_k,
+            source_candidate_k,
             nprobe,
             first_stage_include_attributes,
             knobs,
@@ -1003,6 +1007,11 @@ async fn execute_hybrid_query(
             emit_debug,
         )
         .await?;
+        exclude_seed_ids_from_response(
+            &mut source_response.response,
+            &excluded_seed_ids,
+            validated.candidate_k,
+        );
         source_responses.push(source_response);
     }
 
@@ -1086,6 +1095,32 @@ fn facet_counts_requested(req: &QueryRequest) -> bool {
 
 fn grouping_requested(req: &QueryRequest) -> bool {
     matches!(req.grouping, Some(GroupingSpec::Field { .. }))
+}
+
+fn algebra_seed_exclusion_ids(req: &QueryRequest) -> HashSet<String> {
+    req.sources
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|source| match source {
+            CandidateSource::Ann { id: Some(id), .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn exclude_seed_ids_from_response(
+    response: &mut QueryResponse,
+    excluded_seed_ids: &HashSet<String>,
+    top_k: usize,
+) {
+    if excluded_seed_ids.is_empty() {
+        return;
+    }
+    response
+        .results
+        .retain(|result| !excluded_seed_ids.contains(&result.id));
+    response.results.truncate(top_k);
 }
 
 struct ExplainAccumulator {

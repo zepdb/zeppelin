@@ -1508,7 +1508,8 @@ components:
       description: |
         ANN candidate source. Provide exactly one of `vector` or `id`.
         When `id` is used, Zeppelin loads that stored vector from the
-        namespace and excludes the seed id from returned neighbors.
+        namespace and excludes the seed id from returned results, including
+        fused hybrid results.
       properties:
         type:
           type: string
