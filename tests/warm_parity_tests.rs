@@ -21,7 +21,7 @@ use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use zeppelin::server::{build_router, AppState};
+use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::manifest::{Manifest, SegmentRef};
@@ -101,6 +101,7 @@ async fn start_parity_server(config: Config) -> ParityServer {
     );
     let runtime_query_config = Arc::new(RuntimeQueryConfig::from_config(&config));
     let query_knob_bounds = QueryKnobBounds::from_config(&config);
+    let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: store.clone(),
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
@@ -110,6 +111,7 @@ async fn start_parity_server(config: Config) -> ParityServer {
         compactor: compactor.clone(),
         lease_manager,
         config: Arc::new(config),
+        trusted_proxies,
         runtime_query_config,
         query_knob_bounds,
         cache: cache.clone(),

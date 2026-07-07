@@ -305,6 +305,9 @@ pub async fn build_app(
         config.server.max_concurrent_queries,
     ));
     let rate_limiters = Arc::new(DashMap::new());
+    let trusted_proxies = Arc::from(crate::server::parse_trusted_proxies(
+        &config.server.trusted_proxies,
+    )?);
     let state = AppState {
         store,
         namespace_manager,
@@ -314,6 +317,7 @@ pub async fn build_app(
         compactor,
         lease_manager,
         config: Arc::new(config),
+        trusted_proxies,
         runtime_query_config,
         query_knob_bounds,
         cache,

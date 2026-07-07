@@ -31,7 +31,7 @@ use zeppelin::index::quantization::QuantizationType;
 use zeppelin::index::{HierarchicalIndex, IvfFlatIndex, VectorIndex};
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use zeppelin::server::{build_router, AppState};
+use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::types::{AttributeValue, DistanceMetric, Filter, SearchResult, VectorEntry};
 use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
 
@@ -94,6 +94,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
         config.server.max_concurrent_queries,
     ));
+    let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
 
     let app = build_router(AppState {
         store: store.clone(),
@@ -104,6 +105,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         compactor: compactor.clone(),
         lease_manager,
         config: Arc::new(config),
+        trusted_proxies,
         runtime_query_config,
         query_knob_bounds,
         cache: cache.clone(),

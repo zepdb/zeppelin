@@ -16,8 +16,7 @@ use zeppelin::config::Config;
 use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use zeppelin::server::build_router;
-use zeppelin::server::AppState;
+use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
 
@@ -121,6 +120,7 @@ async fn start_test_server_with_config_inner(
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
     let compactor = compactor(&config, &harness.store);
     let lease_manager = lease_manager(&config, &harness.store);
+    let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: namespace_manager(&config, &harness.store),
@@ -130,6 +130,7 @@ async fn start_test_server_with_config_inner(
         compactor,
         lease_manager,
         config: Arc::new(config),
+        trusted_proxies,
         runtime_query_config,
         query_knob_bounds,
         cache: cache.clone(),
@@ -182,6 +183,7 @@ pub async fn start_test_server_on_store(
     let hydrator = maybe_hydrator(&config, &store, &cache);
     let compactor = compactor(&config, &store);
     let lease_manager = lease_manager(&config, &store);
+    let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: store.clone(),
         namespace_manager: namespace_manager(&config, &store),
@@ -191,6 +193,7 @@ pub async fn start_test_server_on_store(
         compactor,
         lease_manager,
         config: Arc::new(config),
+        trusted_proxies,
         runtime_query_config,
         query_knob_bounds,
         cache: cache.clone(),
@@ -249,6 +252,7 @@ pub async fn start_test_server_with_compactor(
     ));
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
+    let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: namespace_manager(&config, &harness.store),
@@ -258,6 +262,7 @@ pub async fn start_test_server_with_compactor(
         compactor: compactor.clone(),
         lease_manager,
         config: Arc::new(config),
+        trusted_proxies,
         runtime_query_config,
         query_knob_bounds,
         cache: cache.clone(),
@@ -346,6 +351,7 @@ pub async fn start_test_server_with_compaction(
     ));
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
+    let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager,
@@ -355,6 +361,7 @@ pub async fn start_test_server_with_compaction(
         compactor,
         lease_manager,
         config: Arc::new(config),
+        trusted_proxies,
         runtime_query_config,
         query_knob_bounds,
         cache: cache.clone(),

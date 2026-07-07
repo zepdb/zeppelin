@@ -17,7 +17,7 @@ use zeppelin::config::{Config, IndexingConfig};
 use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use zeppelin::server::{build_router, AppState};
+use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
 
@@ -59,6 +59,7 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
         format!("test-{}", uuid::Uuid::new_v4()),
         Duration::from_secs(config.compaction.lease_duration_secs),
     ));
+    let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
 
     let app = build_router(AppState {
         store: store.clone(),
@@ -72,6 +73,7 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
             config.server.max_concurrent_queries,
         )),
         config: Arc::new(config),
+        trusted_proxies,
         runtime_query_config,
         query_knob_bounds,
         cache,

@@ -5,13 +5,19 @@ use std::net::IpAddr;
 use common::server::start_test_server_with_config_no_limit_override;
 use serde_json::json;
 use zeppelin::config::Config;
-use zeppelin::server::resolve_rate_limit_client_ip;
+use zeppelin::server::{parse_trusted_proxies, resolve_rate_limit_client_ip};
 
 #[test]
 fn client_identity_uses_trusted_proxy_xff_rightmost_untrusted() {
+    let empty_trusted = parse_trusted_proxies(&[]).unwrap();
     let trusted = vec!["127.0.0.1/32".to_string(), "10.0.0.0/8".to_string()];
+    let trusted = parse_trusted_proxies(&trusted).unwrap();
     let peer: IpAddr = "127.0.0.1".parse().unwrap();
 
+    assert_eq!(
+        resolve_rate_limit_client_ip(peer, Some("203.0.113.8"), &empty_trusted).unwrap(),
+        peer
+    );
     assert_eq!(
         resolve_rate_limit_client_ip(peer, None, &trusted).unwrap(),
         peer
@@ -24,6 +30,15 @@ fn client_identity_uses_trusted_proxy_xff_rightmost_untrusted() {
         resolve_rate_limit_client_ip(peer, Some("198.51.100.1, 10.1.2.3, 127.0.0.1"), &trusted)
             .unwrap(),
         "198.51.100.1".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(
+        resolve_rate_limit_client_ip(peer, Some("10.1.2.3, 127.0.0.1"), &trusted).unwrap(),
+        peer
+    );
+    assert_eq!(
+        resolve_rate_limit_client_ip(peer, Some("203.0.113.8, garbage, 10.1.2.3"), &trusted)
+            .unwrap(),
+        "203.0.113.8".parse::<IpAddr>().unwrap()
     );
 
     let untrusted_peer: IpAddr = "198.51.100.200".parse().unwrap();

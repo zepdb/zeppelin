@@ -115,6 +115,8 @@ pub struct AppState {
     pub lease_manager: Arc<LeaseManager>,
     /// Global server and indexing configuration.
     pub config: Arc<Config>,
+    /// Trusted proxy CIDRs parsed once at startup for rate-limit client-IP resolution.
+    pub trusted_proxies: Arc<[IpCidr]>,
     /// Runtime-mutable query configuration snapshots.
     pub runtime_query_config: Arc<RuntimeQueryConfig>,
     /// Boot-time validation bounds for runtime query knob updates.
@@ -283,8 +285,9 @@ pub async fn concurrency_limit(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct IpCidr {
+/// Parsed IP CIDR range used for trusted-proxy matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpCidr {
     network: IpAddr,
     prefix: u8,
 }
@@ -297,13 +300,12 @@ struct IpCidr {
 pub fn resolve_rate_limit_client_ip(
     peer_ip: IpAddr,
     x_forwarded_for: Option<&str>,
-    trusted_proxies: &[String],
+    trusted_proxies: &[IpCidr],
 ) -> Result<IpAddr, ZeppelinError> {
     if trusted_proxies.is_empty() {
         return Ok(peer_ip);
     }
-    let trusted = parse_trusted_proxies(trusted_proxies)?;
-    if !trusted.iter().any(|cidr| cidr.contains(peer_ip)) {
+    if !trusted_proxies.iter().any(|cidr| cidr.contains(peer_ip)) {
         return Ok(peer_ip);
     }
 
@@ -318,14 +320,15 @@ pub fn resolve_rate_limit_client_ip(
         let Ok(ip) = trimmed.parse::<IpAddr>() else {
             continue;
         };
-        if !trusted.iter().any(|cidr| cidr.contains(ip)) {
+        if !trusted_proxies.iter().any(|cidr| cidr.contains(ip)) {
             return Ok(ip);
         }
     }
     Ok(peer_ip)
 }
 
-fn parse_trusted_proxies(values: &[String]) -> Result<Vec<IpCidr>, ZeppelinError> {
+/// Parse configured trusted-proxy CIDR strings into reusable matcher ranges.
+pub fn parse_trusted_proxies(values: &[String]) -> Result<Vec<IpCidr>, ZeppelinError> {
     values
         .iter()
         .map(|value| parse_ip_cidr(value))
@@ -410,7 +413,7 @@ pub async fn rate_limit(
     let ip = match resolve_rate_limit_client_ip(
         addr.ip(),
         x_forwarded_for,
-        &state.config.server.trusted_proxies,
+        state.trusted_proxies.as_ref(),
     ) {
         Ok(ip) => ip,
         Err(err) => return ApiError(err).into_response(),
