@@ -8,6 +8,10 @@ const RERANK_COALESCE_GAP_ENV: &str = "ZEPPELIN_RERANK_COALESCE_GAP_BYTES";
 const HYDRATION_POLICY_ENV: &str = "ZEPPELIN_HYDRATION_POLICY";
 const HYDRATION_HEAT_QUERIES_ENV: &str = "ZEPPELIN_HYDRATION_HEAT_QUERIES";
 const HYDRATION_HEAT_WINDOW_SECS_ENV: &str = "ZEPPELIN_HYDRATION_HEAT_WINDOW_SECS";
+const GC_HORIZON_SECS_ENV: &str = "ZEPPELIN_GC_HORIZON_SECS";
+const GC_COMPACTION_UPLOAD_WINDOW_SECS_ENV: &str = "ZEPPELIN_GC_COMPACTION_UPLOAD_WINDOW_SECS";
+const GC_SKEW_SLOP_SECS_ENV: &str = "ZEPPELIN_GC_SKEW_SLOP_SECS";
+const GC_ALLOW_UNSAFE_SHORT_HORIZON_ENV: &str = "ZEPPELIN_GC_ALLOW_UNSAFE_SHORT_HORIZON";
 
 /// Default maximum gap, in bytes, between rerank f32 ranges that are merged
 /// into one physical GET.
@@ -74,6 +78,39 @@ pub struct Config {
     /// Query-time tuning knobs.
     #[serde(default)]
     pub query: QueryConfig,
+    /// Garbage-collection safety horizons and interlocks.
+    #[serde(default)]
+    pub gc: GcConfig,
+}
+
+/// Garbage-collection horizon configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcConfig {
+    /// Time-since-unreachable grace period GC waits before deleting objects.
+    ///
+    /// This must be at least:
+    /// `manifest_cache_ttl_secs + request_timeout_secs + compaction_upload_window_secs + skew_slop_secs`.
+    /// The manifest cache TTL is configured as `cache.manifest_cache_ttl_ms` and rounded
+    /// up to whole seconds for this floor. An interval-derived horizon is wrong because
+    /// the compaction interval is causally unrelated to the reader-staleness window; the
+    /// safe horizon is determined by how long readers may observe old manifests, continue
+    /// requests, race object uploads, and disagree on wall clocks.
+    #[serde(default = "default_gc_horizon_secs")]
+    pub horizon_secs: u64,
+    /// Maximum time a compaction cycle may expose uploaded objects before the manifest
+    /// update that makes their reachability authoritative. Default: `300`.
+    #[serde(default = "default_gc_compaction_upload_window_secs")]
+    pub compaction_upload_window_secs: u64,
+    /// Wall-clock skew allowance in seconds. Default: `5`.
+    #[serde(default = "default_gc_skew_slop_secs")]
+    pub skew_slop_secs: u64,
+    /// Permit boot with a horizon below the computed safety floor. Default: `false`.
+    ///
+    /// This is an explicit operator override for emergency or test deployments only.
+    /// Boot logs a structured warning when this accepts an unsafe horizon.
+    #[serde(default)]
+    pub allow_unsafe_short_horizon: bool,
 }
 
 /// Query-time configuration loaded at boot.
@@ -134,6 +171,10 @@ mod tests {
                 HYDRATION_POLICY_ENV,
                 HYDRATION_HEAT_QUERIES_ENV,
                 HYDRATION_HEAT_WINDOW_SECS_ENV,
+                GC_HORIZON_SECS_ENV,
+                GC_COMPACTION_UPLOAD_WINDOW_SECS_ENV,
+                GC_SKEW_SLOP_SECS_ENV,
+                GC_ALLOW_UNSAFE_SHORT_HORIZON_ENV,
                 "ZEPPELIN_QUERY_WORKERS",
                 "ZEPPELIN_COMPACTION_WORKERS",
                 "ZEPPELIN_RAYON_THREADS",
@@ -505,6 +546,84 @@ mod tests {
         assert_eq!(explicit.cache.hydration_heat_window_secs, 90);
         assert_eq!(explicit.cache.hydration_parallelism, 8);
         assert_eq!(explicit.cache.hydration_max_segment_fraction, 0.25);
+    }
+
+    #[test]
+    fn gc_horizon_below_floor_is_rejected_with_all_inputs() {
+        let mut config = Config::default();
+        config.cache.manifest_cache_ttl_ms = 2_500;
+        config.server.request_timeout_secs = 30;
+        config.gc.compaction_upload_window_secs = 20;
+        config.gc.skew_slop_secs = 3;
+        config.gc.horizon_secs = 55;
+
+        let err = config.validate().unwrap_err();
+        let message = err.to_string();
+        for needle in [
+            "gc.horizon_secs (55)",
+            "cache.manifest_cache_ttl_ms (2500ms => 3s)",
+            "server.request_timeout_secs (30)",
+            "gc.compaction_upload_window_secs (20)",
+            "gc.skew_slop_secs (3)",
+            "floor (56)",
+            "gc.allow_unsafe_short_horizon",
+        ] {
+            assert!(
+                message.contains(needle),
+                "expected horizon floor error to contain {needle:?}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_horizon_override_accepts_short_horizon_and_warns() {
+        let mut config = Config::default();
+        config.cache.manifest_cache_ttl_ms = 1_000;
+        config.server.request_timeout_secs = 30;
+        config.gc.compaction_upload_window_secs = 20;
+        config.gc.skew_slop_secs = 5;
+        config.gc.horizon_secs = 10;
+        config.gc.allow_unsafe_short_horizon = true;
+
+        config.validate().unwrap();
+        assert_eq!(config.gc_horizon_floor_secs(), Some(56));
+        assert!(config.gc_horizon_is_unsafe_short());
+        config.warn_if_unsafe_gc_horizon_override();
+    }
+
+    #[test]
+    fn default_gc_horizon_passes_floor() {
+        let config = Config::default();
+
+        config.validate().unwrap();
+        assert!(config.gc.horizon_secs >= config.gc_horizon_floor_secs().unwrap());
+        assert!(!config.gc.allow_unsafe_short_horizon);
+    }
+
+    #[test]
+    fn gc_config_toml_roundtrips_and_doc_mentions_floor() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let config = load_toml(
+            r#"
+            [gc]
+            horizon_secs = 120
+            compaction_upload_window_secs = 15
+            skew_slop_secs = 4
+            allow_unsafe_short_horizon = true
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.gc.horizon_secs, 120);
+        assert_eq!(config.gc.compaction_upload_window_secs, 15);
+        assert_eq!(config.gc.skew_slop_secs, 4);
+        assert!(config.gc.allow_unsafe_short_horizon);
+
+        let source = include_str!("config.rs");
+        assert!(source.contains("manifest_cache_ttl_secs + request_timeout_secs + compaction_upload_window_secs + skew_slop_secs"));
+        assert!(source.contains("causally unrelated to the reader-staleness window"));
     }
 }
 
@@ -927,6 +1046,15 @@ fn default_log_level() -> String {
 fn default_log_format() -> String {
     "json".to_string()
 }
+fn default_gc_horizon_secs() -> u64 {
+    900
+}
+fn default_gc_compaction_upload_window_secs() -> u64 {
+    300
+}
+fn default_gc_skew_slop_secs() -> u64 {
+    5
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -1022,6 +1150,17 @@ impl Default for LoggingConfig {
         Self {
             level: default_log_level(),
             format: default_log_format(),
+        }
+    }
+}
+
+impl Default for GcConfig {
+    fn default() -> Self {
+        Self {
+            horizon_secs: default_gc_horizon_secs(),
+            compaction_upload_window_secs: default_gc_compaction_upload_window_secs(),
+            skew_slop_secs: default_gc_skew_slop_secs(),
+            allow_unsafe_short_horizon: false,
         }
     }
 }
@@ -1175,6 +1314,33 @@ impl Config {
             );
         }
 
+        match self.checked_gc_horizon_floor_secs() {
+            Some(floor_secs)
+                if self.gc.horizon_secs < floor_secs
+                    && !self.gc.allow_unsafe_short_horizon =>
+            {
+                violations.push(format!(
+                    "gc.horizon_secs ({}) must be >= floor ({}) unless gc.allow_unsafe_short_horizon=true; floor inputs: cache.manifest_cache_ttl_ms ({}ms => {}s), server.request_timeout_secs ({}), gc.compaction_upload_window_secs ({}), gc.skew_slop_secs ({})",
+                    self.gc.horizon_secs,
+                    floor_secs,
+                    self.cache.manifest_cache_ttl_ms,
+                    self.manifest_cache_ttl_secs_for_gc_floor(),
+                    self.server.request_timeout_secs,
+                    self.gc.compaction_upload_window_secs,
+                    self.gc.skew_slop_secs
+                ));
+            }
+            Some(_) => {}
+            None => violations.push(format!(
+                "gc horizon floor overflows u64; floor inputs: cache.manifest_cache_ttl_ms ({}ms => {}s), server.request_timeout_secs ({}), gc.compaction_upload_window_secs ({}), gc.skew_slop_secs ({})",
+                self.cache.manifest_cache_ttl_ms,
+                self.manifest_cache_ttl_secs_for_gc_floor(),
+                self.server.request_timeout_secs,
+                self.gc.compaction_upload_window_secs,
+                self.gc.skew_slop_secs
+            )),
+        }
+
         if violations.is_empty() {
             Ok(())
         } else {
@@ -1183,6 +1349,54 @@ impl Config {
                 violations.join("\n- ")
             )))
         }
+    }
+
+    /// Minimum safe GC horizon in whole seconds.
+    #[must_use]
+    pub fn gc_horizon_floor_secs(&self) -> Option<u64> {
+        self.checked_gc_horizon_floor_secs()
+    }
+
+    /// True when the explicit override permits a horizon below the safety floor.
+    #[must_use]
+    pub fn gc_horizon_is_unsafe_short(&self) -> bool {
+        self.gc.allow_unsafe_short_horizon
+            && self
+                .checked_gc_horizon_floor_secs()
+                .is_some_and(|floor_secs| self.gc.horizon_secs < floor_secs)
+    }
+
+    /// Emit the loud boot warning required when the unsafe short-horizon override is active.
+    pub fn warn_if_unsafe_gc_horizon_override(&self) {
+        let Some(floor_secs) = self.checked_gc_horizon_floor_secs() else {
+            return;
+        };
+        if !self.gc.allow_unsafe_short_horizon || self.gc.horizon_secs >= floor_secs {
+            return;
+        }
+
+        tracing::warn!(
+            gc_horizon_secs = self.gc.horizon_secs,
+            gc_horizon_floor_secs = floor_secs,
+            cache_manifest_cache_ttl_ms = self.cache.manifest_cache_ttl_ms,
+            manifest_cache_ttl_floor_secs = self.manifest_cache_ttl_secs_for_gc_floor(),
+            request_timeout_secs = self.server.request_timeout_secs,
+            compaction_upload_window_secs = self.gc.compaction_upload_window_secs,
+            skew_slop_secs = self.gc.skew_slop_secs,
+            allow_unsafe_short_horizon = self.gc.allow_unsafe_short_horizon,
+            "accepting unsafe gc horizon below computed safety floor"
+        );
+    }
+
+    fn checked_gc_horizon_floor_secs(&self) -> Option<u64> {
+        self.manifest_cache_ttl_secs_for_gc_floor()
+            .checked_add(self.server.request_timeout_secs)?
+            .checked_add(self.gc.compaction_upload_window_secs)?
+            .checked_add(self.gc.skew_slop_secs)
+    }
+
+    fn manifest_cache_ttl_secs_for_gc_floor(&self) -> u64 {
+        self.cache.manifest_cache_ttl_ms.div_ceil(1_000)
     }
 
     fn resolve_query_config(&mut self) -> Result<()> {
@@ -1404,6 +1618,20 @@ impl Config {
         if let Some(v) = env_override(RERANK_COALESCE_GAP_ENV)? {
             self.query.rerank_coalesce_gap_bytes = Some(v);
             self.query.cost_latency_profile = None;
+        }
+
+        // GC
+        if let Some(v) = env_override(GC_HORIZON_SECS_ENV)? {
+            self.gc.horizon_secs = v;
+        }
+        if let Some(v) = env_override(GC_COMPACTION_UPLOAD_WINDOW_SECS_ENV)? {
+            self.gc.compaction_upload_window_secs = v;
+        }
+        if let Some(v) = env_override(GC_SKEW_SLOP_SECS_ENV)? {
+            self.gc.skew_slop_secs = v;
+        }
+        if let Some(v) = env_override(GC_ALLOW_UNSAFE_SHORT_HORIZON_ENV)? {
+            self.gc.allow_unsafe_short_horizon = v;
         }
 
         Ok(())

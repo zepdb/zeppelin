@@ -61,6 +61,21 @@
 # rerank_coalesce_gap_bytes = 1048576      # ZEPPELIN_RERANK_COALESCE_GAP_BYTES
 # cost_latency_profile = "balanced"        # "low_cost", "balanced", or "low_latency"
 
+[gc]
+# horizon_secs = 900                       # ZEPPELIN_GC_HORIZON_SECS
+#                                          # Time-since-unreachable grace period before GC deletes objects.
+#                                          # Must be >= cache.manifest_cache_ttl_ms rounded up to seconds
+#                                          # + server.request_timeout_secs
+#                                          # + gc.compaction_upload_window_secs
+#                                          # + gc.skew_slop_secs.
+#                                          # Do not derive this from compaction.interval_secs:
+#                                          # the polling interval is causally unrelated to the
+#                                          # reader-staleness window that can still reference old objects.
+# compaction_upload_window_secs = 300      # ZEPPELIN_GC_COMPACTION_UPLOAD_WINDOW_SECS
+# skew_slop_secs = 5                       # ZEPPELIN_GC_SKEW_SLOP_SECS
+# allow_unsafe_short_horizon = false       # ZEPPELIN_GC_ALLOW_UNSAFE_SHORT_HORIZON
+#                                          # true accepts a sub-floor horizon and emits a loud WARN at boot.
+
 [compaction]
 # interval_secs = 30                 # ZEPPELIN_COMPACTION_INTERVAL_SECS
 # max_wal_fragments_before_compact = 100   # ZEPPELIN_MAX_WAL_FRAGMENTS — count trigger; must be >= 1
