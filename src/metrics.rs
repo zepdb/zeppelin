@@ -152,13 +152,7 @@ mod inner {
         // Rate limiting metrics
         pub static ref RATE_LIMITED_TOTAL: IntCounterVec = register_int_counter_vec!(
             "zeppelin_rate_limited_total", "Requests rejected by rate limiter",
-            &["ip"]
-        ).unwrap();
-
-        // Per-IP request tracking (for Grafana live table)
-        pub static ref REQUESTS_BY_IP_TOTAL: IntCounterVec = register_int_counter_vec!(
-            "zeppelin_requests_by_ip_total", "Requests by source IP",
-            &["ip", "method", "path", "status"]
+            &["class"]
         ).unwrap();
 
         // Data-quality defense in depth: pre-fix non-finite vectors found
@@ -259,7 +253,6 @@ pub fn init() {
     lazy_static::initialize(&FTS_INDEX_BUILD_DURATION);
     lazy_static::initialize(&FTS_QUERIES_TOTAL);
     lazy_static::initialize(&RATE_LIMITED_TOTAL);
-    lazy_static::initialize(&REQUESTS_BY_IP_TOTAL);
     lazy_static::initialize(&NON_FINITE_VECTORS_SKIPPED_TOTAL);
     lazy_static::initialize(&COMPACTION_LEASE_RENEWALS_TOTAL);
     lazy_static::initialize(&COMPACTION_LEASE_LOST_TOTAL);

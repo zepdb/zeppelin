@@ -67,6 +67,8 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
     zeppelin::metrics::init();
     config.server.rate_limit_rps = 1_000_000;
     config.server.rate_limit_burst = 1_000_000;
+    config.server.write_rate_limit_rps = 1_000_000;
+    config.server.write_rate_limit_burst = 1_000_000;
 
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);

@@ -1,6 +1,7 @@
 use crate::error::{Result, ZeppelinError};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -192,6 +193,10 @@ mod tests {
                 "ZEPPELIN_DEFAULT_TOP_K",
                 "ZEPPELIN_RATE_LIMIT_RPS",
                 "ZEPPELIN_RATE_LIMIT_BURST",
+                "ZEPPELIN_WRITE_RATE_LIMIT_RPS",
+                "ZEPPELIN_WRITE_RATE_LIMIT_BURST",
+                "ZEPPELIN_RATE_LIMIT_IDLE_TTL_SECS",
+                "ZEPPELIN_TRUSTED_PROXIES",
                 "STORAGE_BACKEND",
                 "S3_BUCKET",
                 "AWS_REGION",
@@ -297,12 +302,30 @@ mod tests {
                 vec!["server.port"],
             ),
             (
-                "rate limit burst must be nonzero when rps is enabled",
+                "read rate limit burst must be nonzero when rps is enabled",
                 Box::new(|config| {
                     config.server.rate_limit_rps = 10;
                     config.server.rate_limit_burst = 0;
                 }),
                 vec!["server.rate_limit_burst"],
+            ),
+            (
+                "write rate limit burst must be nonzero when rps is enabled",
+                Box::new(|config| {
+                    config.server.write_rate_limit_rps = 10;
+                    config.server.write_rate_limit_burst = 0;
+                }),
+                vec!["server.write_rate_limit_burst"],
+            ),
+            (
+                "rate limiter idle ttl must be nonzero",
+                Box::new(|config| config.server.rate_limit_idle_ttl_secs = 0),
+                vec!["server.rate_limit_idle_ttl_secs"],
+            ),
+            (
+                "trusted proxies must be CIDRs",
+                Box::new(|config| config.server.trusted_proxies = vec!["127.0.0.1".to_string()]),
+                vec!["server.trusted_proxies"],
             ),
             (
                 "default nprobe must not exceed max nprobe",
@@ -714,25 +737,63 @@ pub struct ServerConfig {
     /// Default `top_k` when the client omits it. Default: `10`.
     #[serde(default = "default_top_k")]
     pub default_top_k: usize,
-    /// Maximum sustained requests per second per IP. Default: `10`.
+    /// Maximum sustained read/query requests per second per client. Default: `100`.
     #[serde(default = "default_rate_limit_rps")]
     pub rate_limit_rps: u32,
-    /// Maximum burst capacity per IP (token bucket size). Default: `20`.
+    /// Maximum read/query burst capacity per client. Default: `200`.
     #[serde(default = "default_rate_limit_burst")]
     pub rate_limit_burst: u32,
+    /// Maximum sustained write/admin requests per second per client. Default: `50`.
+    #[serde(default = "default_write_rate_limit_rps")]
+    pub write_rate_limit_rps: u32,
+    /// Maximum write/admin burst capacity per client. Default: `100`.
+    #[serde(default = "default_write_rate_limit_burst")]
+    pub write_rate_limit_burst: u32,
+    /// Idle token-bucket TTL in seconds. Default: `600`.
+    #[serde(default = "default_rate_limit_idle_ttl_secs")]
+    pub rate_limit_idle_ttl_secs: u64,
+    /// Trusted proxy CIDR ranges whose X-Forwarded-For headers are honored.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 fn default_top_k() -> usize {
     10
 }
 fn default_rate_limit_rps() -> u32 {
-    10
+    100
 }
 fn default_rate_limit_burst() -> u32 {
-    20
+    200
+}
+fn default_write_rate_limit_rps() -> u32 {
+    50
+}
+fn default_write_rate_limit_burst() -> u32 {
+    100
+}
+fn default_rate_limit_idle_ttl_secs() -> u64 {
+    600
 }
 fn default_max_query_batch_size() -> usize {
     256
+}
+
+fn is_valid_ip_cidr(value: &str) -> bool {
+    let Some((ip, prefix)) = value.split_once('/') else {
+        return false;
+    };
+    let Ok(ip) = ip.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    let max_prefix = match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    prefix <= max_prefix
 }
 
 /// Supported object storage backends.
@@ -1110,6 +1171,10 @@ impl Default for ServerConfig {
             default_top_k: default_top_k(),
             rate_limit_rps: default_rate_limit_rps(),
             rate_limit_burst: default_rate_limit_burst(),
+            write_rate_limit_rps: default_write_rate_limit_rps(),
+            write_rate_limit_burst: default_write_rate_limit_burst(),
+            rate_limit_idle_ttl_secs: default_rate_limit_idle_ttl_secs(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -1288,6 +1353,23 @@ impl Config {
                 "server.rate_limit_burst must be at least 1 when rate limiting is enabled"
                     .to_string(),
             );
+        }
+        if self.server.write_rate_limit_rps > 0 && self.server.write_rate_limit_burst == 0 {
+            violations.push(
+                "server.write_rate_limit_burst must be at least 1 when write rate limiting is enabled"
+                    .to_string(),
+            );
+        }
+        if self.server.rate_limit_idle_ttl_secs == 0 {
+            violations
+                .push("server.rate_limit_idle_ttl_secs must be greater than zero".to_string());
+        }
+        for proxy in &self.server.trusted_proxies {
+            if !is_valid_ip_cidr(proxy) {
+                violations.push(format!(
+                    "server.trusted_proxies entry {proxy:?} must be an IP CIDR range"
+                ));
+            }
         }
         if self.server.max_top_k == 0 {
             violations.push("server.max_top_k must be greater than zero".to_string());
@@ -1516,6 +1598,23 @@ impl Config {
         }
         if let Some(v) = env_override("ZEPPELIN_RATE_LIMIT_BURST")? {
             self.server.rate_limit_burst = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_WRITE_RATE_LIMIT_RPS")? {
+            self.server.write_rate_limit_rps = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_WRITE_RATE_LIMIT_BURST")? {
+            self.server.write_rate_limit_burst = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_RATE_LIMIT_IDLE_TTL_SECS")? {
+            self.server.rate_limit_idle_ttl_secs = v;
+        }
+        if let Some(v) = env_override::<String>("ZEPPELIN_TRUSTED_PROXIES")? {
+            self.server.trusted_proxies = v
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
         }
 
         // Storage

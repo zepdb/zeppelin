@@ -27,6 +27,8 @@ fn configure_test_server_limits(config: &mut Config) {
     // in tests that are not exercising rate limiting.
     config.server.rate_limit_rps = 1_000_000;
     config.server.rate_limit_burst = 1_000_000;
+    config.server.write_rate_limit_rps = 1_000_000;
+    config.server.write_rate_limit_burst = 1_000_000;
 }
 
 fn runtime_query_state(config: &Config) -> (Arc<RuntimeQueryConfig>, QueryKnobBounds) {
@@ -66,12 +68,28 @@ fn maybe_hydrator(
 pub async fn start_test_server_with_config(
     config_override: Option<Config>,
 ) -> (String, TestHarness, Arc<DiskCache>, tempfile::TempDir) {
+    start_test_server_with_config_inner(config_override, true).await
+}
+
+/// Start a test server without overriding rate-limit settings.
+pub async fn start_test_server_with_config_no_limit_override(
+    config_override: Option<Config>,
+) -> (String, TestHarness, Arc<DiskCache>, tempfile::TempDir) {
+    start_test_server_with_config_inner(config_override, false).await
+}
+
+async fn start_test_server_with_config_inner(
+    config_override: Option<Config>,
+    override_rate_limits: bool,
+) -> (String, TestHarness, Arc<DiskCache>, tempfile::TempDir) {
     // Ensure metrics are registered (idempotent)
     zeppelin::metrics::init();
 
     let harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
-    configure_test_server_limits(&mut config);
+    if override_rate_limits {
+        configure_test_server_limits(&mut config);
+    }
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(

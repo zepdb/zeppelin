@@ -65,6 +65,8 @@ fn hydration_api_config() -> Config {
     };
     config.server.rate_limit_rps = 1_000_000;
     config.server.rate_limit_burst = 1_000_000;
+    config.server.write_rate_limit_rps = 1_000_000;
+    config.server.write_rate_limit_burst = 1_000_000;
     config
 }
 

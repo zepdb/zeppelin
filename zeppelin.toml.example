@@ -15,8 +15,14 @@
 # max_dimensions = 65536             # ZEPPELIN_MAX_DIMENSIONS
 # max_vector_id_length = 1024        # ZEPPELIN_MAX_VECTOR_ID_LENGTH
 # max_request_body_mb = 512          # ZEPPELIN_MAX_REQUEST_BODY_MB
-# rate_limit_rps = 10                # ZEPPELIN_RATE_LIMIT_RPS
-# rate_limit_burst = 20              # ZEPPELIN_RATE_LIMIT_BURST; must be >= 1 when rate_limit_rps > 0
+# rate_limit_rps = 100               # ZEPPELIN_RATE_LIMIT_RPS; read/query rps per client, 0 disables reads
+# rate_limit_burst = 200             # ZEPPELIN_RATE_LIMIT_BURST; read/query burst, must be >= 1 when read limiting is enabled
+# write_rate_limit_rps = 50          # ZEPPELIN_WRITE_RATE_LIMIT_RPS; write/admin rps per client, 0 disables writes
+# write_rate_limit_burst = 100       # ZEPPELIN_WRITE_RATE_LIMIT_BURST; write/admin burst, must be >= 1 when write limiting is enabled
+# rate_limit_idle_ttl_secs = 600     # ZEPPELIN_RATE_LIMIT_IDLE_TTL_SECS; idle token buckets are evicted after this
+# trusted_proxies = []               # ZEPPELIN_TRUSTED_PROXIES comma list; e.g. ["10.0.0.0/8", "127.0.0.1/32"]
+# If Zeppelin runs behind a load balancer or reverse proxy, set trusted_proxies
+# to only those proxy CIDRs. X-Forwarded-For is ignored from untrusted peers.
 
 [storage]
 # backend = "s3"                     # STORAGE_BACKEND — "s3" or "local" (gcs/azure planned)

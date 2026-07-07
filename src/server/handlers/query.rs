@@ -1,9 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::time::Instant;
 
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
@@ -14,7 +13,7 @@ use crate::namespace::manager::NamespaceMetadata;
 use crate::query;
 use crate::query::QueryResponse;
 use crate::runtime_config::QueryKnobs;
-use crate::server::AppState;
+use crate::server::{AppState, RateLimitClass, RateLimitIdentity};
 use crate::types::{ConsistencyLevel, Filter, SearchResult};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
@@ -417,7 +416,7 @@ pub async fn query_namespace(
 #[instrument(skip(state, body), fields(namespace = %ns))]
 pub async fn batch_query_namespace(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(rate_limit_identity): Extension<RateLimitIdentity>,
     Path(ns): Path<String>,
     body: bytes::Bytes,
 ) -> Result<Json<BatchQueryResponse>, ApiError> {
@@ -441,7 +440,8 @@ pub async fn batch_query_namespace(
 
     crate::server::consume_rate_limit(
         &state,
-        addr.ip(),
+        rate_limit_identity.ip,
+        RateLimitClass::Read,
         req.queries.len().saturating_sub(1) as u64,
     )
     .map_err(ApiError::from)?;

@@ -100,6 +100,8 @@ fn batch_fixture_config() -> Config {
     let mut config = Config::load(None).unwrap();
     config.server.rate_limit_rps = 1_000_000;
     config.server.rate_limit_burst = 1_000_000;
+    config.server.write_rate_limit_rps = 1_000_000;
+    config.server.write_rate_limit_burst = 1_000_000;
     config.indexing = IndexingConfig {
         default_num_centroids: 4,
         default_nprobe: 4,
@@ -333,7 +335,7 @@ async fn batch_query_reuses_segment_setup_gets() {
 #[tokio::test]
 async fn batch_query_rate_limit_counts_entries() {
     let mut config = batch_fixture_config();
-    config.server.rate_limit_rps = 0;
+    config.server.rate_limit_rps = 1;
     config.server.rate_limit_burst = 3;
     let server = start_batch_server(config, false).await;
     let client = reqwest::Client::new();

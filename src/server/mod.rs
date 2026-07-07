@@ -1,12 +1,13 @@
 /// HTTP request handlers for all API endpoints.
 pub mod handlers;
 
-use std::net::{IpAddr, SocketAddr};
+use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, State};
-use axum::http::Request;
+use axum::http::{Method, Request};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -24,7 +25,7 @@ use crate::cache::DiskCache;
 use crate::config::Config;
 use crate::error::ZeppelinError;
 use crate::fts::wal_cache::WalFtsCache;
-use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL, REQUESTS_BY_IP_TOTAL};
+use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL};
 use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::storage::ZeppelinStore;
@@ -44,6 +45,53 @@ tokio::task_local! {
 /// The current request's ID if inside a `REQUEST_ID` scope, else `None`.
 pub fn current_request_id() -> Option<String> {
     REQUEST_ID.try_with(|id| id.clone()).ok()
+}
+
+/// Rate-limit bucket class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RateLimitClass {
+    /// Read/query route.
+    Read,
+    /// Write/admin route.
+    Write,
+}
+
+impl RateLimitClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+/// Client identity resolved by the rate-limit middleware.
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitIdentity {
+    /// Client IP after trusted-proxy extraction.
+    pub ip: IpAddr,
+}
+
+/// Key for one client/class token bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitKey {
+    ip: IpAddr,
+    class: RateLimitClass,
+}
+
+impl Hash for RateLimitKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.ip.hash(state);
+        self.class.hash(state);
+    }
+}
+
+/// Token bucket state.
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitBucket {
+    tokens: u64,
+    last_refill: Instant,
+    last_seen: Instant,
 }
 
 /// Shared application state injected into all handlers via axum's State extractor.
@@ -78,9 +126,8 @@ pub struct AppState {
     pub fts_cache: Arc<WalFtsCache>,
     /// Semaphore that caps concurrent in-flight queries.
     pub query_semaphore: Arc<Semaphore>,
-    /// Per-IP token bucket state for rate limiting.
-    /// Maps IP → (available tokens, last refill time).
-    pub rate_limiters: Arc<DashMap<IpAddr, (u64, Instant)>>,
+    /// Per-client, per-class token bucket state for rate limiting.
+    pub rate_limiters: Arc<DashMap<RateLimitKey, RateLimitBucket>>,
 }
 
 /// Middleware that increments `HTTP_REQUESTS_TOTAL` for every response
@@ -107,9 +154,6 @@ pub async fn http_metrics(
     let status_str = status.to_string();
     HTTP_REQUESTS_TOTAL
         .with_label_values(&[&method, &path, &status_str])
-        .inc();
-    REQUESTS_BY_IP_TOTAL
-        .with_label_values(&[&addr.ip().to_string(), &method, &path, &status_str])
         .inc();
     tracing::info!(
         ip = %addr.ip(),
@@ -209,31 +253,147 @@ pub async fn concurrency_limit(
     }
 }
 
-/// Per-IP token-bucket rate limiter.
+#[derive(Debug, Clone, Copy)]
+struct IpCidr {
+    network: IpAddr,
+    prefix: u8,
+}
+
+/// Resolve the rate-limit client IP from a peer IP and optional XFF header.
 ///
-/// Allows `rate_limit_burst` tokens initially, refilling at `rate_limit_rps` tokens/sec.
+/// X-Forwarded-For is trusted only when `peer_ip` belongs to one of
+/// `trusted_proxies`. When trusted, the selected client is the rightmost XFF
+/// address that is not itself trusted.
+pub fn resolve_rate_limit_client_ip(
+    peer_ip: IpAddr,
+    x_forwarded_for: Option<&str>,
+    trusted_proxies: &[String],
+) -> Result<IpAddr, ZeppelinError> {
+    if trusted_proxies.is_empty() {
+        return Ok(peer_ip);
+    }
+    let trusted = parse_trusted_proxies(trusted_proxies)?;
+    if !trusted.iter().any(|cidr| cidr.contains(peer_ip)) {
+        return Ok(peer_ip);
+    }
+
+    let Some(x_forwarded_for) = x_forwarded_for else {
+        return Ok(peer_ip);
+    };
+    for entry in x_forwarded_for.split(',').rev() {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(ip) = trimmed.parse::<IpAddr>() else {
+            continue;
+        };
+        if !trusted.iter().any(|cidr| cidr.contains(ip)) {
+            return Ok(ip);
+        }
+    }
+    Ok(peer_ip)
+}
+
+fn parse_trusted_proxies(values: &[String]) -> Result<Vec<IpCidr>, ZeppelinError> {
+    values
+        .iter()
+        .map(|value| parse_ip_cidr(value))
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn parse_ip_cidr(value: &str) -> Result<IpCidr, ZeppelinError> {
+    let (ip, prefix) = value.split_once('/').ok_or_else(|| {
+        ZeppelinError::Config(format!("trusted proxy {value:?} must be an IP CIDR range"))
+    })?;
+    let network = ip.parse::<IpAddr>().map_err(|e| {
+        ZeppelinError::Config(format!("trusted proxy {value:?} has invalid IP: {e}"))
+    })?;
+    let prefix = prefix.parse::<u8>().map_err(|e| {
+        ZeppelinError::Config(format!("trusted proxy {value:?} has invalid prefix: {e}"))
+    })?;
+    let max_prefix = match network {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        return Err(ZeppelinError::Config(format!(
+            "trusted proxy {value:?} prefix must be <= {max_prefix}"
+        )));
+    }
+    Ok(IpCidr { network, prefix })
+}
+
+impl IpCidr {
+    fn contains(self, ip: IpAddr) -> bool {
+        match (self.network, ip) {
+            (IpAddr::V4(network), IpAddr::V4(ip)) => ipv4_in_prefix(ip, network, self.prefix),
+            (IpAddr::V6(network), IpAddr::V6(ip)) => ipv6_in_prefix(ip, network, self.prefix),
+            _ => false,
+        }
+    }
+}
+
+fn ipv4_in_prefix(ip: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
+    let ip = u32::from(ip);
+    let network = u32::from(network);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (ip & mask) == (network & mask)
+}
+
+fn ipv6_in_prefix(ip: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
+    let ip = u128::from(ip);
+    let network = u128::from(network);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    (ip & mask) == (network & mask)
+}
+
+/// Per-client token-bucket rate limiter.
+///
+/// Resolves client identity from X-Forwarded-For only when the socket peer is
+/// a configured trusted proxy, then applies separate read/write buckets.
 /// Skips rate limiting for health/readiness/metrics endpoints.
 /// Returns 429 with `Retry-After` header when tokens are exhausted.
 pub async fn rate_limit(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    request: Request<axum::body::Body>,
+    mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    // Skip rate limiting for infrastructure endpoints.
-    if path == "/healthz" || path == "/readyz" || path == "/metrics" {
+    let Some(class) = rate_limit_class(request.method(), path) else {
         return next.run(request).await;
-    }
+    };
 
-    let ip = addr.ip();
-    match consume_rate_limit(&state, ip, 1) {
+    let x_forwarded_for = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok());
+    let ip = match resolve_rate_limit_client_ip(
+        addr.ip(),
+        x_forwarded_for,
+        &state.config.server.trusted_proxies,
+    ) {
+        Ok(ip) => ip,
+        Err(err) => return ApiError(err).into_response(),
+    };
+    request.extensions_mut().insert(RateLimitIdentity { ip });
+
+    match consume_rate_limit(&state, ip, class, 1) {
         Ok(()) => next.run(request).await,
         Err(err) => ApiError(err).into_response(),
     }
 }
 
-/// Consume `tokens` from the per-IP rate limiter.
+/// Consume `tokens` from the per-client rate limiter.
 ///
 /// Batch query calls this after deserialization to charge each entry rather
 /// than each HTTP request. The route-level middleware has already consumed one
@@ -241,33 +401,47 @@ pub async fn rate_limit(
 pub(crate) fn consume_rate_limit(
     state: &AppState,
     ip: IpAddr,
+    class: RateLimitClass,
     tokens_to_consume: u64,
 ) -> Result<(), ZeppelinError> {
     if tokens_to_consume == 0 {
         return Ok(());
     }
 
-    let rps = state.config.server.rate_limit_rps as u64;
-    let burst = state.config.server.rate_limit_burst as u64;
+    let (rps, burst) = rate_limit_settings(&state.config, class);
+    if rps == 0 {
+        return Ok(());
+    }
     let now = Instant::now();
+    evict_idle_rate_limiters(
+        &state.rate_limiters,
+        now,
+        Duration::from_secs(state.config.server.rate_limit_idle_ttl_secs),
+    );
+    let key = RateLimitKey { ip, class };
 
     let allowed = {
         let mut entry = state
             .rate_limiters
-            .entry(ip)
-            .or_insert_with(|| (burst, now));
-        let (ref mut tokens, ref mut last_refill) = *entry;
+            .entry(key)
+            .or_insert_with(|| RateLimitBucket {
+                tokens: burst,
+                last_refill: now,
+                last_seen: now,
+            });
+        let bucket = entry.value_mut();
 
         // Refill tokens based on elapsed time.
-        let elapsed = now.duration_since(*last_refill);
+        let elapsed = now.duration_since(bucket.last_refill);
         let refill = elapsed.as_secs_f64() * rps as f64;
         if refill >= 1.0 {
-            *tokens = (*tokens + refill as u64).min(burst);
-            *last_refill = now;
+            bucket.tokens = (bucket.tokens + refill as u64).min(burst);
+            bucket.last_refill = now;
         }
+        bucket.last_seen = now;
 
-        if *tokens >= tokens_to_consume {
-            *tokens -= tokens_to_consume;
+        if bucket.tokens >= tokens_to_consume {
+            bucket.tokens -= tokens_to_consume;
             true
         } else {
             false
@@ -277,17 +451,67 @@ pub(crate) fn consume_rate_limit(
     if allowed {
         Ok(())
     } else {
-        let retry_after_secs = if rps > 0 { 1 } else { 60 };
+        let retry_after_secs = retry_after_secs(
+            state
+                .rate_limiters
+                .get(&key)
+                .map(|bucket| bucket.tokens)
+                .unwrap_or(0),
+            tokens_to_consume,
+            rps,
+        );
         RATE_LIMITED_TOTAL
-            .with_label_values(&[&ip.to_string()])
+            .with_label_values(&[class.as_str()])
             .inc();
         tracing::warn!(
             ip = %ip,
+            class = class.as_str(),
             requested_tokens = tokens_to_consume,
             "rate limit exceeded"
         );
         Err(ZeppelinError::RateLimitExceeded { retry_after_secs })
     }
+}
+
+fn rate_limit_settings(config: &Config, class: RateLimitClass) -> (u64, u64) {
+    match class {
+        RateLimitClass::Read => (
+            config.server.rate_limit_rps as u64,
+            config.server.rate_limit_burst as u64,
+        ),
+        RateLimitClass::Write => (
+            config.server.write_rate_limit_rps as u64,
+            config.server.write_rate_limit_burst as u64,
+        ),
+    }
+}
+
+fn retry_after_secs(available: u64, requested: u64, rps: u64) -> u64 {
+    let deficit = requested.saturating_sub(available).max(1);
+    deficit.div_ceil(rps).max(1)
+}
+
+fn rate_limit_class(method: &Method, path: &str) -> Option<RateLimitClass> {
+    if path == "/healthz" || path == "/readyz" || path == "/metrics" {
+        return None;
+    }
+    if method == Method::GET
+        || path.ends_with("/query")
+        || path.ends_with("/query/batch")
+        || path.ends_with("/vectors/get")
+    {
+        Some(RateLimitClass::Read)
+    } else {
+        Some(RateLimitClass::Write)
+    }
+}
+
+fn evict_idle_rate_limiters(
+    rate_limiters: &DashMap<RateLimitKey, RateLimitBucket>,
+    now: Instant,
+    idle_ttl: Duration,
+) {
+    rate_limiters.retain(|_, bucket| now.duration_since(bucket.last_seen) < idle_ttl);
 }
 
 /// Builds the axum router with all routes, middleware, and shared state.
@@ -383,4 +607,44 @@ pub fn build_router(state: AppState) -> Router {
         // their responses; JSON envelopes from handlers pass through.
         .layer(axum::middleware::from_fn(normalize_error_responses))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter_eviction_removes_idle_entries() {
+        let buckets = DashMap::new();
+        let now = Instant::now();
+        let old_key = RateLimitKey {
+            ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            class: RateLimitClass::Read,
+        };
+        let fresh_key = RateLimitKey {
+            ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)),
+            class: RateLimitClass::Write,
+        };
+        buckets.insert(
+            old_key,
+            RateLimitBucket {
+                tokens: 1,
+                last_refill: now - Duration::from_secs(60),
+                last_seen: now - Duration::from_secs(60),
+            },
+        );
+        buckets.insert(
+            fresh_key,
+            RateLimitBucket {
+                tokens: 1,
+                last_refill: now,
+                last_seen: now,
+            },
+        );
+
+        evict_idle_rate_limiters(&buckets, now, Duration::from_secs(10));
+
+        assert!(!buckets.contains_key(&old_key));
+        assert!(buckets.contains_key(&fresh_key));
+    }
 }
