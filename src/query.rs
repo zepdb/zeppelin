@@ -6,7 +6,7 @@ use serde::Serialize;
 use tracing::{debug, instrument};
 
 use crate::cache::manifest_cache::ManifestCache;
-use crate::cache::DiskCache;
+use crate::cache::{with_cache_diagnostics, CacheDiagnostics, DiskCache};
 use crate::error::Result;
 use crate::fts::bm25::Bm25Params;
 use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
@@ -37,6 +37,41 @@ pub struct QueryResponse {
     pub scanned_fragments: usize,
     /// Number of compacted segments scanned during the query.
     pub scanned_segments: usize,
+    /// Optional query diagnostics, returned only when the request asks for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug: Option<QueryDebug>,
+}
+
+/// Optional client-visible query diagnostics.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryDebug {
+    /// WAL scan phase latency in milliseconds.
+    pub wal_ms: u64,
+    /// Segment search phase latency in milliseconds.
+    pub segment_ms: u64,
+    /// Result merge phase latency in milliseconds.
+    pub merge_ms: u64,
+    /// Number of WAL fragments scanned, matching `scanned_fragments`.
+    pub fragments_scanned: usize,
+    /// Number of compacted segments scanned, matching `scanned_segments`.
+    pub segments_scanned: usize,
+    /// Number of IVF clusters probed or BM25 fallback clusters scanned.
+    pub clusters_probed: usize,
+    /// Cache activity observed during this query.
+    pub cache: QueryDebugCache,
+    /// Effective consistency level used by execution.
+    pub consistency_effective: ConsistencyLevel,
+    /// Why fewer than `top_k` results were returned, or null when filled.
+    pub underfill_reason: Option<String>,
+}
+
+/// Cache hit/miss counters observed during a debug query.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct QueryDebugCache {
+    /// Cache hits observed during this query.
+    pub hits: u64,
+    /// Cache misses observed during this query.
+    pub misses: u64,
 }
 
 /// Parameters for a vector query, grouped to avoid excessive function arguments.
@@ -105,6 +140,26 @@ pub(crate) async fn read_manifest_for_query(
     }
 }
 
+fn query_underfill_reason(
+    results_len: usize,
+    top_k: usize,
+    consistency: ConsistencyLevel,
+    eventual_skipped_wal: bool,
+    scanned_fragments: usize,
+    scanned_segments: usize,
+) -> Option<String> {
+    if results_len >= top_k {
+        return None;
+    }
+    if consistency == ConsistencyLevel::Eventual && eventual_skipped_wal {
+        return Some("eventual_skipped_wal".to_string());
+    }
+    if scanned_fragments == 0 && scanned_segments == 0 {
+        return Some("no_index_or_wal_data".to_string());
+    }
+    Some("not_enough_matches".to_string())
+}
+
 /// Execute a query against a namespace, combining WAL scan and segment search.
 #[instrument(skip(params), fields(namespace = params.namespace))]
 pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
@@ -115,7 +170,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         params.manifest_cache,
     )
     .await?;
-    execute_query_with_manifest(params, manifest).await
+    execute_query_with_manifest_inner(params, manifest, false).await
 }
 
 /// Execute a vector query against an already-read manifest snapshot.
@@ -124,6 +179,37 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
 pub(crate) async fn execute_query_with_manifest(
     params: QueryParams<'_>,
     manifest: Manifest,
+) -> Result<QueryResponse> {
+    execute_query_with_manifest_inner(params, manifest, false).await
+}
+
+/// Execute a vector query with an opt-in debug response block.
+pub(crate) async fn execute_query_with_manifest_debug(
+    params: QueryParams<'_>,
+    manifest: Manifest,
+) -> Result<QueryResponse> {
+    execute_query_with_manifest_inner(params, manifest, true).await
+}
+
+async fn execute_query_with_manifest_inner(
+    params: QueryParams<'_>,
+    manifest: Manifest,
+    emit_debug: bool,
+) -> Result<QueryResponse> {
+    if emit_debug {
+        let diagnostics = Arc::new(CacheDiagnostics::default());
+        return with_cache_diagnostics(Arc::clone(&diagnostics), async move {
+            execute_query_with_manifest_scoped(params, manifest, Some(diagnostics)).await
+        })
+        .await;
+    }
+    execute_query_with_manifest_scoped(params, manifest, None).await
+}
+
+async fn execute_query_with_manifest_scoped(
+    params: QueryParams<'_>,
+    manifest: Manifest,
+    cache_diagnostics: Option<Arc<CacheDiagnostics>>,
 ) -> Result<QueryResponse> {
     let QueryParams {
         store,
@@ -141,6 +227,8 @@ pub(crate) async fn execute_query_with_manifest(
         manifest_cache: _,
         include_attributes,
     } = params;
+    let eventual_skipped_wal =
+        consistency == ConsistencyLevel::Eventual && !manifest.uncompacted_fragments().is_empty();
 
     // WAL work and segment search are independent — they share only the
     // manifest snapshot — so run them concurrently. Strong scans and scores
@@ -186,12 +274,13 @@ pub(crate) async fn execute_query_with_manifest(
                 deleted_ids: HashSet::new(),
             },
         };
+        let wal_ms = wal_start.elapsed().as_millis() as u64;
         debug!(
-            wal_duration_ms = wal_start.elapsed().as_millis() as u64,
+            wal_duration_ms = wal_ms,
             fragments_scanned = scan_result.fragment_count,
             "query phase: WAL scan"
         );
-        Ok::<_, crate::error::ZeppelinError>(scan_result)
+        Ok::<_, crate::error::ZeppelinError>((scan_result, wal_ms))
     };
 
     let segment_future = async {
@@ -204,7 +293,8 @@ pub(crate) async fn execute_query_with_manifest(
                 .find(|s| s.id == *segment_id)
                 .cloned()
         });
-        let (results, scanned) = if let Some(seg_ref) = segment_ref {
+        let (results, scanned, clusters_probed) = if let Some(seg_ref) = segment_ref {
+            let clusters_probed = nprobe.min(seg_ref.cluster_count);
             let results = segment_search(
                 store,
                 namespace,
@@ -220,26 +310,30 @@ pub(crate) async fn execute_query_with_manifest(
                 include_attributes,
             )
             .await?;
-            (results, 1)
+            (results, 1, clusters_probed)
         } else {
-            (Vec::new(), 0)
+            (Vec::new(), 0, 0)
         };
+        let segment_ms = segment_start.elapsed().as_millis() as u64;
         debug!(
-            segment_duration_ms = segment_start.elapsed().as_millis() as u64,
+            segment_duration_ms = segment_ms,
             segments_scanned = scanned,
             "query phase: segment search"
         );
-        Ok::<_, crate::error::ZeppelinError>((results, scanned))
+        Ok::<_, crate::error::ZeppelinError>((results, scanned, segment_ms, clusters_probed))
     };
 
     let (wal_result, segment_result) = tokio::join!(wal_future, segment_future);
-    let WalScanResult {
-        results: wal_results,
-        overriding_ids: wal_overriding_ids,
-        fragment_count: scanned_fragments,
-        deleted_ids: wal_deleted_ids,
-    } = wal_result?;
-    let (segment_results, scanned_segments) = segment_result?;
+    let (
+        WalScanResult {
+            results: wal_results,
+            overriding_ids: wal_overriding_ids,
+            fragment_count: scanned_fragments,
+            deleted_ids: wal_deleted_ids,
+        },
+        wal_ms,
+    ) = wal_result?;
+    let (segment_results, scanned_segments, segment_ms, clusters_probed) = segment_result?;
 
     // Merge results — pass WAL tombstones so segment results for deleted
     // vectors are excluded (a delete of an already-compacted vector exists
@@ -259,11 +353,37 @@ pub(crate) async fn execute_query_with_manifest(
         final_results = results.len(),
         "query phase: merge"
     );
+    let merge_ms = merge_duration.as_millis() as u64;
+    let debug = cache_diagnostics.map(|diagnostics| {
+        let cache_snapshot = diagnostics.snapshot();
+        QueryDebug {
+            wal_ms,
+            segment_ms,
+            merge_ms,
+            fragments_scanned: scanned_fragments,
+            segments_scanned: scanned_segments,
+            clusters_probed,
+            cache: QueryDebugCache {
+                hits: cache_snapshot.hits,
+                misses: cache_snapshot.misses,
+            },
+            consistency_effective: consistency,
+            underfill_reason: query_underfill_reason(
+                results.len(),
+                top_k,
+                consistency,
+                eventual_skipped_wal,
+                scanned_fragments,
+                scanned_segments,
+            ),
+        }
+    });
 
     Ok(QueryResponse {
         results,
         scanned_fragments,
         scanned_segments,
+        debug,
     })
 }
 
@@ -517,7 +637,7 @@ pub async fn execute_bm25_query(
     include_attributes: bool,
 ) -> Result<QueryResponse> {
     let manifest = read_manifest_for_query(store, namespace, consistency, manifest_cache).await?;
-    execute_bm25_query_with_manifest(
+    execute_bm25_query_with_manifest_inner(
         store,
         wal_reader,
         namespace,
@@ -533,6 +653,7 @@ pub async fn execute_bm25_query(
         max_full_scan_vectors,
         include_attributes,
         manifest,
+        false,
     )
     .await
 }
@@ -558,6 +679,154 @@ pub(crate) async fn execute_bm25_query_with_manifest(
     include_attributes: bool,
     manifest: Manifest,
 ) -> Result<QueryResponse> {
+    execute_bm25_query_with_manifest_inner(
+        store,
+        wal_reader,
+        namespace,
+        rank_by,
+        fts_configs,
+        top_k,
+        filter,
+        consistency,
+        last_as_prefix,
+        fts_cache,
+        cache,
+        max_full_scan_clusters,
+        max_full_scan_vectors,
+        include_attributes,
+        manifest,
+        false,
+    )
+    .await
+}
+
+/// Execute a BM25 query with an opt-in debug response block.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_bm25_query_with_manifest_debug(
+    store: &ZeppelinStore,
+    wal_reader: &WalReader,
+    namespace: &str,
+    rank_by: &RankBy,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    top_k: usize,
+    filter: Option<&Filter>,
+    consistency: ConsistencyLevel,
+    last_as_prefix: bool,
+    fts_cache: Option<&Arc<WalFtsCache>>,
+    cache: Option<&Arc<DiskCache>>,
+    max_full_scan_clusters: usize,
+    max_full_scan_vectors: usize,
+    include_attributes: bool,
+    manifest: Manifest,
+) -> Result<QueryResponse> {
+    execute_bm25_query_with_manifest_inner(
+        store,
+        wal_reader,
+        namespace,
+        rank_by,
+        fts_configs,
+        top_k,
+        filter,
+        consistency,
+        last_as_prefix,
+        fts_cache,
+        cache,
+        max_full_scan_clusters,
+        max_full_scan_vectors,
+        include_attributes,
+        manifest,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_bm25_query_with_manifest_inner(
+    store: &ZeppelinStore,
+    wal_reader: &WalReader,
+    namespace: &str,
+    rank_by: &RankBy,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    top_k: usize,
+    filter: Option<&Filter>,
+    consistency: ConsistencyLevel,
+    last_as_prefix: bool,
+    fts_cache: Option<&Arc<WalFtsCache>>,
+    cache: Option<&Arc<DiskCache>>,
+    max_full_scan_clusters: usize,
+    max_full_scan_vectors: usize,
+    include_attributes: bool,
+    manifest: Manifest,
+    emit_debug: bool,
+) -> Result<QueryResponse> {
+    if emit_debug {
+        let diagnostics = Arc::new(CacheDiagnostics::default());
+        return with_cache_diagnostics(Arc::clone(&diagnostics), async move {
+            execute_bm25_query_with_manifest_scoped(
+                store,
+                wal_reader,
+                namespace,
+                rank_by,
+                fts_configs,
+                top_k,
+                filter,
+                consistency,
+                last_as_prefix,
+                fts_cache,
+                cache,
+                max_full_scan_clusters,
+                max_full_scan_vectors,
+                include_attributes,
+                manifest,
+                Some(diagnostics),
+            )
+            .await
+        })
+        .await;
+    }
+    execute_bm25_query_with_manifest_scoped(
+        store,
+        wal_reader,
+        namespace,
+        rank_by,
+        fts_configs,
+        top_k,
+        filter,
+        consistency,
+        last_as_prefix,
+        fts_cache,
+        cache,
+        max_full_scan_clusters,
+        max_full_scan_vectors,
+        include_attributes,
+        manifest,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_bm25_query_with_manifest_scoped(
+    store: &ZeppelinStore,
+    wal_reader: &WalReader,
+    namespace: &str,
+    rank_by: &RankBy,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    top_k: usize,
+    filter: Option<&Filter>,
+    consistency: ConsistencyLevel,
+    last_as_prefix: bool,
+    fts_cache: Option<&Arc<WalFtsCache>>,
+    cache: Option<&Arc<DiskCache>>,
+    max_full_scan_clusters: usize,
+    max_full_scan_vectors: usize,
+    include_attributes: bool,
+    manifest: Manifest,
+    cache_diagnostics: Option<Arc<CacheDiagnostics>>,
+) -> Result<QueryResponse> {
+    let eventual_skipped_wal =
+        consistency == ConsistencyLevel::Eventual && !manifest.uncompacted_fragments().is_empty();
+
     // Evict compacted fragments from the FTS cache to prevent unbounded growth
     if let Some(cache) = fts_cache {
         let active_ids: Vec<ulid::Ulid> = manifest
@@ -611,8 +880,9 @@ pub(crate) async fn execute_bm25_query_with_manifest(
             }
             _ => Vec::new(),
         };
+        let wal_ms = wal_start.elapsed().as_millis() as u64;
         debug!(
-            wal_duration_ms = wal_start.elapsed().as_millis() as u64,
+            wal_duration_ms = wal_ms,
             fragments_scanned = scanned_fragments,
             "BM25 query phase: WAL scan"
         );
@@ -621,6 +891,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
             scanned_fragments,
             wal_deleted_ids,
             wal_overriding_ids,
+            wal_ms,
         ))
     };
 
@@ -633,8 +904,13 @@ pub(crate) async fn execute_bm25_query_with_manifest(
                 .find(|s| s.id == *segment_id)
                 .cloned()
         });
-        let (results, scanned) = match segment_ref {
+        let (results, scanned, clusters_probed) = match segment_ref {
             Some(seg_ref) => {
+                let clusters_probed = if seg_ref.has_global_fts {
+                    0
+                } else {
+                    seg_ref.cluster_count
+                };
                 let segment_top_k = if manifest.uncompacted_fragments().is_empty() {
                     top_k
                 } else {
@@ -655,24 +931,26 @@ pub(crate) async fn execute_bm25_query_with_manifest(
                     include_attributes,
                 )
                 .await?;
-                (results, 1)
+                (results, 1, clusters_probed)
             }
-            _ => (Vec::new(), 0),
+            _ => (Vec::new(), 0, 0),
         };
+        let segment_ms = segment_start.elapsed().as_millis() as u64;
         debug!(
-            segment_duration_ms = segment_start.elapsed().as_millis() as u64,
+            segment_duration_ms = segment_ms,
             segments_scanned = scanned,
             "BM25 query phase: segment search"
         );
-        Ok::<_, crate::error::ZeppelinError>((results, scanned))
+        Ok::<_, crate::error::ZeppelinError>((results, scanned, segment_ms, clusters_probed))
     };
 
     let (wal_result, segment_result) = tokio::join!(wal_future, segment_future);
-    let (wal_results, scanned_fragments, wal_deleted_ids, wal_overriding_ids) = wal_result?;
-    let (segment_results, scanned_segments) = segment_result?;
+    let (wal_results, scanned_fragments, wal_deleted_ids, wal_overriding_ids, wal_ms) = wal_result?;
+    let (segment_results, scanned_segments, segment_ms, clusters_probed) = segment_result?;
 
     // Merge results — BM25 is higher-is-better
     // Pass deleted IDs so segment results for deleted docs are excluded
+    let merge_start = std::time::Instant::now();
     let mut results = merge_bm25_results(
         wal_results,
         &wal_overriding_ids,
@@ -686,11 +964,37 @@ pub(crate) async fn execute_bm25_query_with_manifest(
             result.attributes = None;
         }
     }
+    let merge_ms = merge_start.elapsed().as_millis() as u64;
+    let debug = cache_diagnostics.map(|diagnostics| {
+        let cache_snapshot = diagnostics.snapshot();
+        QueryDebug {
+            wal_ms,
+            segment_ms,
+            merge_ms,
+            fragments_scanned: scanned_fragments,
+            segments_scanned: scanned_segments,
+            clusters_probed,
+            cache: QueryDebugCache {
+                hits: cache_snapshot.hits,
+                misses: cache_snapshot.misses,
+            },
+            consistency_effective: consistency,
+            underfill_reason: query_underfill_reason(
+                results.len(),
+                top_k,
+                consistency,
+                eventual_skipped_wal,
+                scanned_fragments,
+                scanned_segments,
+            ),
+        }
+    });
 
     Ok(QueryResponse {
         results,
         scanned_fragments,
         scanned_segments,
+        debug,
     })
 }
 

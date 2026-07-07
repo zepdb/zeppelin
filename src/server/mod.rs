@@ -36,9 +36,7 @@ use self::handlers::{config as config_handler, namespace, query, vectors, ApiErr
 tokio::task_local! {
     /// The current request's ID, set by the `request_id` middleware and read by
     /// the error envelope (`handlers::error_response`) so error bodies can carry
-    /// `request_id` without threading it through every handler signature. The
-    /// lightweight query route intentionally skips this middleware (perf), so
-    /// query errors simply omit the field — the envelope treats it as optional.
+    /// `request_id` without threading it through every handler signature.
     static REQUEST_ID: String;
 }
 
@@ -152,10 +150,12 @@ pub async fn http_metrics(
     let status = response.status().as_u16();
     let latency_ms = start.elapsed().as_millis();
     let status_str = status.to_string();
+    let request_id = current_request_id();
     HTTP_REQUESTS_TOTAL
         .with_label_values(&[&method, &path, &status_str])
         .inc();
     tracing::info!(
+        request_id = request_id.as_deref().unwrap_or(""),
         ip = %addr.ip(),
         method = %method,
         path = %uri,
@@ -192,6 +192,31 @@ pub async fn request_id(request: Request<axum::body::Body>, next: Next) -> Respo
             response
         })
         .instrument(tracing::info_span!("request", request_id = %id))
+        .await
+}
+
+/// Minimal request-id middleware for the query hot path.
+///
+/// This preserves the lightweight router's no-TraceLayer/no-span shape while
+/// still returning `x-request-id` and making the id available to error
+/// envelopes and explicit query-route logs.
+#[allow(clippy::unwrap_used)]
+pub async fn query_request_id(request: Request<axum::body::Body>, next: Next) -> Response {
+    let id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let rid = id.clone();
+    REQUEST_ID
+        .scope(id, async move {
+            let mut response = next.run(request).await;
+            response
+                .headers_mut()
+                .insert("x-request-id", rid.parse().unwrap());
+            response
+        })
         .await
 }
 
@@ -519,9 +544,9 @@ pub fn build_router(state: AppState) -> Router {
     let timeout = Duration::from_secs(state.config.server.request_timeout_secs);
     let body_limit = state.config.server.max_request_body_mb * 1024 * 1024;
 
-    // Query route: lightweight middleware (no request_id span, no trace layer).
-    // Removes ~2μs per-request overhead from tracing span creation and traversal.
-    // The query handler has its own #[instrument] for structured logging.
+    // Query route: lightweight middleware (request id, no trace layer/span
+    // traversal). The query handler has its own #[instrument] for structured
+    // logging.
     let query_routes = Router::new()
         .route(
             "/v1/namespaces/:ns/query",
@@ -544,7 +569,8 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .layer(TimeoutLayer::new(timeout))
         .layer(DefaultBodyLimit::max(body_limit))
-        .layer(RequestBodyLimitLayer::new(body_limit));
+        .layer(RequestBodyLimitLayer::new(body_limit))
+        .layer(axum::middleware::from_fn(query_request_id));
 
     // All other routes: full middleware stack with request tracing.
     #[allow(unused_mut)]

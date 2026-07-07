@@ -42,6 +42,57 @@ static EVICTION_TEST_REMOVE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static EVICTION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+tokio::task_local! {
+    static CACHE_DIAGNOSTICS: Arc<CacheDiagnostics>;
+}
+
+/// Per-query cache diagnostics, enabled only inside an explicit task-local scope.
+#[derive(Debug, Default)]
+pub struct CacheDiagnostics {
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+/// Snapshot of cache diagnostics counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheDiagnosticsSnapshot {
+    /// Cache hits recorded in the scope.
+    pub hits: u64,
+    /// Cache misses recorded in the scope.
+    pub misses: u64,
+}
+
+impl CacheDiagnostics {
+    /// Return a point-in-time snapshot of the counters.
+    #[must_use]
+    pub fn snapshot(&self) -> CacheDiagnosticsSnapshot {
+        CacheDiagnosticsSnapshot {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Run a future with per-query cache diagnostics enabled.
+pub async fn with_cache_diagnostics<F>(diagnostics: Arc<CacheDiagnostics>, future: F) -> F::Output
+where
+    F: Future,
+{
+    CACHE_DIAGNOSTICS.scope(diagnostics, future).await
+}
+
+fn record_cache_hit_for_diagnostics() {
+    let _ = CACHE_DIAGNOSTICS.try_with(|diagnostics| {
+        diagnostics.hits.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+fn record_cache_miss_for_diagnostics() {
+    let _ = CACHE_DIAGNOSTICS.try_with(|diagnostics| {
+        diagnostics.misses.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
 /// Metadata for a cached entry.
 struct CacheEntry {
     /// Filename on disk (key with `/` replaced by `__`).
@@ -215,6 +266,7 @@ impl DiskCache {
                 crate::metrics::CACHE_HITS_TOTAL
                     .with_label_values(&["memory_hit"])
                     .inc();
+                record_cache_hit_for_diagnostics();
                 debug!("memory cache hit");
                 return Some(data);
             }
@@ -238,6 +290,7 @@ impl DiskCache {
                 crate::metrics::CACHE_HITS_TOTAL
                     .with_label_values(&["hit"])
                     .inc();
+                record_cache_hit_for_diagnostics();
                 debug!("cache hit");
                 Some(bytes)
             }
@@ -250,6 +303,7 @@ impl DiskCache {
                 crate::metrics::CACHE_HITS_TOTAL
                     .with_label_values(&["miss"])
                     .inc();
+                record_cache_miss_for_diagnostics();
                 debug!("cache miss (file missing)");
                 None
             }
@@ -332,6 +386,7 @@ impl DiskCache {
             crate::metrics::CACHE_HITS_TOTAL
                 .with_label_values(&["miss"])
                 .inc();
+            record_cache_miss_for_diagnostics();
             let data = fetch().await?;
             if let Err(error) = self.put(key, &data).await {
                 error!(

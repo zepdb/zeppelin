@@ -11,7 +11,7 @@ use crate::error::ZeppelinError;
 use crate::fts::rank_by::RankBy;
 use crate::namespace::manager::NamespaceMetadata;
 use crate::query;
-use crate::query::QueryResponse;
+use crate::query::{QueryDebug, QueryDebugCache, QueryResponse};
 use crate::runtime_config::QueryKnobs;
 use crate::server::{AppState, RateLimitClass, RateLimitIdentity};
 use crate::types::{ConsistencyLevel, Filter, SearchResult};
@@ -73,6 +73,9 @@ pub struct QueryRequest {
     /// Explain output request.
     #[serde(default)]
     pub explain: Option<ExplainSpec>,
+    /// Include an opt-in query diagnostics block in the response.
+    #[serde(default)]
+    pub debug: Option<bool>,
 }
 
 /// A typed candidate source in the retrieval-algebra request AST.
@@ -402,7 +405,9 @@ pub async fn query_namespace(
     .await
     .map_err(ApiError::from)?;
 
+    let request_id = crate::server::current_request_id();
     info!(
+        request_id = request_id.as_deref().unwrap_or(""),
         results = result.results.len(),
         scanned_fragments = result.scanned_fragments,
         scanned_segments = result.scanned_segments,
@@ -846,6 +851,7 @@ async fn execute_validated_query(
     let source_ref = query_source_ref(req, validated.source)?;
     validate_query_source_metadata(ns, meta, source_ref)?;
     let manifest = read_manifest_for_execution(state, ns, req.consistency, options).await?;
+    let emit_debug = req.debug.unwrap_or(false);
     execute_query_source_with_manifest(
         state,
         ns,
@@ -857,6 +863,7 @@ async fn execute_validated_query(
         validated.include_attributes,
         knobs,
         manifest,
+        emit_debug,
     )
     .await
     .map(|source| source.response)
@@ -889,6 +896,7 @@ async fn execute_hybrid_query(
 
     let manifest = read_manifest_for_execution(state, ns, req.consistency, options).await?;
     let mut source_responses = Vec::with_capacity(source_count);
+    let emit_debug = req.debug.unwrap_or(false);
     for index in 0..source_count {
         let source_ref = algebra_source_ref(req, index)?;
         let nprobe = nprobe_for_algebra_source(req, index, knobs.default_nprobe)?;
@@ -903,12 +911,19 @@ async fn execute_hybrid_query(
             validated.include_attributes,
             knobs,
             manifest.clone(),
+            emit_debug,
         )
         .await?;
         source_responses.push(source_response);
     }
 
-    fuse_source_responses(req.fusion.as_ref(), source_responses, validated.top_k)
+    fuse_source_responses(
+        req.fusion.as_ref(),
+        source_responses,
+        validated.top_k,
+        req.consistency,
+        emit_debug,
+    )
 }
 
 fn validate_query_source_metadata(
@@ -981,6 +996,7 @@ async fn execute_query_source_with_manifest(
     include_attributes: bool,
     knobs: &QueryKnobs,
     manifest: Manifest,
+    emit_debug: bool,
 ) -> Result<SourceQueryResponse, ZeppelinError> {
     match source_ref {
         QuerySourceRef::Bm25 {
@@ -1000,25 +1016,46 @@ async fn execute_query_source_with_manifest(
                 .with_label_values(&[ns])
                 .inc();
 
-            query::execute_bm25_query_with_manifest(
-                &state.store,
-                &state.wal_reader,
-                ns,
-                rank_by,
-                &meta.full_text_search,
-                top_k,
-                req.filter.as_ref(),
-                req.consistency,
-                last_as_prefix,
-                Some(&state.fts_cache),
-                Some(&state.cache),
-                knobs.bm25_max_full_scan_clusters,
-                knobs.bm25_max_full_scan_vectors,
-                include_attributes,
-                manifest,
-            )
-            .await
-            .map(|response| SourceQueryResponse {
+            let response = if emit_debug {
+                query::execute_bm25_query_with_manifest_debug(
+                    &state.store,
+                    &state.wal_reader,
+                    ns,
+                    rank_by,
+                    &meta.full_text_search,
+                    top_k,
+                    req.filter.as_ref(),
+                    req.consistency,
+                    last_as_prefix,
+                    Some(&state.fts_cache),
+                    Some(&state.cache),
+                    knobs.bm25_max_full_scan_clusters,
+                    knobs.bm25_max_full_scan_vectors,
+                    include_attributes,
+                    manifest,
+                )
+                .await
+            } else {
+                query::execute_bm25_query_with_manifest(
+                    &state.store,
+                    &state.wal_reader,
+                    ns,
+                    rank_by,
+                    &meta.full_text_search,
+                    top_k,
+                    req.filter.as_ref(),
+                    req.consistency,
+                    last_as_prefix,
+                    Some(&state.fts_cache),
+                    Some(&state.cache),
+                    knobs.bm25_max_full_scan_clusters,
+                    knobs.bm25_max_full_scan_vectors,
+                    include_attributes,
+                    manifest,
+                )
+                .await
+            };
+            response.map(|response| SourceQueryResponse {
                 kind: QuerySourceKind::Bm25,
                 response,
             })
@@ -1055,12 +1092,15 @@ async fn execute_query_source_with_manifest(
                 include_attributes,
             };
 
-            query::execute_query_with_manifest(params, manifest)
-                .await
-                .map(|response| SourceQueryResponse {
-                    kind: QuerySourceKind::Ann,
-                    response,
-                })
+            let response = if emit_debug {
+                query::execute_query_with_manifest_debug(params, manifest).await
+            } else {
+                query::execute_query_with_manifest(params, manifest).await
+            };
+            response.map(|response| SourceQueryResponse {
+                kind: QuerySourceKind::Ann,
+                response,
+            })
         }
     }
 }
@@ -1069,6 +1109,8 @@ fn fuse_source_responses(
     fusion: Option<&FusionSpec>,
     sources: Vec<SourceQueryResponse>,
     top_k: usize,
+    consistency: ConsistencyLevel,
+    emit_debug: bool,
 ) -> Result<QueryResponse, ZeppelinError> {
     let scanned_fragments = sources
         .iter()
@@ -1078,6 +1120,14 @@ fn fuse_source_responses(
         .iter()
         .map(|source| source.response.scanned_segments)
         .sum();
+    let source_debugs: Vec<QueryDebug> = if emit_debug {
+        sources
+            .iter()
+            .filter_map(|source| source.response.debug.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let results = match fusion {
         Some(FusionSpec::None) => {
@@ -1089,12 +1139,65 @@ fn fuse_source_responses(
         Some(FusionSpec::Rrf { k }) => fuse_rrf_results(sources, k.unwrap_or(DEFAULT_RRF_K), top_k),
         None => fuse_rrf_results(sources, DEFAULT_RRF_K, top_k),
     };
+    let debug = emit_debug.then(|| {
+        aggregate_source_debug(
+            &source_debugs,
+            scanned_fragments,
+            scanned_segments,
+            results.len(),
+            top_k,
+            consistency,
+        )
+    });
 
     Ok(QueryResponse {
         results,
         scanned_fragments,
         scanned_segments,
+        debug,
     })
+}
+
+fn aggregate_source_debug(
+    source_debugs: &[QueryDebug],
+    scanned_fragments: usize,
+    scanned_segments: usize,
+    results_len: usize,
+    top_k: usize,
+    consistency: ConsistencyLevel,
+) -> QueryDebug {
+    let wal_ms = source_debugs.iter().map(|debug| debug.wal_ms).sum();
+    let segment_ms = source_debugs.iter().map(|debug| debug.segment_ms).sum();
+    let merge_ms = source_debugs.iter().map(|debug| debug.merge_ms).sum();
+    let clusters_probed = source_debugs
+        .iter()
+        .map(|debug| debug.clusters_probed)
+        .sum();
+    let cache = QueryDebugCache {
+        hits: source_debugs.iter().map(|debug| debug.cache.hits).sum(),
+        misses: source_debugs.iter().map(|debug| debug.cache.misses).sum(),
+    };
+    let underfill_reason = if results_len >= top_k {
+        None
+    } else {
+        source_debugs
+            .iter()
+            .filter_map(|debug| debug.underfill_reason.as_deref())
+            .find(|reason| *reason == "eventual_skipped_wal")
+            .map(str::to_string)
+            .or_else(|| Some("not_enough_matches".to_string()))
+    };
+    QueryDebug {
+        wal_ms,
+        segment_ms,
+        merge_ms,
+        fragments_scanned: scanned_fragments,
+        segments_scanned: scanned_segments,
+        clusters_probed,
+        cache,
+        consistency_effective: consistency,
+        underfill_reason,
+    }
 }
 
 fn fuse_rrf_results(

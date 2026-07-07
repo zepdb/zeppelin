@@ -354,6 +354,11 @@ paths:
       responses:
         "200":
           description: Query results
+          headers:
+            x-request-id:
+              schema:
+                type: string
+              description: Echo of the inbound request id, or a server-generated UUID.
           content:
             application/json:
               schema:
@@ -392,6 +397,11 @@ paths:
       responses:
         "200":
           description: Positional batch query results
+          headers:
+            x-request-id:
+              schema:
+                type: string
+              description: Echo of the inbound request id, or a server-generated UUID.
           content:
             application/json:
               schema:
@@ -516,6 +526,7 @@ components:
             - CONFLICT_RETRY
             - RATE_LIMITED
             - CONCURRENCY_LIMIT
+            - INDEX_UNAVAILABLE
             - REQUEST_TIMEOUT
             - PAYLOAD_TOO_LARGE
             - NOT_IMPLEMENTED
@@ -542,8 +553,8 @@ components:
           type: string
           description: |
             Echo of the request's `x-request-id` (or a server-generated UUID).
-            Present on routes that carry the request-id middleware; omitted on
-            the lightweight query hot path. Use it to correlate with server logs.
+            Present on routes that carry request-id middleware, including the
+            lightweight query hot path. Use it to correlate with server logs.
       example:
         code: NAMESPACE_NOT_FOUND
         error: "namespace not found: test"
@@ -1282,6 +1293,13 @@ components:
           $ref: "#/components/schemas/CursorSpec"
         explain:
           $ref: "#/components/schemas/ExplainSpec"
+        debug:
+          type: boolean
+          default: false
+          description: |
+            When true, include an optional `debug` block in the query response
+            with phase timings, scan counts, cache counters, effective
+            consistency, and under-fill reason. Omitted by default.
 
     CandidateSource:
       description: Typed retrieval-algebra candidate source.
@@ -1569,6 +1587,71 @@ components:
         scanned_segments:
           type: integer
           description: Number of index segments scanned
+        debug:
+          $ref: "#/components/schemas/QueryDebug"
+
+    QueryDebug:
+      type: object
+      required:
+        - wal_ms
+        - segment_ms
+        - merge_ms
+        - fragments_scanned
+        - segments_scanned
+        - clusters_probed
+        - cache
+        - consistency_effective
+        - underfill_reason
+      description: Present only when the request sets `debug: true`.
+      properties:
+        wal_ms:
+          type: integer
+          minimum: 0
+          description: WAL scan phase latency in milliseconds.
+        segment_ms:
+          type: integer
+          minimum: 0
+          description: Segment search phase latency in milliseconds.
+        merge_ms:
+          type: integer
+          minimum: 0
+          description: Result merge phase latency in milliseconds.
+        fragments_scanned:
+          type: integer
+          minimum: 0
+          description: Same semantics as top-level `scanned_fragments`.
+        segments_scanned:
+          type: integer
+          minimum: 0
+          description: Same semantics as top-level `scanned_segments`.
+        clusters_probed:
+          type: integer
+          minimum: 0
+          description: Number of IVF clusters probed or BM25 fallback clusters scanned.
+        cache:
+          $ref: "#/components/schemas/QueryDebugCache"
+        consistency_effective:
+          $ref: "#/components/schemas/ConsistencyLevel"
+        underfill_reason:
+          type: string
+          nullable: true
+          enum:
+            - eventual_skipped_wal
+            - no_index_or_wal_data
+            - not_enough_matches
+            - null
+          description: Null when the response filled `top_k`.
+
+    QueryDebugCache:
+      type: object
+      required: [hits, misses]
+      properties:
+        hits:
+          type: integer
+          minimum: 0
+        misses:
+          type: integer
+          minimum: 0
 
     BatchQueryResponse:
       type: object

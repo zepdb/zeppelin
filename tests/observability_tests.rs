@@ -112,13 +112,22 @@ async fn test_active_queries_returns_to_zero() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // After query completes, active_queries should be 0
-    let resp = client
-        .get(format!("{base_url}/metrics"))
-        .send()
-        .await
-        .unwrap();
-    let body = resp.text().await.unwrap();
+    // `zeppelin_active_queries` is process-global, and Rust runs tests in this
+    // binary concurrently by default. Poll briefly so unrelated query tests can
+    // finish before asserting the gauge returned to zero.
+    let mut body = String::new();
+    for _ in 0..20 {
+        let resp = client
+            .get(format!("{base_url}/metrics"))
+            .send()
+            .await
+            .unwrap();
+        body = resp.text().await.unwrap();
+        if body.contains("zeppelin_active_queries 0") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(
         body.contains("zeppelin_active_queries 0"),
         "active queries should be 0 after query completes, metrics:\n{}",
@@ -186,6 +195,183 @@ async fn test_request_id_passthrough() {
         "response should echo back the provided x-request-id"
     );
 
+    harness.cleanup().await;
+}
+
+// --- Test 5a: query route returns x-request-id without TraceLayer ---
+
+#[tokio::test]
+async fn test_query_request_id_header_returned_and_echoed() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api(&client, &base_url, 4).await;
+
+    let upsert = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({
+            "vectors": [
+                {"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upsert.status(), 200);
+
+    let generated = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "top_k": 1,
+            "consistency": "strong"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(generated.status(), 200);
+    let generated_id = generated.headers().get("x-request-id");
+    assert!(
+        generated_id.is_some(),
+        "query route must return an x-request-id header"
+    );
+    assert!(
+        !generated_id.unwrap().to_str().unwrap().is_empty(),
+        "generated query x-request-id must not be empty"
+    );
+
+    let custom_id = "query-request-123";
+    let echoed = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .header("x-request-id", custom_id)
+        .json(&serde_json::json!({
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "top_k": 1,
+            "consistency": "strong"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(echoed.status(), 200);
+    assert_eq!(
+        echoed
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        custom_id,
+        "query route must echo an inbound x-request-id"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+// --- Test 5b: query debug block is opt-in and contains phase diagnostics ---
+
+#[tokio::test]
+async fn test_query_debug_block_is_opt_in() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api(&client, &base_url, 4).await;
+
+    let upsert = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({
+            "vectors": [
+                {"id": "v1", "values": [1.0, 0.0, 0.0, 0.0]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upsert.status(), 200);
+
+    let default_body: serde_json::Value = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "top_k": 1,
+            "consistency": "strong"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        default_body.get("debug").is_none(),
+        "query debug block must be absent by default: {default_body}"
+    );
+
+    let debug_body: serde_json::Value = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&serde_json::json!({
+            "vector": [1.0, 0.0, 0.0, 0.0],
+            "top_k": 1,
+            "consistency": "strong",
+            "debug": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let debug = debug_body
+        .get("debug")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("debug=true must return a debug block: {debug_body}"));
+    for field in ["wal_ms", "segment_ms", "merge_ms"] {
+        assert!(
+            debug
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "debug.{field} must be a non-negative integer: {debug_body}"
+        );
+    }
+    assert_eq!(
+        debug["fragments_scanned"], debug_body["scanned_fragments"],
+        "debug fragments must preserve existing scanned_fragments semantics"
+    );
+    assert_eq!(
+        debug["segments_scanned"], debug_body["scanned_segments"],
+        "debug segments must preserve existing scanned_segments semantics"
+    );
+    assert_eq!(debug["consistency_effective"], "strong");
+    assert!(
+        debug
+            .get("clusters_probed")
+            .and_then(serde_json::Value::as_u64)
+            .is_some(),
+        "debug.clusters_probed must be present: {debug_body}"
+    );
+    let cache = debug
+        .get("cache")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("debug.cache must be present: {debug_body}"));
+    assert!(
+        cache
+            .get("hits")
+            .and_then(serde_json::Value::as_u64)
+            .is_some(),
+        "debug.cache.hits must be present: {debug_body}"
+    );
+    assert!(
+        cache
+            .get("misses")
+            .and_then(serde_json::Value::as_u64)
+            .is_some(),
+        "debug.cache.misses must be present: {debug_body}"
+    );
+    assert!(
+        debug.contains_key("underfill_reason"),
+        "debug.underfill_reason must be present, even when null: {debug_body}"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
 }
 
