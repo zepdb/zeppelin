@@ -44,6 +44,18 @@ pub struct QueryResponse {
     /// and more ranked results remain in the current candidate frontier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+    /// Grouped result hits, returned only when the request asks for grouping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<QueryResultGroup>>,
+}
+
+/// One grouped result bucket.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryResultGroup {
+    /// Group key. Missing group fields use the hit id as the singleton key.
+    pub key: String,
+    /// Ranked hits in this group.
+    pub results: Vec<SearchResult>,
 }
 
 /// Optional client-visible query diagnostics.
@@ -389,6 +401,7 @@ async fn execute_query_with_manifest_scoped(
         scanned_segments,
         debug,
         next_cursor: None,
+        groups: None,
     })
 }
 
@@ -1001,6 +1014,7 @@ async fn execute_bm25_query_with_manifest_scoped(
         scanned_segments,
         debug,
         next_cursor: None,
+        groups: None,
     })
 }
 

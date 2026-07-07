@@ -1400,10 +1400,10 @@ components:
         - multi-source weighted normalized score fusion
         - explicit vector and BM25 rerank over the candidate frontier
         - opaque cursor pagination
+        - field grouping
         - `projection.include_attributes`
 
         Reserved today (returns code `NOT_IMPLEMENTED`):
-        - grouped results
         - enabled explain output
         - field/vector projection
       properties:
@@ -1655,7 +1655,11 @@ components:
           $ref: "#/components/schemas/RankByExpression"
 
     GroupingSpec:
-      description: Result grouping strategy. Field grouping is typed but not executable yet.
+      description: |
+        Result grouping strategy. Field grouping collapses hits by an
+        attribute value, keeps at most `max_per_group` hits in each group,
+        and applies `top_k` to the number of groups. Hits missing the group
+        field form singleton groups keyed by their own ids.
       discriminator:
         propertyName: type
         mapping:
@@ -1788,6 +1792,24 @@ components:
             Opaque cursor for the next page. Present only when cursor
             pagination is enabled and more ranked results remain in the
             current candidate frontier.
+        groups:
+          type: array
+          description: Present only when result grouping is requested.
+          items:
+            $ref: "#/components/schemas/QueryResultGroup"
+
+    QueryResultGroup:
+      type: object
+      required: [key, results]
+      properties:
+        key:
+          type: string
+          description: Group key; missing group fields use the hit id.
+        results:
+          type: array
+          description: Ranked hits retained for this group.
+          items:
+            $ref: "#/components/schemas/SearchResult"
 
     QueryDebug:
       type: object

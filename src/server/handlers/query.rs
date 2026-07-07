@@ -17,7 +17,7 @@ use crate::fts::FtsFieldConfig;
 use crate::index::distance::compute_distance;
 use crate::namespace::manager::NamespaceMetadata;
 use crate::query;
-use crate::query::{QueryDebug, QueryDebugCache, QueryResponse};
+use crate::query::{QueryDebug, QueryDebugCache, QueryResponse, QueryResultGroup};
 use crate::runtime_config::QueryKnobs;
 use crate::server::{AppState, RateLimitClass, RateLimitIdentity};
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, SearchResult};
@@ -769,11 +769,7 @@ fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), Zeppelin
                     "grouping.max_per_group must be >= 1".into(),
                 ));
             }
-            GroupingSpec::Field { .. } => {
-                return Err(ZeppelinError::NotImplemented {
-                    feature: "grouped results",
-                });
-            }
+            GroupingSpec::Field { .. } => {}
         }
     }
     if let Some(cursor) = req.cursor.as_ref() {
@@ -997,7 +993,10 @@ async fn execute_hybrid_query(
 }
 
 fn first_stage_top_k(req: &QueryRequest, validated: ValidatedQuery) -> usize {
-    if req.rerank.as_ref().is_some_and(RerankSpec::is_explicit) || cursor_requested(req) {
+    if req.rerank.as_ref().is_some_and(RerankSpec::is_explicit)
+        || grouping_requested(req)
+        || cursor_requested(req)
+    {
         let min_cursor_frontier = validated.top_k.saturating_add(1);
         if cursor_requested(req) {
             validated.candidate_k.max(min_cursor_frontier)
@@ -1022,11 +1021,17 @@ fn rerank_output_k(
 }
 
 fn first_stage_include_attributes(req: &QueryRequest, include_attributes: bool) -> bool {
-    include_attributes || matches!(req.rerank, Some(RerankSpec::Bm25 { .. }))
+    include_attributes
+        || matches!(req.rerank, Some(RerankSpec::Bm25 { .. }))
+        || grouping_requested(req)
 }
 
 fn cursor_requested(req: &QueryRequest) -> bool {
     req.cursor.is_some()
+}
+
+fn grouping_requested(req: &QueryRequest) -> bool {
+    matches!(req.grouping, Some(GroupingSpec::Field { .. }))
 }
 
 struct RerankExecutionContext<'a> {
@@ -1044,17 +1049,20 @@ async fn apply_rerank_if_requested(
     ctx: RerankExecutionContext<'_>,
     response: QueryResponse,
 ) -> Result<QueryResponse, ZeppelinError> {
+    let keep_attrs_after_rerank = ctx.include_attributes || grouping_requested(ctx.req);
     let response = match ctx.req.rerank.as_ref() {
         Some(RerankSpec::Vector { vector }) => apply_vector_rerank(&ctx, response, vector).await?,
         Some(RerankSpec::Bm25 { rank_by }) => apply_bm25_rerank(
             ctx.meta,
             response,
             ctx.rerank_limit,
-            ctx.include_attributes,
+            keep_attrs_after_rerank,
             rank_by,
         )?,
         _ => response,
     };
+    let response =
+        apply_grouping_if_requested(ctx.req, response, ctx.top_k, ctx.include_attributes)?;
     apply_cursor_if_requested(ctx.ns, ctx.req, response, ctx.top_k)
 }
 
@@ -1106,6 +1114,104 @@ async fn apply_vector_rerank(
         .sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
     response.results.truncate(ctx.rerank_limit);
     Ok(response)
+}
+
+fn apply_grouping_if_requested(
+    req: &QueryRequest,
+    mut response: QueryResponse,
+    top_k: usize,
+    include_attributes: bool,
+) -> Result<QueryResponse, ZeppelinError> {
+    let Some(GroupingSpec::Field {
+        field,
+        max_per_group,
+    }) = req.grouping.as_ref()
+    else {
+        response.groups = None;
+        return Ok(response);
+    };
+
+    let mut groups = Vec::<QueryResultGroup>::new();
+    let mut group_indexes = HashMap::<String, usize>::new();
+    for result in response.results {
+        let (internal_key, display_key) = grouping_keys(&result, field)?;
+        let group_index = match group_indexes.get(&internal_key).copied() {
+            Some(index) => index,
+            None => {
+                let index = groups.len();
+                groups.push(QueryResultGroup {
+                    key: display_key,
+                    results: Vec::new(),
+                });
+                group_indexes.insert(internal_key, index);
+                index
+            }
+        };
+        if groups[group_index].results.len() < *max_per_group {
+            groups[group_index].results.push(result);
+        }
+    }
+
+    groups.truncate(top_k);
+    if !include_attributes {
+        for group in &mut groups {
+            for result in &mut group.results {
+                result.attributes = None;
+            }
+        }
+    }
+    response.results = groups
+        .iter()
+        .flat_map(|group| group.results.iter().cloned())
+        .collect();
+    response.groups = Some(groups);
+    Ok(response)
+}
+
+fn grouping_keys(result: &SearchResult, field: &str) -> Result<(String, String), ZeppelinError> {
+    if let Some(value) = result
+        .attributes
+        .as_ref()
+        .and_then(|attrs| attrs.get(field))
+    {
+        let display = group_attribute_value(value)?;
+        return Ok((format!("field:{display}"), display));
+    }
+    Ok((format!("missing:{}", result.id), result.id.clone()))
+}
+
+fn group_attribute_value(value: &AttributeValue) -> Result<String, ZeppelinError> {
+    match value {
+        AttributeValue::String(value) => Ok(value.clone()),
+        AttributeValue::Integer(value) => Ok(value.to_string()),
+        AttributeValue::Float(value) => {
+            if !value.is_finite() {
+                return Err(ZeppelinError::Validation(
+                    "grouping field contains a non-finite value".into(),
+                ));
+            }
+            Ok(value.to_string())
+        }
+        AttributeValue::Bool(value) => Ok(value.to_string()),
+        AttributeValue::StringList(values) => Ok(values.join(",")),
+        AttributeValue::IntegerList(values) => Ok(values
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",")),
+        AttributeValue::FloatList(values) => {
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(ZeppelinError::Validation(
+                    "grouping field contains a non-finite value".into(),
+                ));
+            }
+            Ok(values
+                .iter()
+                .map(f64::to_string)
+                .collect::<Vec<_>>()
+                .join(","))
+        }
+    }
 }
 
 struct DecodedCursor {
@@ -1633,6 +1739,7 @@ fn fuse_source_responses(
         scanned_segments,
         debug,
         next_cursor: None,
+        groups: None,
     })
 }
 
