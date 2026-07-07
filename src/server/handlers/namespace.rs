@@ -8,15 +8,17 @@ use uuid::Uuid;
 
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
-use crate::namespace::manager::NamespaceMetadata;
+use crate::namespace::manager::{CreateNamespaceOutcome, NamespaceMetadata};
 use crate::server::AppState;
 use crate::types::DistanceMetric;
 
 use super::ApiError;
 
-/// Request body for creating a new namespace (server generates UUID name).
+/// Request body for creating a new namespace.
 #[derive(Debug, Deserialize)]
 pub struct CreateNamespaceRequest {
+    /// Optional client-specified namespace name.
+    pub name: Option<String>,
     /// Dimensionality of vectors stored in this namespace.
     pub dimensions: usize,
     /// Distance metric for similarity search (defaults to Cosine).
@@ -69,13 +71,13 @@ pub struct HydrateNamespaceResponse {
     pub segment_id: String,
 }
 
-/// Response body for namespace creation (includes warning about saving UUID).
+/// Response body for namespace creation.
 #[derive(Debug, Serialize)]
 pub struct CreateNamespaceResponse {
     /// Namespace metadata.
     #[serde(flatten)]
     pub namespace: NamespaceResponse,
-    /// Warning to save the UUID — it cannot be recovered.
+    /// Creation note.
     pub warning: String,
 }
 
@@ -95,7 +97,7 @@ impl From<NamespaceMetadata> for NamespaceResponse {
     }
 }
 
-/// Creates a new namespace with a server-generated UUID v4 name.
+/// Creates a new namespace.
 #[instrument(skip(state), fields(dimensions = req.dimensions))]
 pub async fn create_namespace(
     State(state): State<AppState>,
@@ -108,13 +110,41 @@ pub async fn create_namespace(
         ))));
     }
 
-    let uuid = Uuid::new_v4().to_string();
-    let name = match &state.namespace_name_prefix {
-        Some(prefix) => format!("{prefix}-{uuid}"),
-        None => uuid,
-    };
+    if let Some(name) = req.name {
+        info!(namespace = %name, dimensions = req.dimensions, "creating namespace by client name");
+        let outcome = state
+            .namespace_manager
+            .create_idempotent_with_fts(
+                &name,
+                req.dimensions,
+                req.distance_metric,
+                req.full_text_search,
+            )
+            .await
+            .map_err(ApiError::from)?;
+        let (status, meta) = match outcome {
+            CreateNamespaceOutcome::Created(meta) => {
+                info!(namespace = %name, "namespace created by client name");
+                (StatusCode::CREATED, meta)
+            }
+            CreateNamespaceOutcome::Existing(meta) => {
+                info!(namespace = %name, "namespace already existed with matching config");
+                (StatusCode::OK, meta)
+            }
+        };
+        return Ok((
+            status,
+            Json(CreateNamespaceResponse {
+                namespace: NamespaceResponse::from(meta),
+                warning:
+                    "Client-specified namespace names are idempotent for identical configuration."
+                        .to_string(),
+            }),
+        ));
+    }
 
-    info!(namespace = %name, dimensions = req.dimensions, "creating namespace");
+    let name = generated_namespace_name(state.namespace_name_prefix.as_deref());
+    info!(namespace = %name, dimensions = req.dimensions, "creating generated namespace");
     let meta = state
         .namespace_manager
         .create_with_fts(
@@ -126,7 +156,7 @@ pub async fn create_namespace(
         .await
         .map_err(ApiError::from)?;
 
-    info!(namespace = %name, "namespace created");
+    info!(namespace = %name, "generated namespace created");
     Ok((
         StatusCode::CREATED,
         Json(CreateNamespaceResponse {
@@ -134,6 +164,14 @@ pub async fn create_namespace(
             warning: "Save this namespace name. It cannot be recovered if lost.".to_string(),
         }),
     ))
+}
+
+fn generated_namespace_name(prefix: Option<&str>) -> String {
+    let uuid = Uuid::new_v4().to_string();
+    match prefix {
+        Some(prefix) => format!("{prefix}-{uuid}"),
+        None => uuid,
+    }
 }
 
 /// Lists all namespaces (not routed — disabled to prevent namespace enumeration).
