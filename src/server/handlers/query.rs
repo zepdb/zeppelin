@@ -1727,7 +1727,8 @@ fn apply_cursor_if_requested(
         return Ok(response);
     };
 
-    response.results.sort_by(fused_result_cmp);
+    let cursor_cmp = cursor_result_cmp(req);
+    response.results.sort_by(cursor_cmp);
     let fingerprint = cursor_fingerprint(ns, req)?;
     if let CursorSpec::After { token } = cursor {
         let decoded = decode_cursor_token(token)?;
@@ -1743,7 +1744,7 @@ fn apply_cursor_if_requested(
         };
         response
             .results
-            .retain(|result| fused_result_cmp(result, &marker) == Ordering::Greater);
+            .retain(|result| cursor_cmp(result, &marker) == Ordering::Greater);
     }
 
     let has_more = response.results.len() > top_k;
@@ -1758,6 +1759,28 @@ fn apply_cursor_if_requested(
         None
     };
     Ok(response)
+}
+
+fn cursor_result_cmp(req: &QueryRequest) -> fn(&SearchResult, &SearchResult) -> Ordering {
+    if cursor_lower_score_is_better(req) {
+        distance_result_cmp
+    } else {
+        fused_result_cmp
+    }
+}
+
+fn cursor_lower_score_is_better(req: &QueryRequest) -> bool {
+    if matches!(req.rerank, Some(RerankSpec::Vector { .. })) {
+        return true;
+    }
+    let Some(sources) = req.sources.as_ref() else {
+        return false;
+    };
+    matches!(sources.as_slice(), [CandidateSource::Ann { .. }])
+}
+
+fn distance_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
+    a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
 }
 
 fn cursor_fingerprint(ns: &str, req: &QueryRequest) -> Result<u64, ZeppelinError> {

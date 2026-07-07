@@ -127,11 +127,11 @@ async fn cursor_pages_continue_without_overlap_or_gaps() {
         &base_url,
         &ns,
         json!([
-            {"id": "a", "values": [0.0, 0.0]},
-            {"id": "b", "values": [0.0, 0.0]},
-            {"id": "c", "values": [0.0, 0.0]},
-            {"id": "d", "values": [0.0, 0.0]},
-            {"id": "e", "values": [0.0, 0.0]}
+            {"id": "a", "values": [0.1, 0.0]},
+            {"id": "b", "values": [0.2, 0.0]},
+            {"id": "c", "values": [0.3, 0.0]},
+            {"id": "d", "values": [0.4, 0.0]},
+            {"id": "e", "values": [0.5, 0.0]}
         ]),
     )
     .await;
@@ -173,6 +173,69 @@ async fn cursor_pages_continue_without_overlap_or_gaps() {
 
     assert_eq!(ids(&full), vec!["a", "b", "c", "d", "e"]);
     assert_eq!(paged, ids(&full));
+    assert!(page3.get("next_cursor").is_none());
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn cursor_preserves_vector_rerank_distance_order() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_namespace(&client, &base_url).await;
+
+    upsert(
+        &client,
+        &base_url,
+        &ns,
+        json!([
+            {"id": "far-source-near-rerank", "values": [0.5, 0.0]},
+            {"id": "middle", "values": [0.4, 0.0]},
+            {"id": "near-source-far-rerank", "values": [0.1, 0.0]}
+        ]),
+    )
+    .await;
+
+    let request = |cursor: Value| {
+        json!({
+            "sources": [{
+                "type": "ann",
+                "vector": [0.0, 0.0]
+            }],
+            "rerank": {
+                "type": "vector",
+                "vector": [0.6, 0.0]
+            },
+            "candidate_k": 3,
+            "top_k": 1,
+            "cursor": cursor,
+            "consistency": "strong",
+            "projection": {"include_attributes": false}
+        })
+    };
+
+    let page1 = query(&client, &base_url, &ns, request(json!({"type": "none"}))).await;
+    let cursor1 = page1["next_cursor"].as_str().unwrap();
+    let page2 = query(
+        &client,
+        &base_url,
+        &ns,
+        request(json!({"type": "after", "token": cursor1})),
+    )
+    .await;
+    let cursor2 = page2["next_cursor"].as_str().unwrap();
+    let page3 = query(
+        &client,
+        &base_url,
+        &ns,
+        request(json!({"type": "after", "token": cursor2})),
+    )
+    .await;
+
+    assert_eq!(ids(&page1), vec!["far-source-near-rerank"]);
+    assert_eq!(ids(&page2), vec!["middle"]);
+    assert_eq!(ids(&page3), vec!["near-source-far-rerank"]);
     assert!(page3.get("next_cursor").is_none());
 
     cleanup_ns(&harness.store, &ns).await;
