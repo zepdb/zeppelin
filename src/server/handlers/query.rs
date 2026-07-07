@@ -1796,8 +1796,10 @@ fn cursor_result_cmp(req: &QueryRequest) -> fn(&SearchResult, &SearchResult) -> 
 }
 
 fn cursor_lower_score_is_better(req: &QueryRequest) -> bool {
-    if matches!(req.rerank, Some(RerankSpec::Vector { .. })) {
-        return true;
+    match req.rerank.as_ref() {
+        Some(RerankSpec::Vector { .. }) => return true,
+        Some(RerankSpec::Bm25 { .. }) => return false,
+        Some(RerankSpec::Default | RerankSpec::None) | None => {}
     }
     let Some(sources) = req.sources.as_ref() else {
         return false;

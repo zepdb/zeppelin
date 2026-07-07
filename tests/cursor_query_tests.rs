@@ -15,6 +15,24 @@ async fn create_namespace(client: &reqwest::Client, base_url: &str) -> String {
     .await
 }
 
+async fn create_fts_namespace(client: &reqwest::Client, base_url: &str) -> String {
+    create_ns_api_with(
+        client,
+        base_url,
+        json!({
+            "dimensions": 2,
+            "distance_metric": "euclidean",
+            "full_text_search": {
+                "content": {
+                    "stemming": false,
+                    "remove_stopwords": false
+                }
+            }
+        }),
+    )
+    .await
+}
+
 async fn upsert(client: &reqwest::Client, base_url: &str, ns: &str, vectors: Value) {
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
@@ -347,6 +365,81 @@ async fn cursor_preserves_vector_rerank_distance_order() {
     assert_eq!(ids(&page1), vec!["far-source-near-rerank"]);
     assert_eq!(ids(&page2), vec!["middle"]);
     assert_eq!(ids(&page3), vec!["near-source-far-rerank"]);
+    assert!(page3.get("next_cursor").is_none());
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn cursor_preserves_bm25_rerank_score_order() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let ns = create_fts_namespace(&client, &base_url).await;
+
+    upsert(
+        &client,
+        &base_url,
+        &ns,
+        json!([
+            {
+                "id": "ann-near-zero-bm25",
+                "values": [0.0, 0.0],
+                "attributes": {"content": "plain text"}
+            },
+            {
+                "id": "middle-bm25",
+                "values": [0.1, 0.0],
+                "attributes": {"content": "rerank"}
+            },
+            {
+                "id": "best-bm25",
+                "values": [0.2, 0.0],
+                "attributes": {"content": "rerank rerank rerank rerank"}
+            }
+        ]),
+    )
+    .await;
+
+    let request = |cursor: Value| {
+        json!({
+            "sources": [{
+                "type": "ann",
+                "vector": [0.0, 0.0]
+            }],
+            "rerank": {
+                "type": "bm25",
+                "rank_by": ["content", "BM25", "rerank"]
+            },
+            "candidate_k": 3,
+            "top_k": 1,
+            "cursor": cursor,
+            "consistency": "strong",
+            "projection": {"include_attributes": false}
+        })
+    };
+
+    let page1 = query(&client, &base_url, &ns, request(json!({"type": "none"}))).await;
+    let cursor1 = page1["next_cursor"].as_str().unwrap();
+    let page2 = query(
+        &client,
+        &base_url,
+        &ns,
+        request(json!({"type": "after", "token": cursor1})),
+    )
+    .await;
+    let cursor2 = page2["next_cursor"].as_str().unwrap();
+    let page3 = query(
+        &client,
+        &base_url,
+        &ns,
+        request(json!({"type": "after", "token": cursor2})),
+    )
+    .await;
+
+    assert_eq!(ids(&page1), vec!["best-bm25"]);
+    assert_eq!(ids(&page2), vec!["middle-bm25"]);
+    assert_eq!(ids(&page3), vec!["ann-near-zero-bm25"]);
     assert!(page3.get("next_cursor").is_none());
 
     cleanup_ns(&harness.store, &ns).await;
