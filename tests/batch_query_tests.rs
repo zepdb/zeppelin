@@ -19,7 +19,7 @@ use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use zeppelin::server::{build_router, AppState};
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::wal::{WalReader, WalWriter};
+use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
 
 struct BatchApiServer {
     base_url: String,
@@ -54,6 +54,11 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
         config.indexing.clone(),
         Duration::from_secs(config.gc.compaction_upload_window_secs),
     ));
+    let lease_manager = Arc::new(LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(config.compaction.lease_duration_secs),
+    ));
 
     let app = build_router(AppState {
         store: store.clone(),
@@ -61,6 +66,8 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(store.clone())),
         wal_reader: Arc::new(WalReader::new(store.clone())),
+        compactor: compactor.clone(),
+        lease_manager,
         query_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.server.max_concurrent_queries,
         )),

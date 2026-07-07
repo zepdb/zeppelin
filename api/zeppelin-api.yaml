@@ -201,6 +201,58 @@ paths:
         "422":
           $ref: "#/components/responses/UnprocessableEntity"
 
+  /v1/namespaces/{ns}/compact:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    post:
+      operationId: compactNamespace
+      summary: Trigger namespace compaction
+      description: |
+        Runs one synchronous, lease-protected compaction cycle for a namespace.
+        Empty namespaces and namespaces with no uncompacted WAL fragments return
+        `200` with status `noop` and do not acquire the compaction lease. If
+        another writer holds the namespace compaction lease, the endpoint
+        returns the canonical `409` envelope with code `CONFLICT_RETRY`.
+      tags: [Namespaces]
+      responses:
+        "200":
+          description: Compaction cycle completed or was a no-op
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompactNamespaceResponse"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/ConflictRetry"
+        "410":
+          $ref: "#/components/responses/NamespaceDeletingError"
+
+  /v1/namespaces/{ns}/compact/status:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    get:
+      operationId: getCompactionStatus
+      summary: Get compaction status
+      description: |
+        Returns manifest-derived compaction status for clients that need to
+        wait until all WAL fragments have been compacted without polling query
+        results.
+      tags: [Namespaces]
+      responses:
+        "200":
+          description: Manifest-derived compaction status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompactionStatusResponse"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "410":
+          $ref: "#/components/responses/NamespaceDeletingError"
+
   /v1/namespaces/{ns}/hydrate:
     parameters:
       - $ref: "#/components/parameters/NamespacePath"
@@ -458,6 +510,14 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     NamespaceAlreadyExistsError:
       description: Namespace already exists with different immutable configuration (409)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ConflictRetry:
+      description: |
+        Retryable write conflict (409), such as an active namespace lease.
+        Canonical error envelope with code `CONFLICT_RETRY`.
       content:
         application/json:
           schema:
@@ -1110,6 +1170,53 @@ components:
         segment_id:
           type: string
           description: Active segment id queued into the hydrator pipeline.
+
+    CompactionStatusResponse:
+      type: object
+      required:
+        - namespace
+        - manifest_generation
+        - uncompacted_fragments
+        - segment_count
+        - active_segment
+        - active_segment_vector_count
+        - ready
+      properties:
+        namespace:
+          type: string
+        manifest_generation:
+          type: integer
+          format: uint64
+          description: Persisted manifest generation read from object storage.
+        uncompacted_fragments:
+          type: integer
+          minimum: 0
+          description: Number of WAL fragments still waiting for compaction.
+        segment_count:
+          type: integer
+          minimum: 0
+          description: Number of compacted segment references in the manifest.
+        active_segment:
+          type: [string, "null"]
+          description: Active segment id, or null before first compaction.
+        active_segment_vector_count:
+          type: integer
+          minimum: 0
+          description: Vector count in the active segment only.
+        ready:
+          type: boolean
+          description: True when no WAL fragments are waiting for compaction.
+
+    CompactNamespaceResponse:
+      allOf:
+        - $ref: "#/components/schemas/CompactionStatusResponse"
+        - type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [compacted, noop]
+              description: Outcome for this manual compaction trigger.
 
     UpdateIndexConfigResponse:
       type: object

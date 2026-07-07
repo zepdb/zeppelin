@@ -19,7 +19,7 @@ use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use zeppelin::server::build_router;
 use zeppelin::server::AppState;
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::wal::{WalReader, WalWriter};
+use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
 
 fn configure_test_server_limits(config: &mut Config) {
     // Integration tests share one loopback IP and often issue bursty setup or
@@ -42,6 +42,24 @@ fn namespace_manager(config: &Config, store: &ZeppelinStore) -> Arc<NamespaceMan
     Arc::new(NamespaceManager::new_with_registry_ttl(
         store.clone(),
         Duration::from_millis(config.cache.namespace_registry_ttl_ms),
+    ))
+}
+
+fn compactor(config: &Config, store: &ZeppelinStore) -> Arc<Compactor> {
+    Arc::new(Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        config.compaction.clone(),
+        config.indexing.clone(),
+        Duration::from_secs(config.gc.compaction_upload_window_secs),
+    ))
+}
+
+fn lease_manager(config: &Config, store: &ZeppelinStore) -> Arc<LeaseManager> {
+    Arc::new(LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(config.compaction.lease_duration_secs),
     ))
 }
 
@@ -101,12 +119,16 @@ async fn start_test_server_with_config_inner(
     ));
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
+    let compactor = compactor(&config, &harness.store);
+    let lease_manager = lease_manager(&config, &harness.store);
     let state = AppState {
         store: harness.store.clone(),
         namespace_manager: namespace_manager(&config, &harness.store),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
+        compactor,
+        lease_manager,
         config: Arc::new(config),
         runtime_query_config,
         query_knob_bounds,
@@ -158,12 +180,16 @@ pub async fn start_test_server_on_store(
     ));
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let hydrator = maybe_hydrator(&config, &store, &cache);
+    let compactor = compactor(&config, &store);
+    let lease_manager = lease_manager(&config, &store);
     let state = AppState {
         store: store.clone(),
         namespace_manager: namespace_manager(&config, &store),
         namespace_name_prefix,
         wal_writer: Arc::new(WalWriter::new(store.clone())),
         wal_reader: Arc::new(WalReader::new(store.clone())),
+        compactor,
+        lease_manager,
         config: Arc::new(config),
         runtime_query_config,
         query_knob_bounds,
@@ -214,13 +240,8 @@ pub async fn start_test_server_with_compactor(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
     );
 
-    let compactor = Arc::new(Compactor::new(
-        harness.store.clone(),
-        WalReader::new(harness.store.clone()),
-        config.compaction.clone(),
-        config.indexing.clone(),
-        Duration::from_secs(config.gc.compaction_upload_window_secs),
-    ));
+    let compactor = compactor(&config, &harness.store);
+    let lease_manager = lease_manager(&config, &harness.store);
     let manifest_cache = Arc::new(ManifestCache::new(Duration::ZERO));
 
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
@@ -234,6 +255,8 @@ pub async fn start_test_server_with_compactor(
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
+        compactor: compactor.clone(),
+        lease_manager,
         config: Arc::new(config),
         runtime_query_config,
         query_knob_bounds,
@@ -287,27 +310,18 @@ pub async fn start_test_server_with_compaction(
 
     let namespace_manager = namespace_manager(&config, &harness.store);
 
-    let compactor = Arc::new(Compactor::new(
-        harness.store.clone(),
-        WalReader::new(harness.store.clone()),
-        config.compaction.clone(),
-        config.indexing.clone(),
-        Duration::from_secs(config.gc.compaction_upload_window_secs),
-    ));
+    let compactor = compactor(&config, &harness.store);
 
     // Spawn background compaction loop (mirrors main.rs)
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(500)));
-    let lease_manager = Arc::new(zeppelin::wal::LeaseManager::new(
-        harness.store.clone(),
-        format!("test-{}", uuid::Uuid::new_v4()),
-        Duration::from_secs(config.compaction.lease_duration_secs),
-    ));
+    let lease_manager = lease_manager(&config, &harness.store);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let gc_config = config.gc.clone();
     {
         let compactor = compactor.clone();
         let namespace_manager = namespace_manager.clone();
         let manifest_cache = manifest_cache.clone();
+        let lease_manager = lease_manager.clone();
         let cache = cache.clone();
         let namespace_prefix = Some(harness.prefix.clone());
         tokio::spawn(async move {
@@ -338,6 +352,8 @@ pub async fn start_test_server_with_compaction(
         namespace_name_prefix: Some(harness.prefix.clone()),
         wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
+        compactor,
+        lease_manager,
         config: Arc::new(config),
         runtime_query_config,
         query_knob_bounds,

@@ -6,6 +6,7 @@ use std::time::Duration;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
+use crate::compaction::background::compact_namespace_under_lease;
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
@@ -155,6 +156,46 @@ pub struct UpdateIndexConfigResponse {
     pub observe: String,
 }
 
+/// Manifest-derived status for manual compaction clients.
+#[derive(Debug, Serialize)]
+pub struct CompactionStatusResponse {
+    /// Namespace name.
+    pub namespace: String,
+    /// Persisted manifest generation read from S3.
+    pub manifest_generation: u64,
+    /// Number of WAL fragments still waiting for compaction.
+    pub uncompacted_fragments: usize,
+    /// Number of segment references currently tracked by the manifest.
+    pub segment_count: usize,
+    /// Active segment id, if compaction has produced one.
+    pub active_segment: Option<String>,
+    /// Vector count in the active segment only.
+    pub active_segment_vector_count: usize,
+    /// True when no WAL fragments are waiting for compaction.
+    pub ready: bool,
+}
+
+/// Response body for a manual compaction trigger.
+#[derive(Debug, Serialize)]
+pub struct CompactNamespaceResponse {
+    /// Namespace name.
+    pub namespace: String,
+    /// Stable outcome string for this trigger.
+    pub status: &'static str,
+    /// Persisted manifest generation read from S3.
+    pub manifest_generation: u64,
+    /// Number of WAL fragments still waiting for compaction.
+    pub uncompacted_fragments: usize,
+    /// Number of segment references currently tracked by the manifest.
+    pub segment_count: usize,
+    /// Active segment id, if compaction has produced one.
+    pub active_segment: Option<String>,
+    /// Vector count in the active segment only.
+    pub active_segment_vector_count: usize,
+    /// True when no WAL fragments are waiting for compaction.
+    pub ready: bool,
+}
+
 /// Response body for namespace creation.
 #[derive(Debug, Serialize)]
 pub struct CreateNamespaceResponse {
@@ -205,6 +246,21 @@ impl NamespaceResponse {
             updated_at: meta.updated_at.to_rfc3339(),
             state: meta.state.as_str().to_string(),
             full_text_search: meta.full_text_search,
+        }
+    }
+}
+
+impl CompactNamespaceResponse {
+    fn from_status(status: &'static str, response: CompactionStatusResponse) -> Self {
+        Self {
+            namespace: response.namespace,
+            status,
+            manifest_generation: response.manifest_generation,
+            uncompacted_fragments: response.uncompacted_fragments,
+            segment_count: response.segment_count,
+            active_segment: response.active_segment,
+            active_segment_vector_count: response.active_segment_vector_count,
+            ready: response.ready,
         }
     }
 }
@@ -408,6 +464,78 @@ pub async fn get_namespace(
     )))
 }
 
+/// Reports whether a namespace has WAL fragments pending compaction.
+#[instrument(skip(state), fields(namespace = %ns))]
+pub async fn get_compaction_status(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<Json<CompactionStatusResponse>, ApiError> {
+    state
+        .namespace_manager
+        .get(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    let manifest = state
+        .manifest_cache
+        .get_strong(&state.store, &ns)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(compaction_status_from_manifest(&ns, &manifest)))
+}
+
+/// Runs one manual, lease-protected compaction cycle for a namespace.
+#[instrument(skip(state), fields(namespace = %ns))]
+pub async fn compact_namespace(
+    State(state): State<AppState>,
+    Path(ns): Path<String>,
+) -> Result<Json<CompactNamespaceResponse>, ApiError> {
+    let meta = state
+        .namespace_manager
+        .get(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    let before = state
+        .manifest_cache
+        .get_strong(&state.store, &ns)
+        .await
+        .map_err(ApiError::from)?;
+
+    if before.uncompacted_fragments().is_empty() {
+        return Ok(Json(CompactNamespaceResponse::from_status(
+            "noop",
+            compaction_status_from_manifest(&ns, &before),
+        )));
+    }
+
+    info!(namespace = %ns, "manual compaction requested");
+    let result = compact_namespace_under_lease(
+        &state.compactor,
+        &state.lease_manager,
+        &ns,
+        &meta.full_text_search,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    state.manifest_cache.invalidate(&ns);
+    let after = state
+        .manifest_cache
+        .get_strong(&state.store, &ns)
+        .await
+        .map_err(ApiError::from)?;
+    let status = if result.fragments_removed == 0 && result.segment_id.is_none() {
+        "noop"
+    } else {
+        "compacted"
+    };
+
+    Ok(Json(CompactNamespaceResponse::from_status(
+        status,
+        compaction_status_from_manifest(&ns, &after),
+    )))
+}
+
 /// Stages a new per-namespace index config for the next compaction.
 #[instrument(skip(state), fields(namespace = %ns))]
 pub async fn patch_index_config(
@@ -558,6 +686,23 @@ fn active_segment_snapshot(
     manifest: &crate::wal::Manifest,
 ) -> Option<crate::wal::manifest::SegmentRef> {
     active_segment_ref(manifest).cloned()
+}
+
+fn compaction_status_from_manifest(
+    namespace: &str,
+    manifest: &Manifest,
+) -> CompactionStatusResponse {
+    let active_segment = active_segment_ref(manifest);
+    let uncompacted_fragments = manifest.uncompacted_fragments().len();
+    CompactionStatusResponse {
+        namespace: namespace.to_string(),
+        manifest_generation: manifest.version(),
+        uncompacted_fragments,
+        segment_count: manifest.segments.len(),
+        active_segment: active_segment.map(|segment| segment.id.clone()),
+        active_segment_vector_count: active_segment.map_or(0, |segment| segment.vector_count),
+        ready: uncompacted_fragments == 0,
+    }
 }
 
 fn active_segment_ref(manifest: &Manifest) -> Option<&SegmentRef> {

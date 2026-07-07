@@ -25,7 +25,7 @@ use zeppelin::server::{build_router, AppState};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::manifest::{Manifest, SegmentRef};
-use zeppelin::wal::{WalReader, WalWriter};
+use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
 
 struct ParityServer {
     base_url: String,
@@ -87,6 +87,11 @@ async fn start_parity_server(config: Config) -> ParityServer {
         config.indexing.clone(),
         Duration::from_secs(config.gc.compaction_upload_window_secs),
     ));
+    let lease_manager = Arc::new(LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(config.compaction.lease_duration_secs),
+    ));
     let oversample_factor = config.indexing.oversample_factor;
     let hydrator = SegmentHydrator::start(
         store.clone(),
@@ -102,6 +107,8 @@ async fn start_parity_server(config: Config) -> ParityServer {
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(store.clone())),
         wal_reader: Arc::new(WalReader::new(store.clone())),
+        compactor: compactor.clone(),
+        lease_manager,
         config: Arc::new(config),
         runtime_query_config,
         query_knob_bounds,

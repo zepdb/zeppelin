@@ -33,7 +33,7 @@ use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use zeppelin::server::{build_router, AppState};
 use zeppelin::types::{AttributeValue, DistanceMetric, Filter, SearchResult, VectorEntry};
-use zeppelin::wal::{WalReader, WalWriter};
+use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
 
 const IVF_PREFIX_ATTRS_GETS: u64 = 4;
 const FILTERED_SQ8_ATTRS_GETS: u64 = 5;
@@ -83,6 +83,11 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         config.indexing.clone(),
         Duration::from_secs(config.gc.compaction_upload_window_secs),
     ));
+    let lease_manager = Arc::new(LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(config.compaction.lease_duration_secs),
+    ));
     let manifest_cache = Arc::new(ManifestCache::new(Duration::ZERO));
     let runtime_query_config = Arc::new(RuntimeQueryConfig::from_config(&config));
     let query_knob_bounds = QueryKnobBounds::from_config(&config);
@@ -96,6 +101,8 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(store.clone())),
         wal_reader: Arc::new(WalReader::new(store.clone())),
+        compactor: compactor.clone(),
+        lease_manager,
         config: Arc::new(config),
         runtime_query_config,
         query_knob_bounds,

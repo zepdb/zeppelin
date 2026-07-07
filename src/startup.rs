@@ -272,7 +272,7 @@ pub async fn build_app(
         namespace_manager.clone(),
         shutdown_rx,
         manifest_cache.clone(),
-        lease_manager,
+        lease_manager.clone(),
         cache.clone(),
         CompactionThreadOptions {
             compaction_workers: cpu_budget.compaction_workers,
@@ -311,6 +311,8 @@ pub async fn build_app(
         namespace_name_prefix: None,
         wal_writer,
         wal_reader,
+        compactor,
+        lease_manager,
         config: Arc::new(config),
         runtime_query_config,
         query_knob_bounds,

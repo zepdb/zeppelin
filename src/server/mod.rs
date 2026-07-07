@@ -22,6 +22,7 @@ use tracing::{Instrument, Level};
 use crate::cache::hydration::SegmentHydrator;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
+use crate::compaction::Compactor;
 use crate::config::Config;
 use crate::error::ZeppelinError;
 use crate::fts::wal_cache::WalFtsCache;
@@ -29,7 +30,7 @@ use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL};
 use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::storage::ZeppelinStore;
-use crate::wal::{WalReader, WalWriter};
+use crate::wal::{LeaseManager, WalReader, WalWriter};
 
 use self::handlers::{config as config_handler, namespace, query, vectors, ApiError};
 
@@ -108,6 +109,10 @@ pub struct AppState {
     pub wal_writer: Arc<WalWriter>,
     /// Reads WAL fragments from S3.
     pub wal_reader: Arc<WalReader>,
+    /// Lease-protected compactor shared by background and manual admin paths.
+    pub compactor: Arc<Compactor>,
+    /// Per-namespace compaction lease manager.
+    pub lease_manager: Arc<LeaseManager>,
     /// Global server and indexing configuration.
     pub config: Arc<Config>,
     /// Runtime-mutable query configuration snapshots.
@@ -599,6 +604,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/namespaces/:ns/index_config",
             patch(namespace::patch_index_config),
+        )
+        .route(
+            "/v1/namespaces/:ns/compact",
+            post(namespace::compact_namespace),
+        )
+        .route(
+            "/v1/namespaces/:ns/compact/status",
+            get(namespace::get_compaction_status),
         )
         .route(
             "/v1/namespaces/:ns/hydrate",
