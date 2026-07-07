@@ -568,6 +568,15 @@ paths:
   /v1/namespaces/{ns}/query:
     parameters:
       - $ref: "#/components/parameters/NamespacePath"
+      - name: as_of
+        in: query
+        required: false
+        schema:
+          type: string
+        description: |
+          Optional point-in-time target. Use a manifest generation number, an
+          RFC 3339 timestamp, or `snapshot:<name>` to query a retained
+          historical manifest instead of the live manifest.
 
     post:
       operationId: queryNamespace
@@ -602,7 +611,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFoundError"
         "410":
-          $ref: "#/components/responses/NamespaceDeletingError"
+          $ref: "#/components/responses/GoneError"
         "501":
           $ref: "#/components/responses/NotImplemented"
 
@@ -674,6 +683,12 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     NamespaceDeletingError:
       description: Namespace is being deleted (410)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    GoneError:
+      description: Namespace is deleting or requested point-in-time is no longer retained (410)
       content:
         application/json:
           schema:
@@ -771,6 +786,8 @@ components:
             - NAMESPACE_ALREADY_EXISTS
             - SNAPSHOT_ALREADY_EXISTS
             - SNAPSHOT_NOT_FOUND
+            - NAMESPACE_DELETING
+            - POINT_IN_TIME_NOT_RETAINED
             - HYDRATION_DISABLED
             - FTS_FIELD_NOT_CONFIGURED
             - CONFLICT_RETRY

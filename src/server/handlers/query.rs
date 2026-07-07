@@ -3,8 +3,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 use xxhash_rust::xxh3::xxh3_64;
@@ -26,7 +27,7 @@ use crate::query::{
 use crate::runtime_config::QueryKnobs;
 use crate::server::{AppState, RateLimitClass, RateLimitIdentity};
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, SearchResult};
-use crate::wal::manifest::SegmentRef;
+use crate::wal::manifest::{NamedSnapshot, SegmentRef};
 use crate::wal::Manifest;
 
 use super::ApiError;
@@ -301,6 +302,14 @@ struct QueryExecutionOptions {
     notify_hydration: bool,
 }
 
+/// Query-string parameters for the single-query route.
+#[derive(Debug, Default, Deserialize)]
+pub struct QueryRouteParams {
+    /// Optional point-in-time target: generation, RFC3339 timestamp, or `snapshot:name`.
+    #[serde(default)]
+    as_of: Option<String>,
+}
+
 /// Response body for a batch query request.
 #[derive(Debug, Serialize)]
 pub struct BatchQueryResponse {
@@ -369,6 +378,7 @@ impl BatchQueryError {
 pub async fn query_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
+    Query(params): Query<QueryRouteParams>,
     body: bytes::Bytes,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let req: QueryRequest = serde_json::from_slice(&body).map_err(|e| {
@@ -404,6 +414,11 @@ pub async fn query_namespace(
         .get(&ns)
         .await
         .map_err(ApiError::from)?;
+    let as_of_manifest = match params.as_of.as_deref() {
+        Some(as_of) => Some(resolve_as_of_manifest(&state, &ns, as_of).await?),
+        None => None,
+    };
+    let notify_hydration = as_of_manifest.is_none();
 
     let result = execute_validated_query(
         &state,
@@ -413,8 +428,8 @@ pub async fn query_namespace(
         validated,
         knobs.as_ref(),
         QueryExecutionOptions {
-            manifest: None,
-            notify_hydration: true,
+            manifest: as_of_manifest,
+            notify_hydration,
         },
     )
     .await
@@ -430,6 +445,88 @@ pub async fn query_namespace(
     );
 
     Ok(Json(result))
+}
+
+async fn resolve_as_of_manifest(
+    state: &AppState,
+    namespace: &str,
+    as_of: &str,
+) -> Result<Manifest, ZeppelinError> {
+    if as_of.is_empty() {
+        return Err(ZeppelinError::Validation(
+            "as_of must be a generation, RFC3339 timestamp, or snapshot:name".into(),
+        ));
+    }
+    if let Some(snapshot_name) = as_of.strip_prefix("snapshot:") {
+        if snapshot_name.is_empty() {
+            return Err(ZeppelinError::Validation(
+                "as_of snapshot target must be snapshot:<name>".into(),
+            ));
+        }
+        let snapshot = NamedSnapshot::read(&state.store, namespace, snapshot_name)
+            .await?
+            .ok_or_else(|| ZeppelinError::SnapshotNotFound {
+                namespace: namespace.to_string(),
+                name: snapshot_name.to_string(),
+            })?;
+        return read_retained_history_generation(
+            &state.store,
+            namespace,
+            snapshot.generation,
+            &format!("snapshot:{snapshot_name}"),
+        )
+        .await;
+    }
+
+    if let Ok(generation) = as_of.parse::<u64>() {
+        return read_retained_history_generation(&state.store, namespace, generation, as_of).await;
+    }
+
+    let timestamp = DateTime::parse_from_rfc3339(as_of)
+        .map_err(|e| {
+            ZeppelinError::Validation(format!(
+                "as_of must be a generation, RFC3339 timestamp, or snapshot:name: {e}"
+            ))
+        })?
+        .with_timezone(&Utc);
+    resolve_history_at_or_before_timestamp(&state.store, namespace, timestamp, as_of).await
+}
+
+async fn read_retained_history_generation(
+    store: &crate::storage::ZeppelinStore,
+    namespace: &str,
+    generation: u64,
+    target: &str,
+) -> Result<Manifest, ZeppelinError> {
+    Manifest::read_history(store, namespace, generation)
+        .await?
+        .ok_or_else(|| ZeppelinError::PointInTimeNotRetained {
+            namespace: namespace.to_string(),
+            target: target.to_string(),
+        })
+}
+
+async fn resolve_history_at_or_before_timestamp(
+    store: &crate::storage::ZeppelinStore,
+    namespace: &str,
+    timestamp: DateTime<Utc>,
+    target: &str,
+) -> Result<Manifest, ZeppelinError> {
+    let mut selected = None;
+    for entry in Manifest::list_history(store, namespace).await? {
+        let manifest = Manifest::read_history(store, namespace, entry.version)
+            .await?
+            .ok_or_else(|| ZeppelinError::NotFound { key: entry.key })?;
+        if manifest.updated_at <= timestamp {
+            selected = Some(manifest);
+        } else {
+            break;
+        }
+    }
+    selected.ok_or_else(|| ZeppelinError::PointInTimeNotRetained {
+        namespace: namespace.to_string(),
+        target: target.to_string(),
+    })
 }
 
 /// Batch query handler using direct serde_json deserialization.

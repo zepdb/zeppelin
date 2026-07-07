@@ -123,6 +123,15 @@ pub enum ZeppelinError {
         name: String,
     },
 
+    /// A requested historical manifest generation is no longer retained.
+    #[error("point-in-time {target} is no longer retained for namespace {namespace}")]
+    PointInTimeNotRetained {
+        /// Namespace searched for historical state.
+        namespace: String,
+        /// Caller-supplied generation, timestamp, or snapshot reference.
+        target: String,
+    },
+
     /// The namespace exists but is in the middle of deletion.
     #[error("namespace is being deleted: {namespace}")]
     NamespaceDeleting {
@@ -273,6 +282,8 @@ impl ZeppelinError {
 
             ZeppelinError::NamespaceDeleting { .. } => 410,
 
+            ZeppelinError::PointInTimeNotRetained { .. } => 410,
+
             ZeppelinError::NamespaceAlreadyExists { .. }
             | ZeppelinError::SnapshotAlreadyExists { .. }
             | ZeppelinError::ManifestConflict { .. }
@@ -324,6 +335,7 @@ impl ZeppelinError {
             ZeppelinError::NamespaceAlreadyExists { .. } => "NAMESPACE_ALREADY_EXISTS",
             ZeppelinError::SnapshotAlreadyExists { .. } => "SNAPSHOT_ALREADY_EXISTS",
             ZeppelinError::SnapshotNotFound { .. } => "SNAPSHOT_NOT_FOUND",
+            ZeppelinError::PointInTimeNotRetained { .. } => "POINT_IN_TIME_NOT_RETAINED",
             ZeppelinError::NamespaceDeleting { .. } => "NAMESPACE_DELETING",
             ZeppelinError::NamespaceDeleteIncomplete { .. } => "INTERNAL_ERROR",
             ZeppelinError::Index(_) => "INTERNAL_ERROR",
@@ -427,6 +439,9 @@ impl ZeppelinError {
             }
             ZeppelinError::SnapshotNotFound { namespace, name } => {
                 format!("snapshot not found on namespace {namespace}: {name}")
+            }
+            ZeppelinError::PointInTimeNotRetained { namespace, target } => {
+                format!("point-in-time {target} is no longer retained for namespace {namespace}")
             }
             ZeppelinError::NamespaceDeleting { namespace } => {
                 format!("namespace is being deleted: {namespace}")
@@ -610,6 +625,10 @@ mod tests {
             ZeppelinError::SnapshotNotFound {
                 namespace: "n".into(),
                 name: "s".into(),
+            },
+            ZeppelinError::PointInTimeNotRetained {
+                namespace: "n".into(),
+                target: "generation 1".into(),
             },
             ZeppelinError::NamespaceDeleting {
                 namespace: "n".into(),
