@@ -209,15 +209,24 @@ paths:
       operationId: compactNamespace
       summary: Trigger namespace compaction
       description: |
-        Runs one synchronous, lease-protected compaction cycle for a namespace.
+        Starts one asynchronous, lease-protected compaction cycle for a namespace.
         Empty namespaces and namespaces with no uncompacted WAL fragments return
         `200` with status `noop` and do not acquire the compaction lease. If
         another writer holds the namespace compaction lease, the endpoint
-        returns the canonical `409` envelope with code `CONFLICT_RETRY`.
+        returns the canonical `409` envelope with code `CONFLICT_RETRY`. A
+        non-empty accepted trigger returns `202` with the current manifest
+        generation; clients should poll `GET /v1/namespaces/{ns}/compact/status`
+        until `uncompacted_fragments` reaches zero.
       tags: [Namespaces]
       responses:
         "200":
-          description: Compaction cycle completed or was a no-op
+          description: No compaction was needed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompactNamespaceResponse"
+        "202":
+          description: Compaction was accepted and is running asynchronously
           content:
             application/json:
               schema:
@@ -1218,7 +1227,7 @@ components:
           properties:
             status:
               type: string
-              enum: [compacted, noop]
+              enum: [accepted, noop]
               description: Outcome for this manual compaction trigger.
 
     UpdateIndexConfigResponse:

@@ -157,11 +157,26 @@ pub async fn compact_namespace_under_lease(
     fts_configs: &HashMap<String, FtsFieldConfig>,
 ) -> Result<CompactionResult> {
     let lease = lease_manager.acquire(namespace).await?;
+    run_compaction_with_lease(compactor, lease_manager, namespace, lease, fts_configs).await
+}
+
+/// Run the compaction body after the namespace lease has already been acquired.
+///
+/// The caller owns the acquire step; this function owns everything after it:
+/// heartbeat renewal, fenced compaction, heartbeat stop, and best-effort lease
+/// release on both success and error paths.
+pub async fn run_compaction_with_lease(
+    compactor: &Compactor,
+    lease_manager: &Arc<LeaseManager>,
+    namespace: &str,
+    lease: Lease,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+) -> Result<CompactionResult> {
     info!(
         namespace = %namespace,
         fencing_token = lease.fencing_token,
         lease_expires_at = %lease.expires_at,
-        "compaction lease acquired, starting compaction"
+        "starting compaction with acquired lease"
     );
 
     let heartbeat = LeaseHeartbeat::spawn(

@@ -6,7 +6,7 @@ use std::time::Duration;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
-use crate::compaction::background::compact_namespace_under_lease;
+use crate::compaction::background::run_compaction_with_lease;
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
@@ -489,7 +489,7 @@ pub async fn get_compaction_status(
 pub async fn compact_namespace(
     State(state): State<AppState>,
     Path(ns): Path<String>,
-) -> Result<Json<CompactNamespaceResponse>, ApiError> {
+) -> Result<(StatusCode, Json<CompactNamespaceResponse>), ApiError> {
     let meta = state
         .namespace_manager
         .get(&ns)
@@ -502,38 +502,68 @@ pub async fn compact_namespace(
         .map_err(ApiError::from)?;
 
     if before.uncompacted_fragments().is_empty() {
-        return Ok(Json(CompactNamespaceResponse::from_status(
-            "noop",
-            compaction_status_from_manifest(&ns, &before),
-        )));
+        return Ok((
+            StatusCode::OK,
+            Json(CompactNamespaceResponse::from_status(
+                "noop",
+                compaction_status_from_manifest(&ns, &before),
+            )),
+        ));
     }
 
-    info!(namespace = %ns, "manual compaction requested");
-    let result = compact_namespace_under_lease(
-        &state.compactor,
-        &state.lease_manager,
-        &ns,
-        &meta.full_text_search,
-    )
-    .await
-    .map_err(ApiError::from)?;
-
-    state.manifest_cache.invalidate(&ns);
-    let after = state
-        .manifest_cache
-        .get_strong(&state.store, &ns)
+    let lease = state
+        .lease_manager
+        .acquire(&ns)
         .await
         .map_err(ApiError::from)?;
-    let status = if result.fragments_removed == 0 && result.segment_id.is_none() {
-        "noop"
-    } else {
-        "compacted"
-    };
+    info!(
+        namespace = %ns,
+        fencing_token = lease.fencing_token,
+        "manual compaction accepted"
+    );
 
-    Ok(Json(CompactNamespaceResponse::from_status(
-        status,
-        compaction_status_from_manifest(&ns, &after),
-    )))
+    let compactor = state.compactor.clone();
+    let lease_manager = state.lease_manager.clone();
+    let manifest_cache = state.manifest_cache.clone();
+    let ns_for_task = ns.clone();
+    let fts_configs = meta.full_text_search.clone();
+    tokio::spawn(async move {
+        match run_compaction_with_lease(
+            &compactor,
+            &lease_manager,
+            &ns_for_task,
+            lease,
+            &fts_configs,
+        )
+        .await
+        {
+            Ok(result) => {
+                manifest_cache.invalidate(&ns_for_task);
+                info!(
+                    namespace = %ns_for_task,
+                    vectors_compacted = result.vectors_compacted,
+                    fragments_removed = result.fragments_removed,
+                    "manual compaction completed"
+                );
+            }
+            Err(e) => {
+                manifest_cache.invalidate(&ns_for_task);
+                tracing::error!(
+                    namespace = %ns_for_task,
+                    error = %e,
+                    "manual compaction failed"
+                );
+            }
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CompactNamespaceResponse::from_status(
+            "accepted",
+            compaction_status_from_manifest(&ns, &before),
+        )),
+    ))
 }
 
 /// Stages a new per-namespace index config for the next compaction.

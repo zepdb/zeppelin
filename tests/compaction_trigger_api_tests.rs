@@ -46,20 +46,31 @@ async fn test_post_compact_reaches_quiescence_without_query_polling() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
-    let compacted: Value = resp.json().await.unwrap();
-    assert_eq!(compacted["status"], "compacted");
-    assert_eq!(compacted["uncompacted_fragments"], 0);
-    assert_eq!(compacted["segment_count"], 1);
-    assert!(
-        compacted["manifest_generation"].as_u64().unwrap()
-            > before["manifest_generation"].as_u64().unwrap()
+    assert_eq!(resp.status(), 202);
+    let accepted: Value = resp.json().await.unwrap();
+    assert_eq!(accepted["status"], "accepted");
+    assert_eq!(
+        accepted["manifest_generation"],
+        before["manifest_generation"]
     );
+    assert_eq!(accepted["uncompacted_fragments"], 1);
+    assert_eq!(accepted["segment_count"], 0);
 
-    let after = get_compaction_status(&client, &base_url, &ns).await;
+    let mut after = get_compaction_status(&client, &base_url, &ns).await;
+    for _ in 0..200 {
+        if after["uncompacted_fragments"] == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        after = get_compaction_status(&client, &base_url, &ns).await;
+    }
     assert_eq!(after["uncompacted_fragments"], 0);
     assert_eq!(after["segment_count"], 1);
     assert_eq!(after["ready"], true);
+    assert!(
+        after["manifest_generation"].as_u64().unwrap()
+            > before["manifest_generation"].as_u64().unwrap()
+    );
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
@@ -80,6 +91,16 @@ async fn test_post_compact_returns_409_when_lease_is_held() {
         Duration::from_secs(60),
     );
     let lease = lease_manager.acquire(&ns).await.unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/compact"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 409);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "CONFLICT_RETRY");
+    assert_eq!(body["retryable"], true);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/compact"))
