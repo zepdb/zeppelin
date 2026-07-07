@@ -84,6 +84,12 @@ pub async fn build_app(
     config: Config,
 ) -> Result<(Router, watch::Sender<bool>, std::thread::JoinHandle<()>), Box<dyn std::error::Error>>
 {
+    if let Err(error) = config.validate() {
+        tracing::error!(error = %error, "invalid configuration; refusing to boot");
+        return Err(Box::new(error));
+    }
+    config.warn_if_unsafe_gc_horizon_override();
+
     tracing::info!("zeppelin starting");
 
     // Detect CPU budget and log allocation
