@@ -403,6 +403,13 @@ impl Manifest {
         self.version
     }
 
+    /// Reset the persisted generation before writing this manifest into a
+    /// different namespace. The target namespace assigns its own generation
+    /// during `write`; source history generations must not leak across clones.
+    pub(crate) fn reset_version_for_clone(&mut self) {
+        self.version = 0;
+    }
+
     fn checked_next_version(version: u64) -> Result<u64> {
         version
             .checked_add(1)

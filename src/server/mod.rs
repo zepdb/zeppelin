@@ -614,6 +614,7 @@ pub fn build_router(state: AppState) -> Router {
                 .put(namespace::put_snapshot)
                 .delete(namespace::delete_snapshot),
         )
+        .route("/v1/namespaces/:ns/clone", post(namespace::clone_namespace))
         .route(
             "/v1/namespaces/:ns/index_config",
             patch(namespace::patch_index_config),

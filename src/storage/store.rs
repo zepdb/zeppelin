@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut, S3CopyIfNotExists};
 use object_store::path::Path;
 use object_store::{
     BackoffConfig, ClientOptions, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload,
@@ -57,6 +57,9 @@ impl ZeppelinStore {
                     // Enable conditional PUT (ETag-based CAS) — required for
                     // manifest conflict detection and lease CAS operations.
                     builder = builder.with_conditional_put(S3ConditionalPut::ETagMatch);
+                    // Enable atomic create semantics for server-side copy,
+                    // used by restore-as-clone materialization.
+                    builder = builder.with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
                     builder = builder.with_retry(RetryConfig {
                         backoff: BackoffConfig {
                             init_backoff: Duration::from_millis(100),
@@ -456,6 +459,37 @@ impl ZeppelinStore {
         debug!(elapsed_ms = elapsed.as_millis(), "s3 put_if_not_exists");
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["put"])
+            .observe(elapsed.as_secs_f64());
+        Ok(())
+    }
+
+    /// Copy an object only if the destination key does not already exist.
+    #[instrument(skip(self), fields(from = from, to = to))]
+    pub async fn copy_if_not_exists(&self, from: &str, to: &str, namespace: &str) -> Result<()> {
+        let start = std::time::Instant::now();
+        let from_path = Path::parse(from)?;
+        let to_path = Path::parse(to)?;
+        self.inner
+            .copy_if_not_exists(&from_path, &to_path)
+            .await
+            .map_err(|e| match e {
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. } => {
+                    ZeppelinError::NamespaceAlreadyExists {
+                        namespace: namespace.to_string(),
+                    }
+                }
+                other => {
+                    crate::metrics::S3_ERRORS_TOTAL
+                        .with_label_values(&["copy"])
+                        .inc();
+                    ZeppelinError::Storage(other)
+                }
+            })?;
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), "s3 copy_if_not_exists");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["copy"])
             .observe(elapsed.as_secs_f64());
         Ok(())
     }

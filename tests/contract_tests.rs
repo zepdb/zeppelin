@@ -32,6 +32,7 @@ const ROUTED_OPERATIONS: &[(&str, &str)] = &[
     ("put", "/v1/namespaces/{ns}/snapshots/{name}"),
     ("get", "/v1/namespaces/{ns}/snapshots/{name}"),
     ("delete", "/v1/namespaces/{ns}/snapshots/{name}"),
+    ("post", "/v1/namespaces/{ns}/clone"),
     ("patch", "/v1/namespaces/{ns}/index_config"),
     ("post", "/v1/namespaces/{ns}/compact"),
     ("get", "/v1/namespaces/{ns}/compact/status"),

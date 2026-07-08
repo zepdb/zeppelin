@@ -1,12 +1,15 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::compaction::background::run_compaction_with_lease;
+use crate::compaction::gc::reachable_keys;
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
@@ -212,6 +215,33 @@ pub struct SnapshotResponse {
 pub struct ListSnapshotsResponse {
     /// Snapshot pins for this namespace.
     pub snapshots: Vec<SnapshotResponse>,
+}
+
+/// Request body for restoring a namespace as a new clone.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloneNamespaceRequest {
+    /// Fresh target namespace to create.
+    pub target: String,
+    /// Source point-in-time target: generation, RFC3339 timestamp, or `snapshot:name`.
+    pub as_of: String,
+}
+
+/// Response body for restoring a namespace as a new clone.
+#[derive(Debug, Serialize)]
+pub struct CloneNamespaceResponse {
+    /// Source namespace read at the requested point in time.
+    pub source: String,
+    /// Fresh namespace created by the clone operation.
+    pub target: String,
+    /// Source manifest generation that was materialized.
+    pub generation: u64,
+    /// Target namespace manifest generation after materialization.
+    pub target_generation: u64,
+    /// Clone materialization mode.
+    pub mode: &'static str,
+    /// Target namespace metadata and manifest-derived status.
+    pub namespace: NamespaceResponse,
 }
 
 /// Response body for namespace creation.
@@ -473,6 +503,82 @@ pub async fn create_namespace(
     ))
 }
 
+/// Restores a retained source generation as a fresh, independently writable namespace.
+#[instrument(skip(state, req), fields(source = %source))]
+pub async fn clone_namespace(
+    State(state): State<AppState>,
+    Path(source): Path<String>,
+    Json(req): Json<CloneNamespaceRequest>,
+) -> Result<(StatusCode, Json<CloneNamespaceResponse>), ApiError> {
+    let target = req.target;
+    let as_of = req.as_of;
+    if target == source {
+        return Err(ApiError(ZeppelinError::Validation(
+            "clone target must differ from source namespace".into(),
+        )));
+    }
+
+    let source_meta = state
+        .namespace_manager
+        .get(&source)
+        .await
+        .map_err(ApiError::from)?;
+    let source_manifest = resolve_clone_as_of_manifest(&state, &source, &as_of)
+        .await
+        .map_err(ApiError::from)?;
+    let source_generation = source_manifest.version();
+    let index_config = source_meta
+        .index_config
+        .clone()
+        .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(&state.config.indexing));
+
+    let target_meta = state
+        .namespace_manager
+        .create_with_fts_and_index_config(
+            &target,
+            source_meta.dimensions,
+            source_meta.distance_metric,
+            source_meta.full_text_search.clone(),
+            Some(index_config),
+        )
+        .await
+        .map_err(ApiError::from)?;
+
+    let mut target_manifest = materialize_clone_manifest(&state, &source, &target, source_manifest)
+        .await
+        .map_err(ApiError::from)?;
+    target_manifest
+        .write(&state.store, &target)
+        .await
+        .map_err(ApiError::from)?;
+    state.manifest_cache.invalidate(&target);
+
+    info!(
+        source = %source,
+        target = %target,
+        source_generation,
+        target_generation = target_manifest.version(),
+        mode = "copy",
+        "namespace clone materialized"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CloneNamespaceResponse {
+            source,
+            target: target.clone(),
+            generation: source_generation,
+            target_generation: target_manifest.version(),
+            mode: "copy",
+            namespace: NamespaceResponse::from_manifest(
+                target_meta,
+                &target_manifest,
+                &state.config.indexing,
+            ),
+        }),
+    ))
+}
+
 fn resolve_namespace_index_config(
     request: Option<&CreateNamespaceIndexConfig>,
     defaults: &crate::config::IndexingConfig,
@@ -536,6 +642,154 @@ fn generated_namespace_name(prefix: Option<&str>) -> String {
         Some(prefix) => format!("{prefix}-{uuid}"),
         None => uuid,
     }
+}
+
+async fn resolve_clone_as_of_manifest(
+    state: &AppState,
+    namespace: &str,
+    as_of: &str,
+) -> Result<Manifest, ZeppelinError> {
+    if as_of.is_empty() {
+        return Err(ZeppelinError::Validation(
+            "as_of must be a generation, RFC3339 timestamp, or snapshot:name".into(),
+        ));
+    }
+    if let Some(snapshot_name) = as_of.strip_prefix("snapshot:") {
+        if snapshot_name.is_empty() {
+            return Err(ZeppelinError::Validation(
+                "as_of snapshot target must be snapshot:<name>".into(),
+            ));
+        }
+        let snapshot = NamedSnapshot::read(&state.store, namespace, snapshot_name)
+            .await?
+            .ok_or_else(|| ZeppelinError::SnapshotNotFound {
+                namespace: namespace.to_string(),
+                name: snapshot_name.to_string(),
+            })?;
+        return read_clone_history_generation(
+            &state.store,
+            namespace,
+            snapshot.generation,
+            &format!("snapshot:{snapshot_name}"),
+        )
+        .await;
+    }
+
+    if let Ok(generation) = as_of.parse::<u64>() {
+        return read_clone_history_generation(&state.store, namespace, generation, as_of).await;
+    }
+
+    let timestamp = DateTime::parse_from_rfc3339(as_of)
+        .map_err(|e| {
+            ZeppelinError::Validation(format!(
+                "as_of must be a generation, RFC3339 timestamp, or snapshot:name: {e}"
+            ))
+        })?
+        .with_timezone(&Utc);
+    resolve_clone_history_at_or_before_timestamp(&state.store, namespace, timestamp, as_of).await
+}
+
+async fn read_clone_history_generation(
+    store: &crate::storage::ZeppelinStore,
+    namespace: &str,
+    generation: u64,
+    target: &str,
+) -> Result<Manifest, ZeppelinError> {
+    Manifest::read_history(store, namespace, generation)
+        .await?
+        .ok_or_else(|| ZeppelinError::PointInTimeNotRetained {
+            namespace: namespace.to_string(),
+            target: target.to_string(),
+        })
+}
+
+async fn resolve_clone_history_at_or_before_timestamp(
+    store: &crate::storage::ZeppelinStore,
+    namespace: &str,
+    timestamp: DateTime<Utc>,
+    target: &str,
+) -> Result<Manifest, ZeppelinError> {
+    let mut selected = None;
+    for entry in Manifest::list_history(store, namespace).await? {
+        let manifest = Manifest::read_history(store, namespace, entry.version)
+            .await?
+            .ok_or_else(|| ZeppelinError::NotFound { key: entry.key })?;
+        if manifest.updated_at <= timestamp {
+            selected = Some(manifest);
+        } else {
+            break;
+        }
+    }
+    selected.ok_or_else(|| ZeppelinError::PointInTimeNotRetained {
+        namespace: namespace.to_string(),
+        target: target.to_string(),
+    })
+}
+
+async fn materialize_clone_manifest(
+    state: &AppState,
+    source: &str,
+    target: &str,
+    mut manifest: Manifest,
+) -> Result<Manifest, ZeppelinError> {
+    manifest.pending_deletes.clear();
+    let copies = clone_copy_map(source, target, &manifest)?;
+    rewrite_manifest_stored_keys(source, target, &mut manifest)?;
+    manifest.fencing_token = 0;
+    manifest.updated_at = Utc::now();
+    manifest.reset_version_for_clone();
+
+    for (from, to) in copies {
+        state.store.copy_if_not_exists(&from, &to, target).await?;
+    }
+
+    Ok(manifest)
+}
+
+fn clone_copy_map(
+    source: &str,
+    target: &str,
+    manifest: &Manifest,
+) -> Result<BTreeMap<String, String>, ZeppelinError> {
+    reachable_keys(source, manifest)
+        .into_iter()
+        .map(|source_key| {
+            let target_key = rewrite_namespace_key(source, target, &source_key)?;
+            Ok((source_key, target_key))
+        })
+        .collect()
+}
+
+fn rewrite_manifest_stored_keys(
+    source: &str,
+    target: &str,
+    manifest: &mut Manifest,
+) -> Result<(), ZeppelinError> {
+    for segment in &mut manifest.segments {
+        if let Some(sketch) = &mut segment.sketch {
+            sketch.key = rewrite_namespace_key(source, target, &sketch.key)?;
+        }
+        if let Some(bootstrap) = &mut segment.bootstrap {
+            bootstrap.key = rewrite_namespace_key(source, target, &bootstrap.key)?;
+        }
+        if let Some(membership) = &mut segment.membership {
+            membership.key = rewrite_namespace_key(source, target, &membership.key)?;
+        }
+        for object_ref in &mut segment.cluster_objects {
+            object_ref.key = rewrite_namespace_key(source, target, &object_ref.key)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_namespace_key(source: &str, target: &str, key: &str) -> Result<String, ZeppelinError> {
+    let source_prefix = format!("{source}/");
+    let suffix = key.strip_prefix(&source_prefix).ok_or_else(|| {
+        ZeppelinError::Index(format!(
+            "clone source manifest key {key:?} is outside source prefix {source_prefix:?}"
+        ))
+    })?;
+    Ok(format!("{target}/{suffix}"))
 }
 
 /// Lists all namespaces (not routed — disabled to prevent namespace enumeration).

@@ -328,6 +328,46 @@ paths:
         "410":
           $ref: "#/components/responses/NamespaceDeletingError"
 
+  /v1/namespaces/{ns}/clone:
+    parameters:
+      - $ref: "#/components/parameters/NamespacePath"
+
+    post:
+      operationId: cloneNamespace
+      summary: Restore namespace as clone
+      description: |
+        Creates a fresh target namespace from a retained source manifest
+        generation. The server materializes the clone by copying source
+        artifacts into the target namespace prefix and rewriting manifest
+        references, so the target is independently writable and remains
+        readable after source deletion or source GC.
+      tags: [Namespaces]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CloneNamespaceRequest"
+      responses:
+        "201":
+          description: Clone materialized into a fresh namespace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CloneNamespaceResponse"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/NamespaceAlreadyExistsError"
+        "410":
+          $ref: "#/components/responses/GoneError"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
   /v1/namespaces/{ns}/index_config:
     parameters:
       - $ref: "#/components/parameters/NamespacePath"
@@ -1317,6 +1357,54 @@ components:
               type: string
               description: Creation note. Generated UUID namespaces include a warning to save the name.
               example: "Save this namespace name. It cannot be recovered if lost."
+
+    CloneNamespaceRequest:
+      type: object
+      required: [target, as_of]
+      additionalProperties: false
+      properties:
+        target:
+          type: string
+          minLength: 1
+          maxLength: 255
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          description: Fresh target namespace to create.
+        as_of:
+          type: string
+          description: |
+            Retained source point-in-time target: manifest generation,
+            RFC3339 timestamp, or `snapshot:<name>`.
+
+    CloneNamespaceResponse:
+      type: object
+      required:
+        - source
+        - target
+        - generation
+        - target_generation
+        - mode
+        - namespace
+      properties:
+        source:
+          type: string
+          description: Source namespace read at the requested point in time.
+        target:
+          type: string
+          description: Fresh namespace created by the clone operation.
+        generation:
+          type: integer
+          format: uint64
+          description: Source manifest generation that was materialized.
+        target_generation:
+          type: integer
+          format: uint64
+          description: Target manifest generation after materialization.
+        mode:
+          type: string
+          enum: [copy]
+          description: Clone materialization mode.
+        namespace:
+          $ref: "#/components/schemas/NamespaceResponse"
 
     NamespaceResponse:
       type: object
