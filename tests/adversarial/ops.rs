@@ -50,6 +50,47 @@ pub enum Op {
         ns: String,
         probe: InvalidProbe,
     },
+    CompactEndpoint {
+        ns: String,
+    },
+    GcCycle {
+        ns: String,
+        keep_count: u64,
+    },
+    CreateSnapshot {
+        ns: String,
+        name: String,
+    },
+    GetSnapshot {
+        ns: String,
+        name: String,
+    },
+    ListSnapshots {
+        ns: String,
+    },
+    DeleteSnapshot {
+        ns: String,
+        name: String,
+    },
+    CloneNamespace {
+        source: String,
+        target: String,
+        as_of: AsOfTarget,
+    },
+    PatchIndexConfig {
+        ns: String,
+        patch: serde_json::Value,
+    },
+    Hydrate {
+        ns: String,
+    },
+    DeleteNamespace {
+        ns: String,
+    },
+    ProbeSandwich {
+        ns: String,
+        maintenance: MaintenanceKind,
+    },
     CompactInline {
         ns: String,
     },
@@ -115,6 +156,17 @@ pub enum InvalidProbe {
     BadCursorToken,
     GroupingPlusCursor,
     WeightsLenMismatch,
+    AsOfGenZero,
+    AsOfGenFuture,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum MaintenanceKind {
+    CompactInline,
+    CompactEndpoint,
+    GcCycle,
+    Hydrate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +196,17 @@ impl Op {
             Op::BatchQuery { .. } => "batch_query",
             Op::PaginateAll { .. } => "paginate_all",
             Op::InvalidProbe { .. } => "invalid_probe",
+            Op::CompactEndpoint { .. } => "compact_endpoint",
+            Op::GcCycle { .. } => "gc_cycle",
+            Op::CreateSnapshot { .. } => "create_snapshot",
+            Op::GetSnapshot { .. } => "get_snapshot",
+            Op::ListSnapshots { .. } => "list_snapshots",
+            Op::DeleteSnapshot { .. } => "delete_snapshot",
+            Op::CloneNamespace { .. } => "clone_namespace",
+            Op::PatchIndexConfig { .. } => "patch_index_config",
+            Op::Hydrate { .. } => "hydrate",
+            Op::DeleteNamespace { .. } => "delete_namespace",
+            Op::ProbeSandwich { .. } => "probe_sandwich",
             Op::CompactInline { .. } => "compact_inline",
         }
     }
@@ -160,7 +223,18 @@ impl Op {
             | Op::BatchQuery { ns, .. }
             | Op::PaginateAll { ns, .. }
             | Op::InvalidProbe { ns, .. }
+            | Op::CompactEndpoint { ns }
+            | Op::GcCycle { ns, .. }
+            | Op::CreateSnapshot { ns, .. }
+            | Op::GetSnapshot { ns, .. }
+            | Op::ListSnapshots { ns }
+            | Op::DeleteSnapshot { ns, .. }
+            | Op::PatchIndexConfig { ns, .. }
+            | Op::Hydrate { ns }
+            | Op::DeleteNamespace { ns }
+            | Op::ProbeSandwich { ns, .. }
             | Op::CompactInline { ns } => ns,
+            Op::CloneNamespace { source, .. } => source,
         }
     }
 
@@ -171,6 +245,13 @@ impl Op {
             Op::CreateNamespace { .. }
                 | Op::Upsert { .. }
                 | Op::DeleteVectors { .. }
+                | Op::CompactEndpoint { .. }
+                | Op::CreateSnapshot { .. }
+                | Op::DeleteSnapshot { .. }
+                | Op::CloneNamespace { .. }
+                | Op::PatchIndexConfig { .. }
+                | Op::DeleteNamespace { .. }
+                | Op::ProbeSandwich { .. }
                 | Op::CompactInline { .. }
         )
     }
@@ -185,6 +266,17 @@ impl Op {
                 .collect(),
             Op::PaginateAll { q, .. } => q.pattern_tags.iter().map(String::as_str).collect(),
             Op::InvalidProbe { probe, .. } => vec!["invalid-probe", probe.tag()],
+            Op::CompactEndpoint { .. } => vec!["compact-endpoint"],
+            Op::GcCycle { .. } => vec!["gc-cycle"],
+            Op::CreateSnapshot { .. } | Op::GetSnapshot { .. } | Op::ListSnapshots { .. } => {
+                vec!["snapshot"]
+            }
+            Op::DeleteSnapshot { .. } => vec!["snapshot", "delete-snapshot"],
+            Op::CloneNamespace { .. } => vec!["clone"],
+            Op::PatchIndexConfig { .. } => vec!["config-patch"],
+            Op::Hydrate { .. } => vec!["hydrate"],
+            Op::DeleteNamespace { .. } => vec!["delete-recreate"],
+            Op::ProbeSandwich { maintenance, .. } => vec!["sandwich", maintenance.tag()],
             _ => Vec::new(),
         }
     }
@@ -225,6 +317,7 @@ impl InvalidProbe {
     pub fn expected_status(self) -> u16 {
         match self {
             Self::OversizedBatch => 413,
+            Self::AsOfGenZero | Self::AsOfGenFuture => 410,
             _ => 400,
         }
     }
@@ -233,6 +326,7 @@ impl InvalidProbe {
     pub fn expected_code(self) -> &'static str {
         match self {
             Self::OversizedBatch => "PAYLOAD_TOO_LARGE",
+            Self::AsOfGenZero | Self::AsOfGenFuture => "POINT_IN_TIME_NOT_RETAINED",
             _ => "VALIDATION_ERROR",
         }
     }
@@ -257,6 +351,20 @@ impl InvalidProbe {
             Self::BadCursorToken => "bad-cursor-token",
             Self::GroupingPlusCursor => "grouping-plus-cursor",
             Self::WeightsLenMismatch => "weights-len-mismatch",
+            Self::AsOfGenZero => "as-of-410",
+            Self::AsOfGenFuture => "as-of-410",
+        }
+    }
+}
+
+impl MaintenanceKind {
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::CompactInline => "sandwich-compact-inline",
+            Self::CompactEndpoint => "sandwich-compact-endpoint",
+            Self::GcCycle => "sandwich-gc-cycle",
+            Self::Hydrate => "sandwich-hydrate",
         }
     }
 }

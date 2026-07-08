@@ -47,6 +47,17 @@ async fn smoke() {
         "batch_query",
         "paginate_all",
         "invalid_probe",
+        "compact_endpoint",
+        "gc_cycle",
+        "create_snapshot",
+        "get_snapshot",
+        "list_snapshots",
+        "delete_snapshot",
+        "clone_namespace",
+        "patch_index_config",
+        "hydrate",
+        "delete_namespace",
+        "probe_sandwich",
         "compact_inline",
     ] {
         assert!(
@@ -62,6 +73,13 @@ async fn smoke() {
         "pagination",
         "fts",
         "invalid-probe",
+        "as-of-200",
+        "as-of-410",
+        "snapshot",
+        "clone",
+        "gc-cycle",
+        "sandwich",
+        "delete-recreate",
     ] {
         assert!(
             summary.coverage.tag_counts.get(tag).copied().unwrap_or(0) > 0,

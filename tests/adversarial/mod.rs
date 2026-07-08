@@ -6,6 +6,7 @@ pub mod model;
 pub mod ops;
 pub mod oracle;
 pub mod runner;
+pub mod s3_oracle;
 pub mod vocab;
 
 use std::collections::BTreeMap;

@@ -5,7 +5,7 @@ use zeppelin::index::filter::evaluate_filter;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, Filter};
 
 use super::model::{model_distance, Model, ModelRecord, NsModel, OracleMutation};
-use super::ops::{GeneratedQuery, Op, OpRecord, QueryOracleClass};
+use super::ops::{AsOfTarget, GeneratedQuery, Op, OpRecord, QueryOracleClass};
 use super::RunMode;
 
 pub const SCORE_ABS_EPS: f32 = 1e-5;
@@ -20,9 +20,15 @@ pub enum ViolationId {
     I5BatchEquivalent,
     I6PaginationEquivalent,
     I7FtsMembership,
+    I8AsOfExact,
+    I9Clone,
     I10FailedValidationNoWal,
     I11ErrorEnvelope,
     I12StructuralSanity,
+    I13ProbeSandwich,
+    I14S3Reachability,
+    I15ManifestLineage,
+    I16Quiescence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +61,7 @@ pub fn check_op(
         violations.extend(check_i4_fetch_exact(model, rec, mode));
         violations.extend(check_i12_structural_sanity(model, rec));
         violations.extend(check_i1_strong_exact(model, rec, mode, mutation));
+        violations.extend(check_i8_as_of_exact(model, rec, mode, mutation));
         violations.extend(check_i3_membership(model, rec));
         violations.extend(check_i5_batch_equivalence(rec));
         violations.extend(check_i6_pagination_equivalence(rec));
@@ -77,9 +84,12 @@ fn check_i1_strong_exact(
     if mode != RunMode::Deterministic {
         return Vec::new();
     }
-    let Op::Query { ns, q, .. } = &rec.op else {
+    let Op::Query { ns, q, as_of } = &rec.op else {
         return Vec::new();
     };
+    if as_of.is_some() {
+        return Vec::new();
+    }
     let QueryOracleClass::ExactAnn {
         top_k,
         consistency,
@@ -260,7 +270,10 @@ fn check_i1_strong_exact(
 /// the check applies immediately.
 fn check_i2_deleted_never_returned(model: &Model, rec: &OpRecord) -> Vec<Violation> {
     let (ns, ids) = match &rec.op {
-        Op::Query { ns, .. } => (ns.as_str(), response_ids(&rec.response)),
+        Op::Query {
+            ns, as_of: None, ..
+        } => (ns.as_str(), response_ids(&rec.response)),
+        Op::Query { as_of: Some(_), .. } => return Vec::new(),
         Op::FetchVectors { ns, .. } => {
             let Ok(response) = fetch_response(&rec.response) else {
                 return Vec::new();
@@ -418,6 +431,235 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
                 "actual": actual.missing
             }),
         ));
+    }
+
+    violations
+}
+
+/// I8 — Point-in-time query exactness
+///
+/// Successful `as_of` generation and snapshot reads are checked against the
+/// model checkpoint pinned by that target. Non-retained targets are covered by
+/// the expected-error query class and the canonical error envelope check.
+fn check_i8_as_of_exact(
+    model: &Model,
+    rec: &OpRecord,
+    mode: RunMode,
+    mutation: Option<OracleMutation>,
+) -> Vec<Violation> {
+    if mode != RunMode::Deterministic {
+        return Vec::new();
+    }
+    let Op::Query {
+        ns,
+        q,
+        as_of: Some(as_of),
+    } = &rec.op
+    else {
+        return Vec::new();
+    };
+    let Some(ns_model) = model.namespaces.get(ns) else {
+        return vec![violation(
+            ViolationId::I8AsOfExact,
+            rec,
+            ns,
+            "as_of query response for unknown namespace",
+            serde_json::json!({ "namespace": ns }),
+        )];
+    };
+    let Some((generation, checkpoint)) = checkpoint_for_as_of(ns_model, as_of) else {
+        return Vec::new();
+    };
+
+    match &q.class {
+        QueryOracleClass::ExactAnn {
+            top_k,
+            consistency: ConsistencyLevel::Strong,
+            filter,
+        } => check_as_of_exact_ann(
+            rec, ns, q, ns_model, generation, checkpoint, *top_k, filter, mutation,
+        ),
+        QueryOracleClass::Membership {
+            consistency: ConsistencyLevel::Strong,
+        } => {
+            let visible = checkpoint.keys().cloned().collect::<BTreeSet<_>>();
+            response_ids(&rec.response)
+                .into_iter()
+                .filter(|id| !visible.contains(id))
+                .map(|id| {
+                    violation(
+                        ViolationId::I8AsOfExact,
+                        rec,
+                        ns,
+                        "as_of membership query returned id outside checkpoint",
+                        serde_json::json!({
+                            "id": id,
+                            "generation": generation,
+                        }),
+                    )
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_as_of_exact_ann(
+    rec: &OpRecord,
+    ns: &str,
+    q: &GeneratedQuery,
+    ns_model: &NsModel,
+    generation: u64,
+    checkpoint: &BTreeMap<String, ModelRecord>,
+    top_k: usize,
+    filter: &Option<Filter>,
+    mutation: Option<OracleMutation>,
+) -> Vec<Violation> {
+    let query = query_vector(q);
+    let Ok(results) = query_results(&rec.response) else {
+        return vec![violation(
+            ViolationId::I8AsOfExact,
+            rec,
+            ns,
+            "as_of query response did not contain parseable results",
+            rec.response.clone(),
+        )];
+    };
+    let first_visible = checkpoint.keys().next();
+    let mut expected: Vec<(String, f32, &ModelRecord)> = checkpoint
+        .iter()
+        .filter(|(id, record)| {
+            record_matches_filter(mutation, id, first_visible, record, filter.as_ref())
+        })
+        .map(|(id, record)| {
+            (
+                id.clone(),
+                oracle_distance(
+                    mutation,
+                    id,
+                    first_visible,
+                    ns_model.spec.metric,
+                    &query,
+                    &record.values,
+                ),
+                record,
+            )
+        })
+        .collect();
+    expected.sort_by(|left, right| {
+        left.1
+            .total_cmp(&right.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    let k = top_k.min(expected.len());
+    let mut violations = Vec::new();
+    if results.len() != k {
+        violations.push(violation(
+            ViolationId::I8AsOfExact,
+            rec,
+            ns,
+            "as_of result length did not match checkpoint top-k",
+            serde_json::json!({
+                "generation": generation,
+                "expected_len": k,
+                "actual_len": results.len(),
+            }),
+        ));
+    }
+    if k == 0 {
+        return violations;
+    }
+
+    let kth = expected[k - 1].1;
+    let eps = score_eps(kth);
+    let returned_ids = results
+        .iter()
+        .map(|result| result.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for result in &results {
+        let Some((_, expected_score, expected_record)) =
+            expected.iter().find(|(id, _, _)| id == &result.id)
+        else {
+            violations.push(violation(
+                ViolationId::I8AsOfExact,
+                rec,
+                ns,
+                "as_of query returned id outside checkpoint",
+                serde_json::json!({
+                    "id": result.id,
+                    "generation": generation,
+                }),
+            ));
+            continue;
+        };
+        if *expected_score > kth + eps {
+            violations.push(violation(
+                ViolationId::I8AsOfExact,
+                rec,
+                ns,
+                "as_of query returned id outside kth tie group",
+                serde_json::json!({
+                    "id": result.id,
+                    "score": expected_score,
+                    "kth": kth,
+                    "eps": eps,
+                    "generation": generation,
+                }),
+            ));
+        }
+        if !score_close(result.score, *expected_score) {
+            violations.push(violation(
+                ViolationId::I8AsOfExact,
+                rec,
+                ns,
+                "as_of query score did not match checkpoint distance",
+                serde_json::json!({
+                    "id": result.id,
+                    "actual": result.score,
+                    "expected": expected_score,
+                    "generation": generation,
+                }),
+            ));
+        }
+        if include_attributes(q)
+            && !attributes_equal(&result.attributes, &expected_record.attributes)
+        {
+            violations.push(violation(
+                ViolationId::I8AsOfExact,
+                rec,
+                ns,
+                "as_of query attributes did not match checkpoint",
+                serde_json::json!({
+                    "id": result.id,
+                    "actual": result.attributes,
+                    "expected": expected_record.attributes,
+                    "generation": generation,
+                }),
+            ));
+        }
+    }
+
+    for (id, score, _) in &expected {
+        if *score >= kth - eps {
+            continue;
+        }
+        if !returned_ids.contains(id.as_str()) {
+            violations.push(violation(
+                ViolationId::I8AsOfExact,
+                rec,
+                ns,
+                "as_of query omitted id below kth tie boundary",
+                serde_json::json!({
+                    "id": id,
+                    "score": score,
+                    "kth": kth,
+                    "eps": eps,
+                    "generation": generation,
+                }),
+            ));
+        }
     }
 
     violations
@@ -793,9 +1035,12 @@ fn check_debug_structural(
 }
 
 fn check_i3_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
-    let Op::Query { ns, q, .. } = &rec.op else {
+    let Op::Query { ns, q, as_of } = &rec.op else {
         return Vec::new();
     };
+    if as_of.is_some() {
+        return Vec::new();
+    }
     let QueryOracleClass::Membership { consistency } = q.class else {
         return Vec::new();
     };
@@ -1033,9 +1278,12 @@ fn check_i6_pagination_equivalence(rec: &OpRecord) -> Vec<Violation> {
 }
 
 fn check_i7_fts_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
-    let Op::Query { ns, q, .. } = &rec.op else {
+    let Op::Query { ns, q, as_of } = &rec.op else {
         return Vec::new();
     };
+    if as_of.is_some() {
+        return Vec::new();
+    }
     let query_words = bm25_query_words(&q.body);
     if query_words.is_empty() {
         return Vec::new();
@@ -1156,6 +1404,21 @@ fn first_visible_id(ns_model: &NsModel, consistency: ConsistencyLevel) -> Option
         .visible_records(consistency)
         .first()
         .map(|(id, _)| *id)
+}
+
+fn checkpoint_for_as_of<'a>(
+    ns_model: &'a NsModel,
+    as_of: &AsOfTarget,
+) -> Option<(u64, &'a BTreeMap<String, ModelRecord>)> {
+    let generation = match as_of {
+        AsOfTarget::Generation(generation) => *generation,
+        AsOfTarget::Snapshot(name) => *ns_model.snapshots.get(name)?,
+        AsOfTarget::Timestamp(_) => return None,
+    };
+    ns_model
+        .checkpoints
+        .get(&generation)
+        .map(|checkpoint| (generation, checkpoint))
 }
 
 fn record_matches_filter(

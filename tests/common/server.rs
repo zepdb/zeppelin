@@ -466,6 +466,7 @@ pub async fn cleanup_ns(store: &ZeppelinStore, ns: &str) {
 
 pub struct FullTestServer {
     pub base_url: String,
+    pub store: ZeppelinStore,
     pub cache: Arc<DiskCache>,
     pub cache_dir: tempfile::TempDir,
     pub compactor: Arc<Compactor>,
@@ -569,6 +570,7 @@ pub async fn start_test_server_full(
 
     FullTestServer {
         base_url,
+        store,
         cache,
         cache_dir,
         compactor,

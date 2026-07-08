@@ -9,7 +9,10 @@ use zeppelin::index::quantization::QuantizationType;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter};
 
 use super::model::Model;
-use super::ops::{GenVector, GeneratedQuery, InvalidProbe, NamespaceSpec, Op, QueryOracleClass};
+use super::ops::{
+    AsOfTarget, GenVector, GeneratedQuery, InvalidProbe, MaintenanceKind, NamespaceSpec, Op,
+    QueryOracleClass,
+};
 use super::vocab;
 
 const DELETE_REUPSERT_TAG: &str = "delete-then-reupsert";
@@ -48,6 +51,7 @@ pub struct AdversarialGenerator {
     namespaces: Vec<GenNamespace>,
     pending: VecDeque<Op>,
     scenario: ScenarioState,
+    phase3_started: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +129,7 @@ impl AdversarialGenerator {
             namespaces,
             pending,
             scenario: ScenarioState::Waiting,
+            phase3_started: false,
         };
         let exact_ns = generator
             .namespaces
@@ -358,10 +363,132 @@ impl AdversarialGenerator {
         if let Some(op) = self.pending.pop_front() {
             return op;
         }
+        if let Some(op) = self.maybe_start_phase3_script(model) {
+            return op;
+        }
         if let Some(op) = self.next_scenario_op(model) {
             return op;
         }
         self.weighted_op(model)
+    }
+
+    fn maybe_start_phase3_script(&mut self, model: &Model) -> Option<Op> {
+        if self.phase3_started {
+            return None;
+        }
+        let exact_index = self
+            .namespaces
+            .iter()
+            .position(|namespace| namespace.spec.is_exact())?;
+        let exact = self.namespaces[exact_index].clone();
+        let ns_model = model.namespaces.get(&exact.name)?;
+        if ns_model.live.is_empty() || ns_model.live_generation == 0 {
+            return None;
+        }
+
+        self.phase3_started = true;
+        let generation = ns_model.live_generation;
+        let snapshot = format!("snap-{generation}");
+        let clone_target = format!("{}-clone-{generation}", exact.name);
+        let clone_ids = ns_model.live.keys().cloned().collect::<Vec<_>>();
+        self.namespaces.push(GenNamespace {
+            name: clone_target.clone(),
+            spec: exact.spec.clone(),
+            next_id: 0,
+        });
+
+        let q_generation = self.exhaustive_query(model, &exact.name, Some("as-of-200"));
+        let q_snapshot = self.exhaustive_query(model, &exact.name, Some("as-of-200"));
+        let mut q_zero = self.exhaustive_query(model, &exact.name, Some("as-of-410"));
+        q_zero.class = QueryOracleClass::ExpectError {
+            status: 410,
+            code: "POINT_IN_TIME_NOT_RETAINED".to_string(),
+        };
+        let mut q_future = self.exhaustive_query(model, &exact.name, Some("as-of-410"));
+        q_future.class = QueryOracleClass::ExpectError {
+            status: 410,
+            code: "POINT_IN_TIME_NOT_RETAINED".to_string(),
+        };
+        let q_clone = self.exhaustive_query(model, &exact.name, Some("clone-independence"));
+        self.pending.push_back(Op::CreateSnapshot {
+            ns: exact.name.clone(),
+            name: snapshot.clone(),
+        });
+        self.pending.push_back(Op::GetSnapshot {
+            ns: exact.name.clone(),
+            name: snapshot.clone(),
+        });
+        self.pending.push_back(Op::ListSnapshots {
+            ns: exact.name.clone(),
+        });
+        self.pending.push_back(Op::Query {
+            ns: exact.name.clone(),
+            q: q_generation,
+            as_of: Some(AsOfTarget::Generation(generation)),
+        });
+        self.pending.push_back(Op::Query {
+            ns: exact.name.clone(),
+            q: q_snapshot,
+            as_of: Some(AsOfTarget::Snapshot(snapshot.clone())),
+        });
+        self.pending.push_back(Op::Query {
+            ns: exact.name.clone(),
+            q: q_zero,
+            as_of: Some(AsOfTarget::Generation(0)),
+        });
+        self.pending.push_back(Op::Query {
+            ns: exact.name.clone(),
+            q: q_future,
+            as_of: Some(AsOfTarget::Generation(generation + 10_000)),
+        });
+        self.pending.push_back(Op::GcCycle {
+            ns: exact.name.clone(),
+            keep_count: 4,
+        });
+        self.pending.push_back(Op::CompactEndpoint {
+            ns: exact.name.clone(),
+        });
+        self.pending.push_back(Op::PatchIndexConfig {
+            ns: exact.name.clone(),
+            patch: json!({ "nlist": exact.spec.num_centroids }),
+        });
+        self.pending.push_back(Op::Hydrate {
+            ns: exact.name.clone(),
+        });
+        self.pending.push_back(Op::CloneNamespace {
+            source: exact.name.clone(),
+            target: clone_target.clone(),
+            as_of: AsOfTarget::Generation(generation),
+        });
+        self.pending.push_back(Op::CompactEndpoint {
+            ns: clone_target.clone(),
+        });
+        self.pending.push_back(Op::FetchVectors {
+            ns: clone_target.clone(),
+            ids: clone_ids,
+            consistency: ConsistencyLevel::Strong,
+        });
+        self.pending.push_back(Op::Query {
+            ns: clone_target.clone(),
+            q: q_clone,
+            as_of: None,
+        });
+        self.pending.push_back(Op::ProbeSandwich {
+            ns: exact.name.clone(),
+            maintenance: MaintenanceKind::GcCycle,
+        });
+        self.pending.push_back(Op::DeleteSnapshot {
+            ns: exact.name.clone(),
+            name: snapshot,
+        });
+        self.pending.push_back(Op::DeleteNamespace {
+            ns: clone_target.clone(),
+        });
+        self.pending.push_back(Op::CreateNamespace {
+            ns: clone_target,
+            spec: exact.spec.clone(),
+        });
+        self.pending.pop_front()
     }
 
     pub fn exhaustive_query(

@@ -13,6 +13,8 @@ pub enum OracleMutation {
     PhantomId,
     LeakTombstone,
     FilterSkew,
+    GcEatsLiveKey,
+    StaleCheckpoint,
 }
 
 impl OracleMutation {
@@ -24,6 +26,8 @@ impl OracleMutation {
             "phantom-id" => Self::PhantomId,
             "leak-tombstone" => Self::LeakTombstone,
             "filter-skew" => Self::FilterSkew,
+            "gc-eats-live-key" => Self::GcEatsLiveKey,
+            "stale-checkpoint" => Self::StaleCheckpoint,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -36,6 +40,8 @@ impl OracleMutation {
             Self::PhantomId => "phantom-id",
             Self::LeakTombstone => "leak-tombstone",
             Self::FilterSkew => "filter-skew",
+            Self::GcEatsLiveKey => "gc-eats-live-key",
+            Self::StaleCheckpoint => "stale-checkpoint",
         }
     }
 }
@@ -89,6 +95,7 @@ impl Model {
         op: &Op,
         status: u16,
         gen_after: Option<u64>,
+        response: &serde_json::Value,
         mutation: Option<OracleMutation>,
     ) {
         if !(200..300).contains(&status) {
@@ -116,6 +123,9 @@ impl Model {
                     model.insert_phantom_once();
                 }
                 model.checkpoint(gen_after);
+                if mutation == Some(OracleMutation::StaleCheckpoint) {
+                    model.corrupt_latest_checkpoint();
+                }
             }
             Op::DeleteVectors { ns, ids } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
@@ -131,6 +141,9 @@ impl Model {
                     }
                 }
                 model.checkpoint(gen_after);
+                if mutation == Some(OracleMutation::StaleCheckpoint) {
+                    model.corrupt_latest_checkpoint();
+                }
             }
             Op::CompactInline { ns } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
@@ -139,13 +152,85 @@ impl Model {
                 model.compacted_live = model.live.clone();
                 model.wal_tombstones.clear();
                 model.checkpoint(gen_after);
+                if mutation == Some(OracleMutation::StaleCheckpoint) {
+                    model.corrupt_latest_checkpoint();
+                }
+            }
+            Op::CompactEndpoint { ns } | Op::ProbeSandwich { ns, .. } => {
+                let Some(model) = self.namespaces.get_mut(ns) else {
+                    panic!("maintenance acked for unknown namespace {ns}");
+                };
+                model.compacted_live = model.live.clone();
+                model.wal_tombstones.clear();
+                model.checkpoint(gen_after);
+                if mutation == Some(OracleMutation::StaleCheckpoint) {
+                    model.corrupt_latest_checkpoint();
+                }
+            }
+            Op::CreateSnapshot { ns, name } => {
+                let Some(model) = self.namespaces.get_mut(ns) else {
+                    panic!("snapshot acked for unknown namespace {ns}");
+                };
+                let generation = response["generation"]
+                    .as_u64()
+                    .or(gen_after)
+                    .unwrap_or_else(|| {
+                        panic!("snapshot ack missing generation for namespace {ns}")
+                    });
+                model.snapshots.insert(name.clone(), generation);
+            }
+            Op::DeleteSnapshot { ns, name } => {
+                if let Some(model) = self.namespaces.get_mut(ns) {
+                    model.snapshots.remove(name);
+                }
+            }
+            Op::GcCycle { ns, .. } => {
+                if let Some(model) = self.namespaces.get_mut(ns) {
+                    model.retained_generations = response["retained_generations"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|value| {
+                            value.as_u64().unwrap_or_else(|| {
+                                panic!("gc retained generation was not a u64: {value}")
+                            })
+                        })
+                        .collect();
+                }
+            }
+            Op::CloneNamespace { source, target, .. } => {
+                let Some(source_model) = self.namespaces.get(source) else {
+                    panic!("clone acked for unknown source namespace {source}");
+                };
+                let generation = response["generation"]
+                    .as_u64()
+                    .or(gen_after)
+                    .unwrap_or(source_model.live_generation);
+                let live = source_model
+                    .checkpoints
+                    .get(&generation)
+                    .cloned()
+                    .unwrap_or_else(|| source_model.live.clone());
+                let mut target_model = NsModel::new(source_model.spec.clone(), 1);
+                target_model.live = live.clone();
+                target_model.compacted_live = live.clone();
+                target_model.checkpoints.insert(1, live);
+                target_model.live_generation = 1;
+                self.namespaces.insert(target.clone(), target_model);
+            }
+            Op::DeleteNamespace { ns } => {
+                self.namespaces.remove(ns);
             }
             Op::GetNamespace { .. }
             | Op::FetchVectors { .. }
             | Op::Query { .. }
             | Op::BatchQuery { .. }
             | Op::PaginateAll { .. }
-            | Op::InvalidProbe { .. } => {}
+            | Op::InvalidProbe { .. }
+            | Op::GetSnapshot { .. }
+            | Op::ListSnapshots { .. }
+            | Op::PatchIndexConfig { .. }
+            | Op::Hydrate { .. } => {}
         }
     }
 }
@@ -196,6 +281,19 @@ impl NsModel {
                 attributes: Some(attributes),
             },
         );
+    }
+
+    fn corrupt_latest_checkpoint(&mut self) {
+        let Some((_, checkpoint)) = self.checkpoints.iter_mut().next_back() else {
+            return;
+        };
+        let Some(record) = checkpoint.values_mut().next() else {
+            return;
+        };
+        let Some(first) = record.values.first_mut() else {
+            return;
+        };
+        *first += 10_000.0;
     }
 }
 

@@ -2,8 +2,10 @@ use std::time::{Duration, Instant};
 
 use reqwest::{Client, Method, StatusCode};
 use serde_json::json;
-use zeppelin::config::Config;
+use zeppelin::compaction::gc;
+use zeppelin::config::{Config, GcConfig};
 use zeppelin::types::ConsistencyLevel;
+use zeppelin::wal::Manifest;
 
 use crate::common::harness::TestHarness;
 use crate::common::server::{cleanup_ns, start_test_server_full, FullTestServer};
@@ -13,6 +15,7 @@ use super::generator::{AdversarialGenerator, Coverage};
 use super::model::{Model, OracleMutation};
 use super::ops::{InvalidProbe, Op, OpRecord, QueryOracleClass};
 use super::oracle::{self, Violation, ViolationId};
+use super::s3_oracle::{self, S3Tracker};
 use super::{PreserveMode, RunMode, RunnerEnv};
 
 #[derive(Debug, Clone)]
@@ -68,6 +71,8 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 OracleMutation::PhantomId,
                 OracleMutation::LeakTombstone,
                 OracleMutation::FilterSkew,
+                OracleMutation::GcEatsLiveKey,
+                OracleMutation::StaleCheckpoint,
             ]
         },
         |mutation| vec![mutation],
@@ -121,6 +126,8 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             OracleMutation::SkewScore => fired.contains(&ViolationId::I1StrongExact),
             OracleMutation::LeakTombstone => fired.contains(&ViolationId::I3EventualExact),
             OracleMutation::FilterSkew => fired.contains(&ViolationId::I1StrongExact),
+            OracleMutation::GcEatsLiveKey => fired.contains(&ViolationId::I14S3Reachability),
+            OracleMutation::StaleCheckpoint => fired.contains(&ViolationId::I8AsOfExact),
         };
         assert!(
             accepted,
@@ -158,6 +165,7 @@ async fn run_seed(
     let mut model = Model::default();
     let mut coverage = Coverage::default();
     let mut created_namespaces = Vec::new();
+    let mut s3_tracker = S3Tracker::default();
     let mut op_index = 0u64;
     let mut failed = false;
     let mut failure_violations = Vec::new();
@@ -173,6 +181,7 @@ async fn run_seed(
             &mut artifacts,
             &mut model,
             &mut coverage,
+            &mut s3_tracker,
             &op,
             op_index,
             started,
@@ -182,7 +191,21 @@ async fn run_seed(
         if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
             created_namespaces.push(op.namespace().to_string());
         }
-        if matches!(op, Op::CompactInline { .. }) && (200..300).contains(&step.status) {
+        if let Op::CloneNamespace { target, .. } = &op {
+            if (200..300).contains(&step.status) {
+                created_namespaces.push(target.clone());
+            }
+        }
+        if let Op::DeleteNamespace { ns } = &op {
+            if (200..300).contains(&step.status) {
+                created_namespaces.retain(|created| created != ns);
+            }
+        }
+        if matches!(
+            op,
+            Op::CompactInline { .. } | Op::CompactEndpoint { .. } | Op::ProbeSandwich { .. }
+        ) && (200..300).contains(&step.status)
+        {
             compactions += 1;
         }
         op_index += 1;
@@ -200,6 +223,7 @@ async fn run_seed(
                     &mut artifacts,
                     &mut model,
                     &mut coverage,
+                    &mut s3_tracker,
                     &probe_op,
                     op_index,
                     started,
@@ -223,6 +247,7 @@ async fn run_seed(
             &mut artifacts,
             &mut model,
             &mut coverage,
+            &mut s3_tracker,
             &mut generator,
             &created_namespaces,
             &mut op_index,
@@ -309,19 +334,65 @@ async fn execute_recorded_op(
     artifacts: &mut SeedArtifacts,
     model: &mut Model,
     coverage: &mut Coverage,
+    s3_tracker: &mut S3Tracker,
     op: &Op,
     index: u64,
     started: Instant,
     mutation: Option<OracleMutation>,
 ) -> StepOutcome {
     let mut rec = execute_op(client, server, op, index, started).await;
-    if op.is_mutating() && (200..300).contains(&rec.status) {
-        rec.gen_after = Some(compact_generation(client, &server.base_url, op.namespace()).await);
+    if (200..300).contains(&rec.status) {
+        match op {
+            Op::CloneNamespace { .. } => {
+                rec.gen_after = rec
+                    .response
+                    .get("generation")
+                    .and_then(serde_json::Value::as_u64);
+            }
+            Op::DeleteNamespace { .. } | Op::PatchIndexConfig { .. } => {}
+            _ if op.is_mutating() => {
+                rec.gen_after =
+                    Some(compact_generation(client, &server.base_url, op.namespace()).await);
+            }
+            _ => {}
+        }
     }
     coverage.record(op);
     artifacts.write_op(&rec);
-    model.apply(op, rec.status, rec.gen_after, mutation);
-    let violations = oracle::check_op(model, &rec, RunMode::Deterministic, mutation);
+    model.apply(op, rec.status, rec.gen_after, &rec.response, mutation);
+    if (200..300).contains(&rec.status) {
+        if let Op::DeleteNamespace { ns } = op {
+            s3_tracker.forget_namespace(ns);
+        }
+    }
+    let mut violations = oracle::check_op(model, &rec, RunMode::Deterministic, mutation);
+    if (200..300).contains(&rec.status) {
+        if let Op::CloneNamespace { target, .. } = op {
+            violations.extend(
+                s3_oracle::check_clone_manifest(&server.store, target, &rec.response, rec.index)
+                    .await,
+            );
+        }
+    }
+    if rec.index % 25 == 0 {
+        for (ns, ns_model) in &model.namespaces {
+            if !ns_model.spec.is_exact() {
+                continue;
+            }
+            let status = compact_status(client, &server.base_url, ns).await;
+            violations.extend(
+                s3_tracker
+                    .check_namespace(
+                        &server.store,
+                        ns,
+                        rec.index,
+                        &status,
+                        mutation == Some(OracleMutation::GcEatsLiveKey),
+                    )
+                    .await,
+            );
+        }
+    }
     StepOutcome {
         status: rec.status,
         violations,
@@ -536,6 +607,176 @@ async fn execute_op(
             }
             (method, path, status, response)
         }
+        Op::CompactEndpoint { ns } => {
+            let path = format!("/v1/namespaces/{ns}/compact");
+            let (trigger_status, trigger) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                None,
+            )
+            .await;
+            let mut final_status = trigger_status;
+            let mut status_body = serde_json::Value::Null;
+            if (200..300).contains(&trigger_status) {
+                status_body = wait_compaction_ready(client, &server.base_url, ns).await;
+                final_status = StatusCode::OK.as_u16();
+            }
+            (
+                "POST".to_string(),
+                path,
+                final_status,
+                json!({
+                    "trigger_status": trigger_status,
+                    "trigger": trigger,
+                    "status": status_body
+                }),
+            )
+        }
+        Op::GcCycle { ns, keep_count } => {
+            let path = format!("gc::run_gc_cycle({ns})");
+            let config = gc_config(*keep_count);
+            let report = gc::run_gc_cycle(&server.store, ns, &config)
+                .await
+                .unwrap_or_else(|error| panic!("gc cycle failed for {ns}: {error}"));
+            let retained_generations = Manifest::list_history(&server.store, ns)
+                .await
+                .unwrap_or_else(|error| panic!("history list after gc failed for {ns}: {error}"))
+                .into_iter()
+                .map(|entry| entry.version)
+                .collect::<Vec<_>>();
+            (
+                "IN_PROCESS".to_string(),
+                path,
+                StatusCode::OK.as_u16(),
+                json!({
+                    "candidates_marked": report.candidates_marked,
+                    "objects_deleted": report.objects_deleted,
+                    "pending_deletes_deleted": report.pending_deletes_deleted,
+                    "pending_deletes_pruned": report.pending_deletes_pruned,
+                    "pending_deletes_retained": report.pending_deletes_retained,
+                    "bytes_reclaimed": report.bytes_reclaimed,
+                    "candidates_skipped": report.candidates_skipped,
+                    "retained_generations": retained_generations,
+                    "keep_count": keep_count
+                }),
+            )
+        }
+        Op::CreateSnapshot { ns, name } => {
+            let path = format!("/v1/namespaces/{ns}/snapshots/{name}");
+            let (status, response) = request_json(
+                client,
+                Method::PUT,
+                &format!("{}{}", server.base_url, path),
+                None,
+            )
+            .await;
+            ("PUT".to_string(), path, status, response)
+        }
+        Op::GetSnapshot { ns, name } => {
+            let path = format!("/v1/namespaces/{ns}/snapshots/{name}");
+            let (status, response) = request_json(
+                client,
+                Method::GET,
+                &format!("{}{}", server.base_url, path),
+                None,
+            )
+            .await;
+            ("GET".to_string(), path, status, response)
+        }
+        Op::ListSnapshots { ns } => {
+            let path = format!("/v1/namespaces/{ns}/snapshots");
+            let (status, response) = request_json(
+                client,
+                Method::GET,
+                &format!("{}{}", server.base_url, path),
+                None,
+            )
+            .await;
+            ("GET".to_string(), path, status, response)
+        }
+        Op::DeleteSnapshot { ns, name } => {
+            let path = format!("/v1/namespaces/{ns}/snapshots/{name}");
+            let (status, response) = request_json(
+                client,
+                Method::DELETE,
+                &format!("{}{}", server.base_url, path),
+                None,
+            )
+            .await;
+            ("DELETE".to_string(), path, status, response)
+        }
+        Op::CloneNamespace {
+            source,
+            target,
+            as_of,
+        } => {
+            let path = format!("/v1/namespaces/{source}/clone");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({
+                    "target": target,
+                    "as_of": as_of.to_string()
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        Op::PatchIndexConfig { ns, patch } => {
+            let path = format!("/v1/namespaces/{ns}/index_config");
+            let (status, response) = request_json(
+                client,
+                Method::PATCH,
+                &format!("{}{}", server.base_url, path),
+                Some(patch.clone()),
+            )
+            .await;
+            ("PATCH".to_string(), path, status, response)
+        }
+        Op::Hydrate { ns } => {
+            let path = format!("/v1/namespaces/{ns}/hydrate");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                None,
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        Op::DeleteNamespace { ns } => {
+            let path = format!("/v1/namespaces/{ns}");
+            let (status, response) = request_json(
+                client,
+                Method::DELETE,
+                &format!("{}{}", server.base_url, path),
+                None,
+            )
+            .await;
+            if (200..300).contains(&status) {
+                wait_namespace_gone(client, &server.base_url, ns).await;
+            }
+            ("DELETE".to_string(), path, status, response)
+        }
+        Op::ProbeSandwich { ns, maintenance } => {
+            let path = format!("probe_sandwich({ns},{maintenance:?})");
+            let before = compact_status(client, &server.base_url, ns).await;
+            let maintenance_response =
+                execute_sandwich_maintenance(client, server, ns, *maintenance).await;
+            let after = compact_status(client, &server.base_url, ns).await;
+            (
+                "COMPOSITE".to_string(),
+                path,
+                StatusCode::OK.as_u16(),
+                json!({
+                    "before": before,
+                    "maintenance": maintenance_response,
+                    "after": after
+                }),
+            )
+        }
         Op::CompactInline { ns } => {
             let result = server
                 .compactor
@@ -738,6 +979,29 @@ async fn execute_invalid_probe(
             .await;
             ("POST".to_string(), path, status, response)
         }
+        InvalidProbe::AsOfGenZero | InvalidProbe::AsOfGenFuture => {
+            let generation = if probe == InvalidProbe::AsOfGenZero {
+                0
+            } else {
+                compact_generation(client, &server.base_url, ns).await + 10_000
+            };
+            let path = format!("/v1/namespaces/{ns}/query?as_of={generation}");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({
+                    "sources": [{
+                        "type": "ann",
+                        "vector": [0.0, 0.0]
+                    }],
+                    "fusion": { "type": "none" },
+                    "top_k": 1
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
     }
 }
 
@@ -796,6 +1060,103 @@ async fn compact_status(client: &Client, base_url: &str, ns: &str) -> serde_json
         .unwrap_or_else(|error| panic!("compact/status JSON parse failed for {ns}: {error}"))
 }
 
+async fn wait_compaction_ready(client: &Client, base_url: &str, ns: &str) -> serde_json::Value {
+    for _ in 0..300 {
+        let status = compact_status(client, base_url, ns).await;
+        if status["ready"].as_bool().unwrap_or(false) {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("compact endpoint did not reach ready for {ns}");
+}
+
+async fn wait_namespace_gone(client: &Client, base_url: &str, ns: &str) {
+    for _ in 0..300 {
+        let response = client
+            .get(format!("{base_url}/v1/namespaces/{ns}"))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("namespace delete poll failed for {ns}: {error}"));
+        match response.status() {
+            StatusCode::NOT_FOUND => return,
+            StatusCode::OK | StatusCode::GONE | StatusCode::ACCEPTED => {}
+            status => panic!("unexpected namespace delete poll status for {ns}: {status}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("namespace {ns} did not reach 404 after delete");
+}
+
+async fn execute_sandwich_maintenance(
+    client: &Client,
+    server: &FullTestServer,
+    ns: &str,
+    maintenance: super::ops::MaintenanceKind,
+) -> serde_json::Value {
+    match maintenance {
+        super::ops::MaintenanceKind::CompactInline => {
+            let result = server
+                .compactor
+                .compact(ns)
+                .await
+                .unwrap_or_else(|error| panic!("sandwich compaction failed for {ns}: {error}"));
+            json!({
+                "kind": "compact_inline",
+                "segment_id": result.segment_id,
+                "vectors_compacted": result.vectors_compacted,
+            })
+        }
+        super::ops::MaintenanceKind::CompactEndpoint => {
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}/v1/namespaces/{ns}/compact", server.base_url),
+                None,
+            )
+            .await;
+            let ready = if (200..300).contains(&status) {
+                Some(wait_compaction_ready(client, &server.base_url, ns).await)
+            } else {
+                None
+            };
+            json!({ "kind": "compact_endpoint", "status": status, "response": response, "ready": ready })
+        }
+        super::ops::MaintenanceKind::GcCycle => {
+            let config = gc_config(4);
+            let report = gc::run_gc_cycle(&server.store, ns, &config)
+                .await
+                .unwrap_or_else(|error| panic!("sandwich gc failed for {ns}: {error}"));
+            json!({
+                "kind": "gc_cycle",
+                "candidates_marked": report.candidates_marked,
+                "objects_deleted": report.objects_deleted,
+            })
+        }
+        super::ops::MaintenanceKind::Hydrate => {
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}/v1/namespaces/{ns}/hydrate", server.base_url),
+                None,
+            )
+            .await;
+            json!({ "kind": "hydrate", "status": status, "response": response })
+        }
+    }
+}
+
+fn gc_config(keep_count: u64) -> GcConfig {
+    GcConfig {
+        horizon_secs: 0,
+        compaction_upload_window_secs: 0,
+        skew_slop_secs: 0,
+        allow_unsafe_short_horizon: true,
+        manifest_history_keep_count: keep_count as usize,
+        pitr_retention_secs: 0,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn quiesce_and_verify(
     client: &Client,
@@ -803,6 +1164,7 @@ async fn quiesce_and_verify(
     artifacts: &mut SeedArtifacts,
     model: &mut Model,
     coverage: &mut Coverage,
+    s3_tracker: &mut S3Tracker,
     generator: &mut AdversarialGenerator,
     namespaces: &[String],
     op_index: &mut u64,
@@ -811,24 +1173,70 @@ async fn quiesce_and_verify(
     mutation: Option<OracleMutation>,
 ) -> Vec<Violation> {
     for ns in namespaces {
-        for _ in 0..20 {
-            let status = compact_status(client, &server.base_url, ns).await;
-            let ready = status["ready"].as_bool().unwrap_or(false);
-            let uncompacted = status["uncompacted_fragments"].as_u64().unwrap_or(u64::MAX);
-            if ready && uncompacted == 0 {
-                break;
-            }
-            let op = Op::CompactInline { ns: ns.clone() };
+        let compact = Op::CompactEndpoint { ns: ns.clone() };
+        let step = execute_recorded_op(
+            client, server, artifacts, model, coverage, s3_tracker, &compact, *op_index, started,
+            mutation,
+        )
+        .await;
+        *op_index += 1;
+        *compactions += u64::from((200..300).contains(&step.status));
+        if !step.violations.is_empty() {
+            return step.violations;
+        }
+
+        for _ in 0..2 {
+            let gc = Op::GcCycle {
+                ns: ns.clone(),
+                keep_count: 4,
+            };
             let step = execute_recorded_op(
-                client, server, artifacts, model, coverage, &op, *op_index, started, mutation,
+                client, server, artifacts, model, coverage, s3_tracker, &gc, *op_index, started,
+                mutation,
             )
             .await;
             *op_index += 1;
-            *compactions += 1;
             if !step.violations.is_empty() {
                 return step.violations;
             }
         }
+
+        let status = compact_status(client, &server.base_url, ns).await;
+        let expected_live = model
+            .namespaces
+            .get(ns)
+            .map_or(0, |ns_model| ns_model.live.len());
+        let mut violations = s3_oracle::check_quiescent_namespace(
+            &server.store,
+            ns,
+            expected_live,
+            &status,
+            *op_index,
+        )
+        .await;
+        violations.extend(
+            if model
+                .namespaces
+                .get(ns)
+                .is_some_and(|ns_model| ns_model.spec.is_exact())
+            {
+                s3_tracker
+                    .check_namespace(
+                        &server.store,
+                        ns,
+                        *op_index,
+                        &status,
+                        mutation == Some(OracleMutation::GcEatsLiveKey),
+                    )
+                    .await
+            } else {
+                Vec::new()
+            },
+        );
+        if !violations.is_empty() {
+            return violations;
+        }
+
         let ids = model
             .namespaces
             .get(ns)
@@ -840,7 +1248,8 @@ async fn quiesce_and_verify(
             consistency: ConsistencyLevel::Strong,
         };
         let step = execute_recorded_op(
-            client, server, artifacts, model, coverage, &fetch, *op_index, started, mutation,
+            client, server, artifacts, model, coverage, s3_tracker, &fetch, *op_index, started,
+            mutation,
         )
         .await;
         *op_index += 1;
@@ -855,7 +1264,8 @@ async fn quiesce_and_verify(
             as_of: None,
         };
         let step = execute_recorded_op(
-            client, server, artifacts, model, coverage, &query, *op_index, started, mutation,
+            client, server, artifacts, model, coverage, s3_tracker, &query, *op_index, started,
+            mutation,
         )
         .await;
         *op_index += 1;
