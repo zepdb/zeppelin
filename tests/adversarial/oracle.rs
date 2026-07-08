@@ -1,9 +1,10 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
-use zeppelin::types::{AttributeValue, ConsistencyLevel};
+use zeppelin::index::filter::evaluate_filter;
+use zeppelin::types::{AttributeValue, ConsistencyLevel, Filter};
 
-use super::model::{model_distance, Model, ModelRecord, OracleMutation};
+use super::model::{model_distance, Model, ModelRecord, NsModel, OracleMutation};
 use super::ops::{GeneratedQuery, Op, OpRecord, QueryOracleClass};
 use super::RunMode;
 
@@ -14,7 +15,12 @@ pub const SCORE_REL_EPS: f32 = 1e-4;
 pub enum ViolationId {
     I1StrongExact,
     I2DeletedNeverReturned,
+    I3EventualExact,
     I4FetchExact,
+    I5BatchEquivalent,
+    I6PaginationEquivalent,
+    I7FtsMembership,
+    I10FailedValidationNoWal,
     I11ErrorEnvelope,
     I12StructuralSanity,
 }
@@ -43,23 +49,25 @@ pub fn check_op(
     let mut violations = Vec::new();
     violations.extend(check_i11_error_envelope(rec));
     violations.extend(check_expected_error(rec));
+    violations.extend(check_i10_failed_validation_no_wal(rec));
     if (200..300).contains(&rec.status) {
         violations.extend(check_i2_deleted_never_returned(model, rec));
         violations.extend(check_i4_fetch_exact(model, rec, mode));
-        violations.extend(check_i12_structural_sanity(rec));
+        violations.extend(check_i12_structural_sanity(model, rec));
         violations.extend(check_i1_strong_exact(model, rec, mode, mutation));
+        violations.extend(check_i3_membership(model, rec));
+        violations.extend(check_i5_batch_equivalence(rec));
+        violations.extend(check_i6_pagination_equivalence(rec));
+        violations.extend(check_i7_fts_membership(model, rec));
     }
     violations
 }
 
-/// I1 — Strong exact top-k
+/// I1/I3 — Exact top-k
 ///
-/// Deterministic; `ExactAnn`; strong. Let `V = {id in live : filter
-/// matches}`. Phase 1 has no filters, so `V = live`. The model computes scalar
-/// distance and uses the tie-group epsilon rule: `results.len() == k`; every
-/// returned id is in `V`; every returned id has `d(id) <= kth + eps`; every id
-/// with `d(id) < kth - eps` is returned; returned scores match scalar distance
-/// within eps; scores are ascending; requested attributes match exactly.
+/// Deterministic; `ExactAnn`. Strong uses `live`; eventual uses
+/// `compacted_live \ wal_tombstones`. Filters are evaluated through the
+/// production filter evaluator, with `attributes: None` treated as no match.
 fn check_i1_strong_exact(
     model: &Model,
     rec: &OpRecord,
@@ -80,13 +88,10 @@ fn check_i1_strong_exact(
     else {
         return Vec::new();
     };
-    if *consistency != ConsistencyLevel::Strong {
-        return Vec::new();
-    }
-    assert!(filter.is_none(), "filters land in Phase 2");
+    let violation_id = exact_violation_id(*consistency);
     let Some(ns_model) = model.namespaces.get(ns) else {
         return vec![violation(
-            ViolationId::I1StrongExact,
+            violation_id,
             rec,
             ns,
             "query response for unknown namespace",
@@ -96,7 +101,7 @@ fn check_i1_strong_exact(
     let query = query_vector(q);
     let Ok(results) = query_results(&rec.response) else {
         return vec![violation(
-            ViolationId::I1StrongExact,
+            violation_id,
             rec,
             ns,
             "query response did not contain parseable results",
@@ -104,16 +109,20 @@ fn check_i1_strong_exact(
         )];
     };
 
+    let first_visible = first_visible_id(ns_model, *consistency);
     let mut expected: Vec<(String, f32, &ModelRecord)> = ns_model
-        .live
-        .iter()
+        .visible_records(*consistency)
+        .into_iter()
+        .filter(|(id, record)| {
+            record_matches_filter(mutation, id, first_visible, record, filter.as_ref())
+        })
         .map(|(id, record)| {
             (
                 id.clone(),
                 oracle_distance(
                     mutation,
                     id,
-                    ns_model.live.keys().next(),
+                    first_visible,
                     ns_model.spec.metric,
                     &query,
                     &record.values,
@@ -132,7 +141,7 @@ fn check_i1_strong_exact(
     let mut violations = Vec::new();
     if results.len() != k {
         violations.push(violation(
-            ViolationId::I1StrongExact,
+            violation_id,
             rec,
             ns,
             "result length did not match exact top-k",
@@ -148,7 +157,7 @@ fn check_i1_strong_exact(
     let returned_ids: BTreeSet<&str> = results.iter().map(|result| result.id.as_str()).collect();
     if returned_ids.len() != results.len() {
         violations.push(violation(
-            ViolationId::I1StrongExact,
+            violation_id,
             rec,
             ns,
             "query returned duplicate ids",
@@ -161,7 +170,7 @@ fn check_i1_strong_exact(
             expected.iter().find(|(id, _, _)| id == &result.id)
         else {
             violations.push(violation(
-                ViolationId::I1StrongExact,
+                violation_id,
                 rec,
                 ns,
                 "query returned id outside model live set",
@@ -171,7 +180,7 @@ fn check_i1_strong_exact(
         };
         if *expected_score > kth + eps {
             violations.push(violation(
-                ViolationId::I1StrongExact,
+                violation_id,
                 rec,
                 ns,
                 "query returned id outside kth tie group",
@@ -185,7 +194,7 @@ fn check_i1_strong_exact(
         }
         if !score_close(result.score, *expected_score) {
             violations.push(violation(
-                ViolationId::I1StrongExact,
+                violation_id,
                 rec,
                 ns,
                 "query score did not match model distance",
@@ -196,9 +205,11 @@ fn check_i1_strong_exact(
                 }),
             ));
         }
-        if include_attributes(q) && result.attributes != expected_record.attributes {
+        if include_attributes(q)
+            && !attributes_equal(&result.attributes, &expected_record.attributes)
+        {
             violations.push(violation(
-                ViolationId::I1StrongExact,
+                violation_id,
                 rec,
                 ns,
                 "query attributes did not match model",
@@ -217,7 +228,7 @@ fn check_i1_strong_exact(
         }
         if !returned_ids.contains(id.as_str()) {
             violations.push(violation(
-                ViolationId::I1StrongExact,
+                violation_id,
                 rec,
                 ns,
                 "query omitted id below kth tie boundary",
@@ -229,7 +240,7 @@ fn check_i1_strong_exact(
     for pair in results.windows(2) {
         if pair[0].score > pair[1].score + score_eps(pair[1].score) {
             violations.push(violation(
-                ViolationId::I1StrongExact,
+                violation_id,
                 rec,
                 ns,
                 "query scores were not ascending",
@@ -249,18 +260,7 @@ fn check_i1_strong_exact(
 /// the check applies immediately.
 fn check_i2_deleted_never_returned(model: &Model, rec: &OpRecord) -> Vec<Violation> {
     let (ns, ids) = match &rec.op {
-        Op::Query { ns, .. } => {
-            let Ok(results) = query_results(&rec.response) else {
-                return Vec::new();
-            };
-            (
-                ns.as_str(),
-                results
-                    .into_iter()
-                    .map(|result| result.id)
-                    .collect::<Vec<_>>(),
-            )
-        }
+        Op::Query { ns, .. } => (ns.as_str(), response_ids(&rec.response)),
         Op::FetchVectors { ns, .. } => {
             let Ok(response) = fetch_response(&rec.response) else {
                 return Vec::new();
@@ -274,6 +274,25 @@ fn check_i2_deleted_never_returned(model: &Model, rec: &OpRecord) -> Vec<Violati
                     .collect::<Vec<_>>(),
             )
         }
+        Op::BatchQuery { ns, .. } => (
+            ns.as_str(),
+            rec.response["batch"]["results"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry.get("ok").and_then(serde_json::Value::as_bool) == Some(true))
+                .flat_map(|entry| response_ids(&entry["response"]))
+                .collect::<Vec<_>>(),
+        ),
+        Op::PaginateAll { ns, .. } => (
+            ns.as_str(),
+            rec.response["pages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|page| response_ids(&page["body"]))
+                .collect::<Vec<_>>(),
+        ),
         _ => return Vec::new(),
     };
     let Some(ns_model) = model.namespaces.get(ns) else {
@@ -293,10 +312,10 @@ fn check_i2_deleted_never_returned(model: &Model, rec: &OpRecord) -> Vec<Violati
         .collect()
 }
 
-/// I4 — Fetch exact
+/// I4/I3 — Fetch exact
 ///
-/// Strong fetch returns `results = requested intersect live` in request-relative
-/// order, values byte-equal, attributes equal; `missing` is the rest.
+/// Strong fetch uses `live`; eventual fetch uses
+/// `compacted_live \ wal_tombstones`.
 fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Violation> {
     let Op::FetchVectors {
         ns,
@@ -306,15 +325,13 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
     else {
         return Vec::new();
     };
-    if *consistency != ConsistencyLevel::Strong {
-        return Vec::new();
-    }
+    let violation_id = fetch_violation_id(*consistency);
     let Some(ns_model) = model.namespaces.get(ns) else {
         return Vec::new();
     };
     let Ok(actual) = fetch_response(&rec.response) else {
         return vec![violation(
-            ViolationId::I4FetchExact,
+            violation_id,
             rec,
             ns,
             "fetch response did not contain parseable results/missing",
@@ -325,7 +342,7 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
     let mut expected_results = Vec::new();
     let mut expected_missing = Vec::new();
     for id in ids {
-        if let Some(record) = ns_model.live.get(id) {
+        if let Some(record) = ns_model.visible_get(id, *consistency) {
             expected_results.push((id.clone(), record));
         } else {
             expected_missing.push(id.clone());
@@ -335,7 +352,7 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
     let mut violations = Vec::new();
     if actual.results.len() != expected_results.len() {
         violations.push(violation(
-            ViolationId::I4FetchExact,
+            violation_id,
             rec,
             ns,
             "fetch result length mismatch",
@@ -351,7 +368,7 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
         };
         if &actual_record.id != expected_id {
             violations.push(violation(
-                ViolationId::I4FetchExact,
+                violation_id,
                 rec,
                 ns,
                 "fetch result order/id mismatch",
@@ -365,7 +382,7 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
         }
         if actual_record.values.as_ref() != Some(&expected_record.values) {
             violations.push(violation(
-                ViolationId::I4FetchExact,
+                violation_id,
                 rec,
                 ns,
                 "fetch values mismatch",
@@ -376,9 +393,9 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
                 }),
             ));
         }
-        if actual_record.attributes != expected_record.attributes {
+        if !attributes_equal(&actual_record.attributes, &expected_record.attributes) {
             violations.push(violation(
-                ViolationId::I4FetchExact,
+                violation_id,
                 rec,
                 ns,
                 "fetch attributes mismatch",
@@ -392,7 +409,7 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
     }
     if actual.missing != expected_missing {
         violations.push(violation(
-            ViolationId::I4FetchExact,
+            violation_id,
             rec,
             ns,
             "fetch missing set/order mismatch",
@@ -451,39 +468,102 @@ fn check_i11_error_envelope(rec: &OpRecord) -> Vec<Violation> {
 }
 
 fn check_expected_error(rec: &OpRecord) -> Vec<Violation> {
-    let Op::Query { ns, q, .. } = &rec.op else {
-        return Vec::new();
-    };
-    let QueryOracleClass::ExpectError { status, code } = &q.class else {
-        return Vec::new();
+    let expected = match &rec.op {
+        Op::Query { ns, q, .. } => {
+            let QueryOracleClass::ExpectError { status, code } = &q.class else {
+                return Vec::new();
+            };
+            (ns.as_str(), *status, code.as_str())
+        }
+        Op::InvalidProbe { ns, probe } => {
+            (ns.as_str(), probe.expected_status(), probe.expected_code())
+        }
+        _ => return Vec::new(),
     };
     let actual_code = rec.response.get("code").and_then(serde_json::Value::as_str);
-    if rec.status == *status && actual_code == Some(code.as_str()) {
+    if rec.status == expected.1 && actual_code == Some(expected.2) {
         return Vec::new();
     }
     vec![violation(
         ViolationId::I11ErrorEnvelope,
         rec,
-        ns,
-        "ExpectError query returned unexpected status/code",
+        expected.0,
+        "operation returned unexpected status/code",
         serde_json::json!({
-            "expected_status": status,
-            "expected_code": code,
+            "expected_status": expected.1,
+            "expected_code": expected.2,
             "actual_status": rec.status,
             "actual_code": actual_code,
         }),
     )]
 }
 
+fn check_i10_failed_validation_no_wal(rec: &OpRecord) -> Vec<Violation> {
+    let Op::InvalidProbe { ns, probe } = &rec.op else {
+        return Vec::new();
+    };
+    if !probe.is_write_shaped() || !(400..500).contains(&rec.status) {
+        return Vec::new();
+    }
+    let before = &rec.response["compact_status_before"];
+    let after = &rec.response["compact_status_after"];
+    let fields = ["manifest_generation", "uncompacted_fragments"];
+    let mut violations = Vec::new();
+    for field in fields {
+        if before.get(field) != after.get(field) {
+            violations.push(violation(
+                ViolationId::I10FailedValidationNoWal,
+                rec,
+                ns,
+                "failed validation changed compact status",
+                serde_json::json!({
+                    "field": field,
+                    "before": before.get(field),
+                    "after": after.get(field),
+                    "probe": probe,
+                }),
+            ));
+        }
+    }
+    violations
+}
+
 /// I12 — Structural sanity
 ///
 /// Every successful query response has no NaN/infinite scores, no duplicate
 /// ids, and `results.len() <= top_k`.
-fn check_i12_structural_sanity(rec: &OpRecord) -> Vec<Violation> {
-    let Op::Query { ns, q, .. } = &rec.op else {
-        return Vec::new();
-    };
-    let Ok(results) = query_results(&rec.response) else {
+fn check_i12_structural_sanity(model: &Model, rec: &OpRecord) -> Vec<Violation> {
+    match &rec.op {
+        Op::Query { ns, q, .. } => check_query_structural(model, rec, ns, q, &rec.response),
+        Op::BatchQuery { ns, qs } => rec.response["batch"]["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .zip(qs.iter())
+            .filter(|(entry, _)| entry.get("ok").and_then(serde_json::Value::as_bool) == Some(true))
+            .flat_map(|(entry, q)| check_query_structural(model, rec, ns, q, &entry["response"]))
+            .collect(),
+        Op::PaginateAll { ns, q, .. } => {
+            let mut violations = Vec::new();
+            for page in rec.response["pages"].as_array().into_iter().flatten() {
+                if page.get("status").and_then(serde_json::Value::as_u64) == Some(200) {
+                    violations.extend(check_query_structural(model, rec, ns, q, &page["body"]));
+                }
+            }
+            violations
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn check_query_structural(
+    model: &Model,
+    rec: &OpRecord,
+    ns: &str,
+    q: &GeneratedQuery,
+    response: &serde_json::Value,
+) -> Vec<Violation> {
+    let Ok(results) = query_results(response) else {
         return Vec::new();
     };
     let mut violations = Vec::new();
@@ -519,6 +599,494 @@ fn check_i12_structural_sanity(rec: &OpRecord) -> Vec<Violation> {
             ));
         }
     }
+    violations.extend(check_groups_structural(rec, ns, q, response));
+    violations.extend(check_facets_structural(model, rec, ns, response));
+    violations.extend(check_explain_structural(rec, ns, q, response));
+    violations.extend(check_debug_structural(rec, ns, q, response));
+    violations
+}
+
+fn check_groups_structural(
+    rec: &OpRecord,
+    ns: &str,
+    q: &GeneratedQuery,
+    response: &serde_json::Value,
+) -> Vec<Violation> {
+    let Some(groups) = response.get("groups").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let max_per_group = q
+        .body
+        .get("grouping")
+        .and_then(|grouping| grouping.get("max_per_group"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX) as usize;
+    let mut violations = Vec::new();
+    let mut seen = BTreeSet::new();
+    for group in groups {
+        let results = group["results"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if results.len() > max_per_group {
+            violations.push(violation(
+                ViolationId::I12StructuralSanity,
+                rec,
+                ns,
+                "group exceeded max_per_group",
+                serde_json::json!({ "group": group, "max_per_group": max_per_group }),
+            ));
+        }
+        for result in results {
+            if let Some(id) = result.get("id").and_then(serde_json::Value::as_str) {
+                if !seen.insert(id.to_string()) {
+                    violations.push(violation(
+                        ViolationId::I12StructuralSanity,
+                        rec,
+                        ns,
+                        "grouped query returned duplicate id across groups",
+                        serde_json::json!({ "id": id }),
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+fn check_facets_structural(
+    model: &Model,
+    rec: &OpRecord,
+    ns: &str,
+    response: &serde_json::Value,
+) -> Vec<Violation> {
+    let Some(facets) = response
+        .get("facets")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let Some(ns_model) = model.namespaces.get(ns) else {
+        return Vec::new();
+    };
+    let totals = facet_totals(ns_model);
+    let mut violations = Vec::new();
+    for (field, counts) in facets {
+        let Some(counts) = counts.as_object() else {
+            violations.push(violation(
+                ViolationId::I12StructuralSanity,
+                rec,
+                ns,
+                "facet counts were not an object",
+                serde_json::json!({ "field": field, "counts": counts }),
+            ));
+            continue;
+        };
+        for (value, count) in counts {
+            let actual = count.as_u64().unwrap_or(u64::MAX);
+            let upper = totals
+                .get(field)
+                .and_then(|field_counts| field_counts.get(value))
+                .copied()
+                .unwrap_or(0);
+            if actual > upper {
+                violations.push(violation(
+                    ViolationId::I12StructuralSanity,
+                    rec,
+                    ns,
+                    "facet count exceeded model total",
+                    serde_json::json!({
+                        "field": field,
+                        "value": value,
+                        "actual": actual,
+                        "upper": upper,
+                    }),
+                ));
+            }
+        }
+    }
+    violations
+}
+
+fn check_explain_structural(
+    rec: &OpRecord,
+    ns: &str,
+    q: &GeneratedQuery,
+    response: &serde_json::Value,
+) -> Vec<Violation> {
+    if q.body.get("explain").is_none() {
+        return Vec::new();
+    }
+    let mut violations = Vec::new();
+    let explain = &response["explain"];
+    if explain.get("plan").is_none() {
+        violations.push(violation(
+            ViolationId::I12StructuralSanity,
+            rec,
+            ns,
+            "explain response omitted plan",
+            response.clone(),
+        ));
+        return violations;
+    }
+    if requested_explain_full(q) {
+        let response_ids = response_ids(response);
+        let explain_ids = explain["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if response_ids != explain_ids {
+            violations.push(violation(
+                ViolationId::I12StructuralSanity,
+                rec,
+                ns,
+                "full explain provenance ids did not match results",
+                serde_json::json!({
+                    "response_ids": response_ids,
+                    "explain_ids": explain_ids,
+                }),
+            ));
+        }
+    }
+    violations
+}
+
+fn check_debug_structural(
+    rec: &OpRecord,
+    ns: &str,
+    q: &GeneratedQuery,
+    response: &serde_json::Value,
+) -> Vec<Violation> {
+    if q.body.get("debug").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Vec::new();
+    }
+    let Some(debug) = response.get("debug").and_then(serde_json::Value::as_object) else {
+        return vec![violation(
+            ViolationId::I12StructuralSanity,
+            rec,
+            ns,
+            "debug response omitted debug object",
+            response.clone(),
+        )];
+    };
+    let expected = consistency_str(q.consistency().unwrap_or(ConsistencyLevel::Strong));
+    if debug
+        .get("consistency_effective")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected)
+    {
+        return vec![violation(
+            ViolationId::I12StructuralSanity,
+            rec,
+            ns,
+            "debug consistency_effective did not match request",
+            serde_json::json!({
+                "expected": expected,
+                "debug": debug,
+            }),
+        )];
+    }
+    Vec::new()
+}
+
+fn check_i3_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
+    let Op::Query { ns, q, .. } = &rec.op else {
+        return Vec::new();
+    };
+    let QueryOracleClass::Membership { consistency } = q.class else {
+        return Vec::new();
+    };
+    let Some(ns_model) = model.namespaces.get(ns) else {
+        return Vec::new();
+    };
+    let visible = ns_model
+        .visible_records(consistency)
+        .into_iter()
+        .map(|(id, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+    response_ids(&rec.response)
+        .into_iter()
+        .filter(|id| !visible.contains(id))
+        .map(|id| {
+            violation(
+                exact_violation_id(consistency),
+                rec,
+                ns,
+                "membership query returned id outside visible set",
+                serde_json::json!({ "id": id, "consistency": consistency }),
+            )
+        })
+        .collect()
+}
+
+fn check_i5_batch_equivalence(rec: &OpRecord) -> Vec<Violation> {
+    let Op::BatchQuery { ns, qs } = &rec.op else {
+        return Vec::new();
+    };
+    let Some(batch_entries) = rec.response["batch"]["results"].as_array() else {
+        return vec![violation(
+            ViolationId::I5BatchEquivalent,
+            rec,
+            ns,
+            "batch response omitted results array",
+            rec.response.clone(),
+        )];
+    };
+    let Some(individual) = rec.response["individual"].as_array() else {
+        return vec![violation(
+            ViolationId::I5BatchEquivalent,
+            rec,
+            ns,
+            "batch record omitted individual responses",
+            rec.response.clone(),
+        )];
+    };
+    let mut violations = Vec::new();
+    if batch_entries.len() != qs.len() || individual.len() != qs.len() {
+        violations.push(violation(
+            ViolationId::I5BatchEquivalent,
+            rec,
+            ns,
+            "batch/individual response length mismatch",
+            serde_json::json!({
+                "queries": qs.len(),
+                "batch": batch_entries.len(),
+                "individual": individual.len(),
+            }),
+        ));
+        return violations;
+    }
+    for (idx, ((entry, single), q)) in batch_entries
+        .iter()
+        .zip(individual.iter())
+        .zip(qs.iter())
+        .enumerate()
+    {
+        match &q.class {
+            QueryOracleClass::ExpectError { status, code } => {
+                let ok = entry.get("ok").and_then(serde_json::Value::as_bool);
+                let batch_status = entry["error"]["status"].as_u64();
+                let batch_code = entry["error"]["code"].as_str();
+                let single_status = single["status"].as_u64();
+                let single_code = single["body"]["code"].as_str();
+                if ok != Some(false)
+                    || batch_status != Some(u64::from(*status))
+                    || batch_code != Some(code.as_str())
+                    || single_status != Some(u64::from(*status))
+                    || single_code != Some(code.as_str())
+                {
+                    violations.push(violation(
+                        ViolationId::I5BatchEquivalent,
+                        rec,
+                        ns,
+                        "batch error entry did not match individual error",
+                        serde_json::json!({
+                            "index": idx,
+                            "expected_status": status,
+                            "expected_code": code,
+                            "entry": entry,
+                            "single": single,
+                        }),
+                    ));
+                }
+            }
+            _ => {
+                if entry.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+                    || single["status"]
+                        .as_u64()
+                        .is_none_or(|status| !(200..300).contains(&status))
+                    || !responses_equivalent(&entry["response"], &single["body"])
+                {
+                    violations.push(violation(
+                        ViolationId::I5BatchEquivalent,
+                        rec,
+                        ns,
+                        "batch success entry did not match individual query",
+                        serde_json::json!({
+                            "index": idx,
+                            "entry": entry,
+                            "single": single,
+                        }),
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+fn check_i6_pagination_equivalence(rec: &OpRecord) -> Vec<Violation> {
+    let Op::PaginateAll { ns, .. } = &rec.op else {
+        return Vec::new();
+    };
+    let pages = rec.response["pages"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let big = &rec.response["big"];
+    let mut violations = Vec::new();
+    if pages.is_empty()
+        || big["status"]
+            .as_u64()
+            .is_none_or(|status| !(200..300).contains(&status))
+    {
+        violations.push(violation(
+            ViolationId::I6PaginationEquivalent,
+            rec,
+            ns,
+            "pagination did not record successful pages and big query",
+            rec.response.clone(),
+        ));
+        return violations;
+    }
+    let mut paged_results = Vec::new();
+    for page in pages {
+        if page["status"]
+            .as_u64()
+            .is_none_or(|status| !(200..300).contains(&status))
+        {
+            violations.push(violation(
+                ViolationId::I6PaginationEquivalent,
+                rec,
+                ns,
+                "pagination page failed",
+                page.clone(),
+            ));
+            return violations;
+        }
+        if let Ok(results) = query_results(&page["body"]) {
+            paged_results.extend(results);
+        }
+    }
+    let Ok(big_results) = query_results(&big["body"]) else {
+        return vec![violation(
+            ViolationId::I6PaginationEquivalent,
+            rec,
+            ns,
+            "big pagination query response was not parseable",
+            big.clone(),
+        )];
+    };
+    let paged_ids = paged_results
+        .iter()
+        .map(|result| result.id.clone())
+        .collect::<Vec<_>>();
+    let big_ids = big_results
+        .iter()
+        .map(|result| result.id.clone())
+        .collect::<Vec<_>>();
+    if paged_ids != big_ids {
+        violations.push(violation(
+            ViolationId::I6PaginationEquivalent,
+            rec,
+            ns,
+            "paged ids did not match big query ids",
+            serde_json::json!({ "paged": paged_ids, "big": big_ids }),
+        ));
+    }
+    let unique = paged_results
+        .iter()
+        .map(|result| result.id.clone())
+        .collect::<BTreeSet<_>>();
+    if unique.len() != paged_results.len() {
+        violations.push(violation(
+            ViolationId::I6PaginationEquivalent,
+            rec,
+            ns,
+            "paged query returned duplicate id across pages",
+            serde_json::json!({
+                "paged": paged_results
+                    .iter()
+                    .map(|result| result.id.clone())
+                    .collect::<Vec<_>>()
+            }),
+        ));
+    }
+    for pair in paged_results.windows(2) {
+        if pair[0].score > pair[1].score + score_eps(pair[1].score) {
+            violations.push(violation(
+                ViolationId::I6PaginationEquivalent,
+                rec,
+                ns,
+                "paged scores were not ascending across page boundaries",
+                serde_json::json!({ "left": pair[0], "right": pair[1] }),
+            ));
+        }
+    }
+    if pages
+        .last()
+        .and_then(|page| page["body"].get("next_cursor"))
+        .is_some()
+    {
+        violations.push(violation(
+            ViolationId::I6PaginationEquivalent,
+            rec,
+            ns,
+            "terminal page still had a next_cursor",
+            pages.last().cloned().unwrap_or_default(),
+        ));
+    }
+    violations
+}
+
+fn check_i7_fts_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
+    let Op::Query { ns, q, .. } = &rec.op else {
+        return Vec::new();
+    };
+    let query_words = bm25_query_words(&q.body);
+    if query_words.is_empty() {
+        return Vec::new();
+    }
+    let Some(ns_model) = model.namespaces.get(ns) else {
+        return Vec::new();
+    };
+    let mut violations = Vec::new();
+    for id in response_ids(&rec.response) {
+        let Some(record) =
+            ns_model.visible_get(&id, q.consistency().unwrap_or(ConsistencyLevel::Strong))
+        else {
+            violations.push(violation(
+                ViolationId::I7FtsMembership,
+                rec,
+                ns,
+                "FTS query returned id outside visible set",
+                serde_json::json!({ "id": id }),
+            ));
+            continue;
+        };
+        let Some(text) = record
+            .attributes
+            .as_ref()
+            .and_then(|attrs| attrs.get("body"))
+            .and_then(attribute_string)
+        else {
+            violations.push(violation(
+                ViolationId::I7FtsMembership,
+                rec,
+                ns,
+                "FTS query returned id without text body",
+                serde_json::json!({ "id": id }),
+            ));
+            continue;
+        };
+        let lower = text.to_ascii_lowercase();
+        if !query_words.iter().any(|word| lower.contains(word)) {
+            violations.push(violation(
+                ViolationId::I7FtsMembership,
+                rec,
+                ns,
+                "FTS query returned id whose body had none of the query words",
+                serde_json::json!({
+                    "id": id,
+                    "body": lower,
+                    "query_words": query_words,
+                }),
+            ));
+        }
+    }
     violations
 }
 
@@ -529,6 +1097,259 @@ pub fn score_close(actual: f32, expected: f32) -> bool {
 
 fn score_eps(score: f32) -> f32 {
     SCORE_ABS_EPS + SCORE_REL_EPS * score.abs()
+}
+
+trait VisibleRecords {
+    fn visible_records(&self, consistency: ConsistencyLevel) -> Vec<(&String, &ModelRecord)>;
+    fn visible_get(&self, id: &str, consistency: ConsistencyLevel) -> Option<&ModelRecord>;
+}
+
+impl VisibleRecords for NsModel {
+    fn visible_records(&self, consistency: ConsistencyLevel) -> Vec<(&String, &ModelRecord)> {
+        match consistency {
+            ConsistencyLevel::Strong => self.live.iter().collect(),
+            ConsistencyLevel::Eventual => self
+                .compacted_live
+                .iter()
+                .filter(|(id, _)| !self.wal_tombstones.contains(*id))
+                .collect(),
+        }
+    }
+
+    fn visible_get(&self, id: &str, consistency: ConsistencyLevel) -> Option<&ModelRecord> {
+        match consistency {
+            ConsistencyLevel::Strong => self.live.get(id),
+            ConsistencyLevel::Eventual => {
+                if self.wal_tombstones.contains(id) {
+                    None
+                } else {
+                    self.compacted_live.get(id)
+                }
+            }
+        }
+    }
+}
+
+fn exact_violation_id(consistency: ConsistencyLevel) -> ViolationId {
+    match consistency {
+        ConsistencyLevel::Strong => ViolationId::I1StrongExact,
+        ConsistencyLevel::Eventual => ViolationId::I3EventualExact,
+    }
+}
+
+fn fetch_violation_id(consistency: ConsistencyLevel) -> ViolationId {
+    match consistency {
+        ConsistencyLevel::Strong => ViolationId::I4FetchExact,
+        ConsistencyLevel::Eventual => ViolationId::I3EventualExact,
+    }
+}
+
+fn consistency_str(consistency: ConsistencyLevel) -> &'static str {
+    match consistency {
+        ConsistencyLevel::Strong => "strong",
+        ConsistencyLevel::Eventual => "eventual",
+    }
+}
+
+fn first_visible_id(ns_model: &NsModel, consistency: ConsistencyLevel) -> Option<&String> {
+    ns_model
+        .visible_records(consistency)
+        .first()
+        .map(|(id, _)| *id)
+}
+
+fn record_matches_filter(
+    mutation: Option<OracleMutation>,
+    id: &str,
+    first_id: Option<&String>,
+    record: &ModelRecord,
+    filter: Option<&Filter>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let base = record
+        .attributes
+        .as_ref()
+        .is_some_and(|attributes| evaluate_filter(filter, attributes));
+    if mutation == Some(OracleMutation::FilterSkew) && first_id.is_some_and(|first| first == id) {
+        !base
+    } else {
+        base
+    }
+}
+
+fn response_ids(response: &serde_json::Value) -> Vec<String> {
+    let mut ids = query_results(response)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|result| result.id)
+        .collect::<Vec<_>>();
+    ids.extend(
+        response["groups"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|group| group["results"].as_array().into_iter().flatten())
+            .filter_map(|result| result.get("id").and_then(serde_json::Value::as_str))
+            .map(str::to_string),
+    );
+    ids
+}
+
+fn responses_equivalent(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    let Ok(left_results) = query_results(left) else {
+        return false;
+    };
+    let Ok(right_results) = query_results(right) else {
+        return false;
+    };
+    if left_results.len() != right_results.len() {
+        return false;
+    }
+    left_results
+        .iter()
+        .zip(right_results.iter())
+        .all(|(left, right)| left.id == right.id && score_close(left.score, right.score))
+}
+
+fn facet_totals(ns_model: &NsModel) -> BTreeMap<String, BTreeMap<String, u64>> {
+    let mut totals = BTreeMap::new();
+    for record in ns_model.live.values() {
+        let Some(attributes) = record.attributes.as_ref() else {
+            continue;
+        };
+        for (field, value) in attributes {
+            let field_counts = totals.entry(field.clone()).or_insert_with(BTreeMap::new);
+            for key in facet_keys(value) {
+                *field_counts.entry(key).or_default() += 1;
+            }
+        }
+    }
+    totals
+}
+
+fn facet_keys(value: &AttributeValue) -> Vec<String> {
+    match value {
+        AttributeValue::String(value) => vec![value.clone()],
+        AttributeValue::Integer(value) => vec![value.to_string()],
+        AttributeValue::Float(value) => vec![value.to_string()],
+        AttributeValue::Bool(value) => vec![value.to_string()],
+        AttributeValue::StringList(values) => values.clone(),
+        AttributeValue::IntegerList(values) => values.iter().map(ToString::to_string).collect(),
+        AttributeValue::FloatList(values) => values.iter().map(ToString::to_string).collect(),
+    }
+}
+
+fn requested_explain_full(q: &GeneratedQuery) -> bool {
+    match q.body.get("explain") {
+        Some(serde_json::Value::String(value)) => value == "full",
+        Some(serde_json::Value::Object(object)) => object
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|mode| mode == "full"),
+        _ => false,
+    }
+}
+
+fn bm25_query_words(body: &serde_json::Value) -> Vec<String> {
+    let mut words = Vec::new();
+    if let Some(rank_by) = body.get("rank_by") {
+        collect_rank_by_words(rank_by, &mut words);
+    }
+    if let Some(sources) = body.get("sources").and_then(serde_json::Value::as_array) {
+        for source in sources {
+            if source.get("type").and_then(serde_json::Value::as_str) == Some("bm25") {
+                if let Some(rank_by) = source.get("rank_by") {
+                    collect_rank_by_words(rank_by, &mut words);
+                }
+            }
+        }
+    }
+    words.sort();
+    words.dedup();
+    words
+}
+
+fn collect_rank_by_words(rank_by: &serde_json::Value, out: &mut Vec<String>) {
+    let Some(array) = rank_by.as_array() else {
+        return;
+    };
+    if array.len() == 3
+        && array[1]
+            .as_str()
+            .is_some_and(|algo| algo.eq_ignore_ascii_case("bm25"))
+    {
+        if let Some(query) = array[2].as_str() {
+            out.extend(
+                query
+                    .split_whitespace()
+                    .map(|word| word.to_ascii_lowercase()),
+            );
+        }
+        return;
+    }
+    match array.first().and_then(serde_json::Value::as_str) {
+        Some("Sum" | "sum" | "Max" | "max") => {
+            for child in array
+                .get(1)
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                collect_rank_by_words(child, out);
+            }
+        }
+        Some("Product" | "product") => {
+            if let Some(child) = array.get(2) {
+                collect_rank_by_words(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn attribute_string(value: &AttributeValue) -> Option<&str> {
+    match value {
+        AttributeValue::String(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn attributes_equal(
+    left: &Option<HashMap<String, AttributeValue>>,
+    right: &Option<HashMap<String, AttributeValue>>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) if left.len() == right.len() => {
+            left.iter().all(|(key, left_value)| {
+                right
+                    .get(key)
+                    .is_some_and(|right_value| attribute_values_equal(left_value, right_value))
+            })
+        }
+        _ => false,
+    }
+}
+
+fn attribute_values_equal(left: &AttributeValue, right: &AttributeValue) -> bool {
+    match (left, right) {
+        (AttributeValue::String(left), AttributeValue::String(right)) => left == right,
+        (AttributeValue::Integer(left), AttributeValue::Integer(right)) => left == right,
+        (AttributeValue::Float(left), AttributeValue::Float(right)) => (left - right).abs() <= 1e-9,
+        (AttributeValue::Bool(left), AttributeValue::Bool(right)) => left == right,
+        (AttributeValue::StringList(left), AttributeValue::StringList(right)) => left == right,
+        (AttributeValue::IntegerList(left), AttributeValue::IntegerList(right)) => left == right,
+        (AttributeValue::FloatList(left), AttributeValue::FloatList(right))
+            if left.len() == right.len() =>
+        {
+            left.iter()
+                .zip(right.iter())
+                .all(|(left, right)| (left - right).abs() <= 1e-9)
+        }
+        _ => false,
+    }
 }
 
 fn oracle_distance(

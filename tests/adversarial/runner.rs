@@ -11,7 +11,7 @@ use crate::common::server::{cleanup_ns, start_test_server_full, FullTestServer};
 use super::artifacts::{FailureManifest, RunArtifacts, SeedArtifacts};
 use super::generator::{AdversarialGenerator, Coverage};
 use super::model::{Model, OracleMutation};
-use super::ops::{Op, OpRecord, QueryOracleClass};
+use super::ops::{InvalidProbe, Op, OpRecord, QueryOracleClass};
 use super::oracle::{self, Violation, ViolationId};
 use super::{PreserveMode, RunMode, RunnerEnv};
 
@@ -66,6 +66,8 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 OracleMutation::DropDelete,
                 OracleMutation::SkewScore,
                 OracleMutation::PhantomId,
+                OracleMutation::LeakTombstone,
+                OracleMutation::FilterSkew,
             ]
         },
         |mutation| vec![mutation],
@@ -117,6 +119,8 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 fired.contains(&ViolationId::I4FetchExact)
             }
             OracleMutation::SkewScore => fired.contains(&ViolationId::I1StrongExact),
+            OracleMutation::LeakTombstone => fired.contains(&ViolationId::I3EventualExact),
+            OracleMutation::FilterSkew => fired.contains(&ViolationId::I1StrongExact),
         };
         assert!(
             accepted,
@@ -413,6 +417,125 @@ async fn execute_op(
             .await;
             ("POST".to_string(), path, status, response)
         }
+        Op::BatchQuery { ns, qs } => {
+            let path = format!("/v1/namespaces/{ns}/query/batch");
+            let queries = qs.iter().map(|q| q.body.clone()).collect::<Vec<_>>();
+            let (status, batch) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({ "queries": queries })),
+            )
+            .await;
+            let mut individual = Vec::with_capacity(qs.len());
+            for q in qs {
+                let single_path = format!("/v1/namespaces/{ns}/query");
+                let (single_status, single_body) = request_json(
+                    client,
+                    Method::POST,
+                    &format!("{}{}", server.base_url, single_path),
+                    Some(q.body.clone()),
+                )
+                .await;
+                individual.push(json!({
+                    "status": single_status,
+                    "body": single_body
+                }));
+            }
+            (
+                "POST".to_string(),
+                path,
+                status,
+                json!({
+                    "batch": batch,
+                    "individual": individual
+                }),
+            )
+        }
+        Op::PaginateAll { ns, q, page_size } => {
+            let path = format!("/v1/namespaces/{ns}/query");
+            let mut pages = Vec::new();
+            let mut cursor = json!({ "type": "none" });
+            let mut status = StatusCode::OK.as_u16();
+            for _ in 0..50 {
+                let mut page_body = q.body.clone();
+                let page_object = page_body.as_object_mut().expect("query body is object");
+                page_object.insert("top_k".to_string(), json!(page_size));
+                page_object.insert("cursor".to_string(), cursor.clone());
+                let (page_status, page_response) = request_json(
+                    client,
+                    Method::POST,
+                    &format!("{}{}", server.base_url, path),
+                    Some(page_body),
+                )
+                .await;
+                if !(200..300).contains(&page_status) {
+                    status = page_status;
+                    pages.push(json!({ "status": page_status, "body": page_response }));
+                    break;
+                }
+                let next = page_response
+                    .get("next_cursor")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                pages.push(json!({ "status": page_status, "body": page_response }));
+                let Some(next) = next else {
+                    break;
+                };
+                cursor = json!({ "type": "after", "token": next });
+            }
+
+            let mut big_body = q.body.clone();
+            let paged_result_count = pages
+                .iter()
+                .filter_map(|page| page["body"]["results"].as_array())
+                .map(Vec::len)
+                .sum::<usize>()
+                .max(*page_size);
+            let big_object = big_body.as_object_mut().expect("query body is object");
+            big_object.insert("top_k".to_string(), json!(paged_result_count));
+            big_object.insert("cursor".to_string(), json!({ "type": "none" }));
+            let (big_status, big_response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(big_body),
+            )
+            .await;
+            if !(200..300).contains(&big_status) {
+                status = big_status;
+            }
+            (
+                "POST".to_string(),
+                path,
+                status,
+                json!({
+                    "pages": pages,
+                    "big": {
+                        "status": big_status,
+                        "body": big_response
+                    }
+                }),
+            )
+        }
+        Op::InvalidProbe { ns, probe } => {
+            let status_before = if probe.is_write_shaped() {
+                Some(compact_status(client, &server.base_url, ns).await)
+            } else {
+                None
+            };
+            let (method, path, status, mut response) =
+                execute_invalid_probe(client, server, ns, *probe).await;
+            if let Some(before) = status_before {
+                let after = compact_status(client, &server.base_url, ns).await;
+                let response_object = response
+                    .as_object_mut()
+                    .expect("invalid probe error response is object");
+                response_object.insert("compact_status_before".to_string(), before);
+                response_object.insert("compact_status_after".to_string(), after);
+            }
+            (method, path, status, response)
+        }
         Op::CompactInline { ns } => {
             let result = server
                 .compactor
@@ -444,6 +567,177 @@ async fn execute_op(
         gen_after: None,
         duration_ms: before.elapsed().as_millis() as u64,
         violations: Vec::new(),
+    }
+}
+
+async fn execute_invalid_probe(
+    client: &Client,
+    server: &FullTestServer,
+    ns: &str,
+    probe: InvalidProbe,
+) -> (String, String, u16, serde_json::Value) {
+    match probe {
+        InvalidProbe::NanVector => {
+            let path = format!("/v1/namespaces/{ns}/query");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({
+                    "sources": [{
+                        "type": "ann",
+                        "vector": [serde_json::Value::Null, json!(0.0)]
+                    }],
+                    "fusion": { "type": "none" },
+                    "top_k": 1
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        InvalidProbe::WrongDims => {
+            let path = format!("/v1/namespaces/{ns}/vectors");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({
+                    "vectors": [{
+                        "id": "wrong-dims",
+                        "values": [0.0]
+                    }]
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        InvalidProbe::BadIdCharset => {
+            let path = format!("/v1/namespaces/{ns}/vectors");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({
+                    "vectors": [{
+                        "id": "bad/id",
+                        "values": [0.0, 0.0]
+                    }]
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        InvalidProbe::EmptyBatch => {
+            let path = format!("/v1/namespaces/{ns}/vectors");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({ "vectors": [] })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        InvalidProbe::OversizedBatch => {
+            let path = format!("/v1/namespaces/{ns}/query/batch");
+            let queries = (0..257)
+                .map(|_| {
+                    json!({
+                        "sources": [{
+                            "type": "ann",
+                            "vector": [0.0, 0.0]
+                        }],
+                        "fusion": { "type": "none" },
+                        "top_k": 1
+                    })
+                })
+                .collect::<Vec<_>>();
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({ "queries": queries })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        InvalidProbe::UnknownField => {
+            let path = format!("/v1/namespaces/{ns}/query");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({
+                    "sources": [{
+                        "type": "ann",
+                        "vector": [0.0, 0.0]
+                    }],
+                    "fusion": { "type": "none" },
+                    "top_k": 1,
+                    "unexpected": true
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        InvalidProbe::BadCursorToken => {
+            let path = format!("/v1/namespaces/{ns}/query");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({
+                    "sources": [{
+                        "type": "ann",
+                        "vector": [0.0, 0.0]
+                    }],
+                    "top_k": 1,
+                    "cursor": { "type": "after", "token": "not-a-cursor" }
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        InvalidProbe::GroupingPlusCursor => {
+            let path = format!("/v1/namespaces/{ns}/query");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({
+                    "sources": [{
+                        "type": "ann",
+                        "vector": [0.0, 0.0]
+                    }],
+                    "top_k": 1,
+                    "grouping": { "type": "field", "field": "group", "max_per_group": 1 },
+                    "cursor": { "type": "none" }
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
+        InvalidProbe::WeightsLenMismatch => {
+            let path = format!("/v1/namespaces/{ns}/query");
+            let (status, response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", server.base_url, path),
+                Some(json!({
+                    "sources": [{
+                        "type": "ann",
+                        "vector": [0.0, 0.0]
+                    }, {
+                        "type": "ann",
+                        "vector": [1.0, 0.0]
+                    }],
+                    "fusion": { "type": "weighted", "weights": [1.0] },
+                    "top_k": 1
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
     }
 }
 

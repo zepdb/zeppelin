@@ -37,6 +37,19 @@ pub enum Op {
         q: GeneratedQuery,
         as_of: Option<AsOfTarget>,
     },
+    BatchQuery {
+        ns: String,
+        qs: Vec<GeneratedQuery>,
+    },
+    PaginateAll {
+        ns: String,
+        q: GeneratedQuery,
+        page_size: usize,
+    },
+    InvalidProbe {
+        ns: String,
+        probe: InvalidProbe,
+    },
     CompactInline {
         ns: String,
     },
@@ -90,6 +103,20 @@ pub enum AsOfTarget {
     Snapshot(String),
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum InvalidProbe {
+    NanVector,
+    WrongDims,
+    BadIdCharset,
+    EmptyBatch,
+    OversizedBatch,
+    UnknownField,
+    BadCursorToken,
+    GroupingPlusCursor,
+    WeightsLenMismatch,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpRecord {
     pub index: u64,
@@ -114,6 +141,9 @@ impl Op {
             Op::DeleteVectors { .. } => "delete_vectors",
             Op::FetchVectors { .. } => "fetch_vectors",
             Op::Query { .. } => "query",
+            Op::BatchQuery { .. } => "batch_query",
+            Op::PaginateAll { .. } => "paginate_all",
+            Op::InvalidProbe { .. } => "invalid_probe",
             Op::CompactInline { .. } => "compact_inline",
         }
     }
@@ -127,6 +157,9 @@ impl Op {
             | Op::DeleteVectors { ns, .. }
             | Op::FetchVectors { ns, .. }
             | Op::Query { ns, .. }
+            | Op::BatchQuery { ns, .. }
+            | Op::PaginateAll { ns, .. }
+            | Op::InvalidProbe { ns, .. }
             | Op::CompactInline { ns } => ns,
         }
     }
@@ -146,6 +179,12 @@ impl Op {
     pub fn tags(&self) -> Vec<&str> {
         match self {
             Op::Query { q, .. } => q.pattern_tags.iter().map(String::as_str).collect(),
+            Op::BatchQuery { qs, .. } => qs
+                .iter()
+                .flat_map(|q| q.pattern_tags.iter().map(String::as_str))
+                .collect(),
+            Op::PaginateAll { q, .. } => q.pattern_tags.iter().map(String::as_str).collect(),
+            Op::InvalidProbe { probe, .. } => vec!["invalid-probe", probe.tag()],
             _ => Vec::new(),
         }
     }
@@ -154,11 +193,16 @@ impl Op {
 impl NamespaceSpec {
     #[must_use]
     pub fn create_body(&self, ns: &str) -> serde_json::Value {
+        let full_text_search = self
+            .fts_fields
+            .iter()
+            .map(|field| (field.clone(), json!({})))
+            .collect::<serde_json::Map<_, _>>();
         json!({
             "name": ns,
             "dimensions": self.dims,
             "distance_metric": self.metric,
-            "full_text_search": {},
+            "full_text_search": full_text_search,
             "index_config": {
                 "nlist": self.num_centroids,
                 "quantization": self.quantization,
@@ -173,6 +217,47 @@ impl NamespaceSpec {
     #[must_use]
     pub fn is_exact(&self) -> bool {
         self.quantization == QuantizationType::None
+    }
+}
+
+impl InvalidProbe {
+    #[must_use]
+    pub fn expected_status(self) -> u16 {
+        match self {
+            Self::OversizedBatch => 413,
+            _ => 400,
+        }
+    }
+
+    #[must_use]
+    pub fn expected_code(self) -> &'static str {
+        match self {
+            Self::OversizedBatch => "PAYLOAD_TOO_LARGE",
+            _ => "VALIDATION_ERROR",
+        }
+    }
+
+    #[must_use]
+    pub fn is_write_shaped(self) -> bool {
+        matches!(
+            self,
+            Self::WrongDims | Self::BadIdCharset | Self::EmptyBatch
+        )
+    }
+
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::NanVector => "nan-vector",
+            Self::WrongDims => "wrong-dims",
+            Self::BadIdCharset => "bad-id-charset",
+            Self::EmptyBatch => "empty-batch",
+            Self::OversizedBatch => "oversized-batch",
+            Self::UnknownField => "unknown-field",
+            Self::BadCursorToken => "bad-cursor-token",
+            Self::GroupingPlusCursor => "grouping-plus-cursor",
+            Self::WeightsLenMismatch => "weights-len-mismatch",
+        }
     }
 }
 

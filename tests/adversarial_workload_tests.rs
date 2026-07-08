@@ -37,6 +37,37 @@ async fn smoke() {
             > 0,
         "delete-then-reupsert scenario tag was not covered"
     );
+    for kind in [
+        "create_namespace",
+        "get_namespace",
+        "upsert",
+        "delete_vectors",
+        "fetch_vectors",
+        "query",
+        "batch_query",
+        "paginate_all",
+        "invalid_probe",
+        "compact_inline",
+    ] {
+        assert!(
+            summary.coverage.op_counts.get(kind).copied().unwrap_or(0) > 0,
+            "operation kind {kind} was not covered"
+        );
+    }
+    for tag in [
+        "delete-then-reupsert",
+        "eventual-tombstone",
+        "eventual",
+        "batch",
+        "pagination",
+        "fts",
+        "invalid-probe",
+    ] {
+        assert!(
+            summary.coverage.tag_counts.get(tag).copied().unwrap_or(0) > 0,
+            "scenario tag {tag} was not covered"
+        );
+    }
 
     println!(
         "adversarial smoke: seeds={} ops={} compactions={} failed={} ops/sec={:.2}",

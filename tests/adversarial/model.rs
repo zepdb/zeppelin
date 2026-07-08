@@ -11,6 +11,8 @@ pub enum OracleMutation {
     DropDelete,
     SkewScore,
     PhantomId,
+    LeakTombstone,
+    FilterSkew,
 }
 
 impl OracleMutation {
@@ -20,6 +22,8 @@ impl OracleMutation {
             "drop-delete" => Self::DropDelete,
             "skew-score" => Self::SkewScore,
             "phantom-id" => Self::PhantomId,
+            "leak-tombstone" => Self::LeakTombstone,
+            "filter-skew" => Self::FilterSkew,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -30,6 +34,8 @@ impl OracleMutation {
             Self::DropDelete => "drop-delete",
             Self::SkewScore => "skew-score",
             Self::PhantomId => "phantom-id",
+            Self::LeakTombstone => "leak-tombstone",
+            Self::FilterSkew => "filter-skew",
         }
     }
 }
@@ -116,9 +122,11 @@ impl Model {
                     panic!("delete acked for unknown namespace {ns}");
                 };
                 if mutation != Some(OracleMutation::DropDelete) {
-                    for id in ids {
+                    for (idx, id) in ids.iter().enumerate() {
                         model.live.remove(id);
-                        model.wal_tombstones.insert(id.clone());
+                        if mutation != Some(OracleMutation::LeakTombstone) || idx > 0 {
+                            model.wal_tombstones.insert(id.clone());
+                        }
                         model.deleted_ever.insert(id.clone());
                     }
                 }
@@ -132,7 +140,12 @@ impl Model {
                 model.wal_tombstones.clear();
                 model.checkpoint(gen_after);
             }
-            Op::GetNamespace { .. } | Op::FetchVectors { .. } | Op::Query { .. } => {}
+            Op::GetNamespace { .. }
+            | Op::FetchVectors { .. }
+            | Op::Query { .. }
+            | Op::BatchQuery { .. }
+            | Op::PaginateAll { .. }
+            | Op::InvalidProbe { .. } => {}
         }
     }
 }

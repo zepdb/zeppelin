@@ -129,7 +129,7 @@ impl RunnerEnv {
         let mut clone = self.clone();
         clone.seconds = 30;
         clone.seeds = vec![seed];
-        clone.max_ops = Some(20);
+        clone.max_ops = Some(80);
         clone.preserve = PreserveMode::Never;
         clone
     }
