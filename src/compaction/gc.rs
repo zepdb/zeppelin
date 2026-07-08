@@ -712,11 +712,22 @@ pub async fn run_gc_cycle(
             return Ok(report);
         }
     };
+    let sweep_retained_history =
+        match retained_manifest_history_reachable_keys(store, namespace).await {
+            Ok(keys) => keys,
+            Err(e) => {
+                warn!(namespace, error = %e, "gc retained history re-read failed; skipping sweep");
+                let mut report = base_report;
+                report.candidates_marked = candidates_marked;
+                report.candidates_skipped = unknown_shape_skips;
+                return Ok(report);
+            }
+        };
     let sweep_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         &sweep_manifest,
         &sweep_staging,
-        &retained_history,
+        &sweep_retained_history,
     );
     let oldest_inflight_ms = oldest_inflight_ulid_ms(namespace, &sweep_staging);
     let known_sizes = known_reclaimable_sizes(namespace, &sweep_manifest);

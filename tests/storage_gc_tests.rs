@@ -1,10 +1,19 @@
 mod common;
 
+use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+use futures::stream::BoxStream;
+use object_store::path::Path;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult, Result as OsResult,
+};
 use ulid::Ulid;
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
@@ -38,6 +47,132 @@ fn old_ulid(seconds_ago: i64, entropy: u128) -> Ulid {
         .try_into()
         .expect("test timestamp must be after epoch");
     Ulid::from_parts(ts, entropy)
+}
+
+#[derive(Debug)]
+struct PutOnNthManifestReadStore {
+    inner: Arc<dyn ObjectStore>,
+    manifest_key: String,
+    put_key: String,
+    put_body: Bytes,
+    trigger_read: usize,
+    manifest_reads: AtomicUsize,
+    puts_injected: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug)]
+struct PutOnNthManifestReadHandle {
+    puts_injected: Arc<AtomicUsize>,
+}
+
+impl PutOnNthManifestReadHandle {
+    fn puts_injected(&self) -> usize {
+        self.puts_injected.load(Ordering::Relaxed)
+    }
+}
+
+impl PutOnNthManifestReadStore {
+    fn wrap(
+        inner: Arc<dyn ObjectStore>,
+        manifest_key: String,
+        put_key: String,
+        put_body: Bytes,
+        trigger_read: usize,
+    ) -> (Self, PutOnNthManifestReadHandle) {
+        let puts_injected = Arc::new(AtomicUsize::new(0));
+        let handle = PutOnNthManifestReadHandle {
+            puts_injected: Arc::clone(&puts_injected),
+        };
+        (
+            Self {
+                inner,
+                manifest_key,
+                put_key,
+                put_body,
+                trigger_read,
+                manifest_reads: AtomicUsize::new(0),
+                puts_injected,
+            },
+            handle,
+        )
+    }
+}
+
+impl fmt::Display for PutOnNthManifestReadStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PutOnNthManifestReadStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PutOnNthManifestReadStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        if location.as_ref() == self.manifest_key {
+            let read = self.manifest_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if read == self.trigger_read {
+                let put_path =
+                    Path::parse(&self.put_key).map_err(|error| object_store::Error::Generic {
+                        store: "put_on_nth_manifest_read",
+                        source: Box::new(error),
+                    })?;
+                self.inner
+                    .put(&put_path, PutPayload::from(self.put_body.clone()))
+                    .await?;
+                self.puts_injected.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+fn manifest_json_bytes_with_version(manifest: &Manifest, version: u64) -> Bytes {
+    let mut value = serde_json::to_value(manifest).expect("manifest must serialize");
+    value
+        .as_object_mut()
+        .expect("manifest must serialize as an object")
+        .insert("version".to_string(), serde_json::json!(version));
+    Bytes::from(serde_json::to_vec(&value).expect("manifest json must serialize"))
 }
 
 #[tokio::test]
@@ -175,6 +310,81 @@ async fn gc_cycle_retains_objects_referenced_only_by_manifest_history() {
             .iter()
             .all(|candidate| candidate.key != old_key),
         "history-referenced objects must not enter the candidate ledger"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_sweep_rereads_retained_history_before_deleting_candidate() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("storage-gc-history-sweep-race");
+    let store = harness.store.clone();
+    let old_id = old_ulid(60, 129);
+    let old_key = WalFragment::s3_key(&ns, &old_id);
+
+    store
+        .put(&old_key, Bytes::from_static(b"history race fragment body"))
+        .await
+        .unwrap();
+
+    let mut history_manifest = Manifest::new();
+    history_manifest.add_fragment(FragmentRef {
+        id: old_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 26,
+    });
+    history_manifest.write(&store, &ns).await.unwrap();
+
+    let (mut current, etag) = Manifest::read_versioned(&store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    current.fragments.clear();
+    current.updated_at = Utc::now();
+    current.write_conditional(&store, &ns, &etag).await.unwrap();
+
+    store
+        .delete(&Manifest::history_key(&ns, history_manifest.version()))
+        .await
+        .unwrap();
+
+    let injected_history_version = current.version() + 1;
+    let injected_history_key = Manifest::history_key(&ns, injected_history_version);
+    let injected_history =
+        manifest_json_bytes_with_version(&history_manifest, injected_history_version);
+    let (injecting_store, injection) = PutOnNthManifestReadStore::wrap(
+        store.inner(),
+        Manifest::s3_key(&ns),
+        injected_history_key,
+        injected_history,
+        3,
+    );
+    let injecting_store = zeppelin::storage::ZeppelinStore::new(Arc::new(injecting_store));
+
+    let report = run_gc_cycle(&injecting_store, &ns, &unsafe_short_gc(0))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        injection.puts_injected(),
+        1,
+        "test must inject retained history between mark and sweep"
+    );
+    assert_eq!(
+        report.objects_deleted, 0,
+        "sweep must not delete an object protected by retained history that appeared after mark"
+    );
+    assert_s3_object_exists(&injecting_store, &old_key).await;
+    assert!(
+        load_gc_candidates(&injecting_store, &ns)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.key == old_key),
+        "reachable-at-sweep candidates stay recorded for a later cycle"
     );
 
     harness.cleanup().await;
@@ -462,7 +672,7 @@ async fn gc_cycle_retains_pending_deletes_referenced_by_manifest_history() {
 }
 
 #[tokio::test]
-async fn gc_cycle_reads_retained_manifest_history_once() {
+async fn gc_cycle_rereads_retained_manifest_history_before_sweep() {
     let harness = TestHarness::new().await;
     let ns = harness.key("storage-gc-history-cost");
     let store = harness.store.clone();
@@ -526,12 +736,12 @@ async fn gc_cycle_reads_retained_manifest_history_once() {
 
     assert_eq!(
         counter.gets_matching(&history_prefix),
-        history_snapshots as u64,
-        "one GC cycle must GET each retained history snapshot at most once"
+        (history_snapshots * 2) as u64,
+        "one GC cycle reads retained history once for mark and once before sweep"
     );
     assert!(
         counter.list_calls_for_prefix(&history_prefix) <= 2,
-        "one GC cycle should list retained history only for pruning and one shared reachability pass"
+        "one GC cycle should list retained history only for pruning and sweep revalidation"
     );
 
     harness.cleanup().await;

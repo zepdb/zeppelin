@@ -102,7 +102,7 @@ manifest generation, and `PitrHistoryRetention` includes that invariant.
 | Spec | Default TLC result | Negative variant |
 |------|--------------------|------------------|
 | `PitrHistoryRetention` | PASS: 25,055,355 generated; 1,644,558 distinct; depth 36 | `AllowBuggyCommit = TRUE` violates `LiveHasHistory` |
-| `TwoPassGcSafety` | PASS: 2,547,895 generated; 167,004 distinct; depth 25 | `AllowBuggySweepWithoutRevalidate = TRUE` violates `NoReachableKeyDeleted` |
+| `TwoPassGcSafety` | PASS: 7,748,544 generated; 646,806 distinct; depth 25 | `AllowBuggySweepWithoutRevalidate = TRUE` and `AllowBuggyStaleHistorySweep = TRUE` both violate `NoReachableKeyDeleted` |
 | `RestoreCloneSafety` | PASS: 1,337 generated; 368 distinct; depth 11 | `AllowBuggyPublish = TRUE` violates `VisibleTargetRefsExist` |
 | `IncrementalArtifactClosure` | PASS: 128 generated; 37 distinct; depth 8 | `AllowBuggyPrefixGc = TRUE` violates `ManifestReachableArtifactsExist` |
 | `GroupCommitWalWriter` | PASS: 9,883 generated; 3,523 distinct; depth 16 | `AllowBuggyMixedTokenDeadlock = TRUE` violates `NoMixedTokenLeaderDeadlock`; adding strict `StrictFailedAppendLeavesNoOrphan` violates under best-effort cleanup failure |
