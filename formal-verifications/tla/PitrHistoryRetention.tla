@@ -22,11 +22,15 @@ VARIABLES
     now,
     resolved,
     as_of_error,
-    gc_deleted
+    gc_deleted,
+    pending_gen,
+    pending_refs,
+    pending_history_written
 
 vars ==
     << live_gen, committed, history, history_body, s3_artifacts,
-       pins, commit_time, now, resolved, as_of_error, gc_deleted >>
+       pins, commit_time, now, resolved, as_of_error, gc_deleted,
+       pending_gen, pending_refs, pending_history_written >>
 
 Zero == 0
 
@@ -55,8 +59,14 @@ Retained(g) ==
 ReachableArtifacts ==
     UNION { history_body[g] : g \in history }
 
+InFlightArtifacts ==
+    IF pending_gen = Zero THEN {} ELSE pending_refs
+
+GcProtectedArtifacts ==
+    ReachableArtifacts \cup InFlightArtifacts
+
 CandidatesAtOrBefore(t) ==
-    {g \in history : commit_time[g] <= t}
+    {g \in history \cap committed : commit_time[g] <= t}
 
 LatestAtOrBefore(t) ==
     CHOOSE g \in CandidatesAtOrBefore(t) :
@@ -74,43 +84,88 @@ Init ==
     /\ resolved = Zero
     /\ as_of_error = FALSE
     /\ gc_deleted = {}
+    /\ pending_gen = Zero
+    /\ pending_refs = {}
+    /\ pending_history_written = FALSE
 
-Commit ==
+StartCommitArtifacts ==
     /\ Cardinality(committed) < Cardinality(Generations)
+    /\ pending_gen = Zero
     /\ LET g == NextGeneration
            refs == GenArtifacts(g)
        IN
        /\ g \in Generations
-       /\ committed' = committed \cup {g}
-       /\ history' = history \cup {g}
-       /\ history_body' = [history_body EXCEPT ![g] = refs]
        /\ s3_artifacts' = s3_artifacts \cup refs
+       /\ pending_gen' = g
+       /\ pending_refs' = refs
+       /\ pending_history_written' = FALSE
        /\ commit_time' = [commit_time EXCEPT ![g] = now]
-       /\ live_gen' = g
-       /\ UNCHANGED << pins, resolved, as_of_error, gc_deleted, now >>
+       /\ UNCHANGED << live_gen, committed, history, history_body,
+                       pins, resolved, as_of_error, gc_deleted, now >>
+
+WriteHistorySnapshot ==
+    /\ pending_gen # Zero
+    /\ ~pending_history_written
+    /\ history' = history \cup {pending_gen}
+    /\ history_body' = [history_body EXCEPT ![pending_gen] = pending_refs]
+    /\ pending_history_written' = TRUE
+    /\ UNCHANGED << live_gen, committed, s3_artifacts, pins,
+                    commit_time, now, resolved, as_of_error, gc_deleted,
+                    pending_gen, pending_refs >>
+
+PublishLivePointer ==
+    /\ pending_gen # Zero
+    /\ pending_history_written
+    /\ pending_gen \in history
+    /\ committed' = committed \cup {pending_gen}
+    /\ live_gen' = pending_gen
+    /\ pending_gen' = Zero
+    /\ pending_refs' = {}
+    /\ pending_history_written' = FALSE
+    /\ UNCHANGED << history, history_body, s3_artifacts, pins,
+                    commit_time, now, resolved, as_of_error, gc_deleted >>
+
+AbortBeforeHistoryWrite ==
+    /\ pending_gen # Zero
+    /\ ~pending_history_written
+    /\ pending_gen' = Zero
+    /\ pending_refs' = {}
+    /\ pending_history_written' = FALSE
+    /\ UNCHANGED << live_gen, committed, history, history_body,
+                    s3_artifacts, pins, commit_time, now, resolved,
+                    as_of_error, gc_deleted >>
+
+AbortAfterHistoryWrite ==
+    /\ pending_gen # Zero
+    /\ pending_history_written
+    /\ pending_gen' = Zero
+    /\ pending_refs' = {}
+    /\ pending_history_written' = FALSE
+    /\ UNCHANGED << live_gen, committed, history, history_body,
+                    s3_artifacts, pins, commit_time, now, resolved,
+                    as_of_error, gc_deleted >>
 
 BuggyCommitPointerWithoutHistory ==
     /\ AllowBuggyCommit
-    /\ Cardinality(committed) < Cardinality(Generations)
-    /\ LET g == NextGeneration
-           refs == GenArtifacts(g)
-       IN
-       /\ g \in Generations
-       /\ committed' = committed \cup {g}
-       /\ history' = history
-       /\ history_body' = history_body
-       /\ s3_artifacts' = s3_artifacts \cup refs
-       /\ commit_time' = [commit_time EXCEPT ![g] = now]
-       /\ live_gen' = g
-       /\ UNCHANGED << pins, resolved, as_of_error, gc_deleted, now >>
+    /\ pending_gen # Zero
+    /\ ~pending_history_written
+    /\ committed' = committed \cup {pending_gen}
+    /\ live_gen' = pending_gen
+    /\ pending_gen' = Zero
+    /\ pending_refs' = {}
+    /\ pending_history_written' = FALSE
+    /\ UNCHANGED << history, history_body, s3_artifacts, pins,
+                    commit_time, now, resolved, as_of_error, gc_deleted >>
 
 CreateSnapshotPin ==
-    \E name \in SnapshotNames, g \in history :
+    \E name \in SnapshotNames :
         /\ pins[name] = Zero
-        /\ pins' = [pins EXCEPT ![name] = g]
+        /\ live_gen # Zero
+        /\ pins' = [pins EXCEPT ![name] = live_gen]
         /\ UNCHANGED << live_gen, committed, history, history_body,
                         s3_artifacts, commit_time, now, resolved,
-                        as_of_error, gc_deleted >>
+                        as_of_error, gc_deleted, pending_gen, pending_refs,
+                        pending_history_written >>
 
 DeleteSnapshotPin ==
     \E name \in SnapshotNames :
@@ -118,25 +173,28 @@ DeleteSnapshotPin ==
         /\ pins' = [pins EXCEPT ![name] = Zero]
         /\ UNCHANGED << live_gen, committed, history, history_body,
                         s3_artifacts, commit_time, now, resolved,
-                        as_of_error, gc_deleted >>
+                        as_of_error, gc_deleted, pending_gen, pending_refs,
+                        pending_history_written >>
 
 AdvanceTime ==
     /\ now < MaxTime
     /\ now' = now + 1
     /\ UNCHANGED << live_gen, committed, history, history_body,
                     s3_artifacts, pins, commit_time, resolved,
-                    as_of_error, gc_deleted >>
+                    as_of_error, gc_deleted, pending_gen, pending_refs,
+                    pending_history_written >>
 
 PruneHistory ==
     /\ history' = {g \in history : Retained(g)}
     /\ resolved' = Zero
     /\ as_of_error' = FALSE
     /\ UNCHANGED << live_gen, committed, history_body, s3_artifacts,
-                    pins, commit_time, now, gc_deleted >>
+                    pins, commit_time, now, gc_deleted, pending_gen,
+                    pending_refs, pending_history_written >>
 
 ResolveAsOfGeneration ==
     \E target \in Generations :
-        /\ IF target \in history
+        /\ IF target \in history /\ target \in committed
            THEN
                /\ resolved' = target
                /\ as_of_error' = FALSE
@@ -144,7 +202,8 @@ ResolveAsOfGeneration ==
                /\ resolved' = Zero
                /\ as_of_error' = TRUE
         /\ UNCHANGED << live_gen, committed, history, history_body,
-                        s3_artifacts, pins, commit_time, now, gc_deleted >>
+                        s3_artifacts, pins, commit_time, now, gc_deleted,
+                        pending_gen, pending_refs, pending_history_written >>
 
 ResolveAsOfTimestamp ==
     \E target_time \in 0..MaxTime :
@@ -156,7 +215,8 @@ ResolveAsOfTimestamp ==
                /\ resolved' = Zero
                /\ as_of_error' = TRUE
         /\ UNCHANGED << live_gen, committed, history, history_body,
-                        s3_artifacts, pins, commit_time, now, gc_deleted >>
+                        s3_artifacts, pins, commit_time, now, gc_deleted,
+                        pending_gen, pending_refs, pending_history_written >>
 
 ResolveAsOfSnapshot ==
     \E name \in SnapshotNames :
@@ -168,17 +228,23 @@ ResolveAsOfSnapshot ==
                /\ resolved' = Zero
                /\ as_of_error' = TRUE
         /\ UNCHANGED << live_gen, committed, history, history_body,
-                        s3_artifacts, pins, commit_time, now, gc_deleted >>
+                        s3_artifacts, pins, commit_time, now, gc_deleted,
+                        pending_gen, pending_refs, pending_history_written >>
 
 GcSweep ==
-    \E dead \in s3_artifacts \ ReachableArtifacts :
+    \E dead \in s3_artifacts \ GcProtectedArtifacts :
         /\ s3_artifacts' = s3_artifacts \ {dead}
         /\ gc_deleted' = gc_deleted \cup {dead}
         /\ UNCHANGED << live_gen, committed, history, history_body,
-                        pins, commit_time, now, resolved, as_of_error >>
+                        pins, commit_time, now, resolved, as_of_error,
+                        pending_gen, pending_refs, pending_history_written >>
 
 Next ==
-    \/ Commit
+    \/ StartCommitArtifacts
+    \/ WriteHistorySnapshot
+    \/ PublishLivePointer
+    \/ AbortBeforeHistoryWrite
+    \/ AbortAfterHistoryWrite
     \/ BuggyCommitPointerWithoutHistory
     \/ CreateSnapshotPin
     \/ DeleteSnapshotPin
@@ -203,8 +269,14 @@ AsOfNeverFallsBackToHead ==
     /\ as_of_error => resolved = Zero
     /\ resolved # Zero => resolved \in history
 
+AsOfReturnsCommittedGeneration ==
+    resolved = Zero \/ resolved \in committed
+
 GcPreservesRetainedArtifacts ==
     ReachableArtifacts \subseteq s3_artifacts
+
+GcPreservesInFlightArtifacts ==
+    InFlightArtifacts \subseteq s3_artifacts
 
 PrunedGenerationUnavailable ==
     resolved # Zero => resolved \in history
@@ -212,7 +284,8 @@ PrunedGenerationUnavailable ==
 TypeOK ==
     /\ live_gen \in {Zero} \cup Generations
     /\ committed \subseteq Generations
-    /\ history \subseteq committed
+    /\ history \subseteq Generations
+    /\ live_gen = Zero \/ live_gen \in committed
     /\ history_body \in [Generations -> SUBSET Artifacts]
     /\ \A g \in Generations : history_body[g] = {} \/ history_body[g] = GenArtifacts(g)
     /\ s3_artifacts \subseteq Artifacts
@@ -222,5 +295,9 @@ TypeOK ==
     /\ resolved \in {Zero} \cup Generations
     /\ as_of_error \in BOOLEAN
     /\ gc_deleted \subseteq Artifacts
+    /\ pending_gen \in {Zero} \cup Generations
+    /\ pending_refs \subseteq Artifacts
+    /\ pending_history_written \in BOOLEAN
+    /\ pending_gen = Zero => pending_refs = {}
 
 ====

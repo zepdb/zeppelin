@@ -2,14 +2,17 @@ mod common;
 
 use std::collections::BTreeSet;
 
+use common::fault_injection::fail_put_once_matching;
 use common::server::{
     api_ns, cleanup_ns, create_ns_api_with, start_test_server, start_test_server_with_compactor,
 };
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use ulid::Ulid;
 use zeppelin::compaction::gc::reachable_keys;
 use zeppelin::config::Config;
 use zeppelin::index::quantization::QuantizationType;
+use zeppelin::wal::manifest::FragmentRef;
 use zeppelin::wal::Manifest;
 
 async fn upsert(client: &reqwest::Client, base_url: &str, ns: &str, vectors: Value) {
@@ -87,6 +90,75 @@ async fn wait_namespace_gone(client: &reqwest::Client, base_url: &str, ns: &str)
 
 fn set(ids: Vec<String>) -> BTreeSet<String> {
     ids.into_iter().collect()
+}
+
+fn fragment(id: u128) -> FragmentRef {
+    FragmentRef {
+        id: Ulid::from_parts(76_000, id),
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 16,
+    }
+}
+
+#[tokio::test]
+async fn clone_as_of_ignores_history_generation_ahead_of_live_manifest() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let source = create_ns_api_with(
+        &client,
+        &base_url,
+        json!({
+            "dimensions": 2,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+    let target = api_ns(&harness, "orphan-history-target");
+
+    let (mut pending, version) = Manifest::read_versioned(&harness.store, &source)
+        .await
+        .unwrap()
+        .unwrap();
+    let live_version = pending.version();
+    pending.add_fragment(fragment(1));
+    let orphan_generation = live_version + 1;
+
+    let (failing_store, failures) =
+        fail_put_once_matching(&harness.store, Manifest::s3_key(&source));
+    pending
+        .write_conditional(&failing_store, &source, &version)
+        .await
+        .unwrap_err();
+    assert_eq!(failures.failures_injected(), 1);
+    assert!(
+        Manifest::read_history(&harness.store, &source, orphan_generation)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let (status, body) = clone_namespace(
+        &client,
+        &base_url,
+        &source,
+        &target,
+        &orphan_generation.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["code"], "POINT_IN_TIME_NOT_RETAINED");
+
+    let get_target = client
+        .get(format!("{base_url}/v1/namespaces/{target}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_target.status(), StatusCode::NOT_FOUND);
+
+    cleanup_ns(&harness.store, &source).await;
+    harness.cleanup().await;
 }
 
 #[tokio::test]

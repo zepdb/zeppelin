@@ -26,13 +26,14 @@ VARIABLES
     lastBatch,
     lastBatchResult,
     deletedOnce,
-    zombieCommitted
+    zombieCommitted,
+    cleanupFailed
 
 vars ==
     << namespaceState, manifestExists, manifestFrags, s3Frags, committed,
        failed, queue, leader, leaderStalled, reply, pc, manifestEtag,
        manifestFencing, lastBatch, lastBatchResult, deletedOnce,
-       zombieCommitted >>
+       zombieCommitted, cleanupFailed >>
 
 FragOf(w) ==
     CASE w = "w1" -> "f1"
@@ -75,6 +76,7 @@ Init ==
     /\ lastBatchResult = "none"
     /\ deletedOnce = FALSE
     /\ zombieCommitted = FALSE
+    /\ cleanupFailed = {}
 
 UploadFragment ==
     \E w \in Writers :
@@ -84,7 +86,8 @@ UploadFragment ==
         /\ UNCHANGED << namespaceState, manifestExists, manifestFrags,
                         committed, failed, queue, leader, leaderStalled,
                         reply, manifestEtag, manifestFencing, lastBatch,
-                        lastBatchResult, deletedOnce, zombieCommitted >>
+                        lastBatchResult, deletedOnce, zombieCommitted,
+                        cleanupFailed >>
 
 EnqueueAppend ==
     \E w \in Writers :
@@ -94,7 +97,8 @@ EnqueueAppend ==
         /\ UNCHANGED << namespaceState, manifestExists, manifestFrags,
                         s3Frags, committed, failed, leader, leaderStalled,
                         reply, manifestEtag, manifestFencing, lastBatch,
-                        lastBatchResult, deletedOnce, zombieCommitted >>
+                        lastBatchResult, deletedOnce, zombieCommitted,
+                        cleanupFailed >>
 
 ElectLeader ==
     /\ leader = "none"
@@ -105,7 +109,7 @@ ElectLeader ==
                         s3Frags, committed, failed, queue, leaderStalled,
                         reply, pc, manifestEtag, manifestFencing,
                         lastBatch, lastBatchResult, deletedOnce,
-                        zombieCommitted >>
+                        zombieCommitted, cleanupFailed >>
 
 CommitCompatibleBatch ==
     /\ leader # "none"
@@ -132,7 +136,8 @@ CommitCompatibleBatch ==
         /\ lastBatchResult' = "ok"
         /\ leader' = IF leader \in batch THEN "none" ELSE leader
         /\ UNCHANGED << namespaceState, manifestExists, s3Frags, failed,
-                        leaderStalled, deletedOnce, zombieCommitted >>
+                        leaderStalled, deletedOnce, zombieCommitted,
+                        cleanupFailed >>
 
 FailBatchMissingManifest ==
     /\ leader # "none"
@@ -142,21 +147,24 @@ FailBatchMissingManifest ==
     /\ \E t \in Tokens :
         LET batch == BatchFor(t)
             frags == FragsOf(batch)
+            present == frags \cap s3Frags
         IN
         /\ batch # {}
-        /\ s3Frags' = s3Frags \ frags
-        /\ failed' = failed \cup frags
-        /\ queue' = queue \ batch
-        /\ reply' = [w \in Writers |->
-                        IF w \in batch THEN "err" ELSE reply[w]]
-        /\ pc' = [w \in Writers |->
-                    IF w \in batch THEN "done" ELSE pc[w]]
-        /\ lastBatch' = frags
-        /\ lastBatchResult' = "err"
-        /\ leader' = IF leader \in batch THEN "none" ELSE leader
-        /\ UNCHANGED << namespaceState, manifestExists, manifestFrags,
-                        committed, leaderStalled, manifestEtag,
-                        manifestFencing, deletedOnce, zombieCommitted >>
+        /\ \E cleaned \in SUBSET present :
+            /\ s3Frags' = s3Frags \ cleaned
+            /\ cleanupFailed' = cleanupFailed \cup (present \ cleaned)
+            /\ failed' = failed \cup frags
+            /\ queue' = queue \ batch
+            /\ reply' = [w \in Writers |->
+                            IF w \in batch THEN "err" ELSE reply[w]]
+            /\ pc' = [w \in Writers |->
+                        IF w \in batch THEN "done" ELSE pc[w]]
+            /\ lastBatch' = frags
+            /\ lastBatchResult' = "err"
+            /\ leader' = IF leader \in batch THEN "none" ELSE leader
+            /\ UNCHANGED << namespaceState, manifestExists, manifestFrags,
+                            committed, leaderStalled, manifestEtag,
+                            manifestFencing, deletedOnce, zombieCommitted >>
 
 FailBatchStaleFence ==
     /\ leader # "none"
@@ -166,22 +174,25 @@ FailBatchStaleFence ==
     /\ \E t \in Tokens :
         LET batch == BatchFor(t)
             frags == FragsOf(batch)
+            present == frags \cap s3Frags
         IN
         /\ batch # {}
         /\ manifestFencing > t
-        /\ s3Frags' = s3Frags \ frags
-        /\ failed' = failed \cup frags
-        /\ queue' = queue \ batch
-        /\ reply' = [w \in Writers |->
-                        IF w \in batch THEN "err" ELSE reply[w]]
-        /\ pc' = [w \in Writers |->
-                    IF w \in batch THEN "done" ELSE pc[w]]
-        /\ lastBatch' = frags
-        /\ lastBatchResult' = "err"
-        /\ leader' = IF leader \in batch THEN "none" ELSE leader
-        /\ UNCHANGED << namespaceState, manifestExists, manifestFrags,
-                        committed, leaderStalled, manifestEtag,
-                        manifestFencing, deletedOnce, zombieCommitted >>
+        /\ \E cleaned \in SUBSET present :
+            /\ s3Frags' = s3Frags \ cleaned
+            /\ cleanupFailed' = cleanupFailed \cup (present \ cleaned)
+            /\ failed' = failed \cup frags
+            /\ queue' = queue \ batch
+            /\ reply' = [w \in Writers |->
+                            IF w \in batch THEN "err" ELSE reply[w]]
+            /\ pc' = [w \in Writers |->
+                        IF w \in batch THEN "done" ELSE pc[w]]
+            /\ lastBatch' = frags
+            /\ lastBatchResult' = "err"
+            /\ leader' = IF leader \in batch THEN "none" ELSE leader
+            /\ UNCHANGED << namespaceState, manifestExists, manifestFrags,
+                            committed, leaderStalled, manifestEtag,
+                            manifestFencing, deletedOnce, zombieCommitted >>
 
 ExternalManifestAdvance ==
     /\ leader # "none"
@@ -196,13 +207,15 @@ ExternalManifestAdvance ==
         /\ UNCHANGED << namespaceState, manifestExists, manifestFrags,
                         s3Frags, committed, failed, queue, leader,
                         leaderStalled, reply, pc, lastBatch,
-                        lastBatchResult, deletedOnce, zombieCommitted >>
+                        lastBatchResult, deletedOnce, zombieCommitted,
+                        cleanupFailed >>
 
 DeleteNamespace ==
     /\ namespaceState = "live"
     /\ namespaceState' = "deleted"
     /\ manifestExists' = FALSE
     /\ s3Frags' = {}
+    /\ cleanupFailed' = {}
     /\ deletedOnce' = TRUE
     /\ UNCHANGED << manifestFrags, committed, failed, queue, leader,
                     leaderStalled, reply, pc, manifestEtag,
@@ -220,7 +233,7 @@ BuggyMixedTokenDeadlock ==
                         s3Frags, committed, failed, queue, leader,
                         reply, pc, manifestEtag, manifestFencing,
                         lastBatch, lastBatchResult, deletedOnce,
-                        zombieCommitted >>
+                        zombieCommitted, cleanupFailed >>
 
 TerminalStutter ==
     /\ AllDone
@@ -245,7 +258,14 @@ NoCommittedFragmentLost ==
     committed \subseteq manifestFrags
 
 FailedAppendLeavesNoOrphan ==
+    \A f \in failed :
+        f \notin s3Frags \/ f \in manifestFrags \/ f \in cleanupFailed
+
+StrictFailedAppendLeavesNoOrphan ==
     \A f \in failed : f \notin s3Frags \/ f \in manifestFrags
+
+CleanupFailureDoesNotCommit ==
+    cleanupFailed \cap committed = {}
 
 DeletedNamespaceNotResurrected ==
     deletedOnce => namespaceState = "deleted" /\ ~manifestExists
@@ -283,6 +303,7 @@ TypeOK ==
     /\ lastBatchResult \in {"none", "ok", "err"}
     /\ deletedOnce \in BOOLEAN
     /\ zombieCommitted \in BOOLEAN
+    /\ cleanupFailed \subseteq Fragments
     /\ Writers = {"w1", "w2", "w3"}
     /\ Fragments = {"f1", "f2", "f3"}
     /\ Tokens = {0, 1, 2}

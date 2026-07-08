@@ -695,12 +695,14 @@ async fn read_clone_history_generation(
     generation: u64,
     target: &str,
 ) -> Result<Manifest, ZeppelinError> {
+    let live_version = clone_live_manifest_version(store, namespace).await?;
+    if generation == 0 || generation > live_version {
+        return Err(clone_point_in_time_not_retained(namespace, target));
+    }
+
     Manifest::read_history(store, namespace, generation)
         .await?
-        .ok_or_else(|| ZeppelinError::PointInTimeNotRetained {
-            namespace: namespace.to_string(),
-            target: target.to_string(),
-        })
+        .ok_or_else(|| clone_point_in_time_not_retained(namespace, target))
 }
 
 async fn resolve_clone_history_at_or_before_timestamp(
@@ -709,8 +711,12 @@ async fn resolve_clone_history_at_or_before_timestamp(
     timestamp: DateTime<Utc>,
     target: &str,
 ) -> Result<Manifest, ZeppelinError> {
+    let live_version = clone_live_manifest_version(store, namespace).await?;
     let mut selected = None;
     for entry in Manifest::list_history(store, namespace).await? {
+        if entry.version > live_version {
+            break;
+        }
         let manifest = Manifest::read_history(store, namespace, entry.version)
             .await?
             .ok_or_else(|| ZeppelinError::NotFound { key: entry.key })?;
@@ -724,6 +730,22 @@ async fn resolve_clone_history_at_or_before_timestamp(
         namespace: namespace.to_string(),
         target: target.to_string(),
     })
+}
+
+async fn clone_live_manifest_version(
+    store: &crate::storage::ZeppelinStore,
+    namespace: &str,
+) -> Result<u64, ZeppelinError> {
+    Ok(Manifest::read(store, namespace)
+        .await?
+        .map_or(0, |manifest| manifest.version()))
+}
+
+fn clone_point_in_time_not_retained(namespace: &str, target: &str) -> ZeppelinError {
+    ZeppelinError::PointInTimeNotRetained {
+        namespace: namespace.to_string(),
+        target: target.to_string(),
+    }
 }
 
 async fn materialize_clone_manifest(

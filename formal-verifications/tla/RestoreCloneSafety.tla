@@ -22,6 +22,7 @@ VARIABLES
     sourceDeleted,
     sourceGcDeleted,
     cloneResult,
+    publishFailed,
     targetFencingReset,
     targetPendingCleared,
     targetVersionReset,
@@ -31,7 +32,7 @@ vars ==
     << sourceHistoryRetained, resolved, sourceObjects, sourceManifestKeys,
        targetMeta, targetObjects, targetManifestVisible, targetManifestKeys,
        manifestRewritten, copyFailed, sourceDeleted, sourceGcDeleted,
-       cloneResult, targetFencingReset, targetPendingCleared,
+       cloneResult, publishFailed, targetFencingReset, targetPendingCleared,
        targetVersionReset, targetGeneration >>
 
 AllKeys ==
@@ -61,6 +62,7 @@ Init ==
     /\ sourceDeleted = FALSE
     /\ sourceGcDeleted = {}
     /\ cloneResult = "none"
+    /\ publishFailed = FALSE
     /\ targetFencingReset = FALSE
     /\ targetPendingCleared = FALSE
     /\ targetVersionReset = FALSE
@@ -74,7 +76,7 @@ PruneSourceHistoryBeforeResolve ==
                     targetMeta, targetObjects, targetManifestVisible,
                     targetManifestKeys, manifestRewritten, copyFailed,
                     sourceDeleted, sourceGcDeleted, cloneResult,
-                    targetFencingReset, targetPendingCleared,
+                    publishFailed, targetFencingReset, targetPendingCleared,
                     targetVersionReset, targetGeneration >>
 
 ResolveSourceHistory ==
@@ -85,7 +87,7 @@ ResolveSourceHistory ==
                     targetMeta, targetObjects, targetManifestVisible,
                     targetManifestKeys, manifestRewritten, copyFailed,
                     sourceDeleted, sourceGcDeleted, cloneResult,
-                    targetFencingReset, targetPendingCleared,
+                    publishFailed, targetFencingReset, targetPendingCleared,
                     targetVersionReset, targetGeneration >>
 
 ResolveSourceHistoryMissing ==
@@ -96,7 +98,7 @@ ResolveSourceHistoryMissing ==
                     sourceManifestKeys, targetMeta, targetObjects,
                     targetManifestVisible, targetManifestKeys,
                     manifestRewritten, copyFailed, sourceDeleted,
-                    sourceGcDeleted, targetFencingReset,
+                    sourceGcDeleted, publishFailed, targetFencingReset,
                     targetPendingCleared, targetVersionReset,
                     targetGeneration >>
 
@@ -109,7 +111,7 @@ CreateTargetNamespace ==
                     sourceManifestKeys, targetObjects, targetManifestVisible,
                     targetManifestKeys, manifestRewritten, copyFailed,
                     sourceDeleted, sourceGcDeleted, cloneResult,
-                    targetFencingReset, targetPendingCleared,
+                    publishFailed, targetFencingReset, targetPendingCleared,
                     targetVersionReset, targetGeneration >>
 
 RewriteManifestToTarget ==
@@ -125,7 +127,7 @@ RewriteManifestToTarget ==
     /\ UNCHANGED << sourceHistoryRetained, sourceObjects, sourceManifestKeys,
                     targetMeta, targetObjects, targetManifestVisible,
                     copyFailed, sourceDeleted, sourceGcDeleted, cloneResult,
-                    resolved, targetGeneration >>
+                    publishFailed, resolved, targetGeneration >>
 
 CopyOneObject ==
     \E s \in sourceManifestKeys :
@@ -139,8 +141,8 @@ CopyOneObject ==
                         sourceManifestKeys, targetMeta,
                         targetManifestVisible, targetManifestKeys,
                         manifestRewritten, copyFailed, sourceDeleted,
-                        sourceGcDeleted, cloneResult, targetFencingReset,
-                        targetPendingCleared, targetVersionReset,
+                        sourceGcDeleted, cloneResult, publishFailed,
+                        targetFencingReset, targetPendingCleared, targetVersionReset,
                         targetGeneration >>
 
 CopyOneObjectFails ==
@@ -156,7 +158,7 @@ CopyOneObjectFails ==
                         sourceManifestKeys, targetMeta, targetObjects,
                         targetManifestVisible, targetManifestKeys,
                         manifestRewritten, sourceDeleted, sourceGcDeleted,
-                        targetFencingReset, targetPendingCleared,
+                        publishFailed, targetFencingReset, targetPendingCleared,
                         targetVersionReset, targetGeneration >>
 
 PublishTargetManifest ==
@@ -173,8 +175,26 @@ PublishTargetManifest ==
     /\ UNCHANGED << sourceHistoryRetained, resolved, sourceObjects,
                     sourceManifestKeys, targetMeta, targetObjects,
                     targetManifestKeys, manifestRewritten, copyFailed,
-                    sourceDeleted, sourceGcDeleted, targetFencingReset,
+                    sourceDeleted, sourceGcDeleted, publishFailed, targetFencingReset,
                     targetPendingCleared, targetVersionReset >>
+
+PublishTargetManifestFails ==
+    /\ resolved
+    /\ cloneResult = "none"
+    /\ targetMeta = "created"
+    /\ manifestRewritten
+    /\ targetManifestKeys \subseteq targetObjects
+    /\ copyFailed = {}
+    /\ ~targetManifestVisible
+    /\ publishFailed' = TRUE
+    /\ cloneResult' = "error"
+    /\ UNCHANGED << sourceHistoryRetained, resolved, sourceObjects,
+                    sourceManifestKeys, targetMeta, targetObjects,
+                    targetManifestVisible, targetManifestKeys,
+                    manifestRewritten, copyFailed, sourceDeleted,
+                    sourceGcDeleted, targetFencingReset,
+                    targetPendingCleared, targetVersionReset,
+                    targetGeneration >>
 
 BuggyPublishBeforeCopy ==
     /\ AllowBuggyPublish
@@ -192,7 +212,7 @@ BuggyPublishBeforeCopy ==
     /\ cloneResult' = "success"
     /\ UNCHANGED << sourceHistoryRetained, resolved, sourceObjects,
                     sourceManifestKeys, targetMeta, targetObjects,
-                    copyFailed, sourceDeleted, sourceGcDeleted >>
+                    copyFailed, sourceDeleted, sourceGcDeleted, publishFailed >>
 
 SourceDeleteOrGc ==
     \E s \in sourceObjects :
@@ -202,7 +222,7 @@ SourceDeleteOrGc ==
         /\ UNCHANGED << sourceHistoryRetained, resolved, sourceManifestKeys,
                         targetMeta, targetObjects, targetManifestVisible,
                         targetManifestKeys, manifestRewritten, copyFailed,
-                        cloneResult, targetFencingReset,
+                        cloneResult, publishFailed, targetFencingReset,
                         targetPendingCleared, targetVersionReset,
                         targetGeneration >>
 
@@ -214,7 +234,7 @@ TargetWriteAfterClone ==
                         sourceManifestKeys, targetMeta, targetManifestVisible,
                         targetManifestKeys, manifestRewritten, copyFailed,
                         sourceDeleted, sourceGcDeleted, cloneResult,
-                        targetFencingReset, targetPendingCleared,
+                        publishFailed, targetFencingReset, targetPendingCleared,
                         targetVersionReset, targetGeneration >>
 
 TerminalStutter ==
@@ -230,6 +250,7 @@ Next ==
     \/ CopyOneObject
     \/ CopyOneObjectFails
     \/ PublishTargetManifest
+    \/ PublishTargetManifestFails
     \/ BuggyPublishBeforeCopy
     \/ SourceDeleteOrGc
     \/ TargetWriteAfterClone
@@ -248,7 +269,10 @@ SourceDeletionCannotBreakSuccessfulClone ==
     cloneResult = "success" => targetManifestKeys \subseteq targetObjects
 
 FailedCloneNotReportedSuccess ==
-    copyFailed # {} => cloneResult # "success"
+    (copyFailed # {} \/ publishFailed) => cloneResult # "success"
+
+SuccessRequiresVisibleTarget ==
+    cloneResult = "success" => targetManifestVisible
 
 CloneResetsSourceState ==
     targetManifestVisible =>
@@ -271,6 +295,7 @@ TypeOK ==
     /\ sourceDeleted \in BOOLEAN
     /\ sourceGcDeleted \subseteq SourceKeys
     /\ cloneResult \in {"none", "success", "error"}
+    /\ publishFailed \in BOOLEAN
     /\ targetFencingReset \in BOOLEAN
     /\ targetPendingCleared \in BOOLEAN
     /\ targetVersionReset \in BOOLEAN

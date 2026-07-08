@@ -93,13 +93,19 @@ native group-commit code added after July 3, 2026. The default configs are
 expected to pass. Each spec also has a deliberately buggy variant, enabled by
 a config constant, to prove the invariant can catch the target failure mode.
 
+The July 7 tightening split several previously atomic actions into their real
+publish steps. That exposed one product gap: PITR `as_of` readers treated a
+pre-CAS `history[N]` object as committed before the live manifest reached `N`.
+The query and restore-as-clone resolvers now cap history by the current live
+manifest generation, and `PitrHistoryRetention` includes that invariant.
+
 | Spec | Default TLC result | Negative variant |
 |------|--------------------|------------------|
-| `PitrHistoryRetention` | PASS: 604,773 generated; 41,442 distinct; depth 17 | `AllowBuggyCommit = TRUE` violates `LiveHasHistory` |
+| `PitrHistoryRetention` | PASS: 25,055,355 generated; 1,644,558 distinct; depth 36 | `AllowBuggyCommit = TRUE` violates `LiveHasHistory` |
 | `TwoPassGcSafety` | PASS: 2,547,895 generated; 167,004 distinct; depth 25 | `AllowBuggySweepWithoutRevalidate = TRUE` violates `NoReachableKeyDeleted` |
-| `RestoreCloneSafety` | PASS: 1,309 generated; 360 distinct; depth 11 | `AllowBuggyPublish = TRUE` violates `VisibleTargetRefsExist` |
+| `RestoreCloneSafety` | PASS: 1,337 generated; 368 distinct; depth 11 | `AllowBuggyPublish = TRUE` violates `VisibleTargetRefsExist` |
 | `IncrementalArtifactClosure` | PASS: 128 generated; 37 distinct; depth 8 | `AllowBuggyPrefixGc = TRUE` violates `ManifestReachableArtifactsExist` |
-| `GroupCommitWalWriter` | PASS: 6,368 generated; 2,407 distinct; depth 15 | `AllowBuggyMixedTokenDeadlock = TRUE` violates `NoMixedTokenLeaderDeadlock` |
+| `GroupCommitWalWriter` | PASS: 9,883 generated; 3,523 distinct; depth 16 | `AllowBuggyMixedTokenDeadlock = TRUE` violates `NoMixedTokenLeaderDeadlock`; adding strict `StrictFailedAppendLeavesNoOrphan` violates under best-effort cleanup failure |
 
 The `.tlc.log` files in `formal-verifications/tla/` contain the raw run
 summaries. They are generated artifacts; commit the specs/configs and summarize
