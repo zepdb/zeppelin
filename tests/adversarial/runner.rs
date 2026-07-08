@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use reqwest::{Client, Method, StatusCode};
@@ -7,13 +10,16 @@ use zeppelin::config::{Config, GcConfig};
 use zeppelin::types::ConsistencyLevel;
 use zeppelin::wal::Manifest;
 
+use crate::common::counting::{counting_store, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
 use crate::common::server::{cleanup_ns, start_test_server_full, FullTestServer};
 
-use super::artifacts::{FailureManifest, RunArtifacts, SeedArtifacts};
+use super::artifacts::{
+    read_ops, read_seed_config, FailureManifest, RunArtifacts, SeedArtifacts, SeedReport,
+};
 use super::generator::{AdversarialGenerator, Coverage};
 use super::model::{Model, OracleMutation};
-use super::ops::{InvalidProbe, Op, OpRecord, QueryOracleClass};
+use super::ops::{GeneratedQuery, InvalidProbe, NamespaceSpec, Op, OpRecord, QueryOracleClass};
 use super::oracle::{self, Violation, ViolationId};
 use super::s3_oracle::{self, S3Tracker};
 use super::{PreserveMode, RunMode, RunnerEnv};
@@ -35,12 +41,16 @@ struct SeedOutcome {
     compactions: u64,
     coverage: Coverage,
     violations: Vec<Violation>,
+    wall_secs: f64,
+    object_store: BTreeMap<String, ClassStats>,
 }
 
 pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
     let started = Instant::now();
     let deadline = started + Duration::from_secs(env.seconds);
     let artifacts = RunArtifacts::create(&env);
+    let artifact_root = artifacts.root().to_path_buf();
+    let mut seed_reports = Vec::new();
     let mut summary = RunSummary {
         seeds_run: 0,
         failed_seeds: 0,
@@ -51,15 +61,682 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
     };
 
     for seed in &env.seeds {
-        let outcome = run_seed(&env, &artifacts, *seed, deadline, None, None).await;
+        let outcome = run_seed(
+            &env,
+            &artifacts,
+            *seed,
+            deadline,
+            env.selftest,
+            env.selftest,
+        )
+        .await;
         summary.seeds_run += 1;
         summary.failed_seeds += u64::from(outcome.failed);
         summary.ops_total += outcome.ops;
         summary.compactions_total += outcome.compactions;
         summary.coverage.merge(&outcome.coverage);
+        seed_reports.push(SeedReport {
+            seed: *seed,
+            dir: artifact_root.join(format!("seed-{seed}")),
+            failed: outcome.failed,
+            ops: outcome.ops,
+            compactions: outcome.compactions,
+            violations: outcome.violations,
+            wall_secs: outcome.wall_secs,
+            object_store: outcome.object_store,
+        });
     }
     summary.ops_per_sec = summary.ops_total as f64 / started.elapsed().as_secs_f64().max(0.001);
+    artifacts.write_report(&env, &seed_reports, &summary.coverage);
     summary
+}
+
+pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(env.seconds);
+    let artifacts = RunArtifacts::create(&env);
+    let artifact_root = artifacts.root().to_path_buf();
+    let mut seed_reports = Vec::new();
+    let mut summary = RunSummary {
+        seeds_run: 0,
+        failed_seeds: 0,
+        ops_total: 0,
+        compactions_total: 0,
+        ops_per_sec: 0.0,
+        coverage: Coverage::default(),
+    };
+    let mut seed_index = 0usize;
+
+    while Instant::now() < deadline || summary.seeds_run == 0 {
+        let base_seed = env.seeds[seed_index % env.seeds.len()];
+        let round = (seed_index / env.seeds.len()) as u64;
+        let seed = base_seed.wrapping_add(round << 32);
+        let outcome = run_seed(&env, &artifacts, seed, deadline, env.selftest, env.selftest).await;
+        summary.seeds_run += 1;
+        summary.failed_seeds += u64::from(outcome.failed);
+        summary.ops_total += outcome.ops;
+        summary.compactions_total += outcome.compactions;
+        summary.coverage.merge(&outcome.coverage);
+        seed_reports.push(SeedReport {
+            seed,
+            dir: artifact_root.join(format!("seed-{seed}")),
+            failed: outcome.failed,
+            ops: outcome.ops,
+            compactions: outcome.compactions,
+            violations: outcome.violations,
+            wall_secs: outcome.wall_secs,
+            object_store: outcome.object_store,
+        });
+        seed_index += 1;
+    }
+
+    summary.ops_per_sec = summary.ops_total as f64 / started.elapsed().as_secs_f64().max(0.001);
+    artifacts.write_report(&env, &seed_reports, &summary.coverage);
+    summary
+}
+
+pub async fn replay_seed_from_env() {
+    let env = RunnerEnv::from_env();
+    let replay = std::env::var("ZEPPELIN_ADVERSARIAL_REPLAY")
+        .map(PathBuf::from)
+        .expect("ZEPPELIN_ADVERSARIAL_REPLAY must point at a seed artifact dir");
+    let expected_failure = read_failure_manifest(&replay);
+    let outcome = run_replay(&env, &replay).await;
+
+    if outcome.failed {
+        if let Some(expected) = expected_failure {
+            let actual = outcome
+                .violations
+                .first()
+                .unwrap_or_else(|| panic!("replay failed without a recorded violation"));
+            let expected_violation = expected
+                .violations
+                .first()
+                .unwrap_or_else(|| panic!("failure.json had no violations"));
+            assert_eq!(
+                actual.op_index, expected_violation.op_index,
+                "replay reproduced a violation at the wrong op index"
+            );
+            assert_eq!(
+                actual.id, expected_violation.id,
+                "replay reproduced the wrong violation id"
+            );
+            panic!(
+                "replay reproduced {:?} at op {} in {}",
+                actual.id,
+                actual.op_index,
+                replay.display()
+            );
+        }
+        panic!(
+            "replay produced unexpected violations: {:?}",
+            outcome.violations
+        );
+    }
+
+    if let Some(expected) = expected_failure {
+        let limit = env.max_ops.unwrap_or(u64::MAX);
+        let expected_index = expected
+            .violations
+            .first()
+            .map_or(expected.op_index, |violation| violation.op_index);
+        assert!(
+            limit <= expected_index,
+            "replay did not reproduce expected violation {:?} at op {}",
+            expected.violations.first().map(|violation| violation.id),
+            expected_index
+        );
+    }
+
+    println!(
+        "replay clean: dir={} ops={} compactions={}",
+        replay.display(),
+        outcome.ops,
+        outcome.compactions
+    );
+}
+
+pub async fn inspect_from_env() {
+    let target = std::env::var("ZEPPELIN_ADVERSARIAL_INSPECT")
+        .expect("ZEPPELIN_ADVERSARIAL_INSPECT must be a seed dir or namespace prefix");
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let namespaces = inspect_namespaces(&store, &target).await;
+    assert!(
+        !namespaces.is_empty(),
+        "inspect target {target:?} did not resolve to any namespaces"
+    );
+    let server = start_test_server_full(store.clone(), None, deterministic_config(), false).await;
+    println!("inspect server: {}", server.base_url);
+    for ns in &namespaces {
+        print_namespace_inspection(&store, ns).await;
+    }
+    let hold_secs = std::env::var("ZEPPELIN_ADVERSARIAL_INSPECT_HOLD_SECS")
+        .ok()
+        .map(|value| {
+            value.parse::<u64>().unwrap_or_else(|error| {
+                panic!("invalid ZEPPELIN_ADVERSARIAL_INSPECT_HOLD_SECS={value}: {error}")
+            })
+        })
+        .unwrap_or(0);
+    if hold_secs > 0 {
+        println!("holding inspect server for {hold_secs}s");
+        tokio::time::sleep(Duration::from_secs(hold_secs)).await;
+    }
+    if let Some(shutdown) = server.shutdown_compaction.as_ref() {
+        shutdown
+            .send(true)
+            .expect("failed to signal compaction loop shutdown");
+    }
+}
+
+async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
+    let seed_config = replay_seed_config(replay);
+    let replay_mutation = env.selftest.or(seed_config.fault_plan);
+    let old_prefix = recorded_namespace_prefix(seed_config.seed, &seed_config.namespace_specs);
+    let harness = TestHarness::new().await;
+    let prefix = harness.prefix.clone();
+    let (store, counter) = counting_store(&harness.store);
+    let config = seed_config.config.clone();
+    let specs = seed_config
+        .namespace_specs
+        .iter()
+        .map(|(ns, spec)| (rewrite_prefix(ns, &old_prefix, &prefix), spec.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let run_artifacts = RunArtifacts::create(env);
+    let mut artifacts = run_artifacts.seed(
+        seed_config.seed,
+        &config,
+        &specs,
+        seed_config.mode,
+        replay_mutation.map(OracleMutation::key),
+        seed_config.selftest_probe.map(OracleMutation::key),
+    );
+    let server =
+        start_test_server_full(store.clone(), Some(prefix.clone()), config.clone(), false).await;
+    let client = Client::new();
+    let mut model = Model::default();
+    let mut coverage = Coverage::default();
+    let mut s3_tracker = S3Tracker::default();
+    let mut created_namespaces = Vec::new();
+    let mut failed = false;
+    let mut failure_violations = Vec::new();
+    let mut compactions = 0u64;
+    let started = Instant::now();
+    let max_ops = env.max_ops.unwrap_or(u64::MAX);
+
+    let records = read_ops(replay);
+    for source in records.into_iter().take(max_ops as usize) {
+        let op = source.op.rewrite_namespace_prefix(&old_prefix, &prefix);
+        let step = execute_recorded_op(
+            &client,
+            &server,
+            &mut artifacts,
+            &mut model,
+            &mut coverage,
+            &mut s3_tracker,
+            &op,
+            source.index,
+            started,
+            replay_mutation,
+        )
+        .await;
+        if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
+            created_namespaces.push(op.namespace().to_string());
+        }
+        if let Op::CloneNamespace { target, .. } = &op {
+            if (200..300).contains(&step.status) {
+                created_namespaces.push(target.clone());
+            }
+        }
+        if let Op::DeleteNamespace { ns } = &op {
+            if (200..300).contains(&step.status) {
+                created_namespaces.retain(|created| created != ns);
+            }
+        }
+        if matches!(
+            op,
+            Op::CompactInline { .. } | Op::CompactEndpoint { .. } | Op::ProbeSandwich { .. }
+        ) && (200..300).contains(&step.status)
+        {
+            compactions += 1;
+        }
+        if !step.violations.is_empty() {
+            failed = true;
+            failure_violations = step.violations;
+            break;
+        }
+    }
+
+    let mut op_count = artifacts.op_count();
+    if !failed {
+        let quiescence = quiesce_and_verify(
+            &client,
+            &server,
+            &mut artifacts,
+            &mut model,
+            &mut coverage,
+            &mut s3_tracker,
+            &created_namespaces,
+            &mut op_count,
+            &mut compactions,
+            started,
+            replay_mutation,
+        )
+        .await;
+        if !quiescence.is_empty() {
+            failed = true;
+            failure_violations = quiescence;
+        }
+    }
+
+    artifacts.write_model_final(&model);
+    artifacts.write_s3_final(&store, &created_namespaces).await;
+    artifacts.write_coverage(&coverage);
+    let object_store = object_store_breakdown(&counter);
+    if should_cleanup(env.preserve, failed) {
+        for ns in &created_namespaces {
+            cleanup_ns(&store, ns).await;
+        }
+        harness.cleanup().await;
+    } else {
+        println!("preserved replay prefix {prefix}");
+    }
+    if let Some(shutdown) = server.shutdown_compaction.as_ref() {
+        shutdown
+            .send(true)
+            .expect("failed to signal compaction loop shutdown");
+    }
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    SeedOutcome {
+        failed,
+        ops: op_count,
+        compactions,
+        coverage,
+        violations: failure_violations,
+        wall_secs: elapsed,
+        object_store,
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReplaySeedConfig {
+    seed: u64,
+    mode: RunMode,
+    #[serde(default)]
+    fault_plan: Option<OracleMutation>,
+    #[serde(default)]
+    selftest_probe: Option<OracleMutation>,
+    config: Config,
+    namespace_specs: BTreeMap<String, NamespaceSpec>,
+}
+
+fn replay_seed_config(path: &Path) -> ReplaySeedConfig {
+    serde_json::from_value(read_seed_config(path))
+        .unwrap_or_else(|error| panic!("failed to parse replay seed config: {error}"))
+}
+
+fn read_failure_manifest(path: &Path) -> Option<FailureManifest> {
+    let failure_path = path.join("failure.json");
+    if !failure_path.exists() {
+        return None;
+    }
+    let bytes = fs::read(&failure_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", failure_path.display()));
+    Some(serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse failure manifest {}: {error}",
+            failure_path.display()
+        )
+    }))
+}
+
+fn recorded_namespace_prefix(
+    seed: u64,
+    namespace_specs: &BTreeMap<String, NamespaceSpec>,
+) -> String {
+    let marker = format!("-adv-{seed}-");
+    for ns in namespace_specs.keys() {
+        if let Some(index) = ns.find(&marker) {
+            return ns[..index].to_string();
+        }
+    }
+    let first = namespace_specs
+        .keys()
+        .next()
+        .unwrap_or_else(|| panic!("replay config contained no namespace specs"));
+    first
+        .rsplit_once('-')
+        .map_or_else(|| first.clone(), |(prefix, _)| prefix.to_string())
+}
+
+fn rewrite_prefix(value: &str, old_prefix: &str, new_prefix: &str) -> String {
+    value.strip_prefix(old_prefix).map_or_else(
+        || value.to_string(),
+        |suffix| format!("{new_prefix}{suffix}"),
+    )
+}
+
+fn object_store_breakdown(counter: &GetCounter) -> BTreeMap<String, ClassStats> {
+    counter
+        .class_breakdown()
+        .into_iter()
+        .map(|(class, stats)| (class.name().to_string(), stats))
+        .collect()
+}
+
+fn recorded_seed_ops_if_requested(env: &RunnerEnv, seed: u64, prefix: &str) -> Option<Vec<Op>> {
+    if std::env::var_os("ZEPPELIN_ADVERSARIAL_SEED").is_none()
+        || std::env::var_os("ZEPPELIN_ADVERSARIAL_REPLAY").is_some()
+    {
+        return None;
+    }
+
+    let recorded = latest_recorded_seed_dir(env, seed)?;
+    let seed_config = replay_seed_config(&recorded);
+    let old_prefix = recorded_namespace_prefix(seed_config.seed, &seed_config.namespace_specs);
+    let ops = read_ops(&recorded)
+        .into_iter()
+        .map(|record| rewrite_op_strings(&record.op, &old_prefix, prefix))
+        .collect::<Vec<_>>();
+    eprintln!(
+        "determinism guard: comparing generated seed {} to {}",
+        seed,
+        recorded.display()
+    );
+    Some(ops)
+}
+
+fn latest_recorded_seed_dir(env: &RunnerEnv, seed: u64) -> Option<PathBuf> {
+    let entries = match fs::read_dir(&env.artifacts) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!(
+            "failed to read adversarial artifact root {}: {error}",
+            env.artifacts.display()
+        ),
+    };
+    let min_ops = env.max_ops.unwrap_or(0) as usize;
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!(
+                "failed to read entry under {}: {error}",
+                env.artifacts.display()
+            )
+        });
+        let path = entry.path().join(format!("seed-{seed}"));
+        if !path.join("config.json").exists() || !path.join("ops.jsonl").exists() {
+            continue;
+        }
+        let config = replay_seed_config(&path);
+        if config.fault_plan == env.selftest && config.selftest_probe == env.selftest {
+            let records = read_ops(&path);
+            if !recorded_trace_uses_generated_ids(&records) {
+                continue;
+            }
+            let op_count = records.len();
+            if op_count >= min_ops {
+                dirs.push((op_count, path));
+            }
+        }
+    }
+    dirs.sort();
+    dirs.pop().map(|(_, path)| path)
+}
+
+fn recorded_trace_uses_generated_ids(records: &[OpRecord]) -> bool {
+    for record in records {
+        if let Op::Upsert { ns, vectors } = &record.op {
+            return vectors.iter().all(|vector| vector.id.starts_with(ns));
+        }
+    }
+    true
+}
+
+fn assert_recorded_op_matches(recorded_ops: Option<&[Op]>, seed: u64, index: u64, actual: &Op) {
+    let Some(recorded_ops) = recorded_ops else {
+        return;
+    };
+    let expected = recorded_ops.get(index as usize).unwrap_or_else(|| {
+        panic!("determinism guard for seed {seed} ended before generated op {index}: {actual:#?}")
+    });
+    let expected_json =
+        serde_json::to_value(expected).expect("recorded Op must serialize for comparison");
+    let actual_json = serde_json::to_value(actual).expect("generated Op must serialize");
+    assert!(
+        json_values_equivalent(&actual_json, &expected_json),
+        "determinism guard diverged for seed {seed} at op {index}\nexpected: {expected:#?}\nactual: {actual:#?}"
+    );
+}
+
+fn json_values_equivalent(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    match (left, right) {
+        (serde_json::Value::Null, serde_json::Value::Null) => true,
+        (serde_json::Value::Bool(left), serde_json::Value::Bool(right)) => left == right,
+        (serde_json::Value::String(left), serde_json::Value::String(right)) => left == right,
+        (serde_json::Value::Number(left), serde_json::Value::Number(right)) => {
+            json_numbers_equivalent(left, right)
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| json_values_equivalent(left, right))
+        }
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right| json_values_equivalent(left, right))
+                })
+        }
+        _ => false,
+    }
+}
+
+fn json_numbers_equivalent(left: &serde_json::Number, right: &serde_json::Number) -> bool {
+    if let (Some(left), Some(right)) = (left.as_i64(), right.as_i64()) {
+        return left == right;
+    }
+    if let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) {
+        return left == right;
+    }
+    let left = left
+        .as_f64()
+        .expect("serde_json number should fit in f64 for guard comparison");
+    let right = right
+        .as_f64()
+        .expect("serde_json number should fit in f64 for guard comparison");
+    (left - right).abs() <= 1e-12
+}
+
+fn rewrite_op_strings(op: &Op, old_prefix: &str, new_prefix: &str) -> Op {
+    let mut value = serde_json::to_value(op).expect("Op must serialize for determinism guard");
+    rewrite_json_strings(&mut value, old_prefix, new_prefix);
+    serde_json::from_value(value).expect("rewritten Op must deserialize")
+}
+
+fn rewrite_json_strings(value: &mut serde_json::Value, old_prefix: &str, new_prefix: &str) {
+    match value {
+        serde_json::Value::String(string) => {
+            if let Some(suffix) = string.strip_prefix(old_prefix) {
+                *string = format!("{new_prefix}{suffix}");
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                rewrite_json_strings(value, old_prefix, new_prefix);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                rewrite_json_strings(value, old_prefix, new_prefix);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+async fn inspect_namespaces(store: &zeppelin::storage::ZeppelinStore, target: &str) -> Vec<String> {
+    let path = Path::new(target);
+    if path.exists() {
+        let failure = read_failure_manifest(path);
+        if let Some(failure) = failure {
+            let discovered = discover_namespaces(store, &failure.preserved_prefix).await;
+            if !discovered.is_empty() {
+                return discovered;
+            }
+            let config = replay_seed_config(path);
+            return config.namespace_specs.keys().cloned().collect();
+        }
+        let config = replay_seed_config(path);
+        return config.namespace_specs.keys().cloned().collect();
+    }
+    discover_namespaces(store, target).await
+}
+
+async fn discover_namespaces(
+    store: &zeppelin::storage::ZeppelinStore,
+    prefix: &str,
+) -> Vec<String> {
+    let mut namespaces = store
+        .list_common_prefixes("")
+        .await
+        .unwrap_or_else(|error| panic!("failed to list root namespace prefixes: {error}"))
+        .into_iter()
+        .filter_map(|key| key.strip_suffix('/').map(str::to_string))
+        .filter(|namespace| namespace.starts_with(prefix))
+        .collect::<Vec<_>>();
+    namespaces.sort();
+    namespaces
+}
+
+async fn print_namespace_inspection(store: &zeppelin::storage::ZeppelinStore, ns: &str) {
+    println!("\n## namespace {ns}");
+    let Some(manifest) = Manifest::read(store, ns)
+        .await
+        .unwrap_or_else(|error| panic!("failed to read manifest for {ns}: {error}"))
+    else {
+        println!("manifest: missing");
+        return;
+    };
+    println!("manifest generation: {}", manifest.version());
+    println!("fencing_token: {}", manifest.fencing_token);
+    println!("next_sequence: {}", manifest.next_sequence);
+    println!("active_segment: {:?}", manifest.active_segment);
+    println!("compaction_watermark: {:?}", manifest.compaction_watermark);
+    println!("updated_at: {}", manifest.updated_at);
+    println!("pending_deletes: {}", manifest.pending_deletes.len());
+    for key in &manifest.pending_deletes {
+        println!("  pending {key}");
+    }
+
+    println!("fragments: {}", manifest.fragments.len());
+    for fragment in &manifest.fragments {
+        println!(
+            "  {} seq={} vectors={} deletes={} bytes={}",
+            fragment.id,
+            fragment.sequence_number,
+            fragment.vector_count,
+            fragment.delete_count,
+            fragment.size_bytes
+        );
+    }
+
+    println!("segments: {}", manifest.segments.len());
+    for segment in &manifest.segments {
+        let carried = segment
+            .cluster_owners
+            .iter()
+            .filter(|owner| *owner != &segment.id)
+            .count();
+        println!(
+            "  {} vectors={} clusters={} quant={:?} hierarchical={} carried_clusters={} fts={:?} bitmap={:?} global_fts={}",
+            segment.id,
+            segment.vector_count,
+            segment.cluster_count,
+            segment.quantization,
+            segment.hierarchical,
+            carried,
+            segment.fts_fields,
+            segment.bitmap_fields,
+            segment.has_global_fts
+        );
+    }
+
+    let snapshots = zeppelin::wal::manifest::NamedSnapshot::list(store, ns)
+        .await
+        .unwrap_or_else(|error| panic!("failed to list snapshots for {ns}: {error}"));
+    println!("snapshots: {}", snapshots.len());
+    for snapshot in &snapshots {
+        println!(
+            "  {} -> generation {} at {}",
+            snapshot.name, snapshot.generation, snapshot.created_at
+        );
+    }
+
+    println!("history:");
+    for entry in Manifest::list_history(store, ns)
+        .await
+        .unwrap_or_else(|error| panic!("failed to list history for {ns}: {error}"))
+    {
+        let history = Manifest::read_history(store, ns, entry.version)
+            .await
+            .unwrap_or_else(|error| panic!("failed to read history {}: {error}", entry.key))
+            .unwrap_or_else(|| panic!("history key disappeared: {}", entry.key));
+        let pins = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.generation == entry.version)
+            .map(|snapshot| snapshot.name.as_str())
+            .collect::<Vec<_>>();
+        println!(
+            "  generation {} updated_at={} pins={:?}",
+            history.version(),
+            history.updated_at,
+            pins
+        );
+    }
+
+    let candidates = gc::load_gc_candidates(store, ns)
+        .await
+        .unwrap_or_else(|error| panic!("failed to load GC candidates for {ns}: {error}"));
+    println!("gc candidates: {}", candidates.len());
+    for candidate in &candidates {
+        println!(
+            "  {} first_seen={} since_generation={}",
+            candidate.key,
+            candidate.first_seen_unreachable_at,
+            candidate.unreachable_since_manifest_version
+        );
+    }
+
+    let reachable = gc::reachable_keys_with_retained_history_and_staging(
+        store,
+        ns,
+        &manifest,
+        &Default::default(),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("failed to compute reachability for {ns}: {error}"));
+    let listed = store
+        .list_prefix(&format!("{ns}/"))
+        .await
+        .unwrap_or_else(|error| panic!("failed to list namespace keys for {ns}: {error}"))
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let missing = reachable.difference(&listed).cloned().collect::<Vec<_>>();
+    let extra = listed.difference(&reachable).cloned().collect::<Vec<_>>();
+    println!("reach \\ listed: {}", missing.len());
+    for key in missing {
+        println!("  missing {key}");
+    }
+    println!("listed \\ reach: {}", extra.len());
+    for key in extra {
+        println!("  awaiting_gc {key}");
+    }
 }
 
 pub async fn run_oracle_selftest(env: RunnerEnv) {
@@ -154,11 +831,19 @@ async fn run_seed(
 ) -> SeedOutcome {
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
-    let store = harness.store.clone();
+    let (store, counter) = counting_store(&harness.store);
     let config = deterministic_config();
     let mut generator = AdversarialGenerator::new(seed, &prefix);
     let specs = generator.specs();
-    let mut artifacts = artifacts.seed(seed, &config, &specs, env.mode);
+    let recorded_ops = recorded_seed_ops_if_requested(env, seed, &prefix);
+    let mut artifacts = artifacts.seed(
+        seed,
+        &config,
+        &specs,
+        env.mode,
+        mutation.map(OracleMutation::key),
+        selftest_probe.map(OracleMutation::key),
+    );
     let server =
         start_test_server_full(store.clone(), Some(prefix.clone()), config.clone(), false).await;
     let client = Client::new();
@@ -175,6 +860,7 @@ async fn run_seed(
 
     while op_index < max_ops && (Instant::now() < deadline || op_index == 0) {
         let op = generator.next(&model);
+        assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &op);
         let step = execute_recorded_op(
             &client,
             &server,
@@ -217,6 +903,7 @@ async fn run_seed(
 
         if let Some(probe) = selftest_probe {
             if let Some(probe_op) = selftest_probe_op(probe, &op, &model, &mut generator) {
+                assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &probe_op);
                 let step = execute_recorded_op(
                     &client,
                     &server,
@@ -248,7 +935,6 @@ async fn run_seed(
             &mut model,
             &mut coverage,
             &mut s3_tracker,
-            &mut generator,
             &created_namespaces,
             &mut op_index,
             &mut compactions,
@@ -265,25 +951,48 @@ async fn run_seed(
     artifacts.write_model_final(&model);
     artifacts.write_s3_final(&store, &created_namespaces).await;
     artifacts.write_coverage(&coverage);
+    let object_store = object_store_breakdown(&counter);
 
     if failed {
+        let failure_op_index = failure_violations
+            .first()
+            .map_or(op_index, |violation| violation.op_index);
+        artifacts
+            .capture_s3_metadata(
+                &store,
+                &created_namespaces,
+                std::env::var("ZEPPELIN_ADVERSARIAL_DUMP_S3").as_deref() == Ok("full"),
+            )
+            .await;
+        let replay_max_ops = failure_op_index + 1;
+        let backend = env
+            .env_echo
+            .get("TEST_BACKEND")
+            .map(String::as_str)
+            .unwrap_or("memory");
+        let mut repro_env = format!("TEST_BACKEND={backend}");
+        if let Some(mutation) = mutation {
+            repro_env.push_str(&format!(
+                " ZEPPELIN_ADVERSARIAL_SELFTEST={}",
+                mutation.key()
+            ));
+        }
         artifacts.write_failure(&FailureManifest {
             seed,
             mode: env.mode,
-            op_index,
+            op_index: failure_op_index,
             violations: failure_violations.clone(),
             preserved_prefix: prefix.clone(),
+            fault_plan: mutation.map(|mutation| mutation.key().to_string()),
             repro_cmd: format!(
-                "TEST_BACKEND={} ZEPPELIN_ADVERSARIAL_SEED={} cargo test --test adversarial_workload_tests smoke -- --ignored --nocapture",
-                env.env_echo
-                    .get("TEST_BACKEND")
-                    .map(String::as_str)
-                    .unwrap_or("memory"),
-                seed
+                "{repro_env} ZEPPELIN_ADVERSARIAL_REPLAY={} ZEPPELIN_ADVERSARIAL_MAX_OPS={} cargo test --test adversarial_workload_tests replay_seed -- --ignored --nocapture",
+                artifacts.dir.display(),
+                replay_max_ops
             ),
             inspect_cmd: format!(
-                "ZEPPELIN_ADVERSARIAL_INSPECT={} cargo test --test adversarial_workload_tests inspect -- --ignored --nocapture",
-                prefix
+                "TEST_BACKEND={} ZEPPELIN_ADVERSARIAL_INSPECT={} cargo test --test adversarial_workload_tests inspect -- --ignored --nocapture",
+                backend,
+                artifacts.dir.display()
             ),
         });
     }
@@ -319,6 +1028,8 @@ async fn run_seed(
         compactions,
         coverage,
         violations: failure_violations,
+        wall_secs: elapsed,
+        object_store,
     }
 }
 
@@ -1165,7 +1876,6 @@ async fn quiesce_and_verify(
     model: &mut Model,
     coverage: &mut Coverage,
     s3_tracker: &mut S3Tracker,
-    generator: &mut AdversarialGenerator,
     namespaces: &[String],
     op_index: &mut u64,
     compactions: &mut u64,
@@ -1257,7 +1967,7 @@ async fn quiesce_and_verify(
             return step.violations;
         }
 
-        let q = generator.exhaustive_query(model, ns, None);
+        let q = exhaustive_query_from_model(model, ns);
         let query = Op::Query {
             ns: ns.clone(),
             q,
@@ -1274,6 +1984,46 @@ async fn quiesce_and_verify(
         }
     }
     Vec::new()
+}
+
+fn exhaustive_query_from_model(model: &Model, ns: &str) -> GeneratedQuery {
+    let ns_model = model
+        .namespaces
+        .get(ns)
+        .unwrap_or_else(|| panic!("missing namespace model for quiescence query: {ns}"));
+    let top_k = (ns_model.live.len() + ns_model.wal_tombstones.len()).max(1);
+    let vector = ns_model.live.values().next().map_or_else(
+        || vec![0.0f32; ns_model.spec.dims],
+        |record| record.values.clone(),
+    );
+    let body = json!({
+        "sources": [{
+            "type": "ann",
+            "vector": vector,
+            "nprobe": ns_model.spec.num_centroids
+        }],
+        "fusion": { "type": "none" },
+        "top_k": top_k,
+        "candidate_k": top_k,
+        "consistency": ConsistencyLevel::Strong,
+        "include_attributes": true
+    });
+    let class = if ns_model.spec.is_exact() && ns_model.wal_tombstones.is_empty() {
+        QueryOracleClass::ExactAnn {
+            top_k,
+            consistency: ConsistencyLevel::Strong,
+            filter: None,
+        }
+    } else {
+        QueryOracleClass::Membership {
+            consistency: ConsistencyLevel::Strong,
+        }
+    };
+    GeneratedQuery {
+        body,
+        class,
+        pattern_tags: Vec::new(),
+    }
 }
 
 fn selftest_probe_op(

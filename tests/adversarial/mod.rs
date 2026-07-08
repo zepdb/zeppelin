@@ -65,6 +65,10 @@ impl RunnerEnv {
             .as_str()
         {
             "deterministic" => RunMode::Deterministic,
+            "mixed" => {
+                eprintln!("ZEPPELIN_ADVERSARIAL_MODE=mixed maps to deterministic until Phase 5");
+                RunMode::Deterministic
+            }
             _ => panic!("chaos mode lands in Phase 5"),
         };
         let selftest = std::env::var("ZEPPELIN_ADVERSARIAL_SELFTEST")
@@ -104,7 +108,8 @@ impl RunnerEnv {
         );
         env_echo.insert(
             "ZEPPELIN_ADVERSARIAL_MODE".to_string(),
-            "deterministic".to_string(),
+            std::env::var("ZEPPELIN_ADVERSARIAL_MODE")
+                .unwrap_or_else(|_| "deterministic".to_string()),
         );
         env_echo.insert(
             "ZEPPELIN_ADVERSARIAL_SELFTEST".to_string(),

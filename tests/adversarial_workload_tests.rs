@@ -103,3 +103,30 @@ async fn oracle_selftest() {
     let env = adversarial::RunnerEnv::from_env();
     adversarial::runner::run_oracle_selftest(env).await;
 }
+
+#[tokio::test]
+#[ignore]
+async fn replay_seed() {
+    adversarial::runner::replay_seed_from_env().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn inspect() {
+    adversarial::runner::inspect_from_env().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn overnight() {
+    let env = adversarial::RunnerEnv::from_env();
+    let summary = adversarial::runner::run_overnight(env).await;
+    println!(
+        "adversarial overnight: seeds={} ops={} compactions={} failed={} ops/sec={:.2}",
+        summary.seeds_run,
+        summary.ops_total,
+        summary.compactions_total,
+        summary.failed_seeds,
+        summary.ops_per_sec
+    );
+}

@@ -280,6 +280,96 @@ impl Op {
             _ => Vec::new(),
         }
     }
+
+    #[must_use]
+    pub fn rewrite_namespace_prefix(&self, old_prefix: &str, new_prefix: &str) -> Self {
+        let rewrite = |value: &str| -> String {
+            value.strip_prefix(old_prefix).map_or_else(
+                || value.to_string(),
+                |suffix| format!("{new_prefix}{suffix}"),
+            )
+        };
+        match self {
+            Op::CreateNamespace { ns, spec } => Op::CreateNamespace {
+                ns: rewrite(ns),
+                spec: spec.clone(),
+            },
+            Op::GetNamespace { ns } => Op::GetNamespace { ns: rewrite(ns) },
+            Op::Upsert { ns, vectors } => Op::Upsert {
+                ns: rewrite(ns),
+                vectors: vectors.clone(),
+            },
+            Op::DeleteVectors { ns, ids } => Op::DeleteVectors {
+                ns: rewrite(ns),
+                ids: ids.clone(),
+            },
+            Op::FetchVectors {
+                ns,
+                ids,
+                consistency,
+            } => Op::FetchVectors {
+                ns: rewrite(ns),
+                ids: ids.clone(),
+                consistency: *consistency,
+            },
+            Op::Query { ns, q, as_of } => Op::Query {
+                ns: rewrite(ns),
+                q: q.clone(),
+                as_of: as_of.clone(),
+            },
+            Op::BatchQuery { ns, qs } => Op::BatchQuery {
+                ns: rewrite(ns),
+                qs: qs.clone(),
+            },
+            Op::PaginateAll { ns, q, page_size } => Op::PaginateAll {
+                ns: rewrite(ns),
+                q: q.clone(),
+                page_size: *page_size,
+            },
+            Op::InvalidProbe { ns, probe } => Op::InvalidProbe {
+                ns: rewrite(ns),
+                probe: *probe,
+            },
+            Op::CompactEndpoint { ns } => Op::CompactEndpoint { ns: rewrite(ns) },
+            Op::GcCycle { ns, keep_count } => Op::GcCycle {
+                ns: rewrite(ns),
+                keep_count: *keep_count,
+            },
+            Op::CreateSnapshot { ns, name } => Op::CreateSnapshot {
+                ns: rewrite(ns),
+                name: name.clone(),
+            },
+            Op::GetSnapshot { ns, name } => Op::GetSnapshot {
+                ns: rewrite(ns),
+                name: name.clone(),
+            },
+            Op::ListSnapshots { ns } => Op::ListSnapshots { ns: rewrite(ns) },
+            Op::DeleteSnapshot { ns, name } => Op::DeleteSnapshot {
+                ns: rewrite(ns),
+                name: name.clone(),
+            },
+            Op::CloneNamespace {
+                source,
+                target,
+                as_of,
+            } => Op::CloneNamespace {
+                source: rewrite(source),
+                target: rewrite(target),
+                as_of: as_of.clone(),
+            },
+            Op::PatchIndexConfig { ns, patch } => Op::PatchIndexConfig {
+                ns: rewrite(ns),
+                patch: patch.clone(),
+            },
+            Op::Hydrate { ns } => Op::Hydrate { ns: rewrite(ns) },
+            Op::DeleteNamespace { ns } => Op::DeleteNamespace { ns: rewrite(ns) },
+            Op::ProbeSandwich { ns, maintenance } => Op::ProbeSandwich {
+                ns: rewrite(ns),
+                maintenance: *maintenance,
+            },
+            Op::CompactInline { ns } => Op::CompactInline { ns: rewrite(ns) },
+        }
+    }
 }
 
 impl NamespaceSpec {
