@@ -1,0 +1,27 @@
+name: TLA Nightly
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  july-specs:
+    name: July Durability Specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Download TLA+ tools
+        run: |
+          curl -fsSL \
+            https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar \
+            -o "$RUNNER_TEMP/tla2tools.jar"
+      - name: Run July TLA specs
+        env:
+          TLA_JAR: ${{ runner.temp }}/tla2tools.jar
+        run: ./scripts/run-july-tla.sh

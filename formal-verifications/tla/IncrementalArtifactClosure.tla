@@ -25,37 +25,57 @@ vars ==
 
 KeyUniverse ==
     {"s1_centroids", "s1_sketch", "s1_bootstrap", "s1_membership",
-     "s1_group", "s1_attrs0", "s1_attrs1",
+     "s1_group", "s1_attrs0", "s1_attrs1", "s1_attrs2",
      "s2_centroids", "s2_sketch", "s2_bootstrap", "s2_membership",
-     "s2_group0", "s2_group1", "s2_attrs0", "s2_attrs1"}
+     "s2_group0", "s2_group1", "s2_group2",
+     "s2_attrs0", "s2_attrs1", "s2_attrs2",
+     "s3_centroids", "s3_sketch", "s3_bootstrap", "s3_membership",
+     "s3_group0", "s3_group1", "s3_group2",
+     "s3_attrs0", "s3_attrs1", "s3_attrs2"}
 
 MetaKeys(seg) ==
     CASE seg = "s1" ->
             {"s1_centroids", "s1_sketch", "s1_bootstrap", "s1_membership"}
       [] seg = "s2" ->
             {"s2_centroids", "s2_sketch", "s2_bootstrap", "s2_membership"}
+      [] seg = "s3" ->
+            {"s3_centroids", "s3_sketch", "s3_bootstrap", "s3_membership"}
       [] OTHER -> {}
 
 AttrKey(seg, c) ==
     CASE seg = "s1" /\ c = 0 -> "s1_attrs0"
       [] seg = "s1" /\ c = 1 -> "s1_attrs1"
+      [] seg = "s1" /\ c = 2 -> "s1_attrs2"
       [] seg = "s2" /\ c = 0 -> "s2_attrs0"
       [] seg = "s2" /\ c = 1 -> "s2_attrs1"
+      [] seg = "s2" /\ c = 2 -> "s2_attrs2"
+      [] seg = "s3" /\ c = 0 -> "s3_attrs0"
+      [] seg = "s3" /\ c = 1 -> "s3_attrs1"
+      [] seg = "s3" /\ c = 2 -> "s3_attrs2"
       [] OTHER -> "unknown"
 
-NewGroupKey(c) ==
-    CASE c = 0 -> "s2_group0"
-      [] c = 1 -> "s2_group1"
+GroupKey(seg, c) ==
+    CASE seg = "s2" /\ c = 0 -> "s2_group0"
+      [] seg = "s2" /\ c = 1 -> "s2_group1"
+      [] seg = "s2" /\ c = 2 -> "s2_group2"
+      [] seg = "s3" /\ c = 0 -> "s3_group0"
+      [] seg = "s3" /\ c = 1 -> "s3_group1"
+      [] seg = "s3" /\ c = 2 -> "s3_group2"
       [] OTHER -> "unknown"
 
 SegmentPrefix(k) ==
     CASE k \in {"s1_centroids", "s1_sketch", "s1_bootstrap",
-                "s1_membership", "s1_group", "s1_attrs0", "s1_attrs1"}
+                "s1_membership", "s1_group", "s1_attrs0", "s1_attrs1",
+                "s1_attrs2"}
             -> "s1"
       [] k \in {"s2_centroids", "s2_sketch", "s2_bootstrap",
                 "s2_membership", "s2_group0", "s2_group1",
-                "s2_attrs0", "s2_attrs1"}
+                "s2_group2", "s2_attrs0", "s2_attrs1", "s2_attrs2"}
             -> "s2"
+      [] k \in {"s3_centroids", "s3_sketch", "s3_bootstrap",
+                "s3_membership", "s3_group0", "s3_group1",
+                "s3_group2", "s3_attrs0", "s3_attrs1", "s3_attrs2"}
+            -> "s3"
       [] OTHER -> "unknown"
 
 SegmentClusterKeys(seg) ==
@@ -75,7 +95,7 @@ InitialOwner ==
 InitialDataKey ==
     [seg \in Segments |->
         [c \in Clusters |->
-            IF seg = "s1" THEN "s1_group" ELSE NewGroupKey(c)]]
+            IF seg = "s1" THEN "s1_group" ELSE GroupKey(seg, c)]]
 
 InitialExplicitKeys ==
     [seg \in Segments |-> MetaKeys(seg)]
@@ -102,7 +122,7 @@ IncrementalCompactTouchCluster ==
            newDataKey ==
                [dataKey EXCEPT !["s2"] =
                    [c \in Clusters |->
-                       IF c = 0 THEN NewGroupKey(0) ELSE dataKey["s1"][c]]]
+                       IF c = 0 THEN GroupKey("s2", 0) ELSE dataKey["s1"][c]]]
            newExplicitKeys ==
                [explicitKeys EXCEPT !["s2"] = MetaKeys("s2")]
            s2Reachable ==
@@ -117,6 +137,33 @@ IncrementalCompactTouchCluster ==
        /\ s3' = s3 \cup s2Reachable
        /\ liveSegments' = liveSegments \cup {"s2"}
        /\ touchedClusters' = {0}
+    /\ UNCHANGED << historySegments, pendingDeletes, gcDeleted, oldDropped >>
+
+IncrementalCompactTouchSecondCluster ==
+    /\ "s2" \in liveSegments
+    /\ "s3" \notin liveSegments
+    /\ LET newOwner ==
+               [owner EXCEPT !["s3"] =
+                   [c \in Clusters |->
+                       IF c = 1 THEN "s3" ELSE owner["s2"][c]]]
+           newDataKey ==
+               [dataKey EXCEPT !["s3"] =
+                   [c \in Clusters |->
+                       IF c = 1 THEN GroupKey("s3", 1) ELSE dataKey["s2"][c]]]
+           newExplicitKeys ==
+               [explicitKeys EXCEPT !["s3"] = MetaKeys("s3")]
+           s3Reachable ==
+               newExplicitKeys["s3"]
+                   \cup UNION {{newDataKey["s3"][c],
+                                AttrKey(newOwner["s3"][c], c)}
+                               : c \in Clusters}
+       IN
+       /\ owner' = newOwner
+       /\ dataKey' = newDataKey
+       /\ explicitKeys' = newExplicitKeys
+       /\ s3' = s3 \cup s3Reachable
+       /\ liveSegments' = liveSegments \cup {"s3"}
+       /\ touchedClusters' = touchedClusters \cup {1}
     /\ UNCHANGED << historySegments, pendingDeletes, gcDeleted, oldDropped >>
 
 DropOldSegmentRef ==
@@ -165,6 +212,7 @@ Stutter ==
 
 Next ==
     \/ IncrementalCompactTouchCluster
+    \/ IncrementalCompactTouchSecondCluster
     \/ DropOldSegmentRef
     \/ RetainHistory
     \/ PruneHistory
@@ -192,10 +240,14 @@ RetainedHistoryPinsOldClosure ==
     "s1" \in historySegments => SegmentReachable("s1") \subseteq s3
 
 TouchedClusterRewritten ==
-    "s2" \in liveSegments =>
-        /\ 0 \in touchedClusters
-        /\ owner["s2"][0] = "s2"
-        /\ dataKey["s2"][0] = "s2_group0"
+    /\ ("s2" \in liveSegments =>
+            /\ 0 \in touchedClusters
+            /\ owner["s2"][0] = "s2"
+            /\ dataKey["s2"][0] = "s2_group0")
+    /\ ("s3" \in liveSegments =>
+            /\ 1 \in touchedClusters
+            /\ owner["s3"][1] = "s3"
+            /\ dataKey["s3"][1] = "s3_group1")
 
 TypeOK ==
     /\ liveSegments \subseteq Segments
@@ -208,7 +260,7 @@ TypeOK ==
     /\ gcDeleted \subseteq KeyUniverse
     /\ oldDropped \in BOOLEAN
     /\ touchedClusters \subseteq Clusters
-    /\ Segments = {"s1", "s2"}
-    /\ Clusters = {0, 1}
+    /\ Segments = {"s1", "s2", "s3"}
+    /\ Clusters = {0, 1, 2}
 
 ====

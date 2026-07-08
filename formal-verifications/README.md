@@ -59,23 +59,15 @@ java -jar tla2tools.jar -config NamespaceDeletion.cfg NamespaceDeletion.tla
 java -jar tla2tools.jar -config ULIDOrdering.cfg ULIDOrdering.tla
 ```
 
-Current July 2026 durability/write-path specs were run with:
+Run the current July 2026 durability/write-path specs and their negative
+variants with:
 
 ```bash
-cd formal-verifications/tla
-JAVA="${JAVA:-/opt/homebrew/opt/openjdk/bin/java}"
-
-"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
-  -config PitrHistoryRetention.cfg PitrHistoryRetention.tla
-"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
-  -config TwoPassGcSafety.cfg TwoPassGcSafety.tla
-"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
-  -config RestoreCloneSafety.cfg RestoreCloneSafety.tla
-"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
-  -config IncrementalArtifactClosure.cfg IncrementalArtifactClosure.tla
-"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
-  -config GroupCommitWalWriter.cfg GroupCommitWalWriter.tla
+./scripts/run-july-tla.sh
 ```
+
+The scheduled/manual GitHub workflow `.github/workflows/tla-nightly.yml` runs
+the same script.
 
 ### What Each Spec Verifies
 
@@ -103,13 +95,34 @@ manifest generation, and `PitrHistoryRetention` includes that invariant.
 |------|--------------------|------------------|
 | `PitrHistoryRetention` | PASS: 25,055,355 generated; 1,644,558 distinct; depth 36 | `AllowBuggyCommit = TRUE` violates `LiveHasHistory` |
 | `TwoPassGcSafety` | PASS: 7,748,544 generated; 646,806 distinct; depth 25 | `AllowBuggySweepWithoutRevalidate = TRUE` and `AllowBuggyStaleHistorySweep = TRUE` both violate `NoReachableKeyDeleted` |
-| `RestoreCloneSafety` | PASS: 1,337 generated; 368 distinct; depth 11 | `AllowBuggyPublish = TRUE` violates `VisibleTargetRefsExist` |
-| `IncrementalArtifactClosure` | PASS: 128 generated; 37 distinct; depth 8 | `AllowBuggyPrefixGc = TRUE` violates `ManifestReachableArtifactsExist` |
+| `RestoreCloneSafety` | PASS: 6,833 generated; 1,632 distinct; depth 13 | `AllowBuggyPublish = TRUE` violates `VisibleTargetRefsExist` |
+| `IncrementalArtifactClosure` | PASS: 284 generated; 72 distinct; depth 9 | `AllowBuggyPrefixGc = TRUE` violates `ManifestReachableArtifactsExist` |
 | `GroupCommitWalWriter` | PASS: 9,883 generated; 3,523 distinct; depth 16 | `AllowBuggyMixedTokenDeadlock = TRUE` violates `NoMixedTokenLeaderDeadlock`; adding strict `StrictFailedAppendLeavesNoOrphan` violates under best-effort cleanup failure |
 
 The `.tlc.log` files in `formal-verifications/tla/` contain the raw run
 summaries. They are generated artifacts; commit the specs/configs and summarize
 the logs unless a workflow explicitly asks to preserve the raw logs.
+
+#### Spec-to-Code Cross-Reference
+
+When changing any referenced Rust function, re-check the matching spec action
+and rerun `./scripts/run-july-tla.sh` if the abstraction may have drifted.
+
+| Spec action(s) | Rust entry points modeled |
+|----------------|---------------------------|
+| `PitrHistoryRetention`: `StartCommitArtifacts`, `WriteHistorySnapshot`, `PublishLivePointer` | `src/wal/manifest.rs:616` `Manifest::write`; `src/wal/manifest.rs:658` `Manifest::write_conditional`; `src/wal/manifest.rs:793` `write_history_snapshot_for_commit` |
+| `PitrHistoryRetention`: `CreateSnapshotPin`, `DeleteSnapshotPin`, `PruneHistory` | `src/wal/manifest.rs:927` `NamedSnapshot::create`; `src/wal/manifest.rs:749` `Manifest::prune_history_with_retention`; `src/wal/manifest.rs:686` `Manifest::list_history`; `src/wal/manifest.rs:707` `Manifest::read_history` |
+| `PitrHistoryRetention`: `ResolveAsOfGeneration`, `ResolveAsOfTimestamp`, `ResolveAsOfSnapshot` | `src/server/handlers/as_of.rs:8` `resolve_manifest`; `src/server/handlers/as_of.rs:50` `read_retained_history_generation`; `src/server/handlers/as_of.rs:66` `resolve_history_at_or_before_timestamp` |
+| `PitrHistoryRetention`: `GcSweep` | `src/compaction/gc.rs:140` `retained_manifest_history_reachable_keys`; `src/compaction/gc.rs:544` `run_gc_cycle`; `src/compaction/gc.rs:841` `should_delete_candidate` |
+| `TwoPassGcSafety`: `MarkCandidates`, `DrainPendingDelete*`, `SweepCandidate*`, buggy sweep variants | `src/compaction/gc.rs:48` `reachable_keys`; `src/compaction/gc.rs:493` `mark_gc_candidates`; `src/compaction/gc.rs:544` `run_gc_cycle`; `src/compaction/gc.rs:841` `should_delete_candidate` |
+| `TwoPassGcSafety`: `CommitStagedUploads`, `ExpireStaging`, future/history root protection | `src/compaction/gc.rs:54` `reachable_keys_with_staging`; `src/compaction/gc.rs:140` `retained_manifest_history_reachable_keys`; `src/compaction/gc.rs:1047` `active_staged_keys` |
+| `RestoreCloneSafety`: `ResolveSourceHistory*`, `CreateTargetNamespace`, `RewriteManifestToTarget` | `src/server/handlers/namespace.rs:512` `clone_namespace`; `src/server/handlers/as_of.rs:8` `resolve_manifest`; `src/server/handlers/namespace.rs:740` `rewrite_manifest_stored_keys` |
+| `RestoreCloneSafety`: `CopyOneObject*`, `PublishTargetManifest*`, `BuggyPublishBeforeCopy` | `src/server/handlers/namespace.rs:701` `materialize_clone_manifest`; `src/server/handlers/namespace.rs:726` `clone_copy_map`; `src/storage/store.rs:468` `ZeppelinStore::copy_if_not_exists`; `src/wal/manifest.rs:616` `Manifest::write` |
+| `RestoreCloneSafety`: failure cleanup and source protection | `src/server/handlers/namespace.rs:612` `release_internal_clone_pin`; `src/server/handlers/namespace.rs:624` `cleanup_failed_clone_target`; `src/wal/manifest.rs:927` `NamedSnapshot::create`; `src/server/handlers/namespace.rs:512` `clone_namespace` |
+| `IncrementalArtifactClosure`: `IncrementalCompactTouchCluster`, `IncrementalCompactTouchSecondCluster` | `src/compaction/mod.rs:1572` `write_incremental_segment`; `src/compaction/mod.rs:2173` `incremental_cluster_objects`; `src/wal/manifest.rs:242` `SegmentRef::cluster_owner` |
+| `IncrementalArtifactClosure`: `DropOldSegmentRef`, `RetainHistory`, `PruneHistory`, `GcExactReachability`, `BuggyPrefixGc` | `src/compaction/gc.rs:48` `reachable_keys`; `src/compaction/gc.rs:140` `retained_manifest_history_reachable_keys`; `src/compaction/gc.rs:544` `run_gc_cycle`; `src/wal/manifest.rs:749` `Manifest::prune_history_with_retention` |
+| `GroupCommitWalWriter`: `UploadFragment`, `EnqueueAppend`, `ElectLeader`, `CommitCompatibleBatch`, `FailBatch*` | `src/wal/writer.rs:100` `append`; `src/wal/writer.rs:122` `append_with_lease`; `src/wal/writer.rs:231` `commit_pending_group` |
+| `GroupCommitWalWriter`: `ExternalManifestAdvance`, `DeleteNamespace`, `BuggyMixedTokenDeadlock` | `src/wal/lease.rs:68` `LeaseManager::acquire`; `src/wal/lease.rs:131` `LeaseManager::renew`; `src/wal/lease.rs:173` `LeaseManager::release`; `src/wal/writer.rs:231` `commit_pending_group` |
 
 ### Interpreting Counterexamples
 

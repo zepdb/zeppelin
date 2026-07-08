@@ -43,6 +43,7 @@ TargetOf(s) ==
     CASE s = "s1" -> "t1"
       [] s = "s2" -> "t2"
       [] s = "s3" -> "t3"
+      [] s = "s4" -> "t4"
       [] OTHER -> "unknown-target"
 
 RewrittenTargetKeys ==
@@ -300,7 +301,7 @@ TypeOK ==
     /\ targetPendingCleared \in BOOLEAN
     /\ targetVersionReset \in BOOLEAN
     /\ targetGeneration \in 0..1
-    /\ SourceKeys = {"s1", "s2", "s3"}
-    /\ TargetKeys = {"t1", "t2", "t3"}
+    /\ SourceKeys = {"s1", "s2", "s3", "s4"}
+    /\ TargetKeys = {"t1", "t2", "t3", "t4"}
 
 ====
