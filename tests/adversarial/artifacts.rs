@@ -152,15 +152,23 @@ impl RunArtifacts {
         }
     }
 
-    pub fn write_report(&self, env: &RunnerEnv, seeds: &[SeedReport], coverage: &Coverage) {
+    pub fn write_report(
+        &self,
+        env: &RunnerEnv,
+        seeds: &[SeedReport],
+        coverage: &Coverage,
+        update_latest: bool,
+    ) {
         let report = build_report(&self.root, env, seeds, coverage);
         let report_path = self.root.join("report.md");
         fs::write(&report_path, &report).unwrap_or_else(|error| {
             panic!("failed to write report {}: {error}", report_path.display())
         });
-        fs::create_dir_all("tasks").expect("failed to create tasks directory");
-        fs::write("tasks/overnight-adversarial-report.md", report)
-            .expect("failed to update tasks/overnight-adversarial-report.md");
+        if update_latest {
+            fs::create_dir_all("tasks").expect("failed to create tasks directory");
+            fs::write("tasks/overnight-adversarial-report.md", report)
+                .expect("failed to update tasks/overnight-adversarial-report.md");
+        }
     }
 }
 
@@ -193,8 +201,12 @@ impl SeedArtifacts {
                 .unwrap_or_else(|error| panic!("failed to list S3 keys for {ns}: {error}"));
             keys.sort();
             for key in keys {
-                output.push_str(&key);
-                output.push('\n');
+                let size = store
+                    .head(&key)
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to head S3 key {key}: {error}"))
+                    .size;
+                output.push_str(&format!("{key}\t{size}\n"));
             }
         }
         fs::write(self.dir.join("s3-final.txt"), output)
@@ -477,15 +489,28 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
     }
 
     out.push_str("## Operation Coverage\n\n");
+    for kind in REQUIRED_OP_KINDS {
+        let count = coverage.op_counts.get(*kind).copied().unwrap_or(0);
+        let marker = if count == 0 { " ⚠" } else { "" };
+        out.push_str(&format!("- `{kind}`: {count}{marker}\n"));
+    }
     for (kind, count) in &coverage.op_counts {
-        out.push_str(&format!("- `{kind}`: {count}\n"));
+        if !REQUIRED_OP_KINDS.contains(&kind.as_str()) {
+            out.push_str(&format!("- `{kind}`: {count}\n"));
+        }
     }
     out.push('\n');
 
     out.push_str("## Scenario Tag Coverage\n\n");
-    for (tag, count) in &coverage.tag_counts {
-        let marker = if *count == 0 { " ⚠" } else { "" };
+    for tag in REQUIRED_TAGS {
+        let count = coverage.tag_counts.get(*tag).copied().unwrap_or(0);
+        let marker = if count == 0 { " ⚠" } else { "" };
         out.push_str(&format!("- `{tag}`: {count}{marker}\n"));
+    }
+    for (tag, count) in &coverage.tag_counts {
+        if !REQUIRED_TAGS.contains(&tag.as_str()) {
+            out.push_str(&format!("- `{tag}`: {count}\n"));
+        }
     }
     out.push('\n');
 
@@ -513,6 +538,47 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
     }
     out
 }
+
+const REQUIRED_OP_KINDS: &[&str] = &[
+    "create_namespace",
+    "get_namespace",
+    "upsert",
+    "delete_vectors",
+    "fetch_vectors",
+    "query",
+    "batch_query",
+    "paginate_all",
+    "invalid_probe",
+    "compact_endpoint",
+    "gc_cycle",
+    "create_snapshot",
+    "get_snapshot",
+    "list_snapshots",
+    "delete_snapshot",
+    "clone_namespace",
+    "patch_index_config",
+    "hydrate",
+    "delete_namespace",
+    "probe_sandwich",
+    "compact_inline",
+];
+
+const REQUIRED_TAGS: &[&str] = &[
+    "delete-then-reupsert",
+    "eventual-tombstone",
+    "eventual",
+    "batch",
+    "pagination",
+    "fts",
+    "invalid-probe",
+    "as-of-200",
+    "as-of-410",
+    "snapshot",
+    "clone",
+    "gc-cycle",
+    "sandwich",
+    "delete-recreate",
+];
 
 fn object_store_totals(seeds: &[SeedReport]) -> BTreeMap<String, ClassStats> {
     let mut totals = BTreeMap::<String, ClassStats>::new();

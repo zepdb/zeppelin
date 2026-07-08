@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::json;
 use xxhash_rust::xxh3::xxh3_64;
-use zeppelin::compaction::gc::{reachable_keys, reachable_keys_with_retained_history_and_staging};
+use zeppelin::compaction::gc::{
+    load_gc_candidates, reachable_keys, reachable_keys_with_retained_history_and_staging,
+};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::Manifest;
 
@@ -213,7 +215,7 @@ pub async fn check_clone_manifest(
 pub async fn check_quiescent_namespace(
     store: &ZeppelinStore,
     namespace: &str,
-    _expected_live: usize,
+    expected_live: usize,
     compact_status: &serde_json::Value,
     op_index: u64,
 ) -> Vec<Violation> {
@@ -246,6 +248,18 @@ pub async fn check_quiescent_namespace(
             json!({ "compact_status": compact_status }),
         ));
     }
+    if manifest.vector_count() < expected_live as u64 {
+        violations.push(violation(
+            ViolationId::I16Quiescence,
+            op_index,
+            namespace,
+            "manifest vector_count undercounted model live count at quiescence",
+            json!({
+                "manifest_vector_count": manifest.vector_count(),
+                "expected_live": expected_live,
+            }),
+        ));
+    }
     let reachable = reachable_keys_with_retained_history_and_staging(
         store,
         namespace,
@@ -270,6 +284,25 @@ pub async fn check_quiescent_namespace(
             namespace,
             "unreachable WAL objects remained after quiescence GC",
             json!({ "stray_wal": stray_wal }),
+        ));
+    }
+    let candidates = load_gc_candidates(store, namespace)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("quiescent GC candidate load failed for {namespace}: {error}")
+        });
+    let reachable_candidates = candidates
+        .into_iter()
+        .filter(|candidate| reachable.contains(&candidate.key))
+        .map(|candidate| candidate.key)
+        .collect::<Vec<_>>();
+    if !reachable_candidates.is_empty() {
+        violations.push(violation(
+            ViolationId::I16Quiescence,
+            op_index,
+            namespace,
+            "GC candidates included reachable keys at quiescence",
+            json!({ "reachable_candidates": reachable_candidates }),
         ));
     }
 

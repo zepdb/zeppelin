@@ -92,7 +92,7 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
         });
     }
     summary.ops_per_sec = summary.ops_total as f64 / started.elapsed().as_secs_f64().max(0.001);
-    artifacts.write_report(&env, &seed_reports, &summary.coverage);
+    artifacts.write_report(&env, &seed_reports, &summary.coverage, false);
     summary
 }
 
@@ -138,7 +138,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
     }
 
     summary.ops_per_sec = summary.ops_total as f64 / started.elapsed().as_secs_f64().max(0.001);
-    artifacts.write_report(&env, &seed_reports, &summary.coverage);
+    artifacts.write_report(&env, &seed_reports, &summary.coverage, true);
     summary
 }
 
@@ -515,6 +515,30 @@ fn sanitize_op_for_mode(op: Op, mode: RunMode) -> Op {
         | Op::CompactEndpoint { ns }
         | Op::GcCycle { ns, .. }
         | Op::ProbeSandwich { ns, .. } => Op::GetNamespace { ns },
+        Op::FetchVectors { ns, ids, .. } => Op::FetchVectors {
+            ns,
+            ids,
+            consistency: ConsistencyLevel::Strong,
+        },
+        Op::Query { ns, mut q, as_of } => {
+            if let Some(object) = q.body.as_object_mut() {
+                object.insert("consistency".to_string(), json!(ConsistencyLevel::Strong));
+            }
+            q.class = match q.class {
+                QueryOracleClass::ExactAnn { top_k, filter, .. } => QueryOracleClass::ExactAnn {
+                    top_k,
+                    consistency: ConsistencyLevel::Strong,
+                    filter,
+                },
+                QueryOracleClass::Membership { .. } => QueryOracleClass::Membership {
+                    consistency: ConsistencyLevel::Strong,
+                },
+                QueryOracleClass::ExpectError { status, code } => {
+                    QueryOracleClass::ExpectError { status, code }
+                }
+            };
+            Op::Query { ns, q, as_of }
+        }
         other => other,
     }
 }
@@ -984,7 +1008,7 @@ async fn run_seed(
     let mut failure_violations = Vec::new();
     let mut compactions = 0u64;
     let started = Instant::now();
-    let max_ops = env.max_ops.unwrap_or(100);
+    let max_ops = env.max_ops.unwrap_or(500);
 
     while op_index < max_ops && (Instant::now() < deadline || op_index == 0) {
         let op = sanitize_op_for_mode(generator.next(&model), mode);
@@ -2057,7 +2081,7 @@ async fn quiesce_and_verify(
         for _ in 0..2 {
             let gc = Op::GcCycle {
                 ns: ns.clone(),
-                keep_count: 4,
+                keep_count: 0,
             };
             let step = execute_recorded_op(
                 client, server, artifacts, model, coverage, s3_tracker, &gc, *op_index, started,

@@ -5,7 +5,7 @@ use zeppelin::index::filter::evaluate_filter;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, Filter};
 
 use super::model::{model_distance, Model, ModelRecord, NsModel, OracleMutation};
-use super::ops::{AsOfTarget, GeneratedQuery, Op, OpRecord, QueryOracleClass};
+use super::ops::{AsOfTarget, GeneratedQuery, MaintenanceKind, Op, OpRecord, QueryOracleClass};
 use super::RunMode;
 
 pub const SCORE_ABS_EPS: f32 = 1e-5;
@@ -68,6 +68,7 @@ pub fn check_op(
             violations.extend(check_i3_membership(model, rec));
             violations.extend(check_i5_batch_equivalence(rec));
             violations.extend(check_i6_pagination_equivalence(rec));
+            violations.extend(check_i13_probe_sandwich(rec));
         }
         violations.extend(check_i7_fts_membership(model, rec));
     }
@@ -1339,6 +1340,91 @@ fn check_i7_fts_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
             ));
         }
     }
+    violations
+}
+
+fn check_i13_probe_sandwich(rec: &OpRecord) -> Vec<Violation> {
+    let Op::ProbeSandwich { ns, maintenance } = &rec.op else {
+        return Vec::new();
+    };
+    let before = &rec.response["before"];
+    let after = &rec.response["after"];
+    let recorded_maintenance = &rec.response["maintenance"];
+    let mut violations = Vec::new();
+    if before.is_null() || after.is_null() || recorded_maintenance.is_null() {
+        violations.push(violation(
+            ViolationId::I13ProbeSandwich,
+            rec,
+            ns,
+            "probe sandwich response omitted before/maintenance/after records",
+            rec.response.clone(),
+        ));
+        return violations;
+    }
+
+    let before_generation = before
+        .get("manifest_generation")
+        .and_then(serde_json::Value::as_u64);
+    let after_generation = after
+        .get("manifest_generation")
+        .and_then(serde_json::Value::as_u64);
+    if before_generation.is_none() || after_generation.is_none() {
+        violations.push(violation(
+            ViolationId::I13ProbeSandwich,
+            rec,
+            ns,
+            "probe sandwich compact-status records omitted manifest_generation",
+            serde_json::json!({ "before": before, "after": after }),
+        ));
+    } else if after_generation < before_generation {
+        violations.push(violation(
+            ViolationId::I13ProbeSandwich,
+            rec,
+            ns,
+            "probe sandwich moved manifest generation backwards",
+            serde_json::json!({
+                "before_generation": before_generation,
+                "after_generation": after_generation,
+            }),
+        ));
+    }
+
+    match maintenance {
+        MaintenanceKind::CompactInline | MaintenanceKind::CompactEndpoint => {
+            let ready = after.get("ready").and_then(serde_json::Value::as_bool);
+            let uncompacted = after
+                .get("uncompacted_fragments")
+                .and_then(serde_json::Value::as_u64);
+            if ready != Some(true) || uncompacted != Some(0) {
+                violations.push(violation(
+                    ViolationId::I13ProbeSandwich,
+                    rec,
+                    ns,
+                    "compaction sandwich did not end compact-ready",
+                    serde_json::json!({ "after": after, "maintenance": maintenance }),
+                ));
+            }
+        }
+        MaintenanceKind::GcCycle | MaintenanceKind::Hydrate => {
+            for field in ["ready", "uncompacted_fragments"] {
+                if before.get(field) != after.get(field) {
+                    violations.push(violation(
+                        ViolationId::I13ProbeSandwich,
+                        rec,
+                        ns,
+                        "non-compaction sandwich changed compact-readiness fields",
+                        serde_json::json!({
+                            "field": field,
+                            "before": before.get(field),
+                            "after": after.get(field),
+                            "maintenance": maintenance,
+                        }),
+                    ));
+                }
+            }
+        }
+    }
+
     violations
 }
 

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use zeppelin::types::{AttributeValue, DistanceMetric};
 
-use super::ops::{GenVector, GeneratedQuery, NamespaceSpec, Op};
+use super::ops::{GenVector, GeneratedQuery, MaintenanceKind, NamespaceSpec, Op};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -159,12 +159,25 @@ impl Model {
                     model.corrupt_latest_checkpoint();
                 }
             }
-            Op::CompactEndpoint { ns } | Op::ProbeSandwich { ns, .. } => {
+            Op::CompactEndpoint { ns }
+            | Op::ProbeSandwich {
+                ns,
+                maintenance: MaintenanceKind::CompactInline | MaintenanceKind::CompactEndpoint,
+            } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     panic!("maintenance acked for unknown namespace {ns}");
                 };
                 model.compacted_live = model.live.clone();
                 model.wal_tombstones.clear();
+                model.checkpoint(gen_after);
+                if mutation == Some(OracleMutation::StaleCheckpoint) {
+                    model.corrupt_latest_checkpoint();
+                }
+            }
+            Op::ProbeSandwich { ns, .. } => {
+                let Some(model) = self.namespaces.get_mut(ns) else {
+                    panic!("maintenance acked for unknown namespace {ns}");
+                };
                 model.checkpoint(gen_after);
                 if mutation == Some(OracleMutation::StaleCheckpoint) {
                     model.corrupt_latest_checkpoint();

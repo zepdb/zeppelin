@@ -5,11 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SECONDS_BUDGET="43200"
 INSTALL_NIGHTLY="false"
-PRUNE_PRESERVED="false"
 
 usage() {
     cat <<'USAGE'
-Usage: scripts/overnight-adversarial.sh [SECONDS] [--install-nightly] [--prune-preserved]
+Usage: scripts/overnight-adversarial.sh [SECONDS] [--install-nightly]
 USAGE
 }
 
@@ -17,9 +16,6 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --install-nightly)
             INSTALL_NIGHTLY="true"
-            ;;
-        --prune-preserved)
-            PRUNE_PRESERVED="true"
             ;;
         -h|--help)
             usage
@@ -103,15 +99,8 @@ prune_old_runs() {
         -exec find {} -depth -type d -empty -delete \;
 }
 
-prune_passing_preserved() {
-    echo "--prune-preserved is recorded for Phase 4, but preserved MinIO prefixes are retained unless a passing-run manifest format is available."
-}
-
 ensure_minio
 prune_old_runs
-if [ "$PRUNE_PRESERVED" = "true" ]; then
-    prune_passing_preserved
-fi
 if [ "$INSTALL_NIGHTLY" = "true" ]; then
     install_nightly
     exit 0
@@ -124,6 +113,7 @@ RUN_CMD=(
     env
     TEST_BACKEND=minio
     ZEPPELIN_ADVERSARIAL_SECONDS="$SECONDS_BUDGET"
+    ZEPPELIN_ADVERSARIAL_MAX_OPS="${ZEPPELIN_ADVERSARIAL_MAX_OPS:-500}"
     ZEPPELIN_ADVERSARIAL_MODE=mixed
     cargo test --test adversarial_workload_tests overnight -- --ignored --nocapture
 )
