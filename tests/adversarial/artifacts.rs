@@ -11,6 +11,7 @@ use zeppelin::storage::ZeppelinStore;
 
 use crate::common::counting::ClassStats;
 
+use super::chaos::FiredFault;
 use super::generator::Coverage;
 use super::model::Model;
 use super::ops::{NamespaceSpec, OpRecord};
@@ -44,6 +45,7 @@ pub struct FailureManifest {
 #[derive(Debug, Clone, Serialize)]
 pub struct SeedReport {
     pub seed: u64,
+    pub mode: RunMode,
     pub dir: PathBuf,
     pub failed: bool,
     pub ops: u64,
@@ -51,6 +53,7 @@ pub struct SeedReport {
     pub violations: Vec<Violation>,
     pub wall_secs: f64,
     pub object_store: BTreeMap<String, ClassStats>,
+    pub fired_faults: Vec<FiredFault>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,7 +88,15 @@ impl RunArtifacts {
         let mode_assignment = env
             .seeds
             .iter()
-            .map(|seed| (seed.to_string(), env.mode))
+            .map(|seed| {
+                let mode = match env.mode {
+                    RunMode::Deterministic => RunMode::Deterministic,
+                    RunMode::Chaos => RunMode::Chaos,
+                    RunMode::Mixed if seed % 3 == 1 => RunMode::Chaos,
+                    RunMode::Mixed => RunMode::Deterministic,
+                };
+                (seed.to_string(), mode)
+            })
             .collect::<BTreeMap<_, _>>();
         let run_json = serde_json::json!({
             "git_rev": git_rev(),
@@ -105,6 +116,7 @@ impl RunArtifacts {
         &self.root
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn seed(
         &self,
         seed: u64,
@@ -113,6 +125,7 @@ impl RunArtifacts {
         mode: RunMode,
         fault_plan: Option<&str>,
         selftest_probe: Option<&str>,
+        chaos_plan: Option<&serde_json::Value>,
     ) -> SeedArtifacts {
         let dir = self.root.join(format!("seed-{seed}"));
         fs::create_dir_all(&dir)
@@ -124,6 +137,7 @@ impl RunArtifacts {
                 "mode": mode,
                 "fault_plan": fault_plan,
                 "selftest_probe": selftest_probe,
+                "chaos_plan": chaos_plan,
                 "config": config,
                 "namespace_specs": specs,
             }),
@@ -193,6 +207,21 @@ impl SeedArtifacts {
 
     pub fn write_coverage(&self, coverage: &Coverage) {
         write_json(self.dir.join("coverage.json"), coverage);
+    }
+
+    pub fn write_faults(&self, faults: &[FiredFault]) {
+        let path = self.dir.join("faults.jsonl");
+        let file = File::create(&path)
+            .unwrap_or_else(|error| panic!("failed to create {}: {error}", path.display()));
+        let mut writer = BufWriter::new(file);
+        for fault in faults {
+            let encoded = serde_json::to_string(fault).expect("FiredFault must serialize");
+            writeln!(writer, "{encoded}")
+                .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+        }
+        writer
+            .flush()
+            .unwrap_or_else(|error| panic!("failed to flush {}: {error}", path.display()));
     }
 
     pub async fn capture_s3_metadata(
@@ -359,15 +388,17 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
     out.push_str(&format!("- run dir: `{}`\n\n", root.display()));
 
     out.push_str("## Seeds\n\n");
-    out.push_str("| seed | status | ops | compactions | wall_s | ops/sec |\n");
-    out.push_str("| --- | --- | ---: | ---: | ---: | ---: |\n");
+    out.push_str("| seed | mode | status | ops | compactions | faults | wall_s | ops/sec |\n");
+    out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
     for seed in seeds {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.2} | {:.2} |\n",
+            "| {} | `{:?}` | {} | {} | {} | {} | {:.2} | {:.2} |\n",
             seed.seed,
+            seed.mode,
             if seed.failed { "failed" } else { "passed" },
             seed.ops,
             seed.compactions,
+            seed.fired_faults.len(),
             seed.wall_secs,
             seed.ops as f64 / seed.wall_secs.max(0.001)
         ));
@@ -405,6 +436,33 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
     }
     if !any_violation {
         out.push_str("No violations recorded.\n");
+    }
+    out.push('\n');
+
+    out.push_str("## Fired Faults\n\n");
+    let mut any_fault = false;
+    for seed in seeds {
+        if seed.fired_faults.is_empty() {
+            continue;
+        }
+        any_fault = true;
+        let mut counts = BTreeMap::<String, u64>::new();
+        for fault in &seed.fired_faults {
+            *counts.entry(fault.site_id.clone()).or_default() += 1;
+        }
+        out.push_str(&format!("- seed {}:\n", seed.seed));
+        for (site, count) in counts {
+            out.push_str(&format!("  - `{site}`: {count}\n"));
+        }
+        for fault in seed.fired_faults.iter().take(5) {
+            out.push_str(&format!(
+                "  - sample `{}` call={} key=`{}`\n",
+                fault.site_id, fault.call_ordinal, fault.key
+            ));
+        }
+    }
+    if !any_fault {
+        out.push_str("No chaos faults fired.\n");
     }
     out.push('\n');
 

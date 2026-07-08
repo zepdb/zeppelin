@@ -17,6 +17,7 @@ use crate::common::server::{cleanup_ns, start_test_server_full, FullTestServer};
 use super::artifacts::{
     read_ops, read_seed_config, FailureManifest, RunArtifacts, SeedArtifacts, SeedReport,
 };
+use super::chaos::{chaos_store, ChaosHandle, FaultPlan, FiredFault};
 use super::generator::{AdversarialGenerator, Coverage};
 use super::model::{Model, OracleMutation};
 use super::ops::{GeneratedQuery, InvalidProbe, NamespaceSpec, Op, OpRecord, QueryOracleClass};
@@ -36,6 +37,7 @@ pub struct RunSummary {
 
 #[derive(Debug)]
 struct SeedOutcome {
+    mode: RunMode,
     failed: bool,
     ops: u64,
     compactions: u64,
@@ -43,6 +45,7 @@ struct SeedOutcome {
     violations: Vec<Violation>,
     wall_secs: f64,
     object_store: BTreeMap<String, ClassStats>,
+    fired_faults: Vec<FiredFault>,
 }
 
 pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
@@ -77,6 +80,7 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
         summary.coverage.merge(&outcome.coverage);
         seed_reports.push(SeedReport {
             seed: *seed,
+            mode: outcome.mode,
             dir: artifact_root.join(format!("seed-{seed}")),
             failed: outcome.failed,
             ops: outcome.ops,
@@ -84,6 +88,7 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
             violations: outcome.violations,
             wall_secs: outcome.wall_secs,
             object_store: outcome.object_store,
+            fired_faults: outcome.fired_faults,
         });
     }
     summary.ops_per_sec = summary.ops_total as f64 / started.elapsed().as_secs_f64().max(0.001);
@@ -119,6 +124,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
         summary.coverage.merge(&outcome.coverage);
         seed_reports.push(SeedReport {
             seed,
+            mode: outcome.mode,
             dir: artifact_root.join(format!("seed-{seed}")),
             failed: outcome.failed,
             ops: outcome.ops,
@@ -126,6 +132,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
             violations: outcome.violations,
             wall_secs: outcome.wall_secs,
             object_store: outcome.object_store,
+            fired_faults: outcome.fired_faults,
         });
         seed_index += 1;
     }
@@ -224,19 +231,32 @@ pub async fn inspect_from_env() {
         tokio::time::sleep(Duration::from_secs(hold_secs)).await;
     }
     if let Some(shutdown) = server.shutdown_compaction.as_ref() {
-        shutdown
-            .send(true)
-            .expect("failed to signal compaction loop shutdown");
+        let _ = shutdown.send(true);
     }
 }
 
 async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let seed_config = replay_seed_config(replay);
     let replay_mutation = env.selftest.or(seed_config.fault_plan);
+    let mode = effective_seed_mode(seed_config.mode, seed_config.seed);
+    let chaos_plan = if mode == RunMode::Chaos {
+        Some(
+            seed_config
+                .chaos_plan
+                .clone()
+                .unwrap_or_else(|| FaultPlan::for_seed(seed_config.seed)),
+        )
+    } else {
+        None
+    };
+    let chaos_plan_json = chaos_plan
+        .as_ref()
+        .map(|plan| serde_json::to_value(plan).expect("FaultPlan must serialize"));
     let old_prefix = recorded_namespace_prefix(seed_config.seed, &seed_config.namespace_specs);
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
-    let (store, counter) = counting_store(&harness.store);
+    let (instrumented_store, chaos_handle) = wrap_chaos_store(&harness.store, chaos_plan.clone());
+    let (store, counter) = counting_store(&instrumented_store);
     let config = seed_config.config.clone();
     let specs = seed_config
         .namespace_specs
@@ -248,13 +268,19 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         seed_config.seed,
         &config,
         &specs,
-        seed_config.mode,
+        mode,
         replay_mutation.map(OracleMutation::key),
         seed_config.selftest_probe.map(OracleMutation::key),
+        chaos_plan_json.as_ref(),
     );
-    let server =
-        start_test_server_full(store.clone(), Some(prefix.clone()), config.clone(), false).await;
-    let client = Client::new();
+    let server = start_test_server_full(
+        store.clone(),
+        Some(prefix.clone()),
+        config.clone(),
+        mode == RunMode::Chaos,
+    )
+    .await;
+    let client = adversarial_client();
     let mut model = Model::default();
     let mut coverage = Coverage::default();
     let mut s3_tracker = S3Tracker::default();
@@ -279,6 +305,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             source.index,
             started,
             replay_mutation,
+            mode,
         )
         .await;
         if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
@@ -309,6 +336,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     }
 
     let mut op_count = artifacts.op_count();
+    stop_chaos_and_background(&server, chaos_handle.as_ref()).await;
     if !failed {
         let quiescence = quiesce_and_verify(
             &client,
@@ -322,6 +350,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             &mut compactions,
             started,
             replay_mutation,
+            RunMode::Deterministic,
         )
         .await;
         if !quiescence.is_empty() {
@@ -333,6 +362,11 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     artifacts.write_model_final(&model);
     artifacts.write_s3_final(&store, &created_namespaces).await;
     artifacts.write_coverage(&coverage);
+    let fired_faults = chaos_handle
+        .as_ref()
+        .map(ChaosHandle::fired)
+        .unwrap_or_default();
+    artifacts.write_faults(&fired_faults);
     let object_store = object_store_breakdown(&counter);
     if should_cleanup(env.preserve, failed) {
         for ns in &created_namespaces {
@@ -343,12 +377,11 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         println!("preserved replay prefix {prefix}");
     }
     if let Some(shutdown) = server.shutdown_compaction.as_ref() {
-        shutdown
-            .send(true)
-            .expect("failed to signal compaction loop shutdown");
+        let _ = shutdown.send(true);
     }
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     SeedOutcome {
+        mode,
         failed,
         ops: op_count,
         compactions,
@@ -356,6 +389,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         violations: failure_violations,
         wall_secs: elapsed,
         object_store,
+        fired_faults,
     }
 }
 
@@ -367,6 +401,8 @@ struct ReplaySeedConfig {
     fault_plan: Option<OracleMutation>,
     #[serde(default)]
     selftest_probe: Option<OracleMutation>,
+    #[serde(default)]
+    chaos_plan: Option<FaultPlan>,
     config: Config,
     namespace_specs: BTreeMap<String, NamespaceSpec>,
 }
@@ -415,6 +451,72 @@ fn rewrite_prefix(value: &str, old_prefix: &str, new_prefix: &str) -> String {
         || value.to_string(),
         |suffix| format!("{new_prefix}{suffix}"),
     )
+}
+
+fn effective_seed_mode(mode: RunMode, seed: u64) -> RunMode {
+    match mode {
+        RunMode::Deterministic => RunMode::Deterministic,
+        RunMode::Chaos => RunMode::Chaos,
+        RunMode::Mixed => {
+            if seed % 3 == 1 {
+                RunMode::Chaos
+            } else {
+                RunMode::Deterministic
+            }
+        }
+    }
+}
+
+fn config_for_mode(mode: RunMode, seed: u64) -> Config {
+    let mut config = deterministic_config();
+    if mode == RunMode::Chaos {
+        config.cache.manifest_cache_ttl_ms = 500;
+        config.compaction.interval_secs = 2 + (seed % 4);
+        config.gc.compaction_upload_window_secs = 2;
+    }
+    config
+}
+
+fn wrap_chaos_store(
+    store: &zeppelin::storage::ZeppelinStore,
+    plan: Option<FaultPlan>,
+) -> (zeppelin::storage::ZeppelinStore, Option<ChaosHandle>) {
+    if let Some(plan) = plan {
+        let (store, handle) = chaos_store(store, plan);
+        (store, Some(handle))
+    } else {
+        (store.clone(), None)
+    }
+}
+
+fn adversarial_client() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("failed to build adversarial reqwest client")
+}
+
+async fn stop_chaos_and_background(server: &FullTestServer, chaos: Option<&ChaosHandle>) {
+    if let Some(chaos) = chaos {
+        chaos.disable();
+    }
+    if let Some(shutdown) = server.shutdown_compaction.as_ref() {
+        let _ = shutdown.send(true);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn sanitize_op_for_mode(op: Op, mode: RunMode) -> Op {
+    if mode != RunMode::Chaos {
+        return op;
+    }
+    match op {
+        Op::CompactInline { ns }
+        | Op::CompactEndpoint { ns }
+        | Op::GcCycle { ns, .. }
+        | Op::ProbeSandwich { ns, .. } => Op::GetNamespace { ns },
+        other => other,
+    }
 }
 
 fn object_store_breakdown(counter: &GetCounter) -> BTreeMap<String, ClassStats> {
@@ -750,6 +852,7 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 OracleMutation::FilterSkew,
                 OracleMutation::GcEatsLiveKey,
                 OracleMutation::StaleCheckpoint,
+                OracleMutation::ChaosLostWrite,
             ]
         },
         |mutation| vec![mutation],
@@ -805,6 +908,7 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             OracleMutation::FilterSkew => fired.contains(&ViolationId::I1StrongExact),
             OracleMutation::GcEatsLiveKey => fired.contains(&ViolationId::I14S3Reachability),
             OracleMutation::StaleCheckpoint => fired.contains(&ViolationId::I8AsOfExact),
+            OracleMutation::ChaosLostWrite => fired.contains(&ViolationId::I16Quiescence),
         };
         assert!(
             accepted,
@@ -829,10 +933,28 @@ async fn run_seed(
     mutation: Option<OracleMutation>,
     selftest_probe: Option<OracleMutation>,
 ) -> SeedOutcome {
+    let mode = if mutation == Some(OracleMutation::ChaosLostWrite) {
+        RunMode::Chaos
+    } else {
+        effective_seed_mode(env.mode, seed)
+    };
+    let chaos_plan = if mode == RunMode::Chaos {
+        Some(if mutation == Some(OracleMutation::ChaosLostWrite) {
+            FaultPlan::lost_write_selftest()
+        } else {
+            FaultPlan::for_seed(seed)
+        })
+    } else {
+        None
+    };
+    let chaos_plan_json = chaos_plan
+        .as_ref()
+        .map(|plan| serde_json::to_value(plan).expect("FaultPlan must serialize"));
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
-    let (store, counter) = counting_store(&harness.store);
-    let config = deterministic_config();
+    let (instrumented_store, chaos_handle) = wrap_chaos_store(&harness.store, chaos_plan.clone());
+    let (store, counter) = counting_store(&instrumented_store);
+    let config = config_for_mode(mode, seed);
     let mut generator = AdversarialGenerator::new(seed, &prefix);
     let specs = generator.specs();
     let recorded_ops = recorded_seed_ops_if_requested(env, seed, &prefix);
@@ -840,13 +962,19 @@ async fn run_seed(
         seed,
         &config,
         &specs,
-        env.mode,
+        mode,
         mutation.map(OracleMutation::key),
         selftest_probe.map(OracleMutation::key),
+        chaos_plan_json.as_ref(),
     );
-    let server =
-        start_test_server_full(store.clone(), Some(prefix.clone()), config.clone(), false).await;
-    let client = Client::new();
+    let server = start_test_server_full(
+        store.clone(),
+        Some(prefix.clone()),
+        config.clone(),
+        mode == RunMode::Chaos,
+    )
+    .await;
+    let client = adversarial_client();
     let mut model = Model::default();
     let mut coverage = Coverage::default();
     let mut created_namespaces = Vec::new();
@@ -859,7 +987,7 @@ async fn run_seed(
     let max_ops = env.max_ops.unwrap_or(100);
 
     while op_index < max_ops && (Instant::now() < deadline || op_index == 0) {
-        let op = generator.next(&model);
+        let op = sanitize_op_for_mode(generator.next(&model), mode);
         assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &op);
         let step = execute_recorded_op(
             &client,
@@ -872,6 +1000,7 @@ async fn run_seed(
             op_index,
             started,
             mutation,
+            mode,
         )
         .await;
         if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
@@ -915,6 +1044,7 @@ async fn run_seed(
                     op_index,
                     started,
                     mutation,
+                    mode,
                 )
                 .await;
                 op_index += 1;
@@ -926,6 +1056,8 @@ async fn run_seed(
             }
         }
     }
+
+    stop_chaos_and_background(&server, chaos_handle.as_ref()).await;
 
     if !failed {
         let quiescence = quiesce_and_verify(
@@ -940,6 +1072,7 @@ async fn run_seed(
             &mut compactions,
             started,
             mutation,
+            RunMode::Deterministic,
         )
         .await;
         if !quiescence.is_empty() {
@@ -951,6 +1084,11 @@ async fn run_seed(
     artifacts.write_model_final(&model);
     artifacts.write_s3_final(&store, &created_namespaces).await;
     artifacts.write_coverage(&coverage);
+    let fired_faults = chaos_handle
+        .as_ref()
+        .map(ChaosHandle::fired)
+        .unwrap_or_default();
+    artifacts.write_faults(&fired_faults);
     let object_store = object_store_breakdown(&counter);
 
     if failed {
@@ -979,7 +1117,7 @@ async fn run_seed(
         }
         artifacts.write_failure(&FailureManifest {
             seed,
-            mode: env.mode,
+            mode,
             op_index: failure_op_index,
             violations: failure_violations.clone(),
             preserved_prefix: prefix.clone(),
@@ -1007,9 +1145,7 @@ async fn run_seed(
     }
 
     if let Some(shutdown) = server.shutdown_compaction.as_ref() {
-        shutdown
-            .send(true)
-            .expect("failed to signal compaction loop shutdown");
+        let _ = shutdown.send(true);
     }
 
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
@@ -1023,6 +1159,7 @@ async fn run_seed(
     );
 
     SeedOutcome {
+        mode,
         failed,
         ops: op_index,
         compactions,
@@ -1030,6 +1167,7 @@ async fn run_seed(
         violations: failure_violations,
         wall_secs: elapsed,
         object_store,
+        fired_faults,
     }
 }
 
@@ -1050,6 +1188,7 @@ async fn execute_recorded_op(
     index: u64,
     started: Instant,
     mutation: Option<OracleMutation>,
+    mode: RunMode,
 ) -> StepOutcome {
     let mut rec = execute_op(client, server, op, index, started).await;
     if (200..300).contains(&rec.status) {
@@ -1076,7 +1215,10 @@ async fn execute_recorded_op(
             s3_tracker.forget_namespace(ns);
         }
     }
-    let mut violations = oracle::check_op(model, &rec, RunMode::Deterministic, mutation);
+    let mut violations = oracle::check_op(model, &rec, mode, mutation);
+    if mutation == Some(OracleMutation::ChaosLostWrite) && mode == RunMode::Chaos {
+        violations.clear();
+    }
     if (200..300).contains(&rec.status) {
         if let Op::CloneNamespace { target, .. } = op {
             violations.extend(
@@ -1085,7 +1227,7 @@ async fn execute_recorded_op(
             );
         }
     }
-    if rec.index % 25 == 0 {
+    if mode == RunMode::Deterministic && rec.index % 25 == 0 {
         for (ns, ns_model) in &model.namespaces {
             if !ns_model.spec.is_exact() {
                 continue;
@@ -1488,13 +1630,8 @@ async fn execute_op(
                 }),
             )
         }
-        Op::CompactInline { ns } => {
-            let result = server
-                .compactor
-                .compact(ns)
-                .await
-                .unwrap_or_else(|error| panic!("inline compaction failed for {ns}: {error}"));
-            (
+        Op::CompactInline { ns } => match server.compactor.compact(ns).await {
+            Ok(result) => (
                 "IN_PROCESS".to_string(),
                 format!("compactor.compact({ns})"),
                 StatusCode::OK.as_u16(),
@@ -1504,8 +1641,20 @@ async fn execute_op(
                     "fragments_removed": result.fragments_removed,
                     "old_segment_removed": result.old_segment_removed,
                 }),
-            )
-        }
+            ),
+            Err(error) => (
+                "IN_PROCESS".to_string(),
+                format!("compactor.compact({ns})"),
+                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                json!({
+                    "code": "INTERNAL_ERROR",
+                    "error": error.to_string(),
+                    "status": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    "retryable": true,
+                    "request_id": "in-process",
+                }),
+            ),
+        },
     };
 
     OpRecord {
@@ -1881,16 +2030,26 @@ async fn quiesce_and_verify(
     compactions: &mut u64,
     started: Instant,
     mutation: Option<OracleMutation>,
+    mode: RunMode,
 ) -> Vec<Violation> {
     for ns in namespaces {
-        let compact = Op::CompactEndpoint { ns: ns.clone() };
+        let compact = Op::CompactInline { ns: ns.clone() };
         let step = execute_recorded_op(
             client, server, artifacts, model, coverage, s3_tracker, &compact, *op_index, started,
-            mutation,
+            mutation, mode,
         )
         .await;
         *op_index += 1;
         *compactions += u64::from((200..300).contains(&step.status));
+        if !(200..300).contains(&step.status) {
+            return vec![Violation {
+                id: ViolationId::I16Quiescence,
+                op_index: *op_index,
+                namespace: ns.clone(),
+                detail: "quiescence compaction failed".to_string(),
+                evidence: serde_json::json!({ "status": step.status }),
+            }];
+        }
         if !step.violations.is_empty() {
             return step.violations;
         }
@@ -1902,7 +2061,7 @@ async fn quiesce_and_verify(
             };
             let step = execute_recorded_op(
                 client, server, artifacts, model, coverage, s3_tracker, &gc, *op_index, started,
-                mutation,
+                mutation, mode,
             )
             .await;
             *op_index += 1;
@@ -1959,7 +2118,7 @@ async fn quiesce_and_verify(
         };
         let step = execute_recorded_op(
             client, server, artifacts, model, coverage, s3_tracker, &fetch, *op_index, started,
-            mutation,
+            mutation, mode,
         )
         .await;
         *op_index += 1;
@@ -1975,7 +2134,7 @@ async fn quiesce_and_verify(
         };
         let step = execute_recorded_op(
             client, server, artifacts, model, coverage, s3_tracker, &query, *op_index, started,
-            mutation,
+            mutation, mode,
         )
         .await;
         *op_index += 1;

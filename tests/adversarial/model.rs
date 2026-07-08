@@ -15,6 +15,7 @@ pub enum OracleMutation {
     FilterSkew,
     GcEatsLiveKey,
     StaleCheckpoint,
+    ChaosLostWrite,
 }
 
 impl OracleMutation {
@@ -28,6 +29,7 @@ impl OracleMutation {
             "filter-skew" => Self::FilterSkew,
             "gc-eats-live-key" => Self::GcEatsLiveKey,
             "stale-checkpoint" => Self::StaleCheckpoint,
+            "chaos-lost-write" => Self::ChaosLostWrite,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -42,6 +44,7 @@ impl OracleMutation {
             Self::FilterSkew => "filter-skew",
             Self::GcEatsLiveKey => "gc-eats-live-key",
             Self::StaleCheckpoint => "stale-checkpoint",
+            Self::ChaosLostWrite => "chaos-lost-write",
         }
     }
 }

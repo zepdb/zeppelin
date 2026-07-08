@@ -55,16 +55,20 @@ pub fn check_op(
     let mut violations = Vec::new();
     violations.extend(check_i11_error_envelope(rec));
     violations.extend(check_expected_error(rec));
-    violations.extend(check_i10_failed_validation_no_wal(rec));
+    if mode == RunMode::Deterministic {
+        violations.extend(check_i10_failed_validation_no_wal(rec));
+    }
     if (200..300).contains(&rec.status) {
         violations.extend(check_i2_deleted_never_returned(model, rec));
         violations.extend(check_i4_fetch_exact(model, rec, mode));
         violations.extend(check_i12_structural_sanity(model, rec));
-        violations.extend(check_i1_strong_exact(model, rec, mode, mutation));
-        violations.extend(check_i8_as_of_exact(model, rec, mode, mutation));
-        violations.extend(check_i3_membership(model, rec));
-        violations.extend(check_i5_batch_equivalence(rec));
-        violations.extend(check_i6_pagination_equivalence(rec));
+        if mode == RunMode::Deterministic {
+            violations.extend(check_i1_strong_exact(model, rec, mode, mutation));
+            violations.extend(check_i8_as_of_exact(model, rec, mode, mutation));
+            violations.extend(check_i3_membership(model, rec));
+            violations.extend(check_i5_batch_equivalence(rec));
+            violations.extend(check_i6_pagination_equivalence(rec));
+        }
         violations.extend(check_i7_fts_membership(model, rec));
     }
     violations

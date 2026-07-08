@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod artifacts;
+pub mod chaos;
 pub mod generator;
 pub mod model;
 pub mod ops;
@@ -20,6 +21,8 @@ use self::model::OracleMutation;
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
     Deterministic,
+    Chaos,
+    Mixed,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,16 +63,13 @@ impl RunnerEnv {
             "never" => PreserveMode::Never,
             other => panic!("invalid ZEPPELIN_ADVERSARIAL_PRESERVE: {other}"),
         };
-        let mode = match std::env::var("ZEPPELIN_ADVERSARIAL_MODE")
-            .unwrap_or_else(|_| "deterministic".to_string())
-            .as_str()
-        {
+        let raw_mode =
+            std::env::var("ZEPPELIN_ADVERSARIAL_MODE").unwrap_or_else(|_| "mixed".to_string());
+        let mode = match raw_mode.as_str() {
             "deterministic" => RunMode::Deterministic,
-            "mixed" => {
-                eprintln!("ZEPPELIN_ADVERSARIAL_MODE=mixed maps to deterministic until Phase 5");
-                RunMode::Deterministic
-            }
-            _ => panic!("chaos mode lands in Phase 5"),
+            "chaos" => RunMode::Chaos,
+            "mixed" => RunMode::Mixed,
+            other => panic!("invalid ZEPPELIN_ADVERSARIAL_MODE: {other}"),
         };
         let selftest = std::env::var("ZEPPELIN_ADVERSARIAL_SELFTEST")
             .ok()
@@ -106,11 +106,7 @@ impl RunnerEnv {
             "ZEPPELIN_ADVERSARIAL_PRESERVE".to_string(),
             format!("{preserve:?}"),
         );
-        env_echo.insert(
-            "ZEPPELIN_ADVERSARIAL_MODE".to_string(),
-            std::env::var("ZEPPELIN_ADVERSARIAL_MODE")
-                .unwrap_or_else(|_| "deterministic".to_string()),
-        );
+        env_echo.insert("ZEPPELIN_ADVERSARIAL_MODE".to_string(), raw_mode);
         env_echo.insert(
             "ZEPPELIN_ADVERSARIAL_SELFTEST".to_string(),
             selftest
@@ -137,6 +133,7 @@ impl RunnerEnv {
         clone.seeds = vec![seed];
         clone.max_ops = Some(80);
         clone.preserve = PreserveMode::Never;
+        clone.mode = RunMode::Deterministic;
         clone
     }
 }
