@@ -166,6 +166,123 @@ impl ObjectStore for PutOnNthManifestReadStore {
     }
 }
 
+#[derive(Debug)]
+struct PutOnNthDeleteStore {
+    inner: Arc<dyn ObjectStore>,
+    delete_key: String,
+    put_key: String,
+    put_body: Bytes,
+    trigger_delete: usize,
+    deletes_seen: AtomicUsize,
+    puts_injected: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug)]
+struct PutOnNthDeleteHandle {
+    puts_injected: Arc<AtomicUsize>,
+}
+
+impl PutOnNthDeleteHandle {
+    fn puts_injected(&self) -> usize {
+        self.puts_injected.load(Ordering::Relaxed)
+    }
+}
+
+impl PutOnNthDeleteStore {
+    fn wrap(
+        inner: Arc<dyn ObjectStore>,
+        delete_key: String,
+        put_key: String,
+        put_body: Bytes,
+        trigger_delete: usize,
+    ) -> (Self, PutOnNthDeleteHandle) {
+        let puts_injected = Arc::new(AtomicUsize::new(0));
+        let handle = PutOnNthDeleteHandle {
+            puts_injected: Arc::clone(&puts_injected),
+        };
+        (
+            Self {
+                inner,
+                delete_key,
+                put_key,
+                put_body,
+                trigger_delete,
+                deletes_seen: AtomicUsize::new(0),
+                puts_injected,
+            },
+            handle,
+        )
+    }
+}
+
+impl fmt::Display for PutOnNthDeleteStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PutOnNthDeleteStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PutOnNthDeleteStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        if location.as_ref() == self.delete_key {
+            let delete = self.deletes_seen.fetch_add(1, Ordering::SeqCst) + 1;
+            if delete == self.trigger_delete {
+                let put_path =
+                    Path::parse(&self.put_key).map_err(|error| object_store::Error::Generic {
+                        store: "put_on_nth_delete",
+                        source: Box::new(error),
+                    })?;
+                self.inner
+                    .put(&put_path, PutPayload::from(self.put_body.clone()))
+                    .await?;
+                self.puts_injected.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
 fn manifest_json_bytes_with_version(manifest: &Manifest, version: u64) -> Bytes {
     let mut value = serde_json::to_value(manifest).expect("manifest must serialize");
     value
@@ -386,6 +503,89 @@ async fn gc_sweep_rereads_retained_history_before_deleting_candidate() {
             .any(|candidate| candidate.key == old_key),
         "reachable-at-sweep candidates stay recorded for a later cycle"
     );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_pending_delete_drain_rereads_retained_history_before_deleting() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("storage-gc-history-drain-race");
+    let store = harness.store.clone();
+    let pending_id = old_ulid(60, 139);
+    let pending_key = WalFragment::s3_key(&ns, &pending_id);
+
+    store
+        .put(
+            &pending_key,
+            Bytes::from_static(b"pending history race body"),
+        )
+        .await
+        .unwrap();
+
+    Manifest::new().write(&store, &ns).await.unwrap();
+    let (mut second, etag) = Manifest::read_versioned(&store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    second.updated_at = Utc::now();
+    second.write_conditional(&store, &ns, &etag).await.unwrap();
+    let (mut current, etag) = Manifest::read_versioned(&store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    current.pending_deletes.push(pending_key.clone());
+    current.updated_at = Utc::now();
+    current.write_conditional(&store, &ns, &etag).await.unwrap();
+    store
+        .delete(&Manifest::history_key(&ns, current.version()))
+        .await
+        .unwrap();
+
+    let mut injected_history = Manifest::new();
+    injected_history.pending_deletes.push(pending_key.clone());
+    let injected_history_version = current.version() + 1;
+    let injected_history_key = Manifest::history_key(&ns, injected_history_version);
+    let injected_history_body =
+        manifest_json_bytes_with_version(&injected_history, injected_history_version);
+    let pruned_history_key = Manifest::history_key(&ns, 1);
+    let (injecting_store, injection) = PutOnNthDeleteStore::wrap(
+        store.inner(),
+        pruned_history_key,
+        injected_history_key,
+        injected_history_body,
+        1,
+    );
+    let injecting_store = zeppelin::storage::ZeppelinStore::new(Arc::new(injecting_store));
+
+    let report = run_gc_cycle(
+        &injecting_store,
+        &ns,
+        &GcConfig {
+            manifest_history_keep_count: 1,
+            ..unsafe_short_gc(0)
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        injection.puts_injected(),
+        1,
+        "test must inject retained history between prune and pending-delete drain"
+    );
+    assert_eq!(
+        report.pending_deletes_deleted, 0,
+        "drain must not delete an object protected by retained history that appeared after prune"
+    );
+    assert_eq!(report.pending_deletes_pruned, 0);
+    assert_eq!(report.pending_deletes_retained, 1);
+    assert_s3_object_exists(&injecting_store, &pending_key).await;
+    let manifest = Manifest::read(&injecting_store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(manifest.pending_deletes, vec![pending_key]);
 
     harness.cleanup().await;
 }
@@ -736,12 +936,12 @@ async fn gc_cycle_rereads_retained_manifest_history_before_sweep() {
 
     assert_eq!(
         counter.gets_matching(&history_prefix),
-        (history_snapshots * 2) as u64,
-        "one GC cycle reads retained history once for mark and once before sweep"
+        (history_snapshots * 3) as u64,
+        "one GC cycle reads retained history during prune, before drain/mark, and before sweep"
     );
     assert!(
-        counter.list_calls_for_prefix(&history_prefix) <= 2,
-        "one GC cycle should list retained history only for pruning and sweep revalidation"
+        counter.list_calls_for_prefix(&history_prefix) <= 3,
+        "one GC cycle should list retained history only for pruning, drain/mark, and sweep revalidation"
     );
 
     harness.cleanup().await;

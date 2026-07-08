@@ -151,17 +151,6 @@ pub async fn retained_manifest_history_reachable_keys(
     Ok(keys)
 }
 
-fn retained_manifest_history_reachable_keys_from_manifests(
-    namespace: &str,
-    manifests: &[Manifest],
-) -> BTreeSet<String> {
-    let mut keys = BTreeSet::new();
-    for manifest in manifests {
-        keys.extend(reachable_keys(namespace, manifest));
-    }
-    keys
-}
-
 /// Exact-key set of current manifest refs, retained manifest history, and active staging.
 pub async fn reachable_keys_with_retained_history_and_staging(
     store: &ZeppelinStore,
@@ -564,6 +553,7 @@ pub async fn run_gc_cycle(
         ManifestHistoryRetention {
             keep_count: gc.manifest_history_keep_count,
             pitr_retention_secs: gc.pitr_retention_secs,
+            skew_slop_secs: gc.skew_slop_secs,
         },
     )
     .await
@@ -579,10 +569,17 @@ pub async fn run_gc_cycle(
         }
     };
     let manifest_history_pruned = history_prune.pruned;
-    let retained_history = retained_manifest_history_reachable_keys_from_manifests(
-        namespace,
-        &history_prune.retained_manifests,
-    );
+    let retained_history = match retained_manifest_history_reachable_keys(store, namespace).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!(
+                namespace,
+                error = %e,
+                "gc retained history re-read failed before pending-delete drain; aborting cycle"
+            );
+            return Ok(GcCycleReport::default());
+        }
+    };
     let pending_report =
         match drain_pending_deletes_with_retained_history(store, namespace, gc, &retained_history)
             .await

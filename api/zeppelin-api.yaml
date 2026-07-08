@@ -616,7 +616,10 @@ paths:
         description: |
           Optional point-in-time target. Use a manifest generation number, an
           RFC 3339 timestamp, or `snapshot:<name>` to query a retained
-          historical manifest instead of the live manifest.
+          historical manifest instead of the live manifest. Reads near the
+          retention boundary can fail with `POINT_IN_TIME_NOT_RETAINED` if the
+          selected generation is pruned and swept while the query is in flight;
+          retry with a still-retained generation or named snapshot.
 
     post:
       operationId: queryNamespace

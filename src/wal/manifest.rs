@@ -352,6 +352,8 @@ pub struct ManifestHistoryRetention {
     pub keep_count: usize,
     /// Time-based PITR retention window in seconds. `0` disables time retention.
     pub pitr_retention_secs: u64,
+    /// Additional seconds allowed for writer/read-side clock skew.
+    pub skew_slop_secs: u64,
 }
 
 enum HistorySnapshotWrite {
@@ -736,6 +738,7 @@ impl Manifest {
             ManifestHistoryRetention {
                 keep_count,
                 pitr_retention_secs: 0,
+                skew_slop_secs: 0,
             },
         )
         .await?
@@ -768,9 +771,12 @@ impl Manifest {
                 })?;
             let keep_by_count = index >= keep_from;
             let keep_by_pin = pinned_generations.contains(&entry.version);
+            let retention_window = retention
+                .pitr_retention_secs
+                .saturating_add(retention.skew_slop_secs);
             let keep_by_time = retention.pitr_retention_secs > 0
                 && now.signed_duration_since(manifest.updated_at).num_seconds()
-                    <= retention.pitr_retention_secs as i64;
+                    <= retention_window as i64;
             if keep_by_count || keep_by_time || keep_by_pin {
                 retained_manifests.push(manifest);
             } else {
@@ -930,6 +936,14 @@ impl NamedSnapshot {
             ));
         }
         let key = Self::key(namespace, name)?;
+        if Manifest::read_history(store, namespace, generation)
+            .await?
+            .is_none()
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "snapshot generation {generation} is not retained for namespace {namespace}"
+            )));
+        }
         let snapshot = Self {
             generation,
             created_at: Utc::now(),
@@ -1248,6 +1262,7 @@ mod tests {
             ManifestHistoryRetention {
                 keep_count: 1,
                 pitr_retention_secs: 30,
+                skew_slop_secs: 0,
             },
         )
         .await
@@ -1274,9 +1289,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_history_prune_applies_skew_slop_to_pitr_window() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let ns = "manifest_history_retention_skew";
+
+        let mut initial = Manifest::new();
+        initial.updated_at = Utc::now() - chrono::Duration::seconds(12);
+        initial.write(&store, ns).await.unwrap();
+        for age_secs in [30, 0] {
+            let (mut manifest, etag) = Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+            manifest.updated_at = Utc::now() - chrono::Duration::seconds(age_secs);
+            manifest.write_conditional(&store, ns, &etag).await.unwrap();
+        }
+
+        let result = Manifest::prune_history_with_retention(
+            &store,
+            ns,
+            ManifestHistoryRetention {
+                keep_count: 1,
+                pitr_retention_secs: 10,
+                skew_slop_secs: 5,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result
+                .retained_manifests
+                .iter()
+                .map(Manifest::version)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "generation 1 is older than the PITR window but inside skew slop"
+        );
+    }
+
+    #[tokio::test]
     async fn named_snapshot_create_is_idempotent_but_conflicts_on_generation_change() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let ns = "named_snapshot_create";
+        Manifest::new().write(&store, ns).await.unwrap();
+        for _ in 0..7 {
+            let (mut manifest, etag) = Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+            manifest.updated_at = Utc::now();
+            manifest.write_conditional(&store, ns, &etag).await.unwrap();
+        }
 
         let first = NamedSnapshot::create(&store, ns, "daily.2026-07-08", 7)
             .await
@@ -1293,6 +1351,21 @@ mod tests {
         assert!(
             matches!(err, ZeppelinError::SnapshotAlreadyExists { .. }),
             "different generation must conflict, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_snapshot_create_rejects_missing_history_generation() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let ns = "named_snapshot_missing_history";
+
+        let err = NamedSnapshot::create(&store, ns, "missing", 7)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ZeppelinError::Validation(_)),
+            "missing history generation must be a typed validation error, got {err:?}"
         );
     }
 
