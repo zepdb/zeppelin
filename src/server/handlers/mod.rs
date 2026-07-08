@@ -1,3 +1,5 @@
+/// Point-in-time manifest resolution shared by query and clone handlers.
+pub(crate) mod as_of;
 /// Runtime configuration handlers.
 pub mod config;
 /// Namespace CRUD handlers.

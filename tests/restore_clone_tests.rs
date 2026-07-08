@@ -2,6 +2,7 @@ mod common;
 
 use std::collections::BTreeSet;
 
+use chrono::{Duration, Utc};
 use common::fault_injection::fail_put_once_matching;
 use common::server::{
     api_ns, cleanup_ns, create_ns_api_with, start_test_server, start_test_server_with_compactor,
@@ -12,6 +13,7 @@ use ulid::Ulid;
 use zeppelin::compaction::gc::reachable_keys;
 use zeppelin::config::Config;
 use zeppelin::index::quantization::QuantizationType;
+use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::manifest::FragmentRef;
 use zeppelin::wal::Manifest;
 
@@ -102,6 +104,23 @@ fn fragment(id: u128) -> FragmentRef {
     }
 }
 
+async fn rewrite_history_updated_at(
+    store: &ZeppelinStore,
+    ns: &str,
+    manifest: &Manifest,
+    updated_at: chrono::DateTime<Utc>,
+) {
+    let mut rewritten = manifest.clone();
+    rewritten.updated_at = updated_at;
+    store
+        .put(
+            &Manifest::history_key(ns, rewritten.version()),
+            rewritten.to_bytes().unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn clone_as_of_ignores_history_generation_ahead_of_live_manifest() {
     let (base_url, harness) = start_test_server().await;
@@ -158,6 +177,81 @@ async fn clone_as_of_ignores_history_generation_ahead_of_live_manifest() {
     assert_eq!(get_target.status(), StatusCode::NOT_FOUND);
 
     cleanup_ns(&harness.store, &source).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn clone_as_of_timestamp_scans_full_history_under_clock_skew() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let source = create_ns_api_with(
+        &client,
+        &base_url,
+        json!({
+            "dimensions": 2,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+    let target = api_ns(&harness, "timestamp-skew-clone");
+
+    upsert(
+        &client,
+        &base_url,
+        &source,
+        json!([{ "id": "first", "values": [0.0, 0.0] }]),
+    )
+    .await;
+    let first = Manifest::read(&harness.store, &source)
+        .await
+        .unwrap()
+        .unwrap();
+    upsert(
+        &client,
+        &base_url,
+        &source,
+        json!([{ "id": "second", "values": [10.0, 10.0] }]),
+    )
+    .await;
+    let second = Manifest::read(&harness.store, &source)
+        .await
+        .unwrap()
+        .unwrap();
+    upsert(
+        &client,
+        &base_url,
+        &source,
+        json!([{ "id": "third", "values": [20.0, 20.0] }]),
+    )
+    .await;
+
+    let base = Utc::now() - Duration::minutes(10);
+    rewrite_history_updated_at(
+        &harness.store,
+        &source,
+        &first,
+        base + Duration::seconds(100),
+    )
+    .await;
+    rewrite_history_updated_at(
+        &harness.store,
+        &source,
+        &second,
+        base + Duration::seconds(50),
+    )
+    .await;
+
+    let as_of = (base + Duration::seconds(75)).to_rfc3339();
+    let (status, body) = clone_namespace(&client, &base_url, &source, &target, &as_of).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["generation"], second.version());
+
+    let target_ids = query_ids(&client, &base_url, &target, [10.0, 10.0]).await;
+    assert_eq!(target_ids.first().unwrap(), "second");
+    assert!(!target_ids.iter().any(|id| id == "third"));
+
+    cleanup_ns(&harness.store, &source).await;
+    cleanup_ns(&harness.store, &target).await;
     harness.cleanup().await;
 }
 

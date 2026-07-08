@@ -1,7 +1,7 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -22,7 +22,7 @@ use crate::types::{DistanceMetric, IndexType};
 use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
 use crate::wal::Manifest;
 
-use super::ApiError;
+use super::{as_of, ApiError};
 
 /// Request body for creating a new namespace.
 #[derive(Debug, Deserialize)]
@@ -523,7 +523,7 @@ pub async fn clone_namespace(
         .get(&source)
         .await
         .map_err(ApiError::from)?;
-    let source_manifest = resolve_clone_as_of_manifest(&state, &source, &as_of)
+    let source_manifest = as_of::resolve_manifest(&state.store, &source, &as_of)
         .await
         .map_err(ApiError::from)?;
     let source_generation = source_manifest.version();
@@ -641,110 +641,6 @@ fn generated_namespace_name(prefix: Option<&str>) -> String {
     match prefix {
         Some(prefix) => format!("{prefix}-{uuid}"),
         None => uuid,
-    }
-}
-
-async fn resolve_clone_as_of_manifest(
-    state: &AppState,
-    namespace: &str,
-    as_of: &str,
-) -> Result<Manifest, ZeppelinError> {
-    if as_of.is_empty() {
-        return Err(ZeppelinError::Validation(
-            "as_of must be a generation, RFC3339 timestamp, or snapshot:name".into(),
-        ));
-    }
-    if let Some(snapshot_name) = as_of.strip_prefix("snapshot:") {
-        if snapshot_name.is_empty() {
-            return Err(ZeppelinError::Validation(
-                "as_of snapshot target must be snapshot:<name>".into(),
-            ));
-        }
-        let snapshot = NamedSnapshot::read(&state.store, namespace, snapshot_name)
-            .await?
-            .ok_or_else(|| ZeppelinError::SnapshotNotFound {
-                namespace: namespace.to_string(),
-                name: snapshot_name.to_string(),
-            })?;
-        return read_clone_history_generation(
-            &state.store,
-            namespace,
-            snapshot.generation,
-            &format!("snapshot:{snapshot_name}"),
-        )
-        .await;
-    }
-
-    if let Ok(generation) = as_of.parse::<u64>() {
-        return read_clone_history_generation(&state.store, namespace, generation, as_of).await;
-    }
-
-    let timestamp = DateTime::parse_from_rfc3339(as_of)
-        .map_err(|e| {
-            ZeppelinError::Validation(format!(
-                "as_of must be a generation, RFC3339 timestamp, or snapshot:name: {e}"
-            ))
-        })?
-        .with_timezone(&Utc);
-    resolve_clone_history_at_or_before_timestamp(&state.store, namespace, timestamp, as_of).await
-}
-
-async fn read_clone_history_generation(
-    store: &crate::storage::ZeppelinStore,
-    namespace: &str,
-    generation: u64,
-    target: &str,
-) -> Result<Manifest, ZeppelinError> {
-    let live_version = clone_live_manifest_version(store, namespace).await?;
-    if generation == 0 || generation > live_version {
-        return Err(clone_point_in_time_not_retained(namespace, target));
-    }
-
-    Manifest::read_history(store, namespace, generation)
-        .await?
-        .ok_or_else(|| clone_point_in_time_not_retained(namespace, target))
-}
-
-async fn resolve_clone_history_at_or_before_timestamp(
-    store: &crate::storage::ZeppelinStore,
-    namespace: &str,
-    timestamp: DateTime<Utc>,
-    target: &str,
-) -> Result<Manifest, ZeppelinError> {
-    let live_version = clone_live_manifest_version(store, namespace).await?;
-    let mut selected = None;
-    for entry in Manifest::list_history(store, namespace).await? {
-        if entry.version > live_version {
-            break;
-        }
-        let manifest = Manifest::read_history(store, namespace, entry.version)
-            .await?
-            .ok_or_else(|| ZeppelinError::NotFound { key: entry.key })?;
-        if manifest.updated_at <= timestamp {
-            selected = Some(manifest);
-        } else {
-            break;
-        }
-    }
-    selected.ok_or_else(|| ZeppelinError::PointInTimeNotRetained {
-        namespace: namespace.to_string(),
-        target: target.to_string(),
-    })
-}
-
-async fn clone_live_manifest_version(
-    store: &crate::storage::ZeppelinStore,
-    namespace: &str,
-) -> Result<u64, ZeppelinError> {
-    Ok(Manifest::read(store, namespace)
-        .await?
-        .map_or(0, |manifest| manifest.version()))
-}
-
-fn clone_point_in_time_not_retained(namespace: &str, target: &str) -> ZeppelinError {
-    ZeppelinError::PointInTimeNotRetained {
-        namespace: namespace.to_string(),
-        target: target.to_string(),
     }
 }
 
