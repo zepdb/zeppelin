@@ -1,0 +1,56 @@
+mod adversarial;
+mod common;
+
+#[tokio::test]
+#[ignore]
+async fn smoke() {
+    let env = adversarial::RunnerEnv::from_env();
+    let summary = adversarial::runner::run_smoke(env).await;
+
+    assert!(
+        summary.failed_seeds == 0,
+        "adversarial smoke had {} failed seed(s)",
+        summary.failed_seeds
+    );
+    assert!(
+        summary.seeds_run >= 3,
+        "expected at least 3 seeds, ran {}",
+        summary.seeds_run
+    );
+    assert!(
+        summary.ops_total >= 200,
+        "expected at least 200 ops, ran {}",
+        summary.ops_total
+    );
+    assert!(
+        summary.compactions_total >= 20,
+        "expected at least 20 compactions, ran {}",
+        summary.compactions_total
+    );
+    assert!(
+        summary
+            .coverage
+            .tag_counts
+            .get("delete-then-reupsert")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "delete-then-reupsert scenario tag was not covered"
+    );
+
+    println!(
+        "adversarial smoke: seeds={} ops={} compactions={} failed={} ops/sec={:.2}",
+        summary.seeds_run,
+        summary.ops_total,
+        summary.compactions_total,
+        summary.failed_seeds,
+        summary.ops_per_sec
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn oracle_selftest() {
+    let env = adversarial::RunnerEnv::from_env();
+    adversarial::runner::run_oracle_selftest(env).await;
+}

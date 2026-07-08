@@ -463,3 +463,116 @@ pub async fn cleanup_ns(store: &ZeppelinStore, ns: &str) {
     let prefix = format!("{ns}/");
     let _ = store.delete_prefix(&prefix).await;
 }
+
+pub struct FullTestServer {
+    pub base_url: String,
+    pub cache: Arc<DiskCache>,
+    pub cache_dir: tempfile::TempDir,
+    pub compactor: Arc<Compactor>,
+    pub lease_manager: Arc<LeaseManager>,
+    pub shutdown_compaction: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+/// Start a test server on an already-constructed store, returning the full set
+/// of test handles needed by deterministic and later chaos adversarial runs.
+pub async fn start_test_server_full(
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+    mut config: Config,
+    spawn_compaction_loop: bool,
+) -> FullTestServer {
+    zeppelin::metrics::init();
+    configure_test_server_limits(&mut config);
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+
+    let namespace_manager = namespace_manager(&config, &store);
+    let compactor = compactor(&config, &store);
+    let lease_manager = lease_manager(&config, &store);
+    let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(
+        config.cache.manifest_cache_ttl_ms,
+    )));
+
+    let shutdown_compaction = if spawn_compaction_loop {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let gc_config = config.gc.clone();
+        {
+            let compactor = compactor.clone();
+            let namespace_manager = namespace_manager.clone();
+            let manifest_cache = manifest_cache.clone();
+            let lease_manager = lease_manager.clone();
+            let cache = cache.clone();
+            let namespace_prefix = namespace_name_prefix.clone();
+            tokio::spawn(async move {
+                compaction_loop(
+                    compactor,
+                    namespace_manager,
+                    shutdown_rx,
+                    manifest_cache,
+                    lease_manager,
+                    cache,
+                    CompactionLoopOptions {
+                        gc_config,
+                        namespace_prefix,
+                    },
+                )
+                .await;
+            });
+        }
+        Some(shutdown_tx)
+    } else {
+        None
+    };
+
+    let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        config.server.max_concurrent_queries,
+    ));
+    let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
+    let hydrator = maybe_hydrator(&config, &store, &cache);
+    let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
+    let state = AppState {
+        store: store.clone(),
+        namespace_manager,
+        namespace_name_prefix,
+        wal_writer: Arc::new(WalWriter::new(store.clone())),
+        wal_reader: Arc::new(WalReader::new(store.clone())),
+        compactor: compactor.clone(),
+        lease_manager: lease_manager.clone(),
+        config: Arc::new(config),
+        trusted_proxies,
+        runtime_query_config,
+        query_knob_bounds,
+        cache: cache.clone(),
+        manifest_cache,
+        hydrator,
+        fts_cache: Arc::new(WalFtsCache::new()),
+        query_semaphore,
+        rate_limiters: Arc::new(DashMap::new()),
+    };
+
+    let app = build_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    FullTestServer {
+        base_url,
+        cache,
+        cache_dir,
+        compactor,
+        lease_manager,
+        shutdown_compaction,
+    }
+}
