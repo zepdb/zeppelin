@@ -472,19 +472,11 @@ impl ZeppelinStore {
         self.inner
             .copy_if_not_exists(&from_path, &to_path)
             .await
-            .map_err(|e| match e {
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. } => {
-                    ZeppelinError::NamespaceAlreadyExists {
-                        namespace: namespace.to_string(),
-                    }
-                }
-                other => {
-                    crate::metrics::S3_ERRORS_TOTAL
-                        .with_label_values(&["copy"])
-                        .inc();
-                    ZeppelinError::Storage(other)
-                }
+            .map_err(|e| {
+                crate::metrics::S3_ERRORS_TOTAL
+                    .with_label_values(&["copy"])
+                    .inc();
+                ZeppelinError::Storage(e)
             })?;
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 copy_if_not_exists");

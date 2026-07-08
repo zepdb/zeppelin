@@ -2,10 +2,11 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use crate::compaction::background::run_compaction_with_lease;
@@ -23,6 +24,9 @@ use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
 use crate::wal::Manifest;
 
 use super::{as_of, ApiError};
+
+const CLONE_COPY_CONCURRENCY: usize = 16;
+const CLONE_INTERNAL_SNAPSHOT_PREFIX: &str = "__clone_";
 
 /// Request body for creating a new namespace.
 #[derive(Debug, Deserialize)]
@@ -527,12 +531,17 @@ pub async fn clone_namespace(
         .await
         .map_err(ApiError::from)?;
     let source_generation = source_manifest.version();
+    let clone_pin_name = internal_clone_pin_name();
+    NamedSnapshot::create(&state.store, &source, &clone_pin_name, source_generation)
+        .await
+        .map_err(ApiError::from)?;
+
     let index_config = source_meta
         .index_config
         .clone()
         .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(&state.config.indexing));
 
-    let target_meta = state
+    let target_meta = match state
         .namespace_manager
         .create_with_fts_and_index_config(
             &target,
@@ -542,16 +551,30 @@ pub async fn clone_namespace(
             Some(index_config),
         )
         .await
-        .map_err(ApiError::from)?;
+    {
+        Ok(meta) => meta,
+        Err(e) => {
+            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+            return Err(ApiError::from(e));
+        }
+    };
 
-    let mut target_manifest = materialize_clone_manifest(&state, &source, &target, source_manifest)
-        .await
-        .map_err(ApiError::from)?;
-    target_manifest
-        .write(&state.store, &target)
-        .await
-        .map_err(ApiError::from)?;
+    let mut target_manifest =
+        match materialize_clone_manifest(&state, &source, &target, source_manifest).await {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                cleanup_failed_clone_target(&state, &target).await;
+                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                return Err(ApiError::from(e));
+            }
+        };
+    if let Err(e) = target_manifest.write(&state.store, &target).await {
+        cleanup_failed_clone_target(&state, &target).await;
+        release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+        return Err(ApiError::from(e));
+    }
     state.manifest_cache.invalidate(&target);
+    release_internal_clone_pin(&state, &source, &clone_pin_name).await;
 
     info!(
         source = %source,
@@ -577,6 +600,37 @@ pub async fn clone_namespace(
             ),
         }),
     ))
+}
+
+fn internal_clone_pin_name() -> String {
+    format!(
+        "{CLONE_INTERNAL_SNAPSHOT_PREFIX}{}",
+        Uuid::new_v4().simple()
+    )
+}
+
+async fn release_internal_clone_pin(state: &AppState, source: &str, name: &str) {
+    match NamedSnapshot::delete(&state.store, source, name).await {
+        Ok(()) | Err(ZeppelinError::NotFound { .. }) => {}
+        Err(e) => warn!(
+            source,
+            snapshot = name,
+            error = %e,
+            "failed to release temporary clone snapshot pin"
+        ),
+    }
+}
+
+async fn cleanup_failed_clone_target(state: &AppState, target: &str) {
+    state.manifest_cache.invalidate(target);
+    match state.namespace_manager.delete(target).await {
+        Ok(()) | Err(ZeppelinError::NamespaceNotFound { .. }) => {}
+        Err(e) => warn!(
+            target,
+            error = %e,
+            "failed to clean up target namespace after clone failure"
+        ),
+    }
 }
 
 fn resolve_namespace_index_config(
@@ -657,9 +711,14 @@ async fn materialize_clone_manifest(
     manifest.updated_at = Utc::now();
     manifest.reset_version_for_clone();
 
-    for (from, to) in copies {
-        state.store.copy_if_not_exists(&from, &to, target).await?;
-    }
+    futures::stream::iter(copies.into_iter().map(|(from, to)| {
+        let store = state.store.clone();
+        let target = target.to_string();
+        async move { store.copy_if_not_exists(&from, &to, &target).await }
+    }))
+    .buffer_unordered(CLONE_COPY_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
 
     Ok(manifest)
 }

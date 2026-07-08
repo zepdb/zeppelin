@@ -3,9 +3,12 @@ mod common;
 use std::collections::BTreeSet;
 
 use chrono::{Duration, Utc};
-use common::fault_injection::fail_put_once_matching;
+use common::fault_injection::{
+    assert_snapshot_on_copy, fail_copy_once_matching, fail_put_once_matching,
+};
 use common::server::{
-    api_ns, cleanup_ns, create_ns_api_with, start_test_server, start_test_server_with_compactor,
+    api_ns, cleanup_ns, create_ns_api_with, start_test_server, start_test_server_on_store,
+    start_test_server_with_compactor,
 };
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -14,7 +17,7 @@ use zeppelin::compaction::gc::reachable_keys;
 use zeppelin::config::Config;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::wal::manifest::FragmentRef;
+use zeppelin::wal::manifest::{FragmentRef, NamedSnapshot};
 use zeppelin::wal::Manifest;
 
 async fn upsert(client: &reqwest::Client, base_url: &str, ns: &str, vectors: Value) {
@@ -442,5 +445,202 @@ async fn clone_pruned_generation_returns_410_without_creating_target() {
     assert_eq!(get_target.status(), StatusCode::NOT_FOUND);
 
     cleanup_ns(&harness.store, &source).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn clone_copy_failure_cleans_target_and_allows_retry() {
+    let harness = common::harness::TestHarness::new().await;
+    let (failing_store, failures) = fail_copy_once_matching(&harness.store, "/wal/");
+    let (base_url, _cache, _cache_dir) = start_test_server_on_store(failing_store, None).await;
+    let client = reqwest::Client::new();
+    let source = create_ns_api_with(
+        &client,
+        &base_url,
+        json!({
+            "dimensions": 2,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+    let target = api_ns(&harness, "copy-failure-target");
+
+    upsert(
+        &client,
+        &base_url,
+        &source,
+        json!([{ "id": "copy-me", "values": [0.0, 0.0] }]),
+    )
+    .await;
+    let generation = Manifest::read(&harness.store, &source)
+        .await
+        .unwrap()
+        .unwrap()
+        .version()
+        .to_string();
+
+    let (status, body) = clone_namespace(&client, &base_url, &source, &target, &generation).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["code"], "STORAGE_ERROR");
+    assert_eq!(failures.failures_injected(), 1);
+
+    let get_target = client
+        .get(format!("{base_url}/v1/namespaces/{target}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_target.status(), StatusCode::NOT_FOUND);
+    assert!(
+        harness
+            .store
+            .list_prefix(&format!("{target}/"))
+            .await
+            .unwrap()
+            .is_empty(),
+        "failed clone must remove target meta and partially copied objects"
+    );
+    assert!(
+        NamedSnapshot::list(&harness.store, &source)
+            .await
+            .unwrap()
+            .iter()
+            .all(|snapshot| !snapshot.name.starts_with("__clone_")),
+        "temporary source pin must be released after clone failure"
+    );
+
+    let (retry_status, retry_body) =
+        clone_namespace(&client, &base_url, &source, &target, &generation).await;
+    assert_eq!(retry_status, StatusCode::CREATED);
+    assert_eq!(retry_body["target"], target);
+    let target_ids = query_ids(&client, &base_url, &target, [0.0, 0.0]).await;
+    assert_eq!(target_ids.first().unwrap(), "copy-me");
+
+    cleanup_ns(&harness.store, &source).await;
+    cleanup_ns(&harness.store, &target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn clone_copy_collision_surfaces_storage_error_and_cleans_target() {
+    let (base_url, harness) = start_test_server().await;
+    let client = reqwest::Client::new();
+    let source = create_ns_api_with(
+        &client,
+        &base_url,
+        json!({
+            "dimensions": 2,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+    let target = api_ns(&harness, "copy-collision-target");
+
+    upsert(
+        &client,
+        &base_url,
+        &source,
+        json!([{ "id": "copy-me", "values": [0.0, 0.0] }]),
+    )
+    .await;
+    let source_manifest = Manifest::read(&harness.store, &source)
+        .await
+        .unwrap()
+        .unwrap();
+    let source_key = reachable_keys(&source, &source_manifest)
+        .into_iter()
+        .next()
+        .expect("source manifest must reference a copyable artifact");
+    let target_key = source_key.replacen(&format!("{source}/"), &format!("{target}/"), 1);
+    harness
+        .store
+        .put(
+            &target_key,
+            bytes::Bytes::from_static(b"preexisting target object"),
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = clone_namespace(
+        &client,
+        &base_url,
+        &source,
+        &target,
+        &source_manifest.version().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["code"], "STORAGE_ERROR");
+
+    let get_target = client
+        .get(format!("{base_url}/v1/namespaces/{target}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_target.status(), StatusCode::NOT_FOUND);
+    assert!(
+        !harness.store.exists(&target_key).await.unwrap(),
+        "clone cleanup should remove the colliding target-prefix object"
+    );
+
+    cleanup_ns(&harness.store, &source).await;
+    cleanup_ns(&harness.store, &target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn clone_holds_internal_source_pin_while_copying() {
+    let harness = common::harness::TestHarness::new().await;
+    let (asserting_store, snapshot_observer) = assert_snapshot_on_copy(&harness.store);
+    let (base_url, _cache, _cache_dir) = start_test_server_on_store(asserting_store, None).await;
+    let client = reqwest::Client::new();
+    let source = create_ns_api_with(
+        &client,
+        &base_url,
+        json!({
+            "dimensions": 2,
+            "distance_metric": "euclidean"
+        }),
+    )
+    .await;
+    let target = api_ns(&harness, "copy-pin-target");
+
+    upsert(
+        &client,
+        &base_url,
+        &source,
+        json!([{ "id": "copy-me", "values": [0.0, 0.0] }]),
+    )
+    .await;
+    let source_manifest = Manifest::read(&harness.store, &source)
+        .await
+        .unwrap()
+        .unwrap();
+    snapshot_observer.expect_snapshot(&source, source_manifest.version(), "__clone_");
+
+    let (status, body) = clone_namespace(
+        &client,
+        &base_url,
+        &source,
+        &target,
+        &source_manifest.version().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["target"], target);
+    assert!(
+        snapshot_observer.observations() > 0,
+        "copy wrapper must observe the temporary source snapshot pin"
+    );
+    assert!(
+        NamedSnapshot::list(&harness.store, &source)
+            .await
+            .unwrap()
+            .iter()
+            .all(|snapshot| !snapshot.name.starts_with("__clone_")),
+        "temporary source pin must be released after clone publish"
+    );
+
+    cleanup_ns(&harness.store, &source).await;
+    cleanup_ns(&harness.store, &target).await;
     harness.cleanup().await;
 }
