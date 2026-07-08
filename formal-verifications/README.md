@@ -30,6 +30,15 @@ wget https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
 # https://lamport.azurewebsites.net/tla/toolbox.html
 ```
 
+This workspace also supports the local jar at `~/Downloads/tla2tools.jar`.
+When `/usr/bin/java` has no configured runtime, use Homebrew OpenJDK directly:
+
+```bash
+JAVA="${JAVA:-/opt/homebrew/opt/openjdk/bin/java}"
+"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
+  -config <Spec>.cfg <Spec>.tla
+```
+
 ### Running the Model Checker
 
 Each spec has a matching `.cfg` file. Run TLC from the `tla/` directory:
@@ -50,6 +59,24 @@ java -jar tla2tools.jar -config NamespaceDeletion.cfg NamespaceDeletion.tla
 java -jar tla2tools.jar -config ULIDOrdering.cfg ULIDOrdering.tla
 ```
 
+Current July 2026 durability/write-path specs were run with:
+
+```bash
+cd formal-verifications/tla
+JAVA="${JAVA:-/opt/homebrew/opt/openjdk/bin/java}"
+
+"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
+  -config PitrHistoryRetention.cfg PitrHistoryRetention.tla
+"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
+  -config TwoPassGcSafety.cfg TwoPassGcSafety.tla
+"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
+  -config RestoreCloneSafety.cfg RestoreCloneSafety.tla
+"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
+  -config IncrementalArtifactClosure.cfg IncrementalArtifactClosure.tla
+"$JAVA" -XX:+UseParallelGC -jar "$HOME/Downloads/tla2tools.jar" \
+  -config GroupCommitWalWriter.cfg GroupCommitWalWriter.tla
+```
+
 ### What Each Spec Verifies
 
 | Spec | Invariant | Expected | Bug Found |
@@ -58,6 +85,25 @@ java -jar tla2tools.jar -config ULIDOrdering.cfg ULIDOrdering.tla
 | `QueryReadConsistency` | `QueryNeverHitsOrphan` | VIOLATED | Query reads stale manifest, compactor deletes fragments, query gets 404 |
 | `NamespaceDeletion` | `QueryNeverSeesPartialState` | VIOLATED | Non-atomic prefix deletion exposes half-deleted state to queries |
 | `ULIDOrdering` | `LastCommitterWins` | VIOLATED (with skew) | Clock skew reverses ULID order, wrong value wins in merge |
+
+### July 2026 Durability and Writer Specs
+
+These specs model the newer PITR, GC, restore, incremental compaction, and
+native group-commit code added after July 3, 2026. The default configs are
+expected to pass. Each spec also has a deliberately buggy variant, enabled by
+a config constant, to prove the invariant can catch the target failure mode.
+
+| Spec | Default TLC result | Negative variant |
+|------|--------------------|------------------|
+| `PitrHistoryRetention` | PASS: 604,773 generated; 41,442 distinct; depth 17 | `AllowBuggyCommit = TRUE` violates `LiveHasHistory` |
+| `TwoPassGcSafety` | PASS: 2,547,895 generated; 167,004 distinct; depth 25 | `AllowBuggySweepWithoutRevalidate = TRUE` violates `NoReachableKeyDeleted` |
+| `RestoreCloneSafety` | PASS: 1,309 generated; 360 distinct; depth 11 | `AllowBuggyPublish = TRUE` violates `VisibleTargetRefsExist` |
+| `IncrementalArtifactClosure` | PASS: 128 generated; 37 distinct; depth 8 | `AllowBuggyPrefixGc = TRUE` violates `ManifestReachableArtifactsExist` |
+| `GroupCommitWalWriter` | PASS: 6,368 generated; 2,407 distinct; depth 15 | `AllowBuggyMixedTokenDeadlock = TRUE` violates `NoMixedTokenLeaderDeadlock` |
+
+The `.tlc.log` files in `formal-verifications/tla/` contain the raw run
+summaries. They are generated artifacts; commit the specs/configs and summarize
+the logs unless a workflow explicitly asks to preserve the raw logs.
 
 ### Interpreting Counterexamples
 

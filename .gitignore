@@ -60,6 +60,7 @@ zeppelin.toml
 
 # TLA+ model-checker artifacts
 formal-verifications/tla2tools.jar
+formal-verifications/tla/*.tlc.log
 states/
 result_*.txt
 
