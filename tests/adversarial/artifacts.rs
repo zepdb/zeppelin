@@ -509,6 +509,7 @@ fn is_control_plane_key(namespace: &str, key: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use std::collections::BTreeSet;
     use std::fmt;

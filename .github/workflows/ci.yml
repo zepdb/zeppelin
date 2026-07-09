@@ -35,6 +35,9 @@ jobs:
   integration-tests:
     name: Integration Tests (MinIO)
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUSTFLAGS: -C link-arg=-Wl,--threads=1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,11 +71,14 @@ jobs:
           MINIO_ENDPOINT: http://localhost:9000
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin
-        run: cargo test --tests -- --nocapture
+        run: cargo test --tests -j 1 -- --nocapture
 
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUSTFLAGS: -C link-arg=-Wl,--threads=1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -113,8 +119,8 @@ jobs:
           MINIO_ACCESS_KEY: minioadmin
           MINIO_SECRET_KEY: minioadmin
         run: |
-          cargo llvm-cov --no-report --lib
-          cargo llvm-cov --no-report --tests
+          cargo llvm-cov --no-report --lib -j 1
+          cargo llvm-cov --no-report --tests -j 1
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
