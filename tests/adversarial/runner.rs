@@ -282,7 +282,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         seed_config.selftest_probe.map(OracleMutation::key),
         chaos_plan_json.as_ref(),
     );
-    let server = start_test_server_full(
+    let mut server = start_test_server_full(
         store.clone(),
         Some(prefix.clone()),
         config.clone(),
@@ -349,7 +349,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     }
 
     let mut op_count = artifacts.op_count();
-    stop_chaos_and_background(&server, chaos_handle.as_ref()).await;
+    stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
     if !failed {
         let quiescence = quiesce_and_verify(
             &client,
@@ -390,9 +390,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     } else {
         println!("preserved replay prefix {prefix}");
     }
-    if let Some(shutdown) = server.shutdown_compaction.as_ref() {
-        let _ = shutdown.send(true);
-    }
+    stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     SeedOutcome {
         mode,
@@ -511,13 +509,16 @@ fn adversarial_client() -> Client {
         .expect("failed to build adversarial reqwest client")
 }
 
-async fn stop_chaos_and_background(server: &FullTestServer, chaos: Option<&ChaosHandle>) {
+async fn stop_chaos_and_background(server: &mut FullTestServer, chaos: Option<&ChaosHandle>) {
     if let Some(chaos) = chaos {
         chaos.disable();
     }
-    if let Some(shutdown) = server.shutdown_compaction.as_ref() {
+    if let Some(shutdown) = server.shutdown_compaction.take() {
         let _ = shutdown.send(true);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if let Some(task) = server.compaction_loop_task.take() {
+        task.await
+            .unwrap_or_else(|error| panic!("background compaction task failed: {error}"));
     }
 }
 
@@ -1035,7 +1036,7 @@ async fn run_seed(
         selftest_probe.map(OracleMutation::key),
         chaos_plan_json.as_ref(),
     );
-    let server = start_test_server_full(
+    let mut server = start_test_server_full(
         store.clone(),
         Some(prefix.clone()),
         config.clone(),
@@ -1129,7 +1130,7 @@ async fn run_seed(
         }
     }
 
-    stop_chaos_and_background(&server, chaos_handle.as_ref()).await;
+    stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
 
     if !failed {
         let quiescence = quiesce_and_verify(
@@ -1217,9 +1218,7 @@ async fn run_seed(
         println!("preserved adversarial prefix {prefix}");
     }
 
-    if let Some(shutdown) = server.shutdown_compaction.as_ref() {
-        let _ = shutdown.send(true);
-    }
+    stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
 
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     println!(
@@ -1567,6 +1566,7 @@ async fn execute_op(
             let report = gc::run_gc_cycle(&server.store, ns, &config)
                 .await
                 .unwrap_or_else(|error| panic!("gc cycle failed for {ns}: {error}"));
+            server.manifest_cache.invalidate(ns);
             let retained_generations = Manifest::list_history(&server.store, ns)
                 .await
                 .unwrap_or_else(|error| panic!("history list after gc failed for {ns}: {error}"))
@@ -1706,29 +1706,35 @@ async fn execute_op(
             )
         }
         Op::CompactInline { ns } => match server.compactor.compact(ns).await {
-            Ok(result) => (
-                "IN_PROCESS".to_string(),
-                format!("compactor.compact({ns})"),
-                StatusCode::OK.as_u16(),
-                json!({
-                    "segment_id": result.segment_id,
-                    "vectors_compacted": result.vectors_compacted,
-                    "fragments_removed": result.fragments_removed,
-                    "old_segment_removed": result.old_segment_removed,
-                }),
-            ),
-            Err(error) => (
-                "IN_PROCESS".to_string(),
-                format!("compactor.compact({ns})"),
-                StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-                json!({
-                    "code": "INTERNAL_ERROR",
-                    "error": error.to_string(),
-                    "status": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-                    "retryable": true,
-                    "request_id": "in-process",
-                }),
-            ),
+            Ok(result) => {
+                server.manifest_cache.invalidate(ns);
+                (
+                    "IN_PROCESS".to_string(),
+                    format!("compactor.compact({ns})"),
+                    StatusCode::OK.as_u16(),
+                    json!({
+                        "segment_id": result.segment_id,
+                        "vectors_compacted": result.vectors_compacted,
+                        "fragments_removed": result.fragments_removed,
+                        "old_segment_removed": result.old_segment_removed,
+                    }),
+                )
+            }
+            Err(error) => {
+                server.manifest_cache.invalidate(ns);
+                (
+                    "IN_PROCESS".to_string(),
+                    format!("compactor.compact({ns})"),
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    json!({
+                        "code": "INTERNAL_ERROR",
+                        "error": error.to_string(),
+                        "status": StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        "retryable": true,
+                        "request_id": "in-process",
+                    }),
+                )
+            }
         },
     };
 
@@ -2036,6 +2042,7 @@ async fn execute_sandwich_maintenance(
                 .compact(ns)
                 .await
                 .unwrap_or_else(|error| panic!("sandwich compaction failed for {ns}: {error}"));
+            server.manifest_cache.invalidate(ns);
             json!({
                 "kind": "compact_inline",
                 "segment_id": result.segment_id,
@@ -2062,6 +2069,7 @@ async fn execute_sandwich_maintenance(
             let report = gc::run_gc_cycle(&server.store, ns, &config)
                 .await
                 .unwrap_or_else(|error| panic!("sandwich gc failed for {ns}: {error}"));
+            server.manifest_cache.invalidate(ns);
             json!({
                 "kind": "gc_cycle",
                 "candidates_marked": report.candidates_marked,

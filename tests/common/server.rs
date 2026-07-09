@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
 use super::harness::TestHarness;
 
@@ -471,7 +472,9 @@ pub struct FullTestServer {
     pub cache_dir: tempfile::TempDir,
     pub compactor: Arc<Compactor>,
     pub lease_manager: Arc<LeaseManager>,
+    pub manifest_cache: Arc<ManifestCache>,
     pub shutdown_compaction: Option<tokio::sync::watch::Sender<bool>>,
+    pub compaction_loop_task: Option<JoinHandle<()>>,
 }
 
 /// Start a test server on an already-constructed store, returning the full set
@@ -497,6 +500,7 @@ pub async fn start_test_server_full(
         config.cache.manifest_cache_ttl_ms,
     )));
 
+    let mut compaction_loop_task = None;
     let shutdown_compaction = if spawn_compaction_loop {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let gc_config = config.gc.clone();
@@ -507,7 +511,7 @@ pub async fn start_test_server_full(
             let lease_manager = lease_manager.clone();
             let cache = cache.clone();
             let namespace_prefix = namespace_name_prefix.clone();
-            tokio::spawn(async move {
+            compaction_loop_task = Some(tokio::spawn(async move {
                 compaction_loop(
                     compactor,
                     namespace_manager,
@@ -521,7 +525,7 @@ pub async fn start_test_server_full(
                     },
                 )
                 .await;
-            });
+            }));
         }
         Some(shutdown_tx)
     } else {
@@ -547,7 +551,7 @@ pub async fn start_test_server_full(
         runtime_query_config,
         query_knob_bounds,
         cache: cache.clone(),
-        manifest_cache,
+        manifest_cache: manifest_cache.clone(),
         hydrator,
         fts_cache: Arc::new(WalFtsCache::new()),
         query_semaphore,
@@ -575,6 +579,8 @@ pub async fn start_test_server_full(
         cache_dir,
         compactor,
         lease_manager,
+        manifest_cache,
         shutdown_compaction,
+        compaction_loop_task,
     }
 }
