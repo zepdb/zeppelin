@@ -1,3 +1,130 @@
+//! Authoritative namespace manifests, retained history, and point-in-time pins.
+//!
+//! This module defines the object-store metadata that tells Zeppelin which
+//! immutable WAL fragments and indexed segments belong to a namespace. The live
+//! [`Manifest`][crate::wal::manifest::Manifest] at
+//! `<namespace>/manifest.json` is the visibility boundary: uploading a fragment
+//! or segment object does not make that data queryable until a manifest that
+//! references it is successfully published. Despite the historical `.json`
+//! suffix, new live manifests use versioned MessagePack; readers also accept
+//! legacy JSON.
+//!
+//! The namespace manager creates the first manifest. WAL writers, compaction,
+//! and garbage collection load and publish later generations. Query planning
+//! and the manifest cache consume the published view. All remote access goes
+//! through [`ZeppelinStore`][crate::storage::ZeppelinStore]; this module neither
+//! treats a process-local value as authoritative nor edits an artifact in place.
+//!
+//! ## Artifact visibility and commit order
+//!
+//! ```text
+//! upload immutable WAL fragment or segment
+//!                  |
+//!                  | object exists, but readers cannot discover it
+//!                  v
+//! build next Manifest in memory
+//!                  |
+//!                  v
+//! write history candidate (immutable once referenced)
+//!                  |
+//!                  v
+//! publish live manifest.json -------- live PUT fails
+//!                  |                       |
+//!                  | success               v
+//!                  v                 history may be orphaned;
+//! readers discover new artifacts      a retry may replace it
+//! ```
+//!
+//! History is written first so a successful live publication always has an
+//! addressable generation. A failure of the final live PUT can leave an
+//! unreferenced history object. The retry logic distinguishes such an orphan
+//! from history already referenced by an equal-or-newer live manifest.
+//!
+//! ## Compare-and-swap publication
+//!
+//! ```text
+//! read_versioned() -> Manifest + ETag E1
+//!                         |
+//!                         | mutate owned Manifest
+//!                         v
+//!              write_conditional(..., E1)
+//!                   /                 \
+//!          E1 still current        ETag changed
+//!                |                     |
+//!                v                     v
+//!       publish next generation   ManifestConflict;
+//!                                reload, never overwrite
+//! ```
+//!
+//! [`Manifest::write_conditional`][crate::wal::manifest::Manifest::write_conditional]
+//! protects updates to an existing manifest.
+//! [`Manifest::write`][crate::wal::manifest::Manifest::write] is deliberately
+//! unconditional and is used for bootstrap, cloning, and controlled setup
+//! paths; it must not be mistaken for a stale-writer defense. A missing ETag in
+//! [`ManifestVersion`][crate::wal::manifest::ManifestVersion] likewise selects
+//! an unconditional first write, so update paths must not manufacture
+//! `ManifestVersion(None)` after a namespace has existed.
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`Manifest`][crate::wal::manifest::Manifest] and its
+//!    [`FragmentRef`][crate::wal::manifest::FragmentRef] and
+//!    [`SegmentRef`][crate::wal::manifest::SegmentRef] fields to understand the
+//!    authoritative data model.
+//! 2. Read
+//!    [`Manifest::add_fragment`][crate::wal::manifest::Manifest::add_fragment],
+//!    [`Manifest::remove_compacted_fragments`][crate::wal::manifest::Manifest::remove_compacted_fragments],
+//!    and
+//!    [`Manifest::add_segment_with_limits`][crate::wal::manifest::Manifest::add_segment_with_limits]
+//!    for in-memory state changes.
+//! 3. Read [`Manifest::to_bytes`][crate::wal::manifest::Manifest::to_bytes] and
+//!    [`Manifest::from_bytes`][crate::wal::manifest::Manifest::from_bytes] for
+//!    the persisted compatibility contract.
+//! 4. Follow
+//!    [`Manifest::read_versioned`][crate::wal::manifest::Manifest::read_versioned]
+//!    and
+//!    [`Manifest::write_conditional`][crate::wal::manifest::Manifest::write_conditional]
+//!    for normal optimistic publication.
+//! 5. Follow
+//!    [`Manifest::list_history`][crate::wal::manifest::Manifest::list_history],
+//!    [`Manifest::read_history`][crate::wal::manifest::Manifest::read_history],
+//!    and
+//!    [`Manifest::prune_history_with_retention`][crate::wal::manifest::Manifest::prune_history_with_retention]
+//!    for point-in-time recovery.
+//! 6. Finish with [`NamedSnapshot`][crate::wal::manifest::NamedSnapshot] to see
+//!    how users pin retained generations.
+//!
+//! ## Invariants
+//!
+//! - The live object-store manifest, never a local copy, defines visibility.
+//! - Existing manifests are updated with the ETag CAS implemented here.
+//!   Lease-aware WAL and compaction callers must also validate fencing; this
+//!   module does not turn an ETag into proof of lease ownership.
+//! - Compaction removes the exact fragment-ID snapshot it processed. ULID order
+//!   is observability metadata, not proof that a fragment was compacted.
+//! - History generations are nonzero and monotonically increasing.
+//! - MessagePack encodes these structs positionally. Persisted fields may only
+//!   be appended at the end with a serde default; reordering fields is a wire
+//!   format break.
+//! - Pending deletion keys remain recorded until deletion succeeds. Dropping a
+//!   key merely to bound metadata would leak its object permanently.
+//!
+//! ## Rust concepts used here
+//!
+//! The persisted structs derive [`Serialize`][serde::Serialize] and
+//! [`Deserialize`][serde::Deserialize]. This is
+//! roughly analogous to Java data-transfer objects or C wire structs, but serde
+//! generates the encoder/decoder while the Rust types still enforce ownership
+//! and nullability. Optional legacy fields use [`Option`][std::option::Option]
+//! or default values instead of nullable references.
+//!
+//! Methods that inspect state borrow `&self`; mutation methods require
+//! `&mut self`, so the compiler prevents another ordinary reference from
+//! concurrently observing a half-updated in-memory manifest. Async publication
+//! borrows the store across `.await`, while owned [`Bytes`][bytes::Bytes] values
+//! can be moved into storage calls without retaining pointers into a temporary
+//! buffer.
+
 use std::collections::HashSet;
 
 use bytes::Bytes;
@@ -9,20 +136,28 @@ use ulid::Ulid;
 use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
 
-/// Version byte for manifest format detection.
+/// Prefix byte identifying Zeppelin's current MessagePack manifest encoding.
+///
+/// The byte precedes both live manifests and named snapshot pins. Legacy JSON
+/// objects have no prefix and begin with `{`.
 const MANIFEST_FORMAT_MSGPACK: u8 = 0x01;
 
-/// A reference to a WAL fragment stored on S3.
+/// Manifest metadata for one immutable WAL fragment in object storage.
+///
+/// Presence in [`Manifest::fragments`] makes the fragment visible to readers;
+/// the fragment object may have existed before publication. Sequence numbers,
+/// rather than ULID ordering, establish replay order.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FragmentRef {
-    /// ULID identifying this fragment.
+    /// Stable ULID used to derive the fragment's immutable object key.
     pub id: Ulid,
-    /// Number of vectors in the fragment.
+    /// Number of vector upsert entries encoded in the fragment.
     pub vector_count: usize,
-    /// Number of delete tombstones in the fragment.
+    /// Number of deletion tombstones encoded in the fragment.
     pub delete_count: usize,
-    /// Monotonic sequence number assigned at manifest write time.
-    /// Immune to clock skew — determines merge order instead of ULID.
+    /// Namespace-local replay order assigned by [`Manifest::add_fragment`].
+    ///
+    /// This counter is immune to clock skew and same-millisecond ULID randomness.
     #[serde(default)]
     pub sequence_number: u64,
     /// Serialized fragment size in bytes, recorded at PUT time.
@@ -40,7 +175,10 @@ pub struct FragmentRef {
     pub size_bytes: u64,
 }
 
-/// A reference to a resident coarse sketch artifact stored on S3.
+/// Location and shape of a segment's immutable coarse-search sketch.
+///
+/// Query planning can keep this compact representation resident and use it to
+/// select candidate clusters before reading their full vector payloads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SketchRef {
     /// S3 key for the immutable sketch artifact.
@@ -55,7 +193,10 @@ pub struct SketchRef {
     pub size_bytes: u64,
 }
 
-/// A reference to an immutable segment bootstrap artifact stored on S3.
+/// Location of an immutable segment bootstrap object.
+///
+/// A bootstrap object groups centroids and resident sketch bytes into one
+/// object-store read for newer segments.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BootstrapRef {
     /// S3 key for the immutable bootstrap artifact.
@@ -64,7 +205,10 @@ pub struct BootstrapRef {
     pub size_bytes: u64,
 }
 
-/// A reference to an immutable IVF-Flat segment membership artifact.
+/// Location and cardinality of an immutable IVF-Flat membership map.
+///
+/// The map records vector-ID-to-cluster membership for future incremental
+/// compaction work; current readers do not consult it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MembershipRef {
     /// S3 key for the immutable membership artifact.
@@ -75,8 +219,12 @@ pub struct MembershipRef {
     pub entry_count: u64,
 }
 
-/// A manifest reference to one immutable object containing one or more IVF
+/// Manifest metadata for one immutable object containing one or more IVF
 /// cluster payloads.
+///
+/// Grouping multiple clusters caps object counts and permits a range read of a
+/// self-contained live span. Legacy objects advertise no span and require a
+/// full GET.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterDataObjectRef {
     /// S3 key for the immutable cluster-data object.
@@ -110,8 +258,32 @@ pub struct ClusterDataObjectRef {
 }
 
 impl ClusterDataObjectRef {
-    /// Ranged GET span for the flat-scan live bytes, when this object
-    /// advertises one.
+    /// Converts the persisted live-span metadata into a platform-sized byte range.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(start..end))` when `live_len` advertises a range, or `Ok(None)`
+    /// for legacy/full-object layouts where `live_len` is zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Index`] if either persisted `u64` value cannot
+    /// fit in this platform's `usize`, or if `offset + length` overflows. No
+    /// object-store request occurs before an error.
+    ///
+    /// # Examples
+    ///
+    /// An object with `live_offset = 64` and `live_len = 128` yields
+    /// `Some(64..192)`. An old object with `live_len = 0` yields `None`, telling
+    /// the caller to fetch the complete object.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// Rust makes both narrowing conversions and integer addition explicit.
+    /// Java's cast to `int` and ordinary C casts can truncate, while
+    /// [`usize::try_from`] rejects values that do not fit. [`usize::checked_add`]
+    /// returns [`Option`] instead of wrapping, so malformed remote metadata
+    /// becomes a typed error rather than an unsafe range.
     pub fn live_range(&self) -> Result<Option<Range<usize>>> {
         if self.live_len == 0 {
             return Ok(None);
@@ -138,7 +310,12 @@ impl ClusterDataObjectRef {
     }
 }
 
-/// A reference to an IVF segment stored on S3.
+/// Manifest metadata for one immutable IVF segment stored in object storage.
+///
+/// The descriptor captures the segment's search capabilities and the keys or
+/// owners needed to locate its artifacts. Incremental compaction may create a
+/// logical segment that still references unchanged cluster objects owned by an
+/// older segment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SegmentRef {
     /// Unique segment identifier (e.g., `seg_<ULID>`).
@@ -230,7 +407,7 @@ pub struct SegmentRef {
 }
 
 impl SegmentRef {
-    /// Segment ID that owns cluster `cluster_idx`'s S3 objects.
+    /// Returns the segment ID that owns a cluster's immutable objects.
     ///
     /// Returns the entry in `cluster_owners` when present (incremental
     /// carry-over), otherwise falls back to `self.id` (legacy full-rewrite
@@ -238,6 +415,28 @@ impl SegmentRef {
     /// a per-cluster S3 key MUST resolve the owner through this method
     /// rather than assuming `self.id` — carried-over clusters live under an
     /// older segment's keys.
+    ///
+    /// # Parameters
+    ///
+    /// - `cluster_idx`: Zero-based logical cluster index. An index beyond the
+    ///   explicit owner map uses this segment's own ID, matching the legacy
+    ///   layout; this method does not validate against `cluster_count`.
+    ///
+    /// # Returns
+    ///
+    /// A borrowed owner ID whose lifetime is tied to this descriptor.
+    ///
+    /// # Examples
+    ///
+    /// If cluster 2 was carried from `seg_old`, this returns `seg_old`; a cluster
+    /// without an override returns `self.id`.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The returned `&str` borrows existing string storage and performs no
+    /// allocation. It resembles a Java view of an existing `String` or a C
+    /// `const char *`, but Rust proves the text cannot outlive `self` and is
+    /// valid UTF-8.
     #[must_use]
     pub fn cluster_owner(&self, cluster_idx: usize) -> &str {
         self.cluster_owners
@@ -246,7 +445,23 @@ impl SegmentRef {
             .unwrap_or(&self.id)
     }
 
-    /// Approximate bytes for segment artifacts whose sizes are recorded in the manifest.
+    /// Sums the sizes of segment artifacts recorded directly in this descriptor.
+    ///
+    /// # Returns
+    ///
+    /// The known bytes for grouped cluster objects, sketch, bootstrap, and
+    /// membership artifacts. Legacy or separately addressed artifacts whose
+    /// sizes are absent contribute zero, so this is a lower-bound estimate.
+    ///
+    /// # Performance
+    ///
+    /// Runs in `O(cluster_objects.len())`, allocates nothing, and performs no
+    /// object-store requests.
+    ///
+    /// # Examples
+    ///
+    /// A segment with a 1 KiB cluster object and a 256-byte bootstrap reports
+    /// 1,280 bytes even if legacy per-cluster sidecars also exist.
     #[must_use]
     pub fn approximate_storage_bytes(&self) -> u64 {
         let cluster_bytes: u64 = self
@@ -268,25 +483,38 @@ impl SegmentRef {
     }
 }
 
-/// The manifest is the single source of truth for what data exists
-/// in a namespace. It tracks WAL fragments and compacted segments.
+/// Authoritative inventory of the data visible in one namespace.
+///
+/// A value in memory is only a candidate view. It becomes authoritative when
+/// its encoded bytes are published at [`Manifest::s3_key`]. The manifest tracks
+/// uncompacted WAL fragments, immutable search segments, deferred deletion
+/// work, the writer's fencing token, and its persisted generation.
+///
+/// # Persisted format
+///
+/// MessagePack encodes this struct as a positional array. New fields must be
+/// appended at the end and carry `#[serde(default)]`; moving or inserting a
+/// field can make old object-store manifests decode into the wrong fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Uncompacted WAL fragment references, in order.
+    /// Visible, uncompacted WAL fragments in sequence-number order.
     pub fragments: Vec<FragmentRef>,
-    /// Compacted segment references.
+    /// Visible immutable segments, appended as compactions publish them.
     pub segments: Vec<SegmentRef>,
     /// ULID of the last fragment that was compacted.
     /// Fragments with IDs <= this have been incorporated into segments.
     #[serde(default)]
     pub compaction_watermark: Option<Ulid>,
-    /// The currently active segment (latest).
+    /// ID of the segment that currently serves as the active compacted view.
+    ///
+    /// `None` means no segment is active, as in a new namespace or after the
+    /// active descriptor was explicitly removed.
     #[serde(default)]
     pub active_segment: Option<String>,
-    /// Monotonic counter for assigning sequence numbers to fragments.
+    /// Next namespace-local replay sequence assigned to a new fragment.
     #[serde(default)]
     pub next_sequence: u64,
-    /// S3 keys awaiting deferred deletion from a previous compaction cycle.
+    /// Object-store keys awaiting successful deferred deletion.
     #[serde(default)]
     pub pending_deletes: Vec<String>,
     /// Fencing token set by the lease holder during manifest writes.
@@ -294,7 +522,10 @@ pub struct Manifest {
     /// a manifest that a newer lease holder has already written.
     #[serde(default)]
     pub fencing_token: u64,
-    /// Last time the manifest was updated.
+    /// Wall-clock time of the last in-memory domain update represented here.
+    ///
+    /// Retention uses this timestamp with an explicit skew allowance; ordering
+    /// and publication correctness never rely on it.
     pub updated_at: DateTime<Utc>,
     /// Monotonic manifest generation persisted with each manifest commit.
     ///
@@ -305,7 +536,7 @@ pub struct Manifest {
     version: u64,
 }
 
-/// Addressable historical manifest snapshot.
+/// Location of one immutable, addressable historical manifest generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestHistoryRef {
     /// Persisted manifest generation.
@@ -314,7 +545,10 @@ pub struct ManifestHistoryRef {
     pub key: String,
 }
 
-/// Named PITR snapshot pin stored under `{namespace}/snapshots/{name}.msgpack`.
+/// Persisted point-in-time-recovery pin for one manifest generation.
+///
+/// The object lives at `<namespace>/snapshots/<name>.msgpack`. Its presence
+/// prevents history pruning from deleting the referenced generation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NamedSnapshot {
     /// Manifest generation pinned by this snapshot.
@@ -323,7 +557,7 @@ pub struct NamedSnapshot {
     pub created_at: DateTime<Utc>,
 }
 
-/// Addressable named snapshot pin.
+/// Caller-facing named snapshot metadata plus its object-store location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedSnapshotRef {
     /// Caller-supplied snapshot name.
@@ -336,19 +570,23 @@ pub struct NamedSnapshotRef {
     pub created_at: DateTime<Utc>,
 }
 
-/// Result of pruning manifest history.
+/// Observable result of a manifest-history pruning pass.
 #[derive(Debug, Clone)]
 pub struct ManifestHistoryPruneResult {
     /// Number of history snapshots deleted.
     pub pruned: usize,
-    /// Retained manifest snapshots after pruning.
+    /// Decoded manifests kept by count, time window, or named pin, in ascending
+    /// generation order.
     pub retained_manifests: Vec<Manifest>,
 }
 
-/// Policy controlling manifest-history retention.
+/// Union-of-rules policy controlling manifest-history retention.
+///
+/// A generation is retained when *any* configured rule keeps it: recent count,
+/// PITR age window (including skew slop), or a [`NamedSnapshot`] pin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManifestHistoryRetention {
-    /// Most recent generation count to retain.
+    /// Number of newest generations to retain; must be greater than zero.
     pub keep_count: usize,
     /// Time-based PITR retention window in seconds. `0` disables time retention.
     pub pitr_retention_secs: u64,
@@ -356,18 +594,38 @@ pub struct ManifestHistoryRetention {
     pub skew_slop_secs: u64,
 }
 
+/// Outcome of idempotently creating an immutable history object.
 enum HistorySnapshotWrite {
+    /// The desired bytes were created or already existed byte-for-byte.
     Stored,
-    AlreadyExistsWithDifferentBytes { key: String },
+    /// The generation key exists, but contains different candidate bytes.
+    AlreadyExistsWithDifferentBytes {
+        /// Conflicting history key that the caller must classify.
+        key: String,
+    },
 }
 
+/// Error family used when conflicting history is already live and immutable.
 enum ReferencedHistoryConflict {
+    /// Surface a persisted-format/invariant error to unconditional writers.
     Serialization,
+    /// Surface an optimistic-concurrency conflict to conditional writers.
     ManifestConflict,
 }
 
 impl Manifest {
-    /// Create an empty manifest.
+    /// Creates an unpublished, empty namespace manifest at generation zero.
+    ///
+    /// # Returns
+    ///
+    /// An owned manifest with no visible artifacts, no active segment, and no
+    /// deferred deletions. [`Manifest::write`] assigns the first committed
+    /// generation.
+    ///
+    /// # Examples
+    ///
+    /// Namespace creation starts with this value, writes generation 1, and only
+    /// then exposes the namespace to write and query paths.
     pub fn new() -> Self {
         Self {
             fragments: Vec::new(),
@@ -382,47 +640,138 @@ impl Manifest {
         }
     }
 
-    /// Get the S3 key for the manifest of a namespace.
+    /// Builds the live manifest key for a namespace.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Validated namespace path component used as the key prefix.
+    ///
+    /// # Returns
+    ///
+    /// `<namespace>/manifest.json`. The suffix is legacy naming; newly written
+    /// contents are version-prefixed MessagePack, not JSON.
     pub fn s3_key(namespace: &str) -> String {
         format!("{namespace}/manifest.json")
     }
 
-    /// Get the S3 prefix for immutable manifest history snapshots.
+    /// Builds the object-store prefix for immutable manifest history.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace whose retained generations are addressed.
+    ///
+    /// # Returns
+    ///
+    /// `<namespace>/manifests/`, including the trailing slash.
     #[must_use]
     pub fn history_prefix(namespace: &str) -> String {
         format!("{namespace}/manifests/")
     }
 
-    /// Get the S3 key for a retained manifest generation.
+    /// Builds the immutable key for a retained manifest generation.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace that owns the history object.
+    /// - `version`: Persisted manifest generation.
+    ///
+    /// # Returns
+    ///
+    /// A `.msgpack` key with the generation zero-padded to 20 decimal digits so
+    /// lexical key order matches numeric generation order.
     #[must_use]
     pub fn history_key(namespace: &str, version: u64) -> String {
         format!("{}{version:020}.msgpack", Self::history_prefix(namespace))
     }
 
-    /// Return the persisted manifest generation.
+    /// Returns this value's persisted manifest generation.
+    ///
+    /// Generation zero means the value has not yet been committed in its
+    /// current namespace; committed manifests begin at generation one.
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    /// Reset the persisted generation before writing this manifest into a
-    /// different namespace. The target namespace assigns its own generation
-    /// during `write`; source history generations must not leak across clones.
+    /// Resets the persisted generation before cloning into another namespace.
+    ///
+    /// The content remains unchanged, but the destination must establish its
+    /// own generation history instead of inheriting the source namespace's
+    /// counter.
+    ///
+    /// # Side Effects
+    ///
+    /// Mutates only this in-memory value; no object-store request is made.
+    ///
+    /// # Examples
+    ///
+    /// Cloning source generation 42 resets it to zero, then
+    /// [`Manifest::write`] publishes destination generation 1.
+    ///
     pub(crate) fn reset_version_for_clone(&mut self) {
         self.version = 0;
     }
 
+    /// Computes the successor of a persisted generation without wrapping.
+    ///
+    /// # Parameters
+    ///
+    /// - `version`: Current generation, including zero for an unpublished value.
+    ///
+    /// # Returns
+    ///
+    /// The next generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Serialization`] at `u64::MAX`; wrapping to zero
+    /// would violate the persisted monotonic-generation invariant.
     fn checked_next_version(version: u64) -> Result<u64> {
         version
             .checked_add(1)
             .ok_or_else(|| ZeppelinError::Serialization("manifest version overflow".to_string()))
     }
 
+    /// Computes the generation that would be assigned to this candidate commit.
+    ///
+    /// # Returns
+    ///
+    /// `self.version + 1` when representable.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the generation-overflow error from
+    /// [`Manifest::checked_next_version`].
     fn next_committed_version(&self) -> Result<u64> {
         Self::checked_next_version(self.version)
     }
 
-    /// Add a fragment reference, assigning the next monotonic sequence number.
+    /// Appends a visible fragment descriptor with the next replay sequence.
+    ///
+    /// # Parameters
+    ///
+    /// - `fref`: Owned descriptor for an already-uploaded immutable fragment.
+    ///   Any sequence supplied by the caller is replaced.
+    ///
+    /// # Side Effects
+    ///
+    /// Mutates this in-memory candidate by assigning `next_sequence`, advancing
+    /// that counter, appending the descriptor, and refreshing `updated_at`.
+    /// Publication is separate; no object-store request occurs here.
+    ///
+    /// # Examples
+    ///
+    /// Adding the first fragment to an empty manifest assigns sequence 0. After
+    /// the candidate is published, readers replay that fragment before the next
+    /// fragment assigned sequence 1.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// `fref` is moved into the method and then into the vector. Unlike passing
+    /// a Java object reference or copying a C pointer, Rust makes the caller's
+    /// binding unusable after the call unless it explicitly cloned the value.
+    /// The method therefore gains unique ownership without allocating another
+    /// `FragmentRef`.
     pub fn add_fragment(&mut self, mut fref: FragmentRef) {
         fref.sequence_number = self.next_sequence;
         self.next_sequence += 1;
@@ -441,6 +790,35 @@ impl Manifest {
     ///
     /// `compaction_watermark` is still recorded (max removed ID) for
     /// observability, but is never used to decide removal.
+    ///
+    /// # Parameters
+    ///
+    /// - `compacted_ids`: Borrowed exact set captured by the compaction input
+    ///   snapshot. IDs absent from this set always survive.
+    ///
+    /// # Side Effects
+    ///
+    /// Removes matching in-memory fragment descriptors, advances the
+    /// observability watermark monotonically, and refreshes `updated_at`. The
+    /// fragment objects are not deleted and the change is not visible until a
+    /// later manifest publication succeeds.
+    ///
+    /// # Performance
+    ///
+    /// Scans all visible fragments and performs expected constant-time hash-set
+    /// membership checks; no object-store requests occur.
+    ///
+    /// # Examples
+    ///
+    /// If compaction read fragments A and C while B arrived concurrently, a set
+    /// `{A, C}` removes only A and C even when B's ULID sorts below C.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The borrowed `&HashSet<Ulid>` cannot be mutated through this reference.
+    /// The closure passed to [`Vec::retain`] borrows it while mutating a separate
+    /// vector, a separation the borrow checker verifies without a garbage
+    /// collector or manual alias analysis.
     pub fn remove_compacted_fragments(&mut self, compacted_ids: &HashSet<Ulid>) {
         self.fragments.retain(|f| !compacted_ids.contains(&f.id));
         if let Some(max_id) = compacted_ids.iter().max() {
@@ -455,9 +833,26 @@ impl Manifest {
 
     /// Add a segment reference and prune old segments using the provided limit.
     ///
-    /// NOTE: `max_pending_deletes` is currently UNUSED — `pending_deletes` is
+    /// NOTE: `max_pending_deletes` is currently unused — `pending_deletes` is
     /// deliberately not capped (see `prune()`). The parameter is retained for
     /// call-site compatibility; capping it would leak S3 objects.
+    ///
+    /// # Parameters
+    ///
+    /// - `sref`: Owned descriptor for the newly published segment artifacts.
+    /// - `max_pending_deletes`: Compatibility parameter; intentionally ignored.
+    /// - `max_old_segments`: Maximum non-active segment descriptors to retain.
+    ///
+    /// # Side Effects
+    ///
+    /// Makes `sref` active in this in-memory candidate, appends it, updates the
+    /// timestamp, and prunes old segment metadata. It neither uploads the
+    /// segment nor publishes this manifest.
+    ///
+    /// # Examples
+    ///
+    /// With two retained old segments, adding `seg_4` makes it active and keeps
+    /// at most `seg_4` plus the two most recent older descriptors.
     pub fn add_segment_with_limits(
         &mut self,
         sref: SegmentRef,
@@ -470,12 +865,42 @@ impl Manifest {
         self.prune(max_pending_deletes, max_old_segments);
     }
 
-    /// Add a segment reference and prune with default limits.
+    /// Adds a segment using the legacy default retention limits.
+    ///
+    /// # Parameters
+    ///
+    /// - `sref`: Owned descriptor for a completed immutable segment.
+    ///
+    /// # Side Effects
+    ///
+    /// Delegates to [`Manifest::add_segment_with_limits`] with 1,000 as the
+    /// ignored deletion parameter and 10 retained old segments.
+    ///
+    /// # Examples
+    ///
+    /// Tests and setup utilities use this convenience method when production
+    /// configuration is irrelevant to the scenario.
     pub fn add_segment(&mut self, sref: SegmentRef) {
         self.add_segment_with_limits(sref, 1000, 10);
     }
 
-    /// Remove a segment reference and clear it as active if it was serving reads.
+    /// Removes a segment descriptor and clears the active pointer when needed.
+    ///
+    /// # Parameters
+    ///
+    /// - `segment_id`: Borrowed ID to remove. A missing ID is a metadata no-op
+    ///   apart from refreshing `updated_at`.
+    ///
+    /// # Side Effects
+    ///
+    /// Mutates only the in-memory manifest. It does not delete immutable segment
+    /// objects or publish the result.
+    ///
+    /// # Examples
+    ///
+    /// Removing active `seg_live` leaves older descriptors intact and sets
+    /// `active_segment` to `None`, so callers cannot accidentally keep routing
+    /// through the removed descriptor.
     pub fn remove_segment(&mut self, segment_id: &str) {
         if self.active_segment.as_deref() == Some(segment_id) {
             self.active_segment = None;
@@ -496,6 +921,27 @@ impl Manifest {
     /// deleting the objects leaks them permanently. The list is bounded in
     /// practice — it is rewritten each compaction cycle and cleared (or
     /// carried over on failure) at the start of the next.
+    ///
+    /// # Parameters
+    ///
+    /// - `_max_pending_deletes`: Retained for API compatibility and deliberately
+    ///   ignored because forgetting deletion work would leak objects.
+    /// - `max_old_segments`: Maximum non-active descriptors to retain.
+    ///
+    /// # Side Effects
+    ///
+    /// Rewrites the in-memory `segments` vector when it exceeds the configured
+    /// bound. It never edits `pending_deletes` and performs no remote deletes.
+    ///
+    /// # Performance
+    ///
+    /// At most linear in the number of segment descriptors and may allocate a
+    /// replacement vector for the retained tail.
+    ///
+    /// # Examples
+    ///
+    /// Six descriptors with `max_old_segments = 2` become the active descriptor
+    /// plus two recent older descriptors. Every pending deletion key survives.
     pub fn prune(&mut self, _max_pending_deletes: usize, max_old_segments: usize) {
         // Prune old segments: keep active + most recent max_old_segments
         if self.segments.len() > max_old_segments + 1 {
@@ -516,12 +962,28 @@ impl Manifest {
         }
     }
 
-    /// Get uncompacted fragments (those after the compaction watermark).
+    /// Borrows all fragment descriptors currently visible in this manifest.
+    ///
+    /// The name is historical: membership in `fragments`, not comparison with
+    /// `compaction_watermark`, defines whether a fragment is uncompacted.
+    ///
+    /// # Returns
+    ///
+    /// A read-only slice in replay order. No clone or allocation occurs.
     pub fn uncompacted_fragments(&self) -> &[FragmentRef] {
         &self.fragments
     }
 
-    /// Total vector count across all segments.
+    /// Sums vector entries recorded across all retained segment descriptors.
+    ///
+    /// # Returns
+    ///
+    /// The descriptor total as `usize`. This is not the namespace's deduplicated
+    /// live-vector count and includes every retained segment reference.
+    ///
+    /// # Performance
+    ///
+    /// Linear in `segments.len()` with no allocation or object-store I/O.
     pub fn segment_vector_count(&self) -> usize {
         self.segments.iter().map(|s| s.vector_count).sum()
     }
@@ -533,6 +995,16 @@ impl Manifest {
     /// uncompacted WAL tombstones, lower-bounded at zero. Until compaction
     /// resolves duplicate upserts by ID, it is an upper bound on unique live
     /// vector IDs.
+    ///
+    /// # Returns
+    ///
+    /// Segment entries plus WAL upserts minus WAL tombstones, saturating at zero.
+    ///
+    /// # Examples
+    ///
+    /// Segments containing 125 entries plus 15 WAL upserts and four tombstones
+    /// report 136. Three tombstones against one entry report zero, not an
+    /// unsigned underflow.
     #[must_use]
     pub fn vector_count(&self) -> u64 {
         let entries = self
@@ -559,6 +1031,21 @@ impl Manifest {
     /// This never lists or HEADs S3 objects. Legacy refs whose sizes were not
     /// recorded contribute zero for unknown artifacts, so the value is a known
     /// lower-bound approximation rather than an object-store inventory.
+    ///
+    /// # Returns
+    ///
+    /// Known bytes for visible fragment refs and the artifact sizes represented
+    /// by each segment descriptor.
+    ///
+    /// # Performance
+    ///
+    /// Linear in the number of fragment and grouped-cluster references. It
+    /// performs no GET, HEAD, or LIST request.
+    ///
+    /// # Examples
+    ///
+    /// A legacy fragment with unknown size contributes zero; a newer 2 KiB
+    /// fragment contributes 2 KiB even if its object is not locally cached.
     #[must_use]
     pub fn approximate_storage_bytes(&self) -> u64 {
         let fragment_bytes: u64 = self
@@ -575,10 +1062,30 @@ impl Manifest {
         fragment_bytes + segment_bytes
     }
 
-    /// Serialize to MessagePack bytes with a version header.
+    /// Serializes this manifest as version-prefixed MessagePack bytes.
     ///
-    /// Format: `[0x01] [msgpack payload]`
-    /// Falls back to JSON for human readability during debugging if needed.
+    /// # Returns
+    ///
+    /// Owned shared bytes in the format `[0x01][MessagePack payload]`.
+    /// Serialization does not mutate the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Serialization`] if serde cannot encode the
+    /// manifest. No object-store write has occurred when this fails.
+    ///
+    /// # Examples
+    ///
+    /// An empty generation-zero manifest encodes with `0x01` as its first byte;
+    /// [`Manifest::from_bytes`] can decode the result back into an owned value.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// [`Bytes`] is an immutable, reference-counted byte buffer. Returning it is
+    /// closer to sharing a read-only Java `ByteBuffer` than returning a fresh
+    /// `byte[]`; in C it replaces a pointer/length pair with owned lifetime
+    /// tracking. The intermediate `Vec<u8>` is moved into `Bytes` without
+    /// exposing manual allocation or free operations.
     pub fn to_bytes(&self) -> Result<Bytes> {
         let msgpack = rmp_serde::to_vec(self).map_err(|e| {
             ZeppelinError::Serialization(format!("manifest msgpack serialize: {e}"))
@@ -589,7 +1096,38 @@ impl Manifest {
         Ok(Bytes::from(data))
     }
 
-    /// Deserialize from bytes, auto-detecting format (MessagePack or legacy JSON).
+    /// Decodes a current MessagePack or legacy JSON manifest.
+    ///
+    /// # Parameters
+    ///
+    /// - `data`: Borrowed complete object bytes. The decoder does not retain the
+    ///   slice after returning.
+    ///
+    /// # Returns
+    ///
+    /// An owned manifest. An empty object decodes as [`Manifest::new`] for
+    /// compatibility. `0x01` selects the current prefixed MessagePack format;
+    /// `{` selects legacy JSON. Other leading bytes are tried as an unknown
+    /// one-byte prefix and then as unprefixed MessagePack.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error when the selected format is malformed or
+    /// incompatible. It does not silently substitute a default for non-empty
+    /// corrupt data.
+    ///
+    /// # Examples
+    ///
+    /// A pre-MessagePack JSON object beginning with `{` remains readable. A
+    /// current object beginning with `0x01` decodes its remaining bytes as
+    /// MessagePack.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The exhaustive `match` makes every recognized prefix explicit. `?`
+    /// propagates a typed error like a checked exception without Java's runtime
+    /// exception machinery; unlike a C status code, the caller cannot access a
+    /// success value unless the [`Result`] is `Ok`.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
             return Ok(Self::new());
@@ -611,7 +1149,36 @@ impl Manifest {
         }
     }
 
-    /// Read manifest from S3. Returns None if not found.
+    /// Reads and decodes the authoritative live manifest from object storage.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction used for one complete-object GET.
+    /// - `namespace`: Namespace whose live manifest should be read.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(manifest))` when the live object exists, or `Ok(None)` only when
+    /// storage reports that key as not found.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage failures and manifest decoding errors. A corrupt live
+    /// object is not treated as an absent or empty namespace.
+    ///
+    /// # Consistency
+    ///
+    /// This reads the object-store source of truth directly. A caller that also
+    /// needs an ETag for publication must use [`Manifest::read_versioned`].
+    ///
+    /// # Performance
+    ///
+    /// Performs one full object-store GET and allocates the decoded collections.
+    ///
+    /// # Examples
+    ///
+    /// Reading a newly created namespace returns generation 1. Reading a deleted
+    /// namespace returns `None`; it does not recreate the manifest.
     pub async fn read(store: &ZeppelinStore, namespace: &str) -> Result<Option<Self>> {
         let key = Self::s3_key(namespace);
         match store.get(&key).await {
@@ -621,7 +1188,48 @@ impl Manifest {
         }
     }
 
-    /// Write manifest to S3.
+    /// Publishes this candidate with an unconditional live-manifest PUT.
+    ///
+    /// The method first reads the current live generation, chooses one greater
+    /// than both that value and `self.version`, writes the corresponding history
+    /// snapshot, and finally writes the live object. Use
+    /// [`Manifest::write_conditional`] for normal updates that must reject stale
+    /// writers.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction for the read and writes.
+    /// - `namespace`: Destination namespace. Internal clone paths reset the
+    ///   candidate generation before calling this method.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after both history and live objects are written. Only then is
+    /// `self.version` advanced to the committed generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns on read, generation overflow, serialization, history, or live PUT
+    /// failure. A history object can already exist if the final live PUT fails;
+    /// `self.version` remains unchanged so a retry can reconcile that orphan.
+    ///
+    /// # Side Effects
+    ///
+    /// Performs one live-manifest GET, at least one history operation, and one
+    /// unconditional live-manifest PUT on the success path.
+    ///
+    /// # Consistency
+    ///
+    /// This is not compare-and-swap. Concurrent callers can overwrite each
+    /// other's content even though the generation is advanced. Production
+    /// mutation paths should pair a fresh ETag with
+    /// [`Manifest::write_conditional`].
+    ///
+    /// # Examples
+    ///
+    /// Namespace bootstrap writes an empty generation 1. If its history write
+    /// fails, the live manifest is untouched. If the later live PUT fails,
+    /// history generation 1 may exist without being authoritative.
     pub async fn write(&mut self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
         let key = Self::s3_key(namespace);
         let current_version = Self::read(store, namespace)
@@ -644,8 +1252,38 @@ impl Manifest {
         Ok(())
     }
 
-    /// Read manifest from S3, returning the manifest along with its ETag version.
-    /// Returns None if not found.
+    /// Reads the live manifest together with the ETag needed for CAS publication.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction used for a metadata-bearing GET.
+    /// - `namespace`: Namespace whose current candidate base should be loaded.
+    ///
+    /// # Returns
+    ///
+    /// `Some((manifest, ManifestVersion(etag)))` when present, including a
+    /// possibly absent ETag as reported by the backend, or `None` for not found.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage and decoding failures. Corrupt bytes never become an
+    /// empty manifest.
+    ///
+    /// # Consistency
+    ///
+    /// The returned manifest and ETag come from the same object-store read. The
+    /// ETag is an opaque capability for [`Manifest::write_conditional`], not a
+    /// manifest generation.
+    ///
+    /// # Performance
+    ///
+    /// Performs one full object-store GET with metadata.
+    ///
+    /// # Examples
+    ///
+    /// A writer reads generation 12 with ETag `E12`, mutates the owned manifest,
+    /// and later presents `E12`. If another writer publishes first, `E12` no
+    /// longer matches and the update is rejected.
     pub async fn read_versioned(
         store: &ZeppelinStore,
         namespace: &str,
@@ -661,9 +1299,65 @@ impl Manifest {
         }
     }
 
-    /// Write manifest to S3 using conditional PUT (CAS).
-    /// If version has an ETag, uses put_if_match for optimistic concurrency.
-    /// For first-writes (no ETag), falls back to unconditional put.
+    /// Publishes the next generation using ETag compare-and-swap when available.
+    ///
+    /// ```text
+    /// candidate version N
+    ///         |
+    ///         v
+    /// create history N+1
+    ///         |
+    ///         v
+    /// PUT live manifest if ETag matches ---- mismatch
+    ///         |                                |
+    ///         v                                v
+    /// candidate becomes N+1            reload authoritative state
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction configured for conditional PUT.
+    /// - `namespace`: Namespace whose live manifest is being replaced.
+    /// - `version`: ETag returned with the base manifest. `None` selects an
+    ///   unconditional first-write path and must not be used to resurrect a
+    ///   deleted namespace.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after the live manifest is authoritative; `self.version` then
+    /// advances by exactly one.
+    ///
+    /// # Errors
+    ///
+    /// Returns on generation overflow, serialization, history I/O, live PUT, or
+    /// ETag conflict. A failure after history creation can leave an orphaned
+    /// generation, but does not advance `self.version`. Uploaded data artifacts
+    /// referenced only by this candidate also remain invisible.
+    ///
+    /// # Side Effects
+    ///
+    /// Creates or reconciles the immutable history object before attempting one
+    /// conditional live PUT (or an unconditional PUT when the ETag is absent).
+    ///
+    /// # Consistency
+    ///
+    /// CAS prevents a stale base from overwriting a newer live manifest. Writer
+    /// call sites must also validate lease fencing before this operation; the
+    /// ETag alone does not identify a stale lease holder before its write.
+    ///
+    /// # Examples
+    ///
+    /// Two writers read ETag `E7`. The first publishes generation 8. The second
+    /// receives [`ZeppelinError::ManifestConflict`] and must reload rather than
+    /// overwrite generation 8.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The method clones `self` into an owned candidate so failure leaves the
+    /// caller's generation unchanged. In Java, code would rely on discipline or
+    /// another object instance to avoid partially mutating shared state. In C,
+    /// it would require explicit copy and cleanup paths. Rust's ownership and
+    /// [`Result`] flow make the commit point visible in the final assignment.
     pub async fn write_conditional(
         &mut self,
         store: &ZeppelinStore,
@@ -691,7 +1385,32 @@ impl Manifest {
         Ok(())
     }
 
-    /// List retained manifest history snapshots in ascending generation order.
+    /// Lists retained manifest history descriptors in ascending generation order.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction used to list history keys.
+    /// - `namespace`: Namespace whose retained generations should be listed.
+    ///
+    /// # Returns
+    ///
+    /// Descriptors sorted by numeric generation. An empty vector means no
+    /// history objects are retained.
+    ///
+    /// # Errors
+    ///
+    /// Propagates LIST failures and rejects any key under the history prefix that
+    /// does not have the exact 20-digit `.msgpack` generation shape.
+    ///
+    /// # Performance
+    ///
+    /// Performs one prefix LIST, allocates one descriptor per returned key, and
+    /// sorts them in `O(n log n)` time.
+    ///
+    /// # Examples
+    ///
+    /// Keys for generations 10, 2, and 3 are returned as versions 2, 3, 10 even
+    /// if the backend's listing order differs.
     pub async fn list_history(
         store: &ZeppelinStore,
         namespace: &str,
@@ -712,7 +1431,34 @@ impl Manifest {
         Ok(entries)
     }
 
-    /// Read a retained manifest history snapshot by persisted generation.
+    /// Reads and validates a retained manifest by persisted generation.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction used for one full GET.
+    /// - `namespace`: Namespace owning the history object.
+    /// - `version`: Exact generation encoded in the history key.
+    ///
+    /// # Returns
+    ///
+    /// `Some(manifest)` when retained or `None` when that generation key is
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage and decoding failures. It also returns a serialization
+    /// error if the manifest payload's generation differs from the key, because
+    /// accepting that mismatch would make PITR address the wrong state.
+    ///
+    /// # Consistency
+    ///
+    /// History objects are immutable once referenced by the live manifest.
+    /// Reading history does not make it the namespace's current live state.
+    ///
+    /// # Examples
+    ///
+    /// Reading generation 4 may return a view with fewer fragments than the live
+    /// generation 9. A missing generation returns `None`, never the nearest one.
     pub async fn read_history(
         store: &ZeppelinStore,
         namespace: &str,
@@ -735,7 +1481,28 @@ impl Manifest {
         }
     }
 
-    /// Prune oldest manifest history snapshots, retaining the most recent `keep_count`.
+    /// Deletes old history using only a most-recent-count retention rule.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction used to list, read, and delete.
+    /// - `namespace`: Namespace whose history should be pruned.
+    /// - `keep_count`: Number of newest generations to retain; must be nonzero.
+    ///
+    /// # Returns
+    ///
+    /// Number of deleted history objects.
+    ///
+    /// # Errors
+    ///
+    /// Propagates validation, list, read, decode, snapshot-list, and delete
+    /// failures from [`Manifest::prune_history_with_retention`]. Earlier deletes
+    /// may already have succeeded if a later delete fails.
+    ///
+    /// # Examples
+    ///
+    /// With generations 1 through 4 and `keep_count = 2`, this deletes 1 and 2,
+    /// unless a named snapshot pin protects either generation.
     pub async fn prune_history(
         store: &ZeppelinStore,
         namespace: &str,
@@ -754,7 +1521,60 @@ impl Manifest {
         .pruned)
     }
 
-    /// Prune manifest history by count OR PITR retention window OR named snapshot pins.
+    /// Prunes history while retaining the union of count, time, and named-pin rules.
+    ///
+    /// ```text
+    /// history generation
+    ///       |
+    ///       +-- among newest keep_count? -------- keep
+    ///       +-- inside PITR window + skew? ------ keep
+    ///       +-- named snapshot pins it? --------- keep
+    ///       `-- none apply ---------------------- delete
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction for history and snapshot objects.
+    /// - `namespace`: Namespace whose history should be evaluated.
+    /// - `retention`: Copyable policy; `keep_count` must be greater than zero.
+    ///
+    /// # Returns
+    ///
+    /// The number deleted plus decoded retained manifests in ascending
+    /// generation order. Garbage collection uses the retained manifests to
+    /// preserve every artifact still reachable through PITR.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error for a zero count. Propagates listing,
+    /// decoding, malformed-key, missing-between-list-and-read, and deletion
+    /// failures. Deletion is sequential and not transactional: earlier old
+    /// generations may already be gone when a later operation fails.
+    ///
+    /// # Side Effects
+    ///
+    /// Lists history and named pins, GETs every history manifest, and DELETEs
+    /// generations kept by no rule. It does not modify the live manifest.
+    ///
+    /// # Consistency
+    ///
+    /// Retention is an OR, not an AND. `skew_slop_secs` extends only an enabled
+    /// PITR time window. Named pins are read before pruning so a generation
+    /// observed as pinned in this pass is not deleted. The pin LIST and history
+    /// DELETEs are not one object-store transaction; a pin created concurrently
+    /// after the LIST can race this pass, so higher layers must serialize those
+    /// operations when they require a stronger creation-versus-prune guarantee.
+    ///
+    /// # Performance
+    ///
+    /// Performs one history LIST, one snapshot LIST plus a GET per pin, one GET
+    /// per history entry, and one DELETE per pruned generation.
+    ///
+    /// # Examples
+    ///
+    /// If generation 2 is pinned, generation 3 is within the time window, and
+    /// generation 5 is the newest count-retained value, all three survive while
+    /// unprotected generations 1 and 4 are deleted.
     pub async fn prune_history_with_retention(
         store: &ZeppelinStore,
         namespace: &str,
@@ -799,6 +1619,42 @@ impl Manifest {
         })
     }
 
+    /// Ensures the candidate history object is safe to pair with a live commit.
+    ///
+    /// A unique or byte-identical history object is accepted. Different bytes
+    /// at the same generation are immutable if the live manifest already
+    /// references that generation or a newer one. Otherwise the object is an
+    /// orphan from a failed live PUT and can be replaced by this retry.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction.
+    /// - `namespace`: Namespace receiving the candidate generation.
+    /// - `committed`: Borrowed candidate with its nonzero generation assigned.
+    /// - `data`: Owned encoding of `committed`, reused when replacing an orphan.
+    /// - `referenced_conflict`: Selects the public error appropriate to the
+    ///   unconditional or conditional caller.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage and serialization failures. Conflicting referenced
+    /// history becomes either a serialization invariant error or a manifest CAS
+    /// conflict as selected by the caller.
+    ///
+    /// # Side Effects
+    ///
+    /// May create a history object, read the live manifest, or overwrite an
+    /// orphaned history object. It does not publish the live manifest.
+    ///
+    /// # Consistency
+    ///
+    /// A history object reachable from the live manifest is never overwritten.
+    ///
+    /// # Examples
+    ///
+    /// If generation 8 history exists after generation 7's live PUT failed, a
+    /// retry based on live generation 7 may replace it. Once live generation 8
+    /// exists, different bytes for history 8 are rejected.
     async fn write_history_snapshot_for_commit(
         store: &ZeppelinStore,
         namespace: &str,
@@ -829,6 +1685,41 @@ impl Manifest {
         }
     }
 
+    /// Creates a history object only when its generation key is absent.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction supporting create-if-absent.
+    /// - `namespace`: Namespace owning the history generation.
+    /// - `committed`: Candidate manifest with an already assigned nonzero
+    ///   generation.
+    ///
+    /// # Returns
+    ///
+    /// [`HistorySnapshotWrite::Stored`] for a new or byte-identical object, or
+    /// `AlreadyExistsWithDifferentBytes` for a generation collision.
+    ///
+    /// # Errors
+    ///
+    /// Rejects generation zero and propagates serialization, conditional PUT,
+    /// and collision-read failures.
+    ///
+    /// # Side Effects
+    ///
+    /// Performs one create-if-absent PUT and, on key collision, one GET.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// [`HistorySnapshotWrite`] is an enum carrying collision data only in the
+    /// relevant variant. This resembles a closed Java sealed hierarchy; C would
+    /// commonly use a tag plus union whose pairing must be maintained manually.
+    /// Rust's exhaustive `match` prevents callers from forgetting an outcome.
+    ///
+    /// # Examples
+    ///
+    /// Creating generation 6 for the first time yields `Stored`. Repeating the
+    /// exact bytes also yields `Stored`; different bytes return the collision
+    /// variant for the caller to classify against the live generation.
     async fn try_write_history_snapshot(
         store: &ZeppelinStore,
         namespace: &str,
@@ -857,12 +1748,43 @@ impl Manifest {
         }
     }
 
+    /// Builds the invariant error for immutable history-byte disagreement.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: History object key that already contains different bytes.
+    ///
+    /// # Returns
+    ///
+    /// A serialization error identifying the conflicting key.
     fn history_snapshot_mismatch_error(key: &str) -> ZeppelinError {
         ZeppelinError::Serialization(format!(
             "manifest history key {key} already exists with different bytes"
         ))
     }
 
+    /// Parses and validates a numeric generation from a history object key.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace whose exact history prefix is required.
+    /// - `key`: Complete object-store key returned by prefix listing.
+    ///
+    /// # Returns
+    ///
+    /// The `u64` generation encoded as exactly 20 decimal digits before
+    /// `.msgpack`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error for an outside-prefix key, wrong suffix,
+    /// wrong width, nondigit component, or unparseable number. Strict parsing
+    /// fails loudly if unrelated objects appear under the reserved prefix.
+    ///
+    /// # Examples
+    ///
+    /// `ns/manifests/00000000000000000042.msgpack` parses as generation 42;
+    /// `ns/manifests/latest.msgpack` is rejected.
     fn history_version_from_key(namespace: &str, key: &str) -> Result<u64> {
         let prefix = Self::history_prefix(namespace);
         let Some(name) = key.strip_prefix(&prefix) else {
@@ -889,19 +1811,61 @@ impl Manifest {
 }
 
 impl NamedSnapshot {
-    /// Get the S3 prefix for named snapshot pins.
+    /// Builds the object-store prefix reserved for named snapshot pins.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace that owns the pins.
+    ///
+    /// # Returns
+    ///
+    /// `<namespace>/snapshots/`, including the trailing slash.
     #[must_use]
     pub fn prefix(namespace: &str) -> String {
         format!("{namespace}/snapshots/")
     }
 
-    /// Get the S3 key for a named snapshot pin.
+    /// Validates a snapshot name and builds its immutable pin key.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace that owns the pin.
+    /// - `name`: Caller-visible pin name.
+    ///
+    /// # Returns
+    ///
+    /// `<namespace>/snapshots/<name>.msgpack`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Validation`] when the name is empty, longer
+    /// than 255 bytes, or contains characters outside ASCII letters, digits,
+    /// dash, underscore, and dot.
+    ///
+    /// # Examples
+    ///
+    /// `daily.2026-07-08` is accepted; `daily/2026-07-08` is rejected so a user
+    /// cannot escape the reserved snapshot prefix.
     pub fn key(namespace: &str, name: &str) -> Result<String> {
         validate_snapshot_name(name)?;
         Ok(format!("{}{}.msgpack", Self::prefix(namespace), name))
     }
 
-    /// Serialize to MessagePack bytes with a version header.
+    /// Serializes this pin as version-prefixed MessagePack.
+    ///
+    /// # Returns
+    ///
+    /// Owned shared bytes in `[0x01][MessagePack payload]` format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Serialization`] if the generation and timestamp
+    /// cannot be encoded. No storage operation occurs here.
+    ///
+    /// # Examples
+    ///
+    /// A pin for generation 42 round-trips through
+    /// [`NamedSnapshot::from_bytes`] with its creation timestamp unchanged.
     pub fn to_bytes(&self) -> Result<Bytes> {
         let msgpack = rmp_serde::to_vec(self).map_err(|e| {
             ZeppelinError::Serialization(format!("snapshot msgpack serialize: {e}"))
@@ -912,7 +1876,27 @@ impl NamedSnapshot {
         Ok(Bytes::from(data))
     }
 
-    /// Deserialize from bytes, auto-detecting format (MessagePack or legacy JSON).
+    /// Decodes a current MessagePack or legacy JSON snapshot pin.
+    ///
+    /// # Parameters
+    ///
+    /// - `data`: Borrowed complete pin-object bytes.
+    ///
+    /// # Returns
+    ///
+    /// An owned pin. `0x01` selects prefixed MessagePack, `{` selects legacy
+    /// JSON, and other prefixes are tried as prefixed then unprefixed MessagePack.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty objects and malformed or incompatible encodings with a
+    /// serialization error. Unlike [`Manifest::from_bytes`], an empty pin never
+    /// means a valid default.
+    ///
+    /// # Examples
+    ///
+    /// Both a legacy JSON pin and bytes returned by [`NamedSnapshot::to_bytes`]
+    /// decode to the same domain fields.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
             return Err(ZeppelinError::Serialization(
@@ -932,7 +1916,60 @@ impl NamedSnapshot {
         }
     }
 
-    /// Create or idempotently confirm a named snapshot for `generation`.
+    /// Creates or idempotently confirms a named pin for a retained generation.
+    ///
+    /// ```text
+    /// validate name and generation
+    ///             |
+    ///             v
+    /// history generation exists? ---- no ---> Validation error
+    ///             |
+    ///             v
+    /// create pin if absent
+    ///       /             \
+    ///  created       name already exists
+    ///    |             /             \
+    ///    v        same generation   different generation
+    /// success         success        SnapshotAlreadyExists
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction.
+    /// - `namespace`: Namespace that owns both history and the new pin.
+    /// - `name`: Valid caller-facing pin name.
+    /// - `generation`: Nonzero retained manifest generation to protect.
+    ///
+    /// # Returns
+    ///
+    /// The addressable pin. Repeating the same name and generation returns the
+    /// original pin, including its original `created_at` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors for bad names, zero generations, or missing
+    /// history. Returns [`ZeppelinError::SnapshotAlreadyExists`] when the name
+    /// already pins a different generation. Storage and decoding failures are
+    /// propagated. A failed create-if-absent does not overwrite the old pin.
+    ///
+    /// # Side Effects
+    ///
+    /// GETs the referenced history, conditionally PUTs the pin, and may GET an
+    /// existing pin to decide whether the request is an idempotent retry.
+    ///
+    /// # Consistency
+    ///
+    /// The history existence check rejects a generation already absent at that
+    /// point. It is a separate GET from the pin PUT, so concurrent history
+    /// pruning can race between them unless higher layers serialize those
+    /// operations. Create-if-absent makes a snapshot name immutable: changing
+    /// its target requires deletion followed by explicit recreation.
+    ///
+    /// # Examples
+    ///
+    /// Creating `before-migration` for retained generation 7 twice succeeds and
+    /// returns the same timestamp. Requesting generation 8 under that name is a
+    /// conflict rather than a silent retarget.
     pub async fn create(
         store: &ZeppelinStore,
         namespace: &str,
@@ -986,7 +2023,27 @@ impl NamedSnapshot {
         }
     }
 
-    /// Read a named snapshot pin.
+    /// Reads a named snapshot pin by exact name.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction used for one GET.
+    /// - `namespace`: Namespace owning the pin.
+    /// - `name`: Valid exact pin name.
+    ///
+    /// # Returns
+    ///
+    /// `Some` addressable metadata when present or `None` only for a missing key.
+    ///
+    /// # Errors
+    ///
+    /// Propagates invalid-name, storage, and decoding errors. Corrupt bytes do
+    /// not become a missing pin.
+    ///
+    /// # Examples
+    ///
+    /// Reading `before-migration` returns its pinned generation and timestamp;
+    /// reading a valid but absent name returns `None`.
     pub async fn read(
         store: &ZeppelinStore,
         namespace: &str,
@@ -1008,7 +2065,32 @@ impl NamedSnapshot {
         }
     }
 
-    /// List all named snapshot pins in name order.
+    /// Lists and decodes all named pins in lexical name order.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction used for LIST and GET operations.
+    /// - `namespace`: Namespace whose pins should be enumerated.
+    ///
+    /// # Returns
+    ///
+    /// Addressable pins sorted by `name`; an empty vector means no pins exist.
+    ///
+    /// # Errors
+    ///
+    /// Propagates list/get/decode failures and rejects malformed keys under the
+    /// reserved snapshot prefix. The operation fails as a whole rather than
+    /// silently skipping a corrupt pin.
+    ///
+    /// # Performance
+    ///
+    /// Performs one prefix LIST and one full GET per pin, then sorts in
+    /// `O(n log n)` time.
+    ///
+    /// # Examples
+    ///
+    /// Pins named `weekly` and `daily` are returned as `daily`, then `weekly`,
+    /// regardless of object-store listing order.
     pub async fn list(store: &ZeppelinStore, namespace: &str) -> Result<Vec<NamedSnapshotRef>> {
         let prefix = Self::prefix(namespace);
         let mut snapshots = Vec::new();
@@ -1027,12 +2109,58 @@ impl NamedSnapshot {
         Ok(snapshots)
     }
 
-    /// Delete a named snapshot pin.
+    /// Deletes a named pin, allowing its generation to age out of retention.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction used for the delete.
+    /// - `namespace`: Namespace owning the pin.
+    /// - `name`: Valid exact pin name.
+    ///
+    /// # Errors
+    ///
+    /// Propagates invalid-name and storage delete errors.
+    ///
+    /// # Side Effects
+    ///
+    /// Deletes only the small pin object. It does not immediately delete the
+    /// history manifest or its referenced artifacts; a later retention/GC pass
+    /// decides whether they remain reachable.
+    ///
+    /// # Examples
+    ///
+    /// Deleting `before-migration` removes its retention protection. The pinned
+    /// generation remains readable until a later history-prune pass removes it.
     pub async fn delete(store: &ZeppelinStore, namespace: &str, name: &str) -> Result<()> {
         let key = Self::key(namespace, name)?;
         store.delete(&key).await
     }
 
+    /// Collects the generations protected by all current named pins.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Borrowed storage abstraction.
+    /// - `namespace`: Namespace whose pins should be inspected.
+    ///
+    /// # Returns
+    ///
+    /// A set of unique generation numbers; multiple names may collapse to one
+    /// entry when they pin the same generation.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every failure from [`NamedSnapshot::list`].
+    ///
+    /// # Performance
+    ///
+    /// Performs the LIST/GET work of `list`, then allocates a hash set linear in
+    /// the number of distinct pinned generations.
+    ///
+    /// # Examples
+    ///
+    /// Pins `daily` and `weekly` may both target generation 7 while `release`
+    /// targets generation 9; the returned set is `{7, 9}`.
     async fn pinned_generations(store: &ZeppelinStore, namespace: &str) -> Result<HashSet<u64>> {
         Ok(Self::list(store, namespace)
             .await?
@@ -1042,6 +2170,21 @@ impl NamedSnapshot {
     }
 }
 
+/// Validates that a snapshot name is one safe object-key component.
+///
+/// # Parameters
+///
+/// - `name`: Candidate caller-visible name, measured in bytes.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::Validation`] unless the name is 1 through 255 bytes
+/// and consists only of ASCII alphanumerics, dash, underscore, or dot.
+///
+/// # Examples
+///
+/// `release_7.2` is valid; an empty name, non-ASCII text, or `team/snapshot` is
+/// rejected.
 fn validate_snapshot_name(name: &str) -> Result<()> {
     let valid = !name.is_empty()
         && name.len() <= 255
@@ -1057,6 +2200,25 @@ fn validate_snapshot_name(name: &str) -> Result<()> {
     }
 }
 
+/// Extracts and validates a snapshot name from a listed object-store key.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace whose exact snapshot prefix is required.
+/// - `key`: Complete object-store key beneath that reserved prefix.
+///
+/// # Returns
+///
+/// An owned name with the prefix and `.msgpack` suffix removed.
+///
+/// # Errors
+///
+/// Returns a serialization error for the wrong prefix or suffix, and a
+/// validation error if the embedded name violates [`validate_snapshot_name`].
+///
+/// # Examples
+///
+/// `ns/snapshots/daily.msgpack` yields `daily`; a nested key is rejected.
 fn snapshot_name_from_key(namespace: &str, key: &str) -> Result<String> {
     let prefix = NamedSnapshot::prefix(namespace);
     let Some(name) = key.strip_prefix(&prefix) else {
@@ -1073,11 +2235,31 @@ fn snapshot_name_from_key(namespace: &str, key: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-/// Wraps the ETag for optimistic concurrency control on manifest writes.
+/// Opaque object-store ETag used for optimistic manifest publication.
+///
+/// `Some(etag)` instructs [`Manifest::write_conditional`] to replace only the
+/// exact object read by [`Manifest::read_versioned`]. `None` selects an
+/// unconditional first write and is unsafe as a fabricated fallback for a
+/// missing manifest in an existing namespace.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// This tuple newtype gives an optional string a domain name, so APIs cannot as
+/// easily confuse an ETag with an arbitrary `Option<String>`. Java would often
+/// use a small wrapper class; C would use a struct plus a presence flag. Rust's
+/// [`Option`] encodes absence without a null `String`.
 #[derive(Debug, Clone)]
-pub struct ManifestVersion(pub Option<String>);
+pub struct ManifestVersion(
+    /// Backend-provided ETag, or `None` only when no conditional version exists.
+    pub Option<String>,
+);
 
 impl Default for Manifest {
+    /// Returns the same unpublished empty value as [`Manifest::new`].
+    ///
+    /// # Returns
+    ///
+    /// A generation-zero manifest with no visible artifacts.
     fn default() -> Self {
         Self::new()
     }
@@ -1086,12 +2268,32 @@ impl Default for Manifest {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    //! Wire-compatibility and manifest-state regression tests.
+    //!
+    //! These unit tests use the in-memory object-store backend to isolate the
+    //! manifest state machine. Integration coverage elsewhere exercises the same
+    //! contracts against S3/MinIO. Local replica structs intentionally preserve
+    //! old positional MessagePack shapes so adding or moving a persisted field
+    //! breaks a focused compatibility test.
+
     use super::*;
     use object_store::memory::InMemory;
     use std::sync::Arc;
 
     use crate::storage::ZeppelinStore;
 
+    /// Builds a minimal legacy-layout segment descriptor for state-model tests.
+    ///
+    /// The returned segment owns every cluster itself and records no optional
+    /// side artifacts, making individual tests explicit about fields they vary.
+    ///
+    /// # Parameters
+    ///
+    /// - `id`: Segment identifier copied into the owned descriptor.
+    ///
+    /// # Returns
+    ///
+    /// A four-cluster, 100-vector descriptor using no quantization.
     fn make_segment(id: &str) -> SegmentRef {
         SegmentRef {
             id: id.to_string(),
@@ -1110,6 +2312,8 @@ mod tests {
         }
     }
 
+    /// Verifies that each successful conditional publication advances exactly
+    /// one persisted generation and exposes that value to the next reader.
     #[tokio::test]
     async fn manifest_version_increments_across_conditional_writes() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
@@ -1152,6 +2356,8 @@ mod tests {
         assert_eq!(third.version(), 3);
     }
 
+    /// Verifies that every successful live commit has an addressable immutable
+    /// history object containing the state of that exact generation.
     #[tokio::test]
     async fn manifest_history_is_written_and_addressable_by_committed_version() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
@@ -1197,6 +2403,8 @@ mod tests {
         assert_eq!(v2.fragments[0].vector_count, 3);
     }
 
+    /// Protects count-only retention: pruning removes the oldest generations
+    /// and keeps the requested newest suffix in numeric order.
     #[tokio::test]
     async fn manifest_history_prune_removes_oldest_versions_only() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
@@ -1235,6 +2443,8 @@ mod tests {
             .is_some());
     }
 
+    /// Protects union retention: count, PITR age, and a named snapshot each keep
+    /// a generation independently of the other rules.
     #[tokio::test]
     async fn manifest_history_prune_keeps_count_or_time_or_snapshot_pin() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
@@ -1297,6 +2507,8 @@ mod tests {
         );
     }
 
+    /// Verifies that the configured clock-skew allowance extends the PITR time
+    /// window without changing count retention.
     #[tokio::test]
     async fn manifest_history_prune_applies_skew_slop_to_pitr_window() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
@@ -1334,6 +2546,8 @@ mod tests {
         );
     }
 
+    /// Verifies immutable snapshot-name semantics: repeating the same target is
+    /// idempotent, while retargeting the name is a typed conflict.
     #[tokio::test]
     async fn named_snapshot_create_is_idempotent_but_conflicts_on_generation_change() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
@@ -1363,6 +2577,8 @@ mod tests {
         );
     }
 
+    /// Ensures a named snapshot cannot pin a generation absent from retained
+    /// history, which would create a false promise of recoverability.
     #[tokio::test]
     async fn named_snapshot_create_rejects_missing_history_generation() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
@@ -1378,6 +2594,8 @@ mod tests {
         );
     }
 
+    /// Preserves read compatibility for both current prefixed MessagePack pins
+    /// and the legacy JSON representation.
     #[test]
     fn named_snapshot_decodes_msgpack_and_json() {
         let snapshot = NamedSnapshot {
@@ -1391,6 +2609,8 @@ mod tests {
         assert_eq!(NamedSnapshot::from_bytes(&json).unwrap(), snapshot);
     }
 
+    /// Protects exact-set compaction removal when a concurrently appended ULID
+    /// sorts within the compacted snapshot's apparent range.
     #[test]
     fn test_remove_compacted_fragments_exact_set() {
         // A fragment appended concurrently with compaction can have a ULID
@@ -1422,6 +2642,8 @@ mod tests {
         assert_eq!(manifest.compaction_watermark, Some(snapshot_b));
     }
 
+    /// Ensures the observability watermark remains monotonic even when a later
+    /// compaction removes an older ULID.
     #[test]
     fn test_watermark_never_regresses() {
         let mut manifest = Manifest::new();
@@ -1453,6 +2675,8 @@ mod tests {
         );
     }
 
+    /// Verifies the namespace metadata estimate combines segment entries and
+    /// WAL upserts, then subtracts WAL tombstones.
     #[test]
     fn test_vector_count_includes_segments_fragments_minus_tombstones() {
         let mut manifest = Manifest::new();
@@ -1486,6 +2710,8 @@ mod tests {
         );
     }
 
+    /// Verifies excessive tombstones saturate the aggregate at zero instead of
+    /// underflowing an unsigned count.
     #[test]
     fn test_vector_count_is_zero_when_tombstones_exceed_entries() {
         let mut manifest = Manifest::new();
@@ -1511,22 +2737,36 @@ mod tests {
     #[test]
     fn test_decode_manifest_without_size_bytes_field() {
         // Replica of the pre-size_bytes wire shape.
+        /// Positional fragment shape written before `size_bytes` was appended.
         #[derive(Serialize)]
         struct OldFragmentRef {
+            /// Historical fragment identifier field.
             id: Ulid,
+            /// Historical upsert-entry count field.
             vector_count: usize,
+            /// Historical tombstone count field.
             delete_count: usize,
+            /// Historical replay-order field.
             sequence_number: u64,
         }
+        /// Positional manifest shape whose fragment element lacks `size_bytes`.
         #[derive(Serialize)]
         struct OldManifest {
+            /// Historical visible fragment descriptors.
             fragments: Vec<OldFragmentRef>,
+            /// Historical visible segment descriptors.
             segments: Vec<SegmentRef>,
+            /// Historical compaction observability watermark.
             compaction_watermark: Option<Ulid>,
+            /// Historical active-segment pointer.
             active_segment: Option<String>,
+            /// Historical next replay sequence.
             next_sequence: u64,
+            /// Historical deferred-delete queue.
             pending_deletes: Vec<String>,
+            /// Historical writer fencing token.
             fencing_token: u64,
+            /// Historical update timestamp and final field in this wire shape.
             updated_at: DateTime<Utc>,
         }
 
@@ -1578,26 +2818,44 @@ mod tests {
     fn test_decode_manifest_without_cluster_owners_field() {
         // Replica of the pre-cluster_owners SegmentRef wire shape (has_global_fts
         // was the last field).
+        /// Positional segment shape written before incremental-owner metadata.
         #[derive(Serialize)]
         struct OldSegmentRef {
+            /// Historical segment identifier.
             id: String,
+            /// Historical vector-entry count.
             vector_count: usize,
+            /// Historical IVF cluster count.
             cluster_count: usize,
+            /// Historical quantization choice.
             quantization: crate::index::quantization::QuantizationType,
+            /// Historical hierarchical-index flag.
             hierarchical: bool,
+            /// Historical bitmap-indexed field names.
             bitmap_fields: Vec<String>,
+            /// Historical field-level FTS names.
             fts_fields: Vec<String>,
+            /// Historical global-FTS presence flag and final field in this shape.
             has_global_fts: bool,
         }
+        /// Current outer manifest shape containing an old segment element.
         #[derive(Serialize)]
         struct MixedManifest {
+            /// Visible WAL descriptors.
             fragments: Vec<FragmentRef>,
+            /// Legacy segment descriptors under compatibility test.
             segments: Vec<OldSegmentRef>,
+            /// Compaction observability watermark.
             compaction_watermark: Option<Ulid>,
+            /// Active segment pointer.
             active_segment: Option<String>,
+            /// Next replay sequence.
             next_sequence: u64,
+            /// Deferred-delete queue.
             pending_deletes: Vec<String>,
+            /// Writer fencing token.
             fencing_token: u64,
+            /// Update timestamp and final field in this historical outer shape.
             updated_at: DateTime<Utc>,
         }
 
@@ -1651,8 +2909,8 @@ mod tests {
         assert_eq!(decoded_json.segments[0].cluster_owner(3), "seg_legacy");
     }
 
-    /// `cluster_owner()` returns carried-over owners where present and falls
-    /// back to the segment's own ID for indices beyond the map.
+    /// Verifies that explicit carried-over owners win and missing owner entries
+    /// fall back to the logical segment's own ID.
     #[test]
     fn test_cluster_owner_resolution() {
         let mut seg = make_segment("seg_new");
@@ -1672,7 +2930,8 @@ mod tests {
         assert_eq!(seg.cluster_owner(99), "seg_new");
     }
 
-    /// Round-trip: cluster_owners survives serialize → deserialize.
+    /// Verifies that incremental-compaction owner routing survives a current
+    /// manifest encode/decode round trip.
     #[test]
     fn test_cluster_owners_roundtrip() {
         let mut manifest = Manifest::new();
@@ -1687,37 +2946,64 @@ mod tests {
         );
     }
 
+    /// Verifies old grouped-cluster refs default to full-object reads while new
+    /// live-span and size metadata round-trips exactly.
     #[test]
     fn test_cluster_data_object_live_span_defaults_and_roundtrip() {
+        /// Positional grouped-object shape written before ranged live spans.
         #[derive(Serialize)]
         struct OldClusterDataObjectRef {
+            /// Immutable grouped-object key.
             key: String,
+            /// Logical clusters stored in the object.
             clusters: Vec<usize>,
         }
+        /// Segment wire shape combining current fields with the old object ref.
         #[derive(Serialize)]
         struct MixedSegmentRef {
+            /// Segment identifier.
             id: String,
+            /// Vector-entry count.
             vector_count: usize,
+            /// IVF cluster count.
             cluster_count: usize,
+            /// Quantization choice.
             quantization: crate::index::quantization::QuantizationType,
+            /// Hierarchical-index flag.
             hierarchical: bool,
+            /// Bitmap-indexed fields.
             bitmap_fields: Vec<String>,
+            /// Field-level FTS indexes.
             fts_fields: Vec<String>,
+            /// Global-FTS presence flag.
             has_global_fts: bool,
+            /// Incremental cluster owners.
             cluster_owners: Vec<String>,
+            /// Optional coarse sketch.
             sketch: Option<SketchRef>,
+            /// Old grouped-object descriptors under test.
             cluster_objects: Vec<OldClusterDataObjectRef>,
+            /// Optional bootstrap object and final field in this shape.
             bootstrap: Option<BootstrapRef>,
         }
+        /// Outer manifest shape containing the mixed segment representation.
         #[derive(Serialize)]
         struct MixedManifest {
+            /// Visible WAL descriptors.
             fragments: Vec<FragmentRef>,
+            /// Mixed segment descriptors.
             segments: Vec<MixedSegmentRef>,
+            /// Compaction watermark.
             compaction_watermark: Option<Ulid>,
+            /// Active segment pointer.
             active_segment: Option<String>,
+            /// Next replay sequence.
             next_sequence: u64,
+            /// Deferred-delete queue.
             pending_deletes: Vec<String>,
+            /// Writer fencing token.
             fencing_token: u64,
+            /// Update timestamp and final outer field.
             updated_at: DateTime<Utc>,
         }
 
@@ -1775,39 +3061,68 @@ mod tests {
         assert_eq!(object_ref.size_bytes, 456);
     }
 
+    /// Verifies cluster-object refs written before `size_bytes` decode their
+    /// unknown size as zero without losing a previously stored live span.
     #[test]
     fn test_decode_cluster_ref_without_size_bytes_field() {
+        /// Positional grouped-object shape immediately before `size_bytes`.
         #[derive(Serialize)]
         struct OldClusterDataObjectRef {
+            /// Immutable grouped-object key.
             key: String,
+            /// Logical clusters in the object.
             clusters: Vec<usize>,
+            /// Historical live-span start.
             live_offset: u64,
+            /// Historical live-span length and final field in this shape.
             live_len: u64,
         }
+        /// Segment wire shape containing the old grouped-object representation.
         #[derive(Serialize)]
         struct MixedSegmentRef {
+            /// Segment identifier.
             id: String,
+            /// Vector-entry count.
             vector_count: usize,
+            /// IVF cluster count.
             cluster_count: usize,
+            /// Quantization choice.
             quantization: crate::index::quantization::QuantizationType,
+            /// Hierarchical-index flag.
             hierarchical: bool,
+            /// Bitmap-indexed fields.
             bitmap_fields: Vec<String>,
+            /// Field-level FTS indexes.
             fts_fields: Vec<String>,
+            /// Global-FTS presence flag.
             has_global_fts: bool,
+            /// Incremental cluster owners.
             cluster_owners: Vec<String>,
+            /// Optional coarse sketch.
             sketch: Option<SketchRef>,
+            /// Old grouped-object descriptors under test.
             cluster_objects: Vec<OldClusterDataObjectRef>,
+            /// Optional bootstrap object and final field in this shape.
             bootstrap: Option<BootstrapRef>,
         }
+        /// Outer manifest shape containing the mixed segment representation.
         #[derive(Serialize)]
         struct MixedManifest {
+            /// Visible WAL descriptors.
             fragments: Vec<FragmentRef>,
+            /// Mixed segment descriptors.
             segments: Vec<MixedSegmentRef>,
+            /// Compaction watermark.
             compaction_watermark: Option<Ulid>,
+            /// Active segment pointer.
             active_segment: Option<String>,
+            /// Next replay sequence.
             next_sequence: u64,
+            /// Deferred-delete queue.
             pending_deletes: Vec<String>,
+            /// Writer fencing token.
             fencing_token: u64,
+            /// Update timestamp and final outer field.
             updated_at: DateTime<Utc>,
         }
 
@@ -1854,35 +3169,58 @@ mod tests {
         );
     }
 
-    /// Backward compat: manifests serialized BEFORE `SegmentRef.membership`
+    /// Backward compatibility: manifests serialized before
+    /// [`SegmentRef::membership`]
     /// existed must still decode, in both MessagePack (structs as arrays —
     /// new fields must be trailing + defaulted) and legacy JSON.
     #[test]
     fn test_decode_segment_ref_without_membership_field() {
+        /// Positional segment shape immediately before membership metadata.
         #[derive(Serialize)]
         struct OldSegmentRef {
+            /// Segment identifier.
             id: String,
+            /// Vector-entry count.
             vector_count: usize,
+            /// IVF cluster count.
             cluster_count: usize,
+            /// Quantization choice.
             quantization: crate::index::quantization::QuantizationType,
+            /// Hierarchical-index flag.
             hierarchical: bool,
+            /// Bitmap-indexed fields.
             bitmap_fields: Vec<String>,
+            /// Field-level FTS indexes.
             fts_fields: Vec<String>,
+            /// Global-FTS presence flag.
             has_global_fts: bool,
+            /// Incremental cluster owners.
             cluster_owners: Vec<String>,
+            /// Optional coarse sketch.
             sketch: Option<SketchRef>,
+            /// Grouped cluster-data objects.
             cluster_objects: Vec<ClusterDataObjectRef>,
+            /// Optional bootstrap and final field in this historical shape.
             bootstrap: Option<BootstrapRef>,
         }
+        /// Outer manifest shape containing a pre-membership segment.
         #[derive(Serialize)]
         struct MixedManifest {
+            /// Visible WAL descriptors.
             fragments: Vec<FragmentRef>,
+            /// Legacy segment descriptors under test.
             segments: Vec<OldSegmentRef>,
+            /// Compaction watermark.
             compaction_watermark: Option<Ulid>,
+            /// Active segment pointer.
             active_segment: Option<String>,
+            /// Next replay sequence.
             next_sequence: u64,
+            /// Deferred-delete queue.
             pending_deletes: Vec<String>,
+            /// Writer fencing token.
             fencing_token: u64,
+            /// Update timestamp and final outer field.
             updated_at: DateTime<Utc>,
         }
 
@@ -1926,7 +3264,8 @@ mod tests {
         assert!(decoded_json.segments[0].membership.is_none());
     }
 
-    /// Round-trip: size_bytes survives serialize → deserialize.
+    /// Verifies that a current fragment's stored byte size survives a manifest
+    /// encode/decode round trip.
     #[test]
     fn test_size_bytes_roundtrip() {
         let mut manifest = Manifest::new();
@@ -1942,6 +3281,8 @@ mod tests {
         assert_eq!(decoded.fragments[0].size_bytes, 12_345);
     }
 
+    /// Protects the leak-prevention invariant that pruning metadata never drops
+    /// object keys whose remote deletion has not succeeded.
     #[test]
     fn test_prune_never_drops_pending_deletes() {
         // Every pending_deletes entry is an S3 key still awaiting deletion;
@@ -1954,6 +3295,8 @@ mod tests {
         assert_eq!(manifest.pending_deletes.len(), 10);
     }
 
+    /// Verifies segment pruning retains the active descriptor plus the requested
+    /// number of recent older descriptors.
     #[test]
     fn test_prune_caps_old_segments() {
         let mut manifest = Manifest::new();
@@ -1970,6 +3313,8 @@ mod tests {
         assert!(manifest.segments.iter().any(|s| s.id == "seg_5"));
     }
 
+    /// Verifies adding with limits prunes only segment metadata and leaves every
+    /// deferred object deletion recorded.
     #[test]
     fn test_add_segment_with_limits_prunes_segments_only() {
         let mut manifest = Manifest::new();
@@ -1986,6 +3331,8 @@ mod tests {
         assert_eq!(manifest.pending_deletes.len(), 10);
     }
 
+    /// Verifies removing the active segment also clears the routing pointer while
+    /// leaving unrelated older descriptors intact.
     #[test]
     fn test_remove_segment_clears_active_segment() {
         let mut manifest = Manifest::new();
