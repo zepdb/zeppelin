@@ -1,9 +1,89 @@
-//! Build phase for the hierarchical ANN index.
+//! Constructs immutable hierarchical IVF artifacts from a validated vector set.
 //!
-//! Constructs a multi-level centroid tree via recursive k-means partitioning.
-//! At each level, vectors are partitioned into B groups. If a group exceeds
-//! the leaf threshold, it becomes an internal node and recurses. Otherwise
-//! it becomes a leaf cluster with data written in IVF-Flat format.
+//! Compaction enters through
+//! [`build_hierarchical`](crate::index::hierarchical::build::build_hierarchical).
+//! The builder recursively
+//! partitions vectors with k-means until each group is small enough to become a
+//! leaf cluster. Tree nodes are written bottom-up, while leaves reuse IVF-Flat's
+//! full-precision vector and attribute formats. Optional roaring bitmaps, SQ8
+//! codes, or PQ codes are additional immutable artifacts under the same segment
+//! prefix.
+//!
+//! Hierarchical IVF trades construction work and several small routing objects
+//! for query-time pruning. The branching factor controls how many centroids a
+//! node targets; `leaf_size` controls when recursion stops. A high branching
+//! factor does more distance work per visited node, while a small leaf size
+//! produces a deeper tree and more objects.
+//!
+//! ```text
+//! validated vectors + indexing configuration
+//!                    |
+//!                    v
+//!        recursive k-means partitioning
+//!          /         |          \
+//!         v          v           v
+//!   small group   large group   uneven group
+//!      |              |             |
+//!      v              v             v
+//! leaf cluster    recurse       mixed-depth parent
+//!      |              |             |
+//!      +------ write child artifacts first ------+
+//!                            |
+//!                            v
+//!                 write routing-node objects
+//!                            |
+//!                            v
+//!            write PQ sidecars when configured
+//!                            |
+//!                            v
+//!                   write tree_meta.json
+//!                            |
+//!                            v
+//!          return handle; compaction later publishes
+//!          the segment through the namespace manifest
+//! ```
+//!
+//! `tree_meta.json` is the builder's last planned metadata write, but it is not
+//! the namespace visibility boundary. If any PUT or encoding step fails, already
+//! written objects can remain unreferenced. The caller must not publish the
+//! segment in the authoritative manifest unless this function succeeds.
+//!
+//! ## Reading map
+//!
+//! 1. Start with
+//!    [`build_hierarchical`](crate::index::hierarchical::build::build_hierarchical)
+//!    for validation and phase ordering.
+//! 2. Follow `build_subtree` for recursive partitioning and mixed-depth nodes.
+//! 3. Read `write_leaf_cluster` for IVF-compatible leaf artifacts.
+//! 4. Read `write_quantized_artifacts` for the PQ post-pass; SQ8 is already
+//!    co-located by `write_leaf_cluster`.
+//! 5. Finish with
+//!    [`load_hierarchical`](crate::index::hierarchical::build::load_hierarchical)
+//!    for metadata-only reopening.
+//!
+//! ## Invariants
+//!
+//! - Input vectors are non-empty, non-zero-dimensional, and uniformly sized.
+//! - Leaf cluster indexes are unique and contiguous within the segment.
+//! - A parent stores the centroid associated with each child in the same slot.
+//! - Tree nodes and leaf artifacts are immutable after upload.
+//! - Only successful manifest publication outside this module makes the segment
+//!   visible; partial build objects are not queryable state.
+//!
+//! ## Rust concepts used here
+//!
+//! Recursive `async fn` calls are wrapped in [`Box::pin`]. Without indirection,
+//! the compiler would need to construct a future type containing itself with
+//! infinite size. Java futures are already heap objects; C typically builds an
+//! explicit stack or state machine. Rust keeps the recursion memory-safe while
+//! making the allocation visible in the code.
+//!
+//! Shared slices borrow the source batch, while each recursive child currently
+//! owns cloned [`VectorEntry`] values. That is closer to copying a Java list's
+//! contents than sharing references, and to deep-copying C structs with owned
+//! buffers. Mutable references to the cluster and depth counters guarantee that
+//! only the active recursive call can assign IDs. [`tokio::join!`] runs
+//! independent object PUT futures concurrently without spawning detached tasks.
 
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -26,23 +106,96 @@ use super::{
     serialize_tree_node, tree_meta_key, tree_node_key, HierarchicalIndex, TreeMeta, TreeNode,
 };
 
-/// Maximum vectors per leaf cluster. Groups smaller than this become leaves.
+/// Default recursion cutoff when configuration does not provide a leaf size.
+///
+/// The effective cutoff is also raised to at least twice the branching factor,
+/// preventing a requested fanout from immediately producing implausibly tiny
+/// leaves.
 const DEFAULT_LEAF_SIZE: usize = 1000;
 
-/// Result of building a subtree — either an internal node or a leaf cluster.
+/// Identifies the immutable artifact produced for one recursive group.
+///
+/// The enum prevents callers from confusing an object-backed routing-node ID
+/// with a numeric leaf-cluster index. A parent converts either form to its
+/// persisted child string only after matching the variant.
 enum BuildResult {
-    /// An internal node was created with the given node ID.
+    /// A tree-node object was written under this generated non-numeric ID.
     InternalNode(String),
-    /// A leaf cluster was created with the given cluster index.
+    /// IVF-compatible leaf artifacts were written under this global index.
     LeafCluster(usize),
 }
 
-/// Build a hierarchical ANN index from the given vectors.
+/// Builds and uploads one complete hierarchical index segment.
 ///
-/// 1. Recursively partition via k-means into a centroid tree.
-/// 2. Write tree nodes and leaf cluster data to S3.
-/// 3. Write tree metadata.
-/// 4. Optionally write quantized artifacts at the leaf level.
+/// The function validates vector shape, calibrates SQ8 when selected, builds
+/// the tree and leaves, writes any remaining quantization artifacts, and writes
+/// [`TreeMeta`] last. If the whole dataset fits in one leaf, it creates a
+/// one-child root so every index still has a root-node object.
+///
+/// # Parameters
+///
+/// - `vectors`: Borrowed complete segment input. Every entry must have the same
+///   non-zero dimension, and the slice must not be empty.
+/// - `config`: Borrowed indexing parameters controlling branching, k-means,
+///   leaf cutoff, quantization, and bitmap creation.
+/// - `store`: Object-store abstraction receiving immutable segment artifacts.
+/// - `namespace`: Namespace prefix used to construct object keys. This function
+///   does not validate the namespace or publish its manifest.
+/// - `segment_id`: Unique immutable segment identifier selected by compaction.
+///
+/// # Returns
+///
+/// A metadata handle for the newly built artifacts. For bitmap-enabled builds,
+/// the handle discovers field names from cluster zero when that sidecar can be
+/// read and decoded; otherwise the list is empty and filtering remains exact
+/// but does not use bitmap pruning through this handle.
+///
+/// # Errors
+///
+/// Returns an index error for an empty batch or zero-dimensional vectors, a
+/// dimension mismatch for inconsistent entries, and propagates k-means,
+/// quantization, serialization, cache-independent storage, and PUT failures.
+/// Some leaf, node, codebook, or sidecar objects may already exist when a later
+/// phase fails; no cleanup or manifest publication occurs here.
+///
+/// # Side Effects
+///
+/// Writes multiple immutable objects below the segment prefix and emits
+/// structured build logs. The optional bitmap-field discovery performs one GET
+/// of cluster zero and treats a missing or undecodable bitmap only as absence of
+/// the optimization in the returned in-memory handle.
+///
+/// # Consistency
+///
+/// Successful return means the builder completed its planned artifacts, not
+/// that readers may use them. Compaction must publish a segment reference in the
+/// authoritative namespace manifest. A failed build must never be published.
+///
+/// # Performance
+///
+/// K-means and vector assignment dominate CPU. Recursive child construction is
+/// sequential, and child vector lists are cloned. Leaf payload PUTs are parallel
+/// per cluster. PQ adds a full-segment training pass, parallel GETs of every
+/// leaf, encoding, and parallel PQ PUTs; SQ8 encodes while writing each leaf.
+///
+/// # Examples
+///
+/// With 20,000 vectors, branching factor 16, and leaf size 1,000, the builder
+/// repeatedly partitions oversized groups, writes numbered leaves and their
+/// parent nodes, then records the generated root in `tree_meta.json`. Only after
+/// compaction publishes that segment does query planning open it.
+///
+/// If a PQ sidecar PUT fails after leaves were uploaded, the function returns an
+/// error and those objects remain unreferenced; callers must not expose a
+/// partially encoded segment through the manifest.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The source slice and configuration are borrowed for the build, so ownership
+/// stays with compaction. `?` returns immediately on the first required failure
+/// and preserves the concrete [`ZeppelinError`] variant. The returned handle
+/// owns cloned namespace, segment, metadata, and bitmap-field strings, so it can
+/// outlive all input borrows.
 pub async fn build_hierarchical(
     vectors: &[VectorEntry],
     config: &IndexingConfig,
@@ -200,7 +353,65 @@ pub async fn build_hierarchical(
     })
 }
 
-/// Recursively build a subtree from a subset of vectors.
+/// Recursively materializes one vector group as a leaf or routing subtree.
+///
+/// Groups at or below `leaf_size` receive the next global cluster index.
+/// Oversized groups are partitioned by k-means, empty partitions are skipped,
+/// and each non-empty child is built before its parent node is uploaded. Because
+/// child sizes can differ, a parent may point to both leaves and deeper nodes.
+///
+/// # Parameters
+///
+/// - `vectors`: Borrowed non-empty, dimensionally validated group for this call.
+/// - `dim`: Common vector and centroid dimension.
+/// - `branching_factor`: Target maximum partitions for an oversized group.
+/// - `leaf_size`: Inclusive vector-count cutoff for leaf creation.
+/// - `config`: K-means, bitmap, and quantization settings shared by the build.
+/// - `store`: Object store receiving child and node artifacts.
+/// - `namespace`: Namespace component of every artifact key.
+/// - `segment_id`: Segment component of every artifact key.
+/// - `sq_calibration`: Segment-wide SQ8 calibration when scalar quantization is
+///   active; absent for unquantized and PQ builds.
+/// - `next_cluster_idx`: Exclusive mutable counter assigning contiguous leaf IDs.
+/// - `depth`: One-based depth of this group.
+/// - `max_depth`: Exclusive mutable accumulator for the greatest built depth.
+///
+/// # Returns
+///
+/// [`BuildResult::LeafCluster`] after leaf artifacts are written, or
+/// [`BuildResult::InternalNode`] after all descendants and this node exist.
+///
+/// # Errors
+///
+/// Propagates k-means, encoding, bitmap, quantization, or object-store failures.
+/// Descendants written before a later error remain under the unpublished segment
+/// prefix, and the mutable counters may already have advanced.
+///
+/// # Side Effects
+///
+/// Assigns leaf IDs, updates maximum depth, uploads immutable leaf or node
+/// objects, and emits structured debug events.
+///
+/// # Performance
+///
+/// Each internal group trains k-means and compares every vector with every
+/// resulting centroid. Child groups currently deep-clone their vector entries
+/// and recurse sequentially. The async recursion allocates one boxed future per
+/// descended edge.
+///
+/// # Examples
+///
+/// If a root split produces groups of 600 and 4,000 vectors with a 1,000-row
+/// cutoff, the first becomes a numbered leaf immediately. The second recurses.
+/// Their parent is mixed-depth and stores one numeric child ID plus one node ID.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `&mut usize` parameters are exclusive borrows: while this call assigns IDs,
+/// no sibling can concurrently mutate the same counters. `Box::pin` supplies the
+/// indirection needed for recursive async futures. Matching [`BuildResult`]
+/// exhaustively forces both artifact kinds to be handled before a child ID is
+/// persisted.
 #[allow(clippy::too_many_arguments)]
 async fn build_subtree(
     vectors: &[VectorEntry],
@@ -345,7 +556,60 @@ async fn build_subtree(
     Ok(BuildResult::InternalNode(node_id))
 }
 
-/// Write a leaf cluster's data (vectors + attributes) in IVF-Flat format.
+/// Serializes and uploads one IVF-compatible leaf cluster.
+///
+/// Every leaf always stores IDs, full-precision vectors, and attributes. Scalar
+/// quantization co-locates SQ8 codes inside the cluster object while retaining
+/// full precision for reranking. Optional bitmap data is derived from the exact
+/// row-aligned attributes.
+///
+/// # Parameters
+///
+/// - `vectors`: Borrowed entries assigned to this non-empty leaf.
+/// - `dim`: Validated common vector dimension.
+/// - `cluster_idx`: Globally unique leaf index within the segment.
+/// - `store`: Object store receiving the immutable payloads.
+/// - `namespace`: Namespace component of artifact keys.
+/// - `segment_id`: Segment component of artifact keys.
+/// - `sq_calibration`: Segment-wide calibration used to encode co-located SQ8
+///   codes, or `None` for full-precision and PQ builds.
+/// - `bitmap_index_enabled`: Whether to build a roaring attribute sidecar.
+///
+/// # Returns
+///
+/// Returns unit after all required leaf PUTs succeed.
+///
+/// # Errors
+///
+/// Propagates vector, attribute, bitmap, SQ8, or object-store errors. The three
+/// PUTs run concurrently, so one artifact can exist even when another PUT fails.
+///
+/// # Side Effects
+///
+/// Writes `cluster_N.bin`, `attrs_N.bin`, and, when enabled, the cluster's
+/// bitmap sidecar. It does not publish a manifest.
+///
+/// # Consistency
+///
+/// Vector IDs, vector rows, attributes, SQ8 codes, and bitmap row numbers must
+/// retain identical ordering. Search relies on row indexes to join them.
+///
+/// # Performance
+///
+/// Clones IDs, vectors, and attributes into serialization-friendly buffers,
+/// performs optional SQ8/bitmap CPU work, then overlaps up to three object PUTs.
+///
+/// # Examples
+///
+/// Leaf 7 containing 800 product vectors writes full-precision cluster and
+/// attribute objects now; the PQ post-pass later reads that cluster and writes
+/// `pq_cluster_7.bin`. An SQ8 build instead embeds codes in the cluster PUT.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// [`tokio::join!`] polls all three borrowed futures together and returns each
+/// result; unlike detached Java executor tasks or C threads, no child outlives
+/// this function. The function checks every result after all joins complete.
 #[allow(clippy::too_many_arguments)]
 async fn write_leaf_cluster(
     vectors: &[VectorEntry],
@@ -406,7 +670,58 @@ async fn write_leaf_cluster(
     Ok(())
 }
 
-/// Write quantized artifacts for all leaf clusters (SQ8 or PQ).
+/// Completes the configured quantized representation for all leaves.
+///
+/// SQ8 needs no post-pass because `write_leaf_cluster` already co-locates its
+/// codes. PQ trains and uploads one segment-wide codebook, fetches every
+/// full-precision leaf in parallel, encodes each leaf, and uploads all PQ
+/// sidecars in parallel. Unquantized builds do nothing.
+///
+/// # Parameters
+///
+/// - `vectors`: Complete validated segment batch used to train a PQ codebook.
+/// - `dim`: Common vector dimension.
+/// - `num_clusters`: Number of numbered leaves created by recursion.
+/// - `config`: Quantization type, PQ subquantizer count, and training iterations.
+/// - `store`: Object store used for codebook and cluster GETs/PUTs.
+/// - `namespace`: Namespace component of artifact keys.
+/// - `segment_id`: Segment component of artifact keys.
+///
+/// # Returns
+///
+/// Returns unit after every artifact required by the selected encoding exists.
+///
+/// # Errors
+///
+/// Propagates invalid PQ configuration, training, cluster decoding, GET, and PUT
+/// failures. The codebook or some PQ sidecars may already have been written; the
+/// caller must leave the segment unpublished on any error.
+///
+/// # Side Effects
+///
+/// PQ performs one codebook PUT, one GET and one sidecar PUT per leaf. SQ8 and
+/// unquantized variants perform no storage request here. Structured logs record
+/// the selected completion path.
+///
+/// # Performance
+///
+/// PQ retains all parallel GET results, then all encoded payloads, so peak memory
+/// scales with full-precision and compressed leaf data for the segment. GETs and
+/// PUTs are parallel within their phases, but the three phases are sequential.
+///
+/// # Examples
+///
+/// For 32 leaves and PQ with eight subquantizers, this function trains one
+/// codebook, reads 32 cluster objects concurrently, encodes their rows, and
+/// writes 32 PQ objects. A failure on the final PUT leaves an incomplete,
+/// unpublished prefix and returns an error.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The exhaustive `match` makes adding a new [`QuantizationType`] a compiler
+/// error until its artifact path is defined. `join_all` owns a collection of
+/// futures and preserves result order, allowing the enumeration index to remain
+/// the leaf index without shared mutable synchronization.
 #[allow(clippy::too_many_arguments)]
 async fn write_quantized_artifacts(
     vectors: &[VectorEntry],
@@ -472,7 +787,31 @@ async fn write_quantized_artifacts(
     Ok(())
 }
 
-/// Compute the centroid (mean) of a set of vectors.
+/// Computes the component-wise arithmetic mean for a validated vector group.
+///
+/// # Parameters
+///
+/// - `vectors`: Borrowed non-empty entries whose values are all `dim` wide.
+/// - `dim`: Number of output components.
+///
+/// # Returns
+///
+/// An owned `dim`-element centroid. This helper is used for the synthetic root
+/// that wraps a single leaf.
+///
+/// # Panics
+///
+/// Panics if any input vector has more than `dim` components. The public builder
+/// validates dimensions before this private helper is called. An empty slice is
+/// outside the caller contract and would produce non-finite values.
+///
+/// # Performance
+///
+/// Runs in `O(vector_count * dim)` time and allocates only the result.
+///
+/// # Examples
+///
+/// Vectors `[0, 2]` and `[2, 4]` produce centroid `[1, 3]`.
 fn compute_centroid(vectors: &[VectorEntry], dim: usize) -> Vec<f32> {
     let mut centroid = vec![0.0f32; dim];
     for v in vectors {
@@ -487,12 +826,57 @@ fn compute_centroid(vectors: &[VectorEntry], dim: usize) -> Vec<f32> {
     centroid
 }
 
-/// Load an existing hierarchical index from S3 (metadata only).
+/// Opens an existing hierarchical segment by loading only `tree_meta.json`.
 ///
-/// When `cache` is provided, tree_meta.json is served through the tiered
-/// cache (memory → disk → S3) and pinned for the namespace's active
-/// segment via `pin_scoped` (unpinned automatically on segment rotation).
-/// Cache errors are NOT swallowed — a failed fetch fails the load.
+/// Tree nodes and leaf artifacts remain lazy. When a cache is supplied, metadata
+/// follows memory → disk → S3 lookup and is scoped-pinned for the namespace;
+/// a later segment pin replaces it. Cache and storage failures are not hidden.
+///
+/// # Parameters
+///
+/// - `store`: Object-store abstraction used on a cache miss.
+/// - `namespace`: Namespace containing the manifest-selected segment.
+/// - `segment_id`: Immutable segment whose metadata should be decoded.
+/// - `cache`: Optional shared tiered cache borrowed for lookup and pinning.
+///
+/// # Returns
+///
+/// An owned [`HierarchicalIndex`] containing metadata and key context. Its
+/// bitmap-field list is empty; manifest-aware query planning populates that list
+/// before search, while direct callers still receive correct exact filtering.
+///
+/// # Errors
+///
+/// Propagates cache, object-store, missing-object, and JSON decoding errors. It
+/// never substitutes default metadata for a corrupt or absent object.
+///
+/// # Side Effects
+///
+/// A cold load may populate memory and disk cache tiers. A successful cached
+/// load updates the scoped pin for this namespace.
+///
+/// # Consistency
+///
+/// `tree_meta.json` is immutable segment data, but the namespace manifest is
+/// still authoritative for whether this segment is visible. Callers must not use
+/// arbitrary object-prefix discovery as a replacement for manifest selection.
+///
+/// # Performance
+///
+/// Performs one small object GET on a cache miss and no tree-node or leaf GETs.
+///
+/// # Examples
+///
+/// A second query for the same active segment can load metadata from the pinned
+/// cache entry, while beam traversal separately fetches only its visited nodes.
+/// If the JSON is truncated, loading fails before any search begins.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `Option<&Arc<DiskCache>>` represents either no cache or a borrowed shared
+/// cache owner. Borrowing the `Arc` avoids even a reference-count increment. The
+/// returned handle owns its metadata and strings, so no cache or input reference
+/// is embedded in it.
 pub async fn load_hierarchical(
     store: &ZeppelinStore,
     namespace: &str,

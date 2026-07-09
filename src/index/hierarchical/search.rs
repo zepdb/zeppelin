@@ -1,8 +1,90 @@
-//! Search phase for the hierarchical ANN index.
+//! Query execution for immutable hierarchical IVF segments.
 //!
-//! Uses beam search to navigate the centroid tree, probing `beam_width`
-//! candidates at each level. At the leaf level, scans data clusters
-//! (identical to IVF-Flat scan) with optional quantized two-phase search.
+//! A beam search keeps the nearest routing choices at each tree level instead
+//! of following only one centroid. `beam_width` is therefore the hierarchical
+//! equivalent of IVF-Flat's `nprobe`: larger values inspect more branches and
+//! usually improve recall, but increase tree-node reads, leaf reads, bytes, and
+//! distance calculations. Search ranks lower distance scores first.
+//!
+//! Tree depth is not necessarily uniform. K-means can produce a small group
+//! beside a group that needs more partitioning, so one routing node may contain
+//! numeric leaf IDs and non-numeric node IDs together. Traversal scans leaves as
+//! they appear, continues down internal children, and merges exact candidates at
+//! the end.
+//!
+//! ```text
+//! query + manifest-selected HierarchicalIndex
+//!                    |
+//!                    v
+//!          fetch and score root node
+//!                    |
+//!             keep nearest beam
+//!                    |
+//!         +----------+-----------+
+//!         |                      |
+//!         v                      v
+//! numeric child             node child
+//! scan leaf now       parallel fetch next level
+//!         |                      |
+//!         +----------+-----------+
+//!                    |
+//!                    v
+//!      flat scan OR SQ8/PQ coarse ranking
+//!                    |
+//!       optional bitmap/attribute filtering
+//!                    |
+//!                    v
+//!         full-precision final distances
+//!                    |
+//!                    v
+//!       best top_k + lazy attribute enrichment
+//! ```
+//!
+//! The namespace manifest remains authoritative for segment selection and for
+//! declaring bitmap fields. Node, cluster, attribute, and quantization objects
+//! are immutable. The optional [`DiskCache`](crate::cache::DiskCache)
+//! accelerates memory → disk → S3
+//! lookup but cannot make an unreferenced segment visible or replace a missing
+//! required artifact.
+//!
+//! ## Reading map
+//!
+//! 1. Start with
+//!    [`search_hierarchical`](crate::index::hierarchical::search::search_hierarchical)
+//!    for validation and mixed-depth routing.
+//! 2. Follow `scan_leaf_clusters` for quantization dispatch and exact filtering.
+//! 3. Compare `scan_clusters_flat`, `scan_clusters_sq`, and `scan_clusters_pq`.
+//! 4. Read `finalize_candidates` and `enrich_unfiltered_results` for top-k and
+//!    lazy response attributes.
+//! 5. Read `try_bitmap_prefilter` beside `load_attrs` to understand why a bitmap
+//!    miss affects performance but not exact filter semantics.
+//!
+//! ## Invariants
+//!
+//! - The query dimension equals the segment dimension before any object read.
+//! - IDs, vector rows, quantized codes, attributes, and bitmap positions remain
+//!   row-aligned within each leaf cluster.
+//! - Approximate SQ8/PQ scores choose rerank candidates only; returned scores are
+//!   recomputed from full-precision vectors.
+//! - Filters are applied before quantized truncation and again to selected
+//!   candidates, preventing selective predicates from being silently discarded.
+//! - Bitmap evaluation is an optional prefilter. Unsupported, missing, or corrupt
+//!   bitmap data falls back to exact attributes rather than excluding rows.
+//! - Required tree, vector, quantization, or attribute artifacts fail the query
+//!   loudly when they cannot be loaded or decoded.
+//!
+//! ## Rust concepts used here
+//!
+//! [`futures::future::join_all`] and [`tokio::join!`] overlap independent reads
+//! within one level or phase, while `.await` between levels preserves the tree's
+//! data dependency. No detached task outlives a query. Java might compose
+//! `CompletableFuture` values; C would need an event loop or explicit threads.
+//!
+//! `Option<&Arc<DiskCache>>` borrows an optional shared cache without increasing
+//! its reference count. Owned candidate strings and attribute maps may outlive
+//! fetched byte buffers, while borrowed query and filter values are guaranteed
+//! valid for every awaited operation. Exhaustive matching on
+//! [`QuantizationType`] forces each encoding to choose a scan path.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -29,26 +111,98 @@ use super::{deserialize_tree_node, tree_node_key, HierarchicalIndex};
 use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
 use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 
+/// Row-aligned optional attribute maps decoded for one leaf cluster.
+///
+/// The outer vector position matches vector, ID, code, and bitmap row indexes;
+/// an inner `None` means that row has no attributes.
 type ClusterAttrs = Vec<Option<HashMap<String, AttributeValue>>>;
 
-/// A candidate result during search, before final ranking.
+/// Owned internal result retained between leaf scanning and final projection.
+///
+/// `cluster_idx` and `row_idx` preserve the location needed for lazy attribute
+/// enrichment when an unfiltered scan intentionally avoids reading attrs.
 struct Candidate {
+    /// Stable vector identifier used as the deterministic score tie-breaker.
     id: String,
+    /// Full-precision distance; lower values rank ahead of higher values.
     score: f32,
+    /// Attributes loaded during filtered scans, or deferred for unfiltered ones.
     attributes: Option<HashMap<String, AttributeValue>>,
+    /// Leaf cluster containing the vector and its attribute row.
     cluster_idx: usize,
+    /// Zero-based row shared by vector and attribute artifacts.
     row_idx: usize,
 }
 
+/// Orders final candidates by ascending distance and then vector ID.
+///
+/// # Parameters
+///
+/// - `a`: First borrowed candidate.
+/// - `b`: Second borrowed candidate.
+///
+/// # Returns
+///
+/// A total ordering suitable for deterministic top-k selection, including NaN
+/// scores through [`f32::total_cmp`].
+///
+/// # Examples
+///
+/// Distance `0.2` precedes `0.5`; equal distances order ID `a` before `b`.
 fn candidate_distance_cmp(a: &Candidate, b: &Candidate) -> Ordering {
     a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
 }
 
+/// Orders quantized coarse tuples by approximate distance and then vector ID.
+///
+/// # Parameters
+///
+/// - `a`: First `(id, approximate_distance, cluster_index)` tuple.
+/// - `b`: Second tuple.
+///
+/// # Returns
+///
+/// A deterministic best-first order. Cluster index does not break ties because
+/// vector IDs are expected to identify rows across the segment.
 fn coarse_candidate_cmp(a: &(String, f32, usize), b: &(String, f32, usize)) -> Ordering {
     a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
 }
 
-/// Fetch data from cache or S3.
+/// Fetches immutable artifact bytes through the cache when one is available.
+///
+/// # Parameters
+///
+/// - `cache`: Optional shared memory/disk cache.
+/// - `store`: Authoritative object-store abstraction used on a cache miss.
+/// - `key`: Complete immutable segment-artifact key.
+///
+/// # Returns
+///
+/// Shared immutable bytes from memory, disk, or object storage.
+///
+/// # Errors
+///
+/// Propagates cache read/write or object-store failures. Required artifacts do
+/// not silently become empty bytes.
+///
+/// # Side Effects
+///
+/// A cold cached lookup may perform one GET and populate disk and memory tiers.
+///
+/// # Consistency
+///
+/// Cache entries are copies of immutable segment objects. The manifest-selected
+/// key, not cache contents, determines which segment is queried.
+///
+/// # Performance
+///
+/// Warm memory is cheapest, followed by local disk; a cold miss incurs an
+/// object-store GET and cache population.
+///
+/// # Examples
+///
+/// The first query may fetch `node_root.bin` from S3; a later query for the same
+/// immutable segment can receive the same bytes from memory or disk.
 async fn fetch_with_cache(
     cache: Option<&Arc<DiskCache>>,
     store: &ZeppelinStore,
@@ -61,11 +215,80 @@ async fn fetch_with_cache(
     }
 }
 
-/// Execute a hierarchical beam search.
+/// Searches one hierarchical segment with mixed-depth beam traversal.
 ///
-/// 1. Load root node, rank centroids, keep top `beam_width` children.
-/// 2. At each level: load child nodes, rank all centroids, keep top `beam_width`.
-/// 3. At leaf level: scan the selected clusters for nearest neighbors.
+/// The root is loaded first. At every subsequent depth, all currently selected
+/// node objects are fetched concurrently, all their child centroids compete in
+/// one best-first beam, numeric children are scanned, and non-numeric children
+/// continue downward. Candidates from leaves encountered at different depths
+/// are merged by exact distance before return.
+///
+/// # Parameters
+///
+/// - `index`: Metadata-only handle for the manifest-selected immutable segment.
+/// - `query`: Borrowed query vector whose length must equal the segment dimension.
+/// - `top_k`: Maximum results to return. Zero returns an empty vector after
+///   dimension validation and performs no object read.
+/// - `beam_width`: Maximum routing children retained at each level. Zero is
+///   normalized to one rather than disabling traversal.
+/// - `filter`: Optional exact metadata predicate. Bitmap sidecars may prune rows
+///   first when the manifest declares indexed fields.
+/// - `distance_metric`: Metric used both for centroid routing and exact ranking.
+/// - `store`: Object-store abstraction for cold artifact reads.
+/// - `oversample_factor`: Multiplier used to retain extra filtered candidates
+///   before exact predicate application.
+/// - `cache`: Optional shared tiered cache for immutable artifacts.
+/// - `include_attributes`: Whether final [`SearchResult`] values include attrs.
+///
+/// # Returns
+///
+/// Up to `top_k` results sorted by ascending exact distance and vector ID.
+/// Fewer results can be returned when the approximate beam does not visit enough
+/// matching rows. Attribute maps are omitted when `include_attributes` is false.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::DimensionMismatch`] before I/O for a wrong query
+/// length. Propagates cache, object-store, node/cluster/codebook/calibration,
+/// serialization, and required attribute errors. Search performs no remote
+/// writes, so a failure leaves persisted state unchanged.
+///
+/// # Side Effects
+///
+/// Performs cache lookups and object GETs and emits structured debug events. A
+/// cold cached read can populate local cache tiers.
+///
+/// # Consistency
+///
+/// `index` must come from the current manifest-selected segment. The function
+/// trusts immutable artifacts under that prefix and never discovers or publishes
+/// a segment independently.
+///
+/// # Performance
+///
+/// Tree depths are sequential roundtrip stages, while node GETs within a depth
+/// are parallel. Leaf GET count depends on beam width, mixed-depth branches,
+/// filters, quantization, cache hits, and final attrs. SQ8/PQ add coarse and exact
+/// rerank phases. Wider beams increase recall and cost.
+///
+/// # Examples
+///
+/// A beam of four may select one numeric leaf and three internal nodes at the
+/// root. Search scans that leaf, fetches the three nodes in parallel, continues
+/// their nearest children, then merges all full-precision candidates into one
+/// top ten.
+///
+/// A 127-component query against a 128-dimensional segment fails before loading
+/// the root. A missing root object also fails the query rather than scanning an
+/// arbitrary leaf or returning an apparently valid empty result.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The function borrows every external dependency across `.await`; the compiler
+/// ensures they remain valid for the future's lifetime. Values moved into each
+/// `async move` block are owned by that level's read future, avoiding dangling C
+/// pointers or Java-style accidental mutation of loop variables. Awaiting
+/// `join_all` joins every read before decoded nodes are consumed.
 #[allow(clippy::too_many_arguments)]
 pub async fn search_hierarchical(
     index: &HierarchicalIndex,
@@ -291,8 +514,48 @@ pub async fn search_hierarchical(
     }
 }
 
-/// Scan leaf clusters and return ranked results.
-/// Dispatches to flat, SQ8, or PQ scan based on index quantization.
+/// Scans selected leaves through the segment's configured encoding path.
+///
+/// Filtered queries expand the intermediate target with `oversample_factor`.
+/// The encoding-specific scanner returns full-precision candidates, after which
+/// this function applies the exact predicate and final per-batch top-k. An
+/// available bitmap is only a prefilter; exact attributes remain the final
+/// filtered-result contract.
+///
+/// # Parameters
+///
+/// - `index`: Segment metadata and manifest-provided bitmap field declaration.
+/// - `cluster_indices`: Borrowed leaf IDs selected by beam traversal.
+/// - `query`: Dimension-validated query vector.
+/// - `top_k`: Maximum candidates this leaf batch should return.
+/// - `filter`: Optional exact attribute predicate.
+/// - `distance_metric`: Metric used for coarse and exact distances as applicable.
+/// - `store`: Object store for leaf artifacts.
+/// - `oversample_factor`: Filtered-query candidate multiplier.
+/// - `cache`: Optional shared immutable-artifact cache.
+///
+/// # Returns
+///
+/// Up to `top_k` owned candidates in best-first exact-distance order. Empty
+/// selected leaves or no matching rows produce an empty vector.
+///
+/// # Errors
+///
+/// Propagates required artifact fetch and decoding failures from the flat, SQ8,
+/// or PQ path. Bitmap unavailability alone is not an error because the exact
+/// attribute path remains available.
+///
+/// # Performance
+///
+/// Cost scales with selected leaves and their rows. Filtering may retain more
+/// candidates; quantized modes reduce coarse distance CPU but add sidecar and
+/// exact-rerank reads.
+///
+/// # Examples
+///
+/// With `top_k = 10`, factor three, and a filter, a quantized scan keeps a wider
+/// coarse pool before exact evaluation so selective matches are less likely to
+/// be truncated by approximate distance.
 #[allow(clippy::too_many_arguments)]
 async fn scan_leaf_clusters(
     index: &HierarchicalIndex,
@@ -398,7 +661,53 @@ async fn scan_leaf_clusters(
     Ok(results)
 }
 
-/// Flat scan of leaf clusters (no quantization).
+/// Computes exact distances for every surviving row in selected flat leaves.
+///
+/// Each cluster's vector object, optional bitmap, and required filter attributes
+/// are fetched concurrently. After all selected clusters finish I/O, rows are
+/// decoded and scored sequentially. Unfiltered scans deliberately defer attrs
+/// until final top-k enrichment.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace component of leaf keys.
+/// - `segment_id`: Immutable segment component of leaf keys.
+/// - `cluster_indices`: Selected numbered leaves.
+/// - `query`: Validated query vector.
+/// - `distance_metric`: Exact metric for result scores.
+/// - `filter`: Optional predicate requiring attribute rows.
+/// - `has_bitmaps`: Whether manifest metadata says bitmap sidecars may exist.
+/// - `store`: Object store for vectors, attrs, and bitmap bytes.
+/// - `cache`: Optional tiered cache.
+///
+/// # Returns
+///
+/// One owned candidate for every row not rejected by an available bitmap. When
+/// a filter is active, each candidate also carries its row's cloned attributes
+/// for exact evaluation by `scan_leaf_clusters`.
+///
+/// # Errors
+///
+/// Propagates vector or required attribute fetch/decoding failures. Bitmap
+/// failures yield no prefilter and therefore do not cause false negatives.
+///
+/// # Performance
+///
+/// Performs parallel per-cluster I/O, then `O(selected_rows * dim)` exact
+/// distance work. Attribute GETs occur only for filtered queries at this stage.
+///
+/// # Examples
+///
+/// An unfiltered two-leaf search fetches both vector objects together, scores
+/// all rows, and carries only cluster/row locations for later attrs. A filtered
+/// search also loads attrs and can skip bitmap-rejected rows before distance CPU.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The iterator creates one future per borrowed cluster ID; `async move` copies
+/// that `usize` into its future. `tokio::join!` gives each cluster three typed
+/// results, eliminating a shared mutable completion structure or manual thread
+/// synchronization.
 #[allow(clippy::too_many_arguments)]
 async fn scan_clusters_flat(
     namespace: &str,
@@ -468,7 +777,59 @@ async fn scan_clusters_flat(
     Ok(candidates)
 }
 
-/// SQ8 two-phase scan of leaf clusters.
+/// Uses SQ8 codes for coarse ranking, then reranks selected rows exactly.
+///
+/// New segments embed calibration in [`super::TreeMeta`] and co-locate SQ8 codes
+/// with full vectors. Older segments load a separate calibration and SQ cluster
+/// sidecar. Filters are evaluated during coarse ranking before the pool is cut
+/// to four times `fetch_k`; otherwise an approximate nearest set could discard
+/// every row satisfying a selective predicate.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace component of artifact keys.
+/// - `segment_id`: Immutable segment identifier.
+/// - `cluster_indices`: Selected leaf indexes.
+/// - `query`: Validated full-precision query.
+/// - `distance_metric`: Metric used by SQ8 asymmetric distance and exact rerank.
+/// - `filter`: Optional metadata predicate applied before coarse truncation.
+/// - `fetch_k`: Expanded result target used to size the rerank pool.
+/// - `sq_calibration`: Embedded calibration bytes for new segments, or `None`
+///   for the legacy sidecar format.
+/// - `has_bitmaps`: Whether bitmap prefilter objects may be available.
+/// - `store`: Object store for calibration, codes, full vectors, and attrs.
+/// - `cache`: Optional tiered cache.
+///
+/// # Returns
+///
+/// Owned candidates with scores recomputed from full-precision vectors. The
+/// caller performs final exact filtering and top-k selection.
+///
+/// # Errors
+///
+/// Propagates invalid calibration or SQ8 data, required object/attribute reads,
+/// cluster decoding, and cache failures. A missing bitmap alone uses attrs.
+///
+/// # Performance
+///
+/// Coarse work is `O(selected_rows * dim)` over byte codes with parallel leaf
+/// reads. At most roughly `fetch_k * 4` coarse tuples proceed to full-precision
+/// reranking. Co-located clusters can reuse bytes fetched during the coarse
+/// phase; legacy layouts require separate SQ and full-vector GETs.
+///
+/// # Examples
+///
+/// For `fetch_k = 30`, at most the best 120 filter-surviving SQ8 rows proceed to
+/// exact distance. If a category predicate cannot use a bitmap, attrs are still
+/// checked before those 120 are selected, preserving matching rows.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Calibration is represented as `Option<&[u8]>`, a borrowed tagged state rather
+/// than a nullable pointer. Pattern matching forces both the embedded and legacy
+/// formats to be handled. `HashMap<usize, Bytes>` retains co-located buffers;
+/// cloning `Bytes` shares an immutable reference-counted allocation rather than
+/// deep-copying its contents.
 #[allow(clippy::too_many_arguments)]
 async fn scan_clusters_sq(
     namespace: &str,
@@ -616,6 +977,41 @@ async fn scan_clusters_sq(
     Ok(candidates)
 }
 
+/// Loads SQ8 codes and optionally retains their co-located full-vector bytes.
+///
+/// New-format segments first inspect `cluster_N.bin` for embedded codes. If that
+/// object lacks the embedded section, the helper loads the legacy SQ sidecar but
+/// still returns the already-fetched full cluster for reranking. Legacy metadata
+/// skips the cluster read during coarse ranking and returns no retained bytes.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace component of artifact keys.
+/// - `segment_id`: Immutable segment identifier.
+/// - `cluster_idx`: Numbered leaf to load.
+/// - `prefer_colocated`: Whether metadata indicates the new embedded layout.
+/// - `store`: Object store for required bytes.
+/// - `cache`: Optional tiered cache.
+///
+/// # Returns
+///
+/// Decoded SQ8 IDs/codes plus `Some(cluster_bytes)` when the full cluster was
+/// already fetched, even if codes ultimately came from a legacy sidecar.
+///
+/// # Errors
+///
+/// Propagates cache, object-store, co-located-format, or legacy SQ decoding
+/// errors. It does not continue without valid codes.
+///
+/// # Performance
+///
+/// Uses one cluster GET for a valid co-located object, two GETs when preferred
+/// co-location is absent, or one SQ-sidecar GET for legacy metadata.
+///
+/// # Examples
+///
+/// A new leaf with embedded codes returns both decoded codes and the shared
+/// cluster bytes, allowing exact rerank without another vector GET.
 async fn load_sq_cluster_for_coarse(
     namespace: &str,
     segment_id: &str,
@@ -648,7 +1044,55 @@ async fn load_sq_cluster_for_coarse(
     Ok((sq_cluster, None))
 }
 
-/// PQ two-phase scan of leaf clusters.
+/// Uses product-quantized codes for coarse ranking, then reranks exactly.
+///
+/// The segment-wide codebook converts the query into an asymmetric-distance
+/// lookup table. Every selected PQ row is scored from compact subquantizer codes,
+/// with filters applied before truncation. Only the best coarse pool is grouped
+/// by leaf and fetched from full-precision cluster objects for final distances.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace component of artifact keys.
+/// - `segment_id`: Immutable segment identifier.
+/// - `cluster_indices`: Selected numbered leaves.
+/// - `query`: Validated full-precision query vector.
+/// - `distance_metric`: Metric used to construct the ADC table and exact scores.
+/// - `filter`: Optional predicate applied before coarse truncation.
+/// - `fetch_k`: Expanded result target; four times this many coarse rows rerank.
+/// - `has_bitmaps`: Whether bitmap prefilter sidecars may be present.
+/// - `store`: Object store for codebook, PQ codes, vectors, and attrs.
+/// - `cache`: Optional shared tiered cache.
+///
+/// # Returns
+///
+/// Owned candidates scored from full-precision vectors. Final filtering and
+/// top-k projection remain with the caller.
+///
+/// # Errors
+///
+/// Propagates codebook, PQ, vector, or attribute fetch/decoding errors and cache
+/// failures. Bitmap inability alone falls back to exact attributes.
+///
+/// # Performance
+///
+/// Loads one codebook, then selected PQ and optional attr/bitmap objects in
+/// parallel. ADC scoring is proportional to rows times subquantizers rather than
+/// full dimension. Exact rerank fetches only leaves containing the best roughly
+/// `fetch_k * 4` rows, but unlike co-located SQ8 it requires vector objects.
+///
+/// # Examples
+///
+/// Ten selected leaves may contribute thousands of PQ rows; a request with
+/// `fetch_k = 25` retains at most 100 coarse matches, groups them by leaf, and
+/// recomputes exact distances only for those IDs.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The ADC table and codebook are owned local values, while the query remains a
+/// borrow. Grouping IDs in `HashMap<usize, Vec<String>>` transfers cloned IDs
+/// into per-leaf async reads, so no future retains an iterator reference after
+/// its source collection changes.
 #[allow(clippy::too_many_arguments)]
 async fn scan_clusters_pq(
     namespace: &str,
@@ -777,6 +1221,45 @@ async fn scan_clusters_pq(
     Ok(candidates)
 }
 
+/// Selects the segment-level top-k and projects internal candidates to results.
+///
+/// Filtered candidates already carry exact attributes, so projection is local.
+/// Unfiltered candidates deferred attrs; when requested, only clusters
+/// represented in the final top-k are fetched and joined by saved row index.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace component of attribute keys.
+/// - `segment_id`: Immutable segment identifier.
+/// - `candidates`: Owned exact candidates accumulated across tree depths.
+/// - `top_k`: Maximum results to retain.
+/// - `filter`: Presence indicates attrs were loaded during scanning.
+/// - `store`: Object store for deferred attribute reads.
+/// - `cache`: Optional tiered cache.
+/// - `include_attributes`: Whether response results should carry attrs.
+///
+/// # Returns
+///
+/// Up to `top_k` best-first [`SearchResult`] values. Attribute fields are `None`
+/// when projection is disabled; individual vectors may also legitimately have
+/// no attributes.
+///
+/// # Errors
+///
+/// Filtered or attribute-free projection is infallible here. Unfiltered
+/// enrichment propagates required attr fetch/decoding and row-alignment errors.
+///
+/// # Performance
+///
+/// Uses expected-linear partial selection plus sorting the retained top-k.
+/// Deferred enrichment performs one parallel attrs GET per distinct final
+/// cluster, not per visited leaf.
+///
+/// # Examples
+///
+/// If 500 candidates from six leaves compete for ten results and the winners
+/// occupy two leaves, an unfiltered attributes-included query fetches two attrs
+/// objects after top-k rather than all six during scanning.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_candidates(
     namespace: &str,
@@ -819,6 +1302,44 @@ async fn finalize_candidates(
     }
 }
 
+/// Loads attributes only for final unfiltered candidates and restores row joins.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace component of attrs keys.
+/// - `segment_id`: Immutable segment identifier.
+/// - `candidates`: Already-ranked owned candidates with cluster and row locations.
+/// - `store`: Object store for attrs objects.
+/// - `cache`: Optional tiered cache.
+///
+/// # Returns
+///
+/// Results in the same order as `candidates`, with cloned optional attribute maps.
+/// An empty input performs no reads and returns an empty vector.
+///
+/// # Errors
+///
+/// Propagates attr fetch or decoding failures. Also returns an index error if a
+/// fetched cluster entry, attr object, or row is unexpectedly absent. These are
+/// immutable-artifact alignment violations and are not hidden.
+///
+/// # Performance
+///
+/// Deduplicates leaf IDs, fetches distinct attrs objects concurrently, and
+/// allocates a lookup map plus the result vector. Attribute maps for result rows
+/// are cloned into owned response values.
+///
+/// # Examples
+///
+/// Three winners at rows 2 and 8 of leaf 4 and row 1 of leaf 9 cause two attrs
+/// reads. Their returned order still follows exact distance, not cluster order.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Consuming `Vec<Candidate>` moves each candidate into projection after all
+/// borrowed inspection is complete. Rust prevents mutation while the earlier
+/// `for candidate in &candidates` borrow is active and automatically drops the
+/// location-only candidates after their fields move into results.
 async fn enrich_unfiltered_results(
     namespace: &str,
     segment_id: &str,
@@ -888,7 +1409,58 @@ async fn enrich_unfiltered_results(
     Ok(results)
 }
 
-/// Try to load a cluster's bitmap index and evaluate the filter against it.
+/// Attempts to produce an exact bitmap row set for one cluster and filter.
+///
+/// Bitmap data is a performance sidecar, not authoritative query state. This
+/// helper returns `None` for no filter, no manifest-declared bitmap fields, a
+/// missing/corrupt sidecar, or a predicate the bitmap representation cannot
+/// answer. Callers then evaluate original attributes. `Some(empty)` is distinct:
+/// it proves that the indexed predicate matches no rows in this cluster.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace component of the bitmap key.
+/// - `segment_id`: Immutable segment identifier.
+/// - `cluster_idx`: Leaf whose row bitmap should be evaluated.
+/// - `filter`: Optional predicate to pre-evaluate.
+/// - `has_bitmaps`: Whether manifest metadata declares any bitmap fields.
+/// - `store`: Object store for a cold sidecar read.
+/// - `cache`: Optional tiered cache.
+///
+/// # Returns
+///
+/// `Some(rows)` only when the bitmap index can answer the complete predicate;
+/// otherwise `None`, directing the caller to exact attrs.
+///
+/// # Side Effects
+///
+/// May fetch and cache one bitmap object. Decode failures emit a debug event;
+/// fetch failures are treated as optimization misses.
+///
+/// # Consistency
+///
+/// The manifest supplies `has_bitmaps`, and immutable row positions must align
+/// with vector and attribute artifacts. An unavailable sidecar never excludes a
+/// row, so it cannot silently change exact filter meaning.
+///
+/// # Performance
+///
+/// A usable bitmap costs one cached read and compressed set evaluation but can
+/// avoid distance CPU for rejected rows. Unsupported predicates still incur
+/// exact attribute work.
+///
+/// # Examples
+///
+/// If `category = "books"` maps to rows `{1, 8}`, the helper returns that set and
+/// leaf scoring skips all other rows. If the field was too high-cardinality to
+/// index, it returns `None`; the scanner checks every row's attrs instead.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The `?` operator is used on `Option` to return early when no filter exists.
+/// Unlike a Java null or C null pointer, `Option<RoaringBitmap>` is a tagged type
+/// that requires callers to distinguish unavailable evaluation from an owned,
+/// valid empty set.
 async fn try_bitmap_prefilter(
     namespace: &str,
     segment_id: &str,
@@ -919,7 +1491,40 @@ async fn try_bitmap_prefilter(
     evaluate_filter_bitmap(filter, &bitmap_index)
 }
 
-/// Load attribute data for a cluster.
+/// Loads and decodes the row-aligned attribute object for one leaf.
+///
+/// The `_filter` parameter is intentionally unused by the current loader; it
+/// keeps call sites parallel with other scan helpers. Filtering occurs after
+/// decoding, not inside this function.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace component of the attrs key.
+/// - `segment_id`: Immutable segment identifier.
+/// - `cluster_idx`: Numbered leaf whose attrs are required.
+/// - `_filter`: Optional caller predicate, currently not inspected.
+/// - `store`: Object store used on a cache miss.
+/// - `cache`: Optional tiered cache.
+///
+/// # Returns
+///
+/// `Some` row-aligned attrs on success. The current implementation does not
+/// return `None`; the option shape is consumed by shared filtering code.
+///
+/// # Errors
+///
+/// Propagates cache, object-store, missing-object, and attribute decoding errors.
+/// Required attrs are not replaced by an empty collection.
+///
+/// # Performance
+///
+/// Performs one cached artifact lookup and decodes the complete cluster attrs
+/// object. Callers avoid this on unfiltered scans until final result enrichment.
+///
+/// # Examples
+///
+/// Loading leaf 3 returns a vector whose row 7 corresponds to vector row 7 in
+/// `cluster_3.bin`; a truncated attrs object fails the query.
 async fn load_attrs(
     namespace: &str,
     segment_id: &str,
