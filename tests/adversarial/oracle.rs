@@ -835,15 +835,18 @@ fn check_query_structural(
             ));
         }
     }
-    if let Some(top_k) = q.top_k() {
-        if results.len() > top_k {
-            violations.push(violation(
-                ViolationId::I12StructuralSanity,
-                rec,
-                ns,
-                "query returned more results than top_k",
-                serde_json::json!({ "top_k": top_k, "actual_len": results.len() }),
-            ));
+    let has_field_grouping = field_grouping_requested(q);
+    if !has_field_grouping {
+        if let Some(top_k) = q.top_k() {
+            if results.len() > top_k {
+                violations.push(violation(
+                    ViolationId::I12StructuralSanity,
+                    rec,
+                    ns,
+                    "query returned more results than top_k",
+                    serde_json::json!({ "top_k": top_k, "actual_len": results.len() }),
+                ));
+            }
         }
     }
     violations.extend(check_groups_structural(rec, ns, q, response));
@@ -869,6 +872,42 @@ fn check_groups_structural(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(u64::MAX) as usize;
     let mut violations = Vec::new();
+    if field_grouping_requested(q) {
+        if let Some(top_k) = q.top_k() {
+            if groups.len() > top_k {
+                violations.push(violation(
+                    ViolationId::I12StructuralSanity,
+                    rec,
+                    ns,
+                    "grouped query returned more groups than top_k",
+                    serde_json::json!({ "top_k": top_k, "actual_groups": groups.len() }),
+                ));
+            }
+        }
+        let flat_ids = query_results(response)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|result| result.id)
+            .collect::<Vec<_>>();
+        let grouped_ids = groups
+            .iter()
+            .flat_map(|group| group["results"].as_array().into_iter().flatten())
+            .filter_map(|result| result.get("id").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if flat_ids != grouped_ids {
+            violations.push(violation(
+                ViolationId::I12StructuralSanity,
+                rec,
+                ns,
+                "grouped query flat results did not match group concatenation",
+                serde_json::json!({
+                    "flat_ids": flat_ids,
+                    "grouped_ids": grouped_ids,
+                }),
+            ));
+        }
+    }
     let mut seen = BTreeSet::new();
     for group in groups {
         let results = group["results"]
@@ -1621,6 +1660,14 @@ fn requested_explain_full(q: &GeneratedQuery) -> bool {
     }
 }
 
+fn field_grouping_requested(q: &GeneratedQuery) -> bool {
+    q.body
+        .get("grouping")
+        .and_then(|grouping| grouping.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("field")
+}
+
 fn bm25_query_words(body: &serde_json::Value) -> Vec<String> {
     let mut words = Vec::new();
     if let Some(rank_by) = body.get("rank_by") {
@@ -1882,6 +1929,22 @@ mod tests {
     }
 
     fn query_record(body: serde_json::Value) -> OpRecord {
+        query_record_with_response(
+            body,
+            json!({
+                "results": [{
+                    "id": "row",
+                    "score": 1.0,
+                    "attributes": null
+                }]
+            }),
+        )
+    }
+
+    fn query_record_with_response(
+        body: serde_json::Value,
+        response: serde_json::Value,
+    ) -> OpRecord {
         OpRecord {
             index: 1,
             wall_ms: 0,
@@ -1899,17 +1962,50 @@ mod tests {
             method: "POST".to_string(),
             path: format!("/v1/namespaces/{NS}/query"),
             status: 200,
-            response: json!({
-                "results": [{
-                    "id": "row",
-                    "score": 1.0,
-                    "attributes": null
-                }]
-            }),
+            response,
             gen_after: Some(1),
             duration_ms: 1,
             violations: Vec::new(),
         }
+    }
+
+    fn grouping_query(top_k: usize) -> serde_json::Value {
+        json!({
+            "vector": [0.0, 0.0],
+            "top_k": top_k,
+            "consistency": "strong",
+            "grouping": {
+                "type": "field",
+                "field": "group",
+                "max_per_group": 2
+            }
+        })
+    }
+
+    fn grouped_response(group_count: usize, per_group: usize) -> serde_json::Value {
+        let mut flat_results = Vec::new();
+        let mut groups = Vec::new();
+        for group_index in 0..group_count {
+            let mut group_results = Vec::new();
+            for result_index in 0..per_group {
+                let id = format!("g{group_index}_{result_index}");
+                let result = json!({
+                    "id": id,
+                    "score": (group_index * per_group + result_index) as f32,
+                    "attributes": null
+                });
+                flat_results.push(result.clone());
+                group_results.push(result);
+            }
+            groups.push(json!({
+                "key": format!("g{group_index}"),
+                "results": group_results
+            }));
+        }
+        json!({
+            "results": flat_results,
+            "groups": groups
+        })
     }
 
     #[test]
@@ -1956,6 +2052,29 @@ mod tests {
         assert_eq!(
             violations[0].detail,
             "FTS query returned id whose body had none of the query words"
+        );
+    }
+
+    #[test]
+    fn i12_allows_grouped_flat_results_above_top_k() {
+        let rec = query_record_with_response(grouping_query(4), grouped_response(4, 2));
+
+        let violations = check_i12_structural_sanity(&Model::default(), &rec);
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn i12_rejects_group_count_above_top_k() {
+        let rec = query_record_with_response(grouping_query(4), grouped_response(5, 2));
+
+        let violations = check_i12_structural_sanity(&Model::default(), &rec);
+
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I12StructuralSanity);
+        assert_eq!(
+            violations[0].detail,
+            "grouped query returned more groups than top_k"
         );
     }
 }
