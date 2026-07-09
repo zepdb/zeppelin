@@ -679,14 +679,96 @@ fn check_i11_error_envelope(rec: &OpRecord) -> Vec<Violation> {
     if (200..300).contains(&rec.status) {
         return Vec::new();
     }
-    let Some(object) = rec.response.as_object() else {
-        return vec![violation(
+    let nested = nested_error_envelopes(rec);
+    if nested.is_empty() {
+        return check_error_envelope_body(rec, "$", rec.status, &rec.response)
+            .into_iter()
+            .collect();
+    }
+    nested
+        .into_iter()
+        .filter_map(|nested| {
+            check_error_envelope_body(rec, &nested.path, nested.status, nested.body)
+        })
+        .collect()
+}
+
+struct NestedErrorEnvelope<'a> {
+    path: String,
+    status: u16,
+    body: &'a serde_json::Value,
+}
+
+fn nested_error_envelopes(rec: &OpRecord) -> Vec<NestedErrorEnvelope<'_>> {
+    let mut nested = Vec::new();
+    match &rec.op {
+        Op::BatchQuery { .. } => {
+            push_nested_error(&mut nested, "batch", &rec.response["batch"]);
+            for (idx, individual) in rec.response["individual"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                push_nested_error(&mut nested, &format!("individual[{idx}]"), individual);
+            }
+        }
+        Op::PaginateAll { .. } => {
+            for (idx, page) in rec.response["pages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                push_nested_error(&mut nested, &format!("pages[{idx}]"), page);
+            }
+            push_nested_error(&mut nested, "big", &rec.response["big"]);
+        }
+        _ => {}
+    }
+    nested
+}
+
+fn push_nested_error<'a>(
+    nested: &mut Vec<NestedErrorEnvelope<'a>>,
+    path: &str,
+    wrapper: &'a serde_json::Value,
+) {
+    let Some(status) = wrapper
+        .get("status")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+    else {
+        return;
+    };
+    if (200..300).contains(&status) {
+        return;
+    }
+    nested.push(NestedErrorEnvelope {
+        path: path.to_string(),
+        status,
+        body: &wrapper["body"],
+    });
+}
+
+fn check_error_envelope_body(
+    rec: &OpRecord,
+    response_path: &str,
+    status_code: u16,
+    body: &serde_json::Value,
+) -> Option<Violation> {
+    let Some(object) = body.as_object() else {
+        return Some(violation(
             ViolationId::I11ErrorEnvelope,
             rec,
             rec.op.namespace(),
             "error response was not a JSON object",
-            rec.response.clone(),
-        )];
+            serde_json::json!({
+                "status": status_code,
+                "response_path": response_path,
+                "body": body,
+            }),
+        ));
     };
     let code = object.get("code").and_then(serde_json::Value::as_str);
     let status = object.get("status").and_then(serde_json::Value::as_u64);
@@ -695,23 +777,24 @@ fn check_i11_error_envelope(rec: &OpRecord) -> Vec<Violation> {
     let request_id = object.get("request_id").and_then(serde_json::Value::as_str);
     if code.is_none()
         || !KNOWN_ERROR_CODES.contains(&code.unwrap())
-        || status != Some(u64::from(rec.status))
+        || status != Some(u64::from(status_code))
         || retryable.is_none()
         || error.is_none_or(str::is_empty)
         || request_id.is_none_or(str::is_empty)
     {
-        return vec![violation(
+        return Some(violation(
             ViolationId::I11ErrorEnvelope,
             rec,
             rec.op.namespace(),
             "error response did not match the canonical envelope",
             serde_json::json!({
-                "status": rec.status,
-                "body": rec.response,
+                "status": status_code,
+                "response_path": response_path,
+                "body": body,
             }),
-        )];
+        ));
     }
-    Vec::new()
+    None
 }
 
 fn check_expected_error(rec: &OpRecord) -> Vec<Violation> {
@@ -2128,6 +2211,16 @@ mod tests {
         })
     }
 
+    fn storage_error() -> serde_json::Value {
+        json!({
+            "code": "STORAGE_ERROR",
+            "error": "a transient storage error occurred; please retry",
+            "request_id": "req",
+            "retryable": true,
+            "status": 500
+        })
+    }
+
     #[test]
     fn i7_allows_hybrid_ann_rows_without_bm25_text() {
         let model = model_with_record("row", None);
@@ -2208,6 +2301,79 @@ mod tests {
         );
 
         let violations = check_i6_pagination_equivalence(&rec);
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn i11_accepts_paginateall_big_error_envelope() {
+        let mut rec = paginate_record(
+            QueryOracleClass::Membership {
+                consistency: ConsistencyLevel::Strong,
+            },
+            json!({
+                "pages": [{
+                    "status": 200,
+                    "body": {
+                        "results": [{
+                            "id": "a",
+                            "score": 1.0,
+                            "attributes": null
+                        }]
+                    }
+                }],
+                "big": {
+                    "status": 500,
+                    "body": storage_error()
+                }
+            }),
+        );
+        rec.status = 500;
+
+        let violations = check_i11_error_envelope(&rec);
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn i11_accepts_paginateall_page_error_envelope() {
+        let mut rec = paginate_record(
+            QueryOracleClass::Membership {
+                consistency: ConsistencyLevel::Strong,
+            },
+            json!({
+                "pages": [
+                    {
+                        "status": 200,
+                        "body": {
+                            "results": [{
+                                "id": "a",
+                                "score": 1.0,
+                                "attributes": null
+                            }],
+                            "next_cursor": "cursor"
+                        }
+                    },
+                    {
+                        "status": 500,
+                        "body": storage_error()
+                    }
+                ],
+                "big": {
+                    "status": 200,
+                    "body": {
+                        "results": [{
+                            "id": "a",
+                            "score": 1.0,
+                            "attributes": null
+                        }]
+                    }
+                }
+            }),
+        );
+        rec.status = 500;
+
+        let violations = check_i11_error_envelope(&rec);
 
         assert!(violations.is_empty(), "{violations:#?}");
     }
