@@ -1,9 +1,97 @@
-//! Build phase for IVF-Flat index.
+//! Builds, encodes, uploads, and reloads immutable IVF-Flat segment artifacts.
 //!
-//! Pipeline: train centroids -> assign vectors to clusters -> serialize and
-//! write artifacts (centroids, cluster vectors, cluster attributes) to S3.
+//! This file is the storage-facing half of IVF-Flat. Compaction enters through
+//! [`build_ivf_flat`] with a complete vector snapshot, and query planning
+//! normally enters through [`load_ivf_flat_from_manifest`] with artifact
+//! metadata copied from the authoritative manifest. [`load_ivf_flat`] is the
+//! slower probing loader used when manifest metadata is not available. Search
+//! itself lives in `search.rs`; centroid training, membership, and the resident
+//! coarse sketch live in sibling modules.
 //!
-//! ## Phase C.0b storage-format design
+//! An inverted-file (IVF) index partitions vectors around learned centroids.
+//! At query time, `nprobe` controls how many nearby clusters are considered:
+//! probing more clusters usually improves recall but reads and scores more
+//! data. "Flat" means the final rerank still uses the stored full-precision
+//! vectors; scalar or product quantization may supply an earlier coarse pass.
+//!
+//! The build path deliberately separates CPU work from object-store I/O. It
+//! trains centroids, assigns rows, builds optional bitmap and quantization
+//! sidecars, groups nearby clusters into bounded objects, and uploads those
+//! immutable objects through [`ZeppelinStore`]. Uploading does **not** make a
+//! segment visible. The compactor later places the returned references in a
+//! [`SegmentRef`][crate::wal::manifest::SegmentRef] and publishes the manifest
+//! with compare-and-swap. If construction fails after some PUTs, those objects
+//! may remain unreferenced; readers must never discover them by listing alone.
+//!
+//! ```text
+//! validated VectorEntry snapshot
+//!              |
+//!              v
+//! train centroids -> assign rows -> group nearby clusters
+//!              |                         |
+//!              |                         +--> attributes / bitmaps
+//!              |                         +--> SQ or PQ coarse data
+//!              v
+//! serialize immutable cluster, membership, sketch, and bootstrap bytes
+//!              |
+//!              v
+//! parallel/ordered PUTs to S3 or MinIO   (objects exist, not visible)
+//!              |
+//!              v
+//! return IvfFlatIndex + artifact refs
+//!              |
+//!              v
+//! compaction publishes SegmentRef by manifest CAS   (now visible)
+//! ```
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`build_ivf_flat`] for the seven construction phases and the
+//!    artifact-visibility boundary.
+//! 2. Read `density_cluster_groups` and `build_cluster_object_lookup` for the
+//!    logical-cluster-to-physical-object layout.
+//! 3. Read the bootstrap, centroid, cluster-object, and attribute serializers
+//!    as independent persisted-format contracts.
+//! 4. Read [`load_ivf_flat_from_manifest`] and `load_bootstrap_artifacts` for
+//!    the normal cached query-loading path.
+//! 5. Finish with [`load_ivf_flat`] to understand the more expensive legacy
+//!    path that reconstructs metadata by listing and probing objects.
+//!
+//! ## Invariants
+//!
+//! - Segment artifacts are write-once. Rebuilds use a new `segment_id`; this
+//!   module never mutates a published object in place.
+//! - The manifest, not object existence or a local cache entry, defines which
+//!   segment and object layout readers may use.
+//! - Every vector in one build has the same non-zero dimension, and IDs,
+//!   vectors, attributes, and quantized codes retain the same row order.
+//! - Every logical cluster appears exactly once in a non-legacy grouped-object
+//!   layout. Malformed, duplicate, missing, truncated, or overflowing metadata
+//!   fails loudly instead of selecting a fallback value.
+//! - Persisted little-endian formats remain independently versioned. Legacy
+//!   centroid and per-cluster objects remain readable alongside current ones.
+//! - Cache hits may avoid object-store GETs, but cached metadata is accepted
+//!   only for the manifest-provided key and declared sizes.
+//!
+//! ## Rust concepts used here
+//!
+//! Build inputs are borrowed slices, roughly like read-only Java views or C
+//! `const` pointer/length pairs, while returned [`IvfFlatIndex`]
+//! owns its strings and metadata. Temporary `Vec<&[f32]>` values borrow vector
+//! payloads without duplicating floats; the compiler prevents those views from
+//! outliving the input snapshot. [`Bytes`] moves encoded buffers into cheap,
+//! reference-counted immutable handles, so clones used by parallel PUT futures
+//! share payload memory rather than copying whole artifacts.
+//!
+//! [`Arc`] shares decoded centroids and sketches among index handles and cache
+//! entries. [`OnceLock`] initializes the process-wide decoded-bootstrap map on
+//! first use, while [`DashMap`] permits concurrent lookup without one global
+//! mutex. This resembles Java concurrent-map references; unlike manual C
+//! ownership, Rust's types arrange destruction only after the last owner goes
+//! away. `Result` and `?` make every validation or I/O failure explicit and
+//! prevent later phases from running after an error.
+//!
+//! ## Persisted-format compatibility
 //!
 //! This change is intentionally per-object versioned; the manifest remains
 //! unchanged so old immutable segments and new segments can coexist in one
@@ -44,7 +132,7 @@
 //!   segments store the same legacy SQ calibration bytes in an optional
 //!   `sq_calibration` JSON field there. Old tree metadata lacks the field and
 //!   therefore falls back to legacy `sq_calibration.bin`.
-//! - Compaction migrates only rewritten clusters by writing the new co-located
+//! - Incremental compaction migrates only rewritten clusters by writing the new co-located
 //!   object under the new segment. Task 2B carried clusters keep their old owner
 //!   string in `cluster_owners`, so their old physical keys stay authoritative.
 //! - PQ is deliberately deferred. The current requirement and GET-count target
@@ -71,25 +159,58 @@ use super::sketch::{build_resident_sketch, ResidentSketch};
 use super::IvfFlatIndex;
 use crate::index::distance;
 
+/// Four-byte signature for current centroid objects.
 const CENTROIDS_V2_MAGIC: &[u8; 4] = b"ZCT2";
+/// Four-byte signature for one SQ-and-full-vector cluster section.
 const CLUSTER_V2_MAGIC: &[u8; 4] = b"ZCL2";
+/// Fixed bytes preceding the SQ and full-vector payloads in a v2 section.
 const CLUSTER_V2_HEADER_LEN: usize = 4 + 8 * 4;
+/// Four-byte signature for grouped objects containing unsplit cluster sections.
 const CLUSTER_DATA_OBJECT_V1_MAGIC: &[u8; 4] = b"ZBP1";
+/// Shared prefix used to recognize versioned grouped cluster-data objects.
 const CLUSTER_DATA_OBJECT_MAGIC_PREFIX: &[u8; 3] = b"ZBP";
+/// Version byte for grouped objects whose SQ and full blocks are separated.
 const CLUSTER_DATA_OBJECT_V4_VERSION: u8 = 4;
+/// Magic/version plus entry-count bytes shared by grouped-object formats.
 const CLUSTER_DATA_OBJECT_HEADER_LEN: usize = 8;
+/// Bytes in one v1 directory tuple: cluster index, offset, and length.
 const CLUSTER_DATA_OBJECT_DIR_ENTRY_LEN: usize = 4 + 8 + 8;
+/// Bytes in one v4 tuple containing separate SQ and full-vector ranges.
 const CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN: usize = 4 + 8 + 8 + 8 + 8;
+/// Four-byte signature for a combined centroid-and-sketch bootstrap object.
 const BOOTSTRAP_MAGIC: &[u8; 4] = b"ZBS1";
+/// Only bootstrap format version currently accepted by the decoder.
 const BOOTSTRAP_VERSION: u32 = 1;
+/// Number of offset/length entries in a bootstrap header.
 const BOOTSTRAP_SECTION_COUNT: usize = 2;
+/// Fixed bootstrap header size before the first embedded artifact.
 const BOOTSTRAP_HEADER_LEN: usize = 4 + 4 + BOOTSTRAP_SECTION_COUNT * 16;
+/// Object-count compromise used when no grouping cap is configured.
 const DEFAULT_MAX_CLUSTERS_PER_OBJECT: usize = 3;
+/// Environment variable overriding the maximum clusters in a grouped object.
 const MAX_CLUSTERS_PER_OBJECT_ENV: &str = "ZEPPELIN_MAX_CLUSTERS_PER_OBJECT";
+/// Presence-only switch that emits grouping diagnostics to standard error.
 const CLUSTER_GROUP_STATS_ENV: &str = "ZEPPELIN_CLUSTER_GROUP_STATS";
 
+/// Process-wide reuse of validated bootstrap metadata, keyed by immutable key.
+///
+/// Entries are safe to reuse because segment keys identify write-once objects.
+/// The manifest-provided sizes are still compared before a cached value is
+/// accepted, so incompatible metadata fails loudly.
 static BOOTSTRAP_DECODED_CACHE: OnceLock<DashMap<String, Arc<DecodedBootstrap>>> = OnceLock::new();
 
+/// Returns the lazily initialized process-wide decoded-bootstrap map.
+///
+/// # Returns
+///
+/// A shared map that lives for the process lifetime. Calling this function does
+/// not fetch or decode an object.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `OnceLock` performs thread-safe one-time initialization without requiring
+/// callers to coordinate. The `'static` reference is valid for the rest of the
+/// process; in C this lifetime would be a convention around global storage.
 fn bootstrap_decoded_cache() -> &'static DashMap<String, Arc<DecodedBootstrap>> {
     BOOTSTRAP_DECODED_CACHE.get_or_init(DashMap::new)
 }
@@ -98,32 +219,103 @@ fn bootstrap_decoded_cache() -> &'static DashMap<String, Arc<DecodedBootstrap>> 
 // Artifact paths
 // ---------------------------------------------------------------------------
 
-/// S3 key for the centroids blob.
+/// Constructs the immutable centroid-object key for a segment.
+///
+/// # Parameters
+///
+/// - `namespace`: Validated object-store prefix for the namespace.
+/// - `segment_id`: Unique identifier of the segment that owns the centroids.
+///
+/// # Returns
+///
+/// An owned key ending in `segments/{segment_id}/centroids.bin`; no I/O occurs.
+///
+/// # Examples
+///
+/// Namespace `catalog` and segment `seg-7` produce
+/// `catalog/segments/seg-7/centroids.bin`.
 pub fn centroids_key(namespace: &str, segment_id: &str) -> String {
     format!("{namespace}/segments/{segment_id}/centroids.bin")
 }
 
-/// S3 key for the segment bootstrap blob.
+/// Constructs the immutable combined-bootstrap key for a segment.
+///
+/// # Parameters
+///
+/// - `namespace`: Validated object-store prefix for the namespace.
+/// - `segment_id`: Unique identifier of the segment that owns the bootstrap.
+///
+/// # Returns
+///
+/// An owned key ending in `segments/{segment_id}/bootstrap.bin`; no I/O occurs.
 #[must_use]
 pub fn bootstrap_key(namespace: &str, segment_id: &str) -> String {
     format!("{namespace}/segments/{segment_id}/bootstrap.bin")
 }
 
-/// S3 key for the vector data of cluster `i`.
+/// Constructs a legacy per-cluster full-vector object key.
+///
+/// # Parameters
+///
+/// - `namespace`: Validated namespace object-store prefix.
+/// - `segment_id`: Physical owner of the cluster object.
+/// - `cluster_idx`: Zero-based logical cluster index.
+///
+/// # Returns
+///
+/// A key ending in `cluster_{cluster_idx}.bin`. Current full builds use grouped
+/// objects; this shape remains necessary for legacy and incremental layouts.
 pub(crate) fn cluster_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> String {
     format!("{namespace}/segments/{segment_id}/cluster_{cluster_idx}.bin")
 }
 
-/// S3 key for grouped cluster data object `group_idx`.
+/// Constructs the key for one bounded group of logical cluster payloads.
+///
+/// # Parameters
+///
+/// - `namespace`: Validated namespace object-store prefix.
+/// - `segment_id`: Segment that owns the newly written immutable object.
+/// - `group_idx`: Stable zero-based group number produced by build traversal.
+///
+/// # Returns
+///
+/// A key ending in `cluster_group_{group_idx}.bin`; no I/O occurs.
 pub(crate) fn cluster_group_key(namespace: &str, segment_id: &str, group_idx: usize) -> String {
     format!("{namespace}/segments/{segment_id}/cluster_group_{group_idx}.bin")
 }
 
-/// S3 key for the attribute data of cluster `i`.
+/// Constructs the sidecar key for one cluster's row-aligned attributes.
+///
+/// # Parameters
+///
+/// - `namespace`: Validated namespace object-store prefix.
+/// - `segment_id`: Physical owner of the attribute sidecar.
+/// - `cluster_idx`: Logical cluster whose row order the sidecar mirrors.
+///
+/// # Returns
+///
+/// A key ending in `attrs_{cluster_idx}.bin`; no I/O occurs.
 pub fn attrs_key(namespace: &str, segment_id: &str, cluster_idx: usize) -> String {
     format!("{namespace}/segments/{segment_id}/attrs_{cluster_idx}.bin")
 }
 
+/// Reads and validates the process environment's cluster-grouping cap.
+///
+/// # Returns
+///
+/// The configured positive cap, or [`DEFAULT_MAX_CLUSTERS_PER_OBJECT`] when the
+/// variable is absent.
+///
+/// # Errors
+///
+/// Returns an index error when the variable is non-Unicode, cannot be parsed as
+/// `usize`, or is zero. The function does not silently substitute the default
+/// for malformed operator input.
+///
+/// # Examples
+///
+/// An absent variable permits up to three clusters per object. A value of `1`
+/// forces one object per logical cluster; `0` fails the build.
 fn configured_max_clusters_per_object() -> Result<usize> {
     match std::env::var(MAX_CLUSTERS_PER_OBJECT_ENV) {
         Ok(value) => {
@@ -146,12 +338,43 @@ fn configured_max_clusters_per_object() -> Result<usize> {
     }
 }
 
-/// Capped density-adaptive centroid grouping used for cluster-data objects.
+/// Groups nearby logical clusters into capped physical data objects.
 ///
 /// The only external bound is `max_clusters_per_object`. The merge cutoff is
 /// derived from the segment's own cap-neighbor centroid distance distribution,
 /// so it scales with the embedding space rather than baking in an absolute
 /// radius.
+///
+/// # Parameters
+///
+/// - `centroids`: One owned centroid vector per logical cluster.
+/// - `affinity`: Symmetric boundary-frequency matrix built while assigning
+///   vectors. It breaks distance ties in favor of clusters often seen as first
+///   and second choices; missing cells behave as zero affinity.
+///
+/// # Returns
+///
+/// Deterministic groups sorted by their lowest cluster index. Every input
+/// cluster appears once, and each group respects the environment-selected cap.
+/// Empty centroid input returns an empty layout.
+///
+/// # Errors
+///
+/// Returns an index error for invalid environment configuration, size overflow,
+/// fewer than two centroids where a cutoff is required, or a non-finite
+/// derived neighbor distance.
+///
+/// # Performance
+///
+/// Materializes an `n x n` centroid-distance matrix and examines all centroid
+/// pairs, using `O(n^2 * dim)` CPU and `O(n^2)` float memory. Grouping reduces
+/// object GET count later but can increase bytes fetched for one hot cluster.
+///
+/// # Examples
+///
+/// Four centroids packed near one another and one distant centroid may become
+/// groups `[0, 1, 2]`, `[3]`, and `[4]` under a cap of three. Dense clusters are
+/// never merged past the configured cap.
 pub(crate) fn density_cluster_groups(
     centroids: &[Vec<f32>],
     affinity: &[Vec<u32>],
@@ -160,6 +383,33 @@ pub(crate) fn density_cluster_groups(
     density_cluster_groups_with_cap(centroids, affinity, max_clusters_per_object)
 }
 
+/// Implements density grouping with an explicit cap for callers and tests.
+///
+/// Candidate edges are ordered by increasing centroid distance, then decreasing
+/// assignment affinity, then cluster index. Two groups merge only when their
+/// combined size fits the cap and every cross-group pair is within the derived
+/// cutoff, which is complete-linkage behavior.
+///
+/// # Parameters
+///
+/// - `centroids`: One centroid per logical cluster; dimensions must agree.
+/// - `affinity`: Optional square boundary-frequency matrix used for tie breaks.
+/// - `max_clusters_per_object`: Strict positive upper bound on group size.
+///
+/// # Returns
+///
+/// A deterministic partition of cluster indexes. A cap of one returns singleton
+/// groups without constructing the quadratic distance matrix.
+///
+/// # Errors
+///
+/// Returns an index error when the cap is zero, distance-matrix sizing
+/// overflows, or cutoff derivation encounters invalid/non-finite data.
+///
+/// # Examples
+///
+/// For centroids at `0.0`, `0.1`, and `10.0` with cap two, the nearby first two
+/// can share one object while the distant third remains alone.
 pub(crate) fn density_cluster_groups_with_cap(
     centroids: &[Vec<f32>],
     affinity: &[Vec<u32>],
@@ -246,6 +496,25 @@ pub(crate) fn density_cluster_groups_with_cap(
     Ok(groups)
 }
 
+/// Computes a symmetric row-major matrix of all centroid L2 distances.
+///
+/// # Parameters
+///
+/// - `centroids`: Equal-dimensional centroid vectors.
+///
+/// # Returns
+///
+/// `n * n` distances with zeroes on the diagonal and mirrored off-diagonal
+/// entries.
+///
+/// # Errors
+///
+/// Returns an index error if `n * n` overflows `usize`.
+///
+/// # Panics
+///
+/// Panics when centroid dimensions differ because the distance primitive
+/// requires equal-length slices.
 fn centroid_distances(centroids: &[Vec<f32>]) -> Result<Vec<f32>> {
     let n = centroids.len();
     let total = n
@@ -262,10 +531,47 @@ fn centroid_distances(centroids: &[Vec<f32>]) -> Result<Vec<f32>> {
     Ok(distances)
 }
 
+/// Reads one cell from a row-major centroid-distance matrix.
+///
+/// # Parameters
+///
+/// - `distances`: Flat matrix produced by `centroid_distances`.
+/// - `n`: Matrix width in centroids.
+/// - `left`: Row index.
+/// - `right`: Column index.
+///
+/// # Returns
+///
+/// The stored L2 distance between the two logical clusters.
+///
+/// # Panics
+///
+/// Panics if either index is outside the declared matrix or if `n` does not
+/// match the buffer layout. Callers use indexes derived from the same centroids.
 fn centroid_distance(distances: &[f32], n: usize, left: usize, right: usize) -> f32 {
     distances[left * n + right]
 }
 
+/// Derives a scale-free merge cutoff from cap-neighbor distances.
+///
+/// For each centroid, this helper selects the distance to the neighbor rank
+/// implied by the group cap, then returns the upper quartile of those values.
+/// Dense regions can therefore merge while sparse tails remain separate.
+///
+/// # Parameters
+///
+/// - `distances`: Complete `n x n` row-major distance matrix.
+/// - `n`: Number of centroids represented by the matrix.
+/// - `max_clusters_per_object`: Group cap used to select the neighbor rank.
+///
+/// # Returns
+///
+/// A finite L2-distance cutoff at the upper-quartile position.
+///
+/// # Errors
+///
+/// Returns an index error when fewer than two centroids are supplied or any
+/// selected cap-neighbor distance is NaN or infinite.
 fn cap_neighbor_distance_upper_quartile(
     distances: &[f32],
     n: usize,
@@ -300,6 +606,21 @@ fn cap_neighbor_distance_upper_quartile(
     Ok(cap_neighbor_distances[idx.min(cap_neighbor_distances.len() - 1)])
 }
 
+/// Tests whether every cross-pair between two groups satisfies a cutoff.
+///
+/// # Parameters
+///
+/// - `left_group`: Cluster indexes already joined in the first group.
+/// - `right_group`: Cluster indexes in the candidate partner group.
+/// - `distances`: Complete row-major centroid-distance matrix.
+/// - `n`: Matrix width.
+/// - `cutoff`: Inclusive maximum permitted cross-group distance.
+///
+/// # Returns
+///
+/// `true` only when complete-linkage distance is within the cutoff. Empty input
+/// groups vacuously return `true`, although production grouping never passes
+/// empty groups.
 fn groups_within_cutoff(
     left_group: &[usize],
     right_group: &[usize],
@@ -314,6 +635,18 @@ fn groups_within_cutoff(
     })
 }
 
+/// Optionally prints a compact cluster-group histogram for operators.
+///
+/// # Parameters
+///
+/// - `max_clusters_per_object`: Effective group cap included in the record.
+/// - `cutoff`: Derived centroid-distance cutoff.
+/// - `groups`: Final non-empty groups whose sizes form the histogram.
+///
+/// # Side Effects
+///
+/// Writes one line to standard error only when
+/// `ZEPPELIN_CLUSTER_GROUP_STATS` is present. It never changes grouping.
 fn emit_cluster_group_stats(max_clusters_per_object: usize, cutoff: f32, groups: &[Vec<usize>]) {
     if std::env::var_os(CLUSTER_GROUP_STATS_ENV).is_none() {
         return;
@@ -333,6 +666,37 @@ fn emit_cluster_group_stats(max_clusters_per_object: usize, cutoff: f32, groups:
     );
 }
 
+/// Validates manifest cluster objects and builds a constant-time owner lookup.
+///
+/// # Parameters
+///
+/// - `cluster_count`: Number of logical clusters in the loaded centroid set.
+/// - `cluster_objects`: Manifest-defined immutable objects and their logical
+///   cluster membership.
+///
+/// # Returns
+///
+/// An array where position `i` contains the index of the sole object that owns
+/// cluster `i`. An empty manifest layout returns an empty array and signals the
+/// legacy per-cluster key convention.
+///
+/// # Errors
+///
+/// Returns an index error for an empty object key, an object with no clusters,
+/// an out-of-range or duplicate cluster, a cluster listed in two objects, or a
+/// logical cluster missing from the layout. No object-store I/O occurs.
+///
+/// # Examples
+///
+/// Objects `A -> [0, 2]` and `B -> [1]` produce lookup `[0, 1, 0]`. Omitting
+/// cluster 1 fails rather than silently routing it to a guessed key.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `usize::MAX` is an internal sentinel only during validation; the function
+/// never returns a lookup containing it. `BTreeSet` checks duplicates with
+/// deterministic behavior, and `Result` forces callers to handle malformed
+/// persisted state before indexing the vector.
 pub(crate) fn build_cluster_object_lookup(
     cluster_count: usize,
     cluster_objects: &[ClusterDataObjectRef],
@@ -392,9 +756,14 @@ pub(crate) fn build_cluster_object_lookup(
 // Serialization helpers
 // ---------------------------------------------------------------------------
 
-/// Borrowed sections from a segment bootstrap artifact.
+/// Borrowed, validated views into a combined segment bootstrap artifact.
+///
+/// The views avoid copying the embedded centroid and sketch bytes. Their
+/// lifetime cannot exceed the input buffer passed to `deserialize_bootstrap`.
 pub(crate) struct BootstrapSections<'a> {
+    /// Complete encoded centroid artifact, including its own version header.
     pub centroids: &'a [u8],
+    /// Complete encoded resident-sketch artifact, including its own header.
     pub sketch: &'a [u8],
 }
 
@@ -402,6 +771,37 @@ pub(crate) struct BootstrapSections<'a> {
 ///
 /// The centroid and sketch payloads are embedded verbatim. Their internal
 /// formats remain independently versioned by their existing decoders.
+///
+/// # Parameters
+///
+/// - `centroids`: Complete encoded centroid artifact to place first.
+/// - `sketch`: Complete encoded resident-sketch artifact to place second.
+///
+/// # Returns
+///
+/// One owned immutable buffer with a versioned offset/length directory and the
+/// two payloads in that order.
+///
+/// # Errors
+///
+/// Returns an index error when either payload is empty or size arithmetic
+/// overflows. No object-store write occurs.
+///
+/// # Performance
+///
+/// Allocates one buffer and copies each input payload once. The combined object
+/// later replaces two cold object-store GETs with one GET.
+///
+/// # Examples
+///
+/// A 12 KiB centroid blob and 200 KiB sketch become one bootstrap object. Their
+/// internal bytes are unchanged, so existing decoders can consume each slice.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The parameters are temporary borrows; [`Bytes::from`] takes ownership of the
+/// completed `Vec<u8>` without copying it again. The result can outlive both
+/// input slices because their bytes were copied into the owned buffer.
 pub(crate) fn serialize_bootstrap(centroids: &[u8], sketch: &[u8]) -> Result<Bytes> {
     if centroids.is_empty() {
         return Err(ZeppelinError::Index(
@@ -436,7 +836,34 @@ pub(crate) fn serialize_bootstrap(centroids: &[u8], sketch: &[u8]) -> Result<Byt
     Ok(Bytes::from(buf))
 }
 
-/// Build a manifest ref and bytes for the segment bootstrap artifact.
+/// Builds a bootstrap object's future manifest reference and complete bytes.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace prefix used to derive the immutable key.
+/// - `segment_id`: New segment identifier that will own the object.
+/// - `centroids`: Complete encoded centroid artifact.
+/// - `sketch`: Complete encoded resident-sketch artifact.
+///
+/// # Returns
+///
+/// A [`BootstrapRef`] carrying the key and exact byte length, paired with the
+/// bytes the caller must PUT at that key.
+///
+/// # Errors
+///
+/// Propagates bootstrap serialization errors. It does not perform I/O and
+/// therefore cannot leave a partial remote artifact.
+///
+/// # Consistency
+///
+/// Constructing a reference does not publish it. Readers use the object only
+/// after its reference appears in the authoritative manifest.
+///
+/// # Examples
+///
+/// Building segment `seg-7` returns a ref to `.../seg-7/bootstrap.bin`; after a
+/// successful PUT the object still remains invisible until manifest CAS.
 pub(crate) fn build_bootstrap_artifact(
     namespace: &str,
     segment_id: &str,
@@ -451,7 +878,37 @@ pub(crate) fn build_bootstrap_artifact(
     Ok((bootstrap_ref, bytes))
 }
 
-/// Deserialize and validate a segment bootstrap artifact.
+/// Validates a bootstrap object and borrows its two embedded artifact sections.
+///
+/// Validation requires the current magic/version, exact contiguous section
+/// ordering, non-empty payloads, in-bounds checked ranges, and no trailing
+/// bytes. It does not decode the centroid or sketch formats themselves.
+///
+/// # Parameters
+///
+/// - `data`: Complete bootstrap-object bytes loaded from storage or cache.
+///
+/// # Returns
+///
+/// Borrowed centroid and sketch slices tied to `data`'s lifetime.
+///
+/// # Errors
+///
+/// Returns an index error for a short header, wrong magic, unsupported version,
+/// malformed integer, empty/overlapping/out-of-bounds section, overflow, or an
+/// exact-size mismatch. No partially validated sections are returned.
+///
+/// # Examples
+///
+/// Bytes emitted by `serialize_bootstrap` yield the exact two original
+/// payloads. Changing the sketch length to extend past the object returns an
+/// error before any decoder sees the slice.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `BootstrapSections<'_>` is a zero-copy view. It resembles Java
+/// `ByteBuffer.slice()` or C pointer/length pairs, but the borrow checker proves
+/// the views cannot survive after `data` is released.
 pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>> {
     if data.len() < BOOTSTRAP_HEADER_LEN {
         return Err(ZeppelinError::Index(
@@ -524,6 +981,25 @@ pub(crate) fn deserialize_bootstrap(data: &[u8]) -> Result<BootstrapSections<'_>
     })
 }
 
+/// Checks one bootstrap directory entry against header and object bounds.
+///
+/// # Parameters
+///
+/// - `label`: Human-readable section name included in failures.
+/// - `offset`: Absolute start byte declared by the artifact.
+/// - `len`: Declared section length in bytes.
+/// - `min_offset`: First byte after the fixed header.
+/// - `data_len`: Complete object length.
+///
+/// # Returns
+///
+/// `Ok(())` only for a non-empty range wholly outside the header and within the
+/// object.
+///
+/// # Errors
+///
+/// Returns an index error for an empty section, a start inside the header,
+/// arithmetic overflow, or an end beyond the object.
 fn validate_bootstrap_section(
     label: &str,
     offset: usize,
@@ -554,16 +1030,74 @@ fn validate_bootstrap_section(
     Ok(())
 }
 
-/// Header written before the centroid float array.
+/// Serializes centroids without an embedded scalar-quantization calibration.
 ///
-/// Layout:
+/// The current versioned layout is:
 /// `[b"ZCT2"][num_centroids: u32][dimension: u32]`
 /// `[f32 * num_centroids * dimension][sq_calibration_len:u64][sq_calibration bytes]`
+/// with a zero calibration length.
+///
+/// # Parameters
+///
+/// - `centroids`: Cluster representatives in logical cluster order.
+/// - `dim`: Persisted dimension for each centroid row.
+///
+/// # Returns
+///
+/// Complete current-format centroid bytes.
+///
+/// # Errors
+///
+/// Propagates serialization failures from the general calibrated form. The
+/// current implementation does not validate row lengths or integer narrowing.
+///
+/// # Panics
+///
+/// In debug builds, panics when the supplied shapes make the written length
+/// differ from `centroids.len() * dim` floats.
+///
+/// # Examples
+///
+/// Two three-dimensional centroids produce a header followed by six little-
+/// endian floats and a zero `u64` calibration length.
 pub(crate) fn serialize_centroids(centroids: &[Vec<f32>], dim: usize) -> Result<Bytes> {
     serialize_centroids_with_sq_calibration(centroids, dim, None)
 }
 
-/// Serialize centroids with an optional embedded SQ calibration payload.
+/// Serializes centroids with an optional embedded SQ calibration payload.
+///
+/// # Parameters
+///
+/// - `centroids`: Cluster representatives in logical cluster order.
+/// - `dim`: Number of floats expected in each row and persisted in the header.
+/// - `sq_calibration`: Already encoded scalar-quantization calibration bytes,
+///   or `None` to persist a zero-length section.
+///
+/// # Returns
+///
+/// One `ZCT2` buffer containing centroid floats followed by the optional
+/// calibration bytes.
+///
+/// # Errors
+///
+/// The signature reserves `Result` for format validation; current code emits a
+/// buffer directly. No I/O occurs.
+///
+/// # Panics
+///
+/// Integer multiplication/addition may panic in overflow-checking builds for
+/// impossible in-memory sizes. Debug builds also assert exact output length.
+/// Callers must supply rows whose lengths equal `dim`.
+///
+/// # Performance
+///
+/// Allocates and writes `O(cluster_count * dim + calibration_bytes)` bytes.
+/// Embedding calibration lets the normal metadata load avoid a separate GET.
+///
+/// # Examples
+///
+/// An SQ segment stores its calibration after the centroids. A non-SQ or PQ
+/// segment passes `None`; the same decoder then reports no embedded calibration.
 pub(crate) fn serialize_centroids_with_sq_calibration(
     centroids: &[Vec<f32>],
     dim: usize,
@@ -595,42 +1129,96 @@ pub(crate) fn serialize_centroids_with_sq_calibration(
     Ok(Bytes::from(buf))
 }
 
-/// Parsed centroid blob with optional embedded SQ calibration.
+/// Owned logical contents of either a legacy or current centroid artifact.
 #[derive(Debug)]
 pub(crate) struct CentroidsData {
-    /// IVF centroids.
+    /// IVF centroids in logical cluster order.
     pub centroids: Vec<Vec<f32>>,
-    /// Vector dimensionality.
+    /// Persisted vector dimensionality shared by centroid rows.
     pub dim: usize,
-    /// Embedded legacy SQ calibration payload, present for new SQ segments.
+    /// Embedded SQ calibration payload, present for current SQ segments.
     pub sq_calibration: Option<Bytes>,
 }
 
+/// Metadata needed to construct an in-memory index handle after loading.
+///
+/// This private transfer type unifies bootstrap and legacy-object load paths.
 #[derive(Debug)]
 struct LoadedIndexMetadata {
+    /// Shared, owned centroids in logical cluster order.
     centroids: Arc<Vec<Vec<f32>>>,
+    /// Vector dimension decoded from the centroid artifact.
     dim: usize,
+    /// Decoded SQ calibration when the centroid artifact embeds one.
     sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
+    /// Decoded resident sketch, absent for segments without a sketch ref.
     resident_sketch: Option<Arc<ResidentSketch>>,
 }
 
+/// Cacheable decoded contents of one immutable bootstrap object.
+///
+/// Stored sizes are rechecked against each manifest reference before reuse so
+/// key reuse or inconsistent metadata fails loudly.
 #[derive(Debug)]
 struct DecodedBootstrap {
+    /// Complete bootstrap-object size validated during the initial decode.
     bootstrap_size_bytes: u64,
+    /// Embedded sketch-section size validated during the initial decode.
     sketch_size_bytes: u64,
+    /// Shared decoded centroid rows.
     centroids: Arc<Vec<Vec<f32>>>,
+    /// Vector dimension decoded from the centroid section.
     dim: usize,
+    /// Decoded embedded SQ calibration, if present.
     sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
+    /// Shared decoded resident sketch.
     resident_sketch: Arc<ResidentSketch>,
 }
 
-/// Deserialize centroids from the binary format produced by `serialize_centroids`.
+/// Decodes centroid rows while discarding optional embedded calibration bytes.
+///
+/// # Parameters
+///
+/// - `data`: Complete legacy or current centroid-object bytes.
+///
+/// # Returns
+///
+/// Owned centroid rows and their persisted dimension.
+///
+/// # Errors
+///
+/// Propagates all format, bounds, size, and overflow errors from
+/// `deserialize_centroids_data`.
+///
+/// # Examples
+///
+/// A `ZCT2` SQ artifact still returns only its centroids and dimension here;
+/// callers needing calibration use `deserialize_centroids_data` instead.
 pub(crate) fn deserialize_centroids(data: &[u8]) -> Result<(Vec<Vec<f32>>, usize)> {
     let decoded = deserialize_centroids_data(data)?;
     Ok((decoded.centroids, decoded.dim))
 }
 
-/// Deserialize centroids, auto-detecting legacy and v2 object formats.
+/// Decodes centroids while auto-detecting legacy and current object formats.
+///
+/// # Parameters
+///
+/// - `data`: Complete centroid object loaded from the manifest-selected key.
+///
+/// # Returns
+///
+/// Owned centroid rows, dimension, and optional embedded SQ calibration.
+/// Legacy bytes return `None` for calibration.
+///
+/// # Errors
+///
+/// Returns an index error for malformed/truncated headers, size arithmetic
+/// overflow, incomplete floats or calibration, or extra current-format bytes.
+///
+/// # Examples
+///
+/// Bytes beginning `ZCT2` use the current decoder. Any other prefix is treated
+/// as the historical count-and-dimension header and must satisfy that layout.
 pub(crate) fn deserialize_centroids_data(data: &[u8]) -> Result<CentroidsData> {
     if data.starts_with(CENTROIDS_V2_MAGIC) {
         return deserialize_centroids_v2(data);
@@ -638,6 +1226,26 @@ pub(crate) fn deserialize_centroids_data(data: &[u8]) -> Result<CentroidsData> {
     deserialize_centroids_legacy(data)
 }
 
+/// Decodes the historical unversioned centroid layout.
+///
+/// # Parameters
+///
+/// - `data`: Bytes beginning with `num_centroids:u32, dim:u32` followed by
+///   little-endian floats.
+///
+/// # Returns
+///
+/// Owned centroids with no embedded SQ calibration.
+///
+/// # Errors
+///
+/// Returns an index error for a short/malformed header, insufficient float
+/// bytes, or a malformed float slice conversion.
+///
+/// # Compatibility
+///
+/// Extra trailing bytes are currently ignored by this legacy decoder; current
+/// `ZCT2` objects require an exact length.
 fn deserialize_centroids_legacy(data: &[u8]) -> Result<CentroidsData> {
     if data.len() < 8 {
         return Err(ZeppelinError::Index(
@@ -687,6 +1295,28 @@ fn deserialize_centroids_legacy(data: &[u8]) -> Result<CentroidsData> {
     })
 }
 
+/// Decodes and exactly validates the current `ZCT2` centroid layout.
+///
+/// # Parameters
+///
+/// - `data`: Complete bytes beginning with [`CENTROIDS_V2_MAGIC`].
+///
+/// # Returns
+///
+/// Owned centroid rows, dimension, and copied calibration bytes when the
+/// declared calibration length is non-zero.
+///
+/// # Errors
+///
+/// Returns an index error for a short header, malformed integers/floats,
+/// checked-size overflow, truncated data, or any trailing bytes.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `checked_mul`/`checked_add` turn attacker- or corruption-controlled sizes
+/// into `Option`; `ok_or_else` converts absence into a domain error. C pointer
+/// arithmetic and Java primitive arithmetic would need equivalent explicit
+/// overflow checks to avoid accepting a wrapped length.
 fn deserialize_centroids_v2(data: &[u8]) -> Result<CentroidsData> {
     if data.len() < 12 {
         return Err(ZeppelinError::Index(
@@ -772,9 +1402,38 @@ fn deserialize_centroids_v2(data: &[u8]) -> Result<CentroidsData> {
     })
 }
 
-/// Cluster blob layout:
+/// Serializes one legacy-format cluster's IDs and full-precision vectors.
+///
+/// The row-aligned layout is:
 /// `[num_vectors: u32][dimension: u32]`
 /// then for each vector: `[id_len: u32][id_bytes...][f32 * dim]`
+///
+/// # Parameters
+///
+/// - `ids`: Vector IDs in cluster row order.
+/// - `vectors`: Full-precision vectors in the same row order.
+/// - `dim`: Persisted component count per vector.
+///
+/// # Returns
+///
+/// Complete legacy cluster-section bytes. The same section may stand alone or
+/// be placed inside a grouped object.
+///
+/// # Errors
+///
+/// The signature reserves `Result` for format evolution; current code emits a
+/// buffer directly and performs no I/O.
+///
+/// # Panics
+///
+/// Allocation or integer arithmetic can panic for impossible in-memory sizes.
+/// The function also assumes `ids.len() == vectors.len()` and every vector has
+/// `dim` values; `zip` would otherwise serialize only the shorter row set.
+///
+/// # Examples
+///
+/// IDs `[a, b]` and two two-dimensional vectors become two row records whose
+/// ID and vector remain adjacent and in the caller's order.
 pub(crate) fn serialize_cluster(ids: &[String], vectors: &[Vec<f32>], dim: usize) -> Result<Bytes> {
     let n = ids.len() as u32;
     let dimension = dim as u32;
@@ -796,7 +1455,38 @@ pub(crate) fn serialize_cluster(ids: &[String], vectors: &[Vec<f32>], dim: usize
     Ok(Bytes::from(buf))
 }
 
-/// Serialize a v2 per-cluster object containing SQ codes and full vectors.
+/// Serializes one cluster section containing SQ codes and exact vectors.
+///
+/// # Parameters
+///
+/// - `ids`: Row IDs shared by both representations.
+/// - `vectors`: Full-precision rerank vectors in row order.
+/// - `sq_codes`: One scalar-quantized code row per vector in the same order.
+/// - `dim`: Vector and code dimension persisted by both child formats.
+///
+/// # Returns
+///
+/// A `ZCL2` section with absolute offsets to the SQ and full-vector payloads.
+///
+/// # Errors
+///
+/// Propagates child-format serialization errors. No remote object is written.
+///
+/// # Panics
+///
+/// Assumes row counts and dimensions agree; malformed internal inputs may be
+/// truncated by child `zip` operations or panic during size arithmetic.
+///
+/// # Performance
+///
+/// Allocates one combined buffer after separately encoding the SQ and full
+/// payloads. Co-location allows coarse scoring and exact rerank to share one
+/// cached object, while offsets permit future range reads.
+///
+/// # Examples
+///
+/// A two-row SQ cluster stores compact codes first and exact floats second. The
+/// query path can decode only codes, then later slice exact rows for reranking.
 pub(crate) fn serialize_colocated_sq_cluster(
     ids: &[String],
     vectors: &[Vec<f32>],
@@ -828,6 +1518,33 @@ pub(crate) fn serialize_colocated_sq_cluster(
 ///
 /// Each payload is a complete cluster section: either the legacy full-vector
 /// cluster format or the v2 SQ+full co-located format.
+///
+/// # Parameters
+///
+/// - `entries`: `(logical cluster index, complete cluster section)` pairs. The
+///   order becomes directory and payload order; indexes must be unique and fit
+///   in `u32`.
+///
+/// # Returns
+///
+/// A v4 grouped object when every section is `ZCL2`; otherwise a v1 object that
+/// keeps each section contiguous.
+///
+/// # Errors
+///
+/// Returns an index error for no entries, a duplicate/oversized cluster index,
+/// malformed `ZCL2` sections, or any checked size/offset overflow.
+///
+/// # Examples
+///
+/// Entries for clusters 2 and 5 produce one directory naming both. A reader can
+/// locate cluster 5 without interpreting cluster 2's payload.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// [`Bytes`] clones share immutable buffers. Passing entries by borrowed slice
+/// lets serialization inspect them without taking ownership; the returned
+/// buffer owns its complete encoded copy.
 pub(crate) fn serialize_cluster_data_object(entries: &[(usize, Bytes)]) -> Result<Bytes> {
     if entries.is_empty() {
         return Err(ZeppelinError::Index(
@@ -859,6 +1576,21 @@ pub(crate) fn serialize_cluster_data_object(entries: &[(usize, Bytes)]) -> Resul
     serialize_cluster_data_object_v1(entries)
 }
 
+/// Writes the v1 grouped-object directory followed by contiguous sections.
+///
+/// # Parameters
+///
+/// - `entries`: Prevalidated unique cluster indexes and complete sections.
+///
+/// # Returns
+///
+/// One `ZBP1` object whose directory records an absolute offset and length for
+/// each section.
+///
+/// # Errors
+///
+/// Returns an index error for directory, payload, section, or total-size
+/// overflow.
 fn serialize_cluster_data_object_v1(entries: &[(usize, Bytes)]) -> Result<Bytes> {
     let directory_len = entries
         .len()
@@ -901,10 +1633,37 @@ fn serialize_cluster_data_object_v1(entries: &[(usize, Bytes)]) -> Result<Bytes>
     Ok(Bytes::from(buf))
 }
 
+/// Writes a v4 grouped object with all SQ ranges before all full-vector ranges.
+///
+/// Separating blocks lets a coarse query range-read compact SQ data without
+/// pulling the usually larger exact-vector block. Each input `ZCL2` section is
+/// parsed and its child payloads are copied into the corresponding block.
+///
+/// # Parameters
+///
+/// - `entries`: Prevalidated cluster indexes paired with valid `ZCL2` sections.
+///
+/// # Returns
+///
+/// One `ZBP4` buffer with per-cluster SQ and full absolute ranges.
+///
+/// # Errors
+///
+/// Returns an index error for malformed input sections or checked directory,
+/// block, range, and total-size overflow.
+///
+/// # Examples
+///
+/// Two scalar-quantized clusters become `directory | SQ0 | SQ1 | full0 |
+/// full1`; the largest SQ end is therefore no later than the first full start.
 fn serialize_cluster_data_object_v4(entries: &[(usize, Bytes)]) -> Result<Bytes> {
+    /// Borrowed child payloads extracted from one input `ZCL2` section.
     struct SplitSection<'a> {
+        /// Logical cluster named in the grouped directory.
         cluster_idx: usize,
+        /// Compact scalar-quantized child artifact.
         sq: &'a [u8],
+        /// Exact full-vector child artifact.
         full: &'a [u8],
     }
 
@@ -996,14 +1755,37 @@ fn serialize_cluster_data_object_v4(entries: &[(usize, Bytes)]) -> Result<Bytes>
     Ok(Bytes::from(buf))
 }
 
-/// Cluster data for a single cluster.
+/// Owned IDs and exact vectors decoded for one logical IVF cluster.
+///
+/// Both vectors retain artifact row order; `ids[i]` identifies `vectors[i]`.
 #[derive(Debug)]
 pub(crate) struct ClusterData {
+    /// Vector IDs in stored cluster row order.
     pub ids: Vec<String>,
+    /// Full-precision vectors aligned one-to-one with [`Self::ids`].
     pub vectors: Vec<Vec<f32>>,
 }
 
-/// Deserialize a cluster blob.
+/// Decodes exact vectors from either a legacy or `ZCL2` cluster section.
+///
+/// # Parameters
+///
+/// - `data`: One complete cluster section, not an entire grouped object.
+///
+/// # Returns
+///
+/// Owned IDs and full-precision vectors. SQ bytes in a `ZCL2` section are
+/// ignored by this exact-data path.
+///
+/// # Errors
+///
+/// Returns an index error for malformed co-located offsets, a short legacy
+/// header, truncated IDs/vectors, or malformed integer fields.
+///
+/// # Examples
+///
+/// Passing a scalar-quantized co-located section returns the same IDs and exact
+/// vectors as its full child payload, not the compact codes.
 pub(crate) fn deserialize_cluster(data: &[u8]) -> Result<ClusterData> {
     let data = full_cluster_section(data)?;
     deserialize_legacy_cluster(data)
@@ -1011,6 +1793,26 @@ pub(crate) fn deserialize_cluster(data: &[u8]) -> Result<ClusterData> {
 
 /// Deserialize one cluster section from either a legacy per-cluster object or
 /// a grouped cluster-data object.
+///
+/// # Parameters
+///
+/// - `data`: Complete standalone or grouped object bytes.
+/// - `cluster_idx`: Logical cluster requested by the manifest layout.
+///
+/// # Returns
+///
+/// Owned exact cluster data. Standalone legacy bytes are decoded directly;
+/// grouped bytes select the matching directory range first.
+///
+/// # Errors
+///
+/// Returns an index error for malformed grouped metadata, a missing requested
+/// cluster, an out-of-bounds range, or malformed cluster payload.
+///
+/// # Examples
+///
+/// A grouped object containing clusters 2 and 5 returns only cluster 5 when
+/// called with index 5. Requesting cluster 3 fails loudly.
 pub(crate) fn deserialize_cluster_from_object(
     data: &[u8],
     cluster_idx: usize,
@@ -1019,6 +1821,31 @@ pub(crate) fn deserialize_cluster_from_object(
     deserialize_cluster(data)
 }
 
+/// Decodes the count/dimension legacy full-vector cluster representation.
+///
+/// # Parameters
+///
+/// - `data`: Complete child section beginning with row count and dimension.
+///
+/// # Returns
+///
+/// Owned row IDs and full-precision vector buffers in serialized order.
+///
+/// # Errors
+///
+/// Returns an index error for a short header, truncated ID length/bytes or
+/// vector bytes, and malformed numeric fields.
+///
+/// # Compatibility
+///
+/// Invalid UTF-8 IDs are decoded lossily with replacement characters, and
+/// trailing bytes after the declared rows are currently ignored.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `chunks_exact(4)` creates checked four-byte borrowed views and the iterator
+/// compiles to a tight loop. Unlike manual C pointer stepping, slice bounds are
+/// checked before iteration; the collected `Vec<f32>` owns its decoded values.
 fn deserialize_legacy_cluster(data: &[u8]) -> Result<ClusterData> {
     if data.len() < 8 {
         return Err(ZeppelinError::Index(
@@ -1081,7 +1908,25 @@ fn deserialize_legacy_cluster(data: &[u8]) -> Result<ClusterData> {
     Ok(ClusterData { ids, vectors })
 }
 
-/// Deserialize the SQ section of a v2 co-located cluster object.
+/// Decodes the SQ child of a co-located cluster section when present.
+///
+/// # Parameters
+///
+/// - `data`: One standalone cluster section.
+///
+/// # Returns
+///
+/// `Some` decoded SQ IDs/codes for `ZCL2`; `None` for a legacy full-only
+/// section.
+///
+/// # Errors
+///
+/// Returns an index error for malformed co-located offsets or SQ payload bytes.
+///
+/// # Examples
+///
+/// A legacy `cluster_i.bin` yields `None`, telling the caller to consult the
+/// historical separate `sq_cluster_i.bin` key when SQ is required.
 pub(crate) fn deserialize_colocated_sq_cluster(
     data: &[u8],
 ) -> Result<Option<crate::index::quantization::sq::SqClusterData>> {
@@ -1096,6 +1941,21 @@ pub(crate) fn deserialize_colocated_sq_cluster(
 
 /// Deserialize the SQ section for one cluster in either a legacy per-cluster
 /// object or a grouped cluster-data object.
+///
+/// # Parameters
+///
+/// - `data`: Complete standalone or grouped object bytes.
+/// - `cluster_idx`: Logical cluster to locate in a grouped object.
+///
+/// # Returns
+///
+/// `Some` decoded SQ data for v4 or `ZCL2` input, or `None` when the selected
+/// legacy section contains only full vectors.
+///
+/// # Errors
+///
+/// Returns an index error for malformed directories/ranges, a missing cluster
+/// or SQ range in v4, or invalid SQ bytes.
 pub(crate) fn deserialize_colocated_sq_cluster_from_object(
     data: &[u8],
     cluster_idx: usize,
@@ -1121,31 +1981,60 @@ pub(crate) fn deserialize_colocated_sq_cluster_from_object(
     deserialize_colocated_sq_cluster(data)
 }
 
+/// Borrowed child payloads from one validated `ZCL2` cluster section.
 struct ColocatedClusterSections<'a> {
+    /// Scalar-quantized cluster artifact bytes.
     sq: &'a [u8],
+    /// Legacy-format exact-vector cluster artifact bytes.
     full: &'a [u8],
 }
 
+/// Borrowed full-vector payload for one entry in a grouped object.
 pub(crate) struct ClusterObjectSection<'a> {
+    /// Logical IVF cluster represented by this range.
     pub cluster_idx: usize,
+    /// Full-vector child section borrowed from the grouped object.
     pub data: &'a [u8],
 }
 
 /// Absolute byte ranges for one cluster inside a grouped cluster-data object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClusterObjectRange {
+    /// Logical IVF cluster named by the directory entry.
     pub cluster_idx: usize,
+    /// Compact SQ range for v4 objects; absent for v1 full-only objects.
     pub sq: Option<Range<usize>>,
+    /// Exact-vector child range in either grouped format.
     pub full: Range<usize>,
 }
 
-/// Directory layout for a grouped cluster-data object.
+/// Validated directory layout for a grouped cluster-data object.
+///
+/// Ranges are absolute object offsets. Parsing the directory proves structural
+/// relationships but full object bounds are checked when a range is consumed,
+/// allowing callers to parse a header-only range GET first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClusterObjectLayout {
+    /// One unique range descriptor per directory entry, in stored order.
     pub sections: Vec<ClusterObjectRange>,
 }
 
 impl ClusterObjectLayout {
+    /// Finds the range descriptor for a logical cluster.
+    ///
+    /// # Parameters
+    ///
+    /// - `cluster_idx`: Logical cluster index requested by query planning.
+    ///
+    /// # Returns
+    ///
+    /// A borrowed descriptor, or `None` when the directory does not name that
+    /// cluster. Stored section order does not affect lookup semantics.
+    ///
+    /// # Examples
+    ///
+    /// A layout for clusters `[2, 5]` returns the second descriptor for 5 and
+    /// `None` for 3.
     pub(crate) fn section(&self, cluster_idx: usize) -> Option<&ClusterObjectRange> {
         self.sections
             .iter()
@@ -1157,6 +2046,25 @@ impl ClusterObjectLayout {
 /// directory for `entry_count` manifest entries. The returned range may include
 /// a few payload bytes for v1 objects; parsers ignore bytes beyond the actual
 /// directory.
+///
+/// # Parameters
+///
+/// - `entry_count`: Number of cluster entries declared by manifest metadata.
+///
+/// # Returns
+///
+/// A conservative header range length large enough for the wider v4 directory.
+/// Callers can range-read `0..len` and pass those bytes to
+/// `cluster_object_layout` without fetching payload bodies.
+///
+/// # Errors
+///
+/// Returns an index error if directory or header-size arithmetic overflows.
+///
+/// # Examples
+///
+/// For two entries, the returned length covers an eight-byte header and two v4
+/// directory records. A v1 parser ignores the harmless extra payload prefix.
 pub(crate) fn cluster_object_header_range_len(entry_count: usize) -> Result<usize> {
     let directory_len = entry_count
         .checked_mul(CLUSTER_DATA_OBJECT_V4_DIR_ENTRY_LEN)
@@ -1168,6 +2076,26 @@ pub(crate) fn cluster_object_header_range_len(entry_count: usize) -> Result<usiz
 
 /// Return the directory layout in a grouped cluster-data object. `data` only
 /// needs to contain the object header and directory.
+///
+/// # Parameters
+///
+/// - `data`: Header-plus-directory bytes, optionally followed by payload data.
+///
+/// # Returns
+///
+/// `Some` parsed v1/v4 layout or `None` when the bytes do not carry a supported
+/// grouped-object signature. `None` identifies a legacy standalone cluster,
+/// not a malformed recognized grouped object.
+///
+/// # Errors
+///
+/// Returns an index error for a recognized but truncated/malformed directory,
+/// duplicate cluster indexes, invalid relationships, or size overflow.
+///
+/// # Examples
+///
+/// A `ZBP4` header range can expose SQ and full ranges before the payload is
+/// fetched. Raw legacy cluster bytes return `None`.
 pub(crate) fn cluster_object_layout(data: &[u8]) -> Result<Option<ClusterObjectLayout>> {
     if data.starts_with(CLUSTER_DATA_OBJECT_V1_MAGIC) {
         return cluster_object_layout_v1(data).map(Some);
@@ -1183,6 +2111,26 @@ pub(crate) fn cluster_object_layout(data: &[u8]) -> Result<Option<ClusterObjectL
 /// `Ok(None)` means the bytes are a legacy per-cluster object, not a grouped
 /// object. Callers that already know they fetched a grouped key should treat
 /// `None` as an error at that boundary.
+///
+/// # Parameters
+///
+/// - `data`: Complete object bytes. Unlike `cluster_object_layout`, this helper
+///   must be able to slice every declared full-vector range.
+///
+/// # Returns
+///
+/// Borrowed full-vector sections in directory order, or `None` for a standalone
+/// legacy object. Each returned slice remains tied to `data`.
+///
+/// # Errors
+///
+/// Returns an index error for malformed directory metadata or any full-vector
+/// range that extends outside the supplied complete object.
+///
+/// # Examples
+///
+/// A grouped object naming clusters 2 and 5 yields two views. Passing legacy
+/// `cluster_2.bin` bytes yields `None`, not a fabricated one-entry directory.
 pub(crate) fn cluster_object_sections(
     data: &[u8],
 ) -> Result<Option<Vec<ClusterObjectSection<'_>>>> {
@@ -1205,6 +2153,21 @@ pub(crate) fn cluster_object_sections(
     Ok(Some(sections))
 }
 
+/// Parses the v1 directory into full-vector ranges.
+///
+/// # Parameters
+///
+/// - `data`: Bytes beginning with `ZBP1` and containing the full directory.
+///
+/// # Returns
+///
+/// Unique logical cluster descriptors whose `full` ranges use absolute object
+/// offsets and whose `sq` fields are `None`.
+///
+/// # Errors
+///
+/// Returns an index error for zero entries, truncation, duplicate indexes,
+/// offsets inside the directory, malformed integers, or arithmetic overflow.
 fn cluster_object_layout_v1(data: &[u8]) -> Result<ClusterObjectLayout> {
     let entry_count = cluster_object_entry_count(data)?;
     let directory_len = entry_count
@@ -1256,6 +2219,22 @@ fn cluster_object_layout_v1(data: &[u8]) -> Result<ClusterObjectLayout> {
     Ok(ClusterObjectLayout { sections })
 }
 
+/// Parses the v4 directory into separate SQ and exact-vector ranges.
+///
+/// # Parameters
+///
+/// - `data`: Bytes beginning with `ZBP` plus version 4 and containing the full
+///   directory.
+///
+/// # Returns
+///
+/// Unique logical cluster descriptors with both SQ and full absolute ranges.
+///
+/// # Errors
+///
+/// Returns an index error for zero entries, a truncated directory, duplicate
+/// indexes, SQ data starting inside the directory, overlapping SQ/full ranges,
+/// malformed integers, or arithmetic overflow.
 fn cluster_object_layout_v4(data: &[u8]) -> Result<ClusterObjectLayout> {
     let entry_count = cluster_object_entry_count(data)?;
     let directory_len = entry_count
@@ -1321,6 +2300,20 @@ fn cluster_object_layout_v4(data: &[u8]) -> Result<ClusterObjectLayout> {
     Ok(ClusterObjectLayout { sections })
 }
 
+/// Reads and validates the entry count shared by grouped-object headers.
+///
+/// # Parameters
+///
+/// - `data`: Bytes containing at least the shared eight-byte header.
+///
+/// # Returns
+///
+/// A strictly positive platform-sized entry count.
+///
+/// # Errors
+///
+/// Returns an index error for a short header, malformed count field, or zero
+/// entries.
 fn cluster_object_entry_count(data: &[u8]) -> Result<usize> {
     if data.len() < CLUSTER_DATA_OBJECT_HEADER_LEN {
         return Err(ZeppelinError::Index(
@@ -1340,12 +2333,36 @@ fn cluster_object_entry_count(data: &[u8]) -> Result<usize> {
     Ok(entry_count)
 }
 
+/// Recognizes the v4 grouped-object signature without parsing its directory.
+///
+/// # Parameters
+///
+/// - `data`: Any byte slice, including one shorter than a header.
+///
+/// # Returns
+///
+/// `true` only when the first four bytes are `ZBP` followed by version 4.
 fn is_cluster_data_object_v4(data: &[u8]) -> bool {
     data.len() >= 4
         && &data[0..3] == CLUSTER_DATA_OBJECT_MAGIC_PREFIX
         && data[3] == CLUSTER_DATA_OBJECT_V4_VERSION
 }
 
+/// Validates a half-open persisted range against complete object bytes.
+///
+/// # Parameters
+///
+/// - `range`: Absolute `start..end` byte interval.
+/// - `object_len`: Complete object size available to slice.
+/// - `label`: Context included in error messages.
+///
+/// # Returns
+///
+/// `Ok(())` when `start <= end <= object_len`.
+///
+/// # Errors
+///
+/// Returns an index error for a reversed or out-of-bounds range.
 fn validate_range_in_object(range: &Range<usize>, object_len: usize, label: &str) -> Result<()> {
     if range.start > range.end || range.end > object_len {
         return Err(ZeppelinError::Index(format!(
@@ -1356,6 +2373,22 @@ fn validate_range_in_object(range: &Range<usize>, object_len: usize, label: &str
     Ok(())
 }
 
+/// Borrows one full-vector child section from standalone or grouped bytes.
+///
+/// # Parameters
+///
+/// - `data`: Complete standalone cluster section or grouped object.
+/// - `cluster_idx`: Logical cluster to select when grouped.
+///
+/// # Returns
+///
+/// A slice tied to `data`. Legacy standalone bytes are returned whole because
+/// their key already identifies the cluster.
+///
+/// # Errors
+///
+/// Returns an index error for malformed grouped metadata/ranges or a missing
+/// requested cluster.
 fn cluster_section_from_object(data: &[u8], cluster_idx: usize) -> Result<&[u8]> {
     let Some(sections) = cluster_object_sections(data)? else {
         return Ok(data);
@@ -1371,6 +2404,20 @@ fn cluster_section_from_object(data: &[u8], cluster_idx: usize) -> Result<&[u8]>
         })
 }
 
+/// Selects the exact-vector child from a co-located or legacy cluster section.
+///
+/// # Parameters
+///
+/// - `data`: One complete child cluster section.
+///
+/// # Returns
+///
+/// The `ZCL2` full-vector slice, or all input bytes for legacy full-only data.
+///
+/// # Errors
+///
+/// Returns an index error when a recognized `ZCL2` header has invalid offsets
+/// or size.
 fn full_cluster_section(data: &[u8]) -> Result<&[u8]> {
     if !data.starts_with(CLUSTER_V2_MAGIC) {
         return Ok(data);
@@ -1378,6 +2425,26 @@ fn full_cluster_section(data: &[u8]) -> Result<&[u8]> {
     Ok(colocated_cluster_sections(data)?.full)
 }
 
+/// Validates `ZCL2` offsets and borrows its SQ and exact-vector children.
+///
+/// # Parameters
+///
+/// - `data`: Complete co-located cluster-section bytes.
+///
+/// # Returns
+///
+/// Non-overlapping contiguous child slices, with SQ first and full data second.
+///
+/// # Errors
+///
+/// Returns an index error for a short header, malformed integer, unexpected SQ
+/// start, non-contiguous full start, arithmetic overflow, or exact-size
+/// mismatch.
+///
+/// # Examples
+///
+/// A valid section laid out as `header | SQ | full` returns the two payloads.
+/// Appending a byte is rejected because immutable artifact lengths are exact.
 fn colocated_cluster_sections(data: &[u8]) -> Result<ColocatedClusterSections<'_>> {
     if data.len() < CLUSTER_V2_HEADER_LEN {
         return Err(ZeppelinError::Index(
@@ -1423,6 +2490,27 @@ fn colocated_cluster_sections(data: &[u8]) -> Result<ColocatedClusterSections<'_
     })
 }
 
+/// Reads one little-endian `u64` field and converts it safely to `usize`.
+///
+/// # Parameters
+///
+/// - `data`: Buffer containing the complete eight-byte field.
+/// - `offset`: Start of the field.
+/// - `label`: Context included in parse/conversion errors.
+///
+/// # Returns
+///
+/// The platform-sized value.
+///
+/// # Errors
+///
+/// Returns an index error when the eight-byte slice is unavailable/malformed or
+/// the value cannot fit this platform's `usize`.
+///
+/// # Panics
+///
+/// Slicing panics if `offset + 8` exceeds `data.len()`. Callers first validate
+/// the fixed header/directory length that contains each requested field.
 fn read_u64_usize(data: &[u8], offset: usize, label: &str) -> Result<usize> {
     let value = u64::from_le_bytes(
         data[offset..offset + 8]
@@ -1438,12 +2526,55 @@ fn read_u64_usize(data: &[u8], offset: usize, label: &str) -> Result<usize> {
 /// We use JSON rather than bincode because `AttributeValue` uses
 /// `#[serde(untagged)]`, which requires `deserialize_any` -- a method
 /// that bincode does not support.
+///
+/// # Parameters
+///
+/// - `attrs`: Row-aligned optional attribute maps for one logical cluster.
+///
+/// # Returns
+///
+/// UTF-8 JSON bytes preserving vector-row order and explicit null rows.
+///
+/// # Errors
+///
+/// Returns a serialization error if serde cannot encode the values. No object
+/// is written.
+///
+/// # Examples
+///
+/// `[Some({"color": "red"}), None]` remains two rows, so the first attribute
+/// still belongs to the first vector after decode.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `Option<HashMap<...>>` makes absence explicit rather than using a nullable
+/// pointer. The self-describing JSON format is required because serde's
+/// untagged enum must inspect value shape during decoding.
 pub(crate) fn serialize_attrs(attrs: &[Option<HashMap<String, AttributeValue>>]) -> Result<Bytes> {
     let encoded = serde_json::to_vec(attrs)?;
     Ok(Bytes::from(encoded))
 }
 
-/// Deserialize attributes blob.
+/// Decodes one cluster's row-aligned JSON attribute sidecar.
+///
+/// # Parameters
+///
+/// - `data`: Complete JSON sidecar bytes loaded from the manifest-selected
+///   cluster owner.
+///
+/// # Returns
+///
+/// Owned optional maps in stored row order.
+///
+/// # Errors
+///
+/// Returns a serde error for invalid JSON, unsupported value shapes, or values
+/// that cannot be represented by [`AttributeValue`].
+///
+/// # Examples
+///
+/// A two-row sidecar containing one object and one `null` yields `Some(map)`
+/// followed by `None`.
 pub(crate) fn deserialize_attrs(
     data: &[u8],
 ) -> Result<Vec<Option<HashMap<String, AttributeValue>>>> {
@@ -1454,12 +2585,89 @@ pub(crate) fn deserialize_attrs(
 // Build pipeline
 // ---------------------------------------------------------------------------
 
-/// Build an IVF-Flat index from the given vectors.
+/// Builds and uploads a complete immutable IVF-Flat segment candidate.
 ///
-/// 1. Train centroids via k-means++.
-/// 2. Assign every vector to its nearest centroid.
-/// 3. Serialize and write all artifacts to S3.
-/// 4. Return an `IvfFlatIndex` handle with the metadata needed for search.
+/// The operation validates one same-dimensional vector snapshot, trains
+/// k-means centroids, assigns each row to its nearest centroid, records the
+/// runner-up affinity used for physical object grouping, and produces all
+/// cluster, attribute, bitmap, membership, sketch, bootstrap, and configured
+/// quantization artifacts. It returns an index handle and manifest references
+/// but deliberately does not publish a manifest.
+///
+/// # Parameters
+///
+/// - `vectors`: Complete borrowed vector snapshot for the new segment. It must
+///   be non-empty; every row must have the same non-zero dimension. IDs and
+///   attributes are cloned into cluster order during construction.
+/// - `config`: Validated indexing configuration controlling centroid count,
+///   k-means convergence, quantization, PQ subdivision, and bitmap sidecars.
+/// - `store`: Zeppelin object-store boundary used for every immutable PUT.
+/// - `namespace`: Validated namespace key prefix. This is an object-store key
+///   component, not an HTTP path segment.
+/// - `segment_id`: Fresh segment identifier. Reusing an ID would overwrite
+///   write-once keys and violates the caller contract.
+///
+/// # Returns
+///
+/// An owned [`IvfFlatIndex`] with resident centroids/sketch and references to
+/// the uploaded cluster objects, bootstrap, membership, and sketch. Callers use
+/// those references when constructing the later manifest [`SegmentRef`][crate::wal::manifest::SegmentRef].
+///
+/// # Errors
+///
+/// Returns an index error for empty input, zero dimension, invalid grouping or
+/// persisted-format limits, and centroid/quantization/sketch training failures;
+/// returns [`ZeppelinError::DimensionMismatch`] for inconsistent row shape;
+/// and propagates serialization and object-store PUT failures.
+///
+/// Failure is not transactional. Because objects are uploaded in phases, an
+/// error may leave immutable but unreferenced objects under `segment_id`. No
+/// manifest is changed here, so those objects are not visible to readers and
+/// may later be removed as orphans.
+///
+/// # Side Effects
+///
+/// Writes the centroid object first; grouped cluster data and row sidecars in
+/// parallel; then membership, sketch, and bootstrap objects; and finally PQ
+/// codebook/cluster objects when product quantization is configured. It emits
+/// structured progress logs and may print grouping statistics when enabled.
+///
+/// # Consistency
+///
+/// Every output key is segment-scoped and intended to be immutable. Successful
+/// PUTs establish object existence only. A subsequent compaction fencing check
+/// and manifest compare-and-swap make the segment authoritative and visible.
+/// This function neither acquires a lease nor writes the manifest.
+///
+/// # Performance
+///
+/// Centroid training dominates CPU for many builds. Assignment costs
+/// `O(vector_count * centroid_count * dim)`; grouping additionally costs
+/// `O(centroid_count^2 * dim)` time and `O(centroid_count^2)` memory. The build
+/// clones vector values into cluster buffers and temporarily retains encoded
+/// artifacts until their PUT futures complete. It writes one cluster-data
+/// object per density group rather than one per cluster; attributes and
+/// optional bitmaps remain one sidecar per cluster.
+///
+/// # Examples
+///
+/// Suppose compaction has 50,000 surviving 768-dimensional product vectors and
+/// a fresh ID `seg-42`. This function trains the configured centroids, uploads
+/// immutable `seg-42` artifacts, and returns their refs. Queries still see the
+/// previous segment until compaction successfully publishes a manifest naming
+/// `seg-42`. If the sketch PUT fails, earlier centroid and cluster objects may
+/// remain in S3 but are not queryable through the manifest.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `vectors: &[VectorEntry]` and `config: &IndexingConfig` are shared borrows;
+/// the builder cannot consume or mutate caller state. It intentionally clones
+/// IDs, values, and attributes into a new row order because the async PUT
+/// futures must own stable data after the assignment loop. [`Bytes`] clones in
+/// `write_futs` share immutable payload allocations, unlike cloning a `Vec`,
+/// which would copy elements. `join_all` drives independent PUT futures
+/// concurrently and returns every result; the later loop uses `?` to surface
+/// failures rather than discard them.
 pub async fn build_ivf_flat(
     vectors: &[VectorEntry],
     config: &IndexingConfig,
@@ -1752,18 +2960,79 @@ pub async fn build_ivf_flat(
     })
 }
 
-/// Load an IVF-Flat index using pre-known metadata from the manifest.
+/// Loads an IVF-Flat handle from manifest-provided metadata.
 ///
-/// Fetches the bootstrap object when present, otherwise fetches legacy
-/// centroids plus resident sketch artifacts. It skips the cluster-count probe
-/// loop and quantization-type detection that `load_ivf_flat` performs, saving
-/// ~18 S3 GETs per query.
+/// This is the normal query-planning loader. New segments provide one bootstrap
+/// object containing centroids and the resident sketch. Older segments load
+/// those artifacts separately. Cluster vector objects remain lazy and are read
+/// only if search chooses them.
 ///
-/// When `cache` is provided, the bootstrap or legacy metadata blobs are served
-/// through the tiered cache (memory → disk → S3) and pinned for the
-/// namespace's active segment: `pin_scoped` keeps them safe from LRU eviction
-/// and automatically unpins the previous segment's key on rotation.
-/// Cache errors are NOT swallowed — a failed fetch fails the load.
+/// # Parameters
+///
+/// - `store`: Object-store boundary used after cache misses.
+/// - `namespace`: Namespace whose active segment metadata is being loaded.
+/// - `segment_id`: Manifest-selected logical segment identifier.
+/// - `num_vectors`: Manifest-declared segment cardinality; no cluster scan is
+///   performed to recompute it.
+/// - `quantization`: Manifest-declared representation strategy.
+/// - `cluster_owners`: Per-cluster physical owner IDs for incremental
+///   carry-over, or empty for the segment's own legacy layout.
+/// - `cluster_objects`: Manifest-defined grouped-object layout, or empty for
+///   one legacy object per cluster.
+/// - `sketch_ref`: Manifest reference to the resident coarse sketch. A
+///   bootstrap requires this ref so embedded sketch size can be validated.
+/// - `bootstrap_ref`: Manifest reference to the combined metadata object, or
+///   `None` for older independently stored metadata.
+/// - `cache`: Optional tiered disk/memory cache for active-segment metadata.
+///
+/// # Returns
+///
+/// An owned [`IvfFlatIndex`] that shares decoded centroid/sketch allocations
+/// through [`Arc`] and retains the supplied physical layout for lazy search.
+///
+/// # Errors
+///
+/// Propagates cache and object-store failures, malformed or size-mismatched
+/// centroid/bootstrap/sketch bytes, missing sketch metadata for a bootstrap,
+/// SQ calibration decode failures, and invalid cluster-object coverage.
+/// Cache failures are not treated as misses unless the cache API itself reports
+/// a normal miss.
+///
+/// # Side Effects
+///
+/// On a cold path, performs object-store GETs through the cache. With a cache,
+/// it inserts decoded metadata and pins the current bootstrap or legacy
+/// centroids/sketch under namespace-scoped roles, unpinning the previous active
+/// keys.
+///
+/// # Consistency
+///
+/// The caller must supply fields from one authoritative manifest snapshot.
+/// Cache keys are exactly those refs, and declared sizes are revalidated before
+/// decoded bootstrap reuse. Cache residency cannot select a segment or make an
+/// unpublished artifact visible.
+///
+/// # Performance
+///
+/// A cold current-format load needs one bootstrap GET. A cold legacy load needs
+/// one centroid GET plus one sketch GET when a sketch ref exists. Decoded-cache
+/// hits need no GET. Cluster-object lookup construction is linear in logical
+/// cluster count and manifest entries, avoiding the probing loader's LIST and
+/// per-cluster reads.
+///
+/// # Examples
+///
+/// A manifest naming `seg-42`, its bootstrap, two grouped cluster objects, and
+/// 50,000 rows yields a handle after one cold bootstrap GET. Rotating the
+/// manifest to `seg-43` causes its metadata to be pinned and the prior segment's
+/// pins to be released; the manifest remains the authority for that rotation.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Ownership of the supplied `Vec<String>` and `Vec<ClusterDataObjectRef>` is
+/// moved into the returned handle, avoiding deep copies. The optional cache is
+/// merely borrowed for the async call and cannot be stored accidentally.
+/// Pattern matching on `Option` makes the bootstrap and legacy paths explicit.
 #[allow(clippy::too_many_arguments)]
 pub async fn load_ivf_flat_from_manifest(
     store: &ZeppelinStore,
@@ -1843,6 +3112,47 @@ pub async fn load_ivf_flat_from_manifest(
     })
 }
 
+/// Loads, validates, decodes, and caches one manifest-selected bootstrap.
+///
+/// Lookup order is decoded disk-cache metadata, process-wide decoded reuse,
+/// tiered raw-byte cache, then S3/MinIO. The process-wide path is used only when
+/// a disk cache is present; cache-less callers are intentionally cold.
+///
+/// # Parameters
+///
+/// - `store`: Authoritative object-store boundary used after raw cache misses.
+/// - `namespace`: Namespace scope used for pin rotation.
+/// - `bootstrap_ref`: Manifest key and exact object size.
+/// - `sketch_ref`: Required manifest metadata for the embedded sketch section.
+/// - `cache`: Optional cache that can hold both raw bytes and decoded values.
+///
+/// # Returns
+///
+/// Shared decoded centroids/sketch, dimension, and optional SQ calibration.
+///
+/// # Errors
+///
+/// Returns an index error when the sketch ref is absent, manifest/cached/object
+/// sizes disagree, or embedded bytes fail bootstrap, centroid, calibration, or
+/// sketch validation. Propagates cache and object-store failures.
+///
+/// # Side Effects
+///
+/// May GET the bootstrap, insert raw/decoded cache entries, add a process-wide
+/// decoded entry, and rotate namespace metadata pins. Pinning occurs after raw
+/// fetch and before full decode, so a later format error can leave the bad key
+/// pinned until a subsequent rotation.
+///
+/// # Consistency
+///
+/// Reuse is keyed by the manifest-selected immutable object key and guarded by
+/// both bootstrap and embedded-sketch size checks. The cache cannot override a
+/// different manifest ref.
+///
+/// # Performance
+///
+/// The cold path performs one GET and decodes both child artifacts. Decoded hits
+/// clone only [`Arc`] handles and the small SQ calibration value.
 async fn load_bootstrap_artifacts(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1944,6 +3254,29 @@ async fn load_bootstrap_artifacts(
     })
 }
 
+/// Revalidates cached bootstrap sizes and builds loader metadata.
+///
+/// # Parameters
+///
+/// - `key`: Bootstrap key used in diagnostics.
+/// - `decoded`: Shared previously validated bootstrap contents.
+/// - `bootstrap_ref`: Current manifest's complete-object size.
+/// - `sketch_ref`: Current manifest's embedded-sketch size.
+///
+/// # Returns
+///
+/// A metadata view sharing centroid and sketch allocations with the cache.
+///
+/// # Errors
+///
+/// Returns an index error if either current manifest size differs from the size
+/// stored at decode time.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `Arc::clone` increments a reference count; it does not clone the centroid or
+/// sketch payload. The explicit spelling distinguishes shared ownership from a
+/// deep `Vec::clone`.
 fn metadata_from_decoded_bootstrap(
     key: &str,
     decoded: Arc<DecodedBootstrap>,
@@ -1970,6 +3303,23 @@ fn metadata_from_decoded_bootstrap(
     })
 }
 
+/// Rotates cache pins from separate metadata objects to one bootstrap object.
+///
+/// # Parameters
+///
+/// - `cache`: Namespace-aware cache whose LRU pins are updated.
+/// - `namespace`: Scope name used to replace only this namespace's roles.
+/// - `bootstrap_key`: Manifest-selected active bootstrap key to protect.
+///
+/// # Side Effects
+///
+/// Removes legacy centroid and sketch role pins, then pins the bootstrap role.
+/// The operations are awaited in that order and perform no object-store I/O.
+///
+/// # Examples
+///
+/// When `catalog` moves from legacy metadata to `seg-42/bootstrap.bin`, the two
+/// old role pins are released before the combined object is pinned.
 async fn pin_bootstrap_metadata(
     cache: &crate::cache::DiskCache,
     namespace: &str,
@@ -1984,6 +3334,35 @@ async fn pin_bootstrap_metadata(
         .await;
 }
 
+/// Loads and optionally caches a legacy separately stored resident sketch.
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary used after cache misses.
+/// - `namespace`: Scope for the active sketch pin.
+/// - `sketch_ref`: Manifest key and expected size, or `None` for a segment that
+///   predates resident sketches.
+/// - `cache`: Optional raw and decoded cache.
+///
+/// # Returns
+///
+/// `Some` shared decoded sketch when a ref exists, or `None` without any I/O
+/// when it does not.
+///
+/// # Errors
+///
+/// Propagates cache/object-store failures and returns an index error for invalid
+/// sketch bytes or a manifest/object size mismatch.
+///
+/// # Side Effects
+///
+/// May fetch and cache raw bytes, pin the active sketch key, and insert the
+/// decoded value. Pinning precedes size validation on the raw path.
+///
+/// # Performance
+///
+/// A decoded hit performs no GET and shares the allocation. A cold path
+/// performs one GET and one complete sketch decode.
 async fn load_resident_sketch(
     store: &ZeppelinStore,
     namespace: &str,
@@ -2028,11 +3407,66 @@ async fn load_resident_sketch(
     Ok(Some(sketch))
 }
 
-/// Load an existing IVF-Flat index from S3 artifacts.
+/// Reconstructs an IVF-Flat handle by listing and probing segment artifacts.
 ///
-/// Only the centroids are loaded into memory; cluster data is fetched
-/// on demand during search. Detects available quantization by probing
-/// for calibration/codebook artifacts.
+/// This compatibility loader is used by compaction and tests when a
+/// [`SegmentRef`][crate::wal::manifest::SegmentRef] is not supplied. It loads
+/// centroids, lists grouped keys, reads every cluster to count rows, and probes
+/// quantization sidecars. Normal query planning should use
+/// [`load_ivf_flat_from_manifest`] so the manifest determines layout without
+/// expensive discovery.
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary used for all GET and LIST requests.
+/// - `namespace`: Namespace key prefix containing the segment directory.
+/// - `segment_id`: Existing segment directory to inspect.
+///
+/// # Returns
+///
+/// An [`IvfFlatIndex`] with owned centroids, reconstructed row count and grouped
+/// layout, and detected quantization. Cluster payloads are decoded for counting
+/// but are not retained in the returned handle.
+///
+/// # Errors
+///
+/// Propagates centroid, list, grouped/per-cluster GET, layout, and cluster decode
+/// errors. A key with a grouped filename but non-grouped bytes is an error.
+/// Quantization probes are intentionally heuristic: any PQ probe error is
+/// treated as "not PQ," and any legacy SQ probe error as "not SQ."
+///
+/// # Side Effects
+///
+/// Performs object-store reads and emits a structured load log. It does not
+/// write artifacts, cache data, or publish a manifest.
+///
+/// # Consistency
+///
+/// This function discovers physical objects by prefix and therefore is not an
+/// authority boundary. Callers must already know the segment is appropriate to
+/// inspect; query visibility still comes exclusively from the manifest. It does
+/// not load bootstrap, sketch, membership, cluster-owner carry-over, or bitmap
+/// field metadata.
+///
+/// # Performance
+///
+/// Performs one centroid GET, one prefix LIST, one GET per grouped object (or
+/// per logical cluster for legacy layout), then one PQ probe and possibly one SQ
+/// probe. It decodes all full cluster vectors solely to sum row counts. The
+/// manifest-aware loader avoids this work.
+///
+/// # Examples
+///
+/// Compaction inspecting a legacy four-cluster segment GETs all four cluster
+/// objects to derive cardinality. The returned handle can read/rewrite that
+/// segment, but its existence does not itself prove the segment is active.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The iterator pipeline filters listed keys and owns the selected `String`s;
+/// `collect` makes that ownership explicit before asynchronous GETs begin.
+/// `Option` is not used for probe errors here—the code calls `is_ok`, so all
+/// error detail is deliberately discarded by this legacy heuristic.
 pub async fn load_ivf_flat(
     store: &ZeppelinStore,
     namespace: &str,
@@ -2158,8 +3592,21 @@ pub async fn load_ivf_flat(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    //! Protects persisted-format round trips, corruption rejection, grouping
+    //! limits, and normal/legacy metadata-loading paths.
+    //!
+    //! These unit tests use an in-memory object-store implementation so they
+    //! can isolate encoding and cache contracts without external S3 setup. They
+    //! do not prove manifest publication; production compaction tests cover the
+    //! later visibility boundary. `unwrap` and `expect` are allowed here so a
+    //! failed prerequisite stops the test at the exact setup operation.
+
     use super::*;
 
+    /// Proves current centroid bytes preserve row order, values, and dimension.
+    ///
+    /// A regression in little-endian encoding, header offsets, or row traversal
+    /// would change the decoded values and fail this round trip.
     #[test]
     fn test_serialize_deserialize_centroids() {
         let centroids = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
@@ -2169,6 +3616,10 @@ mod tests {
         assert_eq!(decoded, centroids);
     }
 
+    /// Proves a bootstrap preserves its embedded artifacts byte-for-byte.
+    ///
+    /// This catches directory offset changes that would make the combined GET
+    /// incompatible with the independent centroid or sketch decoders.
     #[test]
     fn test_serialize_deserialize_bootstrap_sections() {
         let centroids = b"centroid-bytes";
@@ -2179,6 +3630,10 @@ mod tests {
         assert_eq!(sections.sketch, sketch);
     }
 
+    /// Proves malformed bootstrap identity, version, and bounds fail loudly.
+    ///
+    /// Accepting any case would allow corrupt remote bytes to reach a child
+    /// decoder or permit an out-of-bounds slice.
     #[test]
     fn test_deserialize_bootstrap_rejects_malformed_header() {
         let data = serialize_bootstrap(b"centroids", b"sketch").unwrap();
@@ -2196,6 +3651,10 @@ mod tests {
         assert!(deserialize_bootstrap(&bad_bounds).is_err());
     }
 
+    /// Proves legacy cluster encoding keeps IDs aligned with exact vectors.
+    ///
+    /// Swapping row order or consuming the wrong number of floats would break
+    /// query-result identity and fail the equality checks.
     #[test]
     fn test_serialize_deserialize_cluster() {
         let ids = vec!["vec_1".to_string(), "vec_2".to_string()];
@@ -2206,6 +3665,11 @@ mod tests {
         assert_eq!(cluster.vectors, vecs);
     }
 
+    /// Proves v4 grouped SQ objects expose valid, separable coarse/exact ranges.
+    ///
+    /// The test parses both a full object and a header-only prefix, checks that
+    /// all SQ bytes precede full bytes, and decodes both logical clusters. It
+    /// protects the range-GET directory contract as well as row alignment.
     #[test]
     fn test_cluster_data_object_v4_exposes_sq_and_full_ranges() {
         let ids0 = vec!["a".to_string(), "b".to_string()];
@@ -2261,6 +3725,10 @@ mod tests {
         assert_eq!(cluster1.vectors, vecs1);
     }
 
+    /// Proves JSON attribute sidecars preserve present and absent row values.
+    ///
+    /// This guards the self-describing serde format required by untagged
+    /// `AttributeValue` variants and the one-entry-per-vector alignment.
     #[test]
     fn test_serialize_deserialize_attrs() {
         let mut attrs_map = HashMap::new();
@@ -2277,18 +3745,31 @@ mod tests {
         assert!(decoded[1].is_none());
     }
 
+    /// Proves a centroid artifact shorter than the legacy header is rejected.
+    ///
+    /// The failure prevents decoder indexing from treating arbitrary short
+    /// storage data as a valid zero-shaped index.
     #[test]
     fn test_centroids_header_too_small() {
         let data = vec![0u8; 4]; // less than 8 bytes
         assert!(deserialize_centroids(&data).is_err());
     }
 
+    /// Proves a cluster artifact shorter than its fixed header is rejected.
+    ///
+    /// This protects all callers because legacy and current exact-data paths
+    /// ultimately pass through the same decoder.
     #[test]
     fn test_cluster_header_too_small() {
         let data = vec![0u8; 4];
         assert!(deserialize_cluster(&data).is_err());
     }
 
+    /// Proves density grouping obeys its cap without absorbing sparse tails.
+    ///
+    /// Four nearby centroids may share one object, while two distant centroids
+    /// must remain singleton groups. This catches both over-grouping and a cap
+    /// violation.
     #[test]
     fn density_grouping_respects_cap_and_leaves_sparse_tail() {
         let centroids = vec![
@@ -2309,6 +3790,11 @@ mod tests {
         assert!(groups.iter().any(|group| group.as_slice() == [5]));
     }
 
+    /// Proves the legacy centroid decoder rejects a truncated float payload.
+    ///
+    /// A header declaring two three-dimensional centroids receives only one
+    /// row; the error must identify a size mismatch rather than return partial
+    /// training metadata.
     #[test]
     fn test_deserialize_centroids_truncated_floats() {
         // Header says 2 centroids dim=3 but only provide 1 centroid of float data
@@ -2327,6 +3813,10 @@ mod tests {
         }
     }
 
+    /// Proves a declared vector row cannot be decoded from partial float bytes.
+    ///
+    /// Returning the ID with a short vector would violate the index dimension
+    /// invariant and could later panic distance calculation.
     #[test]
     fn test_deserialize_cluster_truncated_vector() {
         // Header says 1 vector dim=4 but truncate after 2 floats
@@ -2348,6 +3838,11 @@ mod tests {
         }
     }
 
+    /// Proves manifest-aware loading prefers a present combined bootstrap.
+    ///
+    /// Two loads must recover the same centroids and a resident sketch from the
+    /// single uploaded object, protecting the current-format path independently
+    /// of the optional disk cache.
     #[tokio::test]
     async fn test_load_from_manifest_uses_bootstrap_when_present() {
         let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
@@ -2400,6 +3895,11 @@ mod tests {
         assert!(second.resident_sketch.is_some());
     }
 
+    /// Proves cached bootstrap loads reuse the exact decoded allocations.
+    ///
+    /// Keeping the temporary directory alive preserves the disk cache during
+    /// both loads. `Arc::ptr_eq` catches an accidental second decode that value
+    /// equality alone would miss.
     #[tokio::test]
     async fn test_load_from_manifest_reuses_decoded_bootstrap() {
         let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
@@ -2462,6 +3962,11 @@ mod tests {
         ));
     }
 
+    /// Proves old segments without a bootstrap load separate legacy artifacts.
+    ///
+    /// The handle must recover centroids and the resident sketch while leaving
+    /// its bootstrap ref absent, preserving compatibility with published
+    /// segments created before combined metadata objects existed.
     #[tokio::test]
     async fn test_load_from_manifest_without_bootstrap_uses_legacy_artifacts() {
         let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
