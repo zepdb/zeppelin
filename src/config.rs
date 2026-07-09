@@ -1,3 +1,76 @@
+//! Boot-time configuration for every Zeppelin subsystem.
+//!
+//! This module is the process-wide boundary between operator-supplied text and
+//! the strongly typed settings consumed by storage, caching, indexing,
+//! compaction, query execution, garbage collection, logging, and the HTTP
+//! server. Startup code normally enters through [`crate::config::Config::load`]; subsystem
+//! constructors then borrow the relevant nested configuration such as
+//! [`crate::config::StorageConfig`] or [`crate::config::IndexingConfig`]. Configuration is local process
+//! input, not authoritative search data: manifests and immutable artifacts in
+//! object storage remain the source of truth.
+//!
+//! Loading deliberately fails loudly. Unknown TOML keys, unreadable files,
+//! malformed environment values, mutually exclusive options, and unsafe
+//! cross-field combinations become [`crate::error::ZeppelinError::Config`] errors before the
+//! server starts. No invalid input is silently replaced with a default.
+//!
+//! ## Configuration flow
+//!
+//! ```text
+//! compiled defaults
+//!        |
+//!        v
+//! optional TOML file  -- unknown/malformed key --> startup error
+//!        |
+//!        v
+//! environment overrides -- malformed value ----> startup error
+//!        |
+//!        v
+//! resolve derived choices (for example, query profile -> byte gap)
+//!        |
+//!        v
+//! validate cross-field invariants -- violation --> startup error
+//!        |
+//!        v
+//! typed Config borrowed by subsystem constructors
+//! ```
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`crate::config::Config`] to see the complete subsystem map.
+//! 2. Read [`crate::config::ServerConfig`], [`crate::config::StorageConfig`],
+//!    [`crate::config::CacheConfig`], [`crate::config::IndexingConfig`],
+//!    [`crate::config::CompactionConfig`], and [`crate::config::GcConfig`] for the major
+//!    operational controls.
+//! 3. Follow [`crate::config::Config::load`] to understand precedence and
+//!    [`crate::config::Config::validate`] to understand boot-time invariants.
+//! 4. Read [`crate::config::CpuBudget::auto`] for the independently loaded thread-pool budget.
+//! 5. Finish with `env_override` to see how a single environment value is
+//!    parsed without a type-specific conversion table.
+//!
+//! ## Invariants not to break
+//!
+//! - Precedence is environment variable over TOML over compiled default.
+//! - Present but malformed values are errors; only absent values may fall back.
+//! - `#[serde(deny_unknown_fields)]` keeps misspelled and removed keys from
+//!   being ignored.
+//! - [`crate::config::Config::validate`] reports all independent violations together so an
+//!   operator can fix one boot attempt rather than discovering errors serially.
+//! - The GC horizon must cover every interval during which a reader or
+//!   compactor can legitimately depend on an older manifest view.
+//!
+//! ## Rust concepts used here
+//!
+//! Serde derives turn TOML into nested Rust structs, while enums such as
+//! [`crate::config::StorageBackend`] and [`crate::config::CostLatencyProfile`] limit configuration to named,
+//! compiler-checked choices. Java code often models this with POJOs plus a
+//! validation framework, and C code typically uses structs plus handwritten
+//! parsing. Rust adds exhaustive `match` checking and an ownership model that
+//! lets startup build one owned [`crate::config::Config`] which later code can borrow without
+//! copying it. `env_override` demonstrates bounded generics: one function can
+//! parse any type implementing [`std::str::FromStr`] and still return the crate's single
+//! [`crate::error::Result`] error channel.
+
 use crate::error::{Result, ZeppelinError};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
@@ -5,18 +78,28 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+/// Environment key for an explicit rerank range-coalescing gap in bytes.
 const RERANK_COALESCE_GAP_ENV: &str = "ZEPPELIN_RERANK_COALESCE_GAP_BYTES";
+/// Environment key selecting the cache hydration heat policy.
 const HYDRATION_POLICY_ENV: &str = "ZEPPELIN_HYDRATION_POLICY";
+/// Environment key for the observations needed to mark a namespace hot.
 const HYDRATION_HEAT_QUERIES_ENV: &str = "ZEPPELIN_HYDRATION_HEAT_QUERIES";
+/// Environment key for the hydration heat-observation window in seconds.
 const HYDRATION_HEAT_WINDOW_SECS_ENV: &str = "ZEPPELIN_HYDRATION_HEAT_WINDOW_SECS";
+/// Environment key for the minimum age of unreachable objects before GC.
 const GC_HORIZON_SECS_ENV: &str = "ZEPPELIN_GC_HORIZON_SECS";
+/// Environment key for the maximum time between compaction upload and publication.
 const GC_COMPACTION_UPLOAD_WINDOW_SECS_ENV: &str = "ZEPPELIN_GC_COMPACTION_UPLOAD_WINDOW_SECS";
+/// Environment key for clock-skew allowance in GC safety calculations.
 const GC_SKEW_SLOP_SECS_ENV: &str = "ZEPPELIN_GC_SKEW_SLOP_SECS";
+/// Environment key for the explicit unsafe-short-GC-horizon interlock.
 const GC_ALLOW_UNSAFE_SHORT_HORIZON_ENV: &str = "ZEPPELIN_GC_ALLOW_UNSAFE_SHORT_HORIZON";
+/// Environment key for the count of manifest history generations retained by GC.
 const GC_MANIFEST_HISTORY_KEEP_COUNT_ENV: &str = "ZEPPELIN_GC_MANIFEST_HISTORY_KEEP_COUNT";
+/// Environment key for time-based point-in-time-recovery retention in seconds.
 const GC_PITR_RETENTION_SECS_ENV: &str = "ZEPPELIN_GC_PITR_RETENTION_SECS";
 
-/// Default maximum gap, in bytes, between rerank f32 ranges that are merged
+/// Default maximum gap, in bytes, between rerank `f32` ranges that are merged
 /// into one physical GET.
 ///
 /// `ZEPPELIN_RERANK_COALESCE_GAP_BYTES` is the throughput <-> request-cost
@@ -39,12 +122,15 @@ const GC_PITR_RETENTION_SECS_ENV: &str = "ZEPPELIN_GC_PITR_RETENTION_SECS";
 ///   128 KiB     79.9    28.6   13.4    $31.96   <- loopback throughput knee
 ///   64 KiB     127.5    25.2    8.8    $51.00   <- past the knee; never use
 ///
-/// Examples:
-///   ZEPPELIN_RERANK_COALESCE_GAP_BYTES=1048576  # 1 MiB: ~4x cheaper per
-///       query than 128 KiB at ~60% of its loopback QPS; right when request
-///       cost dominates (high query volume, S3 Standard).
-///   ZEPPELIN_RERANK_COALESCE_GAP_BYTES=131072   # 128 KiB: max QPS on this
-///       loopback bench; right when node count / latency dominates cost.
+/// # Examples
+///
+/// ```text
+/// ZEPPELIN_RERANK_COALESCE_GAP_BYTES=1048576
+/// # 1 MiB: favor fewer S3 GETs when request cost dominates.
+///
+/// ZEPPELIN_RERANK_COALESCE_GAP_BYTES=131072
+/// # 128 KiB: favor the measured loopback throughput knee.
+/// ```
 ///
 /// These numbers are from loopback MinIO (~410 MB/s wall). Real S3 has higher
 /// per-request latency but wider aggregate bandwidth, which pushes the optimal
@@ -53,40 +139,67 @@ const GC_PITR_RETENTION_SECS_ENV: &str = "ZEPPELIN_GC_PITR_RETENTION_SECS";
 /// (qpsbench with this env var) on the target deployment before fixing a value.
 pub const DEFAULT_RERANK_COALESCE_GAP_BYTES: usize = 1024 * 1024;
 
-/// Top-level application configuration loaded from a TOML file, env vars, or defaults.
+/// Complete boot-time configuration after defaults, TOML, and environment input merge.
+///
+/// Each field owns one subsystem's settings. A successfully loaded value has
+/// passed [`Config::validate`], but callers that construct or mutate a value
+/// directly must validate it themselves before starting services.
+///
+/// # Example
+///
+/// With a TOML file that sets `server.port = 9000` and an environment override
+/// `ZEPPELIN_PORT=9001`, [`Config::load`] returns a `Config` whose
+/// [`ServerConfig::port`] is `9001`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// HTTP server settings (host, port, limits).
+    /// HTTP bind, timeout, admission-control, and request-size settings.
     #[serde(default)]
     pub server: ServerConfig,
-    /// Object storage backend and credentials.
+    /// Object-storage backend, bucket, endpoint, credentials, and boot probe policy.
     #[serde(default)]
     pub storage: StorageConfig,
-    /// Local disk and in-memory cache settings.
+    /// Disposable local disk and memory cache settings; these never supersede S3 state.
     #[serde(default)]
     pub cache: CacheConfig,
-    /// Vector indexing parameters (centroids, quantization, hierarchical).
+    /// Vector and lexical indexing parameters used when immutable segments are built.
     #[serde(default)]
     pub indexing: IndexingConfig,
-    /// Background compaction schedule and thresholds.
+    /// Background WAL-to-segment compaction schedule, triggers, retention, and lease.
     #[serde(default)]
     pub compaction: CompactionConfig,
-    /// Structured logging level and format.
+    /// Structured logging level and output format.
     #[serde(default)]
     pub logging: LoggingConfig,
-    /// Write-ahead log batching configuration.
+    /// Reserved home for WAL settings; group commit currently has no tuning knobs.
     #[serde(default)]
     pub wal: WalConfig,
-    /// Query-time tuning knobs.
+    /// Query-time object-read cost and latency tuning.
     #[serde(default)]
     pub query: QueryConfig,
-    /// Garbage-collection safety horizons and interlocks.
+    /// Garbage-collection safety horizons, history retention, and unsafe override.
     #[serde(default)]
     pub gc: GcConfig,
 }
 
-/// Garbage-collection horizon configuration.
+/// Safety and retention controls for deleting unreachable immutable objects.
+///
+/// GC may see an object as unreachable while an in-flight reader still uses an
+/// older cached manifest or a compactor has uploaded but not yet published the
+/// object. The configured horizon covers those intervals before physical
+/// deletion is allowed.
+///
+/// ```text
+/// cached-manifest lifetime
+///        + request lifetime
+///        + upload-before-publication window
+///        + clock-skew allowance
+///        = minimum safe GC horizon
+/// ```
+///
+/// Retained manifest history and named snapshots remain live roots regardless
+/// of object age. Reducing retention can make formerly referenced artifacts
+/// eligible for collection, but only after the normal horizon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GcConfig {
@@ -130,7 +243,11 @@ pub struct GcConfig {
     pub pitr_retention_secs: u64,
 }
 
-/// Query-time configuration loaded at boot.
+/// Query-time object-fetch tuning resolved during [`Config::load`].
+///
+/// Operators may choose either an exact byte gap or a named
+/// [`CostLatencyProfile`]. After loading, the exact gap is stored and the
+/// profile is cleared so query execution has one unambiguous value to read.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryConfig {
@@ -145,7 +262,12 @@ pub struct QueryConfig {
     pub cost_latency_profile: Option<CostLatencyProfile>,
 }
 
-/// Preset tradeoff profiles for rerank range coalescing.
+/// Named tradeoff profiles for rerank range coalescing.
+///
+/// Using an enum makes an unsupported profile impossible after parsing. In
+/// Java this resembles an `enum`; in C it resembles a tagged integer plus a
+/// validated parser. Rust additionally requires [`rerank_coalesce_gap_bytes_for_profile`]
+/// to handle every variant when the enum changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CostLatencyProfile {
@@ -157,7 +279,28 @@ pub enum CostLatencyProfile {
     LowLatency,
 }
 
-/// Resolve a cost/latency profile to a concrete rerank coalesce gap.
+/// Resolves a named cost/latency profile to a concrete byte gap.
+///
+/// # Parameters
+///
+/// - `profile`: Validated profile chosen in TOML.
+///
+/// # Returns
+///
+/// The maximum gap between adjacent rerank ranges that may be covered by one
+/// object-store GET.
+///
+/// # Example
+///
+/// `LowLatency` returns 128 KiB, while `LowCost` and `Balanced` return the
+/// 1 MiB [`DEFAULT_RERANK_COALESCE_GAP_BYTES`]. This changes the fetch plan,
+/// not the candidate set or recall.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The exhaustive `match` has no default branch. Adding an enum variant forces
+/// this function to define its behavior at compile time, unlike a Java `switch`
+/// with a permissive default or a C switch over an arbitrary integer.
 #[must_use]
 pub const fn rerank_coalesce_gap_bytes_for_profile(profile: CostLatencyProfile) -> usize {
     match profile {
@@ -170,18 +313,46 @@ pub const fn rerank_coalesce_gap_bytes_for_profile(profile: CostLatencyProfile) 
 
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
+/// Unit tests for precedence, strict parsing, defaults, and cross-field invariants.
+///
+/// Environment variables are process-global, so tests that change them hold
+/// [`ENV_LOCK`] and use [`EnvGuard`] to restore the caller's environment even
+/// when a test panics.
 mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::Mutex;
 
+    /// Serializes tests that mutate the process environment.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// RAII guard that restores every configuration environment variable on drop.
+    ///
+    /// This gives each test a clean environment without leaking changes to
+    /// later tests. Java would normally express the cleanup with `try/finally`;
+    /// C would use a single cleanup label. Rust invokes [`Drop::drop`]
+    /// automatically on ordinary returns and panic unwinding.
     struct EnvGuard {
+        /// Original value of each removed variable, or `None` if it was absent.
         original: Vec<(&'static str, Option<OsString>)>,
     }
 
     impl EnvGuard {
+        /// Removes all recognized configuration variables and remembers their values.
+        ///
+        /// # Returns
+        ///
+        /// An owned guard whose destructor restores the captured environment.
+        ///
+        /// # Side Effects
+        ///
+        /// Mutates the process environment. The caller must hold [`ENV_LOCK`]
+        /// so another configuration test cannot observe the temporary state.
+        ///
+        /// # Example
+        ///
+        /// A test can create `_env = EnvGuard::clear()`, set one override, and
+        /// then return normally; `_env` restores all prior values automatically.
         fn clear() -> Self {
             let env_names = [
                 RERANK_COALESCE_GAP_ENV,
@@ -257,6 +428,18 @@ mod tests {
     }
 
     impl Drop for EnvGuard {
+        /// Restores every captured environment variable when the guard leaves scope.
+        ///
+        /// # Parameters
+        ///
+        /// - `self`: Mutable access to the guard so captured entries can be
+        ///   drained exactly once.
+        ///
+        /// # Side Effects
+        ///
+        /// Reinstates present values and removes variables that were originally
+        /// absent. The implementation performs no allocation for copied names;
+        /// each name is a `'static` string literal.
         fn drop(&mut self) {
             for (name, value) in self.original.drain(..) {
                 match value {
@@ -267,12 +450,42 @@ mod tests {
         }
     }
 
+    /// Writes TOML to a temporary file and loads it through the production path.
+    ///
+    /// # Parameters
+    ///
+    /// - `contents`: Complete TOML source for one test configuration.
+    ///
+    /// # Returns
+    ///
+    /// The same [`Result`] that [`Config::load`] produces. The temporary file
+    /// remains alive until loading finishes and is then removed by RAII.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the test process cannot create or write its temporary file, or
+    /// if the generated path is not valid UTF-8.
+    ///
+    /// # Example
+    ///
+    /// Passing `"[server]\nport = 9000"` exercises file parsing, overrides,
+    /// derived-value resolution, and validation rather than bypassing startup.
     fn load_toml(contents: &str) -> Result<Config> {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), contents).unwrap();
         Config::load(Some(file.path().to_str().unwrap()))
     }
 
+    /// Asserts that a failed load reports every expected diagnostic fragment.
+    ///
+    /// # Parameters
+    ///
+    /// - `result`: Configuration result expected to be an error.
+    /// - `needles`: Substrings that must all appear in the rendered error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if loading succeeded or if any expected substring is absent.
     fn assert_config_error_contains(result: Result<Config>, needles: &[&str]) {
         let err = result.unwrap_err();
         let message = err.to_string();
@@ -284,6 +497,7 @@ mod tests {
         }
     }
 
+    /// Verifies that a present but malformed numeric override fails startup.
     #[test]
     fn env_override_rejects_present_but_unparseable_port() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -294,6 +508,7 @@ mod tests {
         assert_config_error_contains(load_toml(""), &["ZEPPELIN_PORT", "80eighty"]);
     }
 
+    /// Verifies that strict TOML parsing rejects misspelled configuration keys.
     #[test]
     fn toml_unknown_key_is_startup_error() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -310,8 +525,16 @@ mod tests {
         );
     }
 
+    /// Exercises each independent validation rule with one focused mutation.
+    ///
+    /// The table uses boxed `Fn` trait objects so closures with different
+    /// concrete types can share one vector. Java would store objects implementing
+    /// a functional interface; C would commonly store function pointers plus
+    /// optional context. Rust checks that every closure can only mutably borrow
+    /// the supplied [`Config`] for the duration of the call.
     #[test]
     fn validate_reports_each_cross_field_rule() {
+        /// One named mutation plus the validation fragments it must produce.
         type ValidateCase = (&'static str, Box<dyn Fn(&mut Config)>, Vec<&'static str>);
         let cases: Vec<ValidateCase> = vec![
             (
@@ -427,6 +650,7 @@ mod tests {
         }
     }
 
+    /// Verifies that validation aggregates independent errors in one response.
     #[test]
     fn validate_reports_all_violations_at_once() {
         let mut config = Config::default();
@@ -455,6 +679,7 @@ mod tests {
         }
     }
 
+    /// Protects the default invariant that every default centroid can be probed.
     #[test]
     fn default_max_nprobe_covers_default_centroid_count() {
         let config = Config::default();
@@ -466,6 +691,7 @@ mod tests {
         );
     }
 
+    /// Verifies explicit query gaps and the compiled fallback through full loading.
     #[test]
     fn query_config_parses_explicit_gap_and_defaults_when_absent() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -487,6 +713,7 @@ mod tests {
         );
     }
 
+    /// Pins each named query profile to its intended concrete byte gap.
     #[test]
     fn cost_latency_profiles_map_to_expected_gaps() {
         assert_eq!(
@@ -503,6 +730,7 @@ mod tests {
         );
     }
 
+    /// Verifies that a TOML file cannot set both forms of the same query choice.
     #[test]
     fn query_file_rejects_mutually_exclusive_gap_and_profile() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -522,6 +750,7 @@ mod tests {
         assert!(message.contains("query.cost_latency_profile"));
     }
 
+    /// Verifies environment precedence and strict parsing for the rerank gap.
     #[test]
     fn rerank_gap_env_overrides_file_and_rejects_malformed_value() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -541,6 +770,7 @@ mod tests {
         assert!(err.to_string().contains(RERANK_COALESCE_GAP_ENV));
     }
 
+    /// Documents that a zero coalescing gap is an intentional valid setting.
     #[test]
     fn rerank_gap_zero_is_valid_at_load() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -557,6 +787,7 @@ mod tests {
         assert_eq!(config.effective_rerank_coalesce_gap_bytes(), 0);
     }
 
+    /// Verifies that an unknown hydration policy name fails during deserialization.
     #[test]
     fn test_unknown_policy_name_fails_boot() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -575,6 +806,7 @@ mod tests {
         assert!(message.contains("bogus"));
     }
 
+    /// Pins hydration defaults and verifies explicit TOML values survive loading.
     #[test]
     fn hydration_policy_defaults_and_parses() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -610,6 +842,7 @@ mod tests {
         assert_eq!(explicit.cache.hydration_max_segment_fraction, 0.25);
     }
 
+    /// Verifies that GC floor failures name every interval used in the calculation.
     #[test]
     fn gc_horizon_below_floor_is_rejected_with_all_inputs() {
         let mut config = Config::default();
@@ -637,6 +870,7 @@ mod tests {
         }
     }
 
+    /// Verifies that the explicit unsafe override permits, detects, and warns on a short horizon.
     #[test]
     fn gc_horizon_override_accepts_short_horizon_and_warns() {
         let mut config = Config::default();
@@ -653,6 +887,7 @@ mod tests {
         config.warn_if_unsafe_gc_horizon_override();
     }
 
+    /// Protects the invariant that compiled GC defaults satisfy their own safety floor.
     #[test]
     fn default_gc_horizon_passes_floor() {
         let config = Config::default();
@@ -662,6 +897,7 @@ mod tests {
         assert!(!config.gc.allow_unsafe_short_horizon);
     }
 
+    /// Round-trips GC TOML and protects the reader-safety explanation in source docs.
     #[test]
     fn gc_config_toml_roundtrips_and_doc_mentions_floor() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -692,6 +928,7 @@ mod tests {
         assert!(source.contains("causally unrelated to the reader-staleness window"));
     }
 
+    /// Verifies that a removed compaction key is rejected instead of silently ignored.
     #[test]
     fn old_compaction_upload_window_toml_is_rejected_as_removed() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -716,15 +953,29 @@ mod tests {
 /// WAL configuration.
 ///
 /// Group commit (coalescing concurrent appends into a shared manifest CAS) is
-/// now unconditional in `WalWriter` — there is no batching knob to tune. The
+/// now unconditional in the WAL writer—there is no batching knob to tune. The
 /// former `batch_manifest_size` / `batch_manifest_timeout_ms` fields are gone.
 /// With strict boot config, stale WAL keys are rejected instead of ignored. The
 /// struct is retained as the home for future WAL settings.
+///
+/// # Example
+///
+/// An empty `[wal]` table is accepted. A removed batching key is an unknown
+/// field and fails startup rather than pretending to configure group commit.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WalConfig {}
 
-/// HTTP server configuration including bind address, timeouts, and request limits.
+/// HTTP server bind, lifecycle, admission-control, and request-limit settings.
+///
+/// These values bound work before it reaches the domain layer. Rate limits are
+/// per client, request limits protect memory and CPU, and timeout values also
+/// participate in safety calculations such as the GC horizon floor.
+///
+/// # Example
+///
+/// A deployment may bind `0.0.0.0:8080`, allow bursts of 200 query requests,
+/// and accept `top_k` up to 10,000 while supplying 10 when a client omits it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -784,28 +1035,59 @@ pub struct ServerConfig {
     pub trusted_proxies: Vec<String>,
 }
 
+/// Returns the default number of nearest neighbors for a query that omits `top_k`.
 fn default_top_k() -> usize {
     10
 }
+/// Returns the default sustained query/read request rate per client.
 fn default_rate_limit_rps() -> u32 {
     100
 }
+/// Returns the default query/read token-bucket burst capacity per client.
 fn default_rate_limit_burst() -> u32 {
     200
 }
+/// Returns the default sustained write/admin request rate per client.
 fn default_write_rate_limit_rps() -> u32 {
     50
 }
+/// Returns the default write/admin token-bucket burst capacity per client.
 fn default_write_rate_limit_burst() -> u32 {
     100
 }
+/// Returns the default lifetime, in seconds, of an idle client rate-limit bucket.
 fn default_rate_limit_idle_ttl_secs() -> u64 {
     600
 }
+/// Returns the default maximum number of query entries accepted in one batch request.
 fn default_max_query_batch_size() -> usize {
     256
 }
 
+/// Checks whether a trusted-proxy entry is a syntactically valid IP CIDR range.
+///
+/// # Parameters
+///
+/// - `value`: Candidate containing a literal IPv4 or IPv6 address, `/`, and a
+///   prefix length. Host addresses without a prefix are intentionally rejected.
+///
+/// # Returns
+///
+/// `true` when the address parses and the prefix is at most 32 for IPv4 or 128
+/// for IPv6; otherwise `false`.
+///
+/// # Example
+///
+/// `10.0.0.0/8` and `2001:db8::/32` are valid, while `127.0.0.1` and
+/// `10.0.0.0/33` are not.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `let ... else` exits early when splitting or parsing fails, and the
+/// exhaustive [`IpAddr`] match selects the address-family limit. In Java this
+/// would usually be exceptions plus `instanceof`; in C it would be explicit
+/// return-code checks and an address-family tag. Rust's parsed enum guarantees
+/// the final match receives either a valid IPv4 or valid IPv6 address.
 fn is_valid_ip_cidr(value: &str) -> bool {
     let Some((ip, prefix)) = value.split_once('/') else {
         return false;
@@ -823,7 +1105,11 @@ fn is_valid_ip_cidr(value: &str) -> bool {
     prefix <= max_prefix
 }
 
-/// Supported object storage backends.
+/// Object-store implementations selectable at boot.
+///
+/// The selected backend changes transport construction, not Zeppelin's
+/// authority model: persistent artifacts in the configured object store remain
+/// authoritative and local cache remains disposable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
@@ -839,6 +1125,21 @@ pub enum StorageBackend {
 }
 
 impl std::fmt::Display for StorageBackend {
+    /// Writes the stable lowercase operator-facing name of this backend.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Backend variant to render; it is borrowed and not copied.
+    /// - `f`: Formatter supplied by Rust's formatting machinery.
+    ///
+    /// # Returns
+    ///
+    /// Formatting success or the formatter's error.
+    ///
+    /// # Example
+    ///
+    /// Formatting [`StorageBackend::Gcs`] produces `"gcs"`, matching the TOML
+    /// and environment spelling.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StorageBackend::S3 => write!(f, "s3"),
@@ -849,7 +1150,18 @@ impl std::fmt::Display for StorageBackend {
     }
 }
 
-/// Object storage backend selection and credential configuration.
+/// Object-store backend selection, location, credentials, and boot-probe policy.
+///
+/// This struct configures the durable source-of-truth connection. It does not
+/// hold a client or any cached state; the storage layer borrows these settings
+/// to construct the object-store abstraction used by all higher layers.
+///
+/// # Example
+///
+/// A local MinIO deployment uses the `S3` backend with a custom endpoint and
+/// may explicitly permit HTTP. Production S3 normally leaves the endpoint and
+/// static credentials unset so the platform's standard region and credential
+/// providers can be used.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
@@ -860,7 +1172,8 @@ pub struct StorageConfig {
     #[serde(default = "default_bucket")]
     pub bucket: String,
 
-    // S3 / MinIO / R2
+    // These settings specialize the S3-compatible transport without exposing
+    // object-store implementation details to higher layers.
     /// AWS region for S3 (e.g. `"us-east-1"`).
     #[serde(default)]
     pub s3_region: Option<String>,
@@ -881,7 +1194,18 @@ pub struct StorageConfig {
     pub fail_fast: bool,
 }
 
-/// Local disk and in-memory cache settings.
+/// Disposable local disk, in-memory cache, and background hydration settings.
+///
+/// These values affect latency and local resource use only. Cached manifests
+/// may be briefly stale within their TTL, but cache contents never override the
+/// authoritative manifest and immutable artifacts in object storage.
+///
+/// # Example
+///
+/// With hydration disabled, misses populate cache on demand. Enabling the
+/// session-window policy allows a namespace observed three times within 60
+/// seconds to hydrate segments with at most four concurrent downloads, subject
+/// to the per-segment disk-fraction limit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
@@ -891,8 +1215,7 @@ pub struct CacheConfig {
     /// Maximum disk cache size in gigabytes. Default: `50`.
     #[serde(default = "default_max_size_gb")]
     pub max_size_gb: u64,
-    /// Maximum memory cache size in MB. Set to 0 to disable.
-    /// Default: 256 MB. Override via ZEPPELIN_MEMORY_CACHE_MAX_MB.
+    /// Maximum memory cache size in MB. Set to `0` to disable. Default: `256`.
     #[serde(default = "default_memory_cache_max_mb")]
     pub memory_cache_max_mb: usize,
     /// Manifest cache TTL in milliseconds. Default: `500`.
@@ -925,7 +1248,10 @@ pub struct CacheConfig {
     pub hydration_max_segment_fraction: f64,
 }
 
-/// Globally selected warm-set hydration heat policy.
+/// Globally selected policy for deciding when a namespace is hot enough to hydrate.
+///
+/// This is an enum rather than a free-form string so downstream hydration code
+/// can match exhaustively and cannot encounter an unknown policy after boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HydrationPolicyKind {
@@ -933,7 +1259,32 @@ pub enum HydrationPolicyKind {
     SessionWindow,
 }
 
-/// Vector indexing parameters controlling IVF-Flat, quantization, and hierarchical trees.
+/// Segment-build and search limits for vector, bitmap, and lexical indexes.
+///
+/// IVF-Flat groups vectors around centroids. `nprobe` controls how many of
+/// those groups a query searches: probing more clusters generally improves
+/// recall but increases object-store reads, bytes processed, and distance
+/// calculations. Quantization reduces the bytes stored and fetched at the cost
+/// of approximation. Bitmap and full-text indexes add prefiltering and BM25
+/// retrieval structures during compaction.
+///
+/// ```text
+/// vectors entering compaction
+///        |
+///        +--> train/select centroids --> assign vectors to IVF clusters
+///        |
+///        +--> optional quantization --> smaller stored vector representation
+///        |
+///        +--> optional bitmap/FTS indexes
+///        v
+/// immutable segment consumed by query planning
+/// ```
+///
+/// # Example
+///
+/// With 256 centroids and `default_nprobe = 16`, an ordinary query searches 16
+/// candidate clusters. A caller may request a larger value, but the API must
+/// reject a value above `max_nprobe`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingConfig {
@@ -991,7 +1342,32 @@ pub struct IndexingConfig {
     pub bm25_max_full_scan_vectors: usize,
 }
 
-/// Background WAL-to-segment compaction schedule and thresholds.
+/// Background WAL-to-segment compaction schedule, triggers, retention, and lease.
+///
+/// The background scheduler checks on [`CompactionConfig::interval_secs`] and
+/// may compact when *any* count, age, or byte trigger is reached. Compaction
+/// writes new immutable segment artifacts before a manifest publication makes
+/// them authoritative. Its namespace lease reduces duplicate work, while the
+/// fencing-token and manifest-CAS layers still prevent a stale worker from
+/// committing after lease loss.
+///
+/// ```text
+/// pending immutable WAL fragments
+///        |
+///        | count OR oldest age OR total bytes reaches threshold
+///        v
+/// lease-protected compaction builds immutable segment
+///        |
+///        | fencing check + manifest CAS
+///        v
+/// manifest makes segment visible; later GC reclaims unreachable artifacts
+/// ```
+///
+/// # Example
+///
+/// A namespace with only two fragments still compacts when those fragments are
+/// five minutes old or total 64 MiB, even though the count trigger of 100 has
+/// not fired.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionConfig {
@@ -1035,7 +1411,12 @@ pub struct CompactionConfig {
     pub lease_duration_secs: u64,
 }
 
-/// Structured logging configuration.
+/// Structured logging verbosity and renderer selected during process startup.
+///
+/// # Example
+///
+/// Production uses `level = "info"` and `format = "json"` by default so fields
+/// are machine searchable. A developer may choose `"pretty"` locally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
@@ -1047,151 +1428,203 @@ pub struct LoggingConfig {
     pub format: String,
 }
 
-// Default value functions — hardcoded defaults only.
-// Env var overrides are applied in `apply_env_overrides()`.
+// These helpers provide compiled defaults to Serde and `Default` implementations.
+// They intentionally do not inspect the environment; `apply_env_overrides()` owns
+// the precedence boundary.
+/// Returns the default HTTP bind address, `0.0.0.0`.
 fn default_host() -> String {
     "0.0.0.0".to_string()
 }
+/// Returns the default HTTP listen port, `8080`.
 fn default_port() -> u16 {
     8080
 }
+/// Returns the default per-request timeout in seconds.
 fn default_request_timeout() -> u64 {
     30
 }
+/// Returns the default maximum number of concurrent query handlers.
 fn default_max_concurrent_queries() -> usize {
     64
 }
+/// Returns the default maximum vector count accepted in one write batch.
 fn default_max_batch_size() -> usize {
     50_000
 }
+/// Returns the default hard upper bound for query `top_k`.
 fn default_max_top_k() -> usize {
     10_000
 }
+/// Returns the default graceful-shutdown deadline in seconds.
 fn default_shutdown_timeout_secs() -> u64 {
     30
 }
+/// Returns the default maximum accepted vector dimensionality.
 fn default_max_dimensions() -> usize {
     65_536
 }
+/// Returns the default maximum vector-ID length in bytes.
 fn default_max_vector_id_length() -> usize {
     1024
 }
+/// Returns the default maximum HTTP request-body size in megabytes.
 fn default_max_request_body_mb() -> usize {
     512
 }
+/// Returns the default object-store bucket name.
 fn default_bucket() -> String {
     "zeppelin".to_string()
 }
+/// Returns whether startup probes object storage by default.
 fn default_storage_fail_fast() -> bool {
     true
 }
+/// Returns the default directory for disposable on-disk cache data.
 fn default_cache_dir() -> PathBuf {
     PathBuf::from("/var/cache/zeppelin")
 }
+/// Returns the default disk-cache capacity in gigabytes.
 fn default_max_size_gb() -> u64 {
     50
 }
+/// Returns the default in-memory cache capacity in megabytes.
 fn default_memory_cache_max_mb() -> usize {
     256
 }
+/// Returns the default manifest-cache TTL in milliseconds.
 fn default_manifest_cache_ttl_ms() -> u64 {
     500
 }
+/// Returns the default positive namespace-registry TTL in milliseconds.
 fn default_namespace_registry_ttl_ms() -> u64 {
     5000
 }
+/// Returns the default warm-set heat-detection policy.
 fn default_hydration_policy() -> HydrationPolicyKind {
     HydrationPolicyKind::SessionWindow
 }
+/// Returns the default query count needed to mark a namespace hot.
 fn default_hydration_heat_queries() -> u64 {
     3
 }
+/// Returns the default hydration heat window in seconds.
 fn default_hydration_heat_window_secs() -> u64 {
     60
 }
+/// Returns the default maximum number of parallel hydration downloads.
 fn default_hydration_parallelism() -> usize {
     4
 }
+/// Returns the default maximum disk-cache fraction available to one hydrated segment.
 fn default_hydration_max_segment_fraction() -> f64 {
     0.5
 }
+/// Returns the default number of IVF centroids built per segment.
 fn default_num_centroids() -> usize {
     256
 }
+/// Returns the default number of IVF clusters probed by a vector query.
 fn default_nprobe() -> usize {
     16
 }
+/// Returns the default maximum number of IVF clusters a query may probe.
 fn default_max_nprobe() -> usize {
     256
 }
+/// Returns the default cap on k-means training iterations.
 fn default_kmeans_max_iterations() -> usize {
     25
 }
+/// Returns the default k-means convergence threshold.
 fn default_kmeans_convergence_epsilon() -> f64 {
     1e-4
 }
+/// Returns the default k-means initialization oversampling factor.
 fn default_oversample_factor() -> usize {
     3
 }
+/// Returns the default number of product-quantization subquantizers.
 fn default_pq_m() -> usize {
     8
 }
+/// Returns scalar quantization as the default stored-vector representation.
 fn default_quantization() -> crate::index::quantization::QuantizationType {
     crate::index::quantization::QuantizationType::Scalar
 }
+/// Returns whether immutable segments build bitmap indexes by default.
 fn default_bitmap_index() -> bool {
     true
 }
+/// Returns the default interval between background compaction checks in seconds.
 fn default_compaction_interval() -> u64 {
     30
 }
+/// Returns the default pending-WAL-fragment count that triggers compaction.
 fn default_max_wal_fragments() -> usize {
     100
 }
+/// Returns the default oldest-pending-WAL age that triggers compaction in seconds.
 fn default_max_wal_age_secs() -> u64 {
     300
 }
+/// Returns the default pending-WAL byte total that triggers compaction.
 fn default_max_wal_bytes() -> u64 {
     64 * 1024 * 1024
 }
+/// Returns the default vector-imbalance ratio that retrains centroids.
 fn default_retrain_threshold() -> f64 {
     5.0
 }
+/// Returns the default BM25 fallback cluster-scan circuit breaker.
 fn default_bm25_max_full_scan_clusters() -> usize {
     500
 }
+/// Returns the default BM25 fallback vector-scan circuit breaker.
 fn default_bm25_max_full_scan_vectors() -> usize {
     100_000
 }
+/// Returns the legacy pending-delete compatibility limit.
 fn default_max_pending_deletes() -> usize {
     1000
 }
+/// Returns the default number of inactive segments retained in a manifest.
 fn default_max_old_segments() -> usize {
     10
 }
+/// Returns the default namespace compaction-lease duration in seconds.
 fn default_compaction_lease_secs() -> u64 {
     300
 }
+/// Returns the default structured-log verbosity filter.
 fn default_log_level() -> String {
     "info".to_string()
 }
+/// Returns the default machine-readable structured-log format.
 fn default_log_format() -> String {
     "json".to_string()
 }
+/// Returns the default age threshold for collecting unreachable objects in seconds.
 fn default_gc_horizon_secs() -> u64 {
     900
 }
+/// Returns the default maximum compaction upload-to-publication window in seconds.
 fn default_gc_compaction_upload_window_secs() -> u64 {
     300
 }
+/// Returns the default wall-clock skew allowance for GC in seconds.
 fn default_gc_skew_slop_secs() -> u64 {
     5
 }
+/// Returns the default number of committed manifest-history generations retained by GC.
 fn default_gc_manifest_history_keep_count() -> usize {
     128
 }
 
 impl Default for ServerConfig {
+    /// Builds server settings from the compiled, environment-independent defaults.
+    ///
+    /// Environment variables are intentionally applied later by
+    /// `Config::apply_env_overrides` so precedence remains explicit.
     fn default() -> Self {
         Self {
             host: default_host(),
@@ -1217,6 +1650,10 @@ impl Default for ServerConfig {
 }
 
 impl Default for StorageConfig {
+    /// Builds an S3-oriented storage configuration with no explicit credentials.
+    ///
+    /// The storage layer may use its normal credential chain when the optional
+    /// static credential fields remain `None`.
     fn default() -> Self {
         Self {
             backend: StorageBackend::default(),
@@ -1232,6 +1669,10 @@ impl Default for StorageConfig {
 }
 
 impl Default for CacheConfig {
+    /// Builds the default cache policy with background hydration disabled.
+    ///
+    /// On-demand caching remains available; disabling hydration only prevents
+    /// proactive segment downloads.
     fn default() -> Self {
         Self {
             dir: default_cache_dir(),
@@ -1250,6 +1691,10 @@ impl Default for CacheConfig {
 }
 
 impl Default for IndexingConfig {
+    /// Builds the default IVF-Flat indexing and search policy.
+    ///
+    /// Scalar quantization and bitmap indexes are enabled, while hierarchical
+    /// IVF and full-text indexes remain opt-in.
     fn default() -> Self {
         Self {
             default_num_centroids: default_num_centroids(),
@@ -1271,6 +1716,7 @@ impl Default for IndexingConfig {
 }
 
 impl Default for CompactionConfig {
+    /// Builds the default background compaction triggers and lease duration.
     fn default() -> Self {
         Self {
             interval_secs: default_compaction_interval(),
@@ -1286,6 +1732,7 @@ impl Default for CompactionConfig {
 }
 
 impl Default for LoggingConfig {
+    /// Builds production-oriented JSON logging at `info` verbosity.
     fn default() -> Self {
         Self {
             level: default_log_level(),
@@ -1295,6 +1742,10 @@ impl Default for LoggingConfig {
 }
 
 impl Default for GcConfig {
+    /// Builds conservative GC retention settings with no unsafe override.
+    ///
+    /// The resulting horizon passes the floor derived from the other compiled
+    /// defaults and time-based point-in-time retention is disabled.
     fn default() -> Self {
         Self {
             horizon_secs: default_gc_horizon_secs(),
@@ -1310,10 +1761,26 @@ impl Default for GcConfig {
 /// CPU budget for distributing workers across runtimes.
 ///
 /// Detected at startup via `available_parallelism()`, then allocated:
-/// - **Query workers**: 2× CPUs (overcommit OK — 80%+ I/O-blocked on S3 GETs)
+/// - **Query workers**: 2× CPUs (overcommit is useful because queries wait on S3 GETs)
 /// - **Compaction workers**: max(1, CPUs/4) — reserve most cores for queries.
 ///   On a 4-vCPU c7i.xlarge, this gives 1 compaction worker + 3 for queries.
 /// - **Rayon threads**: match physical cores (work-stealing at core count)
+///
+/// ```text
+/// OS-visible parallelism
+///        |
+///        +--> query Tokio runtime: max(4, CPUs * 2)
+///        +--> compaction Tokio runtime: max(1, CPUs / 4)
+///        +--> Rayon CPU pool: CPUs
+///        |
+///        v
+/// optional environment overrides for each pool
+/// ```
+///
+/// # Example
+///
+/// On eight visible CPUs, the computed budget is 16 query workers, two
+/// compaction workers, and eight Rayon threads before overrides.
 #[derive(Debug, Clone)]
 pub struct CpuBudget {
     /// Number of tokio workers dedicated to query handling (2x CPUs).
@@ -1325,7 +1792,38 @@ pub struct CpuBudget {
 }
 
 impl CpuBudget {
-    /// Auto-detect CPU count and allocate budgets.
+    /// Detects available CPUs, computes runtime budgets, and applies overrides.
+    ///
+    /// # Returns
+    ///
+    /// A complete worker allocation. If the operating system cannot report
+    /// available parallelism, this existing policy computes from four CPUs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Config`] when any present worker-count
+    /// environment variable cannot be parsed as a `usize`. No partial budget is
+    /// returned.
+    ///
+    /// # Side Effects
+    ///
+    /// Reads `ZEPPELIN_QUERY_WORKERS`, `ZEPPELIN_COMPACTION_WORKERS`, and
+    /// `ZEPPELIN_RAYON_THREADS`. It does not create either runtime or a Rayon
+    /// pool.
+    ///
+    /// # Example
+    ///
+    /// On four CPUs, the computed values are eight query workers, one
+    /// compaction worker, and four Rayon threads. Setting
+    /// `ZEPPELIN_RAYON_THREADS=2` changes only the final value.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// [`std::thread::available_parallelism`] returns `NonZeroUsize`, so `.get()`
+    /// converts a value already proven nonzero to `usize`. The `?` operator on
+    /// each `env_override` call returns immediately on an invalid override while
+    /// automatically converting through the crate's [`Result`] type. Java would
+    /// usually propagate an exception; C would check and forward each error code.
     pub fn auto() -> Result<Self> {
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -1339,7 +1837,8 @@ impl CpuBudget {
             rayon_threads: cpus,
         };
 
-        // Allow env var overrides
+        // Apply overrides only after computing a complete baseline so each
+        // variable replaces exactly one worker pool.
         if let Some(v) = env_override("ZEPPELIN_QUERY_WORKERS")? {
             budget.query_workers = v;
         }
@@ -1355,9 +1854,53 @@ impl CpuBudget {
 }
 
 impl Config {
-    /// Load config from a TOML file, falling back to defaults.
-    /// After loading, env var overrides are applied so that:
-    /// env var > TOML file > defaults.
+    /// Loads, resolves, and validates the process configuration before startup.
+    ///
+    /// When `path` is present, Serde starts from that TOML document and uses
+    /// each nested struct's defaults for omitted fields. With no path, loading
+    /// starts from [`Config::default`]. Environment variables then replace file
+    /// or default values, derived query choices are resolved, and cross-field
+    /// validation runs last.
+    ///
+    /// # Parameters
+    ///
+    /// - `path`: Optional borrowed UTF-8 path to a TOML file. `None` means use
+    ///   compiled defaults before applying environment overrides.
+    ///
+    /// # Returns
+    ///
+    /// A fully resolved, validated, owned configuration. Query code can assume
+    /// [`QueryConfig::rerank_coalesce_gap_bytes`] has a concrete value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Config`] if the file cannot be read, TOML is
+    /// malformed or contains an unknown key, a present environment value cannot
+    /// be parsed, query choices conflict after overrides, or any validation
+    /// invariant fails. No service has started and no external state has been
+    /// changed when this returns an error.
+    ///
+    /// # Side Effects
+    ///
+    /// Reads at most one local file and the supported process environment
+    /// variables. It performs no object-store requests and writes no cache,
+    /// manifest, WAL fragment, or segment.
+    ///
+    /// # Example
+    ///
+    /// ```text
+    /// file:        server.port = 8080
+    /// environment: ZEPPELIN_PORT=9090
+    /// result:      config.server.port == 9090
+    /// ```
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// `Option<&str>` borrows a path when one exists; loading never takes
+    /// ownership of the caller's string. The `?` operators propagate a typed
+    /// error while dropping temporary owned values automatically. This resembles
+    /// exceptions with deterministic resource cleanup in Java and explicit
+    /// error forwarding plus cleanup in C.
     pub fn load(path: Option<&str>) -> Result<Self> {
         let mut config = match path {
             Some(p) => {
@@ -1375,7 +1918,48 @@ impl Config {
         Ok(config)
     }
 
-    /// Validate all boot-time configuration and report every violation at once.
+    /// Validates all independent boot-time invariants and reports them together.
+    ///
+    /// Validation is separate from deserialization because important rules span
+    /// fields: for example, default `top_k` must not exceed its maximum, default
+    /// `nprobe` must not exceed its maximum, and the GC horizon must cover the
+    /// sum of every reader-staleness interval.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Configuration to inspect. It is borrowed immutably and is not
+    ///   normalized or repaired.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when all invariants hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns one [`ZeppelinError::Config`] containing a bullet for every
+    /// detected violation. Validation does not stop after the first error.
+    ///
+    /// # Consistency
+    ///
+    /// The GC floor protects readers using a cached older manifest while a
+    /// request is in flight and compaction uploads immutable artifacts before
+    /// publication. Allowing a shorter horizon can delete an object that such a
+    /// reader still legitimately needs; only the explicit unsafe override may
+    /// bypass this check.
+    ///
+    /// # Example
+    ///
+    /// A config with `server.port = 0` and `indexing.default_nprobe` above
+    /// `indexing.max_nprobe` returns one error that names both problems, allowing
+    /// an operator to fix them in a single edit.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The function borrows `&self`, so it cannot modify the configuration.
+    /// It accumulates owned diagnostic strings in a `Vec<String>` and moves them
+    /// into the final joined message only on failure. Java would use a mutable
+    /// list of strings; C would require explicit allocation and cleanup for each
+    /// diagnostic.
     pub fn validate(&self) -> Result<()> {
         let mut violations = Vec::new();
 
@@ -1517,13 +2101,36 @@ impl Config {
         }
     }
 
-    /// Minimum safe GC horizon in whole seconds.
+    /// Calculates the minimum safe GC horizon in whole seconds.
+    ///
+    /// # Returns
+    ///
+    /// The sum of rounded-up manifest-cache TTL, request timeout, compaction
+    /// upload window, and clock-skew allowance. Returns `None` if that sum would
+    /// overflow `u64`; overflow is treated as a validation error by
+    /// [`Config::validate`].
+    ///
+    /// # Example
+    ///
+    /// A 2,500 ms cache TTL, 30-second request timeout, 20-second upload window,
+    /// and three-second skew allowance produce `Some(56)`.
     #[must_use]
     pub fn gc_horizon_floor_secs(&self) -> Option<u64> {
         self.checked_gc_horizon_floor_secs()
     }
 
-    /// True when the explicit override permits a horizon below the safety floor.
+    /// Reports whether the active config knowingly accepts an unsafe short GC horizon.
+    ///
+    /// # Returns
+    ///
+    /// `true` only when the override is enabled, the floor is representable,
+    /// and [`GcConfig::horizon_secs`] is below it. An overflowing floor returns
+    /// `false` here but is still rejected by [`Config::validate`].
+    ///
+    /// # Example
+    ///
+    /// With a 56-second floor, horizon 10, and
+    /// `allow_unsafe_short_horizon = true`, this returns `true`.
     #[must_use]
     pub fn gc_horizon_is_unsafe_short(&self) -> bool {
         self.gc.allow_unsafe_short_horizon
@@ -1532,7 +2139,20 @@ impl Config {
                 .is_some_and(|floor_secs| self.gc.horizon_secs < floor_secs)
     }
 
-    /// Emit the loud boot warning required when the unsafe short-horizon override is active.
+    /// Emits the required structured warning for an active unsafe GC override.
+    ///
+    /// # Side Effects
+    ///
+    /// Writes one warning event through `tracing` when the explicit override is
+    /// enabled and the configured horizon is below the computed floor. The event
+    /// includes the floor and every contributing interval. Otherwise this is a
+    /// no-op.
+    ///
+    /// # Example
+    ///
+    /// A deployment intentionally using a 10-second horizon against a 56-second
+    /// floor logs both numbers and `allow_unsafe_short_horizon = true` during
+    /// boot, making the risk visible to operators.
     pub fn warn_if_unsafe_gc_horizon_override(&self) {
         let Some(floor_secs) = self.checked_gc_horizon_floor_secs() else {
             return;
@@ -1554,6 +2174,19 @@ impl Config {
         );
     }
 
+    /// Adds every GC reader-safety interval without allowing integer wraparound.
+    ///
+    /// # Returns
+    ///
+    /// `Some(total_seconds)` when every addition fits in `u64`, or `None` on
+    /// overflow.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// `checked_add` represents overflow as `Option::None`; `?` then propagates
+    /// that absence through the remaining chain. Java's ordinary integer
+    /// arithmetic and unsigned C arithmetic would require an explicit overflow
+    /// check to avoid wrapping or losing the condition.
     fn checked_gc_horizon_floor_secs(&self) -> Option<u64> {
         self.manifest_cache_ttl_secs_for_gc_floor()
             .checked_add(self.server.request_timeout_secs)?
@@ -1561,10 +2194,46 @@ impl Config {
             .checked_add(self.gc.skew_slop_secs)
     }
 
+    /// Rounds the manifest-cache TTL up from milliseconds to whole seconds.
+    ///
+    /// # Returns
+    ///
+    /// A ceiling conversion, so any partial second contributes a full second to
+    /// the safety floor. For example, 2,500 ms becomes three seconds.
     fn manifest_cache_ttl_secs_for_gc_floor(&self) -> u64 {
         self.cache.manifest_cache_ttl_ms.div_ceil(1_000)
     }
 
+    /// Replaces the two user-facing rerank choices with one concrete byte gap.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Mutable configuration after environment overrides. On success,
+    ///   the exact gap is `Some` and the profile is `None`.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after resolving an explicit byte value, a profile, or the
+    /// compiled default in that order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Config`] if both fields remain set after
+    /// environment processing. The function returns before changing either
+    /// field in that case.
+    ///
+    /// # Example
+    ///
+    /// `cost_latency_profile = "low_latency"` becomes a 128 KiB exact gap. An
+    /// environment-provided exact gap has already cleared the file profile and
+    /// therefore wins according to normal precedence.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The `Option` chain expresses precedence without nullable references:
+    /// `.or_else(...)` evaluates the profile only when no exact value exists,
+    /// and `.unwrap_or(...)` supplies the final compiled default. `Copy` scalar
+    /// values move through this chain without allocation.
     fn resolve_query_config(&mut self) -> Result<()> {
         if self.query.rerank_coalesce_gap_bytes.is_some()
             && self.query.cost_latency_profile.is_some()
@@ -1588,7 +2257,18 @@ impl Config {
         Ok(())
     }
 
-    /// Resolved rerank coalesce gap after file/default/env processing.
+    /// Returns the effective rerank range-coalescing gap in bytes.
+    ///
+    /// # Returns
+    ///
+    /// The resolved exact gap. Fully loaded configurations always contain one;
+    /// the compiled default is retained as a defensive convenience for tests or
+    /// callers that construct [`Config`] directly.
+    ///
+    /// # Example
+    ///
+    /// A loaded low-latency profile returns 131,072. A direct
+    /// `Config::default()` returns [`DEFAULT_RERANK_COALESCE_GAP_BYTES`].
     #[must_use]
     pub fn effective_rerank_coalesce_gap_bytes(&self) -> usize {
         self.query
@@ -1596,8 +2276,45 @@ impl Config {
             .unwrap_or(DEFAULT_RERANK_COALESCE_GAP_BYTES)
     }
 
-    /// Apply environment variable overrides on top of file/default values.
-    /// This ensures env vars always take priority over TOML settings.
+    /// Applies every recognized environment override over file/default values.
+    ///
+    /// The method is intentionally centralized so precedence and accepted names
+    /// are auditable. A present empty string is still a value: it is accepted
+    /// for string fields, used to clear the optional S3 endpoint, and rejected
+    /// when a numeric or boolean parser cannot interpret it.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Mutable configuration built from TOML or compiled defaults.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after applying all present overrides.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Config`] on non-Unicode environment input,
+    /// generic parse failure, or an unsupported named backend, hydration policy,
+    /// or quantization value. Earlier fields may already have been mutated, but
+    /// [`Config::load`] discards the in-progress configuration on error.
+    ///
+    /// # Side Effects
+    ///
+    /// Reads the process environment and mutates only `self`; it performs no
+    /// network calls or persistent writes.
+    ///
+    /// # Example
+    ///
+    /// `ZEPPELIN_TRUSTED_PROXIES="10.0.0.0/8, 2001:db8::/32"` becomes two
+    /// trimmed entries. `STORAGE_BACKEND=ftp` returns an error instead of
+    /// choosing a storage fallback.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// Each `if let Some(v)` unwraps only a present, successfully parsed value;
+    /// absence leaves the previous layer untouched. The compiler infers each
+    /// generic numeric or boolean type from the destination field, while string
+    /// cases specify `::<String>` explicitly.
     fn apply_env_overrides(&mut self) -> Result<()> {
         // Server
         if let Some(v) = env_override::<String>("ZEPPELIN_HOST")? {
@@ -1830,6 +2547,45 @@ impl Config {
     }
 }
 
+/// Reads and parses one optional environment override without choosing a fallback.
+///
+/// # Parameters
+///
+/// - `name`: Static environment-variable name used in both the lookup and any
+///   diagnostic. Callers pass string literals from the supported configuration
+///   surface.
+///
+/// # Returns
+///
+/// `Ok(Some(value))` when the variable is present and parses as `T`, or
+/// `Ok(None)` when it is absent. Absence is distinct from an empty string;
+/// parsing decides whether an empty present value is valid.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::Config`] when the value is not valid Unicode or
+/// [`FromStr`] rejects it. The error names the variable, original value, target
+/// Rust type, and parser diagnostic where available.
+///
+/// # Side Effects
+///
+/// Reads one value from the process environment. It does not remove or modify
+/// the variable.
+///
+/// # Example
+///
+/// If `ZEPPELIN_PORT=9090`, `env_override::<u16>("ZEPPELIN_PORT")` returns
+/// `Ok(Some(9090))`. If it is absent, the function returns `Ok(None)` so the
+/// caller can preserve the TOML or default value.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The `T: FromStr` bound accepts any destination type with a standard string
+/// parser, and `T::Err: Display` guarantees its associated error can be shown.
+/// This resembles a bounded generic parser in Java. C has no direct equivalent;
+/// it would usually pass a conversion function pointer and untyped output
+/// storage. Rust monomorphizes each used `T`, so this abstraction adds no
+/// dynamic dispatch.
 fn env_override<T>(name: &'static str) -> Result<Option<T>>
 where
     T: FromStr,
