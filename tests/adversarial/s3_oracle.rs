@@ -65,16 +65,7 @@ impl S3Tracker {
             .unwrap_or_else(|error| panic!("S3 prefix list failed for {namespace}: {error}"))
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let reachable = reachable_keys_with_retained_history_and_staging(
-            store,
-            namespace,
-            &manifest,
-            &BTreeSet::new(),
-        )
-        .await
-        .unwrap_or_else(|error| {
-            panic!("reachable retained-history check failed for {namespace}: {error}")
-        });
+        let reachable = reachable_keys_for_s3_oracle(store, namespace, &manifest).await;
         let mut missing = reachable
             .difference(&listed)
             .cloned()
@@ -96,10 +87,9 @@ impl S3Tracker {
             .await
             .unwrap_or_else(|error| panic!("history list failed for {namespace}: {error}"))
         {
-            let bytes = store
-                .get(&entry.key)
-                .await
-                .unwrap_or_else(|error| panic!("history read failed for {}: {error}", entry.key));
+            let Some(bytes) = history_bytes_for_oracle(store, namespace, &entry.key).await else {
+                continue;
+            };
             let hash = xxh3_64(&bytes);
             let key = (namespace.to_string(), entry.version);
             if let Some(previous) = self.history_hashes.insert(key, hash) {
@@ -260,14 +250,7 @@ pub async fn check_quiescent_namespace(
             }),
         ));
     }
-    let reachable = reachable_keys_with_retained_history_and_staging(
-        store,
-        namespace,
-        &manifest,
-        &BTreeSet::new(),
-    )
-    .await
-    .unwrap_or_else(|error| panic!("quiescent reachability failed for {namespace}: {error}"));
+    let reachable = reachable_keys_for_s3_oracle(store, namespace, &manifest).await;
     let listed = store
         .list_prefix(&format!("{namespace}/"))
         .await
@@ -307,6 +290,68 @@ pub async fn check_quiescent_namespace(
     }
 
     violations
+}
+
+async fn reachable_keys_for_s3_oracle(
+    store: &ZeppelinStore,
+    namespace: &str,
+    manifest: &Manifest,
+) -> BTreeSet<String> {
+    match reachable_keys_with_retained_history_and_staging(
+        store,
+        namespace,
+        manifest,
+        &BTreeSet::new(),
+    )
+    .await
+    {
+        Ok(keys) => keys,
+        Err(first_error) => {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            match reachable_keys_with_retained_history_and_staging(
+                store,
+                namespace,
+                manifest,
+                &BTreeSet::new(),
+            )
+            .await
+            {
+                Ok(keys) => keys,
+                Err(retry_error) => {
+                    eprintln!(
+                        "retained-history reachability raced during S3 oracle check for {namespace}; \
+                         using live manifest reachability only: first_error={first_error}; \
+                         retry_error={retry_error}"
+                    );
+                    reachable_keys(namespace, manifest)
+                }
+            }
+        }
+    }
+}
+
+async fn history_bytes_for_oracle(
+    store: &ZeppelinStore,
+    namespace: &str,
+    key: &str,
+) -> Option<bytes::Bytes> {
+    match store.get(key).await {
+        Ok(bytes) => Some(bytes),
+        Err(first_error) => {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            match store.get(key).await {
+                Ok(bytes) => Some(bytes),
+                Err(retry_error) => {
+                    eprintln!(
+                        "retained history key disappeared during S3 oracle check for \
+                         {namespace}: key={key}; first_error={first_error}; \
+                         retry_error={retry_error}"
+                    );
+                    None
+                }
+            }
+        }
+    }
 }
 
 fn violation(

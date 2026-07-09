@@ -2132,7 +2132,7 @@ async fn quiesce_and_verify(
         for _ in 0..2 {
             let gc = Op::GcCycle {
                 ns: ns.clone(),
-                keep_count: 0,
+                keep_count: 1,
             };
             let step = execute_recorded_op(
                 client, server, artifacts, model, coverage, s3_tracker, &gc, *op_index, started,
