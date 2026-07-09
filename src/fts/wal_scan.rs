@@ -1,10 +1,74 @@
-//! Brute-force BM25 scoring over uncompacted WAL fragments.
+//! CPU-side BM25 evaluation for documents still visible in uncompacted WAL.
 //!
-//! Same pattern as vector WAL scan in `src/query.rs`: read fragments from
-//! manifest snapshot, dedup, apply deletes, tokenize on the fly, score.
+//! Compacted segments carry immutable inverted indexes, but newly published WAL
+//! fragments have not yet been folded into those artifacts. For a **strong**
+//! lexical query, [`crate::query`] reads one authoritative manifest snapshot,
+//! asks [`crate::wal::reader::WalReader`] for its visible uncompacted fragments,
+//! and calls [`wal_bm25_scan`] to score the latest WAL version of each document.
+//! The query coordinator then merges these results with segment hits, using
+//! [`WalBm25ScanResult::overriding_ids`] and
+//! [`WalBm25ScanResult::deleted_ids`] to suppress stale segment versions.
 //!
-//! When a `WalFtsCache` is provided, pre-tokenized data is reused across
-//! queries instead of re-tokenizing every document on every query.
+//! This file performs no S3/MinIO or manifest I/O. Receiving a decoded fragment
+//! does not make it authoritative: the caller must pass only refs selected by
+//! its manifest snapshot, in manifest sequence-number order. WAL objects remain
+//! immutable, and the scan only builds ephemeral in-memory statistics. Eventual
+//! queries skip WAL scoring in the current coordinator and read tombstones only.
+//!
+//! ```text
+//! authoritative manifest snapshot
+//!            |
+//!            | refs in oldest -> newest sequence order
+//!            v
+//! decoded uncompacted fragments
+//!            |
+//!            v
+//! replay upserts + tombstones --------> live IDs + final deleted IDs
+//!            |
+//!            v
+//! tokenize required fields (optional WalFtsCache)
+//!            |
+//!            v
+//! build WAL-only corpus statistics
+//!            |
+//!            v
+//! filter -> per-field BM25 -> RankBy expression -> optional top-k
+//!            |
+//!            v
+//! query merge suppresses stale/deleted segment hits
+//! ```
+//!
+//! ## Reading map
+//!
+//! 1. Read [`WalBm25ScanResult`] to understand the downstream merge contract.
+//! 2. Read [`wal_bm25_scan`] from replay through scoring and bounded selection.
+//! 3. Read [`crate::fts::wal_cache::WalFtsCache`] for the optional CPU cache and
+//!    its cache-key limitations.
+//! 4. Continue in [`crate::query`] for concurrent segment search and final
+//!    strong/eventual merge behavior.
+//!
+//! ## Scoring and visibility invariants
+//!
+//! - Slice order, not ULID order, defines last-write-wins replay. A newer upsert
+//!   revives an older tombstone; a newer tombstone removes an older upsert.
+//! - Every surviving live WAL ID overrides the same ID in a compacted segment,
+//!   even if metadata filtering, an empty query, a zero score, or top-k prevents
+//!   that WAL document from appearing in `results`.
+//! - Corpus statistics include all surviving WAL documents with token data,
+//!   including documents later rejected by the metadata filter.
+//! - WAL and segment searches compute BM25 against separate corpora. The query
+//!   merge currently compares their resulting numeric scores directly.
+//! - Higher BM25/`RankBy` scores rank first; exact ties use document ID ascending.
+//!
+//! ## Rust concepts used here
+//!
+//! Most intermediate maps own strings and token data, but `latest_vectors` and
+//! `ScoredBm25Doc` borrow IDs and attributes from the input fragments. This is
+//! analogous to read-only Java references or `const` C pointers, with compiler
+//! checked non-null lifetimes. The final [`SearchResult`] values copy IDs and,
+//! only when requested, clone attributes so they can outlive the fragment
+//! borrow. Iterator pipelines build query states and term inputs without
+//! virtual dispatch, while `TopK` owns only the best bounded set.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -21,46 +85,208 @@ use crate::index::topk::TopK;
 use crate::types::{AttributeValue, Filter, SearchResult};
 use crate::wal::fragment::WalFragment;
 
-/// Per-doc, per-field data: (doc_length, term→term_frequency).
+/// Ephemeral token statistics keyed first by document ID and then field name.
+///
+/// Each leaf is `(document_length, term_to_frequency)`. Unlike a segment
+/// inverted index, this representation is rebuilt for the current WAL snapshot
+/// and optimized for scanning a relatively small uncompacted tail.
 type DocFieldData = HashMap<String, HashMap<String, (u32, HashMap<String, u32>)>>;
 
+/// Orders borrowed WAL candidates by relevance descending, then ID ascending.
+///
+/// # Parameters
+///
+/// - `a`: First borrowed candidate to compare.
+/// - `b`: Second borrowed candidate to compare.
+///
+/// # Returns
+///
+/// An [`Ordering`] suitable for best-first sorting and `TopK`. `f32::total_cmp`
+/// gives a total order even for unusual floating-point values.
+///
+/// # Examples
+///
+/// Score `2.0` ranks before `1.0`; tied IDs `a` and `b` rank as `a`, then `b`.
 fn bm25_scored_cmp(a: &ScoredBm25Doc<'_>, b: &ScoredBm25Doc<'_>) -> Ordering {
     b.score.total_cmp(&a.score).then_with(|| a.id.cmp(b.id))
 }
 
+/// Borrowed scored candidate used until the scan creates an owned API result.
+///
+/// Holding references avoids cloning every candidate's ID and attributes before
+/// top-k rejection. Rust prevents the value from outliving its source fragment.
 struct ScoredBm25Doc<'a> {
+    /// Logical document ID borrowed from the replay map.
     id: &'a str,
+    /// Final `RankBy` score; larger positive values are better.
     score: f32,
+    /// Optional source attributes borrowed from the winning WAL upsert.
     attrs: Option<&'a HashMap<String, AttributeValue>>,
 }
 
-/// Result of a WAL BM25 scan.
+/// Owned WAL contribution and suppression metadata for final BM25 merging.
+///
+/// The result deliberately distinguishes scored hits from all live overrides
+/// and tombstones. Strong merging must suppress a compacted segment's older
+/// record even when the latest WAL record did not match the lexical query.
+///
+/// # Examples
+///
+/// If WAL upserts `p42` to text that does not match and deletes `p17`, `results`
+/// may be empty while `overriding_ids = {p42}` and `deleted_ids = {p17}`. The
+/// merge removes both stale segment records.
 pub struct WalBm25ScanResult {
-    /// Scored search results, sorted descending by BM25 score.
+    /// Positive-score WAL hits sorted by score descending and ID ascending on ties.
+    ///
+    /// The vector contains at most the requested `top_k` when one was supplied.
+    /// Attributes are present only when `include_attributes` was true and the
+    /// winning WAL record had attributes.
     pub results: Vec<SearchResult>,
-    /// All live WAL IDs after dedup/delete processing, including IDs that
-    /// filter out, score zero, or rank outside top-k.
+    /// IDs of all live latest WAL upserts after replay.
+    ///
+    /// This includes IDs filtered out, lacking text, scoring zero, or falling
+    /// outside top-k. Strong merge uses the set to hide older segment versions.
     pub overriding_ids: HashSet<String>,
-    /// Number of WAL fragments scanned.
+    /// Number of fragment values supplied to the scan.
+    ///
+    /// This is input count, including delete-only fragments and fragments that
+    /// contribute no surviving document or score.
     pub fragment_count: usize,
-    /// IDs that were explicitly deleted in the WAL.
-    /// Used by the merge step to exclude these from segment results.
+    /// IDs whose final replayed WAL operation is an effective tombstone.
+    ///
+    /// A later upsert removes an ID from this set. Both strong and eventual
+    /// merge paths use final tombstones to exclude matching segment results.
     pub deleted_ids: HashSet<String>,
 }
 
-/// Brute-force BM25 scan over WAL fragments.
+/// Replays visible WAL fragments and ranks their latest live documents with BM25.
 ///
-/// 1. Deduplicate / apply deletes (latest fragment wins)
-/// 2. For each surviving doc, extract text fields, tokenize, build ephemeral stats
-/// 3. Score via BM25
-/// 4. Evaluate rank_by expression
-/// 5. Return sorted results (higher score = better)
+/// The scan first establishes latest-write-wins state, then tokenizes fields
+/// referenced by the ranking expression, computes per-field corpus statistics,
+/// applies metadata filtering, evaluates BM25 leaves and their [`RankBy`]
+/// combination, and materializes positive-score results. It is synchronous CPU
+/// work over already-decoded fragments; storage failures occur before this
+/// boundary in the caller.
 ///
-/// When `fts_cache` is provided, tokenization results are cached per-fragment
-/// and reused across queries, eliminating the dominant CPU cost.
+/// ```text
+/// fragments (oldest -> newest)
+///       |
+///       +-- replay deletes/upserts --> latest_vectors, deleted_ids
+///       |
+///       +-- RankBy leaves ----------> configured query tokens
+///                                      |
+/// latest vectors + optional cache -----+--> token maps + corpus stats
+///                                                |
+/// filter ----------------------------------------+--> score > 0
+///                                                        |
+///                                               all sorted or bounded top-k
+/// ```
 ///
-/// When `top_k` is provided, results are truncated to the top K after scoring.
-/// This enables callers to limit work in the merge phase.
+/// # Parameters
+///
+/// - `fragments`: Manifest-selected, decoded immutable fragments in ascending
+///   replay sequence. Reversing the slice changes update/delete outcomes.
+/// - `rank_by`: Borrowed lexical ranking expression. BM25 leaves identify field
+///   and query text; sum, max, and product nodes combine per-field scores.
+/// - `fts_configs`: Validated tokenization and BM25 settings keyed by field.
+///   Leaves for missing fields are skipped; no error is returned here.
+/// - `last_as_prefix`: When true, leaves the final query token unstemmed and
+///   matches it against the prefixes of normally tokenized document terms.
+/// - `fts_cache`: Optional shared derived-data cache. `None` tokenizes only the
+///   latest replayed record inline. See [`WalFtsCache`] for cache-key caveats.
+/// - `filter`: Optional metadata predicate. A record with no attributes cannot
+///   satisfy a supplied filter. Filtering does not change corpus statistics.
+/// - `include_attributes`: Whether each returned hit clones the winning record's
+///   attribute map. Suppression sets are unaffected.
+/// - `top_k`: Optional result bound. `Some(0)` returns no scored hits while still
+///   computing override/delete sets; `None` sorts every positive-score hit.
+///
+/// # Returns
+///
+/// A [`WalBm25ScanResult`] containing owned ranked hits, every live overriding
+/// WAL ID, final tombstones, and input fragment count. Empty fragments or no
+/// usable configured query tokens produce empty hits without losing suppression
+/// metadata already established by replay.
+///
+/// # Side Effects
+///
+/// With a cache, fragment misses can populate shared token entries. The
+/// function also emits one debug event after a non-early-return scan. It does
+/// not read or write object storage, publish a manifest, or mutate fragments.
+///
+/// # Consistency
+///
+/// The caller is responsible for manifest authority and slice order. Within a
+/// fragment, deletes are processed before vectors; normal fragment constructors
+/// reject overlap between those collections. Across fragments, every later
+/// operation replaces the earlier state for the same ID.
+///
+/// On the cached path, token maps from each fragment are copied for any ID that
+/// survives globally. A newer cached record overwrites older token data when it
+/// has the requested field. If the latest upsert omits that field while an
+/// older version had it, the older cached field data currently remains even
+/// though the no-cache path uses only the latest record.
+///
+/// TODO(doc): Verify whether cached WAL scanning is intended to preserve stale
+/// field text when a newer upsert removes or changes that field to a non-string;
+/// current cached and uncached behavior diverges in that case.
+///
+/// Each document's score map is keyed only by field name. If one `RankBy`
+/// expression contains multiple BM25 leaves for the same field but different
+/// query text, the later extracted leaf overwrites the earlier field score and
+/// both expression leaves read that one value.
+///
+/// TODO(doc): Verify whether repeated BM25 leaves for one field are supported or
+/// should be rejected/represented by a `(field, query)` score key.
+///
+/// Prefix scoring also has a WAL-specific aggregation rule: it sums term
+/// frequencies for every document term beginning with the final query token,
+/// but uses the maximum document frequency among those terms for one IDF value.
+/// Segment posting-list search expands and scores matching terms separately, so
+/// the two sources can assign different numeric scores to the same prefix match.
+///
+/// TODO(doc): Verify whether WAL prefix scoring should match segment posting-list
+/// expansion exactly before their scores are compared in the final merge.
+///
+/// # Performance
+///
+/// Replay is linear in WAL operations. Uncached tokenization is linear in live
+/// text; cached scans trade that CPU for deep map clones. Corpus construction is
+/// linear in cached terms. Exact term scoring is roughly documents times query
+/// leaves/tokens; prefix scoring additionally scans every term in each relevant
+/// document map. `Some(k)` keeps `O(k)` scored candidates, whereas `None`
+/// materializes all positive hits. Attribute cloning occurs only for retained
+/// results.
+///
+/// # Examples
+///
+/// ```text
+/// sequence 7: upsert p42 {content: "red shoe"}
+/// sequence 8: delete p17; upsert p42 {content: "blue shoe"}
+/// query: BM25(content, "blue"), top_k = 10
+///
+/// results        = [p42]
+/// overriding_ids = {p42}
+/// deleted_ids    = {p17}
+///
+/// final merge keeps p42's WAL score and suppresses old segment rows for
+/// both p42 and p17.
+/// ```
+///
+/// If the query tokenizes to nothing or references only unconfigured fields,
+/// `results` is empty, but `p42` and `p17` still carry the same suppression
+/// meaning.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The input slice and expression/configuration values are borrowed, so this
+/// function neither takes ownership nor can retain them after return. Internal
+/// `&str` and attribute references point into `fragments`; Rust's lifetimes
+/// prevent those pointers from escaping. `Option` makes the cache, filter, and
+/// bound cases explicit instead of using null/sentinel values. The final
+/// iterator consumes borrowed candidates and creates owned API values only
+/// after top-k selection, avoiding Java-style eager object copies and manual C
+/// ownership bookkeeping.
 #[allow(clippy::too_many_arguments)]
 pub fn wal_bm25_scan(
     fragments: &[WalFragment],
@@ -83,7 +309,8 @@ pub fn wal_bm25_scan(
         };
     }
 
-    // 1. Dedup: latest fragment wins, apply deletes
+    // Replay in caller-supplied manifest order. The separate live and deleted
+    // maps preserve enough state to suppress stale segment rows after scoring.
     let mut deleted_ids: HashSet<String> = HashSet::new();
     let mut latest_vectors: HashMap<&str, Option<&HashMap<String, AttributeValue>>> =
         HashMap::new();
@@ -113,14 +340,17 @@ pub fn wal_bm25_scan(
         };
     }
 
-    // 2. Extract (field, query) pairs from rank_by
+    // Extract leaves before touching document text so unconfigured or empty
+    // queries can return early while retaining replay suppression metadata.
     let field_queries = rank_by.extract_field_queries();
 
-    // 3. For each (field, query), tokenize the query, then build ephemeral corpus stats
-    // and score each document
+    /// Tokenized and configured state for one BM25 leaf in the ranking tree.
     struct FieldQueryState {
+        /// Owned field name used to find document data and publish its score.
         field: String,
+        /// Normalized exact terms, with the last term prefix-ready when requested.
         query_tokens: Vec<String>,
+        /// Field-specific saturation and length-normalization parameters.
         params: Bm25Params,
     }
 
@@ -152,7 +382,8 @@ pub fn wal_bm25_scan(
         };
     }
 
-    // Gather all unique fields we need to index
+    // Tokenize each physical field once even if the expression references it
+    // repeatedly. Hash-set order is irrelevant to final scoring.
     let fields_needed: Vec<&str> = field_query_states
         .iter()
         .map(|s| s.field.as_str())
@@ -160,15 +391,18 @@ pub fn wal_bm25_scan(
         .into_iter()
         .collect();
 
-    // 4. Build per-doc, per-field tokenized data — using cache when available
+    // Materialize the query-local document view. Cached values are cloned so no
+    // DashMap guard or cache lifetime reaches the scoring phase.
     let mut doc_field_data: DocFieldData = HashMap::new();
 
     if let Some(cache) = fts_cache {
-        // Fast path: use cached pre-tokenized data
+        // Cache hits avoid tokenizer CPU but still clone owned maps.
         for fragment in fragments {
             let cached = cache.get_or_tokenize(fragment, fts_configs, &fields_needed);
             for ((doc_id, field_name), token_data) in &cached.doc_field_data {
-                // Only include docs that survived dedup
+                // Exclude IDs whose final operation is a delete. Notice that an
+                // older version of a still-live ID also passes this membership
+                // check; a later cached field overwrites it only when present.
                 if latest_vectors.contains_key(doc_id.as_str()) {
                     doc_field_data.entry(doc_id.clone()).or_default().insert(
                         field_name.clone(),
@@ -178,7 +412,7 @@ pub fn wal_bm25_scan(
             }
         }
     } else {
-        // Slow path: tokenize inline (no cache)
+        // Without a cache, tokenize exactly the latest borrowed record per ID.
         for (doc_id, attrs_opt) in &latest_vectors {
             let attrs = match attrs_opt {
                 Some(a) => a,
@@ -216,10 +450,13 @@ pub fn wal_bm25_scan(
         }
     }
 
-    // 5. Build ephemeral corpus stats per field
+    /// Aggregate BM25 corpus statistics for one field in the live WAL tail.
     struct CorpusStats {
+        /// Number of live WAL documents that produced token data for this field.
         doc_count: u32,
+        /// Mean retained token count, accumulated as a sum before finalization.
         avg_doc_length: f32,
+        /// Number of field-bearing WAL documents containing each term.
         term_doc_freqs: HashMap<String, u32>,
     }
 
@@ -235,6 +472,8 @@ pub fn wal_bm25_scan(
                     term_doc_freqs: HashMap::new(),
                 });
             stats.doc_count += 1;
+            // Keep the running token total in the eventual average field to
+            // avoid a second per-document accumulator map.
             stats.avg_doc_length += *doc_length as f32; // accumulate total
 
             for term in tf_map.keys() {
@@ -243,14 +482,15 @@ pub fn wal_bm25_scan(
         }
     }
 
-    // Finalize avg doc length
+    // Convert accumulated token totals into means before scoring.
     for stats in field_corpus_stats.values_mut() {
         if stats.doc_count > 0 {
             stats.avg_doc_length /= stats.doc_count as f32;
         }
     }
 
-    // 6. Score each document
+    // Score borrowed candidates and delay owned ID/attribute clones until the
+    // final retained set is known.
     let mut results: Vec<ScoredBm25Doc<'_>> = Vec::new();
     let mut top_results = top_k.map(|k| {
         TopK::new(
@@ -370,10 +610,27 @@ pub fn wal_bm25_scan(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    //! Unit tests for WAL replay, cached reuse, scoring, and early-return contracts.
+    //!
+    //! These tests pass decoded fragments directly and therefore isolate pure
+    //! scan behavior from manifest reads, S3/MinIO, checksum validation, and the
+    //! downstream WAL/segment merge.
+
     use super::*;
     use crate::types::VectorEntry;
     use ulid::Ulid;
 
+    /// Builds a fragment fixture with an independent ULID cache key.
+    ///
+    /// # Parameters
+    ///
+    /// - `vectors`: Upserts moved into the fragment.
+    /// - `deletes`: Tombstone IDs moved into the fragment.
+    ///
+    /// # Returns
+    ///
+    /// A decoded fragment with an unused dummy checksum. Vector/delete overlap
+    /// is not validated because the fixture bypasses production constructors.
     fn make_fragment(vectors: Vec<VectorEntry>, deletes: Vec<String>) -> WalFragment {
         WalFragment {
             id: Ulid::new(),
@@ -383,6 +640,16 @@ mod tests {
         }
     }
 
+    /// Builds one document whose searchable text lives in `content`.
+    ///
+    /// # Parameters
+    ///
+    /// - `id`: Logical ID copied into the fixture.
+    /// - `text`: Content string copied into the attribute map.
+    ///
+    /// # Returns
+    ///
+    /// A vector entry with a placeholder coordinate and owned attributes.
     fn make_vec_entry(id: &str, text: &str) -> VectorEntry {
         let mut attrs = HashMap::new();
         attrs.insert(
@@ -396,6 +663,11 @@ mod tests {
         }
     }
 
+    /// Creates exact, deterministic tokenization settings for `content`.
+    ///
+    /// # Returns
+    ///
+    /// A one-field map with stemming and stop-word removal disabled.
     fn make_configs() -> HashMap<String, FtsFieldConfig> {
         let mut configs = HashMap::new();
         configs.insert(
@@ -410,6 +682,10 @@ mod tests {
     }
 
     #[test]
+    /// Protects basic positive matching, result order, and override completeness.
+    ///
+    /// The nonmatching `v3` must still override any older segment copy even
+    /// though only `v1` and `v2` become scored hits.
     fn test_wal_scan_basic() {
         let fragments = vec![make_fragment(
             vec![
@@ -443,6 +719,10 @@ mod tests {
     }
 
     #[test]
+    /// Protects result parity and stable entry count across a repeated cached scan.
+    ///
+    /// The first call populates one fragment entry and the second reuses it
+    /// without changing the ranked result set.
     fn test_wal_scan_with_cache() {
         let fragments = vec![make_fragment(
             vec![
@@ -460,7 +740,7 @@ mod tests {
 
         let cache = WalFtsCache::new();
 
-        // First scan (populates cache)
+        // The first scan exercises the tokenization-and-insert miss path.
         let result1 = wal_bm25_scan(
             &fragments,
             &rank_by,
@@ -474,7 +754,7 @@ mod tests {
         assert_eq!(result1.results.len(), 2);
         assert_eq!(cache.len(), 1);
 
-        // Second scan (uses cache)
+        // The identical second scan exercises the deep-cloned hit path.
         let result2 = wal_bm25_scan(
             &fragments,
             &rank_by,
@@ -490,6 +770,10 @@ mod tests {
     }
 
     #[test]
+    /// Protects newest-fragment tombstone replay before lexical scoring.
+    ///
+    /// A regression would leak deleted `v1` as either a WAL hit or a live
+    /// override that could displace the segment tombstone behavior.
     fn test_wal_scan_with_deletes() {
         let fragments = vec![
             make_fragment(
@@ -523,6 +807,10 @@ mod tests {
     }
 
     #[test]
+    /// Protects the zero-work result for an empty manifest-selected WAL slice.
+    ///
+    /// No hits, suppression IDs, tombstones, or scanned fragments should be
+    /// reported.
     fn test_wal_scan_empty_fragments() {
         let result = wal_bm25_scan(
             &[],
@@ -542,6 +830,10 @@ mod tests {
     }
 
     #[test]
+    /// Protects suppression metadata when query normalization yields no tokens.
+    ///
+    /// Even with no scored hit, live `v1` must remain an override so strong
+    /// merge cannot resurrect its older segment version.
     fn test_wal_scan_empty_query() {
         let fragments = vec![make_fragment(vec![make_vec_entry("v1", "cat dog")], vec![])];
 
@@ -565,6 +857,10 @@ mod tests {
     }
 
     #[test]
+    /// Protects multi-field score composition through a `RankBy::Sum` expression.
+    ///
+    /// The fixture has searchable text in both fields; losing either field's
+    /// token data or expression traversal would invalidate its positive result.
     fn test_wal_scan_multi_field_sum() {
         let fragments = vec![make_fragment(
             vec![{
