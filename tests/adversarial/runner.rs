@@ -31,6 +31,7 @@ pub struct RunSummary {
     pub failed_seeds: u64,
     pub ops_total: u64,
     pub compactions_total: u64,
+    pub background_compactions_total: u64,
     pub ops_per_sec: f64,
     pub coverage: Coverage,
 }
@@ -41,6 +42,7 @@ struct SeedOutcome {
     failed: bool,
     ops: u64,
     compactions: u64,
+    background_compactions: u64,
     coverage: Coverage,
     violations: Vec<Violation>,
     wall_secs: f64,
@@ -59,6 +61,7 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
         failed_seeds: 0,
         ops_total: 0,
         compactions_total: 0,
+        background_compactions_total: 0,
         ops_per_sec: 0.0,
         coverage: Coverage::default(),
     };
@@ -77,6 +80,7 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
         summary.failed_seeds += u64::from(outcome.failed);
         summary.ops_total += outcome.ops;
         summary.compactions_total += outcome.compactions;
+        summary.background_compactions_total += outcome.background_compactions;
         summary.coverage.merge(&outcome.coverage);
         seed_reports.push(SeedReport {
             seed: *seed,
@@ -85,6 +89,7 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
             failed: outcome.failed,
             ops: outcome.ops,
             compactions: outcome.compactions,
+            background_compactions: outcome.background_compactions,
             violations: outcome.violations,
             wall_secs: outcome.wall_secs,
             object_store: outcome.object_store,
@@ -107,6 +112,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
         failed_seeds: 0,
         ops_total: 0,
         compactions_total: 0,
+        background_compactions_total: 0,
         ops_per_sec: 0.0,
         coverage: Coverage::default(),
     };
@@ -121,6 +127,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
         summary.failed_seeds += u64::from(outcome.failed);
         summary.ops_total += outcome.ops;
         summary.compactions_total += outcome.compactions;
+        summary.background_compactions_total += outcome.background_compactions;
         summary.coverage.merge(&outcome.coverage);
         seed_reports.push(SeedReport {
             seed,
@@ -129,6 +136,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
             failed: outcome.failed,
             ops: outcome.ops,
             compactions: outcome.compactions,
+            background_compactions: outcome.background_compactions,
             violations: outcome.violations,
             wall_secs: outcome.wall_secs,
             object_store: outcome.object_store,
@@ -196,10 +204,11 @@ pub async fn replay_seed_from_env() {
     }
 
     println!(
-        "replay clean: dir={} ops={} compactions={}",
+        "replay clean: dir={} ops={} compactions={} background_compactions={}",
         replay.display(),
         outcome.ops,
-        outcome.compactions
+        outcome.compactions,
+        outcome.background_compactions
     );
 }
 
@@ -285,6 +294,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let mut coverage = Coverage::default();
     let mut s3_tracker = S3Tracker::default();
     let mut created_namespaces = Vec::new();
+    let mut background_compaction_starts = BTreeMap::new();
     let mut failed = false;
     let mut failure_violations = Vec::new();
     let mut compactions = 0u64;
@@ -309,10 +319,13 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         )
         .await;
         if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
-            created_namespaces.push(op.namespace().to_string());
+            let ns = op.namespace().to_string();
+            note_background_compaction_namespace(&mut background_compaction_starts, &ns);
+            created_namespaces.push(ns);
         }
         if let Op::CloneNamespace { target, .. } = &op {
             if (200..300).contains(&step.status) {
+                note_background_compaction_namespace(&mut background_compaction_starts, target);
                 created_namespaces.push(target.clone());
             }
         }
@@ -368,6 +381,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         .unwrap_or_default();
     artifacts.write_faults(&fired_faults);
     let object_store = object_store_breakdown(&counter);
+    let background_compactions = background_compactions_since(&background_compaction_starts);
     if should_cleanup(env.preserve, failed) {
         for ns in &created_namespaces {
             cleanup_ns(&store, ns).await;
@@ -385,6 +399,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         failed,
         ops: op_count,
         compactions,
+        background_compactions,
         coverage,
         violations: failure_violations,
         wall_secs: elapsed,
@@ -511,6 +526,11 @@ fn sanitize_op_for_mode(op: Op, mode: RunMode) -> Op {
         return op;
     }
     match op {
+        // Chaos mode injects S3 faults while foreground APIs are running.
+        // Manual maintenance probes can fail for injected-storage reasons
+        // that drown out foreground invariants; keep explicit maintenance out
+        // of chaos mode and use the live background loop for compaction
+        // coverage instead.
         Op::CompactInline { ns }
         | Op::CompactEndpoint { ns }
         | Op::GcCycle { ns, .. }
@@ -541,6 +561,30 @@ fn sanitize_op_for_mode(op: Op, mode: RunMode) -> Op {
         }
         other => other,
     }
+}
+
+fn note_background_compaction_namespace(starts: &mut BTreeMap<String, u64>, ns: &str) {
+    starts
+        .entry(ns.to_string())
+        .or_insert_with(|| background_compaction_metric(ns));
+}
+
+fn background_compactions_since(starts: &BTreeMap<String, u64>) -> u64 {
+    starts
+        .iter()
+        .map(|(ns, start)| background_compaction_metric(ns).saturating_sub(*start))
+        .sum()
+}
+
+fn background_compaction_metric(ns: &str) -> u64 {
+    ["success", "failure"]
+        .into_iter()
+        .map(|status| {
+            zeppelin::metrics::COMPACTIONS_TOTAL
+                .with_label_values(&[ns, status])
+                .get()
+        })
+        .sum()
 }
 
 fn object_store_breakdown(counter: &GetCounter) -> BTreeMap<String, ClassStats> {
@@ -1002,6 +1046,7 @@ async fn run_seed(
     let mut model = Model::default();
     let mut coverage = Coverage::default();
     let mut created_namespaces = Vec::new();
+    let mut background_compaction_starts = BTreeMap::new();
     let mut s3_tracker = S3Tracker::default();
     let mut op_index = 0u64;
     let mut failed = false;
@@ -1028,10 +1073,13 @@ async fn run_seed(
         )
         .await;
         if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
-            created_namespaces.push(op.namespace().to_string());
+            let ns = op.namespace().to_string();
+            note_background_compaction_namespace(&mut background_compaction_starts, &ns);
+            created_namespaces.push(ns);
         }
         if let Op::CloneNamespace { target, .. } = &op {
             if (200..300).contains(&step.status) {
+                note_background_compaction_namespace(&mut background_compaction_starts, target);
                 created_namespaces.push(target.clone());
             }
         }
@@ -1114,6 +1162,7 @@ async fn run_seed(
         .unwrap_or_default();
     artifacts.write_faults(&fired_faults);
     let object_store = object_store_breakdown(&counter);
+    let background_compactions = background_compactions_since(&background_compaction_starts);
 
     if failed {
         let failure_op_index = failure_violations
@@ -1174,11 +1223,12 @@ async fn run_seed(
 
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     println!(
-        "seed {}: failed={} ops={} compactions={} ops/sec={:.2}",
+        "seed {}: failed={} ops={} compactions={} background_compactions={} ops/sec={:.2}",
         seed,
         failed,
         op_index,
         compactions,
+        background_compactions,
         op_index as f64 / elapsed
     );
 
@@ -1187,6 +1237,7 @@ async fn run_seed(
         failed,
         ops: op_index,
         compactions,
+        background_compactions,
         coverage,
         violations: failure_violations,
         wall_secs: elapsed,

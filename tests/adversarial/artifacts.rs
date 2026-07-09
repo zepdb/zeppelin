@@ -57,6 +57,7 @@ pub struct SeedReport {
     pub failed: bool,
     pub ops: u64,
     pub compactions: u64,
+    pub background_compactions: u64,
     pub violations: Vec<Violation>,
     pub wall_secs: f64,
     pub object_store: BTreeMap<String, ClassStats>,
@@ -707,26 +708,36 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
     out.push_str(&format!("- run dir: `{}`\n\n", root.display()));
 
     out.push_str("## Seeds\n\n");
-    out.push_str("| seed | mode | status | ops | compactions | faults | wall_s | ops/sec |\n");
-    out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
+    out.push_str(
+        "| seed | mode | status | ops | explicit compactions | bg compactions | faults | wall_s | ops/sec |\n",
+    );
+    out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for seed in seeds {
         out.push_str(&format!(
-            "| {} | `{:?}` | {} | {} | {} | {} | {:.2} | {:.2} |\n",
+            "| {} | `{:?}` | {} | {} | {} | {} | {} | {:.2} | {:.2} |\n",
             seed.seed,
             seed.mode,
             if seed.failed { "failed" } else { "passed" },
             seed.ops,
             seed.compactions,
+            seed.background_compactions,
             seed.fired_faults.len(),
             seed.wall_secs,
             seed.ops as f64 / seed.wall_secs.max(0.001)
         ));
     }
+    let explicit_compactions = seeds.iter().map(|seed| seed.compactions).sum::<u64>();
+    let background_compactions = seeds
+        .iter()
+        .map(|seed| seed.background_compactions)
+        .sum::<u64>();
     out.push_str(&format!(
-        "\nSummary: seeds={}, failed={}, ops={}, ops/sec={:.2}\n\n",
+        "\nSummary: seeds={}, failed={}, ops={}, explicit_compactions={}, background_compactions={}, ops/sec={:.2}\n\n",
         seeds.len(),
         failed,
         ops,
+        explicit_compactions,
+        background_compactions,
         ops as f64 / wall
     ));
 

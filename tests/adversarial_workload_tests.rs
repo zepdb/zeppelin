@@ -88,10 +88,11 @@ async fn smoke() {
     }
 
     println!(
-        "adversarial smoke: seeds={} ops={} compactions={} failed={} ops/sec={:.2}",
+        "adversarial smoke: seeds={} ops={} compactions={} background_compactions={} failed={} ops/sec={:.2}",
         summary.seeds_run,
         summary.ops_total,
         summary.compactions_total,
+        summary.background_compactions_total,
         summary.failed_seeds,
         summary.ops_per_sec
     );
@@ -122,10 +123,11 @@ async fn overnight() {
     let env = adversarial::RunnerEnv::from_env();
     let summary = adversarial::runner::run_overnight(env).await;
     println!(
-        "adversarial overnight: seeds={} ops={} compactions={} failed={} ops/sec={:.2}",
+        "adversarial overnight: seeds={} ops={} compactions={} background_compactions={} failed={} ops/sec={:.2}",
         summary.seeds_run,
         summary.ops_total,
         summary.compactions_total,
+        summary.background_compactions_total,
         summary.failed_seeds,
         summary.ops_per_sec
     );
