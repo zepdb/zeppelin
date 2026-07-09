@@ -1,4 +1,104 @@
-//! Exact-key reachability and two-pass storage garbage collection.
+//! Manifest-aware garbage collection for immutable WAL and segment objects.
+//!
+//! Zeppelin never deletes an object merely because an S3/MinIO listing does
+//! not match one in-memory view. The live
+//! [`Manifest`][crate::wal::manifest::Manifest] is authoritative, every
+//! retained manifest-history generation is an additional live root, and
+//! uploads recorded by the active compaction lease are temporarily protected.
+//! This module derives the exact union of those references, records known-shape
+//! objects outside that union in a persisted
+//! [`GcCandidate`][crate::compaction::gc::GcCandidate] ledger, and
+//! revalidates the union before a later sweep physically deletes anything.
+//!
+//! [`run_gc_cycle`][crate::compaction::gc::run_gc_cycle] is called by the
+//! background compaction loop before it considers new compaction work.
+//! [`drain_pending_deletes`][crate::compaction::gc::drain_pending_deletes]
+//! handles objects that an already-published manifest explicitly scheduled for
+//! removal. The helper
+//! [`reachable_keys`][crate::compaction::gc::reachable_keys] is also used by
+//! namespace clone/restore and storage oracles that need the same artifact
+//! vocabulary as GC.
+//!
+//! This file talks to object storage only through
+//! [`ZeppelinStore`][crate::storage::ZeppelinStore]. It does not mutate query
+//! caches or make a candidate ledger authoritative. A configured time horizon
+//! protects readers that may still use a cached older manifest; the cache
+//! itself remains disposable and is not consulted during deletion. There is no
+//! dry-run mode: reports such as
+//! [`GcCycleReport`][crate::compaction::gc::GcCycleReport] describe work already
+//! attempted in the current cycle.
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`reachable_keys`][crate::compaction::gc::reachable_keys] and
+//!    [`reachable_keys_with_staging`][crate::compaction::gc::reachable_keys_with_staging]
+//!    to see how a manifest becomes an exact object-key set.
+//! 2. Read [`CompactionStaging`][crate::compaction::gc::CompactionStaging] and
+//!    [`active_staged_keys`][crate::compaction::gc::active_staged_keys] for the
+//!    upload-before-manifest safety bridge.
+//! 3. Read [`GcCandidate`][crate::compaction::gc::GcCandidate] and
+//!    [`mark_gc_candidates`][crate::compaction::gc::mark_gc_candidates] for the
+//!    persisted mark pass.
+//! 4. Read
+//!    [`drain_pending_deletes`][crate::compaction::gc::drain_pending_deletes]
+//!    for manifest-owned deferred deletion.
+//! 5. Finish with [`run_gc_cycle`][crate::compaction::gc::run_gc_cycle] for
+//!    history pruning, mark persistence, fresh revalidation, and the sequential
+//!    sweep.
+//!
+//! ## Authority and deletion flow
+//!
+//! ```text
+//! live manifest on S3 -----------+
+//! retained manifest history ----+---- exact reachable union
+//! active-lease staged uploads ---+             |
+//!                                              | subtract from namespace LIST
+//!                                              v
+//!                                  persist candidate ledger (mark)
+//!                                              |
+//!                                 wait for configured time horizon
+//!                                              |
+//!                           re-read manifest + history + active staging
+//!                              | reachable/failure       | still unreachable
+//!                              v                         v
+//!                         keep candidate           DELETE immutable object
+//! ```
+//!
+//! History pruning precedes artifact deletion. A generation protected by the
+//! count window, PITR window, or a named snapshot therefore continues to pin
+//! every object it references. Deletes are sequential and not transactional:
+//! a later failure can follow earlier successful deletes. Candidate and
+//! `pending_deletes` state retain retryable work, and `NotFound` is treated as
+//! an idempotent completion where the relevant path explicitly says so.
+//!
+//! ## Invariants
+//!
+//! - The manifest-derived union, not LIST output or the candidate ledger,
+//!   decides reachability.
+//! - Retained history and active compaction staging are live roots.
+//! - Only recognized immutable artifact key shapes may enter the LIST-derived
+//!   candidate sweep; unfamiliar listed keys fail closed and remain in object
+//!   storage. Explicit manifest `pending_deletes` use their separate drain
+//!   contract.
+//! - A candidate must survive the wall-clock horizon and a fresh reachability
+//!   check. Its embedded ULID must also be old enough.
+//! - An object shared by carried clusters is collectible only after its last
+//!   manifest reference disappears.
+//! - GC never edits immutable WAL or segment objects in place.
+//!
+//! ## Rust concepts used here
+//!
+//! [`BTreeSet`][std::collections::BTreeSet] represents mathematical key unions
+//! and differences while
+//! deduplicating shared artifacts and keeping reports deterministic. This is
+//! closest to Java's `TreeSet`; in C it would require an explicitly owned set
+//! implementation and cleanup discipline. Borrowed `&Manifest` and `&str`
+//! parameters cannot be retained after a call, while returned sets and reports
+//! are owned values. Async store calls borrow the shared
+//! [`ZeppelinStore`][crate::storage::ZeppelinStore] gateway across `.await`; no
+//! mutex guard or raw backend pointer is exposed. Rust enums make each
+//! delete/skip outcome explicit and exhaustive instead of relying on integer
+//! status codes as C code often would.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,33 +123,132 @@ use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{Manifest, ManifestHistoryRetention};
 use crate::wal::Lease;
 
+/// Persisted JSON wrapper version written for new candidate ledgers.
 const GC_CANDIDATE_STORE_VERSION: u32 = 1;
+
+/// Maximum fresh-read/CAS attempts made while pruning `pending_deletes`.
 const GC_MANIFEST_CAS_RETRIES: usize = 10;
 
-/// Lease-scoped side-object recording compaction uploads that have not yet
-/// been committed into the manifest.
+/// Lease-scoped record of compaction uploads not yet committed to a manifest.
+///
+/// The record is a temporary GC root, not a visibility mechanism: queries do
+/// not read its keys. A staging object is useful only while its fencing token
+/// matches the unexpired namespace lease observed by [`active_staged_keys`].
+///
+/// The type is encoded as self-describing JSON so its named fields can evolve
+/// without depending on a positional binary layout.
+///
+/// # Examples
+///
+/// During lease token 17, a compactor can record the centroid and cluster keys
+/// it uploaded. The record protects those keys from GC but does not make the
+/// unfinished segment query-visible.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompactionStaging {
-    /// Fencing token of the lease that owns these in-flight uploads.
+    /// Fencing token of the lease holder that owns these in-flight uploads.
     pub fencing_token: u64,
-    /// Exact S3 keys uploaded by the compaction and not yet manifest-live.
+    /// Exact object keys uploaded by compaction but not yet manifest-visible.
     #[serde(default)]
     pub keys: BTreeSet<String>,
 }
 
-/// S3 key for a compaction staging side object.
+/// Builds the object key for one lease holder's compaction staging record.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace that owns the compaction and lease.
+/// - `fencing_token`: Monotonic token assigned to that lease acquisition.
+///
+/// # Returns
+///
+/// An owned key under `<namespace>/_staging/`, ending in `.json`.
+///
+/// # Examples
+///
+/// Namespace `catalog` with fencing token `17` maps to
+/// `catalog/_staging/17.json`.
 #[must_use]
 pub fn staging_key(namespace: &str, fencing_token: u64) -> String {
     format!("{namespace}/_staging/{fencing_token}.json")
 }
 
-/// Exact-key set of every S3 object still referenced by `manifest`.
+/// Derives every immutable artifact key referenced by one manifest.
+///
+/// This pure function expands WAL fragments, segment metadata, cluster data,
+/// attribute sidecars, bitmap/FTS indexes, quantization artifacts, and
+/// `pending_deletes`. Pending-delete keys remain protected until the drain path
+/// confirms their deletion and conditionally removes them from the manifest.
+/// The returned set does not include the manifest object, history objects, GC
+/// ledgers, leases, or staging records themselves; their key families are not
+/// sweepable artifact shapes.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace prefix used by deterministic artifact-key helpers.
+/// - `manifest`: Borrowed manifest snapshot whose references should be expanded.
+///
+/// # Returns
+///
+/// A lexicographically ordered, duplicate-free owned set of exact object keys.
+/// Shared carried-cluster objects appear once.
+///
+/// # Consistency
+///
+/// The result describes the supplied snapshot, not necessarily the current
+/// manifest by the time the caller uses it. Delete callers must obtain a fresh
+/// authoritative snapshot immediately before deciding.
+///
+/// # Performance
+///
+/// Performs no object-store I/O. Work and memory are proportional to fragments,
+/// segments, clusters, and enabled sidecar families in the manifest, with
+/// `BTreeSet` insertion costing `O(log n)` per distinct key.
+///
+/// # Examples
+///
+/// A two-cluster scalar-quantized segment contributes its tree or centroid
+/// metadata, two cluster and attribute objects, two scalar-code objects, and
+/// one calibration object. If both clusters reuse one carried object, that key
+/// remains present only once.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `&Manifest` is a temporary shared borrow, similar to a read-only Java
+/// reference or `const Manifest *` in C, but Rust also guarantees it is non-null
+/// and valid for the call. The returned [`BTreeSet`] owns cloned key strings and
+/// therefore remains valid after the manifest borrow ends.
 #[must_use]
 pub fn reachable_keys(namespace: &str, manifest: &Manifest) -> BTreeSet<String> {
     reachable_keys_with_staging(namespace, manifest, &BTreeSet::new())
 }
 
-/// Exact-key set of every manifest-referenced object plus active staged uploads.
+/// Unions one manifest's references with caller-validated staged uploads.
+///
+/// The caller is responsible for supplying only keys belonging to the active,
+/// unexpired lease; [`active_staged_keys`] performs that validation for normal
+/// GC use. Staged keys are protected from deletion but do not become visible to
+/// query readers.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace prefix for manifest-derived artifact keys.
+/// - `manifest`: Borrowed manifest snapshot to expand.
+/// - `staging`: Borrowed exact keys currently protected by compaction staging.
+///
+/// # Returns
+///
+/// An owned, ordered union containing manifest and staged keys exactly once.
+///
+/// # Consistency
+///
+/// This is a snapshot calculation. Sweep code re-reads both authoritative
+/// manifest state and active staging rather than trusting an earlier union.
+///
+/// # Examples
+///
+/// If the manifest references segment A while the active compactor has
+/// uploaded two objects for segment B, the result protects A and both B objects;
+/// only A is query-visible.
 #[must_use]
 pub fn reachable_keys_with_staging(
     namespace: &str,
@@ -136,7 +335,43 @@ pub fn reachable_keys_with_staging(
     keys
 }
 
-/// Exact-key set of every object referenced by retained manifest history.
+/// Loads retained manifest history and unions every referenced artifact key.
+///
+/// Each retained history generation is a PITR root even when its objects are
+/// absent from the current live manifest. A key remains protected until all
+/// retained generations that reference it have been pruned.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed object-store gateway used for history LIST and GETs.
+/// - `namespace`: Namespace whose immutable manifest history is inspected.
+///
+/// # Returns
+///
+/// A duplicate-free, ordered set of artifact keys referenced by any retained
+/// history manifest. An empty set means no history objects were listed.
+///
+/// # Errors
+///
+/// Propagates history listing, GET, key validation, and manifest decode errors.
+/// If a listed history object disappears before its GET, returns `NotFound`
+/// rather than silently treating that generation as unrooted.
+///
+/// # Side Effects
+///
+/// Performs one history-prefix LIST and one full-object GET per listed history
+/// generation. It does not delete history or data artifacts.
+///
+/// # Consistency
+///
+/// The current live manifest is deliberately not included; callers union it
+/// separately. A concurrent history-prune race can make a listed object vanish,
+/// in which case this function fails closed and the GC cycle skips deletion.
+///
+/// # Examples
+///
+/// If retained generations 7 and 8 both reference segment A while only 8
+/// references segment B, the returned set contains both segments' artifacts.
 pub async fn retained_manifest_history_reachable_keys(
     store: &ZeppelinStore,
     namespace: &str,
@@ -151,7 +386,33 @@ pub async fn retained_manifest_history_reachable_keys(
     Ok(keys)
 }
 
-/// Exact-key set of current manifest refs, retained manifest history, and active staging.
+/// Builds the complete GC root union for a supplied live manifest and staging set.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed gateway used to discover retained history.
+/// - `namespace`: Namespace whose history and artifact keys are addressed.
+/// - `manifest`: Borrowed current manifest snapshot.
+/// - `staging`: Borrowed keys already validated as active compaction staging.
+///
+/// # Returns
+///
+/// The ordered union of current-manifest, retained-history, and staged keys.
+///
+/// # Errors
+///
+/// Propagates retained-history LIST, GET, and decode failures. No partial union
+/// is returned because deleting from an incomplete root set would be unsafe.
+///
+/// # Performance
+///
+/// Adds one history LIST and one GET per retained generation to the in-memory
+/// set construction performed by [`reachable_keys_with_staging`].
+///
+/// # Examples
+///
+/// A segment removed from the live manifest remains in this result while a
+/// retained generation or active staging record still names its exact keys.
 pub async fn reachable_keys_with_retained_history_and_staging(
     store: &ZeppelinStore,
     namespace: &str,
@@ -167,6 +428,23 @@ pub async fn reachable_keys_with_retained_history_and_staging(
     ))
 }
 
+/// Unions already-loaded retained-history keys with live and staged roots.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace used to expand live manifest references.
+/// - `manifest`: Borrowed current manifest snapshot.
+/// - `staging`: Borrowed active staging keys.
+/// - `retained_history`: Borrowed union computed from retained generations.
+///
+/// # Returns
+///
+/// A newly owned, ordered union of all three root families.
+///
+/// # Examples
+///
+/// The mark and sweep phases use this helper with separately loaded snapshots
+/// so the second phase can revalidate instead of reusing the first phase's set.
 fn reachable_keys_with_retained_history_and_staging_keys(
     namespace: &str,
     manifest: &Manifest,
@@ -178,18 +456,32 @@ fn reachable_keys_with_retained_history_and_staging_keys(
     keys
 }
 
-/// A manifest-derived orphan candidate for the future two-pass GC sweep.
+/// A known-shape artifact observed outside the authoritative reachable union.
 ///
-/// This is not an authoritative refcount. It only records that `key` left the
-/// exact reachable union at a manifest CAS time; delete decisions must still
-/// revalidate against `reachable_keys()` from a fresh manifest snapshot.
+/// This is neither an authoritative reference count nor permission to delete.
+/// It records when and at which manifest generation the mark pass first saw the
+/// key unreachable. The sweep must still re-list the object, wait out the
+/// horizon, recognize the key shape, and revalidate fresh reachability.
+///
+/// The persisted representation is JSON. The generation field defaults to zero
+/// so older ledgers remain readable; the wall-clock horizon still applies to
+/// those legacy records.
+///
+/// # Examples
+///
+/// A WAL key first absent from generation 42 at 12:00 remains a candidate with
+/// that original time and generation across later marks. Seeing it reachable
+/// again removes the record instead of resetting or deleting the object.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GcCandidate {
     /// Exact S3 key that left the manifest-derived reachable union.
     pub key: String,
-    /// Manifest commit time at which the key was first observed unreachable.
+    /// Wall-clock time at which the key was first recorded unreachable.
+    ///
+    /// Manifest-delta candidates use the commit time; LIST-discovered candidates
+    /// use the mark-cycle time.
     pub first_seen_unreachable_at: DateTime<Utc>,
-    /// Manifest generation at which the key was first observed unreachable.
+    /// Manifest generation whose reachability snapshot first excluded the key.
     ///
     /// Legacy candidate records decode as `0`, treating them as logically
     /// very old while still requiring the wall-clock horizon before delete.
@@ -197,18 +489,40 @@ pub struct GcCandidate {
     pub unreachable_since_manifest_version: u64,
 }
 
+/// Persisted wrapper that distinguishes the current ledger from a legacy array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GcCandidateStore {
+    /// Wrapper schema marker written with new ledgers.
+    ///
+    /// The current decoder accepts the wrapper without rejecting other numeric
+    /// values; this field records format intent rather than enforcing migration.
     version: u32,
+    /// Complete candidate ledger replacing the previous object contents.
     candidates: Vec<GcCandidate>,
 }
 
-/// Summary of one mark/sweep GC cycle.
+/// Observable counters from one attempted mark/sweep cycle.
+///
+/// Counts describe completed or skipped work, not a dry-run plan. Several
+/// storage failures are logged and converted into an early `Ok` report so the
+/// background loop can retry on a later tick; consult logs and metrics when a
+/// report contains less progress than expected.
+/// Manifest-history prune counts are emitted in the cycle-complete log and are
+/// not stored in this report.
+///
+/// # Examples
+///
+/// A report with `candidates_marked = 3` and `objects_deleted = 0` commonly
+/// describes a first pass whose new candidates have not yet crossed the
+/// horizon. A later cycle may delete them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GcCycleReport {
     /// Number of newly-unreachable objects added to the candidate ledger.
     pub candidates_marked: usize,
-    /// Number of objects deleted from storage.
+    /// Number of candidate and pending-delete removals accepted as complete.
+    ///
+    /// Candidate `NotFound` outcomes count here as idempotent completion;
+    /// pending-delete `NotFound` outcomes are pruned but not counted deleted.
     pub objects_deleted: usize,
     /// Number of pending-delete objects physically deleted by this cycle.
     pub pending_deletes_deleted: usize,
@@ -216,36 +530,65 @@ pub struct GcCycleReport {
     pub pending_deletes_pruned: usize,
     /// Number of manifest pending-delete entries retained for retry.
     pub pending_deletes_retained: usize,
-    /// Known bytes reclaimed from manifest-recorded artifact sizes.
+    /// Bytes reclaimed for deleted keys whose sizes were available in metadata.
+    ///
+    /// Unknown sizes contribute zero, so this is a lower bound rather than the
+    /// sum of physical object sizes returned by S3. In the current sweep, most
+    /// true orphans are absent from the fresh manifest that supplies size
+    /// metadata and therefore contribute zero.
     pub bytes_reclaimed: u64,
     /// Number of candidates skipped instead of deleted.
     pub candidates_skipped: usize,
 }
 
-/// Summary of a manifest pending-delete drain pass.
+/// Observable result of draining the live manifest's deferred-delete queue.
+///
+/// # Examples
+///
+/// If one object is deleted, one was already absent, and one DELETE failed, the
+/// report contains one deleted object, two pruned entries, and one retained
+/// entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingDeleteDrainReport {
     /// Number of pending-delete objects physically deleted from storage.
     pub objects_deleted: usize,
-    /// Number of manifest entries removed after delete/absence confirmation.
+    /// Entries removed after successful DELETE or confirmed prior absence.
     pub entries_pruned: usize,
     /// Number of entries kept because deletion failed.
     pub entries_retained: usize,
 }
 
+/// Auditable reason that a known or listed object was not deleted this cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkipReason {
+    /// The object key is outside the explicit immutable-artifact allowlist.
     UnknownShape,
+    /// The candidate has not remained marked for the configured horizon.
     NotPersistedLongEnough,
+    /// A freshly computed root union references the candidate again.
     ReachableNow,
+    /// The artifact's creation ULID is younger than the configured horizon.
     UlidTooYoung,
+    /// A conservative in-flight watermark protects this newer artifact.
     NewerThanInflightCompaction,
+    /// An optional generation guard has not observed enough newer commits.
     NotEnoughManifestGenerations,
+    /// The object was absent from the namespace LIST captured for this cycle.
     NotListedThisCycle,
+    /// The object-store DELETE failed and the candidate remains retryable.
     DeleteFailed,
 }
 
 impl SkipReason {
+    /// Returns the stable low-cardinality label used by GC metrics and logs.
+    ///
+    /// # Returns
+    ///
+    /// A process-static string; no allocation occurs.
+    ///
+    /// # Examples
+    ///
+    /// `ReachableNow` maps to `"reachable_now"`.
     fn label(self) -> &'static str {
         match self {
             Self::UnknownShape => "unknown_shape",
@@ -260,28 +603,59 @@ impl SkipReason {
     }
 }
 
+/// Pure outcome of evaluating the candidate deletion safety gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeleteDecision {
+    /// All current safety predicates permit a physical DELETE attempt.
     Delete,
+    /// The candidate remains stored, with the auditable reason attached.
     Skip(SkipReason),
 }
 
+/// Immutable inputs used to evaluate one candidate at a common cycle time.
 #[derive(Debug, Clone, Copy)]
 struct DeletePredicateContext {
+    /// Required wall-clock and artifact-age grace period, in seconds.
     horizon_secs: u64,
+    /// Timestamp captured once for the current cycle or test case.
     now: DateTime<Utc>,
+    /// Oldest recognized artifact ULID among active staged uploads, in milliseconds.
     oldest_inflight_ulid_ms: Option<u64>,
+    /// Generation of the freshly read live manifest.
     current_manifest_version: u64,
+    /// Optional extra number of newer manifest generations required before delete.
+    ///
+    /// Production cycles currently pass `None`; tests exercise the independent
+    /// guard retained for future policy use.
     min_newer_manifest_versions: Option<u64>,
 }
 
+/// Recognized immutable artifact families whose keys carry a creation ULID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParsedGcArtifact {
-    WalFragment { ulid: Ulid },
-    SegmentArtifact { ulid: Ulid },
+    /// One immutable WAL fragment with its file-name creation/time-ordering ULID.
+    WalFragment {
+        /// Creation and ordering identifier decoded from the WAL fragment key.
+        ulid: Ulid,
+    },
+    /// One known segment artifact with its `seg_<ulid>` creation identifier.
+    SegmentArtifact {
+        /// Creation identifier decoded from the enclosing segment directory.
+        ulid: Ulid,
+    },
 }
 
 impl ParsedGcArtifact {
+    /// Extracts the creation/time-ordering ULID shared by both artifact families.
+    ///
+    /// # Returns
+    ///
+    /// The copied [`Ulid`] embedded in this parsed value.
+    ///
+    /// # Examples
+    ///
+    /// Both a WAL key and `segments/seg_<ulid>/centroids.bin` return the ULID
+    /// encoded in their path.
     fn ulid(self) -> Ulid {
         match self {
             Self::WalFragment { ulid } | Self::SegmentArtifact { ulid } => ulid,
@@ -289,13 +663,49 @@ impl ParsedGcArtifact {
     }
 }
 
-/// S3 key for the persisted per-namespace GC candidate ledger.
+/// Builds the key of the persisted per-namespace candidate ledger.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace that owns the ledger.
+///
+/// # Returns
+///
+/// An owned key of the form `<namespace>/_gc/candidates.json`.
+///
+/// # Examples
+///
+/// Namespace `catalog` maps to `catalog/_gc/candidates.json`.
 #[must_use]
 pub fn gc_candidate_store_key(namespace: &str) -> String {
     format!("{namespace}/_gc/candidates.json")
 }
 
-/// Load the persisted per-namespace GC candidate ledger.
+/// Loads and decodes the persisted candidate ledger for a namespace.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed object-store gateway used for the full-object GET.
+/// - `namespace`: Namespace whose ledger should be read.
+///
+/// # Returns
+///
+/// The owned candidate vector in persisted order. A missing or empty object
+/// means no candidates and returns an empty vector.
+///
+/// # Errors
+///
+/// Propagates non-`NotFound` GET failures and JSON decoding errors. It accepts
+/// the current versioned wrapper and the legacy bare-array representation.
+///
+/// # Performance
+///
+/// Performs one full GET and allocates one owned key string per candidate.
+///
+/// # Examples
+///
+/// A namespace that has never run the mark pass returns `[]`; malformed ledger
+/// bytes return a serialization error rather than silently resetting history.
 pub async fn load_gc_candidates(
     store: &ZeppelinStore,
     namespace: &str,
@@ -307,7 +717,46 @@ pub async fn load_gc_candidates(
     }
 }
 
-/// Persist the per-namespace GC candidate ledger as JSON.
+/// Replaces the per-namespace candidate ledger with versioned JSON.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed gateway used for one full-object PUT.
+/// - `namespace`: Namespace that owns the ledger.
+/// - `candidates`: Borrowed complete next ledger; entries are cloned into the
+///   serialized wrapper and remain owned by the caller.
+///
+/// # Returns
+///
+/// `Ok(())` after object storage accepts the complete replacement.
+///
+/// # Errors
+///
+/// Propagates JSON serialization, key validation, and object-store PUT errors.
+/// A failure leaves the previously persisted object or backend-defined write
+/// outcome; callers must not proceed to sweep when mark persistence fails.
+///
+/// # Side Effects
+///
+/// Performs one unconditional PUT to `<namespace>/_gc/candidates.json`. This
+/// maintenance ledger does not publish or hide query data.
+///
+/// # Performance
+///
+/// Clones the candidate vector and key strings, creates pretty-printed JSON,
+/// and uploads the entire ledger.
+///
+/// # Examples
+///
+/// Saving candidates A and B replaces a previous A-only ledger. Saving an
+/// empty slice records an empty versioned ledger after a successful sweep.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The slice `&[GcCandidate]` is a borrowed view, like a bounded read-only array
+/// view. `to_vec()` deliberately creates owned elements for serialization; C
+/// code would need explicit allocation and cleanup, while Rust drops temporary
+/// storage automatically on success or error.
 pub async fn save_gc_candidates(
     store: &ZeppelinStore,
     namespace: &str,
@@ -325,11 +774,74 @@ pub async fn save_gc_candidates(
         .await
 }
 
-/// Delete manifest `pending_deletes`, then prune only confirmed entries.
+/// Deletes live-manifest `pending_deletes` and prunes only confirmed entries.
 ///
 /// A key leaves `pending_deletes` only after its object delete succeeds or the
 /// object is already absent. Delete failures keep the entry in the manifest for
-/// a later GC/compaction cycle.
+/// a later GC/compaction cycle. Artifacts still referenced by retained history
+/// or younger than the configured horizon remain queued without a DELETE.
+///
+/// ```text
+/// current pending_deletes entry
+///          |
+///          +-- retained history references it --> keep
+///          +-- artifact ULID younger than horizon -> keep
+///          `-- DELETE succeeds / already absent
+///                         |
+///                         v
+///             remove entry with manifest CAS
+///                         |
+///                 CAS conflict -> reload and retry
+/// ```
+///
+/// # Parameters
+///
+/// - `store`: Borrowed gateway used for history reads, object DELETEs, and the
+///   conditional manifest update.
+/// - `namespace`: Namespace whose live deferred-delete queue is drained.
+/// - `gc`: Borrowed policy supplying the artifact-age horizon.
+///
+/// # Returns
+///
+/// Counts of successful physical deletes, entries pruned after delete or prior
+/// absence, and entries retained in the successful pass. A missing manifest or
+/// empty queue returns a zero/default report (plus any deletes accumulated
+/// across an earlier CAS retry).
+///
+/// # Errors
+///
+/// Propagates retained-history discovery failures, manifest read/decode errors,
+/// non-conflict manifest publication errors, and exhaustion of ten CAS retries.
+/// Individual DELETE failures are not propagated: their keys remain in
+/// `pending_deletes`. Physical deletes may already have succeeded before a
+/// later error or CAS exhaustion is returned.
+///
+/// # Side Effects
+///
+/// Lists and GETs retained manifest history, issues at most one sequential
+/// DELETE per eligible queue entry per attempt, updates deletion metrics, and
+/// conditionally publishes a manifest with confirmed entries removed.
+///
+/// # Consistency
+///
+/// Object deletion precedes manifest pruning. This ordering is safe because
+/// `pending_deletes` names artifacts already removed from the live data view,
+/// while retained history is checked separately. ETag CAS prevents this drain
+/// from overwriting concurrent manifest changes. On conflict, the fresh queue
+/// is re-read; repeated DELETE sees `NotFound` and completes idempotently.
+///
+/// # Performance
+///
+/// History discovery costs one LIST plus one GET per retained generation. Each
+/// CAS attempt costs one manifest GET, up to one DELETE per pending key, and at
+/// most one manifest history write plus conditional live-manifest PUT inside
+/// [`Manifest::write_conditional`].
+///
+/// # Examples
+///
+/// If A is old, B is still PITR-reachable, and C's DELETE fails, A is deleted
+/// and pruned, while B and C remain queued. A concurrent manifest writer can
+/// force a CAS retry but cannot cause its unrelated changes to be overwritten.
 pub async fn drain_pending_deletes(
     store: &ZeppelinStore,
     namespace: &str,
@@ -339,6 +851,34 @@ pub async fn drain_pending_deletes(
     drain_pending_deletes_with_retained_history(store, namespace, gc, &history_reachable).await
 }
 
+/// Drains pending deletes using a retained-history union already loaded by the caller.
+///
+/// This is the retrying implementation behind [`drain_pending_deletes`].
+/// Supplying the set avoids repeating history LIST/GET work inside each manifest
+/// CAS attempt.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed object-store gateway.
+/// - `namespace`: Namespace whose current manifest is updated.
+/// - `gc`: Borrowed GC horizon policy.
+/// - `retained_history`: Exact artifact keys pinned by retained generations.
+///
+/// # Returns
+///
+/// The same counts as [`PendingDeleteDrainReport`], including deletes accumulated
+/// before a successful retry.
+///
+/// # Errors
+///
+/// Returns manifest read/publication errors and a `ManifestConflict` after all
+/// retry attempts. Delete failures are retained as queue entries instead.
+/// Earlier physical deletes can have succeeded before an error is returned.
+///
+/// # Examples
+///
+/// A caller that already computed retained history for the current GC cycle can
+/// drain the queue without a second history scan.
 async fn drain_pending_deletes_with_retained_history(
     store: &ZeppelinStore,
     namespace: &str,
@@ -444,6 +984,29 @@ async fn drain_pending_deletes_with_retained_history(
     })
 }
 
+/// Checks whether a deferred-delete key is old enough for physical removal.
+///
+/// Age comes from the artifact ULID embedded in the key, not
+/// `Manifest::updated_at`, because unrelated writes continually refresh the
+/// manifest timestamp. Unknown key shapes fail closed. A zero horizon is an
+/// explicit test/emergency override that accepts every shape immediately.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace prefix required to parse the exact key shape.
+/// - `key`: Candidate WAL or known segment-artifact object key.
+/// - `now`: Reference wall-clock time for deterministic age calculation.
+/// - `horizon_secs`: Required minimum creation age in whole seconds.
+///
+/// # Returns
+///
+/// `true` when the horizon is zero or the parsed artifact ULID is at least that
+/// old; `false` for young or unrecognized keys.
+///
+/// # Examples
+///
+/// With a five-second horizon, a 30-second-old WAL key is eligible even if the
+/// manifest changed one second ago. `wal/not-a-ulid.wal` remains queued.
 fn pending_delete_horizon_satisfied(
     namespace: &str,
     key: &str,
@@ -467,6 +1030,21 @@ fn pending_delete_horizon_satisfied(
     ulid_age_secs >= horizon_secs
 }
 
+/// Records that an already-absent deferred object can be pruned idempotently.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace label attached to the structured debug event.
+/// - `key`: Exact pending-delete key confirmed absent by the store.
+///
+/// # Side Effects
+///
+/// Emits one structured debug log and performs no storage operation.
+///
+/// # Examples
+///
+/// A retry after an earlier successful DELETE logs absence before the manifest
+/// entry is removed by CAS.
 fn debug_pending_delete_absent(namespace: &str, key: &str) {
     tracing::debug!(
         namespace,
@@ -475,6 +1053,33 @@ fn debug_pending_delete_absent(namespace: &str, key: &str) {
     );
 }
 
+/// Decodes empty, versioned, or legacy candidate-ledger JSON.
+///
+/// # Parameters
+///
+/// - `data`: Borrowed complete object bytes. The decoder never retains this
+///   slice; returned candidates own their strings and timestamps.
+///
+/// # Returns
+///
+/// An empty vector for empty bytes, the wrapper's candidates for versioned JSON,
+/// or the array contents for the legacy bare-vector representation.
+///
+/// # Errors
+///
+/// If neither JSON shape decodes, returns the versioned-wrapper decode error.
+/// The current wrapper's numeric `version` field is recorded but not validated.
+///
+/// # Examples
+///
+/// Both `{"version":1,"candidates":[]}` and `[]` decode to an empty ledger;
+/// truncated JSON returns a serialization error.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The nested `match` tries two strongly typed serde targets without mutating
+/// the input. Each successful branch returns one owned `Vec`; the compiler
+/// requires every failure branch to produce the same `Result` type.
 fn decode_gc_candidates(data: &[u8]) -> Result<Vec<GcCandidate>> {
     if data.is_empty() {
         return Ok(Vec::new());
@@ -488,7 +1093,51 @@ fn decode_gc_candidates(data: &[u8]) -> Result<Vec<GcCandidate>> {
     }
 }
 
-/// Pure mark pass: add newly unreachable known artifacts and drop resurrected candidates.
+/// Computes the next ledger from LIST output, reachability, and existing marks.
+///
+/// Existing known-shape candidates preserve their first-observed timestamp and
+/// manifest generation while they remain unreachable. Candidates that became
+/// reachable are dropped. Newly listed, unreachable, recognized artifacts are
+/// stamped with `now` and `manifest_version`; unknown side objects are ignored
+/// so they can never enter the deletion pipeline.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace used to validate artifact key shapes.
+/// - `listed_keys`: Exact namespace keys observed by the current LIST.
+/// - `reachable`: Complete root union for the mark snapshot.
+/// - `existing`: Borrowed previously persisted candidate ledger.
+/// - `now`: Timestamp assigned only to newly marked candidates.
+/// - `manifest_version`: Mark-snapshot generation assigned only to new marks.
+///
+/// # Returns
+///
+/// An owned vector ordered lexicographically by key. It contains every valid
+/// existing unreachable candidate plus newly observed candidates, with no
+/// duplicates.
+///
+/// # Consistency
+///
+/// This pure result is not safe to sweep until it has been persisted and all
+/// authoritative roots have been re-read. LIST alone does not determine truth.
+///
+/// # Performance
+///
+/// Builds a [`BTreeMap`] in `O((e + l) log n)` time for `e` existing entries and
+/// `l` listed keys, cloning strings retained in the returned ledger.
+///
+/// # Examples
+///
+/// Candidate A keeps its original mark, candidate B disappears because a new
+/// manifest references it, and newly orphaned WAL C receives the current time
+/// and version. An unrelated `_gc/` object is ignored as an unknown shape.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Iterator-driven collection and `entry(...).or_insert(...)` express a
+/// deterministic map update without exposing iterator invalidation. Rust's
+/// borrowing rules prevent `existing` from being mutated while the new owned
+/// map and vector are assembled.
 #[must_use]
 pub fn mark_gc_candidates(
     namespace: &str,
@@ -536,11 +1185,103 @@ pub fn mark_gc_candidates(
         .collect()
 }
 
-/// Run one complete two-pass mark/sweep GC cycle for a namespace.
+/// Runs one complete history-prune, pending-drain, mark, and sweep cycle.
 ///
-/// The cycle lists namespace objects, persists newly-unreachable candidates,
-/// then deletes only candidates that have remained unreachable for
-/// `gc.horizon_secs` and still fail the fresh reachability check.
+/// The cycle first prunes unretained manifest history, rebuilds the retained
+/// history root set, and drains explicit `pending_deletes`. It then lists the
+/// namespace once, persists newly unreachable known artifacts, and re-reads the
+/// live manifest, active staging, and retained history before attempting any
+/// candidate DELETE.
+///
+/// ```text
+/// prune unretained history
+///          |
+///          v
+/// drain manifest pending_deletes
+///          |
+///          v
+/// LIST namespace + read mark roots + save candidate ledger
+///          |
+///          v
+/// re-read sweep roots (manifest, history, active staging)
+///          |
+///          +-- safety predicate fails --> keep candidate
+///          `-- all predicates pass ----> DELETE sequentially
+/// ```
+///
+/// This maintenance operation is best-effort. Most storage and decoding
+/// failures emit structured warnings, stop the unsafe remainder of the cycle,
+/// and return an `Ok` partial report so the background service can retry later.
+/// A zero/partial report must therefore not be read as proof that no garbage
+/// exists.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed authoritative object-store gateway. No query cache is
+///   consulted or invalidated.
+/// - `namespace`: Namespace prefix whose immutable artifacts may be collected.
+/// - `gc`: Borrowed retention and horizon policy. A short horizon must already
+///   have passed boot-time safety validation unless explicitly overridden.
+///
+/// # Returns
+///
+/// A report of marks, completed or idempotently absent deletes, lower-bound
+/// reclaimed bytes, and skips observed before the cycle stopped. Counts include
+/// pending-delete work completed before the LIST/mark phase.
+///
+/// # Errors
+///
+/// The current implementation catches its ordinary storage, serialization,
+/// manifest, and CAS failures, logs them, and returns a partial `Ok` report.
+/// The `Result` return type preserves an error-capable API boundary for callers,
+/// but no current fallible branch propagates an error from this function.
+/// Earlier history or artifact DELETEs may have succeeded before a caught later
+/// failure; this operation is not transactional.
+///
+/// # Side Effects
+///
+/// May delete old manifest-history objects, delete deferred and candidate data
+/// artifacts, conditionally update the live manifest, overwrite the candidate
+/// ledger, increment GC metrics, and emit structured logs. It never modifies a
+/// WAL fragment or segment object in place.
+///
+/// # Consistency
+///
+/// The mark ledger is a hint. Sweep authority comes from the second live
+/// manifest read plus freshly loaded retained history and active staging.
+/// Candidate ledger writes are unconditional and have no cross-cycle lock; a
+/// competing cycle may delay/re-mark work, but no ledger entry bypasses fresh
+/// reachability and age predicates. The horizon protects in-flight readers of
+/// stale cached manifests even though this function does not inspect caches. A
+/// ledger candidate absent from the cycle's original LIST is not deleted and is
+/// omitted from the cleaned ledger; if it later appears again, it must be marked
+/// and wait through the horizon again.
+///
+/// # Performance
+///
+/// One cycle includes history and snapshot LIST/GET/DELETE work, one namespace
+/// LIST materialized in memory, candidate-ledger GET plus one or two full PUTs,
+/// at least two live-manifest GETs for mark and sweep plus any pending-drain CAS
+/// attempts, two active-staging scans, another retained-history scan for the
+/// sweep, and sequential artifact DELETEs. Network roundtrips grow with retained
+/// generations, staging records, pending entries, and mature candidates;
+/// candidates are not deleted concurrently.
+///
+/// # Examples
+///
+/// On the first cycle, orphan A is listed, absent from all roots, and written to
+/// the ledger but is too new to delete. After the horizon, a second cycle marks
+/// it with the original timestamp, re-reads roots, and deletes it. If a retained
+/// PITR generation starts referencing A, the fresh union drops the candidate
+/// instead. If the sweep manifest GET fails, A remains for a later cycle.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Each `match` handles success and failure exhaustively at the I/O boundary.
+/// Owned sets and manifests are moved between phases, while the store and config
+/// are shared borrows. Unlike a Java exception or C error code that might skip
+/// cleanup implicitly, each early return constructs the exact partial report;
+/// Rust also drops all owned temporary collections automatically.
 pub async fn run_gc_cycle(
     store: &ZeppelinStore,
     namespace: &str,
@@ -822,10 +1563,51 @@ pub async fn run_gc_cycle(
     })
 }
 
+/// Reads the current authoritative manifest without consulting a cache.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed object-store gateway.
+/// - `namespace`: Namespace whose live manifest key is loaded.
+///
+/// # Returns
+///
+/// `Some(manifest)` when present or `None` when the manifest object is absent.
+///
+/// # Errors
+///
+/// Propagates object-store and manifest decoding errors to the enclosing phase,
+/// which logs them and skips unsafe deletion work.
+///
+/// # Performance
+///
+/// Performs one full live-manifest GET.
+///
+/// # Examples
+///
+/// Both mark and sweep call this separately so a publication between phases is
+/// visible to the sweep check.
 async fn read_manifest_for_gc(store: &ZeppelinStore, namespace: &str) -> Result<Option<Manifest>> {
     Manifest::read(store, namespace).await
 }
 
+/// Records one fail-closed candidate skip in metrics and structured logs.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace metric label and log field.
+/// - `key`: Exact object key that was not deleted.
+/// - `reason`: Low-cardinality policy or failure classification.
+///
+/// # Side Effects
+///
+/// Increments `GC_CANDIDATES_SKIPPED_TOTAL` and emits a warning. It performs no
+/// object-store operation and does not alter the candidate ledger itself.
+///
+/// # Examples
+///
+/// A newly recognized orphan logs `unreachable_horizon`; an unfamiliar object
+/// under the namespace logs `unknown_shape` and remains untouched.
 fn log_gc_skip(namespace: &str, key: &str, reason: SkipReason) {
     crate::metrics::GC_CANDIDATES_SKIPPED_TOTAL
         .with_label_values(&[namespace, reason.label()])
@@ -838,6 +1620,37 @@ fn log_gc_skip(namespace: &str, key: &str, reason: SkipReason) {
     );
 }
 
+/// Applies every fail-closed safety predicate to one marked candidate.
+///
+/// Predicates are ordered from structural/current authority through elapsed
+/// time, optional manifest generations, artifact creation age, and the active
+/// compaction watermark. Passing this pure function permits a DELETE attempt;
+/// it does not perform the delete.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace required to parse the exact artifact key.
+/// - `candidate`: Borrowed persisted mark being evaluated.
+/// - `reachable`: Borrowed root union from fresh sweep snapshots.
+/// - `context`: Copyable horizon, time, generation, and in-flight watermark.
+///
+/// # Returns
+///
+/// [`DeleteDecision::Delete`] only when all enabled guards pass; otherwise a
+/// precise [`SkipReason`] identifying the first failed guard.
+///
+/// # Consistency
+///
+/// Wall-clock persistence is mandatory because cached readers do not announce
+/// manifest epochs. The optional generation guard can strengthen but never
+/// replace that horizon. The artifact's own ULID is a second age floor, stopping
+/// an old ledger timestamp from authorizing deletion of a newly created object.
+///
+/// # Examples
+///
+/// A key marked ten seconds ago with a five-second horizon is still skipped if
+/// the fresh manifest references it, if its artifact ULID is only one second
+/// old, or if it is newer than the oldest active staged upload.
 fn should_delete_candidate(
     namespace: &str,
     candidate: &GcCandidate,
@@ -885,6 +1698,23 @@ fn should_delete_candidate(
     DeleteDecision::Delete
 }
 
+/// Finds the oldest creation timestamp among recognized active staged artifacts.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace used to parse staged artifact keys.
+/// - `staged`: Borrowed exact keys protected by the active lease.
+///
+/// # Returns
+///
+/// The minimum embedded ULID timestamp in milliseconds, or `None` if no staged
+/// key has a recognized GC artifact shape. Unknown staged keys remain reachable
+/// through the root union but do not contribute a watermark.
+///
+/// # Examples
+///
+/// Staged objects created at milliseconds 100 and 120 produce `Some(100)`;
+/// candidate artifacts newer than 100 are conservatively skipped.
 fn oldest_inflight_ulid_ms(namespace: &str, staged: &BTreeSet<String>) -> Option<u64> {
     staged
         .iter()
@@ -893,6 +1723,30 @@ fn oldest_inflight_ulid_ms(namespace: &str, staged: &BTreeSet<String>) -> Option
         .min()
 }
 
+/// Indexes artifact sizes that the supplied manifest records explicitly.
+///
+/// The manifest currently carries byte sizes for WAL fragments and coarse
+/// sketches, not every segment sidecar. Missing entries intentionally yield
+/// zero-byte accounting rather than guessing from a separate HEAD/GET.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace used to derive WAL keys.
+/// - `manifest`: Borrowed snapshot containing known size metadata.
+///
+/// # Returns
+///
+/// An ordered key-to-byte-count map for WAL fragments and sketch objects whose
+/// sizes are present in this snapshot.
+///
+/// # Performance
+///
+/// Performs no object-store I/O. Work is linear in fragments and segments.
+///
+/// # Examples
+///
+/// A 100-byte fragment and 512-byte sketch produce two entries; an attribute
+/// sidecar has no entry and contributes zero to the cycle's lower-bound report.
 fn known_reclaimable_sizes(namespace: &str, manifest: &Manifest) -> BTreeMap<String, u64> {
     let mut sizes = BTreeMap::new();
     for fragment in &manifest.fragments {
@@ -909,6 +1763,35 @@ fn known_reclaimable_sizes(namespace: &str, manifest: &Manifest) -> BTreeMap<Str
     sizes
 }
 
+/// Parses only immutable artifact key shapes that GC is allowed to delete.
+///
+/// Valid WAL keys are `<namespace>/wal/<ulid>.wal`. Valid segment keys live
+/// directly beneath `<namespace>/segments/seg_<ulid>/` and use the explicit
+/// metadata or numbered sidecar names recognized by
+/// `is_known_segment_artifact_name`. Extra path components, invalid ULIDs, and
+/// maintenance/control objects are rejected.
+///
+/// # Parameters
+///
+/// - `namespace`: Exact namespace prefix expected at the beginning of the key.
+/// - `key`: Full object key to classify.
+///
+/// # Returns
+///
+/// A typed artifact family and copied ULID for known shapes, or `None` for every
+/// unrecognized key. `None` means retain, never "safe to delete."
+///
+/// # Examples
+///
+/// `catalog/wal/<ulid>.wal` and
+/// `catalog/segments/seg_<ulid>/attrs_2.bin` parse. `catalog/lease.json`, a
+/// nested `attrs_2.bin/extra`, or `segments/seg_human-name/...` does not.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The `Option` return type forces callers to handle parse failure explicitly;
+/// there is no null pointer or sentinel ULID. The `?` operators return `None`
+/// from the helper as soon as a required path component is absent.
 fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact> {
     let wal_prefix = format!("{namespace}/wal/");
     if let Some(name) = key.strip_prefix(&wal_prefix) {
@@ -936,6 +1819,22 @@ fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact>
     }
 }
 
+/// Checks the allowlist of immutable files permitted directly under a segment.
+///
+/// # Parameters
+///
+/// - `file_name`: Final path component with no `/`, already separated from the
+///   `seg_<ulid>` directory by the caller.
+///
+/// # Returns
+///
+/// `true` for fixed metadata names or decimal-numbered cluster/index sidecars;
+/// `false` for unknown extensions, prefixes, or nested paths.
+///
+/// # Examples
+///
+/// `centroids.bin`, `cluster_group_12.bin`, and `fts_index_0.bin` are known;
+/// `notes.txt` and `cluster_x.bin` are not.
 fn is_known_segment_artifact_name(file_name: &str) -> bool {
     matches!(
         file_name,
@@ -956,6 +1855,21 @@ fn is_known_segment_artifact_name(file_name: &str) -> bool {
         || numbered_bin(file_name, "pq_cluster_")
 }
 
+/// Recognizes `<prefix><nonempty decimal digits>.bin` exactly.
+///
+/// # Parameters
+///
+/// - `file_name`: Candidate final path component.
+/// - `prefix`: Required family prefix, such as `cluster_` or `bitmap_`.
+///
+/// # Returns
+///
+/// `true` only when at least one ASCII digit lies between the prefix and `.bin`.
+///
+/// # Examples
+///
+/// `numbered_bin("attrs_42.bin", "attrs_")` is true; `attrs_.bin`,
+/// `attrs_-1.bin`, and `attrs_42.dat` are false.
 fn numbered_bin(file_name: &str, prefix: &str) -> bool {
     let Some(number) = file_name
         .strip_prefix(prefix)
@@ -966,13 +1880,44 @@ fn numbered_bin(file_name: &str, prefix: &str) -> bool {
     !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-/// Build GC candidates from the exact key delta across a manifest CAS.
+/// Builds candidates from the exact reachability delta across a manifest commit.
 ///
 /// The returned keys are `reachable(old_manifest) - reachable(new_manifest)`.
 /// This preserves carried-object correctness by construction: any object still
 /// referenced by at least one live segment remains in the reachable union and
 /// is not emitted. Crash-orphans that never entered a manifest are invisible to
 /// this delta and remain the periodic LIST sweep's responsibility.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace used to derive exact keys in both snapshots.
+/// - `old_manifest`: Borrowed manifest that was authoritative before the commit.
+/// - `new_manifest`: Borrowed manifest successfully published by the commit.
+/// - `commit_time`: Wall-clock time assigned to every key leaving reachability.
+///
+/// # Returns
+///
+/// Owned candidates in lexicographic key order, stamped with `commit_time` and
+/// the new manifest's generation. An empty vector means no exact reference was
+/// released.
+///
+/// # Consistency
+///
+/// Call this only for the old/new pair around a successful manifest CAS. The
+/// output accelerates marking but remains non-authoritative and must be
+/// revalidated before deletion.
+///
+/// # Performance
+///
+/// Expands both manifests into ordered sets, then performs a linear set
+/// difference. It does no storage I/O.
+///
+/// # Examples
+///
+/// If a new segment carries cluster 0 from an old segment but replaces cluster
+/// 1, only the old centroid, cluster-1, and cluster-1 sidecar keys enter the
+/// delta. A never-published upload appears in neither manifest and is found only
+/// by periodic LIST-based marking.
 #[must_use]
 pub fn gc_candidates_from_manifest_delta(
     namespace: &str,
@@ -993,11 +1938,35 @@ pub fn gc_candidates_from_manifest_delta(
         .collect()
 }
 
-/// Keep only candidates that are still unreachable in `manifest`.
+/// Keeps only candidates still unreachable in a supplied manifest snapshot.
 ///
 /// Candidate state is an accelerator, not truth. The future delete stage must
 /// call this shape of check after reading the authoritative manifest so a key
 /// that became live again is skipped.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace used to expand exact manifest artifact keys.
+/// - `manifest`: Borrowed freshly loaded manifest snapshot.
+/// - `candidates`: Borrowed marks to filter without modifying the input slice.
+///
+/// # Returns
+///
+/// Owned clones of candidates absent from this manifest's reachable set, in
+/// input order. It does not apply history, staging, age, LIST, or key-shape
+/// guards and therefore is not a complete delete predicate.
+///
+/// # Examples
+///
+/// If candidates A and B are supplied and a fresh manifest references A again,
+/// the result contains only B. Sweep code must still union retained history and
+/// active staging before acting on B.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Filtering borrows each entry and `.cloned()` creates owned output records.
+/// The caller keeps its original slice; Rust prevents the returned vector from
+/// containing dangling pointers into it.
 #[must_use]
 pub fn revalidate_unreachable_candidates(
     namespace: &str,
@@ -1012,7 +1981,48 @@ pub fn revalidate_unreachable_candidates(
         .collect()
 }
 
-/// Write the exact staged-key set for the current compaction lease.
+/// Writes the exact staged-key set for one compaction lease token.
+///
+/// Compaction calls this after listing its uploaded segment prefix and before
+/// attempting manifest publication. The staging object pins those uploads for
+/// GC but does not make them query-visible.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed gateway used for one JSON PUT.
+/// - `namespace`: Namespace owning the lease and uploads.
+/// - `fencing_token`: Token of the lease holder publishing this staging root.
+/// - `keys`: Owned, duplicate-free exact upload keys moved into the record.
+///
+/// # Returns
+///
+/// `Ok(())` after storage accepts the staging object.
+///
+/// # Errors
+///
+/// Propagates JSON serialization, invalid-key, and PUT failures. The caller
+/// must not assume GC protection was published after an error.
+///
+/// # Side Effects
+///
+/// Unconditionally replaces `<namespace>/_staging/<token>.json` with the
+/// complete set. It does not write the live manifest.
+///
+/// # Performance
+///
+/// Serializes the set to pretty JSON and performs one full-object PUT.
+///
+/// # Examples
+///
+/// A compactor uploads centroids and two cluster groups, then writes all three
+/// keys here. GC protects them while this token remains the active lease even
+/// though readers still use the old manifest.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `keys` is moved into [`CompactionStaging`], so the caller cannot accidentally
+/// keep mutating the exact set being serialized. Java would pass a mutable
+/// object reference; C would require a documented ownership transfer.
 pub async fn write_compaction_staging(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1029,7 +2039,32 @@ pub async fn write_compaction_staging(
         .await
 }
 
-/// Clear the staged-key side object for a compaction lease.
+/// Clears one lease token's staging record idempotently.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed gateway used for the DELETE.
+/// - `namespace`: Namespace owning the staging object.
+/// - `fencing_token`: Token encoded in the staging key to remove.
+///
+/// # Returns
+///
+/// `Ok(())` when the object is deleted or was already absent.
+///
+/// # Errors
+///
+/// Propagates invalid-key and non-`NotFound` storage DELETE errors. A failure may
+/// leave a stale staging object, but [`active_staged_keys`] ignores it once the
+/// token no longer matches an unexpired lease.
+///
+/// # Side Effects
+///
+/// Performs one object-store DELETE attempt and does not change the manifest.
+///
+/// # Examples
+///
+/// Cleanup after successful publication removes token 17's record. A retry
+/// after it was already removed also succeeds.
 pub async fn clear_compaction_staging(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1042,8 +2077,57 @@ pub async fn clear_compaction_staging(
     }
 }
 
-/// Return staged keys for the currently active lease, excluding stale or
-/// expired lease records so a dead compactor cannot pin uploads forever.
+/// Returns staged uploads owned by the currently active, unexpired lease.
+///
+/// The function reads the authoritative lease object first. A missing or
+/// expired lease returns an empty set without scanning staging. With an active
+/// lease, all staging records are listed and decoded, but only records whose
+/// embedded fencing token equals the lease token contribute keys. Stale records
+/// may remain in storage, but they cannot pin uploads forever.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed gateway used for the lease GET, staging LIST, and record
+///   GETs.
+/// - `namespace`: Namespace whose lease and staging prefix are inspected.
+///
+/// # Returns
+///
+/// An ordered, duplicate-free owned set of keys for the observed active token.
+/// Missing or expired lease state returns an empty set.
+///
+/// # Errors
+///
+/// Propagates lease GET failures other than `NotFound`, malformed lease JSON,
+/// staging LIST/GET failures, and malformed staging JSON. One bad stale record
+/// still aborts the scan because records are decoded before token comparison;
+/// callers fail closed and skip sweeping rather than use a partial set.
+///
+/// # Consistency
+///
+/// Lease, LIST, and record GETs are separate object-store operations, not one
+/// atomic snapshot. The returned set corresponds to the unexpired lease read at
+/// function entry. GC also applies the configured horizon and re-runs this scan
+/// before sweep, covering upload/publication races conservatively.
+///
+/// # Performance
+///
+/// A missing/expired lease costs one GET. An active lease costs one lease GET,
+/// one staging-prefix LIST, and one full GET plus JSON decode per listed staging
+/// object, processed sequentially.
+///
+/// # Examples
+///
+/// If lease token 9 is active and staging records exist for tokens 8 and 9,
+/// only token 9's keys are returned. Once token 9 expires, the same records
+/// produce an empty root set.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `BTreeSet::extend` moves owned strings from each decoded matching record into
+/// the result. No shared mutable collection or lock crosses `.await`; Java code
+/// might use a mutable `TreeSet`, while C would need explicit string ownership
+/// and cleanup on every error branch.
 pub async fn active_staged_keys(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1073,6 +2157,15 @@ pub async fn active_staged_keys(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    //! Unit coverage for exact reachability, mark persistence, and delete gates.
+    //!
+    //! These tests use deterministic in-memory manifests for pure set logic and
+    //! an in-memory `object_store` backend for candidate-ledger round trips.
+    //! They deliberately cover carried cluster ownership, optional index
+    //! sidecars, legacy persistence, horizon boundaries, and fail-closed
+    //! decisions. Integration suites exercise full cycles against broader store
+    //! and fault-injection setups.
+
     use super::*;
 
     use chrono::Utc;
@@ -1096,8 +2189,23 @@ mod tests {
         SketchRef,
     };
 
+    /// Stable namespace prefix used to make expected artifact keys readable.
     const NS: &str = "gc_ns";
 
+    /// Builds the smallest manifest fragment descriptor useful to reachability tests.
+    ///
+    /// # Parameters
+    ///
+    /// - `id`: ULID embedded in the expected WAL object key.
+    ///
+    /// # Returns
+    ///
+    /// An owned one-vector, 100-byte descriptor with sequence number zero.
+    ///
+    /// # Examples
+    ///
+    /// The returned descriptor contributes exactly one `wal/<id>.wal` key when
+    /// inserted into a manifest.
     fn fragment_ref(id: Ulid) -> FragmentRef {
         FragmentRef {
             id,
@@ -1108,6 +2216,22 @@ mod tests {
         }
     }
 
+    /// Builds a minimal unquantized IVF segment descriptor for focused test mutation.
+    ///
+    /// # Parameters
+    ///
+    /// - `id`: Segment identifier copied into the owned descriptor.
+    /// - `cluster_count`: Number of self-owned cluster and attribute objects.
+    ///
+    /// # Returns
+    ///
+    /// A ten-vector flat segment with no optional bitmap, FTS, quantization,
+    /// sketch, bootstrap, membership, or grouped-cluster artifacts.
+    ///
+    /// # Examples
+    ///
+    /// Tests start from `segment_ref("seg_a", 2)` and selectively enable
+    /// carried ownership or optional sidecars to isolate one reachability rule.
     fn segment_ref(id: &str, cluster_count: usize) -> SegmentRef {
         SegmentRef {
             id: id.to_string(),
@@ -1126,6 +2250,20 @@ mod tests {
         }
     }
 
+    /// Projects candidates into a deterministic set for order-independent assertions.
+    ///
+    /// # Parameters
+    ///
+    /// - `candidates`: Borrowed candidate slice whose exact keys are compared.
+    ///
+    /// # Returns
+    ///
+    /// An owned, sorted, duplicate-free key set.
+    ///
+    /// # Examples
+    ///
+    /// Two candidates in either vector order compare against the same expected
+    /// `BTreeSet`.
     fn candidate_keys(candidates: &[GcCandidate]) -> BTreeSet<String> {
         candidates
             .iter()
@@ -1133,13 +2271,24 @@ mod tests {
             .collect()
     }
 
+    /// One table row describing keys that must and must not be manifest-reachable.
     struct ReachabilityCase {
+        /// Human-readable label included when an assertion fails.
         name: &'static str,
+        /// Owned manifest configuration under test.
         manifest: Manifest,
+        /// Exact keys required in the derived reachability set.
         present: Vec<String>,
+        /// Exact keys required to remain outside the derived set.
         absent: Vec<String>,
     }
 
+    /// Protects the complete manifest-to-artifact expansion across layout variants.
+    ///
+    /// This table catches accidental omission or over-inclusion of fragments,
+    /// carried clusters, deferred deletes, hierarchical metadata, grouped data,
+    /// quantization, bitmap, local/global FTS, sketch, bootstrap, or membership
+    /// objects. Either mistake could leak storage or delete visible data.
     #[test]
     fn reachable_keys_are_the_exact_manifest_references() {
         let frag_a = Ulid::from_parts(1, 10);
@@ -1334,6 +2483,10 @@ mod tests {
         }
     }
 
+    /// Verifies that two live references to one carried object produce one root key.
+    ///
+    /// This protects the set semantics used by manifest deltas: shared object
+    /// reachability is about presence, not a duplicate count in a vector.
     #[test]
     fn reachable_keys_are_deduplicated() {
         let mut manifest = Manifest::new();
@@ -1352,6 +2505,10 @@ mod tests {
         );
     }
 
+    /// Verifies that a manifest delta marks only exact keys whose final reference left.
+    ///
+    /// A carried cluster survives while the old centroid and replaced cluster
+    /// artifacts become candidates stamped at the publication time.
     #[test]
     fn cas_delta_candidates_are_exact_keys_that_left_reachability() {
         let commit_time = Utc::now();
@@ -1402,6 +2559,10 @@ mod tests {
         );
     }
 
+    /// Protects shared carried artifacts until their final live segment releases them.
+    ///
+    /// The test would catch a per-segment deletion scheme that ignores global
+    /// reachability and removes data still referenced by another segment.
     #[test]
     fn shared_carried_object_is_candidate_only_after_last_reference_releases_it() {
         let commit_time = Utc::now();
@@ -1447,6 +2608,10 @@ mod tests {
         );
     }
 
+    /// Demonstrates why manifest deltas cannot discover uploads never published by CAS.
+    ///
+    /// The absent-from-both key must not appear in the delta; periodic namespace
+    /// LIST is the separate backstop for this crash-orphan class.
     #[test]
     fn crash_orphan_absent_from_both_manifests_is_not_a_delta_candidate() {
         let commit_time = Utc::now();
@@ -1466,6 +2631,10 @@ mod tests {
         );
     }
 
+    /// Ensures a newly live key is removed when candidates meet a fresh manifest.
+    ///
+    /// This prevents the persisted ledger from acting like an authoritative
+    /// reference count after a key is resurrected.
     #[test]
     fn candidate_revalidation_recomputes_reachability_from_manifest_before_deletion() {
         let commit_time = Utc::now();
@@ -1497,6 +2666,10 @@ mod tests {
         );
     }
 
+    /// Ensures active compaction uploads join the GC root set without becoming visible.
+    ///
+    /// The test catches a mark pass that protects only manifest artifacts during
+    /// the upload-before-publication interval.
     #[test]
     fn reachable_keys_with_staging_unions_active_staged_keys() {
         let mut manifest = Manifest::new();
@@ -1519,11 +2692,46 @@ mod tests {
         }
     }
 
+    /// Creates a deterministic-entropy ULID with a wall-clock-relative timestamp.
+    ///
+    /// # Parameters
+    ///
+    /// - `seconds`: Signed number of seconds before the current instant.
+    /// - `entropy`: Low 80-bit ULID entropy used to keep fixtures distinct.
+    ///
+    /// # Returns
+    ///
+    /// A ULID whose timestamp drives artifact-age predicate tests.
+    ///
+    /// # Panics
+    ///
+    /// The test-only cast assumes the current UTC timestamp in milliseconds is
+    /// non-negative; this is true for normal post-epoch test execution.
+    ///
+    /// # Examples
+    ///
+    /// `ulid_seconds_ago(30, 1)` produces an artifact roughly 30 seconds old.
     fn ulid_seconds_ago(seconds: i64, entropy: u128) -> Ulid {
         let ts = (Utc::now() - chrono::Duration::seconds(seconds)).timestamp_millis() as u64;
         Ulid::from_parts(ts, entropy)
     }
 
+    /// Builds the production-like baseline predicate context used by table tests.
+    ///
+    /// # Parameters
+    ///
+    /// - `horizon_secs`: Required elapsed time and artifact age.
+    /// - `now`: Shared reference instant for deterministic comparisons.
+    ///
+    /// # Returns
+    ///
+    /// A context at manifest version 10 with no staged watermark or optional
+    /// generation guard; individual tests override only the field under study.
+    ///
+    /// # Examples
+    ///
+    /// A test can start with `delete_context(5, now)` and set only
+    /// `oldest_inflight_ulid_ms` to isolate the in-flight watermark rule.
     fn delete_context(horizon_secs: u64, now: DateTime<Utc>) -> DeletePredicateContext {
         DeletePredicateContext {
             horizon_secs,
@@ -1534,6 +2742,10 @@ mod tests {
         }
     }
 
+    /// Proves old deferred artifacts drain even when unrelated writes refresh the manifest.
+    ///
+    /// A regression to `manifest.updated_at` would keep garbage forever in a
+    /// busy namespace and fail this property.
     #[test]
     fn pending_delete_horizon_uses_key_ulid_age_not_manifest_update_time() {
         let now = Utc::now();
@@ -1546,6 +2758,9 @@ mod tests {
         );
     }
 
+    /// Proves a young artifact remains queued regardless of any old manifest timestamp.
+    ///
+    /// This guards the creation-ULID age floor that covers recent uploads.
     #[test]
     fn pending_delete_horizon_retains_young_key_even_with_old_manifest_update_time() {
         let now = Utc::now();
@@ -1558,6 +2773,10 @@ mod tests {
         );
     }
 
+    /// Verifies malformed or unfamiliar pending-delete keys fail closed.
+    ///
+    /// Without this guard an accidental control-object key could be physically
+    /// removed merely because it appeared in a deferred queue.
     #[test]
     fn pending_delete_horizon_retains_unparseable_key() {
         let now = Utc::now();
@@ -1569,6 +2788,10 @@ mod tests {
         );
     }
 
+    /// Preserves zero horizon as the explicit immediate-drain test override.
+    ///
+    /// This case intentionally accepts an unparseable key only because zero
+    /// bypasses all time-based protection.
     #[test]
     fn pending_delete_horizon_zero_drains_immediately() {
         let now = Utc::now();
@@ -1580,6 +2803,10 @@ mod tests {
         );
     }
 
+    /// Exercises structural, time, reachability, staging, and success decisions as a table.
+    ///
+    /// The table protects the default-deny behavior and confirms that an active
+    /// staged key is treated exactly like any other fresh root.
     #[test]
     fn delete_predicate_table_is_fail_closed() {
         let now = Utc::now();
@@ -1644,6 +2871,10 @@ mod tests {
         }
     }
 
+    /// Verifies the artifact ULID floor and oldest in-flight watermark are independent.
+    ///
+    /// A mature mark cannot authorize a newly created key, and an active older
+    /// upload conservatively protects all candidate artifacts newer than it.
     #[test]
     fn delete_predicate_honors_ulid_age_floor_and_inflight_watermark() {
         let now = Utc::now();
@@ -1684,6 +2915,10 @@ mod tests {
         );
     }
 
+    /// Proves an optional manifest-generation guard strengthens rather than replaces time.
+    ///
+    /// Deletion requires both the configured horizon and the requested number
+    /// of newer generations when the optional guard is enabled.
     #[test]
     fn delete_predicate_epoch_guard_is_additional_to_time_horizon() {
         let now = Utc::now();
@@ -1746,6 +2981,10 @@ mod tests {
         );
     }
 
+    /// Protects decoding compatibility for empty, wrapped, and legacy ledgers.
+    ///
+    /// This catches a migration that would strand bare-array candidate JSON or
+    /// reinterpret empty storage as corrupt.
     #[test]
     fn candidate_store_decodes_empty_versioned_and_legacy_json() {
         assert!(decode_gc_candidates(b"").unwrap().is_empty());
@@ -1769,17 +3008,27 @@ mod tests {
         assert_eq!(decode_gc_candidates(&legacy).unwrap(), vec![candidate]);
     }
 
+    /// Verifies pre-generation candidate records default to generation zero.
+    ///
+    /// The legacy record remains wall-clock gated even though its generation is
+    /// treated as old enough for any future optional epoch guard.
     #[test]
     fn legacy_candidate_without_epoch_decodes_as_very_old_generation() {
+        /// Test-only wrapper matching the persisted schema before epoch tracking.
         #[derive(Serialize)]
         struct LegacyCandidateStore<'a> {
+            /// Wrapper version retained by the historical encoding.
             version: u32,
+            /// Borrowed legacy records serialized into the fixture bytes.
             candidates: Vec<LegacyCandidate<'a>>,
         }
 
+        /// Test-only candidate shape that predates the manifest-version field.
         #[derive(Serialize)]
         struct LegacyCandidate<'a> {
+            /// Borrowed artifact key; serde copies its characters into fixture JSON.
             key: &'a str,
+            /// Original wall-clock mark retained by the legacy representation.
             first_seen_unreachable_at: DateTime<Utc>,
         }
 
@@ -1805,6 +3054,11 @@ mod tests {
         );
     }
 
+    /// Round-trips the versioned candidate ledger through the storage abstraction.
+    ///
+    /// This protects the integration between JSON encoding, the derived ledger
+    /// key, and full-object PUT/GET behavior without requiring an external S3
+    /// service.
     #[tokio::test]
     async fn candidate_store_round_trips_on_storage() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
@@ -1824,6 +3078,10 @@ mod tests {
         );
     }
 
+    /// Ensures marking drops resurrected entries but preserves old marks for dead keys.
+    ///
+    /// Preserving the first mark lets a continuously unreachable key mature;
+    /// dropping the resurrected one prevents stale-ledger deletion authority.
     #[test]
     fn mark_pass_drops_candidate_that_became_reachable_again() {
         let now = Utc::now();
@@ -1850,6 +3108,10 @@ mod tests {
         assert_eq!(marked[0].unreachable_since_manifest_version, 5);
     }
 
+    /// Ensures a new mark records the exact manifest generation used for reachability.
+    ///
+    /// This keeps later auditing and the optional generation guard tied to the
+    /// snapshot that first classified the object as unreachable.
     #[test]
     fn mark_pass_stamps_new_candidates_with_manifest_version() {
         let now = Utc::now();
