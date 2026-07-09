@@ -1266,6 +1266,26 @@ fn check_i5_batch_equivalence(rec: &OpRecord) -> Vec<Violation> {
                 }
             }
             _ => {
+                let entry_ok = entry.get("ok").and_then(serde_json::Value::as_bool);
+                let single_status = single["status"].as_u64();
+                if entry_ok == Some(false)
+                    || single_status.is_some_and(|status| !(200..300).contains(&status))
+                {
+                    if !batch_error_equivalent(entry, single) {
+                        violations.push(violation(
+                            ViolationId::I5BatchEquivalent,
+                            rec,
+                            ns,
+                            "batch error entry did not match individual query",
+                            serde_json::json!({
+                                "index": idx,
+                                "entry": entry,
+                                "single": single,
+                            }),
+                        ));
+                    }
+                    continue;
+                }
                 if entry.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
                     || single["status"]
                         .as_u64()
@@ -1288,6 +1308,25 @@ fn check_i5_batch_equivalence(rec: &OpRecord) -> Vec<Violation> {
         }
     }
     violations
+}
+
+fn batch_error_equivalent(entry: &serde_json::Value, single: &serde_json::Value) -> bool {
+    if entry.get("ok").and_then(serde_json::Value::as_bool) != Some(false) {
+        return false;
+    }
+    let batch_error = &entry["error"];
+    let single_body = &single["body"];
+    let Some(batch_status) = batch_error["status"].as_u64() else {
+        return false;
+    };
+    let Some(single_status) = single["status"].as_u64() else {
+        return false;
+    };
+    batch_status == single_status
+        && single_body["status"].as_u64() == Some(batch_status)
+        && batch_error["code"].as_str() == single_body["code"].as_str()
+        && batch_error["error"].as_str() == single_body["error"].as_str()
+        && batch_error["retryable"].as_bool() == single_body["retryable"].as_bool()
 }
 
 fn check_i6_pagination_equivalence(rec: &OpRecord) -> Vec<Violation> {
@@ -2087,6 +2126,40 @@ mod tests {
         }
     }
 
+    fn batch_record(response: serde_json::Value) -> OpRecord {
+        OpRecord {
+            index: 1,
+            wall_ms: 0,
+            op: Op::BatchQuery {
+                ns: NS.to_string(),
+                qs: vec![GeneratedQuery {
+                    body: json!({
+                        "sources": [{
+                            "type": "ann",
+                            "vector": [0.0, 0.0],
+                            "nprobe": 1
+                        }],
+                        "fusion": { "type": "none" },
+                        "top_k": 1,
+                        "candidate_k": 1,
+                        "consistency": "strong"
+                    }),
+                    class: QueryOracleClass::Membership {
+                        consistency: ConsistencyLevel::Strong,
+                    },
+                    pattern_tags: vec!["batch".to_string()],
+                }],
+            },
+            method: "POST".to_string(),
+            path: format!("/v1/namespaces/{NS}/query/batch"),
+            status: 200,
+            response,
+            gen_after: Some(1),
+            duration_ms: 1,
+            violations: Vec::new(),
+        }
+    }
+
     fn grouping_query(top_k: usize) -> serde_json::Value {
         json!({
             "vector": [0.0, 0.0],
@@ -2219,6 +2292,38 @@ mod tests {
             "retryable": true,
             "status": 500
         })
+    }
+
+    #[test]
+    fn i5_allows_matching_nested_errors_for_membership_queries() {
+        let rec = batch_record(json!({
+            "batch": {
+                "results": [{
+                    "ok": false,
+                    "error": {
+                        "code": "INTERNAL_ERROR",
+                        "error": "an internal error occurred",
+                        "retryable": false,
+                        "status": 500
+                    },
+                    "metadata": { "latency_ms": 1 }
+                }]
+            },
+            "individual": [{
+                "status": 500,
+                "body": {
+                    "code": "INTERNAL_ERROR",
+                    "error": "an internal error occurred",
+                    "request_id": "req",
+                    "retryable": false,
+                    "status": 500
+                }
+            }]
+        }));
+
+        let violations = check_i5_batch_equivalence(&rec);
+
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     #[test]
