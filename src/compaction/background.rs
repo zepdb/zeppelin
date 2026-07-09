@@ -1,3 +1,135 @@
+//! Schedules namespace maintenance and wraps compaction in lease ownership.
+//!
+//! This module is the long-running orchestration layer around
+//! [`Compactor`][crate::compaction::Compactor]. It does not build IVF indexes,
+//! merge WAL rows, or publish manifests itself. Instead, it discovers namespaces,
+//! resumes durable namespace deletion, runs storage garbage collection, asks the
+//! compactor whether work is due, and gives each actual compaction a
+//! per-namespace lease and renewal heartbeat.
+//!
+//! Production enters through
+//! [`start_compaction_thread`][crate::compaction::background::start_compaction_thread],
+//! which creates a
+//! dedicated Tokio runtime so synchronous index training and this runtime's
+//! blocking pool do not occupy query-runtime workers. Tests may call
+//! [`compaction_loop`][crate::compaction::background::compaction_loop] directly
+//! on their runtime. The HTTP manual-compaction handler enters through
+//! [`run_compaction_with_lease`][crate::compaction::background::run_compaction_with_lease]
+//! after acquiring a lease; the periodic loop normally uses
+//! [`compact_namespace_under_lease`][crate::compaction::background::compact_namespace_under_lease]
+//! to acquire
+//! and run in one operation.
+//!
+//! S3 or MinIO remains authoritative throughout this file. The namespace
+//! registry is only a discovery hint, the periodic loop invalidates its manifest
+//! cache entry after authoritative publication or completed deletion, and
+//! post-compaction index warming reads the manifest from object storage before
+//! selecting an immutable key. A warm-cache
+//! failure never changes query semantics: a later query still fetches the key
+//! named by its manifest and reports a missing or corrupt object as an error.
+//!
+//! ## Reading map
+//!
+//! 1. Start with
+//!    [`CompactionThreadOptions`][crate::compaction::background::CompactionThreadOptions]
+//!    and [`CompactionLoopOptions`][crate::compaction::background::CompactionLoopOptions]
+//!    to see which boot-time values are moved into the scheduler.
+//! 2. Read
+//!    [`compact_namespace_under_lease`][crate::compaction::background::compact_namespace_under_lease]
+//!    and [`run_compaction_with_lease`][crate::compaction::background::run_compaction_with_lease]
+//!    for the acquire, heartbeat, fenced-commit,
+//!    and best-effort-release lifecycle.
+//! 3. Read
+//!    [`start_compaction_thread`][crate::compaction::background::start_compaction_thread]
+//!    for the OS-thread and Tokio-runtime
+//!    boundary.
+//! 4. Finish with
+//!    [`compaction_loop`][crate::compaction::background::compaction_loop] for
+//!    namespace discovery, deletion, GC,
+//!    trigger evaluation, metrics, health recording, invalidation, and warming.
+//!
+//! ## Supervisor and maintenance flow
+//!
+//! ```text
+//! server startup
+//!      |
+//!      v
+//! compaction-runtime OS thread
+//!      |
+//!      +--> dedicated Tokio workers
+//!              |
+//!              +-- sleep until interval -- shutdown change --> return
+//!              |
+//!              v
+//!        discover namespaces
+//!        (fresh on tick 1 and every 12th tick;
+//!         cached registry hint between refreshes)
+//!              |
+//!              +-- Deleting --> bounded delete continuation --> next namespace
+//!              |
+//!              v
+//!             GC
+//!              |
+//!              | GC failure is logged; compaction check still runs
+//!              v
+//!        should_compact?
+//!              |
+//!              +-- false/error --> next namespace
+//!              v
+//! acquire lease --> heartbeat renews concurrently --> build immutable segment
+//!              |                                      |
+//!              | lease lost                           | fencing + manifest CAS
+//!              +----------------> no stale commit     v
+//!                                             manifest is authoritative
+//!                                                      |
+//!                              record health + invalidate manifest cache
+//!                                                      |
+//!                                         spawn best-effort metadata warm
+//! ```
+//!
+//! Namespace work is sequential within a tick. A lease heartbeat and an index
+//! warm are separate Tokio tasks, but the loop does not compact multiple
+//! namespaces concurrently. A shutdown notification is observed only at the
+//! next top-level `select!`; it does not interrupt deletion, GC, a compaction,
+//! or the rest of the current namespace scan.
+//!
+//! ## Configuration and retry boundaries
+//!
+//! [`crate::config::CompactionConfig`], [`GcConfig`][crate::config::GcConfig],
+//! the worker count, and the lease duration are startup snapshots. The runtime
+//! query-knob API does not mutate them. Per-namespace metadata is refreshed by
+//! authoritative namespace discovery on the first maintenance tick and every
+//! twelfth tick; same-process metadata updates also refresh the manager's local
+//! registry. Full-text settings passed into a background compaction therefore
+//! come from that discovery snapshot, while the compactor independently reloads
+//! its current manifest and effective index settings before building.
+//!
+//! Individual namespace failures are logged and retried by a later tick rather
+//! than terminating the supervisor. That is failure isolation, not silent data
+//! fallback: failed publication never becomes visible, and cached namespace
+//! entries are used only to find possible work whose storage operations still
+//! revalidate authoritative state.
+//!
+//! ## Rust concepts used here
+//!
+//! [`Arc`][std::sync::Arc] gives the OS thread, loop, heartbeat, and warm task
+//! shared ownership of clients without copying the clients themselves. In Java,
+//! this resembles sharing references to thread-safe services; in C it requires
+//! explicit reference counting and a lifetime protocol. Rust releases the value
+//! after the final `Arc` owner is dropped.
+//!
+//! The heartbeat and compactor share an
+//! [`AtomicBool`][std::sync::atomic::AtomicBool] rather than a lock. A
+//! sequentially consistent store/load communicates only “publication is now
+//! forbidden”; it does not cancel CPU or I/O already in progress. Owned strings,
+//! leases, and client handles are moved into spawned `async move` tasks so those
+//! futures cannot borrow stack frames that may return first. Tokio
+//! [`JoinHandle`][tokio::task::JoinHandle] cancellation is explicit: calling
+//! `abort` requests cancellation, while merely dropping a handle detaches the
+//! task.
+//! The coordinator itself holds no mutex guard across object-store `.await`
+//! points; `Arc` expresses shared lifetime, not automatic locking.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,50 +152,161 @@ use crate::wal::Manifest;
 
 use super::{CompactionResult, Compactor};
 
-/// Options for the dedicated compaction runtime thread.
+/// Boot-time settings moved into the dedicated compaction runtime thread.
+///
+/// These settings are resolved from process startup configuration before the
+/// thread starts. They are not connected to Zeppelin's runtime-mutable query
+/// knobs and do not change while the thread is running.
+///
+/// # Examples
+///
+/// A process can reserve two Tokio workers for maintenance and move its GC
+/// horizon into this value. Every later tick then uses that same GC snapshot.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `Clone` performs field-wise cloning: the worker count is copied and
+/// [`GcConfig`] is cloned into an independent owned value. Passing this struct
+/// by value to [`start_compaction_thread`] then moves that snapshot across the
+/// OS-thread boundary; no borrowed startup stack data can outlive its owner.
 #[derive(Debug, Clone)]
 pub struct CompactionThreadOptions {
-    /// Number of Tokio worker threads assigned to background compaction.
+    /// Number of Tokio worker threads assigned to background maintenance.
+    ///
+    /// Production derives this from [`crate::config::CpuBudget`]. It must be
+    /// nonzero; an invalid value makes the runtime builder fail inside the
+    /// spawned supervisor thread.
     pub compaction_workers: usize,
-    /// Garbage-collection safety and horizon configuration.
+    /// Garbage-collection safety horizons and retention policy used every tick.
+    ///
+    /// This same snapshot also constrains which unreachable immutable artifacts
+    /// the background loop may physically delete.
     pub gc_config: GcConfig,
 }
 
-/// Options for one background compaction loop.
+/// Settings consumed by one invocation of the asynchronous maintenance loop.
+///
+/// Production constructs this inside [`start_compaction_thread`]. Integration
+/// tests call [`compaction_loop`] directly and use `namespace_prefix` to keep a
+/// shared bucket's unrelated namespaces out of their maintenance scan.
+///
+/// # Examples
+///
+/// A test whose isolated namespaces all start with `test-42` supplies that
+/// prefix; the loop discovers and mutates only matching namespaces while using
+/// the supplied GC horizon.
 #[derive(Debug, Clone)]
 pub struct CompactionLoopOptions {
-    /// Garbage-collection safety and horizon configuration.
+    /// Fixed GC safety and retention snapshot applied to every active namespace.
     pub gc_config: GcConfig,
-    /// Optional namespace prefix used by tests to isolate shared buckets.
+    /// Optional lexical namespace-name prefix used to restrict discovery.
+    ///
+    /// `None` scans all top-level namespaces. Production always uses `None`;
+    /// tests use `Some(prefix)` for bucket isolation. This filters namespace
+    /// names, not arbitrary S3 object-key descendants.
     pub namespace_prefix: Option<String>,
 }
 
-/// Lease-renewal heartbeat for a running compaction (Task 2 Phase A).
+/// Owns the abort signal and spawned renewal task for one leased compaction.
 ///
-/// Renews the namespace lease at `lease_duration / 3` intervals so a
-/// compaction that outlasts the lease duration keeps its lease (invariant
-/// A1). Renewal goes through `LeaseManager::renew` — the existing CAS on
-/// the lease object; the fencing token is never bumped, only the expiry
-/// extends.
+/// The task renews at one third of the configured lease duration. Successful
+/// renewal extends expiry without changing the fencing token. A definite
+/// takeover, or a renewal error after the last confirmed expiry, sets the
+/// shared flag so the compactor refuses its next manifest CAS.
 ///
-/// If a renewal fails because the lease was taken over (`LeaseExpired`),
-/// or the last successfully-renewed expiry has passed (we can no longer
-/// PROVE we hold the lease), the heartbeat flips `lease_lost` and stops.
-/// The compactor checks that flag before every manifest CAS attempt and
-/// aborts (invariant A2). Transient storage errors are retried at the next
-/// tick as long as the wall-clock expiry has not passed.
+/// ```text
+/// acquired lease token N
+///        |
+///        +-- every duration/3 --> renew with ETag CAS --> same token, new expiry
+///        |                              |
+///        |                              +-- transient error before expiry
+///        |                                      `--> retry next heartbeat tick
+///        |                              |
+///        |                              `-- takeover / error past expiry
+///        |                                      `--> lease_lost = true; stop
+///        v
+/// compactor checks lease_lost before each manifest CAS
+/// ```
+///
+/// The flag is a publication guard, not cooperative cancellation for the whole
+/// build. Immutable uploads completed before the check may remain as unreferenced
+/// objects for GC, but they never become visible through this stale compaction's
+/// manifest update.
 struct LeaseHeartbeat {
+    /// Sequentially consistent publication-abort signal shared with compaction.
     lease_lost: Arc<AtomicBool>,
+    /// Tokio task that sleeps, renews, records metrics, and exits on lease loss.
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl LeaseHeartbeat {
+    /// Starts renewing an already-acquired namespace lease in a Tokio task.
+    ///
+    /// The heartbeat owns a clone-independent lease snapshot and updates that
+    /// snapshot after every successful renewal. It signals loss only when the
+    /// lease manager proves holder/token mismatch or when another renewal error
+    /// arrives after the last expiry it successfully confirmed. Before that
+    /// expiry, storage and CAS errors are logged and retried on the next tick.
+    ///
+    /// # Parameters
+    ///
+    /// - `lease_manager`: Shared manager whose holder identity acquired the
+    ///   lease and whose configured duration determines the renewal interval.
+    /// - `namespace`: Owned namespace name moved into logs, metric labels, and
+    ///   object-store renewal calls.
+    /// - `lease`: Most recently acquired snapshot. Its holder and fencing token
+    ///   must correspond to `lease_manager` and `namespace`.
+    ///
+    /// # Returns
+    ///
+    /// A heartbeat containing the shared loss flag and a handle that can request
+    /// task cancellation. The flag starts as `false`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called without an active Tokio runtime because
+    /// [`tokio::spawn`] needs a runtime on which to schedule the task.
+    ///
+    /// # Side Effects
+    ///
+    /// Spawns one task, issues periodic lease GET/CAS/GET operations, increments
+    /// lease-renewal or lease-loss metrics, and emits structured diagnostics.
+    /// It never changes the manifest or the fencing token.
+    ///
+    /// # Consistency
+    ///
+    /// Renewal proves lease-object ownership only. The compactor must still
+    /// carry the fencing token into manifest CAS. If a conditional PUT succeeds
+    /// but its confirming GET fails, the heartbeat conservatively retains the
+    /// older local expiry and may later declare loss even though S3 received the
+    /// extension; failing closed is safer than a stale publication.
+    ///
+    /// # Performance
+    ///
+    /// Each successful heartbeat performs the lease manager's three remote
+    /// operations. Renewal runs concurrently with compaction and performs no
+    /// busy polling for a normal positive lease duration.
+    ///
+    /// # Examples
+    ///
+    /// With a 30-second lease, the task wakes about every 10 seconds. If token
+    /// 7 renews successfully it stays token 7 with a later expiry. If another
+    /// node takes over with token 8, the next renewal sets `lease_lost`, and the
+    /// compactor rejects its next commit attempt.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The `async move` closure owns `lease_manager`, `namespace`, `lease`, and
+    /// its cloned `Arc<AtomicBool>`. Java would capture heap references in a
+    /// runnable; C would allocate an explicit context struct and define its
+    /// cleanup. Rust statically prevents this detached future from borrowing
+    /// local stack variables. Cloning `Arc` increments a reference count; it
+    /// does not duplicate the atomic value.
     fn spawn(lease_manager: Arc<LeaseManager>, namespace: String, lease: Lease) -> Self {
         let lease_lost = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&lease_lost);
-        // Renew at <= lease_duration / 3: two consecutive renewal attempts
-        // still fit inside the remaining lease window, so a single missed
-        // tick (transient S3 error) does not lose the lease.
+        // One missed renewal still leaves two nominal intervals before expiry,
+        // giving a transient object-store failure another scheduled attempt.
         let interval = lease_manager.lease_duration() / 3;
 
         let handle = tokio::spawn(async move {
@@ -85,7 +328,8 @@ impl LeaseHeartbeat {
                         current = renewed;
                     }
                     Err(ZeppelinError::LeaseExpired { .. }) => {
-                        // Lease stolen / expired-and-taken: signal abort.
+                        // A different holder/token is authoritative. Tell the
+                        // compactor that publication is now forbidden.
                         crate::metrics::COMPACTION_LEASE_LOST_TOTAL
                             .with_label_values(&[namespace.as_str()])
                             .inc();
@@ -99,10 +343,9 @@ impl LeaseHeartbeat {
                         return;
                     }
                     Err(e) => {
-                        // Transient renewal failure. If our last confirmed
-                        // expiry has passed we can no longer prove we hold
-                        // the lease — treat as lost (fail loud). Otherwise
-                        // retry at the next tick.
+                        // A failed renewal does not prove loss before the last
+                        // confirmed expiry. After it, fail closed rather than
+                        // letting an unproven holder reach manifest CAS.
                         if current.expires_at <= Utc::now() {
                             crate::metrics::COMPACTION_LEASE_LOST_TOTAL
                                 .with_label_values(&[namespace.as_str()])
@@ -130,26 +373,98 @@ impl LeaseHeartbeat {
         Self { lease_lost, handle }
     }
 
-    /// Stop the heartbeat. The compaction is done (committed or aborted);
-    /// the lease no longer needs extending.
+    /// Requests cancellation of the renewal task after compaction finishes.
+    ///
+    /// This method consumes the heartbeat, so its task handle cannot be stopped
+    /// or reused twice.
+    ///
+    /// # Side Effects
+    ///
+    /// Calls [`tokio::task::JoinHandle::abort`]. It does not await task
+    /// termination and does not release the lease; the wrapper performs release
+    /// separately after this call.
+    ///
+    /// # Examples
+    ///
+    /// Once compaction has returned either success or error, stopping prevents
+    /// later sleep ticks from extending a lease whose useful work has ended.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// Taking `self` by value is a compiler-enforced one-shot ownership
+    /// transition. Java code would rely on an idempotent state flag, while C
+    /// would conventionally invalidate a handle after cancellation. Tokio abort
+    /// is cooperative at async yield points; consuming the handle requests but
+    /// does not synchronously join task completion.
     fn stop(self) {
         self.handle.abort();
     }
 }
 
-/// Run one leased compaction cycle for a namespace.
+/// Acquires a namespace lease and runs one fenced compaction lifecycle.
 ///
-/// This is the single production entry point for lease-protected
-/// compaction:
-/// 1. acquire the per-namespace lease,
-/// 2. start the lease-renewal heartbeat (invariant A1),
-/// 3. compact with the fencing token and the heartbeat's abort signal
-///    (invariant A2: renewal failure aborts before the final manifest CAS),
-/// 4. stop the heartbeat and release the lease (best-effort — never an
-///    error, and never deletes the lease object).
+/// This is the periodic scheduler's production entry point. Acquisition happens
+/// before any compaction work. A successful lease is delegated to
+/// [`run_compaction_with_lease`], which renews it while immutable artifacts are
+/// built and carries its token into manifest publication.
 ///
-/// `LeaseHeld` from the acquire step propagates so the caller can skip
-/// quietly (another node is compacting this namespace).
+/// # Parameters
+///
+/// - `compactor`: Stateless coordinator that reads the authoritative manifest,
+///   builds immutable segment artifacts, and attempts fenced manifest CAS.
+/// - `lease_manager`: Shared process holder used to acquire, renew, and release
+///   this namespace's lease object.
+/// - `namespace`: Namespace to compact. The caller has normally obtained it from
+///   namespace discovery, but the compactor re-reads authoritative state.
+/// - `fts_configs`: Full-text field definitions from the namespace metadata
+///   snapshot used for this cycle.
+///
+/// # Returns
+///
+/// The [`CompactionResult`] whose manifest update succeeded, including a
+/// `None` segment for a no-op or all-deleted result.
+///
+/// # Errors
+///
+/// Propagates lease acquisition errors, including [`ZeppelinError::LeaseHeld`]
+/// when another node owns an unexpired lease, and all compaction errors. Lease
+/// acquisition or compaction can leave remote lease or immutable candidate
+/// objects behind; unsuccessful manifest CAS does not make those candidates
+/// visible.
+///
+/// # Side Effects
+///
+/// Acquires and renews the lease object, runs all compaction I/O and CPU work,
+/// updates heartbeat metrics, and attempts best-effort release. Loop-level
+/// compaction counters, namespace health, cache invalidation, and warming are
+/// deliberately the caller's responsibility.
+///
+/// # Consistency
+///
+/// Lease ownership avoids duplicate work, while the fencing token plus ETag CAS
+/// prevent a stale holder from publishing. The manifest, not the lease or the
+/// existence of uploaded objects, defines what readers can see.
+///
+/// # Performance
+///
+/// Adds lease acquisition and periodic renewal roundtrips around the underlying
+/// compaction. A `LeaseHeld` result stops before reading WAL or building an
+/// index.
+///
+/// # Examples
+///
+/// If namespace `catalog` has 100 visible WAL fragments and no live lease, this
+/// call acquires token 12, keeps it renewed during index construction, and
+/// returns the segment made visible by manifest CAS. If node B already owns the
+/// lease, it returns `LeaseHeld` without doing duplicate compaction work.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The compactor and manager are borrowed, so this future does not take them
+/// away from the caller. `fts_configs` is also a shared borrow and is not cloned
+/// here. The `?` operator forwards acquisition failure immediately, analogous to
+/// propagating a Java exception or returning a checked C status, while Rust
+/// still drops all local owned values on that path.
 pub async fn compact_namespace_under_lease(
     compactor: &Compactor,
     lease_manager: &Arc<LeaseManager>,
@@ -160,11 +475,89 @@ pub async fn compact_namespace_under_lease(
     run_compaction_with_lease(compactor, lease_manager, namespace, lease, fts_configs).await
 }
 
-/// Run the compaction body after the namespace lease has already been acquired.
+/// Runs fenced compaction after the caller has already acquired the lease.
 ///
-/// The caller owns the acquire step; this function owns everything after it:
-/// heartbeat renewal, fenced compaction, heartbeat stop, and best-effort lease
-/// release on both success and error paths.
+/// This seam is shared by the periodic scheduler and the manual HTTP endpoint.
+/// It starts renewal, passes the original fencing token plus a shared loss flag
+/// to the compactor, stops renewal after the compactor returns, and then attempts
+/// release before returning the compactor's original result.
+///
+/// ```text
+/// caller owns acquired Lease
+///        |
+///        +-- clone --> heartbeat owns renewable snapshot
+///        |                 |
+///        |                 `--> Arc<AtomicBool> shared with compactor
+///        v
+/// compactor uses original fencing token
+///        |
+///        v
+/// Result ready --> abort heartbeat --> best-effort release --> return Result
+/// ```
+///
+/// # Parameters
+///
+/// - `compactor`: Coordinator that will build and conditionally publish the
+///   compacted segment.
+/// - `lease_manager`: Manager whose holder identity must match `lease`.
+/// - `namespace`: Namespace to which the acquired lease and FTS settings apply.
+/// - `lease`: Owned lease snapshot acquired for this namespace. Its original
+///   token is used for compaction and final release.
+/// - `fts_configs`: Borrowed full-text field definitions to materialize.
+///
+/// # Returns
+///
+/// Returns exactly the compactor's [`CompactionResult`] on success. Heartbeat
+/// stop and release do not replace that value.
+///
+/// # Errors
+///
+/// Returns the compactor's storage, indexing, fencing, lease-loss, upload-window,
+/// or manifest-CAS error. Best-effort release errors are logged and suppressed,
+/// so they never replace the primary result. Immutable uploads may exist even
+/// when the result is an error, but failed publication leaves them invisible.
+///
+/// # Side Effects
+///
+/// Spawns and aborts one heartbeat, may renew the lease many times, runs
+/// compaction, and calls lease release on every normal `Result` path.
+///
+/// # Consistency
+///
+/// The atomic flag is checked before each compactor manifest-CAS attempt. It is
+/// an additional fail-closed signal; authoritative lease checks, fencing, and
+/// manifest ETag CAS remain necessary for races inside one heartbeat interval.
+/// Release preserves the lease object and fencing-token history.
+///
+/// # Cancellation
+///
+/// Cleanup is explicit rather than implemented with `Drop`. If the future is
+/// cancelled or panics while awaiting compaction, execution does not reach
+/// `stop` or `release`; dropping Tokio's join handle detaches the heartbeat
+/// rather than aborting it. Callers that spawn this future should normally let
+/// it finish and observe its result.
+///
+/// # Performance
+///
+/// Cloning the lease duplicates its owned strings, while cloning the atomic
+/// `Arc` only increments a reference count. All index and object-store costs
+/// belong to the delegated compaction.
+///
+/// # Examples
+///
+/// A manual endpoint can acquire token 5, return HTTP 202, and run this function
+/// in a spawned task. A takeover detected during a long build flips the flag;
+/// the build may leave candidate objects, but this function returns an error
+/// after the compactor refuses manifest publication and then attempts release.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The original `Lease` is retained for token use and cleanup while a deep
+/// `clone` is moved into the heartbeat. Both tasks share one atomic allocation
+/// through `Arc`. Java's garbage collection gives shared lifetime but not this
+/// explicit ownership split; C needs a refcount, atomic memory-order choices,
+/// and cleanup on every exit path. Rust cleans up ordinary owned values, but a
+/// detached Tokio task still requires explicit cancellation as described above.
 pub async fn run_compaction_with_lease(
     compactor: &Compactor,
     lease_manager: &Arc<LeaseManager>,
@@ -206,16 +599,65 @@ pub async fn run_compaction_with_lease(
     result
 }
 
-/// Eagerly warm the active segment's index metadata (IVF-Flat centroids or
-/// hierarchical tree_meta.json) into the tiered cache and pin it.
+/// Fetches and pins the current active segment's routing metadata best-effort.
 ///
-/// Runs as a spawned background task after a successful compaction. Reads
-/// the manifest fresh from S3 (source of truth) to discover the active
-/// segment — the compaction that scheduled this task just committed it.
+/// A successful compaction spawns this helper after manifest-cache invalidation.
+/// The helper deliberately reads the manifest from object storage rather than
+/// trusting the compaction result: another compaction may already have advanced
+/// the active segment before this task is scheduled. Hierarchical segments warm
+/// `tree_meta.json`; ordinary IVF-Flat segments warm their centroid artifact.
 ///
-/// Best-effort by design (invariant I5): failures are logged at WARN and
-/// swallowed HERE ONLY — the query path keeps its own fail-loud fetch, so a
-/// missed warm just means the first query pays the cold GET.
+/// # Parameters
+///
+/// - `store`: Owned cloneable store client used for the authoritative manifest
+///   and immutable metadata GETs.
+/// - `cache`: Shared tiered cache into which bytes are fetched and scope-pinned.
+/// - `namespace`: Owned namespace name used for manifest lookup, artifact-key
+///   construction, and the scoped pin.
+///
+/// # Returns
+///
+/// Returns unit after logging the outcome. A missing manifest, no active segment,
+/// or an active ID absent from the segment list results in no pin; fetch and
+/// decode/storage failures are logged rather than returned.
+///
+/// # Side Effects
+///
+/// Performs a fresh manifest GET and, on a cache miss, one immutable metadata
+/// GET. It may fill memory and disk cache tiers, rotate the namespace's scoped
+/// pin, and emit debug or warning diagnostics.
+///
+/// # Consistency
+///
+/// Warming is never a visibility boundary. The manifest read chooses the key,
+/// and that immutable key remains safe to cache. A newer manifest can win after
+/// this read and before pinning; a later warm may rotate the pin, while query
+/// execution still follows its own manifest snapshot. A missing/corrupt object
+/// remains a query-path error even though this helper suppresses its prefetch
+/// failure.
+///
+/// # Performance
+///
+/// Runs outside the serial namespace loop in a spawned task. A warm cache hit
+/// costs local lookup; a miss reads and writes the full routing-metadata object.
+/// The helper does not fetch vector clusters or wait for any query.
+///
+/// # Examples
+///
+/// After segment `S9` becomes active, an IVF-Flat namespace fetches
+/// `S9/centroids.bin` and pins it before the next query. If the GET fails, the
+/// task logs a warning; the first query retries through its fail-loud cache-miss
+/// path. If `S10` became active first, the fresh manifest causes this task to
+/// warm `S10`, not the stale result that scheduled it.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// All parameters are owned because this future is passed to [`tokio::spawn`]
+/// and may outlive the loop iteration. The inner `async` block creates a local
+/// [`Result`] boundary so `?` can short-circuit the warm attempt while the outer
+/// `match` converts every outcome into logging. `let Some(...) = ... else`
+/// makes the no-active-segment branch explicit and prevents nullable access;
+/// Java would use a null/optional check, while C would use a pointer plus status.
 async fn warm_segment_index_meta(store: ZeppelinStore, cache: Arc<DiskCache>, namespace: String) {
     let result = async {
         let manifest = Manifest::read(&store, &namespace)
@@ -259,15 +701,94 @@ async fn warm_segment_index_meta(store: ZeppelinStore, cache: Arc<DiskCache>, na
     }
 }
 
-/// Background compaction loop that periodically checks all namespaces
-/// and compacts any that exceed the fragment threshold.
+/// Starts the production maintenance loop on its own OS thread and Tokio runtime.
 ///
-/// Runs on a dedicated tokio runtime to isolate compaction CPU from
-/// query-serving threads. This prevents k-means training and FTS index
-/// building from stealing CPU time during query processing.
+/// The returned thread owns the runtime until [`compaction_loop`] observes a
+/// shutdown-channel change and returns. `Runtime::block_on` drives the top-level
+/// loop on the supervisor thread, so its synchronous k-means work executes
+/// there rather than on a query-runtime worker. Tasks spawned by the loop use
+/// this runtime's workers, and FTS `spawn_blocking` work uses this runtime's
+/// blocking pool. Object-store operations remain asynchronous and can overlap
+/// while waiting.
 ///
-/// `compaction_workers` controls the number of tokio worker threads for
-/// the compaction runtime. Set via `CpuBudget::auto()` (typically CPUs - 1).
+/// ```text
+/// calling/query runtime
+///        |
+///        | moves Arc owners + shutdown receiver
+///        v
+/// "compaction-runtime" OS supervisor thread
+///        |
+///        +--> block_on(compaction_loop)
+///        |          `--> synchronous compaction work is driven here
+///        |
+///        +--> "compaction-worker" Tokio workers --> spawned heartbeat/warm
+///        |
+///        +--> Tokio blocking pool --> spawned FTS construction
+///        |
+///        `--> compaction_loop returns --> runtime drops --> OS thread exits
+/// ```
+///
+/// # Parameters
+///
+/// - `compactor`: Shared stateless compactor moved into the runtime.
+/// - `namespace_manager`: Shared namespace discovery, deletion, and health
+///   coordinator.
+/// - `shutdown`: Watch receiver whose next change or closed channel asks the loop
+///   to stop. The current boolean value is not inspected by this module.
+/// - `manifest_cache`: Process-local query-manifest cache invalidated after
+///   successful deletion or compaction.
+/// - `lease_manager`: Shared holder used for all namespace compaction leases.
+/// - `cache`: Shared tiered object cache used for post-publication metadata warm.
+/// - `options`: Worker allocation and fixed GC policy for this runtime.
+///
+/// # Returns
+///
+/// A [`std::thread::JoinHandle`] for shutdown code to join. Returning the handle
+/// means only that the OS thread was created; runtime construction happens
+/// inside that thread and may fail afterward.
+///
+/// # Panics
+///
+/// Panics synchronously if the operating system cannot spawn the supervisor
+/// thread. If Tokio cannot build its runtime—for example, because the worker
+/// count is zero—the spawned thread panics, and that panic is observed later
+/// when the caller joins the returned handle.
+///
+/// # Side Effects
+///
+/// Creates one named OS supervisor thread, the configured number of Tokio worker
+/// threads, and Tokio's supporting driver/blocking resources. It immediately
+/// starts logging and then waits one compaction interval before the first tick.
+///
+/// # Consistency
+///
+/// Thread isolation changes scheduling, not authority. Every storage mutation in
+/// the loop still uses the namespace manager, GC implementation, lease manager,
+/// compactor fencing, and manifest CAS contracts.
+///
+/// # Performance
+///
+/// The worker count caps how many spawned runtime tasks execute on ordinary
+/// worker threads at once. It does not include the supervisor thread driving
+/// the top-level future, the blocking pool, the number of pending async tasks,
+/// or remote S3 concurrency inside delegated operations. Production normally
+/// derives the count from
+/// [`crate::config::CpuBudget::auto`].
+///
+/// # Examples
+///
+/// Startup can pass two compaction workers on an eight-core host. Query serving
+/// continues on its separate runtime while the returned handle represents the
+/// maintenance thread; graceful shutdown sends on the watch channel and joins
+/// that handle with a timeout.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The `move` closure transfers owned `Arc` handles and the watch receiver into
+/// the OS thread. Unlike a Java reference capture or C pointer handoff, Rust
+/// requires every captured value to be safe to send across threads. Dropping a
+/// Rust thread `JoinHandle` detaches the thread; production therefore retains
+/// and explicitly joins it during shutdown.
 #[allow(clippy::expect_used)]
 pub fn start_compaction_thread(
     compactor: Arc<Compactor>,
@@ -307,7 +828,113 @@ pub fn start_compaction_thread(
         .expect("failed to spawn compaction thread")
 }
 
-/// Background compaction loop (runs on the compaction runtime).
+/// Repeatedly discovers namespaces and performs deletion, GC, and compaction.
+///
+/// The first maintenance pass occurs after one configured interval. Tick 1 and
+/// every twelfth tick call authoritative namespace discovery; intervening ticks
+/// use the manager's process-local registry. A failed discovery also uses that
+/// registry for this tick, so known namespaces continue maintenance while newly
+/// created remote namespaces wait for a later successful refresh.
+///
+/// For each discovered namespace, processing is deliberately ordered and
+/// serial. A durable `Deleting` tombstone gets a bounded continuation and skips
+/// all other work. An active namespace runs GC first, then trigger evaluation,
+/// then lease-protected compaction if due. Failures are recorded at their own
+/// boundary and the loop proceeds to the next namespace.
+///
+/// # Parameters
+///
+/// - `compactor`: Shared coordinator containing fixed trigger/index defaults and
+///   access to authoritative object storage.
+/// - `namespace_manager`: Shared registry plus authoritative namespace metadata
+///   operations for discovery, deletion, and health updates.
+/// - `shutdown`: Watch receiver. Any observed version change, or closure after
+///   all senders are dropped, ends the loop at its next top-level wait.
+/// - `manifest_cache`: Query-facing cache invalidated after completed deletion or
+///   successful compaction publication/no-op observation.
+/// - `lease_manager`: Shared per-process holder for namespace lease lifecycles.
+/// - `cache`: Tiered immutable-object cache used only by spawned index-metadata
+///   warming in this function.
+/// - `options`: Fixed GC policy and optional lexical namespace discovery scope.
+///
+/// # Returns
+///
+/// Returns unit after shutdown is observed. Per-namespace errors are logged and
+/// represented in metrics/health where applicable rather than returned from this
+/// long-running supervisor.
+///
+/// # Side Effects
+///
+/// Sleeps, lists namespaces, resumes object deletion, runs manifest history and
+/// immutable-object GC, reads compaction status, acquires/renews/releases leases,
+/// builds and publishes segments, updates Prometheus counters and namespace
+/// health metadata, invalidates manifest cache entries, and spawns best-effort
+/// routing-metadata warms.
+///
+/// `COMPACTIONS_TOTAL` counts only attempts that acquired a lease and returned
+/// from the compactor. `LeaseHeld` is a quiet skip. A successful result records
+/// health and invalidates the manifest cache even when a race turned the run
+/// into a no-op; only a result containing a segment ID spawns a warm.
+///
+/// # Consistency
+///
+/// Registry snapshots decide what to inspect, never what is authoritative.
+/// Deletion, GC, trigger checks, leases, and compaction each re-enter their
+/// object-store-backed contracts. GC runs before compaction so it reasons from
+/// the manifest state present at the start of the tick; newly retired objects
+/// are considered by later cycles. Cache invalidation follows successful
+/// publication and cannot make an unpublished segment visible.
+///
+/// A GC failure is logged but does not authorize a weaker cleanup or prevent an
+/// independent compaction attempt. Compaction failure increments failure metrics
+/// and attempts a CAS-protected namespace health update; failure of that health
+/// write is logged without hiding the original compaction failure.
+///
+/// # Cancellation
+///
+/// Shutdown is cooperative at the outer interval boundary. Once namespace work
+/// starts, a signal does not cancel a 25-second deletion pass, remote GC calls,
+/// lease-protected compaction, or remaining namespaces in the current snapshot.
+/// After the loop returns, dropping the dedicated runtime cancels any spawned
+/// warm tasks still running. The per-compaction heartbeat is normally stopped by
+/// [`run_compaction_with_lease`] before control returns here.
+///
+/// # Performance
+///
+/// Work is `O(discovered namespaces)` per tick and namespaces are processed one
+/// at a time, so one slow namespace delays later namespaces and shutdown
+/// observation. Fresh discovery performs delimiter listing plus metadata reads
+/// on tick 1 and every 12 ticks. Each active namespace runs a GC cycle and at
+/// least a manifest-based trigger check; an actual compaction adds its artifact
+/// I/O and CPU cost. `interval_secs = 0` creates an immediately-ready sleep and
+/// therefore no intentional idle delay between scans; production callers should
+/// provide a positive interval.
+///
+/// # Examples
+///
+/// Suppose `catalog` is deleting, `photos` has 120 WAL fragments, and `archive`
+/// is idle. One tick spends at most 25 seconds continuing `catalog` deletion,
+/// runs GC for `photos`, acquires its lease, publishes a segment, records health,
+/// invalidates its manifest cache, and spawns a centroid warm. It then runs GC
+/// and a cheap trigger check for `archive` without compacting it.
+///
+/// If namespace listing temporarily fails, already registered namespaces still
+/// run through authoritative maintenance operations. If another node holds the
+/// `photos` lease, this node logs a debug skip, leaves compaction health and the
+/// success/failure counter unchanged, and retries discovery on later ticks.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// [`tokio::select!`] waits for either the interval future or the watch-channel
+/// change without dedicating an OS thread to each wait. It resembles a Java
+/// `CompletableFuture.anyOf` loop or C event-loop multiplexing, but the compiler
+/// checks that borrowed inputs remain alive across every `.await`.
+///
+/// The loop borrows each namespace from an owned vector while cloning only the
+/// namespace string moved into the detached warm task. `match` exhaustively
+/// separates `LeaseHeld`, success, and other errors, preventing a new error
+/// variant from accidentally taking a success path. Saturating tick arithmetic
+/// keeps a long-lived debug counter from wrapping to zero.
 pub async fn compaction_loop(
     compactor: Arc<Compactor>,
     namespace_manager: Arc<NamespaceManager>,
