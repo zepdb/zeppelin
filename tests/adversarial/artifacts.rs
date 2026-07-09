@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use zeppelin::config::Config;
+use zeppelin::error::ZeppelinError;
 use zeppelin::storage::ZeppelinStore;
 
 use crate::common::counting::ClassStats;
@@ -42,6 +43,12 @@ pub struct FailureManifest {
     pub inspect_cmd: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct S3CaptureMetadata {
+    objects: Vec<S3ObjectMeta>,
+    capture_errors: Vec<S3CaptureError>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SeedReport {
     pub seed: u64,
@@ -56,11 +63,21 @@ pub struct SeedReport {
     pub fired_faults: Vec<FiredFault>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct S3ObjectMeta {
     key: String,
-    size: u64,
+    size: Option<u64>,
     captured: bool,
+    missing: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct S3CaptureError {
+    namespace: Option<String>,
+    key: Option<String>,
+    operation: String,
+    error: String,
 }
 
 impl RunArtifacts {
@@ -243,64 +260,197 @@ impl SeedArtifacts {
         dump_full: bool,
     ) {
         let capture_dir = self.dir.join("s3-capture");
-        fs::create_dir_all(&capture_dir).unwrap_or_else(|error| {
-            panic!(
+        if let Err(error) = fs::create_dir_all(&capture_dir) {
+            eprintln!(
                 "failed to create S3 capture dir {}: {error}",
                 capture_dir.display()
-            )
-        });
+            );
+            return;
+        }
         let objects_dir = capture_dir.join("objects");
-        fs::create_dir_all(&objects_dir).unwrap_or_else(|error| {
-            panic!(
-                "failed to create S3 object capture dir {}: {error}",
-                objects_dir.display()
-            )
-        });
+        let mut metadata = S3CaptureMetadata::default();
+        if let Err(error) = fs::create_dir_all(&objects_dir) {
+            metadata.capture_errors.push(S3CaptureError {
+                namespace: None,
+                key: None,
+                operation: "create_objects_dir".to_string(),
+                error: format!(
+                    "failed to create S3 object capture dir {}: {error}",
+                    objects_dir.display()
+                ),
+            });
+        }
 
-        let mut metadata = Vec::new();
         for ns in namespaces {
-            let mut keys = store
-                .list_prefix(&format!("{ns}/"))
-                .await
-                .unwrap_or_else(|error| panic!("failed to list S3 keys for {ns}: {error}"));
+            let mut keys = match store.list_prefix(&format!("{ns}/")).await {
+                Ok(keys) => keys,
+                Err(error) => {
+                    metadata.capture_errors.push(S3CaptureError {
+                        namespace: Some(ns.clone()),
+                        key: None,
+                        operation: "list_prefix".to_string(),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
             keys.sort();
             for key in keys {
-                let size = store
-                    .head(&key)
-                    .await
-                    .unwrap_or_else(|error| panic!("failed to head S3 key {key}: {error}"))
-                    .size as u64;
                 let should_capture = dump_full || is_control_plane_key(ns, &key);
                 if should_capture {
-                    let bytes = store
-                        .get(&key)
-                        .await
-                        .unwrap_or_else(|error| panic!("failed to capture S3 key {key}: {error}"));
-                    let path = objects_dir.join(&key);
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent).unwrap_or_else(|error| {
-                            panic!(
-                                "failed to create S3 capture parent {}: {error}",
-                                parent.display()
-                            )
-                        });
-                    }
-                    fs::write(&path, bytes).unwrap_or_else(|error| {
-                        panic!(
-                            "failed to write captured S3 key {}: {error}",
-                            path.display()
-                        )
-                    });
+                    let object_meta = capture_full_object(
+                        store,
+                        &objects_dir,
+                        ns,
+                        &key,
+                        &mut metadata.capture_errors,
+                    )
+                    .await;
+                    metadata.objects.push(object_meta);
+                } else {
+                    let object_meta =
+                        capture_head_only(store, ns, &key, &mut metadata.capture_errors).await;
+                    metadata.objects.push(object_meta);
                 }
-                metadata.push(S3ObjectMeta {
-                    key,
-                    size,
-                    captured: should_capture,
-                });
             }
         }
-        write_json(capture_dir.join("metadata.json"), &metadata);
+        if let Err(error) = try_write_json(capture_dir.join("metadata.json"), &metadata) {
+            eprintln!(
+                "failed to write S3 capture metadata under {}: {error}",
+                capture_dir.display()
+            );
+        }
     }
+}
+
+async fn capture_full_object(
+    store: &ZeppelinStore,
+    objects_dir: &Path,
+    namespace: &str,
+    key: &str,
+    capture_errors: &mut Vec<S3CaptureError>,
+) -> S3ObjectMeta {
+    match store.get(key).await {
+        Ok(bytes) => {
+            let size = bytes.len() as u64;
+            let path = objects_dir.join(key);
+            let mut entry = S3ObjectMeta {
+                key: key.to_string(),
+                size: Some(size),
+                captured: true,
+                missing: false,
+                error: None,
+            };
+            if let Some(parent) = path.parent() {
+                if let Err(error) = fs::create_dir_all(parent) {
+                    let message = format!(
+                        "failed to create S3 capture parent {}: {error}",
+                        parent.display()
+                    );
+                    record_capture_error(
+                        capture_errors,
+                        Some(namespace),
+                        Some(key),
+                        "create_parent_dir",
+                        message.clone(),
+                    );
+                    entry.captured = false;
+                    entry.error = Some(message);
+                    return entry;
+                }
+            }
+            if let Err(error) = fs::write(&path, bytes) {
+                let message = format!(
+                    "failed to write captured S3 key {}: {error}",
+                    path.display()
+                );
+                record_capture_error(
+                    capture_errors,
+                    Some(namespace),
+                    Some(key),
+                    "write_object",
+                    message.clone(),
+                );
+                entry.captured = false;
+                entry.error = Some(message);
+            }
+            entry
+        }
+        Err(error) if is_not_found(&error) => missing_object_meta(key, error),
+        Err(error) => errored_object_meta(namespace, key, "get", error, capture_errors),
+    }
+}
+
+async fn capture_head_only(
+    store: &ZeppelinStore,
+    namespace: &str,
+    key: &str,
+    capture_errors: &mut Vec<S3CaptureError>,
+) -> S3ObjectMeta {
+    match store.head(key).await {
+        Ok(meta) => S3ObjectMeta {
+            key: key.to_string(),
+            size: Some(meta.size as u64),
+            captured: false,
+            missing: false,
+            error: None,
+        },
+        Err(error) if is_not_found(&error) => missing_object_meta(key, error),
+        Err(error) => errored_object_meta(namespace, key, "head", error, capture_errors),
+    }
+}
+
+fn missing_object_meta(key: &str, error: ZeppelinError) -> S3ObjectMeta {
+    S3ObjectMeta {
+        key: key.to_string(),
+        size: None,
+        captured: false,
+        missing: true,
+        error: Some(error.to_string()),
+    }
+}
+
+fn errored_object_meta(
+    namespace: &str,
+    key: &str,
+    operation: &str,
+    error: ZeppelinError,
+    capture_errors: &mut Vec<S3CaptureError>,
+) -> S3ObjectMeta {
+    let message = error.to_string();
+    record_capture_error(
+        capture_errors,
+        Some(namespace),
+        Some(key),
+        operation,
+        message.clone(),
+    );
+    S3ObjectMeta {
+        key: key.to_string(),
+        size: None,
+        captured: false,
+        missing: false,
+        error: Some(message),
+    }
+}
+
+fn record_capture_error(
+    capture_errors: &mut Vec<S3CaptureError>,
+    namespace: Option<&str>,
+    key: Option<&str>,
+    operation: &str,
+    error: String,
+) {
+    capture_errors.push(S3CaptureError {
+        namespace: namespace.map(str::to_string),
+        key: key.map(str::to_string),
+        operation: operation.to_string(),
+        error,
+    });
+}
+
+fn is_not_found(error: &ZeppelinError) -> bool {
+    matches!(error, ZeppelinError::NotFound { .. })
 }
 
 pub fn read_seed_config(path: &Path) -> serde_json::Value {
@@ -340,6 +490,11 @@ fn write_json(path: impl AsRef<Path>, value: &impl Serialize) {
     });
 }
 
+fn try_write_json(path: impl AsRef<Path>, value: &impl Serialize) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(value).expect("artifact JSON must serialize");
+    fs::write(path.as_ref(), bytes)
+}
+
 fn is_control_plane_key(namespace: &str, key: &str) -> bool {
     let Some(suffix) = key.strip_prefix(&format!("{namespace}/")) else {
         return false;
@@ -350,6 +505,158 @@ fn is_control_plane_key(namespace: &str, key: &str) -> bool {
         || suffix.starts_with("manifests/")
         || suffix.starts_with("snapshots/")
         || suffix.starts_with("_staging/")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::fmt;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use futures::StreamExt;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn capture_s3_metadata_records_missing_listed_key() {
+        let temp_dir = tempfile::tempdir().expect("failed to create artifact temp dir");
+        let ops = BufWriter::new(
+            File::create(temp_dir.path().join("ops.jsonl")).expect("failed to create ops file"),
+        );
+        let artifacts = SeedArtifacts {
+            dir: temp_dir.path().to_path_buf(),
+            ops,
+            op_count: 0,
+        };
+        let ns = "ns";
+        let key = format!("{ns}/manifest.json");
+        let inner = Arc::new(InMemory::new());
+        let seed_store = ZeppelinStore::new(inner.clone());
+        seed_store
+            .put(&key, Bytes::from_static(b"{}"))
+            .await
+            .expect("failed to seed listed key");
+        let capture_store = ZeppelinStore::new(Arc::new(DeleteOnListStore {
+            inner,
+            delete_on_list: Arc::new(Mutex::new(BTreeSet::from([key.clone()]))),
+        }));
+
+        artifacts
+            .capture_s3_metadata(&capture_store, &[ns.to_string()], true)
+            .await;
+
+        let bytes = fs::read(temp_dir.path().join("s3-capture/metadata.json"))
+            .expect("metadata.json should be written");
+        let metadata: S3CaptureMetadata =
+            serde_json::from_slice(&bytes).expect("metadata should decode");
+        assert!(metadata.capture_errors.is_empty(), "{metadata:#?}");
+        assert_eq!(metadata.objects.len(), 1, "{metadata:#?}");
+        assert_eq!(metadata.objects[0].key, key);
+        assert!(metadata.objects[0].missing, "{metadata:#?}");
+        assert!(!metadata.objects[0].captured, "{metadata:#?}");
+        assert!(metadata.objects[0].size.is_none(), "{metadata:#?}");
+        assert!(
+            metadata.objects[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("object not found")),
+            "{metadata:#?}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct DeleteOnListStore {
+        inner: Arc<dyn ObjectStore>,
+        delete_on_list: Arc<Mutex<BTreeSet<String>>>,
+    }
+
+    impl fmt::Display for DeleteOnListStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "DeleteOnListStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for DeleteOnListStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOpts,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> OsResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &ObjectPath) -> OsResult<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &ObjectPath) -> OsResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+            let inner = self.inner.clone();
+            let delete_on_list = self.delete_on_list.clone();
+            self.inner
+                .list(prefix)
+                .then(move |result| {
+                    let inner = inner.clone();
+                    let delete_on_list = delete_on_list.clone();
+                    async move {
+                        if let Ok(meta) = &result {
+                            let should_delete = {
+                                let mut delete_on_list =
+                                    delete_on_list.lock().expect("delete set mutex poisoned");
+                                delete_on_list.remove(meta.location.as_ref())
+                            };
+                            if should_delete {
+                                let _ = inner.delete(&meta.location).await;
+                            }
+                        }
+                        result
+                    }
+                })
+                .boxed()
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&ObjectPath>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &ObjectPath, to: &ObjectPath) -> OsResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
 }
 
 fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &Coverage) -> String {
