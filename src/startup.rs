@@ -1,8 +1,103 @@
-//! Application startup and bootstrap logic.
+//! Builds the complete Zeppelin process graph and shuts down compaction.
 //!
-//! This module extracts initialization logic from `main.rs` to make it testable
-//! under `cargo test --lib`. All functions use injected dependencies and can be
-//! tested with `StorageBackend::Local` without needing S3 or MinIO.
+//! [`crate::startup::build_app`] is the composition root between boot-time
+//! [`crate::config::Config`] and the HTTP [`axum::Router`]. It validates
+//! configuration, probes the configured S3/MinIO or local backend, discovers
+//! namespaces, constructs WAL/index/cache/query services, starts optional
+//! hydration and the dedicated compaction thread, and places shared handles
+//! into [`crate::server::AppState`]. Extracting this work from the binary keeps
+//! dependency wiring testable with local object storage.
+//!
+//! Object storage remains authoritative throughout startup. A successful probe
+//! does not cache visibility state; it only proves the backend can answer. When
+//! `storage.fail_fast=false`, probe/namespace-scan failures are logged and the
+//! server is still assembled so health and API paths can expose the outage.
+//! This is an explicit configured boot mode, not a silent local-data fallback.
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`crate::startup::resolve_config_path`] and
+//!    [`crate::startup::init_logging`] for pre-runtime process setup.
+//! 2. Read [`crate::startup::build_app`] from validation through storage probing
+//!    and namespace discovery.
+//! 3. Continue through its service graph, hydration worker, manifest cache,
+//!    lease manager, and compaction thread construction.
+//! 4. Read `probe_storage` for the post-client LIST health check.
+//! 5. Finish with [`crate::startup::shutdown_background_tasks`] for
+//!    signal-and-join semantics.
+//!
+//! ## Startup lifecycle
+//!
+//! ```text
+//! Config load (main)
+//!       |
+//!       v
+//! validate + CPU budget + metrics
+//!       |
+//!       v
+//! endpoint probe -> construct ZeppelinStore -> LIST probe
+//!       |                    |
+//!       | unavailable and    +--> namespace discovery (when available)
+//!       | fail_fast=false
+//!       v
+//! construct WAL, caches, compactor, leases, runtime query state
+//!       |
+//!       +--> optional hydration Tokio task
+//!       +--> dedicated compaction OS thread + Tokio runtime
+//!       |
+//!       v
+//! AppState -> Router -> main binds listener
+//! ```
+//!
+//! ## Shutdown ownership
+//!
+//! ```text
+//! main owns watch::Sender + compaction JoinHandle
+//!                 |
+//!                 | send true
+//!                 v
+//! compaction runtime observes shutdown and exits its OS thread
+//!                 |
+//!                 | spawn_blocking joins without blocking query workers
+//!                 v
+//! success / thread panic / join failure / timeout
+//! ```
+//!
+//! ## Invariants and current limits
+//!
+//! - Configuration is validated before storage clients or background workers
+//!   are created.
+//! - Higher layers receive one cloned [`crate::storage::ZeppelinStore`]
+//!   abstraction; they do not construct independent S3 clients here.
+//! - Per-namespace compaction uses both lease fencing and manifest CAS; startup
+//!   creates one process-unique lease holder identity.
+//! - The compaction runtime is isolated on its own OS thread. Hydration runs on
+//!   the main Tokio runtime and query admission uses a semaphore in
+//!   [`crate::server::AppState`].
+//! - [`crate::startup::shutdown_background_tasks`] signals/joins the compaction
+//!   thread only. Hydration and request tasks end through normal Tokio/AppState
+//!   lifecycle.
+//!
+//! TODO(doc): Verify where
+//! [`CpuBudget::query_workers`][crate::config::CpuBudget::query_workers] and
+//! [`CpuBudget::rayon_threads`][crate::config::CpuBudget::rayon_threads] should
+//! be applied. [`crate::startup::build_app`] currently logs both values but only
+//! passes `compaction_workers` into a runtime builder.
+//!
+//! ## Rust concepts used here
+//!
+//! [`std::sync::Arc`] gives the router and background services shared ownership
+//! without a global singleton. Cloning `ZeppelinStore` and `Arc` values clones
+//! handles, not remote data. A Tokio [`watch`][tokio::sync::watch] channel
+//! carries the latest shutdown flag, while an owned
+//! [`std::thread::JoinHandle`] proves exactly one caller can join the compaction
+//! thread.
+//!
+//! [`crate::startup::build_app`] uses `?` across several concrete error types
+//! and returns `Box<dyn Error>` because startup can fail in configuration, I/O,
+//! storage, or runtime construction. Java would use a common exception
+//! superclass; C would need a tagged error plus explicit cleanup of every
+//! already-created service.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,14 +124,30 @@ use crate::server::AppState;
 use crate::storage::ZeppelinStore;
 use crate::wal::{LeaseManager, WalReader, WalWriter};
 
+/// Maximum duration for each endpoint, LIST, or namespace-scan startup probe.
 const STORAGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Resolve the configuration file path.
+/// Resolves the optional configuration file path from process context.
 ///
-/// Priority:
-/// 1. `ZEPPELIN_CONFIG` environment variable
-/// 2. `./zeppelin.toml` if it exists
-/// 3. None (use defaults)
+/// Priority is `ZEPPELIN_CONFIG`, then `./zeppelin.toml` in the current working
+/// directory, then no path so [`Config::load`] uses defaults/environment
+/// overrides. The environment value is returned verbatim, including an empty or
+/// nonexistent path; validation/opening belongs to the loader.
+///
+/// # Returns
+///
+/// `Some(path)` from the environment or existing default file, otherwise
+/// `None`.
+///
+/// # Side Effects
+///
+/// Reads one environment variable and may perform one local filesystem
+/// existence check. It does not open or parse the file.
+///
+/// # Examples
+///
+/// `ZEPPELIN_CONFIG=/etc/zeppelin.toml` wins even when `./zeppelin.toml`
+/// exists. With neither input, the caller receives `None` and loads defaults.
 pub fn resolve_config_path() -> Option<String> {
     std::env::var("ZEPPELIN_CONFIG").ok().or_else(|| {
         let default = "zeppelin.toml";
@@ -46,10 +157,35 @@ pub fn resolve_config_path() -> Option<String> {
     })
 }
 
-/// Initialize tracing subscriber from logging config.
+/// Installs the process-global tracing subscriber from logging configuration.
 ///
-/// Supports JSON and plain text formats. Uses `RUST_LOG` env var if set,
-/// otherwise falls back to `config.logging.level`.
+/// A valid `RUST_LOG` filter overrides the configured level. An absent **or
+/// invalid** environment filter falls back to `config.logging.level`. Format
+/// `"json"` selects structured JSON; every other value selects text (validated
+/// configuration normally restricts the choice earlier).
+///
+/// # Parameters
+///
+/// - `config`: Validated boot configuration containing log level and format.
+///
+/// # Returns
+///
+/// Returns unit after installing the subscriber.
+///
+/// # Panics
+///
+/// Panics if a global tracing subscriber was already installed or if the
+/// selected formatter cannot become global. Call exactly once per process.
+///
+/// # Side Effects
+///
+/// Reads `RUST_LOG` and sets process-global tracing state.
+///
+/// # Examples
+///
+/// With JSON format and no `RUST_LOG`, an `info` configured level produces
+/// structured events at `info` and above. `RUST_LOG=zeppelin=debug` overrides
+/// that filter for this process.
 pub fn init_logging(config: &Config) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
@@ -67,19 +203,74 @@ pub fn init_logging(config: &Config) {
     }
 }
 
-/// Build the application router and spawn background tasks.
+/// Validates configuration and constructs the router plus background services.
 ///
-/// Returns:
-/// - The axum `Router` ready to be served
-/// - A shutdown channel sender to gracefully stop background tasks
-/// - The background compaction thread handle
+/// This is the process composition root. Construction is ordered so validation
+/// and storage probes occur before the compaction thread starts. When storage is
+/// unavailable and `fail_fast` is disabled, the function skips namespace
+/// discovery but still builds the service graph; requests continue to use the
+/// configured remote store and surface its errors.
 ///
-/// This function:
-/// - Initializes metrics
-/// - Creates storage, namespace manager, WAL reader/writer, cache, compactor
-/// - Scans existing namespaces
-/// - Spawns background compaction loop
-/// - Builds `AppState` and axum `Router`
+/// # Parameters
+///
+/// - `config`: Owned boot configuration. Validation runs again here even if the
+///   caller loaded it through [`Config::load`]. The final value is moved into
+///   [`AppState`].
+///
+/// # Returns
+///
+/// A ready [`Router`], a [`watch::Sender`] used to request compaction shutdown,
+/// and the owned OS-thread join handle required by
+/// [`shutdown_background_tasks`]. The caller must bind/serve the router and
+/// eventually signal/join the thread.
+///
+/// # Errors
+///
+/// Returns configuration, CPU-budget, storage-client/probe, namespace-scan,
+/// cache/hydration, or trusted-proxy construction errors. With
+/// `storage.fail_fast=true`, probe and scan failures abort startup. Metrics or
+/// other process-local initialization may already have happened before a later
+/// error, but no router is returned.
+///
+/// # Panics
+///
+/// Panics if the operating system refuses to spawn the dedicated compaction
+/// thread. Failure to build its Tokio runtime occurs inside that new thread and
+/// is later reported as a thread panic during shutdown.
+///
+/// # Side Effects
+///
+/// Reads environment/OS CPU information, initializes global metrics, probes
+/// object storage, scans namespaces, creates local cache directories/state,
+/// optionally spawns a hydration task, and starts a dedicated compaction OS
+/// thread. It emits structured startup logs and metrics.
+///
+/// # Consistency
+///
+/// Namespace discovery reads authoritative storage. Manifest cache and disk
+/// cache instances are empty optimizations at construction. The generated lease
+/// holder ID is unique to this process and all compaction commits still require
+/// fencing plus manifest CAS.
+///
+/// # Performance
+///
+/// Endpoint probing, storage LIST probing, and namespace scanning are each
+/// bounded by two seconds. Discovery may perform object-store LIST/GET work for
+/// existing namespaces. Component allocation is otherwise process-local.
+///
+/// # Examples
+///
+/// A local-storage test receives a router, shutdown sender, and compaction
+/// handle without S3. With a dead S3 endpoint and fail-fast enabled, startup
+/// returns before serving; with fail-fast disabled, it logs the outage, skips
+/// discovery, and returns a router whose storage-dependent requests may fail.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `config` is moved into this function and ultimately into an `Arc` inside
+/// state. Service handles are cloned explicitly when several owners need them.
+/// The tuple return transfers unique responsibility for the shutdown sender and
+/// thread handle to `main`; Rust prevents accidentally joining the handle twice.
 pub async fn build_app(
     config: Config,
 ) -> Result<(Router, watch::Sender<bool>, std::thread::JoinHandle<()>), Box<dyn std::error::Error>>
@@ -334,6 +525,33 @@ pub async fn build_app(
     Ok((app, shutdown_tx, compaction_handle))
 }
 
+/// Verifies a constructed store by listing top-level common prefixes.
+///
+/// The earlier configured-endpoint probe checks network/backend reachability;
+/// this second probe exercises the actual [`ZeppelinStore`] instance used by
+/// higher layers.
+///
+/// # Parameters
+///
+/// - `store`: Constructed storage abstraction to probe.
+///
+/// # Returns
+///
+/// `Ok(())` when the empty-prefix LIST completes within two seconds.
+///
+/// # Errors
+///
+/// Maps storage LIST failure or timeout into [`ZeppelinError::Config`] with
+/// startup context.
+///
+/// # Side Effects
+///
+/// Performs one read-only object-store LIST request.
+///
+/// # Examples
+///
+/// An empty bucket still succeeds because the operation need not find a
+/// namespace. A credential error or stalled endpoint fails the probe.
 async fn probe_storage(store: &ZeppelinStore) -> ZeppelinResult<()> {
     match tokio::time::timeout(STORAGE_STARTUP_TIMEOUT, store.list_common_prefixes("")).await {
         Ok(result) => result.map(|_| ()).map_err(|error| {
@@ -346,7 +564,48 @@ async fn probe_storage(store: &ZeppelinStore) -> ZeppelinResult<()> {
     }
 }
 
-/// Signal background tasks and join the compaction thread within `timeout_duration`.
+/// Signals and joins the dedicated compaction thread within a deadline.
+///
+/// Sending is best-effort because the thread may already have stopped. Joining
+/// runs on Tokio's blocking pool so it does not block an async worker. A timeout
+/// drops the async join handle, but the underlying blocking join/thread may
+/// continue until the compaction thread eventually exits.
+///
+/// # Parameters
+///
+/// - `shutdown_tx`: Owned watch sender connected to the compaction runtime.
+/// - `compaction_handle`: Unique OS-thread join handle returned by [`build_app`].
+/// - `timeout_duration`: Maximum time this caller waits for the spawned join
+///   task.
+///
+/// # Returns
+///
+/// `Ok(())` only when the compaction OS thread exits normally before the
+/// deadline.
+///
+/// # Errors
+///
+/// Returns configuration errors when the compaction thread panics, the blocking
+/// join task fails, or the timeout expires. The shutdown send result itself is
+/// ignored because a closed receiver already means no active listener remains.
+///
+/// # Side Effects
+///
+/// Publishes `true` on the watch channel and occupies a blocking-pool task while
+/// joining. It does not explicitly stop hydration or request tasks.
+///
+/// # Examples
+///
+/// After Axum finishes graceful HTTP shutdown, `main` passes its sender and
+/// handle with the configured timeout. Normal compaction exit returns success;
+/// a panic becomes a startup/configuration-class process error.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Moving `compaction_handle` into `spawn_blocking` transfers unique join
+/// ownership to that closure. Java's `Thread.join` can be invoked through shared
+/// references; C's `pthread_join` requires convention to avoid double joins.
+/// Rust makes a second join impossible after the move.
 pub async fn shutdown_background_tasks(
     shutdown_tx: watch::Sender<bool>,
     compaction_handle: std::thread::JoinHandle<()>,
@@ -373,9 +632,27 @@ pub async fn shutdown_background_tasks(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    //! Local-storage startup tests for configuration discovery and thread cleanup.
+    //!
+    //! The two configuration-path tests mutate process-global environment and
+    //! current-directory state. They are not safe to run concurrently with each
+    //! other; execute this module with `--test-threads=1`. Each test restores the
+    //! previous values for later tests.
+
     use super::*;
     use crate::config::StorageBackend;
 
+    /// Builds a local-backend fixture whose compactor stays idle during a test.
+    ///
+    /// # Parameters
+    ///
+    /// - `tmp`: Temporary directory whose handle remains alive for the complete
+    ///   application/test lifetime.
+    ///
+    /// # Returns
+    ///
+    /// A default configuration redirected to isolated local storage/cache paths
+    /// with a long compaction interval.
     fn test_config(tmp: &tempfile::TempDir) -> Config {
         let mut config = Config::default();
         config.storage.backend = StorageBackend::Local;
@@ -386,6 +663,7 @@ mod tests {
         config
     }
 
+    /// Gives `ZEPPELIN_CONFIG` priority and restores its prior process value.
     #[test]
     fn test_resolve_config_path_from_env() {
         // Save original value
@@ -403,6 +681,9 @@ mod tests {
         assert_eq!(path, Some("foo.toml".to_string()));
     }
 
+    /// Returns no path when neither environment nor working directory provides one.
+    ///
+    /// The test restores both process-global inputs before asserting.
     #[test]
     fn test_resolve_config_path_none() {
         // Save original values
@@ -425,6 +706,7 @@ mod tests {
         assert_eq!(path, None);
     }
 
+    /// Builds the complete local service graph and joins its compaction thread.
     #[tokio::test]
     async fn test_build_app_local_storage() {
         let tmp = tempfile::tempdir().unwrap();
@@ -440,6 +722,7 @@ mod tests {
             .unwrap();
     }
 
+    /// Accepts an empty authoritative local namespace scan during startup.
     #[tokio::test]
     async fn test_build_app_with_namespace_scan() {
         let tmp = tempfile::tempdir().unwrap();
@@ -455,6 +738,7 @@ mod tests {
             .unwrap();
     }
 
+    /// Proves the watch signal and blocking join finish without hanging.
     #[tokio::test]
     async fn test_graceful_shutdown() {
         let tmp = tempfile::tempdir().unwrap();
