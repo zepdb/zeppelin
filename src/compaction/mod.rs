@@ -575,6 +575,9 @@ impl Compactor {
                     fresh_manifest.fencing_token = token;
                 }
 
+                if let Some(seg_id) = old_segment_id.as_deref() {
+                    fresh_manifest.remove_segment(seg_id);
+                }
                 fresh_manifest.remove_compacted_fragments(&compacted_ids);
                 merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 

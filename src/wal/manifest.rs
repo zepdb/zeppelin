@@ -475,6 +475,15 @@ impl Manifest {
         self.add_segment_with_limits(sref, 1000, 10);
     }
 
+    /// Remove a segment reference and clear it as active if it was serving reads.
+    pub fn remove_segment(&mut self, segment_id: &str) {
+        if self.active_segment.as_deref() == Some(segment_id) {
+            self.active_segment = None;
+        }
+        self.segments.retain(|segment| segment.id != segment_id);
+        self.updated_at = Utc::now();
+    }
+
     /// Prune the manifest to prevent unbounded growth at 1M+ scale.
     ///
     /// Retains only the most recent `max_old_segments` non-active segments.
@@ -1975,5 +1984,18 @@ mod tests {
         // ...but pending_deletes entries are never dropped (they are S3 keys
         // still awaiting deletion).
         assert_eq!(manifest.pending_deletes.len(), 10);
+    }
+
+    #[test]
+    fn test_remove_segment_clears_active_segment() {
+        let mut manifest = Manifest::new();
+        manifest.add_segment(make_segment("seg_old"));
+        manifest.add_segment(make_segment("seg_live"));
+
+        manifest.remove_segment("seg_live");
+
+        assert_eq!(manifest.active_segment, None);
+        assert_eq!(manifest.segments.len(), 1);
+        assert_eq!(manifest.segments[0].id, "seg_old");
     }
 }
