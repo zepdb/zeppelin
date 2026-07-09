@@ -1,10 +1,88 @@
-//! Search phase for IVF-Flat index.
+//! Executes the object-store read path for one immutable IVF-Flat segment.
 //!
-//! 1. Compute distance from query to all centroids.
-//! 2. Select top-`nprobe` closest centroids.
-//! 3. For each selected cluster, fetch and scan all vectors.
-//! 4. Apply post-filter with oversampling if a filter is present.
-//! 5. Return sorted top-k results.
+//! An [`IvfFlatIndex`] keeps centroids and small bootstrap metadata in memory,
+//! while the vector rows, attributes, bitmap indexes, and quantized codes remain
+//! in immutable segment objects. [`search_ivf_flat`] first chooses the nearest
+//! centroid clusters (`nprobe`), may narrow that set with a resident coarse
+//! sketch, and then uses the segment's [`QuantizationType`] to choose one of
+//! three scan paths. The caller in the query layer merges these segment results
+//! with newer WAL results; this file neither reads the manifest nor scans the
+//! WAL and never publishes or mutates authoritative data.
+//!
+//! `nprobe` is the number of centroid regions considered. Raising it normally
+//! improves recall—the chance that the true nearest rows are examined—but adds
+//! object-store bytes and distance calculations. A resident sketch can reduce
+//! physical reads within that probe set for unfiltered queries. Grouped object
+//! metadata can make one GET cover several logical clusters, so the number of
+//! scanned clusters and the number of object requests are deliberately distinct.
+//!
+//! ```text
+//! query + loaded segment handle
+//!              |
+//!              v
+//! rank all centroids; retain min(nprobe, cluster count)
+//!              |
+//!              v
+//! optional resident-sketch selection (unfiltered queries only)
+//!              |
+//!       +------+------+----------------+
+//!       |             |                |
+//!       v             v                v
+//!  full precision    SQ8              PQ
+//!  fetch + score     approximate      approximate
+//!  every row         coarse score     coarse score
+//!       |             |                |
+//!       |             +--------+-------+
+//!       |                      v
+//!       |             exact full-vector rerank
+//!       +----------------------+
+//!                              v
+//! exact filter/order, optional attribute enrichment, top-k
+//! ```
+//!
+//! Bitmap filtering is an optimization, not a separate source of truth. If a
+//! bitmap object is absent, unreadable, or cannot express a filter, quantized
+//! scans fetch row attributes and evaluate the same filter exactly before
+//! approximate truncation. Immutable object keys make cached bytes reusable;
+//! object storage remains the source of truth, and malformed cached full objects
+//! are evicted rather than accepted.
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`search_ivf_flat`] for validation, centroid probing, scan-path
+//!    dispatch, final filtering, and result shaping.
+//! 2. Read `select_scan_clusters` and the grouped-object scoring helpers for the
+//!    resident-sketch read budget.
+//! 3. Compare `scan_clusters_flat`, `scan_clusters_sq`, and `scan_clusters_pq`.
+//! 4. Follow `load_sq_object_for_coarse` through the range-read and rerank
+//!    helpers for current grouped SQ objects and legacy compatibility.
+//! 5. Finish with `try_bitmap_prefilter`, `coarse_row_passes`, and
+//!    `enrich_unfiltered_results` for metadata semantics.
+//!
+//! ## Invariants
+//!
+//! - Lower [`SearchResult::score`] values rank first for every supported metric.
+//! - Logical row positions keep IDs, vectors, attributes, bitmap positions, and
+//!   quantized codes aligned; a mismatch is an index error, never skipped data.
+//! - Quantized scores may choose rerank candidates, but returned distances are
+//!   always recomputed from full-precision vectors.
+//! - A filter is applied before quantized candidate truncation and again at the
+//!   final boundary, so selective filters cannot be discarded as coarse noise.
+//! - Manifest-provided grouped-object membership must match the object's decoded
+//!   directory before range offsets are trusted.
+//! - This read path creates no artifacts and changes no manifest visibility.
+//!
+//! ## Rust concepts used here
+//!
+//! Borrowed slices such as `&[f32]` let all phases inspect one caller-owned
+//! query without copying it. `Arc<DiskCache>` is shared ownership similar to a
+//! Java reference-counted service handle; unlike a raw C pointer, Rust proves
+//! the cache remains alive while async reads use it. `join_all` and
+//! `tokio::join!` poll independent I/O concurrently without spawning detached
+//! tasks or sharing mutable candidate buffers. After those futures finish, the
+//! code performs CPU scoring sequentially on owned `Vec` and `HashMap` values.
+//! `Bytes::slice` creates a reference-counted view into immutable bytes rather
+//! than allocating or copying the selected range.
 
 use dashmap::DashMap;
 use std::cmp::Ordering as CmpOrdering;
@@ -34,46 +112,96 @@ use super::IvfFlatIndex;
 use crate::index::bitmap::evaluate::evaluate_filter_bitmap;
 use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 
+/// Row-aligned optional attribute maps for one logical cluster.
+///
+/// Position `i` belongs to the same row as vector and ID position `i`; `None`
+/// means that row stored no attributes. The outer vector is owned after decode.
 type ClusterAttrs = Vec<Option<HashMap<String, AttributeValue>>>;
 
-// Previous smooth fixed budget: keeps the cap monotonic in nprobe and makes
-// high-nprobe sentinel runs become a structural no-op when cap >= probe count.
+/// Minimum size of the historical smooth cluster budget before adaptation.
+///
+/// Keeping this floor at six avoids overly aggressive sketch pruning for small
+/// probe sets; the final cap still never exceeds the effective `nprobe`.
 const SKETCH_BASE_MIN_CLUSTERS: usize = 6;
+/// Linear coefficient in the historical sketch cluster-budget curve.
 const SKETCH_CLUSTER_LINEAR_FRACTION: f32 = 0.3125;
+/// Denominator controlling the curve's quadratic growth at large `nprobe`.
 const SKETCH_CLUSTER_QUADRATIC_SCALE: f32 = 150.0;
-// Always fetch a small sketch-ranked core so sharp/easy queries can spend less
-// than the old fixed budget without risking single-cluster brittleness.
+/// Minimum sketch-ranked cluster core for an adaptively pruned query.
 const SKETCH_ADAPTIVE_FLOOR_CLUSTERS: usize = 4;
-// Hard queries can borrow up to roughly twice the previous fixed budget while
-// the score-gap cutoff keeps the mean near the old operating point.
+/// Maximum multiple of the historical cluster budget available to hard queries.
 const SKETCH_ADAPTIVE_MAX_MULTIPLIER: usize = 2;
-// Include extra clusters whose aggregate sketch distance is close to the best
-// cluster for this query; the cutoff uses no cross-query state.
+/// Relative approximate-distance margin for admitting extra sketch clusters.
 const SKETCH_ADAPTIVE_RELATIVE_SCORE_MARGIN: f32 = 0.13;
-// Grouped cluster objects cover multiple logical clusters per S3 GET. The
-// object cap starts from the cluster cap, scales by actual manifest arity, and
-// keeps a small hard-query allowance for flat score distributions.
+/// Minimum physical grouped objects fetched by the normal adaptive policy.
 const SKETCH_ADAPTIVE_FLOOR_OBJECTS: usize = 3;
+/// Larger object floor used when objects contain at most a few clusters.
 const SKETCH_ADAPTIVE_THIN_OBJECT_FLOOR: usize = 5;
+/// Maximum clusters per object still classified as a thin grouped layout.
 const SKETCH_THIN_OBJECT_MAX_ARITY: usize = 3;
+/// Tighter relative-distance margin used for thin grouped objects.
 const SKETCH_ADAPTIVE_THIN_RELATIVE_SCORE_MARGIN: f32 = 0.12;
+/// Extra physical objects allowed beyond the arity-scaled cluster budget.
 const SKETCH_ADAPTIVE_OBJECT_CAP_EXTRA: usize = 2;
+/// Environment variable enabling one-line sketch object-scan diagnostics.
 const SKETCH_SCAN_STATS_ENV: &str = "ZEPPELIN_SKETCH_SCAN_STATS";
+/// Environment variable enabling query-local SQ byte diagnostics.
 const SQ_BYTE_STATS_ENV: &str = "ZEPPELIN_SQ_BYTE_STATS";
 
-/// A candidate result during search, before final ranking.
+/// One exact-distance segment candidate before final filtering and projection.
+///
+/// The cluster and row coordinates are retained so attributes can be loaded
+/// only for unfiltered winners. `score` is always a full-precision distance at
+/// this stage, even when SQ or PQ chose the row during coarse ranking.
 struct Candidate {
+    /// Owned vector identifier returned to the caller if this candidate wins.
     id: String,
+    /// Exact lower-is-better distance from the query to the stored vector.
     score: f32,
+    /// Decoded row attributes when filtering already required them.
     attributes: Option<HashMap<String, AttributeValue>>,
+    /// Logical cluster containing this row.
     cluster_idx: usize,
+    /// Zero-based position inside that cluster's aligned row arrays.
     row_idx: usize,
 }
 
+/// Orders exact candidates by ascending distance and then identifier.
+///
+/// # Parameters
+///
+/// - `a`: First borrowed candidate.
+/// - `b`: Second borrowed candidate.
+///
+/// # Returns
+///
+/// A total ordering suitable for sorting or partial top-k selection. Ties are
+/// deterministic by ID, and IEEE-754 special values are ordered by `total_cmp`.
+///
+/// # Examples
+///
+/// A candidate at distance `0.2` precedes one at `0.5`; equal-distance IDs
+/// `item-a` and `item-b` retain the lexical order `item-a`, then `item-b`.
 fn candidate_distance_cmp(a: &Candidate, b: &Candidate) -> CmpOrdering {
     a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
 }
 
+/// Orders SQ coarse tuples by approximate distance and then identifier.
+///
+/// # Parameters
+///
+/// - `a`: `(id, approximate_score, cluster, row)` tuple to compare.
+/// - `b`: Other tuple in the same representation.
+///
+/// # Returns
+///
+/// A deterministic lower-score-first ordering; cluster and row are payload,
+/// not tie breakers.
+///
+/// # Examples
+///
+/// Two SQ rows with equal approximate scores are ordered by ID before exact
+/// reranking, which makes truncation reproducible.
 fn coarse_sq_candidate_cmp(
     a: &(String, f32, usize, usize),
     b: &(String, f32, usize, usize),
@@ -81,56 +209,136 @@ fn coarse_sq_candidate_cmp(
     a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
 }
 
+/// Orders PQ coarse tuples by approximate distance and then identifier.
+///
+/// # Parameters
+///
+/// - `a`: `(id, approximate_score, cluster)` tuple to compare.
+/// - `b`: Other tuple in the same representation.
+///
+/// # Returns
+///
+/// A deterministic lower-score-first ordering used by partial top-k selection.
+///
+/// # Examples
+///
+/// If two product-quantized codes score `4.0`, their IDs decide which appears
+/// first in the rerank window.
 fn coarse_pq_candidate_cmp(a: &(String, f32, usize), b: &(String, f32, usize)) -> CmpOrdering {
     a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
 }
 
 #[derive(Debug, Clone)]
+/// Manifest-resolved physical object covering one or more logical clusters.
+///
+/// Cloning this value allocates clones of the key and cluster vector. It does
+/// not clone object bytes or perform I/O.
 struct ClusterFetchObject {
+    /// Immutable object-store key.
     key: String,
+    /// Logical cluster indexes whose full sections live in the object.
     clusters: Vec<usize>,
+    /// Optional self-contained prefix containing live full-vector data.
     live_range: Option<std::ops::Range<usize>>,
+    /// Manifest-declared complete object length, or zero for legacy metadata.
     size_bytes: u64,
 }
 
+/// Outcome of consulting the local full-object cache for a range request.
 enum RangeCacheLookup {
+    /// A validated local full object can satisfy the requested range.
     Local(bytes::Bytes),
+    /// No usable full object was present; the caller should read object storage.
     Miss,
+    /// A wrong-length cached object was evicted before the caller reads S3.
     CorruptEvicted,
 }
 
+/// Process-wide decoded directory cache keyed by immutable cluster-object key.
+///
+/// [`OnceLock`] initializes the concurrent map on first use. Each [`Arc`] shares
+/// an immutable decoded layout across queries without copying its section list.
 static CLUSTER_OBJECT_LAYOUT_CACHE: OnceLock<DashMap<String, Arc<ClusterObjectLayout>>> =
     OnceLock::new();
+/// Monotonic process-local identifier used only to correlate SQ diagnostics.
 static SQ_BYTE_STATS_QUERY_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
+/// Logical I/O phase to which an SQ query attributes a physical GET.
 enum SqBytePhase {
+    /// Quantized coarse-scoring bytes.
     Sq,
+    /// Full-precision exact-rerank bytes.
     Rerank,
+    /// Calibration, attributes, or other supporting bytes.
     Other,
 }
 
+/// Lock-free, query-local counters emitted when SQ byte diagnostics are enabled.
+///
+/// Independent async fetches share this value through [`Arc`]. Relaxed atomics
+/// are sufficient because the counters collect statistics only; they do not
+/// synchronize correctness state.
 struct SqSearchByteStats {
+    /// Process-local diagnostic query identifier.
     query_id: u64,
+    /// Physical GET count during coarse SQ reads.
     sq_gets: AtomicU64,
+    /// Physical bytes returned by coarse SQ reads.
     sq_bytes: AtomicU64,
+    /// Payload bytes actually needed from those coarse reads.
     sq_logical_bytes: AtomicU64,
+    /// Physical GET count during exact rerank.
     rerank_gets: AtomicU64,
+    /// Physical bytes returned during exact rerank.
     rerank_bytes: AtomicU64,
+    /// Exact vector payload bytes requested by rerank.
     rerank_logical_bytes: AtomicU64,
+    /// Physical supporting-object GET count.
     other_gets: AtomicU64,
+    /// Physical supporting-object bytes.
     other_bytes: AtomicU64,
+    /// Bytes served from a complete locally cached object.
     local_bytes: AtomicU64,
+    /// Logical clusters selected for SQ scanning.
     selected_clusters: AtomicU64,
+    /// Distinct physical objects containing those clusters.
     sq_objects: AtomicU64,
+    /// Coarse candidates retained after approximate selection.
     coarse_candidates: AtomicU64,
+    /// Rows requested for exact rerank.
     rerank_candidates: AtomicU64,
+    /// Logical clusters containing rerank rows.
     rerank_clusters: AtomicU64,
+    /// Physical objects containing rerank rows.
     rerank_objects: AtomicU64,
+    /// Results ultimately returned to the segment caller.
     final_results: AtomicU64,
 }
 
 impl SqSearchByteStats {
+    /// Creates diagnostics only for an active SQ path with the environment flag.
+    ///
+    /// # Parameters
+    ///
+    /// - `enabled`: Whether the selected quantization mode is scalar.
+    ///
+    /// # Returns
+    ///
+    /// A shared zeroed counter set when both `enabled` and
+    /// `ZEPPELIN_SQ_BYTE_STATS` are present; otherwise `None` with no allocation.
+    ///
+    /// # Examples
+    ///
+    /// An unquantized query passes `false` and never emits SQ statistics even if
+    /// the environment flag is set. An SQ query with the flag receives a unique
+    /// process-local diagnostic ID.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// `Option<Arc<Self>>` encodes disabled versus enabled diagnostics without a
+    /// null pointer. Cloning the returned `Arc` increments a reference count; it
+    /// does not duplicate the atomics or create a second set of counters.
     fn new_if_enabled(enabled: bool) -> Option<Arc<Self>> {
         if !enabled || std::env::var_os(SQ_BYTE_STATS_ENV).is_none() {
             return None;
@@ -156,10 +364,41 @@ impl SqSearchByteStats {
         }))
     }
 
+    /// Adds one physical GET and its returned byte count to a phase.
+    ///
+    /// # Parameters
+    ///
+    /// - `phase`: Query phase charged for the read.
+    /// - `bytes`: Physical bytes returned by the store.
+    ///
+    /// # Side Effects
+    ///
+    /// Mutates diagnostic atomics only; it does not issue I/O.
+    ///
+    /// # Examples
+    ///
+    /// Reading a 4 KiB SQ range records one SQ GET and 4096 physical bytes.
     fn record_get(&self, phase: SqBytePhase, bytes: usize) {
         self.record_gets(phase, 1, bytes);
     }
 
+    /// Adds an arbitrary number of physical reads and bytes to one phase.
+    ///
+    /// # Parameters
+    ///
+    /// - `phase`: Coarse, rerank, or supporting-I/O bucket.
+    /// - `gets`: Number of completed object-store requests.
+    /// - `bytes`: Sum of bytes returned by those requests.
+    ///
+    /// # Side Effects
+    ///
+    /// Uses relaxed atomic additions so concurrently polled range reads can
+    /// contribute without a mutex.
+    ///
+    /// # Examples
+    ///
+    /// Three coalesced rerank ranges totaling 12 KiB add `(3, 12288)` to the
+    /// rerank counters.
     fn record_gets(&self, phase: SqBytePhase, gets: usize, bytes: usize) {
         let gets = gets as u64;
         let bytes = bytes as u64;
@@ -179,24 +418,81 @@ impl SqSearchByteStats {
         }
     }
 
+    /// Records useful SQ payload bytes independently of range slack.
+    ///
+    /// # Parameters
+    ///
+    /// - `bytes`: Bytes occupied by requested SQ sections.
+    ///
+    /// # Examples
+    ///
+    /// A 6 KiB physical span containing 5 KiB of selected code sections records
+    /// 5 KiB here; `emit` reports the remaining 1 KiB as slack.
     fn record_logical_sq_bytes(&self, bytes: usize) {
         self.sq_logical_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    /// Records useful full-vector payload bytes independently of coalesced gaps.
+    ///
+    /// # Parameters
+    ///
+    /// - `bytes`: Sum of exact vector byte widths requested by rerank.
+    ///
+    /// # Examples
+    ///
+    /// Reranking ten 128-dimensional vectors records `10 * 128 * 4` logical
+    /// bytes even if fewer, larger physical ranges include gaps between rows.
     fn record_logical_rerank_bytes(&self, bytes: usize) {
         self.rerank_logical_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    /// Records bytes read from a validated complete local object.
+    ///
+    /// # Parameters
+    ///
+    /// - `bytes`: Size of the cached object consulted.
+    ///
+    /// # Examples
+    ///
+    /// Slicing one vector from a 1 MiB cached object records 1 MiB of local
+    /// bytes because the full cache value was read.
     fn record_local_bytes(&self, bytes: usize) {
         self.local_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    /// Stores a query cardinality in an atomic diagnostic field.
+    ///
+    /// # Parameters
+    ///
+    /// - `field`: Counter to replace.
+    /// - `value`: Current cluster, object, candidate, or result count.
+    ///
+    /// # Examples
+    ///
+    /// After selecting eight clusters, the caller stores `8` in
+    /// `selected_clusters` before concurrent fetches begin.
     fn set_usize(field: &AtomicU64, value: usize) {
         field.store(value as u64, Ordering::Relaxed);
     }
 
+    /// Emits one complete SQ byte-accounting line to standard error.
+    ///
+    /// # Parameters
+    ///
+    /// - `effective_nprobe`: Probe count after clamping to existing centroids.
+    /// - `fetch_k`: Candidate target after filter oversampling.
+    ///
+    /// # Side Effects
+    ///
+    /// Writes a diagnostic line to standard error. It does not affect query
+    /// results, metrics, cache contents, or object-store state.
+    ///
+    /// # Examples
+    ///
+    /// A query may report eight selected clusters but four physical SQ objects,
+    /// making grouping efficiency and range slack visible in one line.
     fn emit(&self, effective_nprobe: usize, fetch_k: usize) {
         let sq_gets = self.sq_gets.load(Ordering::Relaxed);
         let sq_bytes = self.sq_bytes.load(Ordering::Relaxed);
@@ -231,11 +527,62 @@ total_gets={total_gets} total_bytes={total_bytes}",
     }
 }
 
+/// Returns the lazily initialized process-wide decoded-layout cache.
+///
+/// # Returns
+///
+/// A `'static` concurrent map. Values are immutable and shared through [`Arc`].
+///
+/// # Examples
+///
+/// Two queries for the same grouped object can reuse one decoded directory even
+/// when they use different per-query disk-cache handles.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// [`OnceLock`] is comparable to a Java initialization-on-demand holder or
+/// `pthread_once`, while [`DashMap`] provides sharded concurrent access. The
+/// returned reference is valid for the process lifetime; callers do not free it.
 fn cluster_object_layout_cache() -> &'static DashMap<String, Arc<ClusterObjectLayout>> {
     CLUSTER_OBJECT_LAYOUT_CACHE.get_or_init(DashMap::new)
 }
 
-/// Fetch data from cache if available, otherwise from S3.
+/// Loads one complete immutable object through the optional cache.
+///
+/// # Parameters
+///
+/// - `cache`: Optional shared local disk cache. A miss is delegated to `store`.
+/// - `store`: Zeppelin's object-store abstraction and source of truth.
+/// - `key`: Complete immutable object key.
+///
+/// # Returns
+///
+/// Shared immutable bytes from cache or object storage.
+///
+/// # Errors
+///
+/// Propagates cache and object-store failures. This helper does not replace a
+/// missing or unreadable authoritative object with empty bytes.
+///
+/// # Side Effects
+///
+/// A miss may perform one GET and populate the cache. The cache may coalesce
+/// concurrent misses for the same key.
+///
+/// # Consistency
+///
+/// Segment objects are immutable, so a cached value for the exact key is safe
+/// to reuse. The helper never changes manifest visibility.
+///
+/// # Performance
+///
+/// A hit avoids network I/O. A miss downloads the complete object rather than a
+/// range.
+///
+/// # Examples
+///
+/// Sixteen concurrent cold queries for one cluster can share the cache's single
+/// in-flight GET and then receive cheap [`bytes::Bytes`] handles.
 async fn fetch_with_cache(
     cache: Option<&Arc<DiskCache>>,
     store: &ZeppelinStore,
@@ -248,6 +595,39 @@ async fn fetch_with_cache(
     }
 }
 
+/// Loads one complete object while attributing physical bytes to an SQ phase.
+///
+/// # Parameters
+///
+/// - `cache`: Optional shared disk cache.
+/// - `store`: Authoritative object-store reader used after a miss.
+/// - `key`: Immutable object key.
+/// - `stats`: Optional query-local counters.
+/// - `phase`: Bucket charged when a network GET occurs.
+///
+/// # Returns
+///
+/// Shared immutable complete-object bytes.
+///
+/// # Errors
+///
+/// Propagates cache or object-store failures. Failed reads are not counted as
+/// successful GET bytes.
+///
+/// # Side Effects
+///
+/// May fill the cache and update diagnostic atomics. A cache hit records local
+/// bytes; only the closure that actually fetches S3 records a physical GET.
+///
+/// # Performance
+///
+/// The explicit `get` makes local-byte accounting possible. On a race after a
+/// miss, `get_or_fetch` still single-flights the authoritative read.
+///
+/// # Examples
+///
+/// Loading an SQ calibration sidecar after a cold miss records one `Other` GET;
+/// the next query's cache hit records local bytes instead.
 async fn fetch_with_cache_counted(
     cache: Option<&Arc<DiskCache>>,
     store: &ZeppelinStore,
@@ -279,6 +659,44 @@ async fn fetch_with_cache_counted(
     }
 }
 
+/// Checks whether a validated local full object can satisfy a range request.
+///
+/// # Parameters
+///
+/// - `cache`: Optional complete-object cache.
+/// - `key`: Immutable object key.
+/// - `size_bytes`: Manifest-declared full length, or zero for legacy metadata
+///   that cannot validate exact length.
+/// - `needed_end`: Exclusive absolute end offset the cached value must contain.
+/// - `phase`: Metrics label such as `flat`, `sq`, `rerank`, or `header`.
+/// - `range_count`: Logical physical-range count credited to the selected source.
+///
+/// # Returns
+///
+/// [`RangeCacheLookup::Local`] with the complete cached value when usable,
+/// [`RangeCacheLookup::Miss`] when S3 should be consulted, or
+/// [`RangeCacheLookup::CorruptEvicted`] after removing a wrong-length value.
+///
+/// # Errors
+///
+/// Returns an error if cache lookup or invalidation fails. A corrupt value is
+/// never returned to the parser.
+///
+/// # Side Effects
+///
+/// May evict the cache key, log a corruption error, and increment range-source
+/// metrics. It performs no object-store request itself.
+///
+/// # Consistency
+///
+/// When a manifest size is available, exact length validation protects range
+/// offsets from a truncated or unrelated cache value. Object storage remains
+/// the recovery source after eviction.
+///
+/// # Examples
+///
+/// A manifest says an object is 64 KiB but the cache contains 40 KiB. This
+/// helper evicts it and returns `CorruptEvicted`; the caller then reads S3.
 async fn cached_full_object_for_range(
     cache: Option<&Arc<DiskCache>>,
     key: &str,
@@ -329,6 +747,35 @@ async fn cached_full_object_for_range(
     Ok(RangeCacheLookup::Miss)
 }
 
+/// Resolves one logical cluster to its physical immutable data object.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment metadata, including carried-over owners and any
+///   manifest-defined grouped objects.
+/// - `cluster_idx`: Logical centroid/cluster index.
+///
+/// # Returns
+///
+/// An owned fetch descriptor. Legacy layouts synthesize a one-cluster key;
+/// grouped layouts clone the manifest key, membership, size, and live range.
+///
+/// # Errors
+///
+/// Returns an index error for an invalid manifest lookup or live range. A live
+/// range beginning after byte zero is rejected because flat parsing expects a
+/// self-contained object prefix.
+///
+/// # Consistency
+///
+/// Per-cluster keys always use [`IvfFlatIndex::cluster_owner`], preserving
+/// incremental-compaction ownership. Manifest object membership is not guessed.
+///
+/// # Examples
+///
+/// Logical clusters 4 and 5 may both resolve to
+/// `segments/seg-9/cluster_group_2.bin`; a legacy cluster 4 resolves to its own
+/// key under the segment that owns that carried-over cluster.
 fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<ClusterFetchObject> {
     if let Some(object_ref) = index.cluster_object(cluster_idx)? {
         let live_range = object_ref.live_range()?;
@@ -358,6 +805,41 @@ fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<Clus
     })
 }
 
+/// Fetches bytes needed to flat-scan one physical cluster object.
+///
+/// # Parameters
+///
+/// - `cache`: Optional full-object cache.
+/// - `store`: Authoritative object-store reader.
+/// - `object`: Resolved object descriptor.
+/// - `use_live_range`: Whether an advertised self-contained live prefix may be
+///   read instead of the complete object.
+///
+/// # Returns
+///
+/// Bytes parseable as the complete legacy/grouped object view expected by the
+/// flat scanner. A cached full object may be sliced to its live prefix.
+///
+/// # Errors
+///
+/// Propagates cache validation and S3 full/range GET failures.
+///
+/// # Side Effects
+///
+/// May issue one range GET or one complete-object GET, populate the cache on the
+/// full path, and increment range-source metrics.
+///
+/// # Performance
+///
+/// A live-range read avoids trailing dead bytes for sketch-selected,
+/// unfiltered flat scans. Filtered queries and unsupported layouts read the
+/// complete object.
+///
+/// # Examples
+///
+/// If a 20 MiB immutable object advertises a 12 MiB live prefix, an unfiltered
+/// sketch query can request `0..12 MiB`; a valid cached 20 MiB object supplies
+/// the same bytes without S3.
 async fn fetch_cluster_object_for_flat_scan(
     cache: Option<&Arc<DiskCache>>,
     store: &ZeppelinStore,
@@ -392,6 +874,26 @@ async fn fetch_cluster_object_for_flat_scan(
     fetch_with_cache(cache, store, &object.key).await
 }
 
+/// Deduplicates physical objects for a list of logical clusters.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment layout.
+/// - `clusters`: Logical cluster indexes in desired traversal order.
+///
+/// # Returns
+///
+/// Owned object descriptors ordered by the first cluster that references each
+/// key. Multiple clusters in one grouped object produce one descriptor.
+///
+/// # Errors
+///
+/// Propagates invalid manifest lookups or live-range metadata.
+///
+/// # Examples
+///
+/// Clusters `[0, 1, 3]` where 0 and 1 share object A and 3 uses object B return
+/// `[A, B]`, predicting two object reads rather than three.
 fn cluster_fetch_objects(
     index: &IvfFlatIndex,
     clusters: &[usize],
@@ -407,6 +909,26 @@ fn cluster_fetch_objects(
     Ok(objects)
 }
 
+/// Expands selected logical clusters to every cluster in each touched object.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment layout.
+/// - `clusters`: Initially selected logical clusters.
+///
+/// # Returns
+///
+/// Deduplicated logical indexes in physical-object order. This ensures a
+/// fetched grouped object is parsed consistently as a whole.
+///
+/// # Errors
+///
+/// Propagates malformed object mappings.
+///
+/// # Examples
+///
+/// Selecting cluster 0 from an object containing `[0, 1]` expands the scan set
+/// to `[0, 1]`; no second GET is needed to include cluster 1.
 fn expand_clusters_to_objects(index: &IvfFlatIndex, clusters: &[usize]) -> Result<Vec<usize>> {
     let mut expanded = Vec::new();
     let mut seen_clusters = HashSet::new();
@@ -420,6 +942,24 @@ fn expand_clusters_to_objects(index: &IvfFlatIndex, clusters: &[usize]) -> Resul
     Ok(expanded)
 }
 
+/// Optionally emits sketch scan cardinalities for one query.
+///
+/// # Parameters
+///
+/// - `effective_nprobe`: Probe count after centroid-count clamping.
+/// - `objects`: Distinct physical objects selected.
+/// - `clusters`: Logical clusters covered by those objects.
+/// - `grouped`: Whether manifest-defined grouped layout was active.
+///
+/// # Side Effects
+///
+/// Writes one line to standard error only when
+/// `ZEPPELIN_SKETCH_SCAN_STATS` is present.
+///
+/// # Examples
+///
+/// `nprobe=16`, `objects=5`, and `clusters=12` makes the sketch and grouping
+/// reduction visible without changing the result path.
 fn emit_scan_stats(effective_nprobe: usize, objects: usize, clusters: usize, grouped: bool) {
     if std::env::var_os(SKETCH_SCAN_STATS_ENV).is_some() {
         eprintln!(
@@ -428,20 +968,114 @@ fn emit_scan_stats(effective_nprobe: usize, objects: usize, clusters: usize, gro
     }
 }
 
-/// Execute an IVF-Flat search against the stored index.
+/// Searches one loaded immutable IVF-Flat segment and returns exact-distance winners.
 ///
-/// # Arguments
-/// * `index`    - The in-memory index handle (centroids + metadata).
-/// * `query`    - The query vector.
-/// * `top_k`    - Number of results to return.
-/// * `nprobe`   - Number of clusters to probe.
-/// * `filter`   - Optional post-filter.
-/// * `distance_metric` - Distance metric for ranking.
-/// * `store`    - S3 store for reading cluster data.
-/// * `oversample_factor` - Oversampling multiplier when filters are active.
-/// * `cache`    - Optional disk cache for cluster data.
-/// * `include_attributes` - Whether result attributes should be returned.
-/// * `rerank_coalesce_gap_bytes` - Max gap between rerank vector ranges to coalesce.
+/// Centroids choose at most `nprobe` nearby logical clusters. An optional
+/// resident sketch may reduce the unfiltered physical scan, after which the
+/// selected quantization strategy either scores full vectors directly or uses
+/// compact codes to choose a larger exact-rerank frontier. Filtering and result
+/// attribute projection are kept separate: filtered queries load attributes for
+/// correctness, while unfiltered queries load them only for final winners when
+/// requested.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment handle containing trusted centroid, object-layout,
+///   quantization, and optional resident-sketch metadata.
+/// - `query`: Borrowed full-precision query. Its length must equal `index.dim`.
+/// - `top_k`: Maximum results requested. Zero returns an empty result after
+///   dimension validation.
+/// - `nprobe`: Maximum nearest centroid clusters considered. Values above the
+///   cluster count are clamped; zero examines no cluster.
+/// - `filter`: Optional metadata predicate. A matching row must have suitable
+///   attributes unless the filter's exact semantics allow a missing field.
+/// - `distance_metric`: Metric used for centroid ranking and exact row scores.
+/// - `store`: Zeppelin's object-store abstraction for immutable segment reads.
+/// - `oversample_factor`: Multiplier for the candidate target when a filter is
+///   present; factor zero still preserves at least `top_k`.
+/// - `cache`: Optional shared disk cache for immutable objects and layouts.
+/// - `include_attributes`: Whether returned results retain attribute maps.
+/// - `rerank_coalesce_gap_bytes`: Exclusive maximum gap that SQ exact-vector
+///   ranges may bridge to reduce request count. A gap equal to this value stays
+///   separate.
+///
+/// # Returns
+///
+/// Up to `top_k` owned [`SearchResult`] values ordered by ascending exact
+/// distance and deterministic ID tie breaking. Fewer results mean the segment
+/// has fewer surviving candidates; an empty vector is valid for zero probes,
+/// zero `top_k`, an empty segment, or a filter with no matches.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::DimensionMismatch`] when the query width differs
+/// from the index. Returns storage, cache, or index errors for missing immutable
+/// objects, failed GETs, malformed quantization/calibration/layout/cluster data,
+/// manifest-to-object layout disagreement, invalid range arithmetic, or row
+/// metadata missing during enrichment. Completed reads and cache fills may have
+/// occurred before a later parallel phase fails; this read-only operation never
+/// publishes partial segment state.
+///
+/// # Panics
+///
+/// The loaded index must preserve its build-time invariants: every centroid and
+/// decoded full vector has `index.dim` components, and aligned ID/code/vector
+/// arrays have matching row counts. Violating those internal invariants can
+/// panic in distance or indexed row access. In debug builds, an extremely large
+/// filtered `top_k` can also panic when the quantized rerank factor multiplies
+/// the saturated fetch target by four.
+///
+/// # Side Effects
+///
+/// Performs cache lookups and object-store full/range GETs, may populate or
+/// invalidate local cache entries, updates range-source metrics, and writes
+/// tracing or opt-in diagnostic events. It does not upload, delete, or mutate
+/// any segment, WAL, or manifest object.
+///
+/// # Consistency
+///
+/// The caller constructs `index` from an authoritative manifest snapshot.
+/// This function reads only objects named by that snapshot or deterministic
+/// legacy keys. Cached segment objects are safe because the keys are immutable;
+/// cache state cannot add a cluster or change visibility. Exact full vectors,
+/// not SQ/PQ/sketch scores, determine returned scores.
+///
+/// # Performance
+///
+/// Centroid ranking costs `O(cluster_count * dim)` CPU and a full centroid sort.
+/// The remaining cost depends on `nprobe`, resident-sketch selection, grouping,
+/// filter metadata, and quantization. Independent object reads are polled in
+/// parallel. Flat scan computes one exact distance per visited row. SQ/PQ scan
+/// scores all visited compact codes, retains at most roughly `4 * fetch_k`, and
+/// rereads only those full vectors when current layout metadata permits ranges.
+/// Request coalescing trades extra gap bytes for fewer range GETs.
+///
+/// # Examples
+///
+/// ```text
+/// loaded segment: 64 clusters, grouped two per object, SQ8 enabled
+/// request: top_k=10, nprobe=8, filter=color == "red", oversample=3
+///
+/// 1. rank 64 resident centroids and choose 8 clusters
+/// 2. keep all touched grouped clusters because filters bypass sketch pruning
+/// 3. load SQ codes plus bitmap/attributes and discard non-red rows
+/// 4. retain an approximate frontier for fetch_k=30, then exact-rerank it
+/// 5. return at most 10 red rows ordered by full-vector distance
+/// ```
+///
+/// With `include_attributes=false`, the IDs and distances are unchanged, but
+/// unfiltered winners avoid the final attribute-object reads.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The function borrows `index`, `query`, `store`, `filter`, and `cache`; it
+/// cannot free or retain those values beyond the returned future's lifetime.
+/// This resembles Java object references or C `const` pointers, but Rust also
+/// proves non-null validity and prevents mutation through these shared borrows.
+/// The `match` on [`QuantizationType`] is exhaustive, so adding a strategy forces
+/// this dispatch to be updated. `?` returns the first error while RAII drops all
+/// partially built vectors and maps; it is ordinary typed control flow, not a
+/// Java exception or C `goto cleanup` path.
 #[allow(clippy::too_many_arguments)]
 pub async fn search_ivf_flat(
     index: &IvfFlatIndex,
@@ -628,6 +1262,50 @@ pub async fn search_ivf_flat(
     Ok(results)
 }
 
+/// Chooses logical clusters whose physical objects proceed to vector scanning.
+///
+/// The centroid probe set decides which physical objects are eligible to be
+/// touched. Without a resident sketch—or whenever a metadata filter is
+/// present—the function keeps every touched object and expands grouped
+/// membership, so a physical sibling outside the original centroid set may also
+/// be scanned. Unfiltered queries may use resident PQ evidence to spend fewer
+/// object reads. Grouped layouts select whole objects rather than pretending a
+/// partial object saves a GET.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment and optional resident sketch.
+/// - `query`: Full-precision query already checked against `index.dim`.
+/// - `distance_metric`: Metric used to score resident sketch codes.
+/// - `filter`: Present when exact attribute semantics must preserve the full
+///   centroid probe set.
+/// - `probe_clusters`: Nearest centroid indexes in centroid-distance order.
+/// - `effective_nprobe`: Probe count after clamping; used to derive budgets.
+/// - `retrieval_top_k`: Candidate-window size used to estimate sketch mass.
+///
+/// # Returns
+///
+/// Logical cluster indexes to scan. The result can include siblings from a
+/// grouped object that were not individually in `probe_clusters`, because the
+/// physical GET already covers them.
+///
+/// # Errors
+///
+/// Returns index errors for malformed object mappings, invalid sketch inputs or
+/// budgets, and empty grouped-object selections. No object-store I/O occurs.
+///
+/// # Performance
+///
+/// The no-sketch/filter path performs metadata lookups only. Sketch paths build
+/// ADC tables and scan resident compact codes for the probed clusters, trading
+/// CPU for fewer downstream object reads.
+///
+/// # Examples
+///
+/// If centroid probing selects clusters `[2, 7, 8, 9]` and the sketch finds
+/// most approximate top-row mass in 7 and 8, an ungrouped segment may scan
+/// `[7, 8]`. If 7 shares an object with 6, the grouped result includes both 7
+/// and 6 because fetching only 7 would not save bytes or requests.
 fn select_scan_clusters(
     index: &IvfFlatIndex,
     query: &[f32],
@@ -684,18 +1362,64 @@ fn select_scan_clusters(
     )
 }
 
+/// Object-aware sketch selection returned to the scan dispatcher.
 struct SelectedObjectClusters {
+    /// Logical clusters covered by selected whole physical objects.
     clusters: Vec<usize>,
+    /// Distinct physical objects represented by `clusters`.
     object_count: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Adaptive physical-object limits derived from grouping arity and query shape.
+///
+/// The value is `Copy`: passing it duplicates three scalar fields and allocates
+/// nothing, similar to a small C struct passed by value.
 struct AdaptiveObjectBudget {
+    /// Minimum selected objects before distance margin may stop expansion.
     floor_objects: usize,
+    /// Hard upper bound on selected physical objects.
     max_objects: usize,
+    /// Fractional distance slack relative to the best sketch score.
     relative_score_margin: f32,
 }
 
+/// Selects whole grouped objects from resident-sketch cluster rankings.
+///
+/// Selection first establishes a close-distance core, then favors objects that
+/// cover more global approximate top-row mass while remaining within a
+/// query-relative score cutoff. Every chosen object's complete manifest cluster
+/// membership enters the scan set.
+///
+/// # Parameters
+///
+/// - `index`: Segment with manifest-defined grouped-object mappings.
+/// - `ranked_clusters`: Non-empty sketch scores ordered best first.
+/// - `effective_nprobe`: Clamped centroid probe count used to derive read caps.
+///
+/// # Returns
+///
+/// Selected logical clusters and the corresponding physical object count.
+/// Cluster order follows object selection and each object's manifest membership.
+///
+/// # Errors
+///
+/// Returns an index error when rankings are empty, mappings are invalid, or the
+/// policy cannot produce any cluster. It fails loudly rather than reverting to
+/// an unbounded scan.
+///
+/// # Performance
+///
+/// Builds cluster-score/rank maps and repeatedly scores unselected candidate
+/// objects. With `o` objects and budget `b`, selection is approximately
+/// `O(o * b * average_clusters_per_object)` and performs no I/O.
+///
+/// # Examples
+///
+/// Suppose object A contains two close clusters with moderate mass and object B
+/// contains four slightly farther clusters holding most approximate top rows.
+/// The core can select A first, then mass expansion can admit B if its best
+/// score remains inside the relative cutoff.
 fn select_grouped_object_clusters(
     index: &IvfFlatIndex,
     ranked_clusters: &[ClusterScore],
@@ -779,19 +1503,48 @@ fn select_grouped_object_clusters(
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Query-local score assigned to one candidate physical object.
 struct ObjectCandidateScore {
+    /// Position in the temporary `object_candidates` vector.
     object_idx: usize,
+    /// Global approximate top-row mass not already covered by selected objects.
     mass_count: usize,
+    /// Best lower-is-better sketch distance among uncovered member clusters.
     aggregate_score: f32,
+    /// Best original sketch rank among uncovered member clusters.
     best_rank: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Tie-breaking policy for the two grouped-object selection phases.
 enum ObjectCandidateRanking {
+    /// Prefer the closest object, then uncovered mass, then stable object order.
     DistanceCore,
+    /// Prefer uncovered mass, then distance, sketch rank, and stable order.
     MassExpansion,
 }
 
+/// Finds the best remaining physical object under one selection policy.
+///
+/// # Parameters
+///
+/// - `object_candidates`: Manifest-resolved objects under consideration.
+/// - `score_by_cluster`: Resident-sketch evidence keyed by logical cluster.
+/// - `rank_by_cluster`: Original sketch ordering used for deterministic ties.
+/// - `covered_clusters`: Clusters already obtained through selected objects.
+/// - `selected_object_idxs`: Candidate positions already chosen.
+/// - `ranking`: Distance-core or mass-expansion ordering.
+/// - `distance_cutoff`: Largest acceptable best-cluster score during expansion.
+///
+/// # Returns
+///
+/// The best unselected object score, or `None` when none remains or all
+/// mass-expansion candidates exceed the cutoff.
+///
+/// # Examples
+///
+/// After object A covers clusters 0 and 1, scoring object B ignores any already
+/// covered members and can return B if it contributes the best remaining mass.
 fn best_object_candidate(
     object_candidates: &[ClusterFetchObject],
     score_by_cluster: &HashMap<usize, ClusterScore>,
@@ -828,6 +1581,25 @@ fn best_object_candidate(
     best
 }
 
+/// Aggregates uncovered sketch evidence for one physical object.
+///
+/// # Parameters
+///
+/// - `object_idx`: Stable temporary object position.
+/// - `object`: Physical object and its logical memberships.
+/// - `score_by_cluster`: Scores for clusters participating in this query.
+/// - `rank_by_cluster`: Query-local sketch ranks.
+/// - `covered_clusters`: Membership already supplied by selected objects.
+///
+/// # Returns
+///
+/// A score containing summed uncovered mass, best uncovered distance, and best
+/// rank. Clusters absent from this query's ranking contribute nothing.
+///
+/// # Examples
+///
+/// An object with uncovered cluster masses 3 and 5 receives mass 8 and keeps
+/// the smaller of their two aggregate distances.
 fn score_object_candidate(
     object_idx: usize,
     object: &ClusterFetchObject,
@@ -866,6 +1638,24 @@ fn score_object_candidate(
     }
 }
 
+/// Applies deterministic ordering between two grouped-object scores.
+///
+/// # Parameters
+///
+/// - `candidate`: Newly scored object.
+/// - `best`: Current winner.
+/// - `ranking`: Phase-specific precedence rules.
+///
+/// # Returns
+///
+/// `true` when `candidate` should replace `best`. Stable object position is the
+/// final tie breaker.
+///
+/// # Examples
+///
+/// In the core phase, distance `0.2` beats `0.3` even with less mass. In mass
+/// expansion, mass 10 beats mass 8 as long as the caller already enforced the
+/// distance cutoff.
 fn object_candidate_better(
     candidate: &ObjectCandidateScore,
     best: &ObjectCandidateScore,
@@ -892,6 +1682,22 @@ fn object_candidate_better(
     }
 }
 
+/// Derives grouped-object floors, caps, and score margin for one query.
+///
+/// # Parameters
+///
+/// - `index`: Segment whose largest grouped-object arity shapes the policy.
+/// - `effective_nprobe`: Clamped centroid probe count.
+///
+/// # Returns
+///
+/// A scalar budget. Thin objects use a larger floor and tighter margin; dense
+/// grouping uses the normal floor because each GET already covers more clusters.
+///
+/// # Examples
+///
+/// A layout with at most two clusters per object is “thin” and retains up to a
+/// five-object floor when the computed cap permits it.
 fn adaptive_object_budget(index: &IvfFlatIndex, effective_nprobe: usize) -> AdaptiveObjectBudget {
     let max_arity = max_cluster_object_arity(index);
     let max_objects = grouped_object_cap_for_arity(max_arity, effective_nprobe);
@@ -913,6 +1719,19 @@ fn adaptive_object_budget(index: &IvfFlatIndex, effective_nprobe: usize) -> Adap
     }
 }
 
+/// Reports the largest number of logical clusters stored in one physical object.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment layout.
+///
+/// # Returns
+///
+/// At least one. Legacy and empty mappings are treated as one cluster per object.
+///
+/// # Examples
+///
+/// Object memberships of `[0, 1]` and `[2, 3, 4, 5]` yield arity four.
 fn max_cluster_object_arity(index: &IvfFlatIndex) -> usize {
     index
         .cluster_objects
@@ -922,6 +1741,29 @@ fn max_cluster_object_arity(index: &IvfFlatIndex) -> usize {
         .unwrap_or(1)
 }
 
+/// Converts a cluster scan cap into a physical-object cap for grouping arity.
+///
+/// # Parameters
+///
+/// - `max_arity`: Maximum clusters carried by one object; callers pass at least
+///   one.
+/// - `effective_nprobe`: Clamped centroid probe count.
+///
+/// # Returns
+///
+/// A cap bounded by the historical pair-object budget and a small floor. When
+/// the adaptive cluster cap already covers every probe, this returns the full
+/// probe count so sketch pruning becomes a structural no-op.
+///
+/// # Panics
+///
+/// Panics if `max_arity` is zero because integer ceiling division requires a
+/// nonzero divisor. [`max_cluster_object_arity`] guarantees at least one.
+///
+/// # Examples
+///
+/// With arity four and `nprobe=16`, the current policy caps selection at six
+/// objects; at `nprobe=128`, the no-pruning sentinel allows all 128.
 fn grouped_object_cap_for_arity(max_arity: usize, effective_nprobe: usize) -> usize {
     let cluster_cap = sketch_adaptive_cluster_cap(effective_nprobe);
     if cluster_cap >= effective_nprobe {
@@ -936,6 +1778,21 @@ fn grouped_object_cap_for_arity(max_arity: usize, effective_nprobe: usize) -> us
     }
 }
 
+/// Builds the cluster budget used by resident-sketch selection.
+///
+/// # Parameters
+///
+/// - `effective_nprobe`: Clamped centroid probe count.
+///
+/// # Returns
+///
+/// A budget whose floor and cap never exceed the available probes, with a 13%
+/// relative score margin. Zero probes produce a zero budget, but the caller's
+/// no-scan branch returns before asking the sketch to validate or use it.
+///
+/// # Examples
+///
+/// `nprobe=16` produces a cap of 14, while `nprobe=8` keeps all eight probes.
 fn adaptive_sketch_budget(effective_nprobe: usize) -> AdaptiveClusterBudget {
     let max_clusters = sketch_adaptive_cluster_cap(effective_nprobe);
     AdaptiveClusterBudget::new(
@@ -945,12 +1802,40 @@ fn adaptive_sketch_budget(effective_nprobe: usize) -> AdaptiveClusterBudget {
     )
 }
 
+/// Computes the hard adaptive cluster cap for a probe count.
+///
+/// # Parameters
+///
+/// - `effective_nprobe`: Available centroid probes.
+///
+/// # Returns
+///
+/// Twice the historical smooth budget, clamped to `effective_nprobe`.
+///
+/// # Examples
+///
+/// A small probe set can return its full size, deliberately disabling pruning.
 fn sketch_adaptive_cluster_cap(effective_nprobe: usize) -> usize {
     sketch_base_cluster_budget(effective_nprobe)
         .saturating_mul(SKETCH_ADAPTIVE_MAX_MULTIPLIER)
         .min(effective_nprobe)
 }
 
+/// Evaluates the monotonic historical sketch budget curve.
+///
+/// # Parameters
+///
+/// - `effective_nprobe`: Available centroid probes.
+///
+/// # Returns
+///
+/// The ceiling of a linear-plus-quadratic curve, floored at six and clamped to
+/// `effective_nprobe`.
+///
+/// # Examples
+///
+/// At high probe counts the quadratic term grows the budget until the final
+/// clamp makes a sentinel run scan every probe.
 fn sketch_base_cluster_budget(effective_nprobe: usize) -> usize {
     let nprobe = effective_nprobe as f32;
     ((nprobe * SKETCH_CLUSTER_LINEAR_FRACTION + (nprobe * nprobe / SKETCH_CLUSTER_QUADRATIC_SCALE))
@@ -959,7 +1844,63 @@ fn sketch_base_cluster_budget(effective_nprobe: usize) -> usize {
         .min(effective_nprobe)
 }
 
-/// Scan clusters using full-precision vectors (no quantization).
+/// Scans selected cluster objects and scores every surviving full vector exactly.
+///
+/// This is the unquantized path. Physical object fetches are concurrent across
+/// selected objects. For each fetched object, bitmap and optional attribute
+/// metadata for its member clusters are then fetched concurrently before a
+/// sequential CPU pass parses rows, applies bitmap membership, and computes
+/// exact distances.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment layout and bitmap-field metadata.
+/// - `probe_clusters`: Logical clusters selected for this physical scan.
+/// - `query`: Validated full-precision query.
+/// - `distance_metric`: Exact row scoring policy.
+/// - `filter`: Optional predicate. Its attributes are loaded for final exact
+///   evaluation by the dispatcher; a bitmap can skip impossible rows early.
+/// - `store`: Authoritative object-store reader.
+/// - `cache`: Optional shared complete-object cache.
+/// - `use_live_range`: Whether a self-contained live object prefix may replace
+///   a complete GET.
+///
+/// # Returns
+///
+/// One owned [`Candidate`] per visited row allowed by the bitmap prefilter.
+/// Ordering follows selected physical objects, manifest cluster membership, and
+/// persisted row order; the caller performs top-k ordering.
+///
+/// # Errors
+///
+/// Propagates layout resolution, cache, object-store, bitmap-independent
+/// attribute, and cluster decode errors. It also rejects grouped bytes under a
+/// legacy key or cluster metadata inconsistent with the object membership.
+///
+/// # Side Effects
+///
+/// Performs object, bitmap, and possibly attribute GETs, may fill the cache, and
+/// updates range-source metrics. No artifact is changed.
+///
+/// # Performance
+///
+/// Reads each distinct grouped object once and computes `O(rows * dim)` exact
+/// distance work. It retains all scanned candidates until the dispatcher applies
+/// top-k, so memory is proportional to surviving rows. Bitmap membership can
+/// avoid vector scoring but not the full cluster-object read.
+///
+/// # Examples
+///
+/// Two selected logical clusters sharing one grouped object cause one data GET.
+/// A bitmap that admits rows 2 and 9 makes only those rows candidates, but their
+/// exact attributes are still available for final filter verification.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `join_all` owns a collection of async blocks that borrow the immutable index,
+/// store, and cache. It provides concurrency without OS threads or detached
+/// tasks. Once I/O finishes, the loop owns decoded clusters and moves owned IDs
+/// into candidates while cloning only attributes that may outlive the decode.
 #[allow(clippy::too_many_arguments)]
 async fn scan_clusters_flat(
     index: &IvfFlatIndex,
@@ -1055,8 +1996,97 @@ async fn scan_clusters_flat(
     Ok(candidates)
 }
 
-/// Scan clusters using SQ8 quantized distances, then rerank top candidates
-/// with full-precision vectors.
+/// Uses SQ8 for coarse row ranking and full vectors for exact reranking.
+///
+/// Scalar quantization stores one calibrated byte per vector component. The
+/// query remains full precision while
+/// [`SqCalibration::asymmetric_distance`](crate::index::quantization::sq::SqCalibration::asymmetric_distance)
+/// scores compact rows. Only a bounded frontier is then read and rescored from
+/// full-precision vector bytes, so approximation affects recall and I/O but
+/// never the returned distance value.
+///
+/// ```text
+/// embedded calibration or legacy sidecar
+///                  |
+///                  v
+/// fetch SQ blocks for selected objects
+///                  |
+///                  v
+/// bitmap / exact attribute filter before truncation
+///                  |
+///                  v
+/// retain at most 4 * fetch_k approximate rows
+///                  |
+///          +-------+------------------+
+///          | current ranged layout    | legacy / cached full object
+///          v                          v
+/// coalesce full-vector ranges       parse full clusters
+///          +-------------+------------+
+///                        v
+///                 exact distance
+/// ```
+///
+/// # Parameters
+///
+/// - `index`: Loaded SQ segment, calibration metadata, and object layout.
+/// - `probe_clusters`: Logical clusters selected for SQ scanning.
+/// - `query`: Validated full-precision query.
+/// - `distance_metric`: Metric used by both approximate and exact phases.
+/// - `filter`: Optional predicate applied before coarse truncation.
+/// - `fetch_k`: Candidate target after filter oversampling.
+/// - `store`: Authoritative object-store reader.
+/// - `cache`: Optional full-object and decoded-layout cache.
+/// - `byte_stats`: Optional shared query-local diagnostic counters.
+/// - `rerank_coalesce_gap_bytes`: Exclusive gap threshold for merging adjacent
+///   exact-vector range requests.
+///
+/// # Returns
+///
+/// Exact-distance [`Candidate`] values for the retained rerank frontier. The
+/// caller sorts, rechecks a filter when present, and truncates to `top_k`.
+///
+/// # Errors
+///
+/// Returns storage, cache, calibration, layout, range, SQ decode, attribute, or
+/// full-vector decode errors. Duplicate/missing cluster payload or metadata is
+/// treated as corruption. Parallel reads may already have filled cache entries
+/// before a sibling error is observed.
+///
+/// # Panics
+///
+/// Internal artifacts must keep SQ IDs, codes, calibration dimensions, and row
+/// metadata aligned. Debug builds also panic if `fetch_k * 4` overflows.
+///
+/// # Side Effects
+///
+/// Issues supporting, SQ, bitmap, attribute, header, and exact-vector GETs; may
+/// populate or invalidate caches; updates metrics and optional byte counters.
+/// It does not modify the immutable segment.
+///
+/// # Performance
+///
+/// Coarse scoring costs `O(selected_rows * dim)` over one-byte codes. Current v4
+/// grouped objects can use one contiguous SQ range per object and coalesced
+/// exact-vector ranges; legacy objects may require full-object or sidecar GETs.
+/// The rerank frontier is at most four times `fetch_k`, subject to available
+/// filter matches.
+///
+/// # Examples
+///
+/// For `top_k=10` with a filter and oversampled `fetch_k=30`, a 2,000-row SQ
+/// scan first removes nonmatching rows, retains at most 120 approximate matches,
+/// fetches their full vectors, and returns exact candidates for final top ten.
+/// Filtering before the 120-row cutoff prevents selective matches from being
+/// displaced by better approximate scores that would later fail the predicate.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Each async fetch receives a cheap clone of `Arc<SqSearchByteStats>`, so all
+/// futures update one counter set. Candidate maps own IDs and ranges across the
+/// `.await` boundary; borrowed references into temporary decoded SQ buffers
+/// could not legally survive there. Rust enforces that lifetime distinction at
+/// compile time, whereas Java relies on heap reachability and C on manual buffer
+/// lifetime discipline.
 #[allow(clippy::too_many_arguments)]
 async fn scan_clusters_sq(
     index: &IvfFlatIndex,
@@ -1321,45 +2351,114 @@ async fn scan_clusters_sq(
     Ok(candidates)
 }
 
+/// SQ coarse payloads and rerank metadata recovered from one physical object.
 struct CoarseObjectSqFetch {
+    /// Immutable object key used to associate a prefetched full object.
     object_key: String,
+    /// Decoded compact rows keyed by logical cluster.
     sq_clusters: Vec<(usize, crate::index::quantization::sq::SqClusterData)>,
+    /// Absolute full-vector byte ranges aligned with each cluster's SQ IDs.
     vector_ranges: Vec<(usize, Vec<Range<usize>>)>,
+    /// Complete bytes retained when a compatibility path had to download them.
     full_object: Option<bytes::Bytes>,
 }
 
 #[derive(Clone)]
+/// One SQ coarse winner that must be recovered at full precision.
+///
+/// Cloning duplicates the ID string and optional range; it is used to build
+/// owned requests that safely cross async range fetches.
 struct RerankNeed {
+    /// Vector identifier recorded by the SQ payload.
     id: String,
+    /// Original row position used for attribute alignment.
     row_idx: usize,
+    /// Absolute full-vector byte range when current layout metadata provides it.
     vector_range: Option<Range<usize>>,
 }
 
+/// One logical exact-vector range request before physical coalescing.
 struct RerankRangeRequest {
+    /// Logical cluster owning the row.
     cluster_idx: usize,
+    /// Owned identity and row metadata.
     need: RerankNeed,
+    /// Absolute vector-only byte range in the grouped object.
     range: Range<usize>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
+/// One physical range GET that covers one or more logical rerank requests.
 struct CoalescedRerankRange {
+    /// Absolute merged byte span.
     range: Range<usize>,
+    /// Positions in the original request vector recovered from this span.
     request_indices: Vec<usize>,
 }
 
+/// Full-precision row reconstructed for exact distance calculation.
 struct RerankFetchedVector {
+    /// Logical cluster owning the row.
     cluster_idx: usize,
+    /// Owned vector identifier.
     id: String,
+    /// Row position retained for attribute lookup.
     row_idx: usize,
+    /// Owned full-precision components parsed or cloned from the object.
     vector: Vec<f32>,
 }
 
-/// Fetch SQ coarse data for every selected cluster in one physical object.
+/// Fetches SQ coarse data for every selected cluster in one physical object.
 ///
 /// v4 grouped objects expose a contiguous SQ block, so the hot path reads one
 /// range per selected object and never downloads full vectors during coarse
 /// scoring. Legacy grouped/per-cluster objects keep the old full-object or
 /// sidecar behavior so existing immutable data remains readable.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment metadata and vector dimension.
+/// - `object`: Physical object and logical clusters selected from it.
+/// - `prefer_colocated`: Whether embedded calibration indicates the newer
+///   colocated SQ layout should be attempted.
+/// - `store`: Authoritative object-store reader.
+/// - `cache`: Optional full-object and decoded-layout cache.
+/// - `stats`: Optional query-local byte counters.
+///
+/// # Returns
+///
+/// Decoded SQ rows for every object cluster, plus absolute full-vector ranges
+/// when a v4 directory describes them. A compatibility full-object download is
+/// retained so exact rerank can reuse it without a second GET.
+///
+/// # Errors
+///
+/// Propagates storage, cache, header, layout, range, and SQ decode failures.
+/// Current layouts with an SQ directory must describe every selected cluster;
+/// inconsistent sections fail rather than silently reading a sidecar.
+///
+/// # Side Effects
+///
+/// May perform one SQ range GET, one full-object GET, or one sidecar GET per
+/// legacy cluster, and may populate caches and diagnostics.
+///
+/// # Consistency
+///
+/// Compatibility branches read immutable formats already named by the loaded
+/// segment. They do not infer new visibility or rewrite old artifacts.
+///
+/// # Performance
+///
+/// The current v4 path reads one contiguous range per grouped object. A legacy
+/// object can require the complete object plus sidecars for member clusters that
+/// do not contain colocated codes.
+///
+/// # Examples
+///
+/// A v4 object containing clusters 4 and 5 returns two decoded code arrays and
+/// two row-aligned vector-range tables from one SQ span. A legacy object with
+/// external codes performs separate sidecar reads but returns the same logical
+/// cluster payloads.
 async fn load_sq_object_for_coarse(
     index: &IvfFlatIndex,
     object: &ClusterFetchObject,
@@ -1479,11 +2578,52 @@ async fn load_sq_object_for_coarse(
     })
 }
 
+/// Bytes fetched for one absolute object span plus their origin offset.
 struct RangeBytes {
+    /// Absolute object offset corresponding to `bytes[0]`.
     base_offset: usize,
+    /// Immutable range payload, possibly sliced from a complete cached object.
     bytes: bytes::Bytes,
 }
 
+/// Fetches the smallest contiguous span covering selected SQ sections.
+///
+/// # Parameters
+///
+/// - `object_key`: Immutable grouped-object key.
+/// - `object_size_bytes`: Manifest-declared full length used to validate cache.
+/// - `layout`: Validated decoded object directory.
+/// - `clusters`: Logical cluster sections to include.
+/// - `store`: Authoritative range reader.
+/// - `cache`: Optional complete-object cache.
+/// - `stats`: Optional byte counters.
+///
+/// # Returns
+///
+/// The contiguous bytes from the minimum SQ start through maximum SQ end, plus
+/// that absolute starting offset. Gaps between requested sections are included
+/// physically but excluded from logical-byte accounting.
+///
+/// # Errors
+///
+/// Returns an index error for a missing SQ section, arithmetic overflow, or an
+/// empty/invalid combined span, and propagates cache or range-GET failures.
+///
+/// # Side Effects
+///
+/// May evict a wrong-length cached object, perform one S3/MinIO range GET, and
+/// update metrics and diagnostics.
+///
+/// # Performance
+///
+/// Always uses at most one physical range read for the selected SQ sections in
+/// an object. This deliberately accepts intervening bytes to avoid extra
+/// roundtrips.
+///
+/// # Examples
+///
+/// SQ sections `100..180` and `200..260` produce one physical `100..260` read,
+/// 140 logical bytes, and 20 slack bytes.
 async fn fetch_object_sq_range(
     object_key: &str,
     object_size_bytes: u64,
@@ -1547,6 +2687,36 @@ async fn fetch_object_sq_range(
     })
 }
 
+/// Derives each full-vector byte span from SQ row IDs and the full section range.
+///
+/// The full section encodes an eight-byte `(row_count, dim)` header followed by
+/// repeated `(id_length, id_bytes, vector_bytes)` rows. SQ IDs preserve the same
+/// order, so their encoded lengths advance directly to each vector payload.
+///
+/// # Parameters
+///
+/// - `section`: Directory entry containing the absolute full-section range.
+/// - `ids`: SQ identifiers in persisted row order.
+/// - `dim`: Full-vector component count.
+///
+/// # Returns
+///
+/// One absolute vector-only range per ID, aligned to `ids` order.
+///
+/// # Errors
+///
+/// Returns an index error on byte-width or offset overflow, or when derived rows
+/// do not end exactly at the declared full section boundary. Exact coverage is
+/// the cross-format proof that SQ IDs and full rows remain aligned.
+///
+/// # Performance
+///
+/// Allocates one range per row and performs no byte reads or vector decoding.
+///
+/// # Examples
+///
+/// For dimension 128, each derived span is 512 bytes. The preceding ID length
+/// and bytes are skipped, so rerank can fetch only the floating-point payload.
 fn full_vector_ranges_from_sq_ids(
     section: &ClusterObjectRange,
     ids: &[String],
@@ -1583,6 +2753,43 @@ fn full_vector_ranges_from_sq_ids(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Loads exact full vectors for all coarse winners contained in one object.
+///
+/// Reuses a full object already downloaded during SQ coarse compatibility work;
+/// otherwise it prefers layout-backed range reads when every candidate has a
+/// derived span, then falls back to one complete-object GET for legacy formats.
+///
+/// # Parameters
+///
+/// - `index`: Segment dimension and layout metadata.
+/// - `object`: Physical object being reranked.
+/// - `cluster_candidates`: Rerank needs keyed by logical cluster.
+/// - `prefetched_objects`: Complete bytes retained from the coarse phase.
+/// - `store`: Authoritative object-store reader.
+/// - `cache`: Optional full-object/layout cache.
+/// - `stats`: Optional SQ byte diagnostics.
+/// - `rerank_coalesce_gap_bytes`: Exclusive physical range merge threshold.
+///
+/// # Returns
+///
+/// Owned full-precision rows for candidate clusters in this object. Returns an
+/// empty vector without I/O when the object contains no requested cluster.
+///
+/// # Errors
+///
+/// Propagates layout, cache, object-store, coalescing, parsing, and candidate-ID
+/// consistency errors.
+///
+/// # Side Effects
+///
+/// May fetch a directory header, exact ranges, or the complete object and update
+/// caches, metrics, and diagnostics.
+///
+/// # Examples
+///
+/// If the coarse phase retained a legacy full object, rerank parses winners from
+/// those bytes immediately. For a v4 object with known row ranges, it requests
+/// only the winner vectors, optionally bridging small gaps.
 async fn load_full_clusters_for_rerank(
     index: &IvfFlatIndex,
     object: &ClusterFetchObject,
@@ -1641,6 +2848,23 @@ async fn load_full_clusters_for_rerank(
     )
 }
 
+/// Checks whether every requested rerank row has an absolute vector span.
+///
+/// # Parameters
+///
+/// - `needed_clusters`: Object member clusters participating in rerank.
+/// - `cluster_candidates`: Candidate metadata keyed by cluster.
+///
+/// # Returns
+///
+/// `true` only when every cluster has a candidate list and every need contains
+/// `Some(range)`. An empty `needed_clusters` slice is vacuously true, although
+/// the caller handles that case before this helper.
+///
+/// # Examples
+///
+/// Two candidates with ranges and one legacy candidate without a range return
+/// `false`, selecting the full-object compatibility path.
 fn all_needed_vectors_have_ranges(
     needed_clusters: &[usize],
     cluster_candidates: &HashMap<usize, Vec<RerankNeed>>,
@@ -1654,6 +2878,61 @@ fn all_needed_vectors_have_ranges(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Fetches and reconstructs exact rerank vectors using coalesced range reads.
+///
+/// Logical row ranges are sorted and merged into physical spans. Fetches for
+/// distinct spans are concurrent, but the result is reconstructed into the
+/// original logical request order so cluster/ID/attribute alignment survives
+/// the I/O optimization.
+///
+/// # Parameters
+///
+/// - `object_key`: Immutable grouped-object key.
+/// - `object_size_bytes`: Manifest-declared length for cache validation.
+/// - `clusters`: Logical clusters in desired result grouping order.
+/// - `cluster_candidates`: Candidate rows and absolute vector ranges.
+/// - `dim`: Components per full vector.
+/// - `store`: Authoritative object-store range reader.
+/// - `cache`: Optional complete-object cache.
+/// - `stats`: Optional byte counters.
+/// - `rerank_coalesce_gap_bytes`: Exclusive maximum gap bridged between ranges.
+///
+/// # Returns
+///
+/// Owned full-precision vectors in the same order the logical requests were
+/// collected: cluster order, then candidate order within each cluster.
+///
+/// # Errors
+///
+/// Returns errors for missing candidate/range metadata, invalid ranges, byte
+/// arithmetic overflow, failed cache/S3 reads, mismatched physical response
+/// counts, out-of-bounds slices, wrong vector widths, or a logical request not
+/// reconstructed from its coalesced span.
+///
+/// # Side Effects
+///
+/// May validate or evict a cached full object, issue concurrent range GETs, and
+/// update range-source metrics and query diagnostics.
+///
+/// # Performance
+///
+/// Coalescing reduces GET count at the cost of downloading bytes between nearby
+/// vectors. A valid complete-object cache satisfies every span locally. Network
+/// range futures are all polled together; parsed vectors allocate `dim` floats
+/// per candidate.
+///
+/// # Examples
+///
+/// Logical ranges `100..116`, `120..136`, and `900..916` with threshold 8
+/// become physical reads `100..136` and `900..916`. The four-byte first gap is
+/// downloaded as slack, then the first two vectors are sliced back out.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The temporary `Vec<Option<RerankFetchedVector>>` is a checked assembly table:
+/// each original request slot starts empty and must become `Some`. Rust's
+/// exhaustive conversion to `Result<Vec<_>>` prevents a null-filled result from
+/// escaping, while ownership moves each completed vector out exactly once.
 async fn fetch_rerank_vectors_by_range(
     object_key: &str,
     object_size_bytes: u64,
@@ -1826,6 +3105,35 @@ async fn fetch_rerank_vectors_by_range(
         .collect()
 }
 
+/// Merges sorted overlapping or sufficiently close rerank ranges.
+///
+/// # Parameters
+///
+/// - `requests`: Logical absolute ranges in any order.
+/// - `max_gap_bytes`: Exclusive gap limit. Overlaps always merge; a nonoverlap
+///   gap merges only when it is strictly smaller than this value.
+///
+/// # Returns
+///
+/// Physical spans sorted by byte offset. Each span retains original request
+/// indexes so the caller can restore logical order after concurrent GETs. Empty
+/// input returns an empty vector.
+///
+/// # Errors
+///
+/// Returns an index error if any request is empty or reversed. No partial set of
+/// ranges is returned.
+///
+/// # Performance
+///
+/// Sorting costs `O(n log n)` and the merge pass is linear. Range values and
+/// request indexes are copied; vector payload bytes are not involved.
+///
+/// # Examples
+///
+/// With threshold 11, `100..110` and `120..130` merge because their gap is 10.
+/// With threshold 10 they remain separate. Overlapping ranges merge even when
+/// the threshold is zero.
 fn coalesce_rerank_ranges(
     requests: &[RerankRangeRequest],
     max_gap_bytes: usize,
@@ -1877,6 +3185,44 @@ fn coalesce_rerank_ranges(
     Ok(coalesced)
 }
 
+/// Recovers candidate full vectors by ID from a downloaded complete object.
+///
+/// # Parameters
+///
+/// - `object_key`: Key included in corruption diagnostics.
+/// - `object_data`: Complete legacy or grouped object bytes.
+/// - `needed_clusters`: Logical member clusters to parse.
+/// - `cluster_candidates`: Coarse winners keyed by cluster.
+///
+/// # Returns
+///
+/// Owned vectors in `needed_clusters` order and candidate order. The returned
+/// row index is the row found by ID in the full object, preserving attribute
+/// alignment even though the coarse request also carried its earlier position.
+///
+/// # Errors
+///
+/// Returns an index error when candidate metadata is missing, a cluster cannot
+/// be decoded, or a coarse winner ID is absent from the corresponding full
+/// cluster. No incomplete result escapes.
+///
+/// # Performance
+///
+/// Parses every requested full cluster, builds one borrowed ID-to-row map, and
+/// clones only winner vectors. Cost is linear in parsed cluster bytes plus
+/// `winner_count * dim` copied floats.
+///
+/// # Examples
+///
+/// If cluster 3 contains 1,000 rows but coarse ranking retained IDs `a` and `z`,
+/// the helper parses the cluster once and clones only those two vectors.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The hash map stores `&str` slices borrowed from the decoded cluster's owned
+/// strings. Rust prevents the map from outliving that cluster. Returned vectors
+/// are cloned into owned allocations, so they remain valid after both the map
+/// and decoded object are dropped.
 fn rerank_vectors_from_object(
     object_key: &str,
     object_data: &[u8],
@@ -1922,6 +3268,30 @@ fn rerank_vectors_from_object(
     Ok(vectors)
 }
 
+/// Decodes one exact little-endian vector from a vector-only byte range.
+///
+/// # Parameters
+///
+/// - `data`: Borrowed bytes expected to contain exactly `dim` IEEE-754 values.
+/// - `dim`: Required component count.
+///
+/// # Returns
+///
+/// An owned `Vec<f32>` in persisted component order.
+///
+/// # Errors
+///
+/// Returns an index error if `dim * 4` overflows or the byte range has any other
+/// length. Exact size rejects both truncation and accidental adjacent bytes.
+///
+/// # Performance
+///
+/// Allocates `dim` floats and performs one linear endian conversion.
+///
+/// # Examples
+///
+/// Eight bytes representing `1.0f32` and `-2.0f32` decode with `dim=2`; the
+/// same bytes with `dim=3` return a length mismatch.
 fn parse_f32_vector(data: &[u8], dim: usize) -> Result<Vec<f32>> {
     let expected_len = dim
         .checked_mul(4)
@@ -1938,6 +3308,53 @@ fn parse_f32_vector(data: &[u8], dim: usize) -> Result<Vec<f32>> {
         .collect())
 }
 
+/// Loads and validates the directory of a possibly grouped cluster object.
+///
+/// Decoded layouts are checked first in the supplied cache, then in a
+/// process-wide concurrent cache. A cold lookup reads only the fixed header plus
+/// manifest-implied directory length, validates cluster membership, and stores
+/// the immutable decoded result in both cache layers.
+///
+/// # Parameters
+///
+/// - `_index`: Loaded index handle retained for a uniform helper signature; the
+///   current implementation needs no additional fields from it.
+/// - `object`: Physical key, manifest clusters, and declared size.
+/// - `store`: Authoritative object-store range reader.
+/// - `cache`: Optional local byte/decoded-object cache.
+/// - `stats`: Optional byte diagnostics charged to supporting I/O.
+///
+/// # Returns
+///
+/// `Some(shared_layout)` for a recognized grouped format. `None` means the key
+/// cannot have a directory or the fetched header is a legacy per-cluster format.
+///
+/// # Errors
+///
+/// Propagates decoded-cache, invalidation, range-GET, header parse, arithmetic,
+/// and manifest/header cluster-membership errors.
+///
+/// # Side Effects
+///
+/// May evict corrupt full bytes, issue one header range GET, update metrics and
+/// diagnostics, and insert an immutable layout into process and local caches.
+///
+/// # Consistency
+///
+/// Cache reuse is keyed by an immutable object key. Before first insertion, the
+/// decoded directory's cluster set must equal the manifest descriptor's set;
+/// object bytes cannot silently redefine logical membership.
+///
+/// # Performance
+///
+/// Cache hits avoid I/O and parsing. A cold current-format lookup reads only the
+/// directory prefix, not vector or SQ payloads.
+///
+/// # Examples
+///
+/// A manifest object listing clusters `{4, 5}` whose header lists `{4, 6}`
+/// returns an error and is not cached. A matching header is decoded once and
+/// shared by subsequent queries through [`Arc`].
 async fn load_cluster_object_layout(
     _index: &IvfFlatIndex,
     object: &ClusterFetchObject,
@@ -2007,6 +3424,23 @@ async fn load_cluster_object_layout(
     Ok(Some(layout))
 }
 
+/// Cheaply identifies keys that may carry a grouped-object directory.
+///
+/// # Parameters
+///
+/// - `key`: Object-store key.
+/// - `cluster_count`: Manifest membership count.
+///
+/// # Returns
+///
+/// `true` for multi-cluster objects or filenames beginning with
+/// `cluster_group_`/`cluster_pair_`; otherwise `false` for legacy per-cluster
+/// objects.
+///
+/// # Examples
+///
+/// A two-cluster object always returns `true`. A one-cluster key ending in
+/// `cluster_7.bin` returns `false` and avoids an unnecessary header GET.
 fn cluster_object_key_may_have_layout(key: &str, cluster_count: usize) -> bool {
     cluster_count > 1
         || key
@@ -2018,6 +3452,26 @@ fn cluster_object_key_may_have_layout(key: &str, cluster_count: usize) -> bool {
             .unwrap_or(false)
 }
 
+/// Verifies that decoded object membership equals manifest membership.
+///
+/// # Parameters
+///
+/// - `object_key`: Key included in any diagnostic.
+/// - `layout`: Parsed grouped-object directory.
+/// - `manifest_clusters`: Logical clusters advertised by the segment manifest.
+///
+/// # Returns
+///
+/// `Ok(())` when both sets are equal; ordering does not matter.
+///
+/// # Errors
+///
+/// Returns an index error showing both sets when any cluster is missing or
+/// unexpected. The caller must not trust range offsets after this error.
+///
+/// # Examples
+///
+/// Header `[5, 4]` matches manifest `[4, 5]`; header `[4, 6]` does not.
 fn validate_layout_matches_manifest(
     object_key: &str,
     layout: &ClusterObjectLayout,
@@ -2037,6 +3491,37 @@ fn validate_layout_matches_manifest(
     Ok(())
 }
 
+/// Converts an absolute object range into a checked borrow of fetched bytes.
+///
+/// # Parameters
+///
+/// - `bytes`: Borrowed fetched span.
+/// - `absolute`: Desired half-open offsets in complete-object coordinates.
+/// - `base_offset`: Complete-object offset corresponding to `bytes[0]`.
+/// - `label`: Human-readable range kind for errors.
+/// - `object_key`: Object key for diagnostics.
+///
+/// # Returns
+///
+/// A borrowed subslice whose lifetime is tied to `bytes`; no allocation or copy
+/// occurs.
+///
+/// # Errors
+///
+/// Returns an index error when the range begins before the fetched base, is
+/// reversed, or extends past the fetched bytes.
+///
+/// # Examples
+///
+/// Fetched bytes for absolute `100..200` and desired range `120..140` return
+/// `&bytes[20..40]`. Desired `90..110` is rejected.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The explicit lifetime `'a` states that the returned slice cannot outlive the
+/// input buffer. A Java `ByteBuffer.slice()` relies on garbage collection to
+/// keep backing storage alive; a C pointer requires manual lifetime tracking.
+/// Rust proves this relationship statically and keeps bounds checks explicit.
 fn slice_relative_range<'a>(
     bytes: &'a [u8],
     absolute: &Range<usize>,
@@ -2061,8 +3546,66 @@ fn slice_relative_range<'a>(
     Ok(&bytes[start..end])
 }
 
-/// Scan clusters using PQ-encoded distances with ADC lookup tables,
-/// then rerank top candidates with full-precision vectors.
+/// Uses product-quantized ADC scores for coarse ranking, then reranks exactly.
+///
+/// Product quantization divides each stored vector into chunks and replaces each
+/// chunk with a codebook index. One query-to-codeword lookup table turns each
+/// approximate row score into cheap table additions. As with SQ, filtering is
+/// resolved before coarse truncation and full vectors determine returned scores.
+///
+/// # Parameters
+///
+/// - `index`: Loaded PQ segment and cluster ownership metadata.
+/// - `probe_clusters`: Logical clusters selected for coarse scan.
+/// - `query`: Validated full-precision query.
+/// - `distance_metric`: Metric used to build ADC and compute exact rerank scores.
+/// - `filter`: Optional metadata predicate applied before truncation.
+/// - `fetch_k`: Candidate target after filter oversampling.
+/// - `store`: Authoritative object-store reader.
+/// - `cache`: Optional complete-object cache.
+///
+/// # Returns
+///
+/// Exact-distance candidates for at most the retained approximate rerank
+/// frontier. The dispatcher performs final order, filter verification, and
+/// result shaping.
+///
+/// # Errors
+///
+/// Propagates codebook, PQ sidecar, bitmap/attribute, full-object, cache, and
+/// decode failures, plus invalid physical cluster mappings. Some parallel reads
+/// may complete before another read's error is returned.
+///
+/// # Panics
+///
+/// Build-time invariants must keep code widths, IDs, full vectors, and
+/// attributes row-aligned. Debug builds also panic if `fetch_k * 4` overflows.
+///
+/// # Side Effects
+///
+/// Reads the segment-global codebook, per-cluster PQ payloads, optional bitmap
+/// and attribute objects, and full cluster objects. Cache misses may populate
+/// the local cache; no immutable artifact or manifest is changed.
+///
+/// # Performance
+///
+/// ADC-table construction is proportional to codebook size. Coarse work is
+/// `O(scanned_rows * subquantizers)`. At most roughly `4 * fetch_k` rows survive
+/// to full-object rerank. Unlike the current SQ v4 path, this implementation
+/// loads per-cluster PQ sidecars and parses complete full-vector cluster objects.
+///
+/// # Examples
+///
+/// A 16-subquantizer index scores each coarse row with 16 lookup additions. If
+/// `fetch_k=25`, at most 100 matching rows are retained, grouped by cluster, and
+/// recomputed from exact vectors before the final top 25 are chosen.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The ADC table and decoded codebook are owned local values, while each async
+/// block borrows the store and cache. `HashSet<&str>` borrows candidate ID
+/// strings only for the duration of full-cluster matching; Rust prevents those
+/// string views from escaping after `needed_ids` is dropped.
 #[allow(clippy::too_many_arguments)]
 async fn scan_clusters_pq(
     index: &IvfFlatIndex,
@@ -2206,9 +3749,44 @@ async fn scan_clusters_pq(
     Ok(candidates)
 }
 
-/// Try to load a cluster's bitmap index and evaluate the filter against it.
-/// Returns `Some(bitmap)` if pre-filtering succeeded (positions to include),
-/// or `None` if bitmaps are unavailable or the filter can't be resolved.
+/// Tries to resolve a metadata filter into allowed row positions for one cluster.
+///
+/// Bitmap indexes accelerate supported predicates but are optional. Any absent,
+/// unreadable, undecodable, or inexpressible bitmap path returns `None`, causing
+/// the caller to load attributes and use exact filter evaluation. That fallback
+/// preserves semantics rather than silently accepting or rejecting rows.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace prefix for the immutable bitmap key.
+/// - `segment_id`: Physical owner of this cluster's per-cluster objects.
+/// - `cluster_idx`: Logical cluster index and bitmap row coordinate space.
+/// - `filter`: Optional predicate to compile against bitmap postings.
+/// - `has_bitmaps`: Whether manifest metadata advertises any bitmap fields.
+/// - `store`: Authoritative object-store reader.
+/// - `cache`: Optional complete-object cache.
+///
+/// # Returns
+///
+/// `Some(bitmap)` when the complete filter is resolved, with set bits naming
+/// allowed row positions. `None` requests exact attribute evaluation.
+///
+/// # Side Effects
+///
+/// May perform and cache one bitmap-object GET. Decode failures emit a debug
+/// event; storage/cache failures are intentionally converted to `None`.
+///
+/// # Performance
+///
+/// A successful bitmap can avoid per-row distance and filter work, but loading
+/// it adds one cache lookup or object GET per cluster. Unsupported filters skip
+/// only after loading the advertised cluster bitmap.
+///
+/// # Examples
+///
+/// A bitmap-resolvable `color == "red"` predicate may return positions
+/// `{2, 9, 11}`. A token predicate absent from the bitmap index returns `None`,
+/// so exact row attributes decide matches.
 async fn try_bitmap_prefilter(
     namespace: &str,
     segment_id: &str,
@@ -2239,16 +3817,38 @@ async fn try_bitmap_prefilter(
     evaluate_filter_bitmap(filter, &bitmap_index)
 }
 
-/// Whether row `j` of a cluster survives filtering during the COARSE quantized
-/// scan (Task 6: filter before truncation, not after).
+/// Decides whether one row may enter a quantized coarse-ranking frontier.
 ///
-/// - A bitmap prefilter, when present, is authoritative (fast path, I2).
-/// - Otherwise a non-bitmap filter is evaluated against the row's attributes;
-///   a filtered row with no attributes cannot match.
-/// - No filter ⇒ always passes (unfiltered queries keep the old behavior, I3).
+/// A resolved bitmap is the fast path. Otherwise the function evaluates a
+/// present filter against that row's attributes before approximate top-k
+/// truncation; missing attributes reject the row. With neither bitmap nor
+/// filter, every row passes. Hierarchical leaf search shares this helper because
+/// it has the same two-phase truncation hazard.
 ///
-/// Shared with the hierarchical leaf scan, which has the same two-phase
-/// quantized structure and the same truncation hazard.
+/// # Parameters
+///
+/// - `filter`: Optional exact predicate.
+/// - `prefilter`: Optional complete bitmap result in cluster row coordinates.
+/// - `attrs`: Optional row-aligned cluster attributes.
+/// - `j`: Zero-based row position.
+///
+/// # Returns
+///
+/// `true` when the row may participate in approximate ranking. A bitmap result
+/// takes precedence; callers later perform final exact filter verification.
+///
+/// # Examples
+///
+/// If the bitmap contains row 7, row 7 passes without consulting attributes.
+/// Without a bitmap, row 7 passes only when its attribute map satisfies the
+/// filter. An unfiltered row always passes.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Nested `Option` values distinguish “no cluster attribute object,” “no row at
+/// this position,” and “row has no map” without sentinel pointers. Chained
+/// `and_then` borrows through each layer and produces a non-null map only when
+/// every condition succeeds.
 pub(crate) fn coarse_row_passes(
     filter: Option<&Filter>,
     prefilter: &Option<roaring::RoaringBitmap>,
@@ -2271,7 +3871,46 @@ pub(crate) fn coarse_row_passes(
     }
 }
 
-/// Enrich final unfiltered results by fetching attrs for only their clusters.
+/// Loads attributes only for final unfiltered winners and builds API results.
+///
+/// Unfiltered scans avoid attribute I/O during ranking. When the caller requests
+/// attributes, this helper deduplicates winner clusters, loads their immutable
+/// attribute objects concurrently, and joins maps back by retained cluster/row
+/// coordinates without changing candidate order.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment ownership and attribute-presence metadata.
+/// - `candidates`: Ordered final candidate frontier, consumed by this helper.
+/// - `store`: Authoritative object-store reader.
+/// - `cache`: Optional complete-object cache.
+/// - `stats`: Optional SQ diagnostics charged for attribute reads.
+///
+/// # Returns
+///
+/// Owned [`SearchResult`] values in the same order as `candidates`, each with
+/// its row's optional attribute map. Empty candidates return immediately.
+///
+/// # Errors
+///
+/// Propagates attribute read/decode failures and returns index errors if a
+/// completed cluster lookup or row coordinate is unexpectedly absent.
+///
+/// # Side Effects
+///
+/// May perform one attribute GET per distinct winner cluster, populate the
+/// cache, and update SQ supporting-byte diagnostics.
+///
+/// # Performance
+///
+/// Attribute I/O is proportional to distinct winner clusters rather than all
+/// scanned clusters. The function clones only winning row maps into results.
+///
+/// # Examples
+///
+/// Ten winners spread across three clusters cause three concurrent attribute
+/// loads, not ten. A sketch proving one cluster has no non-null maps avoids that
+/// cluster's GET and returns `attributes: None` for its winners.
 async fn enrich_unfiltered_results(
     index: &IvfFlatIndex,
     candidates: Vec<Candidate>,
@@ -2337,7 +3976,48 @@ async fn enrich_unfiltered_results(
     Ok(results)
 }
 
-/// Load attribute data for a cluster. Shared helper for all scan methods.
+/// Loads and decodes row-aligned attributes for one logical cluster when needed.
+///
+/// The resident sketch carries a conservative “cluster may have attributes”
+/// bit. A proven-empty cluster returns `None` without a GET; otherwise the key
+/// is built under the cluster's physical owner so carried-over incremental
+/// compaction data remains addressable.
+///
+/// # Parameters
+///
+/// - `index`: Loaded segment and ownership/sketch metadata.
+/// - `cluster_idx`: Logical cluster whose row attributes are requested.
+/// - `_filter`: Present for call-site symmetry; current loading behavior does
+///   not inspect the predicate.
+/// - `store`: Authoritative object-store reader.
+/// - `cache`: Optional complete-object cache.
+/// - `stats`: Optional SQ diagnostics charged to supporting I/O.
+///
+/// # Returns
+///
+/// `Some(rows)` when an attribute object is loaded, preserving one optional map
+/// per cluster row. `None` means the resident sketch proves the cluster contains
+/// no non-null attributes.
+///
+/// # Errors
+///
+/// Propagates cache, object-store, and attribute decode errors. A cluster that
+/// may have attributes but lacks its immutable object fails loudly.
+///
+/// # Side Effects
+///
+/// May fetch and cache one complete attribute object and update diagnostics.
+///
+/// # Consistency
+///
+/// Keys use [`IvfFlatIndex::cluster_owner`]; the active segment ID must not
+/// override the manifest's older owner for a carried-over cluster.
+///
+/// # Examples
+///
+/// Cluster 6 carried from `seg-3` while the active index is `seg-4` loads
+/// `seg-3`'s attribute object. If the resident sketch's bit is clear, it performs
+/// no read and returns `None`.
 async fn load_attrs(
     index: &IvfFlatIndex,
     cluster_idx: usize,
@@ -2361,8 +4041,28 @@ async fn load_attrs(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    //! Unit tests for validation short circuits, adaptive read budgets, grouped
+    //! object expansion, and deterministic exact-vector range coalescing.
+    //!
+    //! Tests that call the async entry point use an in-memory object store and
+    //! deliberately stop before artifact reads. They isolate pure search
+    //! contracts without pretending the in-memory backend validates S3 behavior;
+    //! integration coverage exercises real cache/object-store interaction.
+
     use super::*;
 
+    /// Builds a minimal two-centroid handle for validation-only search tests.
+    ///
+    /// # Returns
+    ///
+    /// An unquantized, ungrouped index with dimension two and no resident
+    /// artifacts. Tests must not attempt a nonempty scan because no cluster
+    /// objects are installed in the backing store.
+    ///
+    /// # Examples
+    ///
+    /// A three-component query fails before this fixture needs object data, and
+    /// `top_k=0` returns before cluster reads.
     fn make_index() -> IvfFlatIndex {
         IvfFlatIndex {
             centroids: std::sync::Arc::new(vec![vec![0.0, 0.0], vec![10.0, 10.0]]),
@@ -2384,6 +4084,10 @@ mod tests {
     }
 
     #[test]
+    /// Protects the public query-width validation and structured error payload.
+    ///
+    /// A regression that deferred validation until distance calculation could
+    /// panic or perform needless I/O instead of returning expected/actual widths.
     fn test_dimension_mismatch() {
         let index = make_index();
         let query = vec![1.0, 2.0, 3.0]; // dim=3 vs index dim=2
@@ -2418,6 +4122,10 @@ mod tests {
     }
 
     #[test]
+    /// Proves zero requested results short-circuit before immutable object reads.
+    ///
+    /// The query still has the correct dimension, distinguishing this path from
+    /// dimension validation and ensuring the empty result is successful.
     fn test_top_k_zero() {
         let index = make_index();
         let query = vec![1.0, 2.0];
@@ -2447,6 +4155,11 @@ mod tests {
     }
 
     #[test]
+    /// Pins monotonic adaptive caps and sentinel points used by read budgeting.
+    ///
+    /// This catches a tuning-formula change that would reduce the cap as
+    /// `nprobe` grows, exceed the probe set, or alter calibrated small/full-scan
+    /// checkpoints and grouped arity conversion.
     fn adaptive_sketch_cap_scales_monotonically() {
         let mut prev = 0usize;
         for nprobe in 1..=128 {
@@ -2468,6 +4181,11 @@ mod tests {
     }
 
     #[test]
+    /// Ensures a touched grouped object expands to all of its logical clusters.
+    ///
+    /// Without a resident sketch, selecting cluster 0 must include sibling 1
+    /// because both arrive in the same physical bytes. A regression returning
+    /// only 0 would make parsing/scan accounting inconsistent with the GET.
     fn select_scan_clusters_expands_touched_grouped_object_without_sketch() {
         let mut index = make_index();
         index.centroids = std::sync::Arc::new(vec![
@@ -2509,6 +4227,21 @@ mod tests {
         assert_eq!(scan_clusters, vec![0, 1]);
     }
 
+    /// Constructs one minimal logical rerank request for coalescing tests.
+    ///
+    /// # Parameters
+    ///
+    /// - `range`: Absolute vector byte span, cloned into both need metadata and
+    ///   the physical request field.
+    ///
+    /// # Returns
+    ///
+    /// A request for cluster and row zero with a stable placeholder ID.
+    ///
+    /// # Examples
+    ///
+    /// `rerank_request(100..116)` models one four-float vector at that object
+    /// offset.
     fn rerank_request(range: Range<usize>) -> RerankRangeRequest {
         RerankRangeRequest {
             cluster_idx: 0,
@@ -2522,6 +4255,10 @@ mod tests {
     }
 
     #[test]
+    /// Verifies unsorted logical requests are sorted and small gaps are merged.
+    ///
+    /// It also pins original request indexes, which are required to restore
+    /// candidate order after physical range responses arrive.
     fn coalesce_rerank_ranges_sorts_and_merges_small_gaps() {
         let requests = vec![
             rerank_request(300..310),
@@ -2547,6 +4284,10 @@ mod tests {
     }
 
     #[test]
+    /// Pins the coalescing threshold as exclusive rather than inclusive.
+    ///
+    /// A ten-byte gap with threshold ten must remain two GETs; changing this
+    /// boundary would silently alter the configured byte-versus-request tradeoff.
     fn coalesce_rerank_ranges_does_not_merge_gap_equal_to_threshold() {
         let requests = vec![rerank_request(100..110), rerank_request(120..130)];
 
@@ -2568,6 +4309,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects empty logical vector spans before any object-store request.
+    ///
+    /// Accepting `start == end` would later yield a zero-length vector or make a
+    /// coalesced request impossible to reconstruct exactly.
     fn coalesce_rerank_ranges_rejects_empty_ranges() {
         let requests = vec![rerank_request(100..100)];
 
