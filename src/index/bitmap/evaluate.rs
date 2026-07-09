@@ -1,13 +1,83 @@
-//! Evaluate filters against bitmap indexes.
+//! Evaluates recursive metadata filters as set operations over cluster rows.
 //!
-//! Returns `Option<RoaringBitmap>`:
-//! - `Some(bitmap)` — the set of matching vector positions
-//! - `None` — the filter cannot be evaluated via bitmap (fall back to post-filter)
+//! IVF-Flat and hierarchical search call [`evaluate::evaluate_filter_bitmap`]
+//! after loading a manifest-visible [`ClusterBitmapIndex`]. The returned rows can
+//! be applied before distance computation, avoiding CPU work for vectors that
+//! cannot match. This module performs no S3/MinIO reads and does not inspect raw
+//! attributes; its answer is limited to facts encoded by [`build`].
 //!
-//! `None` is returned when:
-//! - The field is not in the bitmap index
-//! - Contains is used on a String field (substring match)
-//! - A compound filter has a sub-filter that returns `None`
+//! The return type deliberately distinguishes two outcomes:
+//!
+//! - `Some(bitmap)` is a complete bitmap answer. An empty bitmap proves that no
+//!   cluster row matches.
+//! - `None` means the bitmap representation cannot answer safely. Search must use
+//!   the exact attribute evaluator rather than treating the set as empty.
+//!
+//! A missing field returns `None` because it may have exceeded
+//! [`MAX_CARDINALITY`]; the index cannot distinguish that case from a field
+//! absent on every row. String substring and full-text token filters also return
+//! `None` because their text content/tokenization is not stored here. For `AND`,
+//! `OR`, and `NOT`, one unavailable child makes the complete expression
+//! unavailable so an incomplete candidate set never causes false negatives.
+//!
+//! ```text
+//! Filter abstract syntax tree + ClusterBitmapIndex
+//!                         |
+//!                         v
+//!                   evaluate recursively
+//!                         |
+//!        +----------------+----------------+
+//!        |                |                |
+//!        v                v                v
+//!     AND: ∩            OR: ∪       NOT: universe - child
+//!        |                |                |
+//!        +----------------+----------------+
+//!                         |
+//!              +----------+-----------+
+//!              |                      |
+//!              v                      v
+//!       Some(exact row set)      None (unsupported child,
+//!              |                 unindexed field, or text)
+//!              v                      |
+//!       prefilter ANN work             v
+//!                              inspect original attributes
+//! ```
+//!
+//! ## Reading map
+//!
+//! 1. Read [`evaluate::evaluate_filter_bitmap`] as the exhaustive mapping from
+//!    [`crate::types::Filter`] variants to set operations.
+//! 2. Read `make_universe` for missing-field and logical-negation semantics.
+//! 3. Read `value_to_key` beside [`BitmapKey`] to understand typed value
+//!    lookup.
+//! 4. Compare [`crate::index::filter::evaluate_filter`] for the exact path used
+//!    when this module returns `None`.
+//!
+//! ## Missing-field semantics
+//!
+//! Within an indexed field, positive predicates (`Eq`, `In`, `Range`, and list
+//! `Contains`) exclude rows where the field is missing. `NotEq` and `NotIn`
+//! subtract matching rows from the full `0..vector_count` universe, so missing
+//! rows match. A general `Not` uses the same universe rule. This mirrors the
+//! exact evaluator's handling of absent attributes.
+//!
+//! ## Rust concepts used here
+//!
+//! The exhaustive `match` over [`crate::types::Filter`] forces new filter variants
+//! to make an explicit bitmap-support decision at compile time. The `?` operator
+//! is used on `Option`, not only on `Result`: inside a compound filter it
+//! immediately propagates an unavailable child. Java would normally encode this
+//! with a nullable return and manual checks; C might use a status code plus output
+//! pointer. Rust keeps `None` distinct from an owned empty bitmap and prevents
+//! either value from being dereferenced accidentally.
+//!
+//! TODO(doc): Confirm whether bitmap equality should mirror the exact evaluator's
+//! integer/float coercion and epsilon-based float comparison. The current typed
+//! keys distinguish integer `1` from float `1.0` and compare float bits exactly.
+//!
+//! TODO(doc): Confirm whether range predicates are intended to match elements of
+//! `FloatList`. The builder currently records float-list elements as numeric range
+//! keys, while the exact attribute evaluator accepts only scalar integers/floats.
 
 use roaring::RoaringBitmap;
 
@@ -15,11 +85,58 @@ use crate::types::{AttributeValue, Filter};
 
 use super::{BitmapKey, ClusterBitmapIndex};
 
-/// Evaluate a filter against a cluster's bitmap index.
+/// Evaluates one complete filter expression against a cluster bitmap index.
 ///
-/// Returns `Some(bitmap)` with the matching vector positions, or `None`
-/// if the filter cannot be resolved via bitmaps (caller must fall back
-/// to post-filter evaluation).
+/// Leaf predicates look up typed value sets or combine numeric value sets.
+/// Logical predicates recursively intersect, union, or subtract those sets. The
+/// method is conservative about representation gaps: it returns `None` for the
+/// complete expression if any required field or operation is unavailable.
+///
+/// # Parameters
+///
+/// - `filter`: Borrowed recursive predicate to evaluate; it is neither cloned nor
+///   consumed.
+/// - `index`: Borrowed bitmap sidecar for exactly one cluster. Its row count
+///   defines the universe for negative predicates.
+///
+/// # Returns
+///
+/// `Some(bitmap)` containing every matching cluster-relative row when the index
+/// can answer the complete expression. `Some(empty)` is a valid proof of no
+/// matches. Returns `None` for an unindexed field, string substring containment,
+/// full-text token predicates, or any compound expression containing such a
+/// child.
+///
+/// # Consistency
+///
+/// This function trusts that every nested bitmap uses the same row ordering and
+/// lies below `index.vector_count`. It does not establish that the sidecar belongs
+/// to the current manifest-visible segment; the loading caller owns that storage
+/// boundary. Negative predicates include rows missing the named field because
+/// they subtract matches from the full cluster universe.
+///
+/// # Performance
+///
+/// Equality clones one compressed bitmap so the caller owns the answer. `IN`,
+/// `AND`, and `OR` allocate a result and apply roaring set operations. `NOT`
+/// constructs the cluster universe. Range evaluation visits every distinct
+/// numeric key currently stored for the field and unions matching bitmaps; the
+/// sorted representation is not used for early termination.
+///
+/// # Examples
+///
+/// For five rows where `color = red` at positions `{0, 2}`, `Eq(red)` returns
+/// `Some({0, 2})` and `Not(Eq(red))` returns `Some({1, 3, 4})`. Querying an omitted
+/// high-cardinality `user_id` field returns `None`, directing search to the exact
+/// attribute path instead of incorrectly returning no rows.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Both inputs are shared borrows. The returned roaring bitmap is owned: cloning
+/// a stored value bitmap duplicates its compressed containers, while set
+/// operations mutate only newly owned temporaries. Rust therefore prevents this
+/// evaluation from changing the immutable loaded index or returning a dangling
+/// view into it.
 pub fn evaluate_filter_bitmap(
     filter: &Filter,
     index: &ClusterBitmapIndex,
@@ -152,12 +269,43 @@ pub fn evaluate_filter_bitmap(
     }
 }
 
-/// Create a universe bitmap containing positions 0..vector_count.
+/// Creates the complete valid row-position set for one cluster.
+///
+/// # Parameters
+///
+/// - `vector_count`: Exclusive upper bound copied from the cluster index.
+///
+/// # Returns
+///
+/// An owned roaring bitmap containing every integer in `0..vector_count`; zero
+/// returns an empty bitmap.
+///
+/// # Examples
+///
+/// A three-row cluster produces `{0, 1, 2}`. Subtracting a red-value bitmap
+/// `{0, 2}` then implements a negative predicate as `{1}`.
 fn make_universe(vector_count: u32) -> RoaringBitmap {
     (0..vector_count).collect()
 }
 
-/// Convert an AttributeValue to a BitmapKey for lookup.
+/// Converts a query value into the key representation used by the builder.
+///
+/// Scalar strings, integers, and floats intentionally use the same constructors
+/// as list elements because equality and containment can test membership in a
+/// list. Other variants delegate to [`BitmapKey::from_attr`].
+///
+/// # Parameters
+///
+/// - `value`: Borrowed typed query operand.
+///
+/// # Returns
+///
+/// A newly owned lookup key; the attribute value remains available to the caller.
+///
+/// # Examples
+///
+/// Query string `"sale"` becomes `"s:sale"`, which can select either a scalar
+/// string value or every string list containing `"sale"`.
 fn value_to_key(value: &AttributeValue) -> BitmapKey {
     match value {
         AttributeValue::String(s) => BitmapKey::from_string_element(s),
@@ -170,16 +318,26 @@ fn value_to_key(value: &AttributeValue) -> BitmapKey {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    //! Truth-table and fallback-boundary tests for recursive bitmap evaluation.
+
     use super::*;
     use crate::index::bitmap::build::build_cluster_bitmaps;
     use std::collections::HashMap;
 
-    /// Build a test index with 5 vectors matching the TLA+ spec data:
-    /// - vec 0: color=red, size=1, tags=[a,b]
-    /// - vec 1: color=blue, size=2, tags=[a]
-    /// - vec 2: color=red, size=3, tags=[]
-    /// - vec 3: color=NULL, size=2, tags=[b]
-    /// - vec 4: color=green, size=NULL, tags=[a,b]
+    /// Builds the shared five-row fixture used to compare predicate semantics.
+    ///
+    /// The rows match the bitmap TLA+ model:
+    ///
+    /// - row 0: `color=red`, `size=1`, `tags=[a,b]`;
+    /// - row 1: `color=blue`, `size=2`, `tags=[a]`;
+    /// - row 2: `color=red`, `size=3`, `tags=[]`;
+    /// - row 3: missing `color`, `size=2`, `tags=[b]`;
+    /// - row 4: `color=green`, missing `size`, `tags=[a,b]`.
+    ///
+    /// # Returns
+    ///
+    /// An owned index whose presence sets exercise both missing fields and a
+    /// present empty list.
     fn build_test_index() -> ClusterBitmapIndex {
         let a0 = [
             ("color".to_string(), AttributeValue::String("red".into())),
@@ -238,12 +396,22 @@ mod tests {
         build_cluster_bitmaps(&attrs)
     }
 
+    /// Expands a compressed bitmap into ordered positions for readable assertions.
+    ///
+    /// # Parameters
+    ///
+    /// - `bm`: Borrowed result bitmap.
+    ///
+    /// # Returns
+    ///
+    /// Ascending row positions owned by the test.
     fn bm_to_set(bm: &RoaringBitmap) -> Vec<u32> {
         bm.iter().collect()
     }
 
     // --- Eq tests ---
 
+    /// Proves equality selects every row carrying the requested scalar value.
     #[test]
     fn test_eval_eq_match() {
         let index = build_test_index();
@@ -255,6 +423,7 @@ mod tests {
         assert_eq!(bm_to_set(&result), vec![0, 2]);
     }
 
+    /// Proves an indexed but unknown value yields `Some(empty)`, not fallback.
     #[test]
     fn test_eval_eq_no_match() {
         let index = build_test_index();
@@ -268,6 +437,7 @@ mod tests {
 
     // --- NotEq tests ---
 
+    /// Proves inequality includes rows where the compared field is missing.
     #[test]
     fn test_eval_not_eq() {
         let index = build_test_index();
@@ -283,6 +453,7 @@ mod tests {
 
     // --- Range tests ---
 
+    /// Proves inclusive lower and upper range bounds union all matching values.
     #[test]
     fn test_eval_range_gte_lte() {
         let index = build_test_index();
@@ -298,6 +469,7 @@ mod tests {
         assert_eq!(bm_to_set(&result), vec![0, 1, 3]);
     }
 
+    /// Proves an omitted upper bound leaves a numeric range open-ended.
     #[test]
     fn test_eval_range_open_ended() {
         let index = build_test_index();
@@ -313,6 +485,7 @@ mod tests {
         assert_eq!(bm_to_set(&result), vec![1, 2, 3]);
     }
 
+    /// Proves exclusive bounds reject values exactly equal to either endpoint.
     #[test]
     fn test_eval_range_gt_lt() {
         let index = build_test_index();
@@ -330,6 +503,7 @@ mod tests {
 
     // --- In / NotIn tests ---
 
+    /// Proves `IN` unions each requested value bitmap.
     #[test]
     fn test_eval_in() {
         let index = build_test_index();
@@ -345,6 +519,7 @@ mod tests {
         assert_eq!(bm_to_set(&result), vec![0, 1, 2]);
     }
 
+    /// Proves `NOT IN` subtracts the union and therefore includes missing fields.
     #[test]
     fn test_eval_not_in() {
         let index = build_test_index();
@@ -362,6 +537,7 @@ mod tests {
 
     // --- And / Or / Not tests ---
 
+    /// Proves conjunction intersects child candidate sets.
     #[test]
     fn test_eval_and() {
         let index = build_test_index();
@@ -385,6 +561,7 @@ mod tests {
         assert_eq!(bm_to_set(&result), vec![0]);
     }
 
+    /// Proves disjunction unions child candidate sets.
     #[test]
     fn test_eval_or() {
         let index = build_test_index();
@@ -404,6 +581,7 @@ mod tests {
         assert_eq!(bm_to_set(&result), vec![0, 1, 2]);
     }
 
+    /// Proves logical negation subtracts a child set from the full universe.
     #[test]
     fn test_eval_not() {
         let index = build_test_index();
@@ -420,6 +598,7 @@ mod tests {
 
     // --- Contains tests ---
 
+    /// Proves `Contains` performs element lookup for list-valued fields.
     #[test]
     fn test_eval_contains_list() {
         let index = build_test_index();
@@ -432,6 +611,7 @@ mod tests {
         assert_eq!(bm_to_set(&result), vec![0, 1, 4]);
     }
 
+    /// Proves string substring containment requests exact attribute evaluation.
     #[test]
     fn test_eval_contains_string_returns_none() {
         // Build index with a non-list string field
@@ -452,6 +632,7 @@ mod tests {
         assert!(evaluate_filter_bitmap(&filter, &index).is_none());
     }
 
+    /// Proves a wholly unindexed field requests fallback rather than proving empty.
     #[test]
     fn test_eval_missing_attribute_returns_none() {
         let index = build_test_index();
@@ -462,6 +643,7 @@ mod tests {
         assert!(evaluate_filter_bitmap(&filter, &index).is_none());
     }
 
+    /// Proves nested unions and intersections preserve recursive filter structure.
     #[test]
     fn test_eval_nested_compound() {
         let index = build_test_index();
@@ -498,6 +680,7 @@ mod tests {
 
     // --- Cross-module verification: build then evaluate ---
 
+    /// Exercises the builder/evaluator boundary for scalar equality.
     #[test]
     fn test_build_then_evaluate_eq() {
         let index = build_test_index();
@@ -509,6 +692,7 @@ mod tests {
         assert_eq!(bm_to_set(&result), vec![4]);
     }
 
+    /// Exercises the builder/evaluator boundary for an exact numeric range value.
     #[test]
     fn test_build_then_evaluate_range() {
         let index = build_test_index();
@@ -523,6 +707,7 @@ mod tests {
         assert_eq!(bm_to_set(&result), vec![2]);
     }
 
+    /// Exercises build and evaluation for a compound scalar/range/list predicate.
     #[test]
     fn test_build_then_evaluate_compound() {
         let index = build_test_index();
@@ -557,6 +742,11 @@ mod tests {
         assert_eq!(bm_to_set(&result), vec![0, 3]);
     }
 
+    /// Compares supported bitmap predicates with row-by-row exact evaluation.
+    ///
+    /// The fixture checks equality, range, membership, and list containment at
+    /// every row; any bitmap false positive or false negative fails with the
+    /// filter and position that diverged.
     #[test]
     fn test_bitmap_matches_post_filter_exhaustive() {
         use crate::index::filter::evaluate_filter;
@@ -639,6 +829,7 @@ mod tests {
 
     // --- And/Or with None sub-filter ---
 
+    /// Proves one unavailable child makes an entire conjunction unavailable.
     #[test]
     fn test_eval_and_with_none_subfilter() {
         let index = build_test_index();
@@ -659,6 +850,7 @@ mod tests {
         assert!(evaluate_filter_bitmap(&filter, &index).is_none());
     }
 
+    /// Proves disjunction also propagates unavailable children conservatively.
     #[test]
     fn test_eval_or_with_none_subfilter() {
         let index = build_test_index();

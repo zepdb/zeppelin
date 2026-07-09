@@ -1,11 +1,70 @@
-//! Build cluster bitmap indexes from vector attributes.
+//! Constructs an in-memory metadata bitmap index from one cluster's attributes.
 //!
-//! The build process iterates over each vector's attributes, constructing:
-//! - A `present` bitmap per field (which positions have a non-null value)
-//! - A `value` bitmap per distinct value per field (inverted index)
-//! - For list types, each element gets its own value bitmap entry
-//! - For numeric fields, sorted keys for range query support
-//! - Fields with >MAX_CARDINALITY distinct values are excluded entirely
+//! IVF-Flat construction, hierarchical construction, and compaction enter this
+//! module through [`build::build_cluster_bitmaps`]. The input order must be
+//! identical to the vector-row order stored for that cluster. The builder assigns
+//! each row a `u32` position and creates one [`AttributeBitmaps`] value per
+//! eligible field.
+//! It does not serialize, upload, or publish anything; those steps belong to the
+//! segment builder that calls it.
+//!
+//! For each field, construction records both presence and an inverted value map.
+//! An inverted map answers "which rows contain this value?" instead of scanning
+//! each row's `HashMap`. List elements become individual entries, numeric values
+//! also receive ordered range keys, and a field with more than
+//! [`MAX_CARDINALITY`] distinct encoded values is omitted to keep the sidecar
+//! bounded. Omission is a performance decision: query evaluation treats the field
+//! as unavailable and uses exact attribute filtering.
+//!
+//! ```text
+//! row-aligned attributes
+//!   0: {color: red,  tags: [sale, summer]}
+//!   1: {color: blue, tags: [sale]}
+//!   2: {              tags: []}
+//!                 |
+//!                 v
+//!      collect one FieldBuilder per field
+//!                 |
+//!       +---------+-------------------+
+//!       |                             |
+//!       v                             v
+//! color.present = {0,1}          tags.present = {0,1,2}
+//! color.red     = {0}            tags.sale    = {0,1}
+//! color.blue    = {1}            tags.summer  = {0}
+//!       |                             |
+//!       +-------------+---------------+
+//!                     v
+//!             ClusterBitmapIndex
+//! ```
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`build::build_cluster_bitmaps`] for the cluster-wide two-phase
+//!    flow.
+//! 2. Read `FieldBuilder::add` for scalar, list, and missing-field semantics.
+//! 3. Read `FieldBuilder::finish` for range-key ordering and ownership transfer.
+//! 4. See [`evaluate::evaluate_filter_bitmap`] for how the resulting sets
+//!    become query candidates.
+//!
+//! ## Invariants
+//!
+//! - Input slice position and vector row position are the same value.
+//! - A missing attribute map or missing field never enters that field's
+//!   [`AttributeBitmaps::present`] bitmap.
+//! - A present empty list enters `present` but creates no value bitmap.
+//! - Cardinality counts distinct typed keys, not rows or repeated list elements.
+//! - A field over the cardinality limit is absent from the final index, never
+//!   represented by a misleading empty bitmap.
+//!
+//! ## Rust concepts used here
+//!
+//! The input type `&[Option<&HashMap<...>>]` layers three ideas: a borrowed slice,
+//! an optional attribute map per row, and a borrowed map when one exists. Java
+//! would commonly pass a list containing nullable map references; C would pass an
+//! array of nullable pointers plus a length. Rust makes the slice bounds and every
+//! present map reference non-null and lifetime checked. `FieldBuilder::finish`
+//! then consumes each builder, moving its owned maps and bitmaps into the final
+//! index without deep-copying them.
 
 use roaring::RoaringBitmap;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -14,11 +73,46 @@ use crate::types::AttributeValue;
 
 use super::{AttributeBitmaps, BitmapKey, ClusterBitmapIndex, MAX_CARDINALITY};
 
-/// Build a `ClusterBitmapIndex` from a slice of per-vector attributes.
+/// Builds the complete bitmap prefilter representation for one vector cluster.
 ///
-/// Each element in `attrs` corresponds to a vector position (0-indexed).
-/// `None` means the vector has no attributes at all; fields missing from
-/// the HashMap are treated as null for that field.
+/// Construction first accumulates values by field, then removes fields whose
+/// distinct key count exceeds [`MAX_CARDINALITY`] and finalizes range metadata.
+/// A field omitted for cardinality is intentionally indistinguishable from any
+/// other unindexed field so the evaluator will request exact post-filtering.
+///
+/// # Parameters
+///
+/// - `attrs`: Row-aligned attribute maps. Slice index `n` is cluster row `n`.
+///   `None` means that row has no attribute object; a missing map entry means the
+///   specific field is absent. The cluster must fit in the `u32` position space
+///   used by roaring bitmaps.
+///
+/// # Returns
+///
+/// An owned [`ClusterBitmapIndex`] with the same row count and every field whose
+/// encoded distinct-value count is at most [`MAX_CARDINALITY`]. An empty input
+/// produces a zero-row index with no fields.
+///
+/// # Side Effects
+///
+/// Allocates in-memory maps and roaring bitmaps and emits structured tracing
+/// events, including one debug event per omitted high-cardinality field. It does
+/// not mutate the input maps or perform object-store I/O.
+///
+/// # Performance
+///
+/// The collection phase is linear in the number of attribute values and list
+/// elements, subject to hash/tree-map operations. Finalization sorts each
+/// field's distinct numeric values and retains compressed bitmaps proportional to
+/// the indexed field/value incidence. High-cardinality detection bounds the
+/// returned artifact but occurs after values have been accumulated in memory.
+///
+/// # Examples
+///
+/// If rows 0 and 2 have `color = "red"` and row 1 has no `color`, the returned
+/// color value bitmap is `{0, 2}` and its presence bitmap is also `{0, 2}`. If
+/// `user_id` has 10,001 distinct values, `user_id` is absent from `fields` so a
+/// query on it takes the exact filtering path.
 pub fn build_cluster_bitmaps(
     attrs: &[Option<&HashMap<String, AttributeValue>>],
 ) -> ClusterBitmapIndex {
@@ -66,17 +160,37 @@ pub fn build_cluster_bitmaps(
     }
 }
 
-/// Intermediate builder for a single field's bitmaps.
+/// Mutable accumulator for one field while cluster rows are being scanned.
+///
+/// The builder owns all intermediate allocations. It exists only during segment
+/// construction and becomes immutable [`AttributeBitmaps`] through
+/// [`FieldBuilder::finish`].
 struct FieldBuilder {
+    /// Rows where the field exists, including rows whose value is an empty list.
     present: RoaringBitmap,
+    /// Typed scalar or list-element key to every row containing that value.
     values: BTreeMap<BitmapKey, RoaringBitmap>,
+    /// IEEE-754 bit patterns used to construct ordered numeric range entries.
     numeric_keys: HashSet<u64>,
+    /// Whether any observed value used a list variant.
     is_list: bool,
+    /// Count of distinct entries in `seen_keys`, used for the field-size limit.
     cardinality: usize,
+    /// Deduplicates values for cardinality accounting across rows and list repeats.
     seen_keys: HashSet<BitmapKey>,
 }
 
 impl FieldBuilder {
+    /// Creates an empty accumulator for a field observed for the first time.
+    ///
+    /// # Returns
+    ///
+    /// A builder with no present rows, values, numeric keys, or list marker.
+    ///
+    /// # Examples
+    ///
+    /// The first occurrence of `color` creates this empty state; adding
+    /// `color = "red"` then records one present row and one value key.
     fn new() -> Self {
         Self {
             present: RoaringBitmap::new(),
@@ -88,6 +202,33 @@ impl FieldBuilder {
         }
     }
 
+    /// Records one row's value in the field's presence and inverted indexes.
+    ///
+    /// Scalars add one typed value key. Lists add one key for each element while
+    /// marking the field as list-valued; repeated elements still produce only one
+    /// row membership and one unit of global cardinality. An empty list marks the
+    /// row present but adds no value entry.
+    ///
+    /// # Parameters
+    ///
+    /// - `pos`: Cluster-relative row position to add to the compressed sets.
+    /// - `value`: Borrowed value from that row's attribute map.
+    ///
+    /// # Side Effects
+    ///
+    /// Mutates only this in-memory builder and may allocate keys and bitmap
+    /// containers. The borrowed attribute remains owned by the caller.
+    ///
+    /// # Performance
+    ///
+    /// Scalar work is one key insertion plus one bitmap insertion. List work is
+    /// linear in list length. String keys allocate owned text; numeric and Boolean
+    /// keys allocate their formatted key strings.
+    ///
+    /// # Examples
+    ///
+    /// Adding row 4 with `tags = ["sale", "summer"]` inserts `4` into `present`,
+    /// `values["s:sale"]`, and `values["s:summer"]`.
     fn add(&mut self, pos: u32, value: &AttributeValue) {
         self.present.insert(pos);
 
@@ -149,6 +290,41 @@ impl FieldBuilder {
         }
     }
 
+    /// Converts the mutable accumulator into the persisted per-field model.
+    ///
+    /// Numeric bit patterns are paired with their exact integer or float value
+    /// keys and sorted by [`f64::total_cmp`] so range evaluation sees numeric
+    /// order rather than string or raw-bit order.
+    ///
+    /// # Returns
+    ///
+    /// Owned [`AttributeBitmaps`] containing the accumulated sets, sorted range
+    /// metadata, and list marker.
+    ///
+    /// # Performance
+    ///
+    /// Consumes the builder, moving its `present` and `values` allocations into
+    /// the result without cloning them. It allocates and sorts one vector with an
+    /// entry per distinct numeric bit pattern.
+    ///
+    /// # Examples
+    ///
+    /// A field observed in row order as integer values `30`, `10`, and `20`
+    /// finishes with range metadata ordered `10`, `20`, `30`, while each key
+    /// still points to its original row.
+    ///
+    /// TODO(doc): Confirm the supported range for integer attributes. Integer
+    /// ordering currently passes through `f64`, so an `i64` that cannot be
+    /// represented exactly can reconstruct a rounded key that is absent from the
+    /// value map and therefore be skipped by range evaluation.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The `self` parameter is owned rather than borrowed. Calling `finish`
+    /// moves the builder and prevents later reuse, allowing Rust to transfer its
+    /// collections directly. Java would leave the old mutable object reachable
+    /// unless code followed a convention; C would require a documented ownership
+    /// handoff to avoid either copying or double-freeing its buffers.
     fn finish(self) -> AttributeBitmaps {
         // Build sorted numeric keys for range query support
         let mut sorted_numeric_keys: Vec<(u64, BitmapKey)> = self
@@ -192,7 +368,26 @@ impl FieldBuilder {
     }
 }
 
-/// Try to convert f64 back to i64 losslessly.
+/// Converts an integral, in-range floating value to the corresponding `i64`.
+///
+/// This helper reconstructs integer-form [`BitmapKey`] values from the `f64`
+/// representation used by [`FieldBuilder::numeric_keys`]. "Integral" here means
+/// that the supplied floating value has no fractional part and is within the
+/// cast's numeric bounds; it does not prove that an earlier arbitrary `i64` to
+/// `f64` conversion preserved every low bit.
+///
+/// # Parameters
+///
+/// - `f`: Floating value recovered from a stored IEEE-754 bit pattern.
+///
+/// # Returns
+///
+/// `Some(integer)` for an integral in-range value; `None` for fractional,
+/// non-finite, or out-of-range input.
+///
+/// # Examples
+///
+/// `42.0` returns `Some(42)`, while `42.5` and positive infinity return `None`.
 fn try_f64_to_i64(f: f64) -> Option<i64> {
     if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
         Some(f as i64)
@@ -204,12 +399,25 @@ fn try_f64_to_i64(f: f64) -> Option<i64> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    //! Construction tests for field presence, value inversion, and range metadata.
+
     use super::*;
 
+    /// Converts concise fixture pairs into the owned maps accepted by the builder.
+    ///
+    /// # Parameters
+    ///
+    /// - `pairs`: Field names borrowed from the test and owned attribute values.
+    ///
+    /// # Returns
+    ///
+    /// An owned map with copied field names, suitable for borrowing into a row
+    /// slice for the duration of one test.
     fn make_attrs(pairs: Vec<(&str, AttributeValue)>) -> HashMap<String, AttributeValue> {
         pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
     }
 
+    /// Proves that repeated strings map to every matching cluster row.
     #[test]
     fn test_build_simple_string_attrs() {
         let a0 = make_attrs(vec![("color", AttributeValue::String("red".into()))]);
@@ -235,6 +443,7 @@ mod tests {
         assert!(!blue.contains(2));
     }
 
+    /// Proves that a missing field is excluded from its presence bitmap.
     #[test]
     fn test_build_null_handling() {
         let a0 = make_attrs(vec![("color", AttributeValue::String("red".into()))]);
@@ -252,6 +461,7 @@ mod tests {
         assert!(color.present.contains(2));
     }
 
+    /// Proves that numeric range metadata is ordered by value, not row order.
     #[test]
     fn test_build_numeric_sorted_keys() {
         let a0 = make_attrs(vec![("size", AttributeValue::Integer(30))]);
@@ -274,6 +484,7 @@ mod tests {
         assert_eq!(sorted_vals, vec![10.0, 20.0, 30.0]);
     }
 
+    /// Proves that Boolean values occupy independent true and false bitmaps.
     #[test]
     fn test_build_bool_attrs() {
         let a0 = make_attrs(vec![("active", AttributeValue::Bool(true))]);
@@ -292,6 +503,7 @@ mod tests {
         assert!(false_bm.contains(1));
     }
 
+    /// Proves that each string-list element maps to all containing rows.
     #[test]
     fn test_build_string_list_inverted() {
         let a0 = make_attrs(vec![(
@@ -327,6 +539,7 @@ mod tests {
         assert!(c_bm.contains(2));
     }
 
+    /// Proves that integer-list membership uses the same inverted-index model.
     #[test]
     fn test_build_integer_list_inverted() {
         let a0 = make_attrs(vec![("scores", AttributeValue::IntegerList(vec![10, 20]))]);
@@ -347,6 +560,7 @@ mod tests {
         assert!(bm_20.contains(1));
     }
 
+    /// Proves that float-list elements retain exact bit-pattern lookup keys.
     #[test]
     fn test_build_float_list_inverted() {
         let a0 = make_attrs(vec![("ratios", AttributeValue::FloatList(vec![1.5, 2.5]))]);
@@ -369,6 +583,7 @@ mod tests {
         assert!(bm.contains(1));
     }
 
+    /// Proves that an empty list is present without inventing an element value.
     #[test]
     fn test_build_empty_list() {
         let a0 = make_attrs(vec![("tags", AttributeValue::StringList(vec![]))]);
@@ -382,6 +597,7 @@ mod tests {
         assert!(tags.values.is_empty());
     }
 
+    /// Proves that an over-limit field is omitted without removing eligible fields.
     #[test]
     fn test_build_high_cardinality_skip() {
         // Create vectors with >MAX_CARDINALITY distinct values
@@ -404,6 +620,7 @@ mod tests {
         assert!(index.fields.contains_key("common"));
     }
 
+    /// Proves that independently named fields can use every supported value type.
     #[test]
     fn test_build_mixed_types() {
         let a0 = make_attrs(vec![
@@ -425,6 +642,7 @@ mod tests {
         assert!(index.fields.contains_key("tags"));
     }
 
+    /// Proves that rows with no attribute object remain in the cluster universe.
     #[test]
     fn test_build_none_attributes() {
         // Some vectors have None attributes (no attributes at all)
