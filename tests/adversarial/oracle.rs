@@ -1208,7 +1208,7 @@ fn check_i5_batch_equivalence(rec: &OpRecord) -> Vec<Violation> {
 }
 
 fn check_i6_pagination_equivalence(rec: &OpRecord) -> Vec<Violation> {
-    let Op::PaginateAll { ns, .. } = &rec.op else {
+    let Op::PaginateAll { ns, q, .. } = &rec.op else {
         return Vec::new();
     };
     let pages = rec.response["pages"]
@@ -1267,7 +1267,16 @@ fn check_i6_pagination_equivalence(rec: &OpRecord) -> Vec<Violation> {
         .iter()
         .map(|result| result.id.clone())
         .collect::<Vec<_>>();
-    if paged_ids != big_ids {
+    // I6's full page-walk-vs-big-query equivalence is only an exact ANN
+    // contract while the query reads the same WAL/segment shape throughout.
+    // Membership/approximate ANN queries intentionally only promise visible
+    // members, and compaction can move exact rows between WAL and SQ8 segments
+    // mid-walk, changing score bits embedded in cursor markers. In those
+    // cases I6 still checks cursor structure: successful pages, no duplicate
+    // ids, ascending page-boundary scores, and terminal cursor exhaustion.
+    let require_big_equivalence = matches!(q.class, QueryOracleClass::ExactAnn { .. })
+        && !pagination_scan_shape_changed(pages, big);
+    if require_big_equivalence && paged_ids != big_ids {
         violations.push(violation(
             ViolationId::I6PaginationEquivalent,
             rec,
@@ -1319,6 +1328,32 @@ fn check_i6_pagination_equivalence(rec: &OpRecord) -> Vec<Violation> {
         ));
     }
     violations
+}
+
+fn pagination_scan_shape_changed(pages: &[serde_json::Value], big: &serde_json::Value) -> bool {
+    let mut first = None;
+    for body in pages
+        .iter()
+        .map(|page| &page["body"])
+        .chain(std::iter::once(&big["body"]))
+    {
+        let Some(shape) = query_scan_shape(body) else {
+            continue;
+        };
+        match first {
+            Some(first) if first != shape => return true,
+            Some(_) => {}
+            None => first = Some(shape),
+        }
+    }
+    false
+}
+
+fn query_scan_shape(body: &serde_json::Value) -> Option<(u64, u64)> {
+    Some((
+        body.get("scanned_fragments")?.as_u64()?,
+        body.get("scanned_segments")?.as_u64()?,
+    ))
 }
 
 fn check_i7_fts_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
@@ -2008,6 +2043,91 @@ mod tests {
         })
     }
 
+    fn paginate_record(class: QueryOracleClass, response: serde_json::Value) -> OpRecord {
+        OpRecord {
+            index: 1,
+            wall_ms: 0,
+            op: Op::PaginateAll {
+                ns: NS.to_string(),
+                q: GeneratedQuery {
+                    body: json!({
+                        "sources": [{
+                            "type": "ann",
+                            "vector": [0.0, 0.0],
+                            "nprobe": 1
+                        }],
+                        "fusion": { "type": "none" },
+                        "top_k": 2,
+                        "candidate_k": 2,
+                        "consistency": "strong"
+                    }),
+                    class,
+                    pattern_tags: vec!["pagination".to_string()],
+                },
+                page_size: 1,
+            },
+            method: "POST".to_string(),
+            path: format!("/v1/namespaces/{NS}/query"),
+            status: 200,
+            response,
+            gen_after: Some(1),
+            duration_ms: 1,
+            violations: Vec::new(),
+        }
+    }
+
+    fn pagination_response(
+        paged: &[(&str, f32)],
+        big: &[(&str, f32)],
+        shape_changed: bool,
+    ) -> serde_json::Value {
+        let pages = paged
+            .iter()
+            .enumerate()
+            .map(|(idx, (id, score))| {
+                let mut body = json!({
+                    "results": [{
+                        "id": id,
+                        "score": score,
+                        "attributes": null
+                    }],
+                    "scanned_fragments": if shape_changed && idx > 0 { 0 } else { 1 },
+                    "scanned_segments": 1
+                });
+                if idx + 1 < paged.len() {
+                    body.as_object_mut()
+                        .expect("pagination body is object")
+                        .insert("next_cursor".to_string(), json!("cursor"));
+                }
+                json!({
+                    "status": 200,
+                    "body": body
+                })
+            })
+            .collect::<Vec<_>>();
+        let big_results = big
+            .iter()
+            .map(|(id, score)| {
+                json!({
+                    "id": id,
+                    "score": score,
+                    "attributes": null
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "pages": pages,
+            "big": {
+                "status": 200,
+                "body": {
+                    "results": big_results,
+                    "scanned_fragments": 1,
+                    "scanned_segments": 1
+                }
+            }
+        })
+    }
+
     #[test]
     fn i7_allows_hybrid_ann_rows_without_bm25_text() {
         let model = model_with_record("row", None);
@@ -2076,5 +2196,56 @@ mod tests {
             violations[0].detail,
             "grouped query returned more groups than top_k"
         );
+    }
+
+    #[test]
+    fn i6_allows_membership_pages_that_differ_from_big_query() {
+        let rec = paginate_record(
+            QueryOracleClass::Membership {
+                consistency: ConsistencyLevel::Strong,
+            },
+            pagination_response(&[("a", 1.0), ("b", 2.0)], &[("a", 1.0), ("c", 2.0)], false),
+        );
+
+        let violations = check_i6_pagination_equivalence(&rec);
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn i6_rejects_exact_pages_that_differ_from_big_query() {
+        let rec = paginate_record(
+            QueryOracleClass::ExactAnn {
+                top_k: 2,
+                consistency: ConsistencyLevel::Strong,
+                filter: None,
+            },
+            pagination_response(&[("a", 1.0), ("b", 2.0)], &[("a", 1.0), ("c", 2.0)], false),
+        );
+
+        let violations = check_i6_pagination_equivalence(&rec);
+
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I6PaginationEquivalent);
+        assert_eq!(
+            violations[0].detail,
+            "paged ids did not match big query ids"
+        );
+    }
+
+    #[test]
+    fn i6_allows_exact_id_mismatch_when_scan_shape_changes() {
+        let rec = paginate_record(
+            QueryOracleClass::ExactAnn {
+                top_k: 2,
+                consistency: ConsistencyLevel::Strong,
+                filter: None,
+            },
+            pagination_response(&[("a", 1.0), ("b", 2.0)], &[("a", 1.0), ("c", 2.0)], true),
+        );
+
+        let violations = check_i6_pagination_equivalence(&rec);
+
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 }
