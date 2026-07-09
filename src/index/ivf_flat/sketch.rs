@@ -1,10 +1,83 @@
-//! Resident coarse sketch for IVF-Flat segments.
+//! Builds and searches the resident coarse sketch for an IVF-Flat segment.
 //!
-//! The sketch is a small immutable segment artifact built during compaction
-//! from corpus vectors only. It stores product-quantization codes for every
-//! vector, ordered by IVF cluster. Query-time code scans this resident data
-//! inside the requested `nprobe` centroid set, selects a small cluster set,
-//! and the normal cluster reader performs exact rerank.
+//! IVF first chooses `nprobe` nearby centroid clusters; larger `nprobe` usually
+//! improves recall—the chance of finding the true nearest neighbors—at the cost
+//! of more object reads and exact distance work. This module adds a smaller,
+//! memory-resident selection stage inside that probe set. It stores one product
+//! quantization (PQ) code per corpus vector, ordered by IVF cluster. PQ divides a
+//! vector into contiguous subvectors called subquantizers, learns a centroid
+//! codebook for each part, and replaces each part with a small integer code
+//! naming its nearest learned centroid. Manifest metadata calls these
+//! projection/code dimensions; in this implementation each dimension is one
+//! contiguous subvector slot, not a learned matrix projection.
+//!
+//! At query time, asymmetric distance computation (ADC) compares the full-
+//! precision query with codebook centroids once, then scores compact row codes
+//! by table lookup. The sketch ranks clusters; the normal IVF reader still
+//! fetches selected full-precision cluster data and performs the authoritative
+//! exact rerank. The sketch is therefore a recall/latency optimization, not a
+//! replacement source of vector truth.
+//!
+//! ```text
+//! compaction/build                         query
+//! ----------------                        -----
+//! clustered full vectors                  nprobe centroid set
+//!          |                                        |
+//!          v                                        v
+//! train PQ codebooks                    build query-to-codebook table
+//!          |                                        |
+//!          v                                        v
+//! encode one compact code per row        scan resident codes in probe set
+//!          |                                        |
+//!          v                                        v
+//! upload immutable sketch object         adaptive cluster/object budget
+//!          |                                        |
+//!          v                                        v
+//! manifest publishes SketchRef           fetch full vectors + exact rerank
+//! ```
+//!
+//! This module performs no S3 operations. `build_resident_sketch` and
+//! `stitch_resident_sketch` return bytes and a [`SketchRef`]; their callers
+//! upload immutable objects and later expose them through the authoritative
+//! manifest. `ResidentSketch::from_bytes` validates bytes loaded either from
+//! the sketch object or a segment bootstrap object.
+//!
+//! ## Reading map
+//!
+//! 1. `ResidentSketch` describes the decoded resident representation and
+//!    `ResidentSketch::from_bytes` defines format compatibility.
+//! 2. `build_resident_sketch` trains codebooks and encodes a new artifact.
+//! 3. `ResidentSketch::rank_clusters` shows ADC scoring and cluster ranking;
+//!    `ResidentSketch::select_clusters` applies `AdaptiveClusterBudget`.
+//! 4. `stitch_resident_sketch` reuses an old codebook and unchanged code spans
+//!    during bounded incremental compaction.
+//! 5. The small helpers after `ClusterScore` define deterministic ranking,
+//!    packing, chunk layout, and guarded binary reads.
+//!
+//! ## Invariants and compatibility
+//!
+//! - Rows and packed codes remain grouped in logical cluster order; cluster
+//!   count metadata must partition exactly the declared vector count.
+//! - New artifacts use version 3 with 256 one-byte codes per subquantizer.
+//!   Version 2's 16 four-bit codes remain readable, but only current version-3
+//!   artifacts are eligible for incremental stitching.
+//! - A stitched artifact may copy an untouched cluster's old code bytes only
+//!   when vector count, dimension, cluster layout, codebook, and code width are
+//!   compatible. Otherwise the caller receives an explicit unavailable reason.
+//! - Existence in object storage does not make a sketch visible. The containing
+//!   segment's manifest entry remains authoritative.
+//! - Lower ADC scores are better. Dot product is negated so all supported
+//!   metrics share that ordering.
+//!
+//! ## Rust concepts used here
+//!
+//! Borrowed slices let training and scoring inspect caller-owned vectors
+//! without copying them. Owned `Vec` buffers hold codebooks and offsets, while
+//! [`Bytes`] holds immutable encoded bytes. In Java these all look broadly like
+//! references, and in C like pointer/length pairs, but Rust distinguishes who
+//! owns the allocation and proves borrowed views cannot outlive it. The
+//! `ResidentSketchStitch` also makes “reuse succeeded” and “rebuild is
+//! required” explicit states that callers must exhaustively match.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -16,31 +89,65 @@ use crate::index::ivf_flat::kmeans::train_kmeans;
 use crate::types::{AttributeValue, DistanceMetric};
 use crate::wal::manifest::SketchRef;
 
+/// Four-byte signature for coarse-sketch objects.
 const SKETCH_MAGIC: &[u8; 4] = b"ZSK1";
+/// Current write format: 256 codewords represented by one byte per subvector.
 const SKETCH_VERSION: u32 = 3;
+/// Legacy readable format using packed four-bit codes.
 const SKETCH_V2_VERSION: u32 = 2;
+/// Number of codewords in each version-2 subquantizer codebook.
 const SKETCH_V2_K: usize = 16;
+/// Number of codewords in each version-3 subquantizer codebook.
 const SKETCH_V3_K: usize = 256;
+/// Resident-memory fence on the number of codes stored for one vector.
 const SKETCH_MAX_SUBQUANTIZERS: usize = 64;
+/// Codebook size used when writing new sketches.
 const SKETCH_K: usize = SKETCH_V3_K;
+/// Maximum corpus rows sampled to train each subquantizer codebook.
 const SKETCH_TRAIN_SAMPLE: usize = 4096;
+/// K-means refinement passes used for each coarse-sketch codebook.
 const SKETCH_TRAIN_ITERS: usize = 6;
+/// Best row scores averaged to break equal global-mass cluster ranks.
 const SKETCH_CLUSTER_SCORE_TOP_M: usize = 2;
+/// Packed-code representation used by newly written sketches.
 const SKETCH_CODE_WIDTH: SketchCodeWidth = SketchCodeWidth::EightBit;
 
-/// S3 key for the resident coarse sketch.
+/// Constructs the object-store key for a segment's resident coarse sketch.
+///
+/// # Parameters
+///
+/// - `namespace`: Validated namespace key prefix.
+/// - `segment_id`: Immutable segment identifier.
+///
+/// # Returns
+///
+/// An owned key ending in `segments/{segment_id}/coarse_sketch.bin`.
+///
+/// # Examples
+///
+/// `sketch_key("catalog", "seg-7")` names
+/// `catalog/segments/seg-7/coarse_sketch.bin`. It constructs a key only; it
+/// performs no object-store request.
 #[must_use]
 pub fn sketch_key(namespace: &str, segment_id: &str) -> String {
     format!("{namespace}/segments/{segment_id}/coarse_sketch.bin")
 }
 
+/// Persisted width of one subquantizer code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SketchCodeWidth {
+    /// Two codes share one byte; used by readable version-2 artifacts.
     FourBit,
+    /// Each code occupies one byte; used by current version-3 artifacts.
     EightBit,
 }
 
 impl SketchCodeWidth {
+    /// Calculates bytes required for one vector's packed subquantizer codes.
+    ///
+    /// Four-bit layouts round odd code counts up to the next byte; eight-bit
+    /// layouts use one byte per code. For example, three four-bit codes need two
+    /// bytes, while three eight-bit codes need three.
     fn packed_code_bytes(self, subquantizers: usize) -> usize {
         match self {
             Self::FourBit => subquantizers.div_ceil(2),
@@ -49,29 +156,81 @@ impl SketchCodeWidth {
     }
 }
 
+/// Decoding parameters selected from an artifact's persisted version.
 #[derive(Debug, Clone, Copy)]
 struct SketchFormat {
+    /// Number of learned centroid choices for each subquantizer.
     codebook_size: usize,
+    /// On-disk width used to pack each centroid code.
     code_width: SketchCodeWidth,
 }
 
-/// In-memory resident sketch loaded from the immutable segment artifact.
+/// Validated in-memory coarse index loaded from an immutable segment artifact.
+///
+/// Rows are represented only by compact PQ codes and cluster boundaries; full
+/// vectors and IDs remain in normal segment data. Cloning this type clones the
+/// codebook and offset vectors and cheaply clones the reference-counted
+/// [`Bytes`] code buffer.
 #[derive(Debug, Clone)]
 pub(crate) struct ResidentSketch {
+    /// Full vector dimension expected from every query.
     dim: usize,
+    /// Number of contiguous vector chunks encoded independently.
     subquantizers: usize,
+    /// Number of logical IVF clusters represented by offset ranges.
     cluster_count: usize,
+    /// Flattened subquantizer codebooks in chunk-major, code-major order.
     codebook: Vec<f32>,
+    /// Number of centroid choices available in each subquantizer.
     codebook_size: usize,
+    /// Half-open row range for each cluster in the packed code stream.
     cluster_offsets: Vec<(usize, usize)>,
+    /// Immutable cluster-ordered packed PQ codes.
     codes: Bytes,
+    /// Conservative bit per cluster indicating any non-null row attributes.
     cluster_has_attrs: Vec<bool>,
+    /// Encoded byte stride for one vector row.
     packed_code_bytes: usize,
+    /// Version-selected interpretation of the packed code bytes.
     code_width: SketchCodeWidth,
 }
 
 impl ResidentSketch {
-    /// Deserialize and validate a sketch artifact.
+    /// Decodes and validates one complete version-2 or version-3 sketch.
+    ///
+    /// Validation derives every section size with checked arithmetic, requires
+    /// the object length to match exactly, and proves cluster row counts sum to
+    /// the declared vector count before constructing a resident view.
+    ///
+    /// # Parameters
+    ///
+    /// - `data`: Complete borrowed sketch bytes loaded by the caller.
+    ///
+    /// # Returns
+    ///
+    /// An owned, validated [`ResidentSketch`]. The codebook is decoded into
+    /// floats and the packed-code section is copied into immutable [`Bytes`], so
+    /// the result does not borrow `data`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Index`] for a short object, wrong magic,
+    /// unsupported version, zero/invalid dimensions or cluster counts, size
+    /// arithmetic overflow, exact-size mismatch, truncated scalar fields, or
+    /// cluster counts inconsistent with the declared row count. No partial
+    /// sketch escapes.
+    ///
+    /// # Performance
+    ///
+    /// Performs one linear decode. It allocates the float codebook, cluster
+    /// metadata, attribute flags, and a copy of the packed-code section. It
+    /// performs no object-store I/O.
+    ///
+    /// # Examples
+    ///
+    /// A version-2 object is decoded with 16 four-bit codewords, while a
+    /// version-3 object uses 256 eight-bit codewords. Appending one unexplained
+    /// byte to either object causes an exact-size error instead of being ignored.
     pub(crate) fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.len() < 28 {
             return Err(ZeppelinError::Index(
@@ -197,7 +356,25 @@ impl ResidentSketch {
         })
     }
 
-    /// Whether a cluster may contain any non-null attributes.
+    /// Reports whether a cluster may contain at least one non-null attribute map.
+    ///
+    /// `false` proves that the encoded cluster had no non-null attributes when
+    /// built. `true` is conservative: it can mean the bit was set or the caller
+    /// supplied an out-of-range cluster index, in which case query planning must
+    /// not skip attribute work based on missing sketch metadata.
+    ///
+    /// # Parameters
+    ///
+    /// - `cluster_idx`: Logical cluster index to inspect.
+    ///
+    /// # Returns
+    ///
+    /// `false` only for a known cluster whose bit is clear; otherwise `true`.
+    ///
+    /// # Examples
+    ///
+    /// If every row in cluster 2 stored `None`, this returns `false` for 2. An
+    /// index beyond the cluster count returns `true` to preserve correctness.
     #[must_use]
     pub(crate) fn cluster_has_attrs(&self, cluster_idx: usize) -> bool {
         self.cluster_has_attrs
@@ -206,7 +383,44 @@ impl ResidentSketch {
             .unwrap_or(true)
     }
 
-    /// Select clusters for exact rerank from the requested centroid-probe set.
+    /// Selects an adaptively bounded subset of probed clusters for exact rerank.
+    ///
+    /// All candidates stay inside the caller's centroid-selected probe set.
+    /// Ranking uses global top-row mass first, the mean of each cluster's best
+    /// approximate scores second, and original centroid rank last. If the budget
+    /// cap covers the entire probe set, validation and ranking still run but the
+    /// original probe ordering is returned unchanged.
+    ///
+    /// # Parameters
+    ///
+    /// - `query`: Full-precision query with exactly the sketch dimension.
+    /// - `distance_metric`: Metric whose lower-is-better ADC form scores codes.
+    /// - `probe_clusters`: Non-empty, in-range centroid-selected cluster indexes.
+    /// - `budget`: Validated floor, cap, and mass-margin policy.
+    /// - `mass_top_k`: Number of globally best approximate rows used to measure
+    ///   how much result mass falls in each cluster; must be positive.
+    ///
+    /// # Returns
+    ///
+    /// Cluster indexes ordered by coarse preference, except the no-pruning case
+    /// preserves `probe_clusters`. Empty clusters do not enter a pruned result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index or dimension error for an invalid budget, query shape,
+    /// empty probe set, zero `mass_top_k`, or out-of-range cluster index.
+    ///
+    /// # Performance
+    ///
+    /// Builds one ADC table and scans every compact code row in the requested
+    /// clusters. It avoids S3 reads here; downstream exact rerank reads only the
+    /// selected full cluster objects.
+    ///
+    /// # Examples
+    ///
+    /// With eight probed clusters and a floor of two, cap of four, and a narrow
+    /// margin, the sketch may return three clusters whose rows dominate the
+    /// global approximate top results. A cap of eight returns all probes.
     pub(crate) fn select_clusters(
         &self,
         query: &[f32],
@@ -229,7 +443,40 @@ impl ResidentSketch {
             .collect())
     }
 
-    /// Rank clusters inside the requested centroid-probe set by sketch score.
+    /// Ranks non-empty probe clusters by approximate result evidence.
+    ///
+    /// “Mass” counts how many of the globally best `mass_top_k` encoded rows
+    /// belong to each cluster. Ties use the mean of that cluster's best two ADC
+    /// row scores, then the cluster's incoming centroid-probe order.
+    ///
+    /// # Parameters
+    ///
+    /// - `query`: Full-precision query with `self.dim` components.
+    /// - `distance_metric`: Euclidean, cosine, or dot-product score policy.
+    /// - `probe_clusters`: Non-empty in-range logical clusters to consider.
+    /// - `mass_top_k`: Positive size of the global approximate-result window.
+    ///
+    /// # Returns
+    ///
+    /// Owned [`ClusterScore`] values sorted best first. Empty probed clusters
+    /// are omitted because they contribute no encoded rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a dimension or index error for invalid query/probe inputs.
+    ///
+    /// # Performance
+    ///
+    /// ADC-table construction costs `O(dim * codebook_size)`. Row scoring costs
+    /// `O(rows_in_probes * subquantizers)` and retains at most `mass_top_k` rows
+    /// in a heap plus one score per cluster.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The iterator chain that builds `centroid_rank` consumes copied integer
+    /// indexes, not the borrowed probe slice. `BinaryHeap` owns only compact
+    /// [`SketchRowScore`] values. Rust's borrows keep the query, codes, and probe
+    /// storage read-only throughout without reference counting or locks.
     pub(crate) fn rank_clusters(
         &self,
         query: &[f32],
@@ -329,6 +576,16 @@ impl ResidentSketch {
         Ok(ranked_clusters)
     }
 
+    /// Precomputes query distance to every codeword for constant-time code lookup.
+    ///
+    /// The returned table is indexed by `(subquantizer, code)`. Cosine and
+    /// Euclidean use squared L2 between chunks; dot product stores its negation
+    /// so lower table sums consistently rank better.
+    ///
+    /// # Performance
+    ///
+    /// Allocates `subquantizers * codebook_size` floats and performs `dim *
+    /// codebook_size` component operations.
     fn build_adc_table(&self, query: &[f32], distance_metric: DistanceMetric) -> Vec<f32> {
         let mut table = vec![0.0f32; self.subquantizers * self.codebook_size];
         for subq in 0..self.subquantizers {
@@ -347,6 +604,11 @@ impl ResidentSketch {
         table
     }
 
+    /// Sums precomputed ADC entries for one vector's packed PQ code.
+    ///
+    /// `adc_table` must match this sketch's layout and `packed_codes` must hold
+    /// one complete row. The caller guarantees both by slicing validated
+    /// resident buffers. The operation allocates nothing.
     #[inline]
     fn adc_score(&self, adc_table: &[f32], packed_codes: &[u8]) -> f32 {
         let mut score = 0.0;
@@ -358,15 +620,28 @@ impl ResidentSketch {
     }
 }
 
-/// Query-local cluster budget for resident-sketch selection.
+/// Query-local policy balancing minimum recall work against a hard read cap.
+///
+/// The floor guarantees some clusters survive, the cap bounds downstream work,
+/// and the relative margin admits clusters whose global top-row mass stays
+/// close enough to the best cluster. This is a `Copy` value: passing it copies
+/// three machine-scale fields and performs no heap allocation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AdaptiveClusterBudget {
+    /// Minimum clusters to retain, capped by available ranked clusters.
     floor_clusters: usize,
+    /// Maximum clusters allowed to reach exact rerank.
     max_clusters: usize,
+    /// Allowed fractional drop from the best cluster's global mass.
     relative_score_margin: f32,
 }
 
 impl AdaptiveClusterBudget {
+    /// Creates a budget value; [`AdaptiveClusterBudget::validate`] enforces it at use.
+    ///
+    /// For example, `(2, 5, 0.10)` always retains at least two clusters, never
+    /// more than five, and may retain extra clusters with at least 90% of the
+    /// best cluster's mass.
     #[must_use]
     pub(crate) fn new(
         floor_clusters: usize,
@@ -380,11 +655,26 @@ impl AdaptiveClusterBudget {
         }
     }
 
+    /// Returns the hard cluster cap without consuming owned resources.
+    ///
+    /// The receiver is copied because [`AdaptiveClusterBudget`] implements
+    /// `Copy`; Java would pass these fields by value only if represented as
+    /// primitives, while C has the same cheap struct-copy model.
     #[must_use]
     pub(crate) fn max_clusters(self) -> usize {
         self.max_clusters
     }
 
+    /// Rejects budgets that cannot define a safe adaptive selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::Index`] when the floor or cap is zero, the floor
+    /// exceeds the cap, or the margin is negative, NaN, or infinite.
+    ///
+    /// # Examples
+    ///
+    /// `(1, 4, 0.08)` is valid; `(5, 4, 0.08)` and `(1, 4, NaN)` are not.
     fn validate(self) -> Result<()> {
         if self.max_clusters == 0 {
             return Err(ZeppelinError::Index(
@@ -412,7 +702,67 @@ impl AdaptiveClusterBudget {
     }
 }
 
-/// Build and serialize a resident coarse sketch from clustered corpus vectors.
+/// Trains PQ codebooks and serializes a new resident coarse sketch.
+///
+/// Training samples at most 4,096 rows at deterministic, evenly spaced corpus
+/// positions. Each vector is split into at most 64 contiguous chunks; each
+/// chunk receives a 256-centroid codebook and one byte code. If fewer than 256
+/// samples exist, the last learned centroid is duplicated so every persisted
+/// codebook retains the fixed current layout.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace used to derive the future immutable object key.
+/// - `segment_id`: Segment identifier that will own the artifact.
+/// - `dim`: Required full vector dimension.
+/// - `cluster_vecs`: Full-precision corpus vectors grouped in logical cluster
+///   order. All rows must have exactly `dim` finite values.
+/// - `cluster_attrs`: Attribute maps grouped in the same outer cluster order;
+///   each cluster contributes one conservative “has attributes” bit.
+///
+/// # Returns
+///
+/// A [`SketchRef`], complete immutable object bytes, and a decoded resident
+/// sketch ready for the building node to use. Nothing has been uploaded or
+/// published yet.
+///
+/// # Errors
+///
+/// Returns an index or dimension error for zero clusters, mismatched outer
+/// attribute cluster count, no vectors, invalid row dimensions detected during
+/// encoding, k-means failure, oversized cluster counts, invalid serialized
+/// output, or arithmetic failures handled by called operations.
+///
+/// # Panics
+///
+/// Callers must validate dimensions and finite values before entry. A malformed
+/// sampled row can panic while slicing, and [`train_kmeans`] debug-asserts
+/// finite components. Practical dimensions/counts must also fit persisted
+/// `u32`/`u64` fields.
+///
+/// # Consistency
+///
+/// The returned object is not visible merely because a caller uploads it. The
+/// manifest must publish the returned [`SketchRef`] as part of the segment.
+///
+/// # Performance
+///
+/// Allocates sampled subvector copies for training, a `dim * 256` float
+/// codebook, and up to 64 code bytes per row. Encoding compares every subvector
+/// with 256 codewords. No object-store I/O occurs here.
+///
+/// # Examples
+///
+/// For three-dimensional rows, the builder uses three one-dimensional
+/// subquantizers and stores three code bytes per vector. Two clusters produce
+/// two contiguous code ranges plus two attribute-presence bits.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `all_vectors` contains borrowed slices pointing into `cluster_vecs`; it does
+/// not duplicate the corpus. Training samples do allocate owned subvector
+/// copies because k-means needs a compact stable input. The returned tuple moves
+/// three owned results to the caller with no implicit deep copies.
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_resident_sketch(
     namespace: &str,
@@ -545,11 +895,17 @@ pub(crate) fn build_resident_sketch(
     Ok((sketch_ref, bytes, resident))
 }
 
-/// Result of attempting to stitch a resident sketch from a previous segment.
+/// Outcome of attempting codebook-preserving incremental sketch construction.
+///
+/// Incompatibility is distinct from corruption: it tells the compactor that a
+/// full rebuild is required and names the reason, while a `Result::Err` from
+/// [`stitch_resident_sketch`] means the requested construction itself was
+/// invalid or corrupt.
 pub(crate) enum ResidentSketchStitch {
-    /// The old sketch was compatible and the new sketch was stitched.
+    /// New manifest metadata, complete bytes, and decoded resident state built
+    /// with the compatible old codebook.
     Stitched(SketchRef, Bytes, Box<ResidentSketch>),
-    /// The old sketch could not be reused; caller should rebuild the sketch.
+    /// Stable reason code explaining why the caller must rebuild from vectors.
     Unavailable(&'static str),
 }
 
@@ -559,6 +915,73 @@ pub(crate) enum ResidentSketchStitch {
 /// clusters are re-encoded against the same old codebook, so the result is
 /// identical to a full re-encode of all surviving vectors against that
 /// codebook without paying to encode carried clusters again.
+///
+/// ```text
+/// old validated sketch + touched[] + current clustered rows
+///                       |
+///          +------------+-------------+
+///          |                          |
+///   compatible layout          incompatible layout
+///          |                          |
+///          v                          v
+/// touched: re-encode          Unavailable(reason)
+/// untouched: copy bytes       caller decides whether rebuild is allowed
+///          |
+///          v
+/// new immutable version-3 sketch bytes
+/// ```
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace prefix for the new sketch key.
+/// - `segment_id`: New immutable segment identifier.
+/// - `dim`: Current vector dimension.
+/// - `old`: Validated resident sketch considered for reuse.
+/// - `touched`: One flag per cluster; `true` means current vectors must be
+///   re-encoded, `false` permits byte-for-byte carry-over.
+/// - `cluster_vecs`: Current full vectors for every cluster. Untouched cluster
+///   row counts must equal the old code ranges.
+/// - `cluster_attrs`: Current attributes for touched clusters; untouched
+///   presence bits come from `old`.
+///
+/// # Returns
+///
+/// [`ResidentSketchStitch::Stitched`] with fully owned metadata, bytes, and
+/// resident state, or [`ResidentSketchStitch::Unavailable`] when dimensions,
+/// subquantizers, cluster count, or persisted format prevent safe reuse.
+///
+/// # Errors
+///
+/// Returns an index or dimension error for empty/misaligned cluster state,
+/// vector-count or byte-offset overflow, changed row count in an allegedly
+/// untouched cluster, invalid touched-row dimension, an empty result, oversized
+/// persisted counts, or failure to decode the newly assembled artifact.
+///
+/// # Consistency
+///
+/// No object is written here. Successful bytes still require immutable upload
+/// and authoritative manifest publication. Returning `Unavailable` creates no
+/// partial artifact and gives the compactor an explicit rebuild decision.
+///
+/// # Performance
+///
+/// Copies packed bytes for untouched rows and performs `O(touched_rows * dim *
+/// 256)` codeword comparisons for changed rows. It reuses the old codebook
+/// values rather than retraining them, then allocates a complete new artifact.
+///
+/// # Examples
+///
+/// If only cluster 3 changed, its rows are re-encoded against the old codebook
+/// while all other cluster code spans are copied. If the new segment dimension
+/// differs, the result is `Unavailable("dim_mismatch")`; no misleading mixed-
+/// format sketch is produced.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The function borrows every input but returns owned output. Boxing the
+/// resident sketch keeps the successful enum variant's inline size smaller;
+/// unlike a raw C pointer it has automatic destruction, and unlike an ordinary
+/// Java reference its unique ownership can be moved without garbage collection.
 #[must_use = "callers must use the stitched sketch or intentionally rebuild"]
 #[allow(clippy::type_complexity)]
 pub(crate) fn stitch_resident_sketch(
@@ -733,20 +1156,35 @@ pub(crate) fn stitch_resident_sketch(
     ))
 }
 
+/// Query-local evidence used to rank one non-empty logical cluster.
+///
+/// This type is `Copy`, so sorting and passing scores duplicates three scalar
+/// fields without allocation or shared ownership.
 #[derive(Clone, Copy)]
 pub(crate) struct ClusterScore {
+    /// Logical cluster index understood by the surrounding IVF segment.
     pub(crate) cluster_idx: usize,
+    /// Mean ADC score of the cluster's best few rows; lower is better.
     pub(crate) aggregate_score: f32,
+    /// Rows this cluster contributes to the global approximate top window.
     pub(crate) mass_count: usize,
 }
 
+/// Heap entry for one approximate row participating in global mass counting.
 #[derive(Clone, Copy, Debug)]
 struct SketchRowScore {
+    /// Lower-is-better ADC score.
     score: f32,
+    /// Cluster that owns the encoded row.
     cluster_idx: usize,
 }
 
 impl PartialEq for SketchRowScore {
+    /// Compares exact float bit patterns and cluster indexes for heap consistency.
+    ///
+    /// Bit equality distinguishes representations such as positive and negative
+    /// zero. Together with [`Ord::cmp`]'s total float order, this avoids the
+    /// undefined NaN behavior of ordinary partial float comparison.
     fn eq(&self, other: &Self) -> bool {
         self.score.to_bits() == other.score.to_bits() && self.cluster_idx == other.cluster_idx
     }
@@ -755,12 +1193,20 @@ impl PartialEq for SketchRowScore {
 impl Eq for SketchRowScore {}
 
 impl PartialOrd for SketchRowScore {
+    /// Adapts the type's total ordering to APIs expecting partial ordering.
+    ///
+    /// This always returns `Some` because [`SketchRowScore::cmp`] orders every
+    /// IEEE-754 bit pattern, including NaN.
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for SketchRowScore {
+    /// Orders worse (larger) scores first, then uses cluster index as a tie-break.
+    ///
+    /// Rust's `f32::total_cmp` resembles Java's `Float.compare`; C callers would
+    /// need to define an explicit total order before using floats in a heap.
     fn cmp(&self, other: &Self) -> Ordering {
         self.score
             .total_cmp(&other.score)
@@ -768,6 +1214,27 @@ impl Ord for SketchRowScore {
     }
 }
 
+/// Retains one row in a bounded max-heap of globally best approximate scores.
+///
+/// # Parameters
+///
+/// - `top_rows`: Heap whose root is the current worst retained row.
+/// - `mass_top_k`: Maximum rows to retain; callers require a positive value.
+/// - `row`: Newly scored row considered for the global window.
+///
+/// # Side Effects
+///
+/// Mutates the heap, inserting while under capacity or replacing the current
+/// worst row when `row` is better. Equal scores keep the existing row.
+///
+/// # Performance
+///
+/// Costs `O(log mass_top_k)` only when the heap changes.
+///
+/// # Examples
+///
+/// With capacity two and retained scores `1.0` and `3.0`, inserting `2.0`
+/// evicts `3.0`; inserting `4.0` changes nothing.
 fn insert_top_mass_row(
     top_rows: &mut BinaryHeap<SketchRowScore>,
     mass_top_k: usize,
@@ -788,12 +1255,19 @@ fn insert_top_mass_row(
     }
 }
 
+/// Fixed-size accumulator for a cluster's best row scores.
+///
+/// The array avoids heap allocation because the tie-break needs only
+/// [`SKETCH_CLUSTER_SCORE_TOP_M`] values.
 struct TopSketchScores {
+    /// Ascending best scores, with unused slots initialized to infinity.
     scores: [f32; SKETCH_CLUSTER_SCORE_TOP_M],
+    /// Number of initialized values in `scores`.
     len: usize,
 }
 
 impl TopSketchScores {
+    /// Creates an empty best-score accumulator without allocation.
     fn new() -> Self {
         Self {
             scores: [f32::INFINITY; SKETCH_CLUSTER_SCORE_TOP_M],
@@ -801,6 +1275,11 @@ impl TopSketchScores {
         }
     }
 
+    /// Retains `score` when it belongs to the fixed-size best set.
+    ///
+    /// Once full, scores no better than the current worst retained value are
+    /// ignored. For best-two storage, inserting `1`, `4`, then `2` leaves
+    /// `[1, 2]`.
     fn insert(&mut self, score: f32) {
         if self.len < SKETCH_CLUSTER_SCORE_TOP_M {
             self.scores[self.len] = score;
@@ -817,11 +1296,21 @@ impl TopSketchScores {
         self.bubble_up(SKETCH_CLUSTER_SCORE_TOP_M - 1);
     }
 
+    /// Returns the arithmetic mean of all initialized best scores.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds assert that at least one row was inserted. Production
+    /// callers create this accumulator only for non-empty cluster ranges.
     fn mean(&self) -> f32 {
         debug_assert!(self.len > 0);
         self.scores[..self.len].iter().sum::<f32>() / self.len as f32
     }
 
+    /// Restores ascending order after a value is appended or replaces the tail.
+    ///
+    /// `idx` must name an initialized array slot. The fixed two-element bound
+    /// makes this effectively constant work.
     fn bubble_up(&mut self, mut idx: usize) {
         while idx > 0 && self.scores[idx] < self.scores[idx - 1] {
             self.scores.swap(idx, idx - 1);
@@ -830,6 +1319,26 @@ impl TopSketchScores {
     }
 }
 
+/// Chooses how many already-ranked clusters fit an adaptive budget.
+///
+/// The floor is always honored up to the available/capped cluster count. Beyond
+/// it, consecutive clusters survive while their mass meets the cutoff derived
+/// from the best rank.
+///
+/// # Parameters
+///
+/// - `ranked_clusters`: Best-first cluster scores from
+///   [`ResidentSketch::rank_clusters`].
+/// - `budget`: Previously validated adaptive policy.
+///
+/// # Returns
+///
+/// A prefix length no greater than either the ranked length or budget cap.
+///
+/// # Examples
+///
+/// A floor of two always retains the first two available scores. If the third
+/// cluster remains within the mass margin and the fourth does not, returns 3.
 fn adaptive_cluster_count(
     ranked_clusters: &[ClusterScore],
     budget: AdaptiveClusterBudget,
@@ -850,6 +1359,23 @@ fn adaptive_cluster_count(
     count
 }
 
+/// Converts a relative mass margin into the minimum integer mass to retain.
+///
+/// # Parameters
+///
+/// - `best_mass`: Global top-row count owned by the highest-ranked cluster.
+/// - `relative_margin`: Allowed fractional drop from that count. Normal callers
+///   provide a finite non-negative value through [`AdaptiveClusterBudget`].
+///
+/// # Returns
+///
+/// A ceiling-rounded cutoff of at least one when `best_mass` is positive. Zero
+/// best mass yields zero; margins of one or greater accept any positive mass.
+///
+/// # Examples
+///
+/// Best mass `10` with margin `0.20` returns `8`, so clusters contributing at
+/// least eight global top rows remain eligible.
 pub(crate) fn mass_score_cutoff(best_mass: usize, relative_margin: f32) -> usize {
     if best_mass == 0 {
         return 0;
@@ -862,6 +1388,22 @@ pub(crate) fn mass_score_cutoff(best_mass: usize, relative_margin: f32) -> usize
         .max(1.0) as usize
 }
 
+/// Selects deterministic, approximately even training positions across a corpus.
+///
+/// # Parameters
+///
+/// - `vector_count`: Total cluster-ordered rows.
+/// - `sample_count`: Maximum positions requested.
+///
+/// # Returns
+///
+/// Every position when the request covers the corpus; otherwise exactly
+/// `sample_count` monotonically increasing indexes spread by integer division.
+///
+/// # Examples
+///
+/// Sampling two positions from ten rows returns `[0, 5]`. No randomness or
+/// allocation of vector values occurs here.
 fn sample_indices(vector_count: usize, sample_count: usize) -> Vec<usize> {
     if sample_count >= vector_count {
         return (0..vector_count).collect();
@@ -871,6 +1413,16 @@ fn sample_indices(vector_count: usize, sample_count: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Maps a persisted sketch version to its codebook and packing interpretation.
+///
+/// # Returns
+///
+/// Version 2 maps to 16 four-bit codes; version 3 maps to 256 eight-bit codes.
+///
+/// # Errors
+///
+/// Returns an index error for every unsupported version so new formats cannot
+/// be accidentally decoded with an old layout.
 fn sketch_format(version: u32) -> Result<SketchFormat> {
     match version {
         SKETCH_V2_VERSION => Ok(SketchFormat {
@@ -887,6 +1439,31 @@ fn sketch_format(version: u32) -> Result<SketchFormat> {
     }
 }
 
+/// Encodes one vector chunk as the nearest codebook-centroid index.
+///
+/// # Parameters
+///
+/// - `codebook`: Flattened codebooks for all subquantizers.
+/// - `dim`: Full vector dimension used to derive chunk widths.
+/// - `subquantizers`: Number of chunks covering the full dimension.
+/// - `codebook_size`: Centroids available for each chunk, at most 256.
+/// - `subq`: Chunk whose codebook should be searched.
+/// - `vector`: Borrowed values for exactly that chunk.
+///
+/// # Returns
+///
+/// One byte naming the nearest centroid by squared L2 distance. Equal distances
+/// retain the lower code index.
+///
+/// # Panics
+///
+/// Debug builds assert chunk width and byte-sized codebook constraints. Invalid
+/// flattened layouts can panic while slicing; callers construct layouts through
+/// validated build/decode paths.
+///
+/// # Performance
+///
+/// Scans every codeword and allocates nothing.
 #[inline]
 fn encode_subvector(
     codebook: &[f32],
@@ -913,6 +1490,16 @@ fn encode_subvector(
     best_code
 }
 
+/// Locates one codeword in the flattened variable-width codebook.
+///
+/// # Returns
+///
+/// Float offset for `(subq, code)`. Earlier chunk widths are accumulated because
+/// dimensions that do not divide evenly can give chunks different sizes.
+///
+/// # Panics
+///
+/// Callers must provide in-range chunk and code indexes matching the codebook.
 fn codebook_offset(
     dim: usize,
     subquantizers: usize,
@@ -929,17 +1516,42 @@ fn codebook_offset(
     offset + code * (end - start)
 }
 
+/// Divides a dimension into deterministic contiguous, near-equal chunks.
+///
+/// # Parameters
+///
+/// - `dim`: Full component count.
+/// - `chunks`: Positive number of partitions, normally no greater than `dim`.
+/// - `chunk`: Zero-based partition index smaller than `chunks`.
+///
+/// # Returns
+///
+/// Half-open `(start, end)` component indexes. Across all valid chunk indexes,
+/// ranges are contiguous and cover `0..dim` exactly.
+///
+/// # Panics
+///
+/// `chunks == 0` divides by zero; callers enforce a positive subquantizer count.
 fn chunk_range(dim: usize, chunks: usize, chunk: usize) -> (usize, usize) {
     let start = chunk * dim / chunks;
     let end = (chunk + 1) * dim / chunks;
     (start, end)
 }
 
+/// Returns the current write format's row stride for resident-memory tests.
+///
+/// For 64 current eight-bit subquantizers the result is 64 bytes.
 #[cfg(test)]
 fn packed_code_bytes(subquantizers: usize) -> usize {
     SKETCH_CODE_WIDTH.packed_code_bytes(subquantizers)
 }
 
+/// Writes one code into a caller-provided packed row according to its format.
+///
+/// # Panics
+///
+/// Panics when `bytes` is too short for `index`; four-bit values must also be
+/// below 16 in debug builds. Valid layouts derive both from [`SketchFormat`].
 fn pack_code(bytes: &mut [u8], index: usize, value: u8, code_width: SketchCodeWidth) {
     match code_width {
         SketchCodeWidth::FourBit => pack_nibble(bytes, index, value),
@@ -949,6 +1561,15 @@ fn pack_code(bytes: &mut [u8], index: usize, value: u8, code_width: SketchCodeWi
     }
 }
 
+/// Reads one code from a packed row according to its persisted format.
+///
+/// # Returns
+///
+/// A value in `0..16` for four-bit data or the stored byte for eight-bit data.
+///
+/// # Panics
+///
+/// Panics if the packed row is too short for `index`.
 fn unpack_code(bytes: &[u8], index: usize, code_width: SketchCodeWidth) -> u8 {
     match code_width {
         SketchCodeWidth::FourBit => unpack_nibble(bytes, index),
@@ -956,6 +1577,14 @@ fn unpack_code(bytes: &[u8], index: usize, code_width: SketchCodeWidth) -> u8 {
     }
 }
 
+/// Stores a four-bit value in the low or high half of its target byte.
+///
+/// Neighboring nibbles are preserved. Index 0 uses the low nibble, index 1 the
+/// high nibble, and index 2 begins the next byte.
+///
+/// # Panics
+///
+/// Debug builds reject values above 15; any build panics for a short buffer.
 fn pack_nibble(bytes: &mut [u8], index: usize, value: u8) {
     debug_assert!(value < 16);
     let slot = &mut bytes[index / 2];
@@ -966,6 +1595,11 @@ fn pack_nibble(bytes: &mut [u8], index: usize, value: u8) {
     }
 }
 
+/// Extracts one low-then-high ordered four-bit code from packed bytes.
+///
+/// # Panics
+///
+/// Panics when the buffer does not contain the byte for `index`.
 fn unpack_nibble(bytes: &[u8], index: usize) -> u8 {
     let value = bytes[index / 2];
     if index % 2 == 0 {
@@ -975,6 +1609,11 @@ fn unpack_nibble(bytes: &[u8], index: usize) -> u8 {
     }
 }
 
+/// Computes squared L2 distance for equal-length vector chunks.
+///
+/// The implementation uses iterator zipping and therefore considers only the
+/// shared prefix if lengths differ. Internal callers guarantee equal chunk
+/// widths. The function allocates nothing.
 #[inline]
 fn sq_l2(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
@@ -986,19 +1625,37 @@ fn sq_l2(a: &[f32], b: &[f32]) -> f32 {
         .sum()
 }
 
+/// Computes the dot product of equal-length vector chunks.
+///
+/// Internal callers guarantee equal widths; iterator zipping otherwise ignores
+/// unmatched tails. The function allocates nothing.
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
 }
 
+/// Returns bytes required to store one bit per item.
+///
+/// Eight bits require one byte and nine require two. Zero bits require no bytes.
 fn bitset_len(bits: usize) -> usize {
     bits.div_ceil(8)
 }
 
+/// Marks one in-range bit in a mutable compact bitset.
+///
+/// # Panics
+///
+/// Panics when `bytes` does not contain the requested bit. Builders size the
+/// buffer with [`bitset_len`] first.
 fn set_bit(bytes: &mut [u8], bit: usize) {
     bytes[bit / 8] |= 1 << (bit % 8);
 }
 
+/// Tests a bit, returning `false` when the backing byte is absent.
+///
+/// The conservative out-of-range behavior exposed to query planning is handled
+/// by [`ResidentSketch::cluster_has_attrs`], which returns `true` before calling
+/// this helper on an absent cluster.
 fn bit_is_set(bytes: &[u8], bit: usize) -> bool {
     bytes
         .get(bit / 8)
@@ -1006,6 +1663,13 @@ fn bit_is_set(bytes: &[u8], bit: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Reads a little-endian `u32` from a known fixed-field offset.
+///
+/// # Errors
+///
+/// Returns an index error labeled with `label` when four bytes are unavailable
+/// or cannot be converted. The input is borrowed and no allocation occurs apart
+/// from an error message on failure.
 fn read_u32(data: &[u8], offset: usize, label: &str) -> Result<u32> {
     let bytes = data
         .get(offset..offset + 4)
@@ -1015,6 +1679,12 @@ fn read_u32(data: &[u8], offset: usize, label: &str) -> Result<u32> {
     })?))
 }
 
+/// Reads a little-endian `u64` from a known fixed-field offset.
+///
+/// # Errors
+///
+/// Returns an index error labeled with `label` when eight bytes are unavailable
+/// or cannot be converted.
 fn read_u64(data: &[u8], offset: usize, label: &str) -> Result<u64> {
     let bytes = data
         .get(offset..offset + 8)
@@ -1024,6 +1694,13 @@ fn read_u64(data: &[u8], offset: usize, label: &str) -> Result<u64> {
     })?))
 }
 
+/// Reads one little-endian IEEE-754 `f32` from a fixed-field offset.
+///
+/// # Errors
+///
+/// Returns an index error labeled with `label` when four bytes are unavailable
+/// or cannot be converted. Floating-point finiteness is a build-time input
+/// invariant, not revalidated by this format reader.
 fn read_f32(data: &[u8], offset: usize, label: &str) -> Result<f32> {
     let bytes = data
         .get(offset..offset + 4)
@@ -1033,15 +1710,21 @@ fn read_f32(data: &[u8], offset: usize, label: &str) -> Result<f32> {
     })?))
 }
 
+/// Unit tests for format compatibility, stitching, ranking, and adaptive budgets.
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Creates a policy whose floor equals its cap, forcing an exact count.
     fn fixed_budget(cluster_budget: usize) -> AdaptiveClusterBudget {
         AdaptiveClusterBudget::new(cluster_budget, cluster_budget, 0.0)
     }
 
+    /// Builds a one-row-per-cluster sketch with controlled squared-L2 scores.
+    ///
+    /// The helper turns each desired score into a one-dimensional codeword so
+    /// selection tests can exercise ranking without invoking training.
     fn one_dim_sketch_with_scores(scores: &[f32]) -> ResidentSketch {
         assert!(scores.len() <= SKETCH_K);
         let mut codebook = vec![0.0; SKETCH_K];
@@ -1067,6 +1750,7 @@ mod tests {
         }
     }
 
+    /// Build/decode preserves row layout and conservative attribute-presence bits.
     #[test]
     fn sketch_roundtrip_and_attr_bits() {
         let attrs = vec![
@@ -1101,6 +1785,7 @@ mod tests {
         assert_eq!(selected.len(), 1);
     }
 
+    /// A changed dimension reports incompatibility instead of mixing codebooks.
     #[test]
     fn stitch_reports_incompatible_dim_without_reencoding() {
         let attrs = vec![vec![None], vec![None]];
@@ -1132,6 +1817,7 @@ mod tests {
         }
     }
 
+    /// Cluster ranking prioritizes ownership of the global approximate top rows.
     #[test]
     fn cluster_selection_prefers_global_top_k_mass() {
         let mut codebook = Vec::with_capacity(SKETCH_K);
@@ -1172,6 +1858,7 @@ mod tests {
         assert_eq!(selected, vec![1]);
     }
 
+    /// Equal mass is resolved by the mean of each cluster's best row scores.
     #[test]
     fn cluster_selection_ties_mass_by_top_m_mean() {
         let mut codebook = Vec::with_capacity(SKETCH_K);
@@ -1212,11 +1899,13 @@ mod tests {
         assert_eq!(selected, vec![1]);
     }
 
+    /// The maximum current subquantizer count stays within the 64-byte row fence.
     #[test]
     fn sketch_code_bytes_stay_within_resident_fence() {
         assert_eq!(packed_code_bytes(SKETCH_MAX_SUBQUANTIZERS), 64);
     }
 
+    /// Adaptive selection honors its floor and extends through the mass margin.
     #[test]
     fn adaptive_cluster_selection_uses_floor_and_score_gap() {
         let sketch = one_dim_sketch_with_scores(&[1.0, 1.03, 1.07, 1.20, 1.21, 1.22]);
@@ -1245,6 +1934,7 @@ mod tests {
         assert_eq!(floor_selected, vec![0, 1, 2, 3]);
     }
 
+    /// Adaptive selection never exceeds the configured hard cap.
     #[test]
     fn adaptive_cluster_selection_respects_cap() {
         let sketch = one_dim_sketch_with_scores(&[1.0, 1.01, 1.02, 1.03]);
@@ -1262,6 +1952,7 @@ mod tests {
         assert_eq!(selected, vec![0, 1]);
     }
 
+    /// A cap covering every probe preserves the caller's original cluster order.
     #[test]
     fn adaptive_cluster_selection_no_ops_when_cap_covers_probe_set() {
         let sketch = one_dim_sketch_with_scores(&[8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]);
@@ -1280,6 +1971,7 @@ mod tests {
         assert_eq!(selected, probe_clusters);
     }
 
+    /// Legacy version-2 four-bit artifacts remain decodable and searchable.
     #[test]
     fn v2_four_bit_sketch_still_decodes() {
         let mut bytes = Vec::new();

@@ -1,38 +1,152 @@
-//! Immutable IVF-Flat segment membership artifacts.
+//! Encodes the immutable vector-to-cluster map carried by each IVF-Flat segment.
 //!
-//! A membership artifact maps every vector id in a segment to the logical IVF
-//! cluster that currently owns it. Stage 2C.1 only produces this artifact; no
-//! query or compaction read path consumes it yet.
+//! A membership artifact records which logical IVF cluster owns every vector
+//! ID. The IVF builder and incremental compactor create it beside the segment's
+//! other immutable objects. Incremental compaction reads the published map to
+//! find surviving rows without scanning every old cluster, and point lookup can
+//! use it to locate an ID. This module only builds and validates bytes; callers
+//! perform object-store PUTs and make the resulting [`MembershipRef`] visible by
+//! publishing a manifest.
+//!
+//! ```text
+//! cluster-ordered vector IDs
+//!            |
+//!            v
+//! build + sort deterministic membership bytes
+//!            |
+//!            v
+//! upload immutable membership.bin  (exists, not authoritative yet)
+//!            |
+//!            v
+//! publish segment in manifest      (membership becomes visible)
+//!            |
+//!            v
+//! compaction / point lookup validates and reads the map
+//! ```
+//!
+//! The binary layout is intentionally small and self-describing enough to fail
+//! loudly on incompatible or truncated input:
+//!
+//! ```text
+//! magic "ZMB1" | version u32 | cluster_count u32 | entry_count u64
+//! repeated entry_count times:
+//!     id_len u16 | UTF-8 id bytes | cluster_index u32
+//! ```
+//!
+//! ## Reading map
+//!
+//! 1. [`MembershipData`] describes the validated in-memory result.
+//! 2. `build_membership_artifact` flattens cluster ownership into entries and
+//!    constructs manifest metadata.
+//! 3. [`serialize_membership`] establishes deterministic ID ordering.
+//! 4. [`deserialize_membership`] and `MembershipReader` enforce format and
+//!    bounds invariants on bytes loaded from authoritative storage.
+//!
+//! ## Invariants and compatibility
+//!
+//! - Artifacts are write-once; updates create a new segment key and are exposed
+//!   only through the authoritative manifest.
+//! - Entries are strictly sorted by vector ID, so IDs are unique after decode
+//!   and serialization is independent of cluster traversal order.
+//! - Every decoded cluster index is smaller than `cluster_count`.
+//! - Only [`MEMBERSHIP_VERSION`] is accepted. A future layout must use a new
+//!   version and retain explicit compatibility handling.
+//!
+//! ## Rust concepts used here
+//!
+//! `MembershipReader` borrows `&[u8]` and returns slices tied to that input's
+//! lifetime. This resembles a checked cursor over a Java `ByteBuffer` or a C
+//! pointer-plus-length, but Rust prevents returned byte views from outliving the
+//! artifact buffer. Decoding allocates owned `String` IDs only after every slice
+//! access has passed bounds checks.
 
 use bytes::Bytes;
 
 use crate::error::{Result, ZeppelinError};
 use crate::wal::manifest::MembershipRef;
 
-/// Magic bytes for IVF-Flat membership artifacts.
+/// Four-byte signature that distinguishes membership data from other objects.
 pub const MEMBERSHIP_MAGIC: &[u8; 4] = b"ZMB1";
 
-/// Current IVF-Flat membership artifact format version.
+/// Current binary membership format written and accepted by this module.
 pub const MEMBERSHIP_VERSION: u32 = 1;
 
+/// Fixed bytes before the first variable-length membership entry.
 const HEADER_LEN: usize = 4 + 4 + 4 + 8;
 
-/// Decoded IVF-Flat segment membership data.
+/// Validated, owned membership data decoded from an immutable segment artifact.
+///
+/// Cloning this value clones every ID string and allocates a second entries
+/// vector. Borrow it when a second owned copy is unnecessary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipData {
-    /// Number of logical IVF clusters in the segment.
+    /// Number of logical IVF clusters addressable by the entry indexes.
     pub cluster_count: u32,
-    /// Entries sorted by vector id ascending.
+    /// Unique `(vector_id, cluster_index)` pairs sorted by ID ascending.
     pub entries: Vec<(String, u32)>,
 }
 
-/// S3 key for an IVF-Flat segment membership artifact.
+/// Constructs the object-store key for a segment's membership artifact.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace key prefix already validated by the caller.
+/// - `segment_id`: Immutable segment identifier whose membership is described.
+///
+/// # Returns
+///
+/// An owned key ending in `segments/{segment_id}/membership.bin`.
+///
+/// # Examples
+///
+/// Namespace `catalog` and segment `seg-7` produce
+/// `catalog/segments/seg-7/membership.bin`. This is an S3 key, not an HTTP path.
 #[must_use]
 pub fn membership_key(namespace: &str, segment_id: &str) -> String {
     format!("{namespace}/segments/{segment_id}/membership.bin")
 }
 
-/// Serialize a deterministic IVF-Flat segment membership artifact.
+/// Serializes membership entries in deterministic vector-ID order.
+///
+/// The caller supplies cluster indexes, while this function owns canonical
+/// ordering and the versioned little-endian layout. It does not validate that
+/// indexes are below `cluster_count`; [`deserialize_membership`] performs that
+/// check when bytes are consumed.
+///
+/// # Parameters
+///
+/// - `cluster_count`: Number of logical clusters addressable by entries.
+/// - `entries`: Borrowed `(ID, cluster index)` pairs in any order. Valid
+///   artifacts require unique IDs and indexes below `cluster_count`. IDs are
+///   cloned into a temporary vector so the caller's order remains unchanged.
+///
+/// # Returns
+///
+/// Shared [`Bytes`] containing one complete version-1 artifact. Equal sets of
+/// valid, unique entries produce equal bytes regardless of their input order.
+///
+/// # Panics
+///
+/// Panics if an ID needs more than `u16::MAX` UTF-8 bytes or if the calculated
+/// artifact size overflows `usize`. The build path treats those as violated
+/// segment-format limits rather than emitting a truncated artifact.
+///
+/// # Performance
+///
+/// Clones and sorts all entries in `O(e log e)` time, then allocates one output
+/// buffer sized to the encoded artifact.
+///
+/// # Examples
+///
+/// Entries `[("b", 1), ("a", 0)]` are written as `a` followed by `b`.
+/// Serializing the reversed input produces byte-identical output.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// [`Bytes::from`] moves the completed `Vec<u8>` buffer into reference-counted
+/// immutable storage without copying its payload. Java has a similar conceptual
+/// result in a read-only byte buffer, while C would normally transfer ownership
+/// manually and record who must free it.
 #[must_use]
 pub fn serialize_membership(cluster_count: u32, entries: &[(String, u32)]) -> Bytes {
     let mut sorted = entries.to_vec();
@@ -63,6 +177,48 @@ pub fn serialize_membership(cluster_count: u32, entries: &[(String, u32)]) -> By
     Bytes::from(buf)
 }
 
+/// Builds manifest metadata and bytes from cluster-ordered vector IDs.
+///
+/// Each outer position is the cluster index; its strings become entries for
+/// that cluster. Serialization then sorts all IDs globally so the artifact is
+/// deterministic and searchable independently of cluster iteration order.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace prefix used only to construct the artifact key.
+/// - `segment_id`: New immutable segment identifier.
+/// - `cluster_ids`: Vector IDs grouped by logical cluster index.
+///
+/// # Returns
+///
+/// A [`MembershipRef`] describing the future object and its complete bytes.
+/// This function does not upload or publish either value.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::Membership`] if cluster count, cluster indexes, or
+/// total entry count cannot fit their persisted/in-memory integer widths. No
+/// external state is changed.
+///
+/// # Panics
+///
+/// Inherits [`serialize_membership`]'s ID-length and artifact-size limits.
+///
+/// # Consistency
+///
+/// Creating bytes does not make the map authoritative. The caller must upload
+/// the immutable object and publish the containing segment through manifest
+/// compare-and-swap.
+///
+/// # Performance
+///
+/// Clones every ID once while flattening, then serialization clones and sorts
+/// the flattened entries before producing the final byte buffer.
+///
+/// # Examples
+///
+/// Given cluster 0 IDs `[a, c]` and cluster 1 ID `[b]`, the result describes
+/// three entries and serializes them as `(a, 0), (b, 1), (c, 0)`.
 pub(crate) fn build_membership_artifact(
     namespace: &str,
     segment_id: &str,
@@ -102,7 +258,39 @@ pub(crate) fn build_membership_artifact(
     Ok((membership_ref, bytes))
 }
 
-/// Deserialize and validate an IVF-Flat segment membership artifact.
+/// Decodes a complete membership artifact and rejects incompatible corruption.
+///
+/// Validation covers the signature, exact supported version, checked lengths,
+/// UTF-8 IDs, strict ID ordering, cluster-index bounds, declared entry count,
+/// and absence of trailing bytes. Failure is explicit; callers never receive a
+/// partial map.
+///
+/// # Parameters
+///
+/// - `data`: Complete borrowed object bytes loaded by the caller.
+///
+/// # Returns
+///
+/// Owned [`MembershipData`] whose IDs are unique, sorted, and safe to use as
+/// cluster lookups after the input buffer is released.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::Membership`] for a short or truncated object,
+/// wrong magic, unsupported version, impossible entry count, invalid UTF-8,
+/// duplicate/out-of-order IDs, out-of-range cluster indexes, integer-width
+/// overflow, or trailing bytes. No partial entries escape.
+///
+/// # Performance
+///
+/// Performs one linear pass over the artifact and allocates one `String` per
+/// entry plus the result vector. This function performs no object-store I/O.
+///
+/// # Examples
+///
+/// A valid artifact with IDs `a` and `b` returns those two sorted entries. If
+/// the object is truncated after `b`'s length field, decoding returns an error
+/// rather than treating `b` as absent.
 pub fn deserialize_membership(data: &[u8]) -> Result<MembershipData> {
     if data.len() < HEADER_LEN {
         return Err(ZeppelinError::Membership(
@@ -175,16 +363,42 @@ pub fn deserialize_membership(data: &[u8]) -> Result<MembershipData> {
     })
 }
 
+/// Bounds-checked cursor over borrowed membership bytes.
+///
+/// The reader advances monotonically. Its lifetime `'a` ensures slices returned
+/// by [`MembershipReader::read_bytes`] cannot outlive `data`.
 struct MembershipReader<'a> {
+    /// Complete borrowed artifact backing every returned byte slice.
     data: &'a [u8],
+    /// Offset of the next unread byte.
     offset: usize,
 }
 
 impl<'a> MembershipReader<'a> {
+    /// Starts a cursor at the first byte of an artifact.
+    ///
+    /// # Parameters
+    ///
+    /// - `data`: Borrowed bytes retained for the cursor's lifetime.
+    ///
+    /// # Returns
+    ///
+    /// A reader with offset zero and no allocation.
     fn new(data: &'a [u8]) -> Self {
         Self { data, offset: 0 }
     }
 
+    /// Advances over a fixed field after checking its bounds.
+    ///
+    /// # Parameters
+    ///
+    /// - `len`: Number of bytes to consume.
+    /// - `label`: Field name included in a precise error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a membership error if offset arithmetic overflows or the field
+    /// extends beyond the artifact.
     fn skip(&mut self, len: usize, label: &str) -> Result<()> {
         let end = self
             .offset
@@ -197,6 +411,21 @@ impl<'a> MembershipReader<'a> {
         Ok(())
     }
 
+    /// Borrows the next `len` bytes and advances the cursor.
+    ///
+    /// # Parameters
+    ///
+    /// - `len`: Requested field length.
+    /// - `label`: Domain field name used in failure messages.
+    ///
+    /// # Returns
+    ///
+    /// A slice tied to the original artifact lifetime, without copying bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a membership error for overflow or truncation; the cursor moves
+    /// only after a valid range is found.
     fn read_bytes(&mut self, len: usize, label: &str) -> Result<&'a [u8]> {
         let start = self.offset;
         let end = start
@@ -210,6 +439,10 @@ impl<'a> MembershipReader<'a> {
         Ok(bytes)
     }
 
+    /// Reads one little-endian 16-bit integer field.
+    ///
+    /// `label` identifies the field on truncation or conversion failure. The
+    /// returned value is host-endian and the cursor advances by two bytes.
     fn read_u16(&mut self, label: &str) -> Result<u16> {
         let bytes = self.read_bytes(2, label)?;
         Ok(u16::from_le_bytes(bytes.try_into().map_err(|_| {
@@ -217,6 +450,10 @@ impl<'a> MembershipReader<'a> {
         })?))
     }
 
+    /// Reads one little-endian 32-bit integer field.
+    ///
+    /// `label` identifies the field on truncation or conversion failure. The
+    /// returned value is host-endian and the cursor advances by four bytes.
     fn read_u32(&mut self, label: &str) -> Result<u32> {
         let bytes = self.read_bytes(4, label)?;
         Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| {
@@ -224,6 +461,10 @@ impl<'a> MembershipReader<'a> {
         })?))
     }
 
+    /// Reads one little-endian 64-bit integer field.
+    ///
+    /// `label` identifies the field on truncation or conversion failure. The
+    /// returned value is host-endian and the cursor advances by eight bytes.
     fn read_u64(&mut self, label: &str) -> Result<u64> {
         let bytes = self.read_bytes(8, label)?;
         Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| {
@@ -232,11 +473,13 @@ impl<'a> MembershipReader<'a> {
     }
 }
 
+/// Unit tests for deterministic encoding and fail-loud corruption handling.
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Serialization canonicalizes entry order and round-trips all ownership data.
     #[test]
     fn membership_roundtrip_sorts_entries_by_id() {
         let bytes = serialize_membership(
@@ -270,6 +513,7 @@ mod tests {
         assert_eq!(bytes, bytes_again);
     }
 
+    /// Short, wrong-magic, and every truncated prefix return errors without panics.
     #[test]
     fn membership_rejects_malformed_inputs_without_panicking() {
         assert!(deserialize_membership(b"bad").is_err());
