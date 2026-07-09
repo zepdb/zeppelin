@@ -1,12 +1,81 @@
-/// Point-in-time manifest resolution shared by query and clone handlers.
+//! Shared handler utilities, operational endpoints, and API error rendering.
+//!
+//! Endpoint-specific modules translate JSON and path inputs into calls on the
+//! services in [`crate::server::AppState`]. This file owns the behavior shared
+//! across those endpoints: canonical client-safe error envelopes, finite-float
+//! validation, liveness/readiness, Prometheus exposition, and the optional CPU
+//! profiler. It does not duplicate namespace, WAL, compaction, or query rules;
+//! those remain in their domain layers and are surfaced through typed errors.
+//!
+//! Domain failures and a small set of middleware-only statuses meet at one
+//! public response shape:
+//!
+//! ```text
+//! handler returns ZeppelinError                 Tower/Axum returns bare status
+//!            |                                              |
+//!            v                                              v
+//! ApiError -> status/code/retry/redacted text      envelope_for_status
+//!            |                                              |
+//!            +------------------+---------------------------+
+//!                               v
+//!       {code, error, status, request_id?, retryable}
+//!                               |
+//!               full internal detail stays in logs
+//! ```
+//!
+//! Operational endpoints have narrower contracts. `/healthz` proves only that
+//! the process can answer; `/readyz` performs an object-store list operation;
+//! `/metrics` exports process metrics; and the feature-gated profiling route
+//! performs blocking CPU sampling off the Tokio worker pool. Their success and
+//! failure bodies are not all canonical domain-error envelopes, so callers
+//! should follow each endpoint's documented response format.
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`crate::server::handlers::ApiError`] and
+//!    [`crate::server::handlers::error_response`] for domain-error mapping.
+//! 2. Read [`crate::server::handlers::envelope_for_status`] and
+//!    [`crate::server::handlers::render_status_envelope`] for pre-handler errors.
+//! 3. Read [`crate::server::handlers::health_check`],
+//!    [`crate::server::handlers::readiness_check`], and
+//!    [`crate::server::handlers::metrics_handler`] for operator routes.
+//! 4. Continue into [`crate::server::handlers::namespace`],
+//!    [`crate::server::handlers::vectors`],
+//!    [`crate::server::handlers::query`], and
+//!    [`crate::server::handlers::config`] for resource semantics; `as_of` is
+//!    their internal shared point-in-time resolver.
+//!
+//! ## Invariants
+//!
+//! - Client bodies use [`ZeppelinError::client_message`]; full `Display` text,
+//!   which may contain S3 keys or lease details, is logged but not returned.
+//! - Stable machine-readable codes come from [`ZeppelinError::error_code`], not
+//!   from parsing prose.
+//! - A missing object referenced by authoritative state is a redacted server
+//!   failure, not a client-facing resource 404.
+//! - Readiness reports storage reachability without returning endpoint, bucket,
+//!   or object-store diagnostics to unauthenticated callers.
+//!
+//! ## Rust concepts used here
+//!
+//! [`crate::server::handlers::ApiError`] is a newtype that implements Axum's
+//! [`IntoResponse`](axum::response::IntoResponse) trait. It
+//! is similar to a Java exception mapper or a C error-to-response adapter, but
+//! the compiler chooses the conversion from the concrete return type. Handler
+//! signatures use [`Result`](std::result::Result) so `?` can move a failure into
+//! this adapter. Profiling uses [`tokio::task::spawn_blocking`] to move a
+//! blocking closure to the runtime's blocking pool; awaiting its join handle
+//! does not block an async worker thread.
+
+/// Internal point-in-time manifest resolution shared by query and clone handlers.
 pub(crate) mod as_of;
-/// Runtime configuration handlers.
+/// Runtime query-configuration read and update endpoints.
 pub mod config;
-/// Namespace CRUD handlers.
+/// Namespace, snapshot, clone, compaction, and hydration endpoints.
 pub mod namespace;
-/// Vector similarity and BM25 query handler.
+/// Vector similarity, BM25, hybrid, and batch query endpoints.
 pub mod query;
-/// Vector upsert and delete handlers.
+/// Vector upsert, lookup, and delete endpoints.
 pub mod vectors;
 
 use axum::extract::State;
@@ -19,22 +88,64 @@ use serde_json::{json, Value};
 use crate::error::ZeppelinError;
 use crate::server::{current_request_id, AppState};
 
-/// Wrapper that converts `ZeppelinError` into an HTTP response.
-pub struct ApiError(pub ZeppelinError);
+/// Adapts an owned Zeppelin domain failure to Axum's response protocol.
+///
+/// Handlers return `Result<T, ApiError>` and use `?` through the [`From`]
+/// implementation below. Conversion to a response centralizes status, stable
+/// code, retry policy, request correlation, and redaction instead of allowing
+/// each endpoint to invent an error body.
+///
+/// # Examples
+///
+/// A missing namespace becomes a JSON 404 with code `NAMESPACE_NOT_FOUND`. A
+/// missing S3 object referenced by a manifest becomes a redacted JSON 500 with
+/// code `INTERNAL_DATA_MISSING`; its key appears only in the structured log.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// This one-field newtype has no intended semantic overhead over the wrapped
+/// enum. Unlike a Java subclass, it uses trait implementations to opt into
+/// framework behavior. Unlike a C typedef, it is a distinct type, so only this
+/// explicit wrapper can be converted automatically into an HTTP response.
+pub struct ApiError(
+    /// Owned error whose classification and sanitized message define the response.
+    pub ZeppelinError,
+);
 
-/// Find the first non-finite value in a float slice.
+/// Finds the first non-finite component in a decoded vector.
 ///
-/// Returns `(dimension_index, kind)` where kind is `"NaN"`, `"inf"`, or
-/// `"-inf"`. JSON cannot express NaN/inf literally, but serde_json overflows
-/// in-f64-range literals like `1e39` to +/-inf during the f64→f32 narrowing —
-/// without this check such values poison distance comparisons
-/// (`partial_cmp(..).unwrap_or(Equal)` makes orderings nondeterministic) and
-/// get baked into k-means centroids at compaction, permanently damaging
-/// recall for the namespace.
+/// JSON cannot spell NaN or infinity directly, but a finite JSON number such as
+/// `1e39` can overflow while narrowing to `f32`. Rejecting that value at the API
+/// boundary prevents unordered distance comparisons and non-finite values from
+/// entering immutable WAL data or later K-means centroids.
 ///
-/// Cost: a single `is_finite()` pass over floats the handler has already
-/// deserialized — O(dims × batch), a tiny fraction of the JSON parse that
-/// preceded it. No perf guard needed.
+/// # Parameters
+///
+/// - `values`: Borrowed vector components after JSON deserialization and `f32`
+///   conversion.
+///
+/// # Returns
+///
+/// `Some((dimension_index, kind))` for the first offending component, where
+/// `kind` is `"NaN"`, `"inf"`, or `"-inf"`; `None` when every component is
+/// finite.
+///
+/// # Performance
+///
+/// Performs one allocation-free, linear `is_finite` scan. Across a batch the
+/// caller pays O(total dimensions), typically much less than JSON parsing.
+///
+/// # Examples
+///
+/// `[0.25, f32::INFINITY, 0.75]` returns `Some((1, "inf"))`. A normal embedding
+/// returns `None` and can proceed to dimension validation and WAL publication.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The input is a borrowed slice, comparable to a Java array view or
+/// `const float *` plus length in C, but Rust guarantees non-nullness and bounds
+/// checks. The iterator returns only an index; the short static kind string does
+/// not allocate or borrow from the slice.
 pub(crate) fn find_non_finite(values: &[f32]) -> Option<(usize, &'static str)> {
     values.iter().position(|v| !v.is_finite()).map(|i| {
         let v = values[i];
@@ -49,20 +160,71 @@ pub(crate) fn find_non_finite(values: &[f32]) -> Option<(usize, &'static str)> {
     })
 }
 
-/// Converts a `ZeppelinError` into an `ApiError`.
+/// Moves a domain error into the HTTP adapter used by handler return types.
+///
+/// # Parameters
+///
+/// - `e`: Owned Zeppelin failure to classify when Axum requests a response.
+///
+/// # Returns
+///
+/// An [`ApiError`] containing the same enum value without altering its detail.
+///
+/// # Examples
+///
+/// `some_domain_call().await.map_err(ApiError::from)?` preserves the failure
+/// until the framework renders the canonical response.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// [`From`] is a compiler-known conversion used by the `?` operator. Ownership
+/// moves into the wrapper; there is no exception allocation or error copy.
 impl From<ZeppelinError> for ApiError {
+    /// Wraps an owned domain error without changing its classification or text.
+    ///
+    /// # Parameters
+    ///
+    /// - `e`: Failure moved out of the domain result.
+    ///
+    /// # Returns
+    ///
+    /// The HTTP adapter that now owns `e`.
     fn from(e: ZeppelinError) -> Self {
         ApiError(e)
     }
 }
 
-/// Build the canonical error envelope for a `ZeppelinError`. Single source of
-/// truth so middleware-produced errors (timeout, body-limit, unmatched route,
-/// concurrency) render identically to handler errors (Task 11 I1/I4).
+/// Renders one domain failure as the canonical client-safe JSON response.
 ///
-/// Envelope: `{code, error, status, request_id?, retryable}`. The full
-/// `Display` (which may embed S3 keys / tokens / holder IDs) goes ONLY to the
-/// structured log; the body carries `client_message()` (I3).
+/// The envelope is `{code, error, status, request_id?, retryable}`. Numeric
+/// status, stable code, retry advice, and sanitized prose all come from
+/// [`ZeppelinError`]'s classification methods. The full `Display` value may
+/// contain object keys, endpoints, fencing tokens, or lease-holder IDs, so it
+/// goes only to structured logs; the body uses
+/// [`ZeppelinError::client_message`].
+///
+/// # Parameters
+///
+/// - `err`: Borrowed failure. Rendering does not consume it, although the
+///   resulting response owns its serialized body.
+///
+/// # Returns
+///
+/// An Axum response with the mapped status and JSON envelope. A task-local
+/// request ID is included when available, and errors with a retry delay receive
+/// a `Retry-After` header. An invalid numeric mapping defensively becomes 500.
+///
+/// # Side Effects
+///
+/// Logs 4xx failures at WARN and 5xx failures at ERROR, including full internal
+/// detail and the correlation ID. It allocates the JSON body but performs no
+/// domain or storage operation.
+///
+/// # Examples
+///
+/// A dimension mismatch produces status 400 and code `DIMENSION_MISMATCH` with
+/// non-retryable advice. A storage failure logs its endpoint detail, returns a
+/// generic `STORAGE_ERROR` message, and marks the response retryable.
 pub fn error_response(err: &ZeppelinError) -> Response {
     let status = err.status_code();
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -95,19 +257,50 @@ pub fn error_response(err: &ZeppelinError) -> Response {
     response
 }
 
-/// Maps `ApiError` to an HTTP response with the canonical error envelope.
+/// Lets Axum render [`ApiError`] through the shared canonical mapper.
+///
+/// # Returns
+///
+/// The response produced by [`error_response`] after borrowing the wrapped
+/// error. Consuming `self` then drops the owned error normally.
+///
+/// # Examples
+///
+/// When a handler returns `Err(ApiError(...))`, Axum invokes this method and
+/// sends the mapped status, headers, and JSON body.
 impl IntoResponse for ApiError {
+    /// Consumes the adapter and renders its domain error canonically.
+    ///
+    /// # Returns
+    ///
+    /// An owned Axum response from [`error_response`].
     fn into_response(self) -> Response {
         error_response(&self.0)
     }
 }
 
-/// Build the canonical envelope for an error STATUS produced outside the
-/// handler layer — tower middleware (request timeout 408, body limit 413),
-/// the unmatched-route fallback (404), etc. (Task 11 I4). These never carry a
-/// `ZeppelinError`, so we synthesize `{code, error, status, request_id?,
-/// retryable}` from the status alone. Returns `None` for statuses we don't own
-/// (so success responses pass through untouched).
+/// Classifies a bare framework status for canonical envelope rendering.
+///
+/// Middleware failures do not carry a [`ZeppelinError`], so the server owns a
+/// small explicit mapping for request timeout, body limit, unmatched route, and
+/// method mismatch. All other statuses remain the responsibility of the
+/// handler or layer that produced them.
+///
+/// # Parameters
+///
+/// - `status`: HTTP status observed by the outer normalization middleware.
+///
+/// # Returns
+///
+/// `Some((stable_code, client_message, retryable))` for 408, 413, 404, or 405;
+/// `None` for successes, redirects, domain-specific errors, and unowned
+/// failures such as 500.
+///
+/// # Examples
+///
+/// Status 408 maps to `("REQUEST_TIMEOUT", ..., true)`. Status 503 returns
+/// `None` because a concurrency 503 is already rendered from
+/// [`ZeppelinError::QueryConcurrencyExhausted`].
 pub fn envelope_for_status(status: StatusCode) -> Option<(&'static str, &'static str, bool)> {
     // (code, client message, retryable)
     match status {
@@ -131,19 +324,53 @@ pub fn envelope_for_status(status: StatusCode) -> Option<(&'static str, &'static
     }
 }
 
-/// Fallback handler for unmatched routes: canonical 404 envelope (I4).
+/// Returns the canonical response for a path that matched no registered route.
+///
+/// # Returns
+///
+/// A JSON 404 carrying code `NOT_FOUND`. [`render_status_envelope`] adds the
+/// current request ID when the fallback runs inside a request scope.
+///
+/// # Examples
+///
+/// `GET /v1/this/route/does/not/exist` reaches this fallback instead of
+/// returning Axum's default empty 404 body.
 pub async fn not_found_fallback() -> Response {
     render_status_envelope(StatusCode::NOT_FOUND, None)
 }
 
-/// Render the canonical envelope for a bare error status.
+/// Renders a framework-generated status with the canonical JSON shape.
 ///
-/// `request_id_override` lets a caller that runs OUTSIDE the `REQUEST_ID`
-/// task-local scope (e.g. the outermost `normalize_error_responses` layer,
-/// which sits above the request_id middleware) still stamp the id — it falls
-/// back to `current_request_id()` when `None`. When an id is resolved it is
-/// echoed in both the body and the `x-request-id` response header so a
-/// middleware-rewritten 408/413 stays correlatable.
+/// The outer response-normalization layer runs after the inner request-ID scope
+/// has ended, so it can pass an explicit ID captured from headers. Without an
+/// override this function consults [`current_request_id`]. A resolved ID appears
+/// in both the body and response header.
+///
+/// # Parameters
+///
+/// - `status`: Bare framework status to preserve on the response.
+/// - `request_id_override`: Owned correlation ID captured outside task-local
+///   scope, or `None` to use the current scope.
+///
+/// # Returns
+///
+/// A JSON response containing the mapped code, message, numeric status,
+/// optional request ID, and retry flag. Unrecognized statuses receive generic
+/// code `ERROR` and non-retryable advice. Status 408 also receives
+/// `Retry-After: 1`.
+///
+/// # Examples
+///
+/// Rendering 413 with ID `upload-7` produces code `PAYLOAD_TOO_LARGE` and
+/// echoes `upload-7` in the header and body. Rendering an unowned 418 directly
+/// preserves 418 but uses the generic `ERROR` classification.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `request_id_override.or_else(current_request_id)` consumes the optional
+/// owned string only when present and lazily calls the fallback otherwise. The
+/// later `ref` pattern borrows that string for JSON construction before it is
+/// moved into header parsing; Rust prevents use-after-move at compile time.
 pub fn render_status_envelope(status: StatusCode, request_id_override: Option<String>) -> Response {
     let (code, message, retryable) =
         envelope_for_status(status).unwrap_or(("ERROR", "request failed", false));
@@ -172,18 +399,66 @@ pub fn render_status_envelope(status: StatusCode, request_id_override: Option<St
     response
 }
 
-/// Liveness probe: returns 200 OK if the server process is running.
+/// Reports process liveness without consulting storage or domain state.
+///
+/// # Returns
+///
+/// JSON `{"status":"ok"}` with status 200 whenever the Axum task can execute
+/// this handler.
+///
+/// # Side Effects
+///
+/// None beyond normal request middleware. In particular, this endpoint performs
+/// no S3/MinIO request and does not prove the service can answer queries.
+///
+/// # Examples
+///
+/// An orchestrator uses `/healthz` to decide whether the process should be
+/// restarted. It uses `/readyz`, not this response, before sending data traffic.
 pub async fn health_check() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
-/// Readiness probe: returns 200 OK when S3 connectivity is confirmed.
+/// Checks whether the configured object store is reachable for list operations.
 ///
-/// On failure the body carries only a generic reason — the underlying
-/// `object_store` error Display embeds the S3 endpoint URL, port, and bucket
-/// name, which must not be served to an unauthenticated caller (`/readyz` is
-/// exempt from rate limiting and auth). The full error goes to the logs
-/// instead (Task 11 I3).
+/// Readiness lists an intentionally unlikely prefix through
+/// [`crate::storage::ZeppelinStore`]. A successful empty listing is sufficient;
+/// this probe does not read a namespace manifest or prove that any particular
+/// immutable artifact exists. Failure text from `object_store` may include an
+/// endpoint, port, or bucket, so only a generic reason reaches the caller.
+///
+/// # Parameters
+///
+/// - `state`: Shared application state containing the configured store handle.
+///
+/// # Returns
+///
+/// `Ok` with JSON `{"status":"ready","s3_connected":true}` and status 200
+/// when listing succeeds. Returns a direct `(503, JSON)` rejection with
+/// `s3_connected:false` when it fails; this operational body is intentionally
+/// distinct from the canonical domain-error envelope.
+///
+/// # Errors
+///
+/// The error return represents an unreachable or failing storage backend. No
+/// raw backend diagnostic is returned, and no partial mutation can occur
+/// because the probe only lists.
+///
+/// # Side Effects
+///
+/// Performs one object-store list request and logs the full backend failure on
+/// error. `/readyz` bypasses rate-limit charging.
+///
+/// # Consistency
+///
+/// A successful probe is point-in-time connectivity evidence, not authoritative
+/// namespace state and not a promise that a later request cannot fail.
+///
+/// # Examples
+///
+/// A healthy MinIO bucket returns 200 even when `__healthcheck__` contains no
+/// objects. If credentials or networking fail, operators receive 503 while the
+/// detailed endpoint error remains only in server logs.
 pub async fn readiness_check(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -203,7 +478,34 @@ pub async fn readiness_check(
     }
 }
 
-/// Serves Prometheus metrics in the text exposition format.
+/// Encodes the current Prometheus registry in text exposition format.
+///
+/// # Returns
+///
+/// Status 200, Prometheus content type, and encoded bytes on success. Encoder
+/// failure returns status 500, a plain-text content type, and diagnostic bytes;
+/// this operational response is not a canonical JSON domain-error envelope.
+///
+/// # Errors
+///
+/// Failures are represented directly in the returned response tuple rather
+/// than the Rust return type. They indicate metrics encoding failure, not a
+/// storage or manifest failure.
+///
+/// # Side Effects
+///
+/// Gathers registered metric families, allocates an output buffer, and logs an
+/// encoder failure. `/metrics` bypasses rate-limit charging.
+///
+/// # Performance
+///
+/// Work and response size scale with the number of registered metric families
+/// and label combinations. No object-store request occurs.
+///
+/// # Examples
+///
+/// Prometheus scraping `/metrics` receives lines such as request counters and
+/// active-query gauges in version 0.0.4 text format.
 pub async fn metrics_handler() -> impl IntoResponse {
     let encoder = TextEncoder::new();
     let families = prometheus::gather();
@@ -228,23 +530,79 @@ pub async fn metrics_handler() -> impl IntoResponse {
     }
 }
 
-/// Query parameters for the CPU profiling endpoint.
+/// Decoded query parameters for the feature-gated CPU profiling endpoint.
+///
+/// Serde supplies `default_profile_seconds` when `seconds` is absent. The
+/// handler subsequently clamps explicit values, so this type may temporarily
+/// contain zero or a value greater than 300 after deserialization.
 #[cfg(feature = "profiling")]
 #[derive(serde::Deserialize)]
 pub struct ProfileParams {
-    /// Duration of CPU profiling in seconds (1-300).
+    /// Requested sampling duration in seconds; [`cpu_profile`] clamps it to 1–300.
     #[serde(default = "default_profile_seconds")]
     pub seconds: u64,
 }
 
 #[cfg(feature = "profiling")]
+/// Supplies the 30-second profiling duration used when the query omits it.
+///
+/// # Returns
+///
+/// `30`, expressed as seconds.
+///
+/// # Examples
+///
+/// `/debug/pprof/cpu` samples for 30 seconds before returning its SVG.
 fn default_profile_seconds() -> u64 {
     30
 }
 
-/// GET /debug/pprof/cpu?seconds=N
+/// Samples process CPU activity and returns an SVG flamegraph.
 ///
-/// Samples CPU at 99 Hz for N seconds (clamped 1-300), returns an SVG flamegraph.
+/// The requested duration is clamped to 1–300 seconds. Sampling sleeps and
+/// renders synchronously, so the work is moved to Tokio's blocking pool rather
+/// than occupying an async worker thread.
+///
+/// ```text
+/// HTTP query -> clamp seconds -> spawn blocking profiler -> await join
+///                                      |                    |
+///                               sample + render       SVG or plain 500
+/// ```
+///
+/// # Parameters
+///
+/// - `params`: Deserialized query string; absent `seconds` defaults to 30.
+///
+/// # Returns
+///
+/// Status 200 with `image/svg+xml` bytes when profiling succeeds. Profiler
+/// setup/rendering failure or blocking-task panic returns a plain-text 500 with
+/// a diagnostic; these feature-only errors do not use [`ApiError`].
+///
+/// # Side Effects
+///
+/// Spawns one blocking task, samples the entire process at 99 Hz for the chosen
+/// duration, allocates report and SVG buffers, and emits success or failure
+/// logs. Concurrent calls may run concurrent profilers.
+///
+/// # Performance
+///
+/// The response cannot complete before the sampling duration. Profiling adds
+/// process-wide sampling overhead and blocking-pool occupancy, but does not
+/// block a Tokio async worker.
+///
+/// # Examples
+///
+/// `/debug/pprof/cpu?seconds=10` returns ten seconds of samples. A value of zero
+/// is clamped to one second; a value of 600 is clamped to 300 seconds.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `spawn_blocking` moves an owned closure to a dedicated pool and returns a
+/// typed join handle. This resembles submitting a Java `Callable` to an
+/// executor. In C it would require a thread-pool job plus explicit result and
+/// error channels. The nested `Result` distinguishes task panic/cancellation
+/// from an ordinary profiler error.
 #[cfg(feature = "profiling")]
 pub async fn cpu_profile(
     axum::extract::Query(params): axum::extract::Query<ProfileParams>,
@@ -281,6 +639,38 @@ pub async fn cpu_profile(
 }
 
 #[cfg(feature = "profiling")]
+/// Performs synchronous CPU sampling and flamegraph rendering.
+///
+/// # Parameters
+///
+/// - `seconds`: Already-clamped sampling duration. The function sleeps for this
+///   many seconds while the profiler guard records samples.
+///
+/// # Returns
+///
+/// Owned SVG bytes on success.
+///
+/// # Errors
+///
+/// Returns descriptive text when profiler initialization, report construction,
+/// flamegraph rendering, or protobuf generation fails. Sampling may already
+/// have consumed the requested time before a later rendering error occurs.
+///
+/// # Side Effects
+///
+/// Installs a 99 Hz profiler guard, blocks the calling thread for the duration,
+/// allocates report buffers, and logs SVG and protobuf sizes. The caller must
+/// keep this work off async runtime workers.
+///
+/// # Performance
+///
+/// Wall time is at least `seconds`; memory depends on the number and diversity
+/// of captured stacks plus the rendered SVG size.
+///
+/// # Examples
+///
+/// A call with `10` samples for ten seconds and returns a complete SVG buffer;
+/// no partial SVG is returned if final rendering fails.
 fn collect_profile(seconds: u64) -> Result<Vec<u8>, String> {
     use pprof::protos::Message;
 

@@ -1,4 +1,80 @@
-/// HTTP request handlers for all API endpoints.
+//! HTTP routing, middleware, and shared service composition.
+//!
+//! This module is the boundary between Axum/Tower and Zeppelin's domain
+//! services. Startup constructs one [`crate::server::AppState`],
+//! [`crate::server::build_router`] attaches it to every route, and the modules
+//! under [`crate::server::handlers`] translate HTTP requests
+//! into namespace, WAL, compaction, cache, and query operations. This layer
+//! does not make object storage or local caches authoritative: handlers must
+//! continue to honor the manifest and storage contracts enforced below it.
+//!
+//! The router deliberately gives query endpoints a lighter tracing stack than
+//! administrative and write endpoints, while preserving request IDs, metrics,
+//! timeouts, body limits, rate limits, and the query concurrency cap. Tower
+//! layers execute from the last layer added toward the handler:
+//!
+//! ```text
+//! request
+//!   |
+//!   v
+//! normalize selected bare error responses             (all routes)
+//!   |
+//!   v
+//! request ID -> body limits -> timeout -> rate limit
+//!   |
+//!   v
+//! full trace (non-query only) -> HTTP metrics
+//!   |
+//!   v
+//! query semaphore (query only) -> handler -> domain/storage services
+//!   |
+//!   v
+//! response unwinds through the same layers in reverse order
+//! ```
+//!
+//! The request ID uses task-local state, not a process-global variable, so
+//! concurrent requests cannot overwrite one another's correlation value. Rate
+//! limiting and query admission are separate controls: a token bucket limits a
+//! client over time, while a [`Semaphore`](tokio::sync::Semaphore) bounds the
+//! number of query futures executing at once.
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`crate::server::AppState`] to see the domain services available
+//!    to handlers.
+//! 2. Read [`crate::server::build_router`] for routes and middleware order.
+//! 3. Read [`crate::server::request_id`],
+//!    [`crate::server::normalize_error_responses`], and
+//!    [`crate::server::http_metrics`] for correlation and observability.
+//! 4. Read [`crate::server::rate_limit`] and
+//!    [`crate::server::concurrency_limit`] for admission control.
+//! 5. Continue into [`crate::server::handlers`] for endpoint response mapping.
+//!
+//! ## Lifecycle and invariants
+//!
+//! - [`crate::startup::build_app`] owns service construction and background-task
+//!   startup. This module only composes those handles into a router.
+//! - [`crate::startup::shutdown_background_tasks`] stops compaction; dropping a
+//!   router alone is not Zeppelin's graceful-shutdown protocol.
+//! - A client-supplied `X-Forwarded-For` value affects rate limiting only when
+//!   the socket peer belongs to a configured trusted-proxy CIDR.
+//! - Middleware-generated 404, 405, 408, and 413 responses use the same public
+//!   envelope shape as handler errors; internal error details stay in logs.
+//! - Health, readiness, and metrics bypass token-bucket charging so operators
+//!   can observe an overloaded service.
+//!
+//! ## Rust concepts used here
+//!
+//! [`Arc`](std::sync::Arc) gives cloned [`crate::server::AppState`] values shared
+//! ownership of expensive services. Cloning an `Arc` increments a reference count; it does
+//! not duplicate a cache, compactor, or WAL client. This resembles sharing a
+//! Java reference, while also making cross-thread ownership explicit. In C it
+//! replaces an informal pointer/refcount convention with compiler-checked
+//! cleanup. [`DashMap`](dashmap::DashMap) permits concurrent token-bucket access without one
+//! application-wide mutex, and RAII releases each semaphore permit even when a
+//! request future is cancelled.
+
+/// HTTP handlers and shared response helpers for every API endpoint.
 pub mod handlers;
 
 use std::hash::{Hash, Hasher};
@@ -35,27 +111,61 @@ use crate::wal::{LeaseManager, WalReader, WalWriter};
 use self::handlers::{config as config_handler, namespace, query, vectors, ApiError};
 
 tokio::task_local! {
-    /// The current request's ID, set by the `request_id` middleware and read by
-    /// the error envelope (`handlers::error_response`) so error bodies can carry
-    /// `request_id` without threading it through every handler signature.
+    /// Correlation ID scoped to the currently executing request future.
+    ///
+    /// [`request_id`] and [`query_request_id`] establish the scope;
+    /// [`handlers::error_response`] reads it without adding an ID parameter to
+    /// every handler and domain function. Tokio keeps values isolated between
+    /// concurrent tasks.
     static REQUEST_ID: String;
 }
 
-/// The current request's ID if inside a `REQUEST_ID` scope, else `None`.
+/// Returns the correlation ID associated with the current request task.
+///
+/// # Returns
+///
+/// An owned copy of the ID inside [`request_id`] or [`query_request_id`], or
+/// `None` when called outside either middleware scope. Cloning lets an error
+/// response retain the ID after the task-local borrow ends.
+///
+/// # Examples
+///
+/// A handler reached through [`build_router`] receives `Some(id)`. Startup code
+/// calling this function before serving a request receives `None`.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Tokio task-local storage is analogous to Java `ThreadLocal` in purpose, but
+/// follows an async task when that task moves between runtime threads. In C an
+/// explicit request-context pointer would normally be threaded through calls.
 pub fn current_request_id() -> Option<String> {
     REQUEST_ID.try_with(|id| id.clone()).ok()
 }
 
-/// Rate-limit bucket class.
+/// Selects the independent token budget charged by an HTTP operation.
+///
+/// Reads and writes intentionally do not consume one another's burst capacity.
+/// The classification is part of server admission control, not a statement
+/// about whether the eventual domain operation performs object-store reads or
+/// writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RateLimitClass {
-    /// Read/query route.
+    /// Query, lookup, or other route classified as read traffic.
     Read,
-    /// Write/admin route.
+    /// Mutation or administrative route classified as write traffic.
     Write,
 }
 
 impl RateLimitClass {
+    /// Returns the stable metrics label for this budget class.
+    ///
+    /// # Returns
+    ///
+    /// The static label `"read"` or `"write"`; no allocation occurs.
+    ///
+    /// # Examples
+    ///
+    /// A rejected query increments the counter carrying the `"read"` label.
     fn as_str(self) -> &'static str {
         match self {
             Self::Read => "read",
@@ -64,82 +174,165 @@ impl RateLimitClass {
     }
 }
 
-/// Client identity resolved by the rate-limit middleware.
+/// Carries the trusted client identity from middleware into a handler.
+///
+/// [`rate_limit`] inserts this value into request extensions after applying
+/// trusted-proxy rules. Batch query handling reuses it to charge additional
+/// entries to the same bucket instead of reparsing headers.
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimitIdentity {
-    /// Client IP after trusted-proxy extraction.
+    /// Socket peer or rightmost untrusted forwarded address selected by policy.
     pub ip: IpAddr,
 }
 
-/// Key for one client/class token bucket.
+/// Identifies one client's read or write token bucket.
+///
+/// The same IP owns two independent entries, one for each [`RateLimitClass`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimitKey {
+    /// Trusted client address used to partition rate-limit state.
     ip: IpAddr,
+    /// Independent read or write budget associated with the address.
     class: RateLimitClass,
 }
 
 impl Hash for RateLimitKey {
+    /// Feeds both identity components into a hash-map hasher.
+    ///
+    /// # Parameters
+    ///
+    /// - `state`: Hasher selected by the surrounding [`DashMap`].
+    ///
+    /// # Side Effects
+    ///
+    /// Mutates only the hasher state; the key remains unchanged.
+    ///
+    /// # Examples
+    ///
+    /// `203.0.113.7/read` and `203.0.113.7/write` hash as distinct keys even
+    /// though they share the same client address.
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.ip.hash(state);
         self.class.hash(state);
     }
 }
 
-/// Token bucket state.
+/// Stores the mutable state for one client's token bucket.
+///
+/// Buckets begin with the configured burst capacity. Refills use elapsed
+/// monotonic time, and `consume_rate_limit` updates `last_seen` so idle state
+/// can be reclaimed without depending on wall-clock changes.
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimitBucket {
+    /// Whole tokens currently available for an atomic charge.
     tokens: u64,
+    /// Monotonic instant from which the next refill is calculated.
     last_refill: Instant,
+    /// Monotonic instant of the most recent attempted charge.
     last_seen: Instant,
 }
 
-/// Shared application state injected into all handlers via axum's State extractor.
+/// Owns the shared service handles injected into every HTTP handler.
+///
+/// Axum clones this value when composing or extracting state. The clones share
+/// service instances through [`Arc`]; they do not clone manifests, disk caches,
+/// or background tasks. The plain [`ZeppelinStore`] handle is likewise a cheap
+/// clone of the storage abstraction. S3/MinIO and its published manifest remain
+/// authoritative; the cache fields here only accelerate access.
+///
+/// ```text
+///                         AppState clone per request
+///                                   |
+///          +------------------------+-------------------------+
+///          |                        |                         |
+///          v                        v                         v
+/// shared domain/store Arcs   shared cache/config Arcs   admission-control Arcs
+///          |                        |                         |
+///          +------------------------+-------------------------+
+///                                   |
+///                                   v
+///                      handler borrows the extracted state
+/// ```
+///
+/// [`crate::startup::build_app`] creates the production value. Tests may set
+/// [`AppState::namespace_name_prefix`] and use isolated store prefixes, but the
+/// router and handlers are otherwise the same production code.
 #[derive(Clone)]
 pub struct AppState {
-    /// S3-backed object store for all persistence operations.
+    /// Storage abstraction through which handlers reach authoritative S3/MinIO.
     pub store: ZeppelinStore,
-    /// Manages namespace CRUD and metadata.
+    /// Domain service for namespace CRUD and authoritative metadata changes.
     pub namespace_manager: Arc<NamespaceManager>,
     /// Optional prefix for server-generated namespace names.
     ///
     /// Production leaves this unset. Test servers use it to keep API-created
     /// namespaces under the same random harness prefix as direct storage keys.
     pub namespace_name_prefix: Option<String>,
-    /// Writes WAL fragments to S3.
+    /// Service that writes immutable WAL fragments and publishes visibility.
     pub wal_writer: Arc<WalWriter>,
-    /// Reads WAL fragments from S3.
+    /// Service that discovers visible WAL fragments through the manifest.
     pub wal_reader: Arc<WalReader>,
     /// Lease-protected compactor shared by background and manual admin paths.
     pub compactor: Arc<Compactor>,
     /// Per-namespace compaction lease manager.
     pub lease_manager: Arc<LeaseManager>,
-    /// Global server and indexing configuration.
+    /// Immutable boot-time server, storage, indexing, and compaction settings.
     pub config: Arc<Config>,
     /// Trusted proxy CIDRs parsed once at startup for rate-limit client-IP resolution.
     pub trusted_proxies: Arc<[IpCidr]>,
-    /// Runtime-mutable query configuration snapshots.
+    /// Atomically replaceable query settings read as consistent snapshots.
     pub runtime_query_config: Arc<RuntimeQueryConfig>,
     /// Boot-time validation bounds for runtime query knob updates.
     pub query_knob_bounds: QueryKnobBounds,
-    /// LRU disk cache for segment data.
+    /// Disposable LRU disk cache for immutable segment data.
     pub cache: Arc<DiskCache>,
-    /// In-memory manifest cache with TTL.
+    /// Disposable in-memory manifest cache with a bounded freshness policy.
     pub manifest_cache: Arc<ManifestCache>,
     /// Optional background warm-set hydrator.
     pub hydrator: Option<Arc<SegmentHydrator>>,
-    /// In-memory cache for WAL-level full-text search indexes.
+    /// Disposable in-memory cache for WAL-level full-text search indexes.
     pub fts_cache: Arc<WalFtsCache>,
-    /// Semaphore that caps concurrent in-flight queries.
+    /// Non-blocking admission semaphore for in-flight query handlers.
     pub query_semaphore: Arc<Semaphore>,
-    /// Per-client, per-class token bucket state for rate limiting.
+    /// Concurrent, process-local token buckets keyed by client and traffic class.
     pub rate_limiters: Arc<DashMap<RateLimitKey, RateLimitBucket>>,
 }
 
-/// Middleware that increments `HTTP_REQUESTS_TOTAL` for every response
-/// and logs request details (IP, path, status, latency) via structured tracing.
+/// Records HTTP response counts, latency, and structured request context.
 ///
-/// Uses `MatchedPath` to normalize route patterns (avoids unbounded cardinality
-/// from namespace names in URLs).
+/// The metrics label uses Axum's normalized [`MatchedPath`] rather than the raw
+/// URI, preventing namespace and vector identifiers from creating unbounded
+/// Prometheus label cardinality. The structured log still includes the raw path
+/// for diagnosis. Only requests that reach this inner middleware are counted;
+/// an outer body-limit or rate-limit rejection may return before this function
+/// runs.
+///
+/// # Parameters
+///
+/// - `addr`: Socket peer supplied by Axum's connect-info service.
+/// - `matched_path`: Normalized route template, or `None` for an unmatched path.
+/// - `request`: Owned request forwarded to the next service exactly once.
+/// - `next`: Remaining middleware and handler stack.
+///
+/// # Returns
+///
+/// The downstream response, unchanged.
+///
+/// # Side Effects
+///
+/// Increments `HTTP_REQUESTS_TOTAL` after downstream completion and emits one
+/// structured `request` log with peer IP, method, raw path, status, latency,
+/// and the task-local request ID when available.
+///
+/// # Performance
+///
+/// Adds one monotonic timer, small string allocations for metric labels and
+/// logging, and a Prometheus counter update. It performs no storage I/O.
+///
+/// # Examples
+///
+/// Requests for `/v1/namespaces/books` and `/v1/namespaces/movies` are logged
+/// with their concrete paths but share the same route-pattern metric label.
 #[allow(clippy::unwrap_used)]
 pub async fn http_metrics(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -173,12 +366,44 @@ pub async fn http_metrics(
     response
 }
 
-/// Middleware that attaches a request ID to every request.
+/// Correlates a non-query request, its logs, and its response with one ID.
 ///
-/// - Respects an incoming `x-request-id` header if present.
-/// - Otherwise generates a UUID v4.
-/// - Creates a tracing span so all downstream logs include the request ID.
-/// - Returns the request ID in the response `x-request-id` header.
+/// A text-compatible incoming `x-request-id` is preserved; otherwise the
+/// server generates a UUID v4. Downstream execution occurs inside both a Tokio
+/// task-local scope and a tracing span, and the selected value is echoed in the
+/// response header.
+///
+/// # Parameters
+///
+/// - `request`: Owned request whose optional header supplies the correlation ID.
+/// - `next`: Remaining middleware and handler stack.
+///
+/// # Returns
+///
+/// The downstream response with `x-request-id` inserted or replaced.
+///
+/// # Panics
+///
+/// Header insertion assumes the chosen ID can be represented as an HTTP header
+/// value. That is guaranteed for a UUID and for a value already accepted by
+/// `HeaderValue::to_str`; a panic would indicate that invariant changed.
+///
+/// # Side Effects
+///
+/// Generates randomness when no usable ID was supplied and creates an INFO
+/// tracing span around downstream work. It performs no domain or storage I/O.
+///
+/// # Examples
+///
+/// A request carrying `x-request-id: import-42` receives the same response
+/// header, and handler errors include `"request_id":"import-42"`. A request
+/// without that header receives a generated UUID instead.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `REQUEST_ID.scope` binds data to the async future, and `.instrument` binds a
+/// tracing span to that future. Unlike a Java thread-local or C thread-local,
+/// both remain correct when Tokio polls the future on different worker threads.
 #[allow(clippy::unwrap_used)]
 pub async fn request_id(request: Request<axum::body::Body>, next: Next) -> Response {
     let id = request
@@ -202,11 +427,31 @@ pub async fn request_id(request: Request<axum::body::Body>, next: Next) -> Respo
         .await
 }
 
-/// Minimal request-id middleware for the query hot path.
+/// Correlates a query request without creating the general-purpose trace span.
 ///
-/// This preserves the lightweight router's no-TraceLayer/no-span shape while
-/// still returning `x-request-id` and making the id available to error
-/// envelopes and explicit query-route logs.
+/// The selection and response-header contract matches [`request_id`], but the
+/// query handler performs its own targeted instrumentation. Avoiding an extra
+/// span and `TraceLayer` traversal keeps the hot path lightweight while still
+/// making [`current_request_id`] available to errors and explicit query logs.
+///
+/// # Parameters
+///
+/// - `request`: Owned query request and optional client correlation header.
+/// - `next`: Remaining query middleware and handler stack.
+///
+/// # Returns
+///
+/// The downstream response with the chosen `x-request-id` header.
+///
+/// # Panics
+///
+/// As in [`request_id`], insertion relies on the generated or previously parsed
+/// ID being a valid HTTP header value.
+///
+/// # Examples
+///
+/// A nearest-neighbor query with no ID gets a generated ID in both a canonical
+/// error envelope and the response header, without a router-level trace span.
 #[allow(clippy::unwrap_used)]
 pub async fn query_request_id(request: Request<axum::body::Body>, next: Next) -> Response {
     let id = request
@@ -227,15 +472,48 @@ pub async fn query_request_id(request: Request<axum::body::Body>, next: Next) ->
         .await
 }
 
-/// Middleware that normalizes middleware/layer-produced error responses into
-/// the canonical JSON envelope (Task 11 I4).
+/// Rewrites selected bare middleware errors into the canonical JSON envelope.
 ///
-/// Tower layers like `TimeoutLayer` (408) and `RequestBodyLimitLayer` (413)
-/// emit bare/plain-text bodies that never pass through a handler. This runs
-/// OUTERMOST and rewrites any response whose status we own but whose body is
-/// not already our JSON envelope (detected via `content-type`). Handler and
-/// `ApiError` responses are already `application/json`, so they pass through
-/// untouched — this only catches the layer-produced stragglers.
+/// Tower body-limit and timeout layers can produce responses before a handler
+/// creates an [`ApiError`]. Because [`build_router`] installs this middleware
+/// outermost, it sees those responses on the way out. Statuses recognized by
+/// [`handlers::envelope_for_status`] are rewritten unless their content type
+/// already begins with `application/json`; JSON is treated as evidence that a
+/// handler already rendered its intended body.
+///
+/// ```text
+/// downstream response
+///        |
+///        +-- status not owned ----------------------> unchanged
+///        |
+///        +-- owned status + application/json ------> unchanged
+///        |
+///        `-- owned status + bare body
+///                       |
+///                       v
+///             canonical JSON + request ID
+/// ```
+///
+/// # Parameters
+///
+/// - `request`: Owned request; its incoming ID is retained as a fallback.
+/// - `next`: Complete inner router stack.
+///
+/// # Returns
+///
+/// Either the original response or a canonical 404, 405, 408, or 413 envelope.
+///
+/// # Side Effects
+///
+/// May discard a bare downstream response body and allocate a JSON replacement.
+/// It performs no storage work and emits no additional error log.
+///
+/// # Examples
+///
+/// If `RequestBodyLimitLayer` rejects a four-megabyte body with status 413,
+/// this function replaces Tower's plain response with code
+/// `PAYLOAD_TOO_LARGE`. A handler-produced JSON 404 remains unchanged so its
+/// more specific `NAMESPACE_NOT_FOUND` code is preserved.
 pub async fn normalize_error_responses(request: Request<axum::body::Body>, next: Next) -> Response {
     // Capture the request's id BEFORE running downstream: this layer sits above
     // the request_id middleware (and its REQUEST_ID scope), so when it rewrites
@@ -270,10 +548,40 @@ pub async fn normalize_error_responses(request: Request<axum::body::Body>, next:
     handlers::render_status_envelope(status, rid)
 }
 
-/// Middleware that limits concurrent query execution.
+/// Admits a query only when an in-flight semaphore permit is immediately free.
 ///
-/// Acquires a permit from the query semaphore before forwarding the request.
-/// Returns 503 Service Unavailable when all permits are exhausted.
+/// This is load shedding, not a waiting queue. The permit remains alive across
+/// the downstream `.await` and is released by RAII on completion, cancellation,
+/// or timeout. Exhaustion returns the canonical 503 `CONCURRENCY_LIMIT` error
+/// with a one-second retry hint.
+///
+/// # Parameters
+///
+/// - `state`: Shared application state containing the query semaphore.
+/// - `request`: Owned query request to run after admission.
+/// - `next`: Query handler stack protected by the permit.
+///
+/// # Returns
+///
+/// The downstream response when admitted, or an immediate 503 response when no
+/// permit is available.
+///
+/// # Side Effects
+///
+/// Temporarily decrements the semaphore's available-permit count. It does not
+/// spawn work or mutate authoritative data itself.
+///
+/// # Examples
+///
+/// With a limit of 32, the first 32 simultaneous queries run. A 33rd request is
+/// rejected rather than queued; once any running future ends, a later request
+/// can acquire the returned permit.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `_permit` is an RAII guard. It resembles a Java `Semaphore` permit released
+/// in `finally`, or a C cleanup path that must always call `sem_post`, but Rust
+/// runs `Drop` automatically on every normal or cancellation path.
 pub async fn concurrency_limit(
     State(state): State<AppState>,
     request: Request<axum::body::Body>,
@@ -285,18 +593,51 @@ pub async fn concurrency_limit(
     }
 }
 
-/// Parsed IP CIDR range used for trusted-proxy matching.
+/// Represents one validated IPv4 or IPv6 trusted-proxy CIDR.
+///
+/// Host bits need not be zero in configuration because membership comparison
+/// masks both this stored address and the candidate. Address-family mismatches
+/// never match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpCidr {
+    /// Configured address whose first `prefix` bits define the network.
     network: IpAddr,
+    /// Significant leading bits, bounded to 32 for IPv4 or 128 for IPv6.
     prefix: u8,
 }
 
-/// Resolve the rate-limit client IP from a peer IP and optional XFF header.
+/// Resolves the client address used to partition rate-limit buckets.
 ///
-/// X-Forwarded-For is trusted only when `peer_ip` belongs to one of
-/// `trusted_proxies`. When trusted, the selected client is the rightmost XFF
-/// address that is not itself trusted.
+/// `X-Forwarded-For` is ignored unless `peer_ip` belongs to a configured
+/// trusted proxy. For a trusted peer, entries are scanned from right to left;
+/// blank, malformed, and still-trusted hops are skipped, and the first
+/// untrusted address becomes the client. If no such address exists, the socket
+/// peer remains the identity.
+///
+/// # Parameters
+///
+/// - `peer_ip`: Address of the TCP peer observed by the server.
+/// - `x_forwarded_for`: Raw comma-separated forwarding header, when present and
+///   text-compatible.
+/// - `trusted_proxies`: CIDRs validated once during startup.
+///
+/// # Returns
+///
+/// The peer address or rightmost untrusted forwarded address. The current
+/// implementation is infallible and always returns `Ok`; malformed header
+/// entries are deliberately ignored rather than treated as configuration
+/// failures.
+///
+/// # Errors
+///
+/// No error is currently produced. The `Result` keeps the middleware boundary
+/// able to propagate future identity-policy failures as [`ZeppelinError`].
+///
+/// # Examples
+///
+/// With trusted ranges `127.0.0.1/32` and `10.0.0.0/8`, a loopback peer and
+/// header `198.51.100.7, 10.1.2.3, 127.0.0.1` resolve to `198.51.100.7`. The
+/// same header from an untrusted peer is ignored, preventing address spoofing.
 pub fn resolve_rate_limit_client_ip(
     peer_ip: IpAddr,
     x_forwarded_for: Option<&str>,
@@ -327,7 +668,35 @@ pub fn resolve_rate_limit_client_ip(
     Ok(peer_ip)
 }
 
-/// Parse configured trusted-proxy CIDR strings into reusable matcher ranges.
+/// Parses all configured trusted-proxy CIDRs before the server accepts traffic.
+///
+/// # Parameters
+///
+/// - `values`: Borrowed configuration entries in `address/prefix` form.
+///
+/// # Returns
+///
+/// An owned vector in configuration order. An empty input produces an empty
+/// vector, which disables all trust in forwarded addresses.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::Config`] for the first missing slash, invalid IP,
+/// non-numeric prefix, or prefix wider than its address family. No partially
+/// parsed vector is returned.
+///
+/// # Examples
+///
+/// `127.0.0.1/32` and `10.0.0.0/8` become two reusable matchers. `10.0.0.0/33`
+/// fails startup validation rather than silently broadening or narrowing trust.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The iterator pipeline borrows every input string and uses `collect` over
+/// `Result`. Rust stops at the first error and returns it; successful parsed
+/// values accumulated before that point are dropped automatically. Java often
+/// expresses this with a loop and exception, while C needs explicit cleanup of
+/// the partial array.
 pub fn parse_trusted_proxies(values: &[String]) -> Result<Vec<IpCidr>, ZeppelinError> {
     values
         .iter()
@@ -335,6 +704,25 @@ pub fn parse_trusted_proxies(values: &[String]) -> Result<Vec<IpCidr>, ZeppelinE
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// Parses and validates one trusted-proxy CIDR entry.
+///
+/// # Parameters
+///
+/// - `value`: Borrowed `IPv4/prefix` or `IPv6/prefix` text from configuration.
+///
+/// # Returns
+///
+/// A compact copyable matcher containing the parsed address and prefix width.
+///
+/// # Errors
+///
+/// Returns a configuration error for malformed structure, address, prefix, or
+/// address-family bounds. The error includes the offending configuration text.
+///
+/// # Examples
+///
+/// `2001:db8::/32` succeeds; `2001:db8::/129` is rejected because IPv6 has only
+/// 128 address bits.
 fn parse_ip_cidr(value: &str) -> Result<IpCidr, ZeppelinError> {
     let (ip, prefix) = value.split_once('/').ok_or_else(|| {
         ZeppelinError::Config(format!("trusted proxy {value:?} must be an IP CIDR range"))
@@ -358,6 +746,20 @@ fn parse_ip_cidr(value: &str) -> Result<IpCidr, ZeppelinError> {
 }
 
 impl IpCidr {
+    /// Reports whether an address belongs to this CIDR's network prefix.
+    ///
+    /// # Parameters
+    ///
+    /// - `ip`: Candidate peer or forwarded address.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the address family matches and the leading `prefix` bits are
+    /// equal; `false` for a mismatch or a different address family.
+    ///
+    /// # Examples
+    ///
+    /// `10.4.5.6` belongs to `10.0.0.0/8`; an IPv6 address does not.
     fn contains(self, ip: IpAddr) -> bool {
         match (self.network, ip) {
             (IpAddr::V4(network), IpAddr::V4(ip)) => ipv4_in_prefix(ip, network, self.prefix),
@@ -367,6 +769,26 @@ impl IpCidr {
     }
 }
 
+/// Compares the significant leading bits of two IPv4 addresses.
+///
+/// # Parameters
+///
+/// - `ip`: Candidate address.
+/// - `network`: Configured address that defines the network bits.
+/// - `prefix`: Leading-bit count already validated to be at most 32.
+///
+/// # Returns
+///
+/// `true` when both masked values match. Prefix zero matches every IPv4 address.
+///
+/// # Panics
+///
+/// A prefix greater than 32 can make the mask shift invalid. Callers preserve
+/// the bound established by `parse_ip_cidr`.
+///
+/// # Examples
+///
+/// `192.0.2.99` matches `192.0.2.0/24` but not `192.0.3.0/24`.
 fn ipv4_in_prefix(ip: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
     let ip = u32::from(ip);
     let network = u32::from(network);
@@ -378,6 +800,26 @@ fn ipv4_in_prefix(ip: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
     (ip & mask) == (network & mask)
 }
 
+/// Compares the significant leading bits of two IPv6 addresses.
+///
+/// # Parameters
+///
+/// - `ip`: Candidate address.
+/// - `network`: Configured address that defines the network bits.
+/// - `prefix`: Leading-bit count already validated to be at most 128.
+///
+/// # Returns
+///
+/// `true` when both masked values match. Prefix zero matches every IPv6 address.
+///
+/// # Panics
+///
+/// A prefix greater than 128 can make the mask shift invalid. Callers preserve
+/// the bound established by `parse_ip_cidr`.
+///
+/// # Examples
+///
+/// `2001:db8::1` matches `2001:db8::/32`; `2001:db9::1` does not.
 fn ipv6_in_prefix(ip: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
     let ip = u128::from(ip);
     let network = u128::from(network);
@@ -389,12 +831,53 @@ fn ipv6_in_prefix(ip: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
     (ip & mask) == (network & mask)
 }
 
-/// Per-client token-bucket rate limiter.
+/// Applies the route-level, per-client token-bucket admission policy.
 ///
-/// Resolves client identity from X-Forwarded-For only when the socket peer is
-/// a configured trusted proxy, then applies separate read/write buckets.
-/// Skips rate limiting for health/readiness/metrics endpoints.
-/// Returns 429 with `Retry-After` header when tokens are exhausted.
+/// The function classifies the request, resolves a spoof-resistant identity,
+/// stores that identity in request extensions, and charges one token. Read and
+/// write traffic use independent buckets. Health, readiness, and metrics return
+/// `None` from route classification and pass through without a bucket.
+///
+/// ```text
+/// method + path ----> exempt ------------------------------> handler
+///       |
+///       v
+/// peer + trusted XFF -> client IP -> read/write bucket -> token available?
+///                                                    | yes       | no
+///                                                    v           v
+///                                                 handler    JSON 429
+/// ```
+///
+/// # Parameters
+///
+/// - `state`: Shared configuration, trusted CIDRs, metrics, and bucket map.
+/// - `addr`: Socket peer supplied by the connection service.
+/// - `request`: Owned request whose method, path, headers, and extensions may be
+///   inspected or updated.
+/// - `next`: Remaining middleware and route handler.
+///
+/// # Returns
+///
+/// The downstream response when exempt or admitted; otherwise a canonical 429
+/// response carrying `Retry-After`.
+///
+/// # Side Effects
+///
+/// Creates, refills, charges, or evicts process-local buckets; inserts
+/// [`RateLimitIdentity`] into admitted non-exempt requests; and records/logs a
+/// rejection. It never writes object storage.
+///
+/// # Consistency
+///
+/// Bucket state is local to one Zeppelin process and is not a distributed
+/// quota. Restarting a stateless node resets its buckets. This admission state
+/// has no authority over manifests or namespace data.
+///
+/// # Examples
+///
+/// A write client with burst capacity 100 can issue 100 immediate namespace
+/// mutations. The next write receives 429 until tokens refill. A readiness
+/// probe from the same address remains uncharged.
 pub async fn rate_limit(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -426,11 +909,55 @@ pub async fn rate_limit(
     }
 }
 
-/// Consume `tokens` from the per-client rate limiter.
+/// Atomically charges one client's selected rate-limit bucket.
 ///
-/// Batch query calls this after deserialization to charge each entry rather
-/// than each HTTP request. The route-level middleware has already consumed one
-/// token, so handlers should pass only the additional token count.
+/// Buckets start full, refill in whole tokens according to monotonic elapsed
+/// time, and never exceed the configured burst. The charge is all-or-nothing.
+/// Batch query invokes this after deserialization so a request with `N` entries
+/// costs `N` tokens: [`rate_limit`] already charged one, and the handler charges
+/// `N - 1` here.
+///
+/// # Parameters
+///
+/// - `state`: Shared configuration and concurrent bucket map.
+/// - `ip`: Trusted client identity established by middleware.
+/// - `class`: Independent read or write budget to charge.
+/// - `tokens_to_consume`: Additional whole tokens required by the operation.
+///
+/// # Returns
+///
+/// `Ok(())` when charging is disabled, zero tokens were requested, or the full
+/// charge succeeds.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::RateLimitExceeded`] when the bucket lacks the full
+/// requested amount. No tokens are deducted on that failure. The error carries
+/// the computed whole-second retry hint.
+///
+/// # Side Effects
+///
+/// Scans out idle buckets, then creates or mutates one [`DashMap`] entry. A
+/// rejection increments `RATE_LIMITED_TOTAL` and emits a structured warning.
+///
+/// # Performance
+///
+/// Charging one bucket is expected constant time, but idle eviction calls
+/// `DashMap::retain` and therefore scans all current buckets on every nonzero,
+/// enabled charge. No network or object-store request occurs.
+///
+/// # Examples
+///
+/// If a read bucket has 10 tokens and a batch needs 4 additional tokens, the
+/// function succeeds and leaves 6. If it needs 11, the function returns 429
+/// metadata and leaves all 10 available.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `DashMap::entry` provides a scoped mutable guard for one key. The guard is
+/// dropped before this function performs the later lookup and logging. Rust's
+/// guard lifetime prevents retaining an unlocked raw pointer to the bucket, a
+/// hazard that would need manual discipline with a C hash table and lock.
 pub(crate) fn consume_rate_limit(
     state: &AppState,
     ip: IpAddr,
@@ -506,6 +1033,20 @@ pub(crate) fn consume_rate_limit(
     }
 }
 
+/// Selects the sustained rate and burst capacity for a traffic class.
+///
+/// # Parameters
+///
+/// - `config`: Borrowed immutable boot configuration.
+/// - `class`: Read or write budget selector.
+///
+/// # Returns
+///
+/// `(tokens_per_second, maximum_tokens)` converted to `u64` for arithmetic.
+///
+/// # Examples
+///
+/// With read settings `100/200`, [`RateLimitClass::Read`] returns `(100, 200)`.
 fn rate_limit_settings(config: &Config, class: RateLimitClass) -> (u64, u64) {
     match class {
         RateLimitClass::Read => (
@@ -519,11 +1060,49 @@ fn rate_limit_settings(config: &Config, class: RateLimitClass) -> (u64, u64) {
     }
 }
 
+/// Estimates the whole-second delay needed to refill a token deficit.
+///
+/// # Parameters
+///
+/// - `available`: Tokens currently present in the bucket.
+/// - `requested`: Tokens required by the rejected atomic charge.
+/// - `rps`: Positive refill rate in tokens per second.
+///
+/// # Returns
+///
+/// The deficit divided by the refill rate, rounded up and clamped to at least
+/// one second.
+///
+/// # Panics
+///
+/// Division requires `rps > 0`. [`consume_rate_limit`] returns before calling
+/// this helper when the configured rate is zero.
+///
+/// # Examples
+///
+/// With 2 available, 12 requested, and 4 tokens per second, the hint is
+/// `ceil(10 / 4) = 3` seconds.
 fn retry_after_secs(available: u64, requested: u64, rps: u64) -> u64 {
     let deficit = requested.saturating_sub(available).max(1);
     deficit.div_ceil(rps).max(1)
 }
 
+/// Classifies an HTTP method and path for route-level token charging.
+///
+/// # Parameters
+///
+/// - `method`: Request method after HTTP parsing.
+/// - `path`: Raw URI path without the query string.
+///
+/// # Returns
+///
+/// `None` for `/healthz`, `/readyz`, and `/metrics`; read class for every GET,
+/// query endpoint, or vector-get endpoint; write class for everything else.
+///
+/// # Examples
+///
+/// `POST /v1/namespaces/books/query` is read traffic even though it uses POST;
+/// `DELETE /v1/namespaces/books` is write traffic.
 fn rate_limit_class(method: &Method, path: &str) -> Option<RateLimitClass> {
     if path == "/healthz" || path == "/readyz" || path == "/metrics" {
         return None;
@@ -539,6 +1118,27 @@ fn rate_limit_class(method: &Method, path: &str) -> Option<RateLimitClass> {
     }
 }
 
+/// Removes token buckets whose clients have been inactive for the configured TTL.
+///
+/// # Parameters
+///
+/// - `rate_limiters`: Shared process-local bucket map.
+/// - `now`: One monotonic instant used for every entry in this eviction pass.
+/// - `idle_ttl`: Maximum permitted duration since `last_seen`.
+///
+/// # Side Effects
+///
+/// Deletes entries with age greater than or equal to the TTL. Fresh entries and
+/// their token counts remain unchanged.
+///
+/// # Performance
+///
+/// Scans the map and briefly locks shards as required by [`DashMap::retain`].
+///
+/// # Examples
+///
+/// With a ten-second TTL, a bucket last seen 60 seconds ago is removed while a
+/// bucket touched now remains available.
 fn evict_idle_rate_limiters(
     rate_limiters: &DashMap<RateLimitKey, RateLimitBucket>,
     now: Instant,
@@ -547,7 +1147,64 @@ fn evict_idle_rate_limiters(
     rate_limiters.retain(|_, bucket| now.duration_since(bucket.last_seen) < idle_ttl);
 }
 
-/// Builds the axum router with all routes, middleware, and shared state.
+/// Builds the complete Axum service from initialized Zeppelin dependencies.
+///
+/// Query routes and all other routes are composed separately, then merged.
+/// Queries receive dedicated concurrency admission and a lighter request-ID
+/// path; other routes receive Tower HTTP tracing. Both groups enforce the same
+/// body size, timeout, rate-limit, metrics, and canonical-error policies.
+///
+/// Layer order is security- and observability-sensitive. Axum runs the last
+/// attached layer first on requests. The effective request paths are:
+///
+/// ```text
+/// query:
+/// normalize -> query ID -> body limits -> timeout -> rate limit
+///           -> HTTP metrics -> concurrency permit -> query handler
+///
+/// other:
+/// normalize -> request ID -> TraceLayer -> body limits -> timeout
+///           -> rate limit -> HTTP metrics -> endpoint handler
+/// ```
+///
+/// # Parameters
+///
+/// - `state`: Fully initialized application state. Configuration has already
+///   passed startup validation, and background-service ownership remains with
+///   [`crate::startup::build_app`].
+///
+/// # Returns
+///
+/// An owned [`Router`] ready for `into_make_service_with_connect_info` or the
+/// test harness. The router owns a cloneable shared state handle; it does not
+/// return separate service instances per route.
+///
+/// # Side Effects
+///
+/// Router construction allocates route and middleware service structures but
+/// performs no network bind, object-store request, or background-task spawn.
+/// The optional profiling route is included only with the `profiling` feature.
+///
+/// # Consistency
+///
+/// This function establishes HTTP policy only. Handler services remain
+/// responsible for manifest authority, immutable artifact publication, lease
+/// fencing, and cache-as-optimization rules.
+///
+/// # Examples
+///
+/// Production startup passes one [`AppState`] and later serves the returned
+/// router with socket connect information. An oversized query can be rejected
+/// by the outer body limit before it consumes a rate token or query permit; an
+/// admitted query then holds a permit only during handler execution.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Tower's `Layer` composition is a typed decorator stack. It resembles nested
+/// Java servlet filters or C function-pointer wrappers, but generics assemble
+/// the chain at compile time. Moving `state` into `with_state` transfers the
+/// final owned handle to the router; earlier `state.clone()` calls clone the
+/// internal shared handles needed to configure middleware.
 pub fn build_router(state: AppState) -> Router {
     let timeout = Duration::from_secs(state.config.server.request_timeout_secs);
     let body_limit = state.config.server.max_request_body_mb * 1024 * 1024;
@@ -664,8 +1321,15 @@ pub fn build_router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod tests {
+    //! Unit tests for server-local admission helpers that need no storage backend.
+
     use super::*;
 
+    /// Confirms idle cleanup removes stale clients without disturbing active buckets.
+    ///
+    /// This catches both inverted TTL comparisons and accidental whole-map
+    /// clearing. The test supplies one old read bucket and one fresh write
+    /// bucket, then verifies their independent survival outcomes.
     #[test]
     fn rate_limiter_eviction_removes_idle_entries() {
         let buckets = DashMap::new();
