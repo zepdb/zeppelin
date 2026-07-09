@@ -1,3 +1,139 @@
+//! HTTP orchestration for namespace lifecycle and administrative operations.
+//!
+//! This module is the thin Axum boundary between namespace-oriented HTTP
+//! routes and Zeppelin's domain services. It deserializes path and JSON input,
+//! performs request-specific validation, calls
+//! [`crate::namespace::manager::NamespaceManager`] and manifest-based services,
+//! and turns successful results into stable JSON response shapes. Domain
+//! failures remain [`crate::error::ZeppelinError`] values until
+//! [`crate::server::handlers::ApiError`] maps them to the canonical HTTP error
+//! envelope.
+//!
+//! S3 or MinIO remains authoritative throughout these handlers. Namespace
+//! metadata describes identity, vector shape, lifecycle, desired index
+//! settings, and compaction health. The [`crate::wal::Manifest`] separately
+//! defines which immutable WAL fragments and segments are visible. For that
+//! reason,
+//! [`get_namespace`][crate::server::handlers::namespace::get_namespace]
+//! combines metadata with a strong manifest read rather than trusting counters
+//! in memory or recursively listing objects.
+//!
+//! The routed operations are create, get, delete, named snapshot management,
+//! point-in-time clone, index-config patching, manual compaction, compaction
+//! status, and cache hydration.
+//! [`list_namespaces`][crate::server::handlers::namespace::list_namespaces]
+//! exists for internal use but is deliberately not registered as an HTTP route,
+//! preventing namespace enumeration. Rate limits, body limits, timeouts,
+//! request IDs, and tracing are applied by [`crate::server::build_router`]
+//! outside this file.
+//!
+//! ## Reading map
+//!
+//! 1. Start with
+//!    [`CreateNamespaceRequest`][crate::server::handlers::namespace::CreateNamespaceRequest]
+//!    and [`NamespaceResponse`][crate::server::handlers::namespace::NamespaceResponse]
+//!    to learn the public namespace model.
+//! 2. Read [`create_namespace`][crate::server::handlers::namespace::create_namespace],
+//!    [`get_namespace`][crate::server::handlers::namespace::get_namespace], and
+//!    [`delete_namespace`][crate::server::handlers::namespace::delete_namespace]
+//!    for the main lifecycle.
+//! 3. Continue with [`put_snapshot`][crate::server::handlers::namespace::put_snapshot],
+//!    [`list_snapshots`][crate::server::handlers::namespace::list_snapshots],
+//!    [`get_snapshot`][crate::server::handlers::namespace::get_snapshot], and
+//!    [`delete_snapshot`][crate::server::handlers::namespace::delete_snapshot]
+//!    for point-in-time retention pins.
+//! 4. Read [`CloneNamespaceRequest`][crate::server::handlers::namespace::CloneNamespaceRequest]
+//!    and [`clone_namespace`][crate::server::handlers::namespace::clone_namespace]
+//!    for independent copy-based restoration.
+//! 5. Finish with
+//!    [`patch_index_config`][crate::server::handlers::namespace::patch_index_config],
+//!    [`compact_namespace`][crate::server::handlers::namespace::compact_namespace],
+//!    [`get_compaction_status`][crate::server::handlers::namespace::get_compaction_status],
+//!    and [`trigger_hydration`][crate::server::handlers::namespace::trigger_hydration]
+//!    for asynchronous administrative work.
+//!
+//! ## Namespace lifecycle and authority
+//!
+//! ```text
+//! POST create
+//!     |
+//!     v
+//! create meta.json if absent --> write empty manifest --> 201 Created
+//!     | conflict
+//!     +--> same named configuration --> 200 OK
+//!     +--> different configuration --> 409 conflict
+//!
+//! GET namespace
+//!     |
+//!     +--> metadata snapshot
+//!     +--> strong manifest verification (S3/MinIO authority)
+//!     `--> combined status JSON; no WAL/segment reads or prefix LIST
+//!
+//! DELETE namespace
+//!     |
+//!     v
+//! CAS metadata to "deleting" --> remove manifest visibility root --> 202
+//!     |
+//!     `--> background prefix cleanup --> delete tombstone last --> later 404
+//! ```
+//!
+//! ## Point-in-time clone flow
+//!
+//! ```text
+//! resolve retained source manifest
+//!              |
+//!              v
+//! create temporary source snapshot pin
+//!              |
+//!              v
+//! reserve fresh target namespace
+//!              |
+//!              v
+//! copy every manifest-reachable immutable object (up to 16 concurrently)
+//!              |
+//!              v
+//! rewrite target keys + publish target manifest generation 1
+//!              |
+//!              v
+//! invalidate target cache + release source pin --> 201 Created
+//!              |
+//!              `-- failure: best-effort target cleanup and pin release
+//! ```
+//!
+//! ## Invariants
+//!
+//! - A response never treats the process-local manifest cache as more
+//!   authoritative than object storage; strong reads verify the remote object.
+//! - Namespace creation reserves `meta.json` before initializing the manifest.
+//!   A manifest-write failure can therefore leave metadata for an operation
+//!   that returned an error; the handler does not claim rollback.
+//! - `202 Accepted` means background work was admitted or requested, not that
+//!   compaction, deletion, index rewriting, or hydration has completed.
+//! - Deletion writes a durable tombstone and removes the manifest before
+//!   deleting data objects. Retried DELETE requests resume the protocol.
+//! - A clone owns copied target objects and rewrites stored source keys; it must
+//!   not leave the target dependent on source objects that can later be deleted.
+//! - Cache invalidation changes only disposable process state. It never creates
+//!   or removes manifest authority.
+//!
+//! ## Rust concepts used here
+//!
+//! Axum extractors destructure [`axum::extract::State`],
+//! [`axum::extract::Path`], and [`axum::Json`] directly in function parameters.
+//! This is similar to dependency injection plus request binding in Java; in C
+//! it would normally require explicit parsing and context pointers. Rust's
+//! types ensure a handler body runs only after extraction has produced the
+//! declared owned values.
+//!
+//! Request bodies own their strings and maps, so moving them into async domain
+//! calls cannot leave pointers into an HTTP buffer. Conversely,
+//! [`NamespaceResponse::from_manifest`][crate::server::handlers::namespace::NamespaceResponse::from_manifest]
+//! borrows the manifest with `&Manifest` and cannot retain that reference after
+//! it returns. `tokio::spawn` requires its future to own cloned shared handles
+//! and strings because the HTTP request may finish first. Java would rely on
+//! garbage-collected references; C would require an explicit ownership
+//! protocol. Rust checks those lifetimes at compile time.
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -25,51 +161,103 @@ use crate::wal::Manifest;
 
 use super::{as_of, ApiError};
 
+/// Maximum number of immutable source objects copied concurrently by one clone.
+///
+/// The bound limits object-store pressure and memory used by in-flight futures;
+/// it does not limit the number of clone requests accepted by the server.
 const CLONE_COPY_CONCURRENCY: usize = 16;
+
+/// Reserved prefix for temporary snapshot pins that protect clone source data.
+///
+/// A random UUID suffix makes pins independent across concurrent clone
+/// requests. The pin is an internal implementation detail and is released on
+/// both the success and handled-failure paths.
 const CLONE_INTERNAL_SNAPSHOT_PREFIX: &str = "__clone_";
 
-/// Request body for creating a new namespace.
+/// JSON body that selects a namespace's immutable shape and index defaults.
+///
+/// Omitting `name` asks the server to generate a UUID-based name. Supplying a
+/// name selects idempotent create-by-name semantics: an identical repeated
+/// request returns the existing namespace, while a different immutable
+/// configuration returns a conflict.
+///
+/// Deserialization supplies cosine distance and an empty FTS map when those
+/// fields are omitted. [`create_namespace`] validates dimensions against the
+/// server limit, then the namespace domain validates names, FTS analyzers, and
+/// resolved index parameters.
+///
+/// # Examples
+///
+/// A body containing `{"name":"catalog","dimensions":384}` requests a
+/// named cosine namespace with no full-text fields and server-derived index
+/// settings.
 #[derive(Debug, Deserialize)]
 pub struct CreateNamespaceRequest {
-    /// Optional client-specified namespace name.
+    /// Optional stable client name; `None` requests a generated UUID name.
     pub name: Option<String>,
-    /// Dimensionality of vectors stored in this namespace.
+    /// Number of floating-point components in every vector; must be in the
+    /// inclusive range `1..=server.max_dimensions`.
     pub dimensions: usize,
-    /// Distance metric for similarity search (defaults to Cosine).
+    /// Namespace-wide vector distance metric; omitted JSON defaults to cosine.
     #[serde(default = "default_distance_metric")]
     pub distance_metric: DistanceMetric,
-    /// Full-text search field configurations (empty map disables FTS).
+    /// Field-to-analyzer configuration; an omitted or empty map disables FTS.
     #[serde(default)]
     pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
-    /// Optional per-namespace index configuration for future compactions.
+    /// Optional partial override resolved into a complete persisted build
+    /// configuration for future compactions.
     #[serde(default)]
     pub index_config: Option<CreateNamespaceIndexConfig>,
 }
 
-/// Optional index config overrides accepted at namespace creation.
+/// Partial per-namespace index-build settings accepted at create or patch time.
+///
+/// Every field is optional so clients can override only the choices they care
+/// about. Creation fills missing fields from the boot-time indexing defaults.
+/// Patching fills missing fields from the namespace's current effective
+/// configuration. The complete result is validated before metadata is written.
+///
+/// # Examples
+///
+/// `{"nlist":256,"quantization":"product","pq_m":8}` requests 256 IVF
+/// clusters and eight product-quantization subspaces while inheriting the
+/// remaining boolean index settings.
 #[derive(Debug, Deserialize)]
 pub struct CreateNamespaceIndexConfig {
-    /// Number of IVF centroids/clusters.
+    /// Number of IVF centroids, and therefore coarse clusters; must be positive.
     #[serde(default)]
     pub nlist: Option<usize>,
-    /// Quantization mode.
+    /// Compression mode used by newly built segment vectors.
     #[serde(default)]
     pub quantization: Option<QuantizationType>,
-    /// Number of product-quantization subquantizers.
+    /// Product-quantization subspace count; must be positive and divide vector
+    /// dimensions when product quantization is selected.
     #[serde(default)]
     pub pq_m: Option<usize>,
-    /// Build hierarchical indexes for future compactions.
+    /// Whether future segment builds use hierarchical rather than flat IVF.
     #[serde(default)]
     pub hierarchical: Option<bool>,
-    /// Build FTS indexes for configured full-text fields.
+    /// Whether future segment builds create full-text indexes for configured
+    /// fields.
     #[serde(default)]
     pub fts_index: Option<bool>,
-    /// Build bitmap indexes for future compactions.
+    /// Whether future segment builds create metadata bitmap indexes.
     #[serde(default)]
     pub bitmap_index: Option<bool>,
 }
 
 impl CreateNamespaceIndexConfig {
+    /// Reports whether a patch omitted every index-config field.
+    ///
+    /// # Returns
+    ///
+    /// `true` only when all six options are `None`; explicit `false` values
+    /// count as supplied settings.
+    ///
+    /// # Examples
+    ///
+    /// `{}` is empty and rejected by [`patch_index_config`], while
+    /// `{"bitmap_index":false}` is a meaningful patch.
     fn is_empty(&self) -> bool {
         self.nlist.is_none()
             && self.quantization.is_none()
@@ -80,185 +268,292 @@ impl CreateNamespaceIndexConfig {
     }
 }
 
-/// Partial index config patch staged for the next compaction.
+/// JSON patch that updates desired index settings for the next compaction.
+///
+/// This alias deliberately shares the optional-field wire shape used during
+/// creation. [`patch_index_config`] rejects an all-omitted body and overlays
+/// supplied fields on the current effective configuration.
 pub type PatchNamespaceIndexConfigRequest = CreateNamespaceIndexConfig;
 
+/// Supplies cosine distance when creation JSON omits `distance_metric`.
+///
+/// # Returns
+///
+/// [`DistanceMetric::Cosine`], with no allocation or shared-state access.
+///
+/// # Examples
+///
+/// Serde calls this helper while decoding `{"dimensions":384}`.
 fn default_distance_metric() -> DistanceMetric {
     DistanceMetric::Cosine
 }
 
-/// Response body containing namespace metadata.
+/// Client-facing namespace metadata combined with manifest-derived live status.
+///
+/// Identity, lifecycle, desired index settings, and compaction health come from
+/// [`NamespaceMetadata`]. Counts, storage estimates, and active-segment details
+/// come from the supplied manifest. This separation matters: the metadata
+/// record is not the visibility authority for WAL fragments or segments.
+///
+/// `approximate_storage_bytes` is the sum of sizes recorded in manifest
+/// references, not a bucket inventory or billing value. An absent active
+/// segment produces `null` quantization and a zero active-segment count.
+///
+/// # Examples
+///
+/// Immediately after creation, a response reports zero vectors, fragments,
+/// segments, and bytes. After an upsert it can report one uncompacted fragment;
+/// after compaction it instead reports an active segment and its quantization.
 #[derive(Debug, Serialize)]
 pub struct NamespaceResponse {
-    /// Namespace name.
+    /// Stable namespace identifier used in subsequent URL path segments.
     pub name: String,
-    /// Vector dimensionality.
+    /// Number of components required in every stored and query vector.
     pub dimensions: usize,
-    /// Distance metric used for similarity search.
+    /// Namespace-wide metric used to compare query and stored vectors.
     pub distance_metric: DistanceMetric,
-    /// Total number of vectors in this namespace.
+    /// Logical live vector count derived from manifest-visible artifacts.
     pub vector_count: u64,
-    /// Number of uncompacted WAL fragments currently referenced by the manifest.
+    /// Number of manifest-visible WAL fragments not yet represented by a
+    /// segment.
     pub uncompacted_fragments: usize,
-    /// Number of segment references currently tracked by the manifest.
+    /// Number of immutable segment references in the current manifest.
     pub segment_count: usize,
-    /// Approximate live storage bytes known from manifest object-size refs.
+    /// Lower-cost storage estimate from manifest object-size references; this
+    /// performs no object listing or HEAD requests.
     pub approximate_storage_bytes: u64,
-    /// Quantization mode of the active segment, or null before first compaction.
+    /// Compression mode recorded by the active segment, or `null` when no
+    /// active segment reference resolves.
     pub quantization: Option<QuantizationType>,
-    /// Index kind used by the namespace's active segment.
+    /// Effective active index family: hierarchical when the active segment says
+    /// so, otherwise the metadata index type.
     pub index_kind: IndexType,
-    /// Effective index parameters for future compactions.
+    /// Complete desired settings for future compactions; legacy metadata
+    /// without an override is resolved from current server defaults.
     pub index_config: NamespaceIndexConfig,
-    /// Vector count in the active segment only.
+    /// Number of vectors represented by the active segment alone, excluding
+    /// uncompacted WAL fragments.
     pub active_segment_vector_count: usize,
-    /// RFC 3339 timestamp of the last compaction outcome, if any.
+    /// RFC 3339 completion/failure time of the last recorded compaction, or
+    /// `null` before any outcome is recorded.
     pub last_compaction_at: Option<String>,
-    /// Last recorded compaction status.
+    /// Stable status string: `never`, `success`, or `failure`.
     pub last_compaction_status: String,
-    /// Last compaction error, present only after a failure.
+    /// Last persisted compaction error, omitted from JSON unless present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_compaction_error: Option<String>,
-    /// Consecutive compaction failures since the last success.
+    /// Number of consecutive failures since the most recent successful run.
     pub consecutive_compaction_failures: u32,
-    /// True after repeated compaction failures.
+    /// Whether the failure count has reached
+    /// [`COMPACTION_DEGRADED_FAILURE_THRESHOLD`].
     pub index_degraded: bool,
-    /// RFC 3339 timestamp of namespace creation.
+    /// RFC 3339 timestamp persisted when the namespace name was reserved.
     pub created_at: String,
-    /// RFC 3339 timestamp of the last update.
+    /// RFC 3339 timestamp of the latest namespace-metadata update.
     pub updated_at: String,
-    /// Namespace lifecycle state.
+    /// Stable lifecycle state, currently `active` or `deleting`.
     pub state: String,
-    /// Full-text search field configurations (omitted when empty).
+    /// Per-field lexical analyzer settings, omitted from JSON when FTS is not
+    /// configured.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub full_text_search: std::collections::HashMap<String, FtsFieldConfig>,
 }
 
-/// Response body for asynchronous namespace deletion.
+/// Acknowledges that namespace deletion entered or resumed its durable protocol.
+///
+/// The only current value is `"deleting"`. A `202` response does not mean all
+/// objects are gone; clients can poll [`get_namespace`] until it returns 404.
 #[derive(Debug, Serialize)]
 pub struct DeleteNamespaceResponse {
-    /// Current lifecycle state.
+    /// Lifecycle state persisted before background object cleanup begins.
     pub state: &'static str,
 }
 
-/// Response body for an accepted admin hydration request.
+/// Identifies the active segment selected by an administrative hydration call.
+///
+/// The endpoint returns this body after a non-blocking request to the hydrator.
+/// It does not wait for cache population, and the hydrator's bounded queue can
+/// reject a job after this handler has selected the segment.
 #[derive(Debug, Serialize)]
 pub struct HydrateNamespaceResponse {
-    /// Namespace whose active segment was queued for hydration.
+    /// Namespace whose current active segment was offered to the hydrator.
     pub namespace: String,
-    /// Active segment id queued into the hydrator pipeline.
+    /// Manifest-visible segment identifier selected for warm-set hydration.
     pub segment_id: String,
 }
 
-/// Response body for an index config update.
+/// Acknowledges a persisted desired index-configuration update.
+///
+/// Metadata changes immediately, but immutable segments are not rewritten in
+/// place. A later compaction builds a replacement using these settings.
 #[derive(Debug, Serialize)]
 pub struct UpdateIndexConfigResponse {
-    /// Namespace whose desired index config was updated.
+    /// Namespace whose authoritative metadata now carries the new settings.
     pub namespace: String,
-    /// Effective index config staged for the next compaction.
+    /// Fully resolved configuration persisted for the next segment build.
     pub index_config: NamespaceIndexConfig,
-    /// Stable status string for clients.
+    /// Stable acknowledgment string, currently `"accepted"`.
     pub status: &'static str,
-    /// How to observe the asynchronous rewrite.
+    /// Human-readable polling guidance for observing a later rewrite.
     pub observe: String,
 }
 
-/// Manifest-derived status for manual compaction clients.
+/// Lightweight compaction readiness derived from one authoritative manifest.
+///
+/// `ready` means no WAL fragments are waiting for compaction. It does not
+/// attest to compaction health, cache hydration, or the absence of older
+/// retained manifest history.
+///
+/// # Examples
+///
+/// After one upsert and before compaction, `uncompacted_fragments` is commonly
+/// one and `ready` is false. After publication it becomes zero and `ready` is
+/// true with a newer `manifest_generation`.
 #[derive(Debug, Serialize)]
 pub struct CompactionStatusResponse {
-    /// Namespace name.
+    /// Namespace whose manifest supplied this snapshot.
     pub namespace: String,
-    /// Persisted manifest generation read from S3.
+    /// Monotonic generation of the strongly read live manifest.
     pub manifest_generation: u64,
-    /// Number of WAL fragments still waiting for compaction.
+    /// Count of manifest-visible WAL fragments not represented by a segment.
     pub uncompacted_fragments: usize,
-    /// Number of segment references currently tracked by the manifest.
+    /// Count of immutable segment references in the live manifest.
     pub segment_count: usize,
-    /// Active segment id, if compaction has produced one.
+    /// Active segment identifier when the manifest's pointer resolves.
     pub active_segment: Option<String>,
-    /// Vector count in the active segment only.
+    /// Vectors in the active segment, or zero when none resolves.
     pub active_segment_vector_count: usize,
-    /// True when no WAL fragments are waiting for compaction.
+    /// `true` exactly when `uncompacted_fragments == 0`.
     pub ready: bool,
 }
 
-/// Response body for a manual compaction trigger.
+/// Result of evaluating one manual compaction trigger request.
+///
+/// `status` is `"noop"` with HTTP 200 when no fragments need work, or
+/// `"accepted"` with HTTP 202 after a lease is acquired and a task is spawned.
+/// The manifest fields describe the pre-trigger snapshot; accepted work is
+/// observed later through [`get_compaction_status`].
 #[derive(Debug, Serialize)]
 pub struct CompactNamespaceResponse {
-    /// Namespace name.
+    /// Namespace evaluated for manual compaction.
     pub namespace: String,
-    /// Stable outcome string for this trigger.
+    /// Stable trigger result: `"noop"` or `"accepted"`.
     pub status: &'static str,
-    /// Persisted manifest generation read from S3.
+    /// Manifest generation observed before returning the trigger response.
     pub manifest_generation: u64,
-    /// Number of WAL fragments still waiting for compaction.
+    /// Pre-trigger count of uncompacted manifest-visible fragments.
     pub uncompacted_fragments: usize,
-    /// Number of segment references currently tracked by the manifest.
+    /// Pre-trigger count of manifest segment references.
     pub segment_count: usize,
-    /// Active segment id, if compaction has produced one.
+    /// Pre-trigger active segment identifier, if one resolves.
     pub active_segment: Option<String>,
-    /// Vector count in the active segment only.
+    /// Pre-trigger active-segment vector count.
     pub active_segment_vector_count: usize,
-    /// True when no WAL fragments are waiting for compaction.
+    /// Pre-trigger readiness flag.
     pub ready: bool,
 }
 
-/// Response body for a named PITR snapshot.
+/// Public metadata for one named point-in-time recovery pin.
+///
+/// The snapshot is a small immutable object that protects one retained manifest
+/// generation. It does not duplicate vectors or segment data.
 #[derive(Debug, Serialize)]
 pub struct SnapshotResponse {
-    /// Snapshot name.
+    /// Client-selected pin name within this namespace.
     pub name: String,
-    /// Manifest generation pinned by this snapshot.
+    /// Nonzero committed manifest generation protected from history pruning.
     pub generation: u64,
-    /// RFC 3339 timestamp when the snapshot was created.
+    /// RFC 3339 creation time retained across idempotent PUT retries.
     pub created_at: String,
 }
 
-/// Response body for listing named PITR snapshots.
+/// Lexically ordered named snapshot pins for one namespace.
+///
+/// An empty `snapshots` array means the namespace has no named pins.
 #[derive(Debug, Serialize)]
 pub struct ListSnapshotsResponse {
-    /// Snapshot pins for this namespace.
+    /// Snapshot metadata sorted by `name` by the manifest domain layer.
     pub snapshots: Vec<SnapshotResponse>,
 }
 
-/// Request body for restoring a namespace as a new clone.
+/// JSON body selecting a fresh clone target and retained source point in time.
+///
+/// Unknown fields are rejected by Serde. `as_of` accepts the same generation,
+/// RFC 3339 timestamp, or `snapshot:name` syntax as historical queries. The
+/// target must differ from the source and must not already exist.
+///
+/// # Examples
+///
+/// `{"target":"catalog-restore","as_of":"snapshot:before-migration"}`
+/// asks Zeppelin to copy the snapshot's reachable objects into a new writable
+/// namespace.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloneNamespaceRequest {
-    /// Fresh target namespace to create.
+    /// Fresh target name to reserve using normal namespace-name validation.
     pub target: String,
-    /// Source point-in-time target: generation, RFC3339 timestamp, or `snapshot:name`.
+    /// Retained source generation, RFC 3339 timestamp, or `snapshot:name`.
     pub as_of: String,
 }
 
-/// Response body for restoring a namespace as a new clone.
+/// Describes a successfully materialized, independently writable clone.
+///
+/// The nested namespace status belongs to the target after its first manifest
+/// publication. Source and target generation numbers differ because the target
+/// starts its own history at generation one.
 #[derive(Debug, Serialize)]
 pub struct CloneNamespaceResponse {
-    /// Source namespace read at the requested point in time.
+    /// Active source namespace from which retained state was resolved.
     pub source: String,
-    /// Fresh namespace created by the clone operation.
+    /// Newly created namespace that now owns copied artifact keys.
     pub target: String,
-    /// Source manifest generation that was materialized.
+    /// Retained source manifest generation selected by `as_of`.
     pub generation: u64,
-    /// Target namespace manifest generation after materialization.
+    /// Target manifest generation after publication, normally one.
     pub target_generation: u64,
-    /// Clone materialization mode.
+    /// Stable materialization mode, currently `"copy"`.
     pub mode: &'static str,
-    /// Target namespace metadata and manifest-derived status.
+    /// Target metadata combined with its newly published manifest.
     pub namespace: NamespaceResponse,
 }
 
-/// Response body for namespace creation.
+/// Namespace creation result with flattened metadata and client guidance.
+///
+/// Flattening makes fields such as `name` and `dimensions` top-level JSON
+/// properties rather than nesting them under `namespace`.
 #[derive(Debug, Serialize)]
 pub struct CreateNamespaceResponse {
-    /// Namespace metadata.
+    /// Empty-manifest namespace status flattened into this response object.
     #[serde(flatten)]
     pub namespace: NamespaceResponse,
-    /// Creation note.
+    /// Guidance that differs for generated names and idempotent client names.
     pub warning: String,
 }
 
 impl SnapshotResponse {
+    /// Converts an addressable domain pin into its JSON representation.
+    ///
+    /// # Parameters
+    ///
+    /// - `snapshot`: Owned snapshot reference returned by the manifest layer.
+    ///
+    /// # Returns
+    ///
+    /// An owned response containing the name, generation, and RFC 3339 time.
+    /// The storage key is intentionally not exposed.
+    ///
+    /// # Examples
+    ///
+    /// A domain reference for `daily` at generation 12 becomes
+    /// `{"name":"daily","generation":12,...}` without its S3 key.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The parameter is moved, so its owned strings can be reused without
+    /// cloning. Java would keep references valid through garbage collection; C
+    /// would need a convention for which struct frees each allocation. Rust
+    /// makes the ownership transfer explicit and prevents later reuse of the
+    /// moved domain value.
     fn from_ref(snapshot: NamedSnapshotRef) -> Self {
         Self {
             name: snapshot.name,
@@ -269,7 +564,54 @@ impl SnapshotResponse {
 }
 
 impl NamespaceResponse {
-    /// Converts namespace metadata plus the authoritative manifest into the API response.
+    /// Combines owned namespace metadata with a borrowed manifest status view.
+    ///
+    /// Metadata supplies stable configuration and lifecycle fields. The
+    /// manifest supplies live vector/artifact counts and the active segment.
+    /// Legacy metadata without `index_config` is presented using current server
+    /// defaults; that compatibility behavior does not rewrite metadata.
+    ///
+    /// # Parameters
+    ///
+    /// - `meta`: Owned namespace metadata snapshot. Its strings and maps are
+    ///   moved into the returned response.
+    /// - `manifest`: Borrowed manifest that defines currently visible artifacts.
+    /// - `default_indexing`: Borrowed server defaults used only when legacy
+    ///   metadata has no persisted namespace index config.
+    ///
+    /// # Returns
+    ///
+    /// A fully owned JSON-ready response. If the manifest's active-segment ID
+    /// is absent or does not match a segment reference, active-only fields are
+    /// `None` or zero and `index_kind` falls back to metadata.
+    ///
+    /// # Consistency
+    ///
+    /// This conversion performs no I/O and cannot establish freshness itself.
+    /// Callers that need current status must first obtain a strong manifest,
+    /// as [`get_namespace`] does. Manifest-derived values never come from the
+    /// metadata's legacy `vector_count` field.
+    ///
+    /// # Performance
+    ///
+    /// Scans segment references to resolve the active ID and scans fragments to
+    /// derive uncompacted status. It allocates response strings and moves most
+    /// metadata-owned fields without reading WAL or segment objects.
+    ///
+    /// # Examples
+    ///
+    /// Metadata for a 384-dimensional namespace plus a manifest containing one
+    /// seven-vector WAL fragment yields `vector_count = 7`,
+    /// `uncompacted_fragments = 1`, and `active_segment_vector_count = 0`.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// `meta` is consumed while `manifest` and `default_indexing` are shared
+    /// borrows. This lets the response take ownership of metadata strings and
+    /// maps without cloning them, while the compiler guarantees it cannot keep
+    /// references into the borrowed manifest. In C terms, the borrows resemble
+    /// non-null `const` pointers with checked lifetimes; Java has no direct
+    /// equivalent of consuming the metadata value.
     #[must_use]
     pub fn from_manifest(
         meta: NamespaceMetadata,
@@ -312,7 +654,56 @@ impl NamespaceResponse {
     }
 }
 
-/// Creates a named PITR snapshot pin for the current committed generation.
+/// Creates or idempotently confirms a named pin for the current manifest.
+///
+/// The handler first requires an active namespace, strongly verifies the live
+/// manifest, then asks [`NamedSnapshot::create`] to pin that committed
+/// generation. Repeating the same name while the generation is unchanged
+/// returns the original pin and timestamp, although the HTTP status remains
+/// `201 Created`. Reusing the name after the live generation advances is a
+/// conflict rather than silently retargeting the snapshot.
+///
+/// # Parameters
+///
+/// - `state`: Shared server services extracted from [`AppState`].
+/// - `ns`: Namespace path segment; it must name an active namespace.
+/// - `name`: Snapshot path segment validated by the manifest domain.
+///
+/// # Returns
+///
+/// HTTP 201 and the immutable pin's name, generation, and original creation
+/// timestamp.
+///
+/// # Errors
+///
+/// Returns the canonical [`ApiError`] envelope for a missing namespace (404), a
+/// deleting namespace (410), an invalid snapshot name or unavailable generation
+/// (400), a name already bound to another generation (409), or storage and
+/// decoding failures (500). A failed conditional pin creation does not
+/// overwrite an existing pin.
+///
+/// # Side Effects
+///
+/// May refresh metadata and manifest caches, reads retained manifest history,
+/// and conditionally writes one small snapshot object to S3/MinIO.
+///
+/// # Consistency
+///
+/// The strongly read live manifest selects the generation. The snapshot object
+/// protects that generation from later history pruning, subject to the
+/// history-check/publication race documented by [`NamedSnapshot::create`].
+///
+/// # Performance
+///
+/// Performs metadata lookup, one strong manifest verification, one history
+/// GET, and one conditional pin PUT. An idempotent conflict path can add a pin
+/// GET.
+///
+/// # Examples
+///
+/// PUT `.../snapshots/before-migration` at generation 12 creates a pin. A
+/// repeated PUT at generation 12 returns the same timestamp. If an upsert has
+/// advanced the live manifest to 13, the same PUT returns 409.
 #[instrument(skip(state), fields(namespace = %ns, snapshot = %name))]
 pub async fn put_snapshot(
     State(state): State<AppState>,
@@ -337,7 +728,41 @@ pub async fn put_snapshot(
     ))
 }
 
-/// Lists named PITR snapshot pins for a namespace.
+/// Lists every named point-in-time pin for an active namespace.
+///
+/// The manifest domain decodes every pin and sorts the result lexically by
+/// name. Corrupt or malformed pin objects fail the whole request; the handler
+/// does not silently omit them.
+///
+/// # Parameters
+///
+/// - `state`: Shared server state and object-store gateway.
+/// - `ns`: Namespace path segment whose pins should be enumerated.
+///
+/// # Returns
+///
+/// HTTP 200 with a lexically ordered array. An empty array means no named pins
+/// exist.
+///
+/// # Errors
+///
+/// Returns 404 for a missing namespace, 410 for a deleting namespace, or the
+/// mapped storage/key/decoding failure for the snapshot listing.
+///
+/// # Side Effects
+///
+/// May refresh the namespace metadata registry and performs read-only
+/// object-store operations. It does not change retention.
+///
+/// # Performance
+///
+/// Performs one snapshot-prefix LIST, one full GET per pin, and an
+/// `O(n log n)` in-memory sort.
+///
+/// # Examples
+///
+/// Pins named `weekly` and `daily` are returned as `daily`, then `weekly`,
+/// regardless of S3 listing order.
 #[instrument(skip(state), fields(namespace = %ns))]
 pub async fn list_snapshots(
     State(state): State<AppState>,
@@ -357,7 +782,32 @@ pub async fn list_snapshots(
     Ok(Json(ListSnapshotsResponse { snapshots }))
 }
 
-/// Gets one named PITR snapshot pin.
+/// Returns one exact named point-in-time pin for an active namespace.
+///
+/// # Parameters
+///
+/// - `state`: Shared server state and storage gateway.
+/// - `ns`: Namespace path segment that owns the pin.
+/// - `name`: Exact snapshot name to validate and read.
+///
+/// # Returns
+///
+/// HTTP 200 with the pin's public name, generation, and RFC 3339 creation time.
+///
+/// # Errors
+///
+/// Returns 404 when either the namespace or valid snapshot name is absent, 410
+/// for a deleting namespace, 400 for an invalid name, or a mapped storage or
+/// decode error. Corrupt bytes are not treated as a missing pin.
+///
+/// # Side Effects
+///
+/// May refresh namespace metadata and performs one snapshot-object GET.
+///
+/// # Examples
+///
+/// GET `.../snapshots/daily` returns the generation protected by `daily`.
+/// GET of a valid but unknown name returns `SNAPSHOT_NOT_FOUND` with HTTP 404.
 #[instrument(skip(state), fields(namespace = %ns, snapshot = %name))]
 pub async fn get_snapshot(
     State(state): State<AppState>,
@@ -380,7 +830,45 @@ pub async fn get_snapshot(
     Ok(Json(SnapshotResponse::from_ref(snapshot)))
 }
 
-/// Deletes one named PITR snapshot pin.
+/// Removes one named pin so its generation may later age out of retention.
+///
+/// The handler checks that the pin exists before deleting it. Deleting a pin
+/// does not immediately remove manifest history or vector artifacts; a later
+/// pruning and GC cycle decides when unreferenced immutable data is safe to
+/// delete.
+///
+/// # Parameters
+///
+/// - `state`: Shared server state and storage gateway.
+/// - `ns`: Active namespace that owns the pin.
+/// - `name`: Exact snapshot name to validate, check, and delete.
+///
+/// # Returns
+///
+/// HTTP 204 with no body after the pin DELETE succeeds.
+///
+/// # Errors
+///
+/// Returns 404 for a missing namespace or snapshot, 410 for a deleting
+/// namespace, 400 for an invalid name, or a mapped storage failure. This API is
+/// not idempotent at the HTTP contract: deleting an already absent pin returns
+/// 404 rather than 204.
+///
+/// # Side Effects
+///
+/// Performs a pin GET followed by a DELETE of the small snapshot object.
+/// Retained data remains untouched by this handler.
+///
+/// # Consistency
+///
+/// The existence check and DELETE are separate object-store requests. A
+/// concurrent deletion can race between them; the low-level delete result is
+/// returned according to backend semantics.
+///
+/// # Examples
+///
+/// Removing `before-migration` returns 204. A later GET returns 404, while the
+/// previously pinned generation can remain readable until retention pruning.
 #[instrument(skip(state), fields(namespace = %ns, snapshot = %name))]
 pub async fn delete_snapshot(
     State(state): State<AppState>,
@@ -408,6 +896,22 @@ pub async fn delete_snapshot(
 }
 
 impl CompactNamespaceResponse {
+    /// Adds a trigger outcome to an already derived compaction-status snapshot.
+    ///
+    /// # Parameters
+    ///
+    /// - `status`: Process-long stable outcome string chosen by the handler.
+    /// - `response`: Owned pre-trigger manifest status whose fields are moved
+    ///   into the trigger response.
+    ///
+    /// # Returns
+    ///
+    /// A response with identical manifest observations plus `status`.
+    ///
+    /// # Examples
+    ///
+    /// A ready status snapshot combined with `"noop"` becomes the body of the
+    /// HTTP 200 no-work response.
     fn from_status(status: &'static str, response: CompactionStatusResponse) -> Self {
         Self {
             namespace: response.namespace,
@@ -422,7 +926,74 @@ impl CompactNamespaceResponse {
     }
 }
 
-/// Creates a new namespace.
+/// Creates a generated namespace or idempotently creates a client-named one.
+///
+/// The handler validates the server-wide dimension bound, resolves a complete
+/// per-namespace index configuration, and delegates persistence to
+/// [`crate::namespace::manager::NamespaceManager`]. A supplied name uses
+/// idempotent comparison against fresh S3 metadata. An omitted name generates a
+/// UUID (optionally prefixed by the test server) and uses create-only semantics.
+///
+/// # Parameters
+///
+/// - `state`: Shared server services, limits, defaults, and optional generated
+///   name prefix.
+/// - `req`: Owned, deserialized creation request. Axum rejects malformed JSON
+///   before this function runs.
+///
+/// # Returns
+///
+/// Returns HTTP 201 for a newly created namespace. An identical retry with a
+/// client-specified name returns HTTP 200 and the original metadata. The
+/// response always uses an empty manifest view, so an idempotent retry against
+/// a namespace that later acquired data still reports zero live counts; clients
+/// should use [`get_namespace`] for current manifest statistics.
+///
+/// # Errors
+///
+/// Returns 400 for dimensions outside `1..=max_dimensions`, an unsafe name,
+/// invalid FTS settings, or incompatible index parameters. Returns 409 when a
+/// client name exists with different immutable settings and 410 while that name
+/// is deleting. Serialization and object-store failures map to server errors.
+///
+/// Namespace creation writes metadata before the initial manifest. If the
+/// manifest write fails, `meta.json` may remain even though the HTTP operation
+/// returned an error; this handler does not report a rollback that did not
+/// occur.
+///
+/// # Side Effects
+///
+/// A new namespace conditionally writes metadata, writes generation-one empty
+/// manifest state/history, refreshes the process-local namespace registry, and
+/// emits structured logs. The matching-existing path reads authoritative
+/// metadata and does not rewrite it.
+///
+/// # Consistency
+///
+/// S3's create-if-absent metadata write owns name uniqueness. The local
+/// registry is a cache, not the reservation authority. The idempotent path
+/// compares dimensions, metric, FTS, and resolved index settings rather than
+/// silently changing an existing namespace.
+///
+/// # Performance
+///
+/// Successful creation performs two sequential object-store writes. A named
+/// conflict can add a metadata GET to classify the existing namespace. No WAL
+/// or segment data is read for the response.
+///
+/// # Examples
+///
+/// POST `{"name":"catalog","dimensions":384}` returns 201 the first time
+/// and 200 for an identical retry. Repeating it with 768 dimensions returns
+/// `NAMESPACE_ALREADY_EXISTS` rather than changing the stored vector shape.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Destructuring `Json(req)` yields an owned request. Moving its FTS map and
+/// resolved config into the async manager call avoids copies and prevents the
+/// persisted metadata from borrowing request memory. The `match` on
+/// [`CreateNamespaceOutcome`] is exhaustive: adding a new domain outcome forces
+/// this handler to decide its HTTP meaning at compile time.
 #[instrument(skip(state), fields(dimensions = req.dimensions))]
 pub async fn create_namespace(
     State(state): State<AppState>,
@@ -507,7 +1078,82 @@ pub async fn create_namespace(
     ))
 }
 
-/// Restores a retained source generation as a fresh, independently writable namespace.
+/// Materializes retained source state as a fresh, independently writable clone.
+///
+/// This operation resolves a historical manifest, pins it against pruning,
+/// creates target metadata, copies every immutable object reachable from that
+/// manifest, rewrites source-prefixed stored keys, and publishes a new target
+/// manifest history beginning at generation one. It copies data rather than
+/// sharing source keys, so deleting the source cannot break the successful
+/// target.
+///
+/// # Parameters
+///
+/// - `state`: Shared namespace, manifest, storage, and cache services.
+/// - `source`: Active source namespace from the URL path.
+/// - `req`: Owned target name and generation/timestamp/snapshot selector.
+///
+/// # Returns
+///
+/// HTTP 201 with the selected source generation, newly published target
+/// generation, `"copy"` mode, and target namespace status.
+///
+/// # Errors
+///
+/// Returns 400 when source and target names match or an input is invalid, 404
+/// for a missing source, 410 for a deleting source or point in time no longer
+/// retained, and 409 when the target already exists. Snapshot pin, copy,
+/// manifest publication, serialization, and storage failures also propagate.
+///
+/// Once target creation succeeds, a later copy or publication failure triggers
+/// best-effort synchronous target deletion. Cleanup or temporary-pin deletion
+/// errors are logged rather than replacing the original failure, so rare
+/// cleanup failures can leave a deleting target or internal pin for later
+/// maintenance.
+///
+/// # Side Effects
+///
+/// Creates a temporary source snapshot, creates target metadata and an initial
+/// empty manifest, performs bounded-concurrency server-side object copies,
+/// publishes the rewritten target manifest, invalidates the target manifest
+/// cache, and deletes the temporary pin. Failed attempts may have copied some
+/// target objects before cleanup begins.
+///
+/// # Consistency
+///
+/// The internal pin keeps the selected source generation rooted while copies
+/// run. Destination copies use copy-if-absent so pre-existing target artifacts
+/// are conflicts, not overwritten data. Target manifest publication is the
+/// visibility boundary: copied objects are not query-visible until it succeeds.
+/// The target must be fresh, so this endpoint is not idempotent after success;
+/// retrying the same completed clone returns a target-name conflict.
+///
+/// # Performance
+///
+/// Resolving a point in time may list/read manifest history. The clone performs
+/// one server-side copy per manifest-reachable WAL or segment artifact, with at
+/// most `CLONE_COPY_CONCURRENCY` in flight, then writes the target manifest.
+/// Cost scales with the selected manifest's reachable object set and copies
+/// full object contents inside the configured store.
+///
+/// # Examples
+///
+/// Cloning `catalog` at `snapshot:before-migration` to `catalog-restore` copies
+/// only artifacts reachable at the pinned generation. Later writes to either
+/// namespace and deletion of the source do not alter the other namespace.
+///
+/// If one object copy fails, the response carries the storage error, the target
+/// is cleaned up best-effort, and a later retry can reserve the target again
+/// after cleanup completes.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The request strings move into local owned values. Cloned store/metadata
+/// fields are deliberate owned snapshots needed across `.await` points. The
+/// cleanup branches use `match` rather than exceptions: success and each failure
+/// path must explicitly release the temporary pin. Java would commonly encode
+/// this with `try/finally`; C would use cleanup labels. Rust has RAII for local
+/// memory, but remote S3 objects still require explicit asynchronous cleanup.
 #[instrument(skip(state, req), fields(source = %source))]
 pub async fn clone_namespace(
     State(state): State<AppState>,
@@ -602,6 +1248,16 @@ pub async fn clone_namespace(
     ))
 }
 
+/// Generates a collision-resistant name in the reserved clone-pin namespace.
+///
+/// # Returns
+///
+/// An owned string beginning with `__clone_` followed by a simple UUID. It is
+/// valid under snapshot-name rules and carries no source or target user data.
+///
+/// # Examples
+///
+/// A result has the shape `__clone_550e8400e29b41d4a716446655440000`.
 fn internal_clone_pin_name() -> String {
     format!(
         "{CLONE_INTERNAL_SNAPSHOT_PREFIX}{}",
@@ -609,6 +1265,28 @@ fn internal_clone_pin_name() -> String {
     )
 }
 
+/// Best-effort releases a temporary source snapshot after clone processing.
+///
+/// Cleanup must not hide the clone operation's primary success or failure.
+/// Missing pins are accepted as already released; other failures are logged so
+/// maintenance can diagnose an unexpectedly retained internal pin.
+///
+/// # Parameters
+///
+/// - `state`: Borrowed server state whose store owns the pin.
+/// - `source`: Source namespace that contains the temporary snapshot.
+/// - `name`: Exact generated internal pin name.
+///
+/// # Side Effects
+///
+/// Performs one snapshot-object DELETE and may emit a warning. It does not
+/// prune manifest history or data artifacts directly.
+///
+/// # Examples
+///
+/// After target publication, deleting `__clone_<uuid>` lets normal retention
+/// eventually prune the source generation. If the pin is already absent,
+/// cleanup completes silently.
 async fn release_internal_clone_pin(state: &AppState, source: &str, name: &str) {
     match NamedSnapshot::delete(&state.store, source, name).await {
         Ok(()) | Err(ZeppelinError::NotFound { .. }) => {}
@@ -621,6 +1299,33 @@ async fn release_internal_clone_pin(state: &AppState, source: &str, name: &str) 
     }
 }
 
+/// Best-effort removes all target state left by a failed clone attempt.
+///
+/// The target was reserved specifically for this clone before copying began,
+/// so cleanup can run the normal full namespace-delete protocol. Cache
+/// invalidation happens first so no process-local manifest survives cleanup.
+///
+/// # Parameters
+///
+/// - `state`: Borrowed services used for cache invalidation and durable delete.
+/// - `target`: Fresh target namespace whose partial state should be removed.
+///
+/// # Side Effects
+///
+/// Invalidates disposable manifest cache state, tombstones the target, deletes
+/// its manifest and prefix objects, and removes metadata last. Missing targets
+/// are accepted; other cleanup failures are logged and not returned.
+///
+/// # Performance
+///
+/// Calls synchronous namespace deletion with an unbounded cleanup budget, so
+/// the original clone error is not returned until cleanup succeeds or fails.
+/// Cost scales with every object already copied under the target prefix.
+///
+/// # Examples
+///
+/// If the seventh object copy fails, this helper removes target metadata and
+/// the first six copied objects so a later clone request can reuse the name.
 async fn cleanup_failed_clone_target(state: &AppState, target: &str) {
     state.manifest_cache.invalidate(target);
     match state.namespace_manager.delete(target).await {
@@ -633,6 +1338,37 @@ async fn cleanup_failed_clone_target(state: &AppState, target: &str) {
     }
 }
 
+/// Resolves creation overrides against complete server indexing defaults.
+///
+/// # Parameters
+///
+/// - `request`: Optional borrowed partial creation config. `None` keeps every
+///   server default.
+/// - `defaults`: Borrowed boot-time indexing configuration.
+/// - `dimensions`: Namespace vector width used to validate product
+///   quantization.
+///
+/// # Returns
+///
+/// A complete owned [`NamespaceIndexConfig`] suitable for persistence.
+///
+/// # Errors
+///
+/// Returns validation errors when `nlist` or `pq_m` is zero, or when product
+/// quantization's `pq_m` does not divide `dimensions`. No state is changed.
+///
+/// # Examples
+///
+/// With server `nlist = 128`, a request containing only `{"nlist":256}`
+/// returns 256 plus all other fields copied from the defaults.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `Option<&T>` expresses “a partial request may be absent” without null
+/// pointers. Each inner `Option` is exhaustively tested; scalar and enum values
+/// used here are `Copy`, so reading them from a shared borrow does not move the
+/// request. Java would typically use nullable boxed fields; C would pair each
+/// field with a presence flag.
 fn resolve_namespace_index_config(
     request: Option<&CreateNamespaceIndexConfig>,
     defaults: &crate::config::IndexingConfig,
@@ -663,6 +1399,27 @@ fn resolve_namespace_index_config(
     Ok(config)
 }
 
+/// Overlays supplied patch fields on a complete current configuration.
+///
+/// # Parameters
+///
+/// - `config`: Owned effective configuration to update in memory.
+/// - `request`: Borrowed optional-field patch; omitted fields preserve `config`.
+/// - `dimensions`: Namespace vector width used for final validation.
+///
+/// # Returns
+///
+/// The fully resolved and validated replacement configuration.
+///
+/// # Errors
+///
+/// Returns the same index-parameter validation errors as creation. Validation
+/// occurs before the caller performs any metadata write.
+///
+/// # Examples
+///
+/// Applying `{"bitmap_index":false}` to a config with `nlist = 128` keeps
+/// `nlist` unchanged and disables bitmaps for future segment builds.
 fn apply_namespace_index_config_patch(
     mut config: NamespaceIndexConfig,
     request: &PatchNamespaceIndexConfigRequest,
@@ -690,6 +1447,23 @@ fn apply_namespace_index_config_patch(
     Ok(config)
 }
 
+/// Builds a unique server-generated namespace name.
+///
+/// # Parameters
+///
+/// - `prefix`: Optional borrowed test/harness prefix. Production normally
+///   passes `None`.
+///
+/// # Returns
+///
+/// A UUID string, or `<prefix>-<uuid>` when a prefix is configured. The
+/// namespace manager still performs authoritative name validation and
+/// create-if-absent reservation.
+///
+/// # Examples
+///
+/// Production may return `550e8400-e29b-41d4-a716-446655440000`; a test prefix
+/// `run-7` yields `run-7-<uuid>` so cleanup can scope its object keys.
 fn generated_namespace_name(prefix: Option<&str>) -> String {
     let uuid = Uuid::new_v4().to_string();
     match prefix {
@@ -698,6 +1472,75 @@ fn generated_namespace_name(prefix: Option<&str>) -> String {
     }
 }
 
+/// Copies one retained manifest's artifacts and prepares it for target publish.
+///
+/// This helper deliberately stops before writing the target manifest. It drops
+/// source pending-delete bookkeeping, computes the live reachable artifact
+/// set, rewrites explicit stored keys, clears the source fencing token, assigns
+/// a fresh timestamp, resets generation to zero, and copies each target object
+/// with a create-only operation.
+///
+/// ```text
+/// owned source manifest
+///         |
+///         +--> clear pending deletes and rewrite explicit keys
+///         +--> reset fencing token, timestamp, and generation
+///         |
+///         v
+/// copy reachable source objects -- any failure --> partial target copies
+///         |
+///         v
+/// return unpublished target manifest (caller writes visibility root)
+/// ```
+///
+/// # Parameters
+///
+/// - `state`: Borrowed server state whose store performs server-side copies.
+/// - `source`: Source namespace prefix expected on every reachable key.
+/// - `target`: Fresh target namespace prefix for copied objects.
+/// - `manifest`: Owned retained source manifest to transform in place.
+///
+/// # Returns
+///
+/// The rewritten, generation-zero manifest after every object copy succeeds.
+/// It is not visible in the target until the caller writes it.
+///
+/// # Errors
+///
+/// Returns an index error if a manifest key escapes the source prefix, or the
+/// first copy/storage error observed. Some copies may already exist under the
+/// target prefix; [`clone_namespace`] is responsible for cleanup.
+///
+/// # Side Effects
+///
+/// Performs one copy-if-absent operation per reachable artifact. It does not
+/// write metadata, publish a manifest, update caches, or release the source pin.
+///
+/// # Consistency
+///
+/// The caller must hold a named source pin while this function runs. Clearing
+/// `pending_deletes` prevents source GC backlog from becoming target cleanup
+/// intent. Copy-if-absent prevents overwriting any destination object.
+///
+/// # Performance
+///
+/// At most [`CLONE_COPY_CONCURRENCY`] copies are polled simultaneously. The
+/// ordered map makes planning deterministic, but completion order is not.
+/// Memory is linear in the number of reachable object keys.
+///
+/// # Examples
+///
+/// A source manifest at generation 42 with one WAL fragment and one segment is
+/// transformed into generation zero with target-prefixed explicit references.
+/// After copies finish, the caller's manifest write publishes target generation
+/// one.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `manifest` is moved in and returned as a new owned value. The iterator builds
+/// owned async closures for each copy; cloning `ZeppelinStore` shares its
+/// underlying client rather than duplicating S3 contents. `buffer_unordered`
+/// provides bounded asynchronous concurrency without one OS thread per object.
 async fn materialize_clone_manifest(
     state: &AppState,
     source: &str,
@@ -723,6 +1566,28 @@ async fn materialize_clone_manifest(
     Ok(manifest)
 }
 
+/// Maps every manifest-reachable source key to its target-prefixed destination.
+///
+/// # Parameters
+///
+/// - `source`: Namespace prefix all input keys must have.
+/// - `target`: Namespace prefix to substitute.
+/// - `manifest`: Borrowed manifest whose live reachable artifacts are expanded.
+///
+/// # Returns
+///
+/// An ordered, duplicate-free map from exact source keys to exact target keys.
+/// The manifest remains usable by the caller.
+///
+/// # Errors
+///
+/// Returns an index error if any generated or stored reachable key lies outside
+/// the source namespace prefix. No copies occur in this helper.
+///
+/// # Examples
+///
+/// `source/wal/01.wal` maps to `restore/wal/01.wal`; segment sidecars and
+/// quantization artifacts are expanded by [`reachable_keys`] in the same way.
 fn clone_copy_map(
     source: &str,
     target: &str,
@@ -737,6 +1602,32 @@ fn clone_copy_map(
         .collect()
 }
 
+/// Rewrites explicit object keys embedded in segment references for the target.
+///
+/// Computed artifact locations already receive the target namespace when query
+/// or GC code derives them. This helper updates only keys persisted directly in
+/// sketch, bootstrap, membership, and grouped-cluster references.
+///
+/// # Parameters
+///
+/// - `source`: Prefix expected on each embedded key.
+/// - `target`: Replacement namespace prefix.
+/// - `manifest`: Mutable unpublished clone manifest.
+///
+/// # Errors
+///
+/// Returns an index error on the first embedded key outside the source prefix.
+/// Earlier fields may already have been rewritten in memory, but no storage
+/// publication occurs here.
+///
+/// # Side Effects
+///
+/// Mutates only the owned in-memory manifest supplied by the caller.
+///
+/// # Examples
+///
+/// A stored membership key `source/segments/s1/membership.bin` becomes
+/// `restore/segments/s1/membership.bin`; the segment ID remains `s1`.
 fn rewrite_manifest_stored_keys(
     source: &str,
     target: &str,
@@ -759,6 +1650,28 @@ fn rewrite_manifest_stored_keys(
     Ok(())
 }
 
+/// Replaces one exact leading namespace component in an object-store key.
+///
+/// # Parameters
+///
+/// - `source`: Expected source namespace without the trailing slash.
+/// - `target`: Destination namespace without the trailing slash.
+/// - `key`: Complete source object key.
+///
+/// # Returns
+///
+/// A newly allocated target key with the suffix preserved byte-for-byte.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::Index`] when `key` does not begin with
+/// `<source>/`; this fails closed instead of copying or publishing a reference
+/// outside the source namespace.
+///
+/// # Examples
+///
+/// Rewriting source `catalog`, target `restore`, and key
+/// `catalog/wal/01.wal` returns `restore/wal/01.wal`.
 fn rewrite_namespace_key(source: &str, target: &str, key: &str) -> Result<String, ZeppelinError> {
     let source_prefix = format!("{source}/");
     let suffix = key.strip_prefix(&source_prefix).ok_or_else(|| {
@@ -769,7 +1682,44 @@ fn rewrite_namespace_key(source: &str, target: &str, key: &str) -> Result<String
     Ok(format!("{target}/{suffix}"))
 }
 
-/// Lists all namespaces (not routed — disabled to prevent namespace enumeration).
+/// Builds metadata-only responses for all namespaces discovered in storage.
+///
+/// This function is intentionally not registered by
+/// [`crate::server::build_router`], so `GET /v1/namespaces` receives 405 rather
+/// than enumerating tenant names. If an internal caller invokes it, each result
+/// is combined with one empty manifest, so all live artifact statistics are
+/// zero; it is a metadata inventory, not a status endpoint.
+///
+/// # Parameters
+///
+/// - `state`: Shared namespace manager and indexing defaults.
+///
+/// # Returns
+///
+/// An unordered JSON array of namespace metadata responses. Empty means no
+/// top-level metadata records were discovered.
+///
+/// # Errors
+///
+/// Propagates common-prefix listing, per-namespace metadata GET, and metadata
+/// decoding failures through [`ApiError`]. A missing metadata object that
+/// disappears during listing is skipped by the domain manager.
+///
+/// # Side Effects
+///
+/// Refreshes process-local namespace registry entries and emits a count log. It
+/// does not read manifests or modify object storage.
+///
+/// # Performance
+///
+/// Performs one delimiter LIST plus one metadata GET per discovered namespace;
+/// those GETs currently run sequentially. It does not recursively walk WAL or
+/// segment objects.
+///
+/// # Examples
+///
+/// An internal inventory over `catalog` and `inventory` returns two metadata
+/// rows with zero live counts. External `GET /v1/namespaces` remains disabled.
 #[allow(dead_code)]
 #[instrument(skip(state))]
 pub async fn list_namespaces(
@@ -790,7 +1740,54 @@ pub async fn list_namespaces(
     Ok(Json(responses))
 }
 
-/// Returns metadata for a single namespace.
+/// Returns lifecycle metadata plus strongly verified manifest statistics.
+///
+/// Unlike ordinary data operations, this status endpoint deliberately accepts
+/// a deletion tombstone so clients can observe `state = "deleting"` until the
+/// background worker removes metadata. The manifest may already be gone at
+/// that point; the manifest cache represents a missing live manifest as empty,
+/// so a deleting response can contain zero artifact statistics.
+///
+/// # Parameters
+///
+/// - `state`: Shared metadata manager, manifest cache, store, and defaults.
+/// - `ns`: Namespace path segment to inspect.
+///
+/// # Returns
+///
+/// HTTP 200 with a fully owned [`NamespaceResponse`]. Active and deleting
+/// namespaces are both representable; absence after final deletion returns an
+/// error instead.
+///
+/// # Errors
+///
+/// Returns 404 when metadata is absent. Metadata, object-store, ETag, and
+/// manifest decoding errors map through [`ApiError`]. This endpoint does not
+/// return 410 merely because metadata is already `deleting`.
+///
+/// # Side Effects
+///
+/// May refresh the namespace metadata registry and always strongly verifies or
+/// fetches the live manifest through the process-local cache.
+///
+/// # Consistency
+///
+/// Manifest-derived fields are based on an S3/MinIO verification performed for
+/// this strong read, not solely on TTL. Metadata lookup can use its bounded-TTL
+/// registry because this operation does not publish metadata changes.
+///
+/// # Performance
+///
+/// A metadata cache miss performs one metadata GET. The strong manifest path
+/// normally performs one conditional or full manifest GET and can coalesce
+/// concurrent readers. It performs no prefix LIST, HEAD, WAL GET, or segment
+/// GET; counts and bytes come from the manifest body.
+///
+/// # Examples
+///
+/// After an upsert publishes one seven-vector WAL fragment, GET reports seven
+/// vectors and one uncompacted fragment. During deletion it may briefly report
+/// `deleting` with zero counts; after tombstone removal the same GET returns 404.
 #[instrument(skip(state), fields(namespace = %ns))]
 pub async fn get_namespace(
     State(state): State<AppState>,
@@ -818,7 +1815,42 @@ pub async fn get_namespace(
     )))
 }
 
-/// Reports whether a namespace has WAL fragments pending compaction.
+/// Reports compaction readiness from a strongly verified live manifest.
+///
+/// This endpoint is a polling surface for [`compact_namespace`]. It does not
+/// inspect compaction tasks or metadata health; `ready` is exactly the absence
+/// of uncompacted WAL fragment references in the manifest.
+///
+/// # Parameters
+///
+/// - `state`: Shared active-namespace and manifest services.
+/// - `ns`: Namespace path segment whose readiness should be read.
+///
+/// # Returns
+///
+/// HTTP 200 with manifest generation, fragment/segment counts, active segment,
+/// and a derived readiness flag.
+///
+/// # Errors
+///
+/// Returns 404 for a missing namespace, 410 for a deletion tombstone, or mapped
+/// metadata, storage, and manifest errors.
+///
+/// # Side Effects
+///
+/// May refresh metadata and manifest caches. It does not acquire a lease or
+/// start compaction.
+///
+/// # Performance
+///
+/// Performs active metadata lookup and one strong manifest verification, then
+/// scans in-memory fragment and segment references. It reads no artifact body.
+///
+/// # Examples
+///
+/// A manifest with two fragments returns `ready = false`. After a successful
+/// compaction publishes a segment and removes both references, a later poll
+/// returns a newer generation with `ready = true`.
 #[instrument(skip(state), fields(namespace = %ns))]
 pub async fn get_compaction_status(
     State(state): State<AppState>,
@@ -838,7 +1870,84 @@ pub async fn get_compaction_status(
     Ok(Json(compaction_status_from_manifest(&ns, &manifest)))
 }
 
-/// Runs one manual, lease-protected compaction cycle for a namespace.
+/// Starts one lease-protected compaction cycle when manifest work is pending.
+///
+/// The handler strongly reads the current manifest before acquiring a lease.
+/// With no uncompacted fragments it returns a synchronous no-op. Otherwise it
+/// acquires the namespace lease, moves the lease and shared service handles into
+/// a detached Tokio task, and immediately returns the pre-trigger status.
+///
+/// ```text
+/// strong manifest read
+///        |
+///        +-- no fragments --> 200 "noop"
+///        |
+///        v
+/// acquire lease -- held elsewhere --> 409 retryable conflict
+///        |
+///        v
+/// spawn fenced compaction --> 202 "accepted"
+///        |
+///        +-- success --> publish manifest + invalidate cache + log
+///        `-- failure --> invalidate cache + log; HTTP response is unchanged
+/// ```
+///
+/// # Parameters
+///
+/// - `state`: Shared namespace manager, manifest cache, lease manager, and
+///   compactor.
+/// - `ns`: Active namespace selected for one manual cycle.
+///
+/// # Returns
+///
+/// HTTP 200 with `status = "noop"` when no fragment needs compaction, or HTTP
+/// 202 with `status = "accepted"` after lease acquisition and task spawn. Both
+/// bodies describe the manifest observed before work began.
+///
+/// # Errors
+///
+/// Returns 404 for a missing namespace, 410 for a deleting namespace, 409 when
+/// another valid lease holder owns the namespace, or mapped metadata/manifest/
+/// lease storage errors before the task is spawned. Errors after HTTP 202 are
+/// logged and reflected through later status and health reads, not returned to
+/// the completed request.
+///
+/// # Side Effects
+///
+/// May acquire a lease and spawn a task that reads immutable WAL artifacts,
+/// builds and uploads a segment, conditionally publishes the manifest, records
+/// compaction health, releases the lease best-effort, and invalidates manifest
+/// cache state on either outcome.
+///
+/// # Consistency
+///
+/// The background path combines a lease/fencing token with manifest CAS; a
+/// stale writer must not publish over a newer lease holder. The initial
+/// no-fragment check is only an observation: publication authority remains in
+/// the lease-protected domain operation.
+///
+/// # Performance
+///
+/// The request path pays for metadata lookup, one strong manifest verification,
+/// and lease acquisition. Accepted work continues asynchronously and can incur
+/// substantial S3 reads/writes and CPU for index construction. The handler does
+/// not wait for that cost.
+///
+/// # Examples
+///
+/// After one upsert, POST `/compact` returns 202 with one uncompacted fragment.
+/// Polling `/compact/status` eventually observes zero fragments and a newer
+/// generation. A simultaneous second trigger normally receives a retryable 409
+/// while the first task holds the lease.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `tokio::spawn` requires an owned, `Send + 'static` future because the request
+/// stack frame will disappear before compaction finishes. Cloning each `Arc`
+/// increments a reference count rather than copying the service. The owned
+/// namespace string, FTS map, and lease move into the task. Java relies on heap
+/// reachability for similar callbacks; C requires explicit reference counting
+/// and cleanup. Rust verifies the task cannot retain borrowed request locals.
 #[instrument(skip(state), fields(namespace = %ns))]
 pub async fn compact_namespace(
     State(state): State<AppState>,
@@ -920,7 +2029,56 @@ pub async fn compact_namespace(
     ))
 }
 
-/// Stages a new per-namespace index config for the next compaction.
+/// Persists desired per-namespace index settings for the next compaction.
+///
+/// Omitted fields preserve the namespace's current effective settings. Legacy
+/// metadata without an override first inherits current server defaults. The
+/// handler validates the complete result, then the namespace manager publishes
+/// a whole-metadata replacement with ETag compare-and-swap. It does not itself
+/// schedule or run compaction.
+///
+/// # Parameters
+///
+/// - `state`: Shared metadata manager and server indexing defaults.
+/// - `ns`: Active namespace whose desired build settings should change.
+/// - `req`: Owned optional-field patch; at least one field must be supplied.
+///
+/// # Returns
+///
+/// HTTP 202 with the complete persisted configuration and guidance to observe a
+/// later compaction through namespace GET.
+///
+/// # Errors
+///
+/// Returns 400 for an empty patch or invalid resolved parameters, 404 for a
+/// missing namespace, 410 for a deleting namespace, 409 if repeated metadata
+/// CAS attempts lose, or mapped storage/serialization errors. A post-write
+/// invariant check also returns a server-side index error if the returned
+/// metadata unexpectedly omits `index_config`.
+///
+/// # Side Effects
+///
+/// Performs a fresh versioned metadata GET and conditional PUT, updates
+/// `updated_at`, and refreshes the metadata registry. Existing immutable
+/// segments and the manifest are unchanged.
+///
+/// # Consistency
+///
+/// Every CAS retry reloads authoritative metadata, so a stale patch cannot
+/// overwrite a concurrent deletion or health update. New settings affect only
+/// a future segment publication. Repeating an identical patch is behaviorally
+/// safe but still republishes metadata and advances `updated_at`.
+///
+/// # Performance
+///
+/// Performs at least one metadata GET and conditional PUT, with up to ten CAS
+/// attempts inside the manager. No segment objects are read or rewritten.
+///
+/// # Examples
+///
+/// PATCH `{"nlist":256}` returns 202 immediately. The active segment keeps its
+/// old cluster count until a later compaction publishes a replacement built
+/// with 256 centroids.
 #[instrument(skip(state), fields(namespace = %ns))]
 pub async fn patch_index_config(
     State(state): State<AppState>,
@@ -967,7 +2125,73 @@ pub async fn patch_index_config(
     ))
 }
 
-/// Deletes a namespace and cleans up associated in-memory state.
+/// Tombstones a namespace and resumes destructive cleanup in the background.
+///
+/// Phase one is completed before HTTP acceptance: metadata is conditionally
+/// changed to `deleting`, then the live manifest is removed so ordinary readers
+/// can no longer discover artifacts. The handler evicts disposable WAL-lock and
+/// manifest-cache state, then spawns a 25-second bounded prefix-deletion pass.
+/// The metadata tombstone is deleted last only after S3/MinIO verifies no other
+/// namespace keys remain.
+///
+/// # Parameters
+///
+/// - `state`: Shared lifecycle manager plus process-local WAL and manifest
+///   caches.
+/// - `ns`: Namespace whose deletion should begin or resume.
+///
+/// # Returns
+///
+/// HTTP 202 with `{"state":"deleting"}` after the tombstone and manifest
+/// removal succeed and a cleanup task is spawned. Completion is observed when
+/// [`get_namespace`] returns 404.
+///
+/// # Errors
+///
+/// Returns 404 after deletion has fully removed metadata, 409 if the metadata
+/// tombstone CAS repeatedly conflicts, or mapped metadata/manifest storage and
+/// serialization failures. If manifest deletion fails, the durable tombstone
+/// can already exist even though this request returns an error.
+///
+/// Background listing/deletion failures happen after HTTP 202 and are logged;
+/// they leave the tombstone so a later DELETE can resume safely.
+///
+/// # Side Effects
+///
+/// CAS-updates metadata, deletes the live manifest, removes the process-local
+/// WAL writer lock, invalidates the manifest cache, and spawns prefix cleanup.
+/// The worker can delete every object under the namespace and finally
+/// `meta.json`.
+///
+/// # Consistency
+///
+/// Tombstone-before-data ordering prevents a new active namespace from
+/// appearing over partially deleted objects. Removing the manifest ends the
+/// visibility root before artifact deletion. DELETE is resumable while the
+/// tombstone exists; after completion another retry returns 404. More than one
+/// retry may spawn overlapping cleanup passes, which rely on idempotent delete
+/// behavior and final authoritative relisting.
+///
+/// # Performance
+///
+/// Before returning, the handler pays for versioned metadata read/CAS and a
+/// manifest DELETE. The detached pass spends up to 25 seconds on paged LIST and
+/// DELETE work; large namespaces may require a later retry.
+///
+/// # Examples
+///
+/// DELETE `catalog` returns 202. Status GET may briefly report `deleting`; data
+/// requests receive the deleting error. If the first 25-second pass exhausts
+/// its budget, a repeated DELETE starts another pass. Final metadata removal
+/// makes GET return 404.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Cloning the manager's `Arc` and moving an owned namespace string into the
+/// spawned task separates task lifetime from request lifetime. There is no
+/// borrowed stack pointer to become invalid. Remote cleanup is not covered by
+/// Rust RAII, so the tombstone is the durable equivalent of a resumable cleanup
+/// record after process cancellation or crash.
 #[instrument(skip(state), fields(namespace = %ns))]
 pub async fn delete_namespace(
     State(state): State<AppState>,
@@ -980,7 +2204,8 @@ pub async fn delete_namespace(
         .await
         .map_err(ApiError::from)?;
 
-    // Clean up per-namespace in-memory state to prevent unbounded growth
+    // The durable tombstone and manifest removal happened first. Only now is it
+    // safe to discard disposable process state that could retain the namespace.
     state.wal_writer.remove_lock(&ns);
     state.manifest_cache.invalidate(&ns);
 
@@ -1023,7 +2248,56 @@ pub async fn delete_namespace(
     ))
 }
 
-/// Enqueues warm-set hydration for the namespace's current active segment.
+/// Requests non-blocking warm-set hydration for the current active segment.
+///
+/// Hydration is a cache optimization, never an authority change. The handler
+/// rejects the request when hydration is disabled, requires an active namespace,
+/// strongly reads the manifest, clones the active segment descriptor, and
+/// offers it to the hydrator's bounded channel without awaiting object loads.
+///
+/// # Parameters
+///
+/// - `state`: Shared optional hydrator, namespace manager, manifest cache, and
+///   store.
+/// - `ns`: Active namespace whose current active segment should be warmed.
+///
+/// # Returns
+///
+/// HTTP 202 naming the selected segment after the non-blocking hydration request
+/// is made. This does not guarantee the job entered the bounded queue or that
+/// any cache object has been written; queue-full/closed outcomes are logged and
+/// counted inside the hydrator, whose API returns unit.
+///
+/// # Errors
+///
+/// Returns 409 before namespace lookup when hydration is disabled, 404 for a
+/// missing namespace, 410 for a deleting namespace, 400 when the strong
+/// manifest has no resolvable active segment, or mapped manifest/storage errors.
+///
+/// # Side Effects
+///
+/// Strongly verifies the manifest and may enqueue an owned hydration job. A
+/// worker can later GET immutable segment objects and populate disposable local
+/// disk cache, while updating hydration metrics and logs.
+///
+/// # Consistency
+///
+/// The selected descriptor comes from the strongly verified live manifest.
+/// If a later compaction changes the active segment, the queued job retains its
+/// owned snapshot; hydration cannot change query visibility or override S3.
+/// Repeated requests can submit repeated jobs and are not deduplicated here.
+///
+/// # Performance
+///
+/// The HTTP path performs metadata lookup and one strong manifest verification,
+/// then uses a non-blocking channel send. It does not wait for potentially large
+/// segment GETs or cache writes.
+///
+/// # Examples
+///
+/// POST `/hydrate` after compaction returns 202 with `segment_id = "s42"` in
+/// well under the time needed to download that segment. A later query can hit
+/// disk cache after the worker completes. An empty namespace returns 400.
 #[instrument(skip(state), fields(namespace = %ns))]
 pub async fn trigger_hydration(
     State(state): State<AppState>,
@@ -1066,12 +2340,63 @@ pub async fn trigger_hydration(
     ))
 }
 
+/// Clones the manifest's active segment descriptor for work beyond the borrow.
+///
+/// # Parameters
+///
+/// - `manifest`: Borrowed visibility snapshot whose active pointer should be
+///   resolved.
+///
+/// # Returns
+///
+/// An owned [`SegmentRef`] when `active_segment` matches an entry in
+/// `manifest.segments`, or `None` when the pointer is absent or unresolved.
+///
+/// # Performance
+///
+/// Scans segment references linearly, then clones the selected descriptor and
+/// its owned keys/vectors. It performs no storage I/O.
+///
+/// # Examples
+///
+/// A manifest pointing to `s42` returns an owned `s42` descriptor that a
+/// hydration job can retain after the manifest borrow ends.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The inner lookup returns `&SegmentRef`, a temporary shared borrow. `.cloned()`
+/// creates an owned descriptor because the async hydrator may outlive the
+/// borrowed manifest. Java object references would remain heap-managed; C would
+/// require a deep-copy/lifetime convention. Rust prevents enqueuing a dangling
+/// reference.
 fn active_segment_snapshot(
     manifest: &crate::wal::Manifest,
 ) -> Option<crate::wal::manifest::SegmentRef> {
     active_segment_ref(manifest).cloned()
 }
 
+/// Derives the compact polling view from one borrowed manifest snapshot.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace name copied into the response.
+/// - `manifest`: Borrowed strongly read manifest to summarize.
+///
+/// # Returns
+///
+/// An owned status response. `ready` is true exactly when no uncompacted
+/// fragments are referenced; an absent or unresolved active segment yields
+/// `None` and zero active vectors.
+///
+/// # Performance
+///
+/// Scans manifest fragment/segment references in memory and allocates the
+/// namespace and optional active ID. It performs no S3/MinIO request.
+///
+/// # Examples
+///
+/// Generation 8 with one active segment and no fragments becomes a ready
+/// response carrying generation 8 and that segment's vector count.
 fn compaction_status_from_manifest(
     namespace: &str,
     manifest: &Manifest,
@@ -1089,6 +2414,25 @@ fn compaction_status_from_manifest(
     }
 }
 
+/// Resolves the manifest's active-segment ID to its borrowed segment reference.
+///
+/// # Parameters
+///
+/// - `manifest`: Borrowed manifest containing the optional ID and segment list.
+///
+/// # Returns
+///
+/// `Some(&SegmentRef)` when both the ID and matching entry exist; otherwise
+/// `None`. The returned reference cannot outlive `manifest`.
+///
+/// # Performance
+///
+/// Performs a linear scan of `manifest.segments` and no allocation or I/O.
+///
+/// # Examples
+///
+/// If `active_segment` is `s2` and the list contains `s1, s2`, this returns a
+/// borrow of `s2`. A stale pointer to an absent ID returns `None`.
 fn active_segment_ref(manifest: &Manifest) -> Option<&SegmentRef> {
     let active_segment = manifest.active_segment.as_ref()?;
     manifest
@@ -1097,6 +2441,23 @@ fn active_segment_ref(manifest: &Manifest) -> Option<&SegmentRef> {
         .find(|segment| segment.id == *active_segment)
 }
 
+/// Chooses the index family reported for the namespace's active data.
+///
+/// # Parameters
+///
+/// - `meta`: Borrowed metadata containing the namespace's baseline index type.
+/// - `manifest`: Borrowed manifest whose active segment can record hierarchical
+///   layout.
+///
+/// # Returns
+///
+/// [`IndexType::Hierarchical`] when the resolved active segment is marked
+/// hierarchical; otherwise the metadata `index_type` value.
+///
+/// # Examples
+///
+/// Legacy IVF-flat metadata plus a hierarchical active segment reports
+/// `hierarchical`. Before first compaction, the metadata type is reported.
 fn namespace_index_kind(meta: &NamespaceMetadata, manifest: &Manifest) -> IndexType {
     if active_segment_ref(manifest).is_some_and(|segment| segment.hierarchical) {
         IndexType::Hierarchical
