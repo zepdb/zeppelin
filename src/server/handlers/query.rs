@@ -1,3 +1,146 @@
+//! Validates HTTP query requests and orchestrates Zeppelin's retrieval algebra.
+//!
+//! This is the API boundary between Axum and the domain query engine in
+//! [`crate::query`]. The handlers deserialize the wire format, reject malformed
+//! combinations before doing namespace or storage work, choose one authoritative
+//! manifest snapshot, execute ANN and/or BM25 candidate sources, and apply
+//! response-level fusion, reranking, facets, grouping, cursor pagination,
+//! projection, explain data, and diagnostics. They deliberately delegate WAL,
+//! immutable-segment, bitmap-filter, index, and cache mechanics to the domain
+//! layer rather than reproducing them here.
+//!
+//! [`query_namespace`][crate::server::handlers::query::query_namespace] serves
+//! `POST /v1/namespaces/:ns/query`, including optional point-in-time reads
+//! selected by `?as_of=...`.
+//! [`batch_query_namespace`][crate::server::handlers::query::batch_query_namespace] serves
+//! `POST /v1/namespaces/:ns/query/batch`; it validates entries independently,
+//! resolves the namespace and one shared live manifest once, and returns a
+//! positional success-or-error envelope for every entry.
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`QueryRequest`][crate::server::handlers::query::QueryRequest]
+//!    and [`CandidateSource`][crate::server::handlers::query::CandidateSource]
+//!    for the legacy and retrieval-algebra request shapes.
+//! 2. Read [`query_namespace`][crate::server::handlers::query::query_namespace]
+//!    and [`batch_query_namespace`][crate::server::handlers::query::batch_query_namespace]
+//!    for HTTP ordering,
+//!    metrics, rate charging, snapshot choice, and error boundaries.
+//! 3. Follow `validate_query_shape`, `validate_query_source`, and
+//!    `validate_retrieval_algebra_options` for the I/O-free request contract.
+//! 4. Continue with `execute_validated_query`, `execute_hybrid_query`, and
+//!    `execute_query_source_with_manifest` for source execution against one
+//!    manifest.
+//! 5. Read `fuse_source_responses` and `apply_rerank_if_requested` for the
+//!    response pipeline, then the facet, grouping, and cursor helpers.
+//! 6. Finish with `ExplainAccumulator`, hydration notification, and batch entry
+//!    construction for observational side effects and response metadata.
+//!
+//! ## Single-query flow
+//!
+//! ```text
+//! HTTP bytes + path + query string
+//!             |
+//!             v
+//! deserialize and validate shape -------- invalid -> ApiError (no query metric)
+//!             |
+//!             v
+//! resolve namespace metadata
+//!             |
+//!             +--> as_of present -> resolve retained manifest from S3/MinIO
+//!             |
+//!             `--> live query ----> strong/eventual manifest read or cache
+//!                                      |
+//!                                      v
+//!                       one authoritative Manifest snapshot
+//!                                      |
+//!                +---------------------+---------------------+
+//!                |                                           |
+//!                v                                           v
+//!          ANN source(s)                               BM25 source(s)
+//!      lower distance is better                  higher relevance is better
+//!                |                                           |
+//!                +------------- fuse if needed --------------+
+//!                                      |
+//!                                      v
+//!             facet frontier -> optional rerank -> group/cursor -> projection
+//!                                      |
+//!                                      v
+//!                   QueryResponse + optional explain/debug
+//! ```
+//!
+//! A metadata [`Filter`][crate::types::Filter] is passed to each source so
+//! filtering happens while the source candidate frontier is built, before
+//! fusion and later presentation transforms. ANN and BM25 raw scores have
+//! opposite directions and unrelated scales: reciprocal-rank fusion uses only
+//! source positions, while weighted fusion converts each source to a
+//! direction-adjusted `[0, 1]` range first. Exact vector reranking again yields
+//! a distance, so smaller is better; BM25 reranking yields relevance, so larger
+//! is better.
+//!
+//! ## Batch snapshot and failure flow
+//!
+//! ```text
+//! batch body -> validate each entry -> resolve namespace once
+//!      |                  |                    |
+//!      |                  | invalid            | missing/error
+//!      |                  v                    v
+//!      |          preserve entry error     all valid entries receive
+//!      |                                   the namespace error
+//!      v
+//! strongest consistency among valid entries
+//!      |
+//!      v
+//! read one live Manifest and clone the snapshot for every valid entry
+//!      |
+//!      +--> entry succeeds -> { ok: true, response, latency }
+//!      `--> entry fails ----> { ok: false, error, latency }
+//! ```
+//!
+//! Cloning a [`Manifest`][crate::wal::Manifest] gives each sequential batch
+//! execution the same owned visibility description; no entry silently upgrades
+//! to a newer generation. A batch has no `as_of` query parameter. It chooses
+//! strong manifest freshness if any shape-valid entry requests strong
+//! consistency, although each source still applies its own requested WAL
+//! semantics.
+//!
+//! ## Invariants
+//!
+//! - Request-shape validation precedes namespace I/O and single-query metrics,
+//!   so malformed input remains a client error even for a missing namespace.
+//! - The selected S3/MinIO manifest controls artifact visibility. Caches and
+//!   hydration never add artifacts to the current query snapshot.
+//! - Every source in one hybrid or batch execution receives the selected owned
+//!   manifest rather than re-reading visibility independently.
+//! - Cursor tokens are opaque integrity checks, not durable server-side state.
+//!   They bind namespace, ranking-affecting request fields, score bits, and ID;
+//!   they do not freeze a live manifest generation.
+//! - Grouping and cursoring are mutually exclusive. Facets count the filtered,
+//!   pre-rerank candidate frontier, not the entire namespace or final page.
+//! - Unsupported projections and inconsistent request combinations fail
+//!   explicitly; this layer does not silently approximate them.
+//!
+//! ## Rust concepts used here
+//!
+//! Serde's tagged enums model the request grammar as closed Rust variants. This
+//! resembles a Java sealed hierarchy and a C tagged union, but exhaustive
+//! `match` expressions make omitted cases a compiler error. `Option<T>` records
+//! whether a field was absent without null sentinels, and `Result<T, E>` plus
+//! `?` keeps validation, storage, and index failures on explicit paths.
+//!
+//! [`Cow`][std::borrow::Cow] lets an ANN source borrow coordinates embedded in
+//! the request or own coordinates fetched by ID behind one type. Java would use
+//! references without compiler-enforced lifetime distinctions; C would need a
+//! pointer plus an ownership convention. Rust proves borrowed request data
+//! cannot outlive the request and drops an owned fetched vector automatically.
+//!
+//! Handler extractors move shared [`AppState`][crate::server::AppState] handles
+//! and owned request bytes into an async future. Small validated enums are
+//! `Copy`, while manifest clones duplicate the manifest data intentionally.
+//! `DurationGuard` uses RAII: its [`Drop`] implementation records latency on
+//! both success and every early error, analogous to Java `finally` or a C
+//! cleanup label but enforced by scope.
+
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -32,337 +175,541 @@ use crate::wal::Manifest;
 use super::as_of;
 use super::ApiError;
 
-/// Request body for querying vectors by ANN or BM25 ranking.
+/// Describes one legacy or retrieval-algebra query request.
+///
+/// A legacy request supplies exactly one of `vector` and `rank_by`. An algebra
+/// request supplies `sources` and may add fusion, reranking, grouping, facets,
+/// projection, cursoring, and explain output. Unknown JSON fields are rejected
+/// so misspelled controls never degrade silently into defaults.
+///
+/// `consistency` defaults to [`ConsistencyLevel::Strong`]. `top_k`, `nprobe`,
+/// and the wider `candidate_k` frontier are finalized from a single runtime
+/// configuration snapshot during validation.
+///
+/// # Examples
+///
+/// A legacy ANN body can provide a vector and `top_k = 10`. A hybrid algebra
+/// body can provide one ANN and one BM25 source, request RRF, and ask each source
+/// for 100 candidates before returning the best ten fused IDs.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Serde constructs this owned value from JSON. Optional fields retain the
+/// distinction between “absent, use the server snapshot” and an explicit
+/// value. In Java this usually requires nullable fields plus validation; in C
+/// it requires presence flags alongside values.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryRequest {
-    /// Vector for legacy ANN search. Required unless `rank_by` or `sources` is provided.
+    /// Coordinates for legacy ANN search; mutually exclusive with `rank_by` and `sources`.
     #[serde(default)]
     pub vector: Option<Vec<f32>>,
-    /// BM25 ranking expression for legacy FTS search.
-    /// Required unless `vector` or `sources` is provided.
+    /// BM25 expression for legacy lexical search; mutually exclusive with vector sources.
     #[serde(default)]
     pub rank_by: Option<RankBy>,
-    /// Whether the last token of each BM25 query should be treated as a prefix.
+    /// Whether each BM25 field query's last token also matches indexed prefixes.
     #[serde(default)]
     pub last_as_prefix: Option<bool>,
-    /// Maximum number of results to return (defaults to server config).
+    /// Maximum flat results, groups, or page entries to return after all transforms.
     #[serde(default)]
     pub top_k: Option<usize>,
-    /// Per-source candidate count before multi-source fusion.
+    /// Wider per-source frontier used by fusion and post-retrieval transforms.
     #[serde(default)]
     pub candidate_k: Option<usize>,
-    /// Optional attribute filter applied before ranking.
+    /// Metadata predicate pushed into every source before candidates are retained.
     #[serde(default)]
     pub filter: Option<Filter>,
-    /// Read consistency level (eventual or strong).
+    /// WAL freshness mode; omitted JSON selects strong consistency.
     #[serde(default)]
     pub consistency: ConsistencyLevel,
-    /// Number of IVF clusters to probe (defaults to server config).
+    /// Top-level IVF cluster probe count for ANN sources that do not override it.
     #[serde(default)]
     pub nprobe: Option<usize>,
-    /// Whether result attributes should be included. Defaults to true.
+    /// Legacy attribute projection flag; defaults to `true`.
     #[serde(default)]
     pub include_attributes: Option<bool>,
-    /// Typed retrieval-algebra candidate sources.
+    /// Ordered algebra sources; their positions align with weighted-fusion weights.
     #[serde(default)]
     pub sources: Option<Vec<CandidateSource>>,
-    /// Multi-source fusion strategy.
+    /// Multi-source combination strategy; omitted multi-source fusion defaults to RRF.
     #[serde(default)]
     pub fusion: Option<FusionSpec>,
-    /// Optional reranking strategy.
+    /// Optional second-stage scorer applied only to first-stage candidates.
     #[serde(default)]
     pub rerank: Option<RerankSpec>,
-    /// Optional grouping strategy.
+    /// Optional response grouping applied after source scoring and reranking.
     #[serde(default)]
     pub grouping: Option<GroupingSpec>,
-    /// Attribute fields to facet over the filtered candidate frontier.
+    /// Attribute fields counted over the filtered pre-rerank candidate frontier.
     #[serde(default)]
     pub facets: Option<Vec<FacetSpec>>,
-    /// Response projection settings.
+    /// Response materialization controls; field and vector projection are unsupported.
     #[serde(default)]
     pub projection: Option<ProjectionSpec>,
-    /// Pagination cursor.
+    /// Stateless page marker request; presence also widens retrieval by one result.
     #[serde(default)]
     pub cursor: Option<CursorSpec>,
-    /// Explain output request.
+    /// Plan or full per-result provenance output request.
     #[serde(default)]
     pub explain: Option<ExplainSpec>,
-    /// Include an opt-in query diagnostics block in the response.
+    /// Whether source execution should collect and return timing/cache diagnostics.
     #[serde(default)]
     pub debug: Option<bool>,
 }
 
-/// A typed candidate source in the retrieval-algebra request AST.
+/// Selects one typed candidate generator in the retrieval-algebra request.
+///
+/// ANN can use caller-provided coordinates or load a stored vector by ID. The
+/// by-ID form excludes that seed ID from results. BM25 carries a lexical ranking
+/// expression. A hybrid request retains source order for explain output and
+/// weighted fusion.
+///
+/// # Examples
+///
+/// `Ann { id: "seed-7", ... }` fetches `seed-7` from the selected manifest and
+/// searches for neighbors without returning the seed itself. `Bm25` retrieves
+/// records matching its configured full-text fields.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CandidateSource {
-    /// ANN vector candidate source.
+    /// Approximate nearest-neighbor source where lower raw distance is better.
     Ann {
-        /// Query vector for ANN search.
+        /// Inline query coordinates; exactly one of `vector` and `id` is required.
         #[serde(default)]
         vector: Option<Vec<f32>>,
-        /// Stored vector ID to load and use as the ANN query vector.
+        /// Stored vector whose coordinates become the query and whose ID is excluded.
         #[serde(default)]
         id: Option<String>,
-        /// Number of IVF clusters to probe for this source.
+        /// Source-local IVF probe count, mutually exclusive with top-level `nprobe`.
         #[serde(default)]
         nprobe: Option<usize>,
     },
-    /// BM25 full-text candidate source.
+    /// Full-text source where higher raw relevance is better.
     Bm25 {
-        /// BM25 ranking expression.
+        /// Expression whose field queries are validated against namespace FTS config.
         rank_by: RankBy,
-        /// Treat the last token of each BM25 query as a prefix.
+        /// Source-local prefix choice, falling back to the top-level option when absent.
         #[serde(default)]
         last_as_prefix: Option<bool>,
     },
 }
 
-/// Candidate fusion strategy in the retrieval-algebra request AST.
+/// Chooses how multiple source rankings become one comparable score list.
+///
+/// RRF is scale independent and rewards source rank. Weighted fusion first
+/// min-max normalizes ANN distances and BM25 relevance so that `1.0` is best in
+/// both source kinds, then multiplies by each positional weight.
+///
+/// # Examples
+///
+/// With `Rrf { k: 60 }`, a rank-one hit contributes `1 / 61` from that source.
+/// With weights `[0.25, 0.75]`, the second source's normalized score contributes
+/// three times as much as the first source's score.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FusionSpec {
-    /// No fusion. Valid only with one source.
+    /// No fusion; rejected when more than one source is present.
     None,
-    /// Reciprocal rank fusion. Reserved for multi-source retrieval.
+    /// Reciprocal rank fusion over source positions.
     Rrf {
-        /// RRF smoothing constant.
+        /// Positive smoothing constant; omitted means the private `DEFAULT_RRF_K` value.
         #[serde(default)]
         k: Option<usize>,
     },
-    /// Weighted score fusion. Reserved for multi-source retrieval.
+    /// Direction-adjusted min-max score fusion.
     Weighted {
-        /// Per-source weights, in the same order as `sources`.
+        /// Finite weights in exactly the same order and count as `sources`.
         weights: Vec<f32>,
     },
 }
 
 impl FusionSpec {
+    /// Reports whether this specification explicitly disables fusion.
+    ///
+    /// # Returns
+    ///
+    /// `true` only for [`FusionSpec::None`].
+    ///
+    /// # Examples
+    ///
+    /// Validation accepts `None` for a single source but rejects it for two.
     fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }
 }
 
-/// Reranking strategy in the retrieval-algebra request AST.
+/// Selects an optional scorer for the already-retrieved candidate frontier.
+///
+/// Explicit vector reranking fetches each candidate's stored coordinates and
+/// sorts by exact distance to a second vector. BM25 reranking tokenizes
+/// candidate attributes and scores only that in-memory frontier; it is not a
+/// replacement for the namespace-wide BM25 source.
+///
+/// # Examples
+///
+/// A request can retrieve 100 ANN candidates, rerank them by a different vector,
+/// and return ten. No reranker can introduce an ID absent from those 100.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RerankSpec {
-    /// Use the engine default rerank behavior.
+    /// Keep the source engine's built-in behavior without another HTTP-layer scorer.
     Default,
-    /// Disable explicit rerank. Vector execution still performs required exact rerank.
+    /// Add no HTTP-layer reranker; ANN indexes may still exact-rerank internally.
     None,
-    /// Reserved for future vector reranking over a different vector.
+    /// Recompute candidate scores as distance to another vector.
     Vector {
-        /// Reranking vector.
+        /// Finite coordinates whose dimensions must match the namespace.
         vector: Vec<f32>,
     },
-    /// Reserved for future BM25 reranking.
+    /// Recompute relevance from candidate attributes using a BM25 expression.
     Bm25 {
-        /// BM25 reranking expression.
+        /// Expression over namespace fields configured for full-text search.
         rank_by: RankBy,
     },
 }
 
 impl RerankSpec {
+    /// Reports whether this variant requests an actual second-stage scorer.
+    ///
+    /// # Returns
+    ///
+    /// `true` for vector or BM25 reranking and `false` for default/no-op modes.
+    ///
+    /// # Examples
+    ///
+    /// An explicit scorer widens first-stage retrieval to `candidate_k`; a
+    /// `Default` request can stay at `top_k`.
     fn is_explicit(&self) -> bool {
         matches!(self, Self::Vector { .. } | Self::Bm25 { .. })
     }
 }
 
-/// Grouping strategy in the retrieval-algebra request AST.
+/// Selects flat output or post-ranking groups keyed by one attribute field.
+///
+/// Groups preserve the first appearance of each key in ranked order and retain
+/// at most `max_per_group` members. Records missing the field become separate
+/// singleton groups keyed by their own IDs.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GroupingSpec {
-    /// Do not group results.
+    /// Return the ordinary flat ranked list.
     None,
-    /// Reserved for field-based grouping.
+    /// Group results by a string representation of one attribute.
     Field {
-        /// Attribute field to group by.
+        /// Attribute field whose scalar or list value becomes the display key.
         field: String,
-        /// Maximum results per group.
+        /// Positive maximum number of ranked members retained in one group.
         max_per_group: usize,
     },
 }
 
-/// Facet field request in the retrieval-algebra request AST.
+/// Names one attribute field to count over the filtered candidate frontier.
+///
+/// The transparent newtype serializes as a JSON string while preventing facet
+/// names from being confused with unrelated strings inside this module.
+/// Duplicate requested fields are counted once; an absent field returns an
+/// empty count map.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(transparent)]
-pub struct FacetSpec(String);
+pub struct FacetSpec(
+    /// Exact request field name; validation rejects the empty string.
+    String,
+);
 
 impl FacetSpec {
+    /// Borrows the requested field name without allocating.
+    ///
+    /// # Returns
+    ///
+    /// The exact field string supplied by the request.
+    ///
+    /// # Examples
+    ///
+    /// A JSON facet string `"category"` yields the borrowed name `category`.
     fn field(&self) -> &str {
         &self.0
     }
 }
 
-/// Projection settings in the retrieval-algebra request AST.
+/// Controls which stored payloads are materialized into result JSON.
+///
+/// Attribute inclusion is implemented and can avoid metadata work in the
+/// source engine. Field-level projection and returning vectors are rejected as
+/// not implemented rather than ignored.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectionSpec {
-    /// Whether result attributes should be included. Defaults to true.
+    /// Whether complete result attribute maps should be returned; defaults to `true`.
     #[serde(default)]
     pub include_attributes: Option<bool>,
-    /// Reserved for field-level attribute projection.
+    /// Requested attribute subset; any present value is currently rejected.
     #[serde(default)]
     pub fields: Option<Vec<String>>,
-    /// Reserved for returning vectors in query results.
+    /// Requested stored-vector output; `true` is currently rejected.
     #[serde(default)]
     pub include_vectors: Option<bool>,
 }
 
-/// Cursor strategy in the retrieval-algebra request AST.
+/// Selects the first page or continuation after an opaque rank marker.
+///
+/// Cursor paging is stateless: the token embeds a request fingerprint, score
+/// bits, and ID. It detects accidental reuse with another query but is not a
+/// cryptographic signature and does not pin a live manifest generation.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CursorSpec {
-    /// No cursor.
+    /// Request the first page while enabling cursor output.
     None,
-    /// Reserved for opaque continuation tokens.
+    /// Continue strictly after a prior page's final score-and-ID marker.
     After {
-        /// Opaque cursor token returned by a previous request.
+        /// Versioned token returned as `next_cursor` by a compatible request.
         token: String,
     },
 }
 
-/// Explain request in the retrieval-algebra request AST.
+/// Accepts either a boolean shorthand or a named explain mode.
+///
+/// The untagged Serde representation keeps wire compatibility with both
+/// `"explain": true` and `"explain": "full"`. It must therefore remain in a
+/// self-describing JSON format rather than positional binary serialization.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ExplainSpec {
-    /// Boolean explain toggle.
+    /// Boolean shorthand: `true` means plan mode and `false` means omitted.
     Flag(bool),
-    /// Named explain mode.
+    /// Explicit `none`, `plan`, or `full` mode.
     Mode(ExplainMode),
 }
 
-/// Explain mode in the retrieval-algebra request AST.
+/// Chooses whether explain output is absent, plan-only, or per-result.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExplainMode {
-    /// Do not include explain output.
+    /// Omit explain output.
     None,
-    /// Reserved for physical/logical plan explain output.
+    /// Return the effective source and transform plan.
     Plan,
-    /// Reserved for per-result score/source details.
+    /// Return the plan plus source, fusion, and explicit-rerank provenance.
     Full,
 }
 
-/// Request body for batch querying vectors or BM25 expressions.
+/// Holds the positional requests submitted to the batch route.
+///
+/// The outer request must contain at least one entry and may not exceed the
+/// configured batch size. Entry failures remain isolated response elements once
+/// namespace and shared-manifest setup succeeds.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BatchQueryRequest {
-    /// Positional list of query requests. Each entry uses the single-query body.
+    /// Query bodies whose output entries preserve this exact order.
     pub queries: Vec<QueryRequest>,
 }
 
+/// I/O-free result of expanding defaults and validating request shape.
+///
+/// This compact `Copy` value is passed through execution so downstream code
+/// cannot accidentally reinterpret absent request fields with a newer runtime
+/// configuration snapshot.
 #[derive(Debug, Clone, Copy)]
 struct ValidatedQuery {
+    /// Final response/page/group limit after configuration defaults.
     top_k: usize,
+    /// Per-source frontier retained for transforms that need extra candidates.
     candidate_k: usize,
+    /// Effective top-level or single-source ANN probe count.
     nprobe: usize,
+    /// Effective response attribute projection.
     include_attributes: bool,
+    /// Validated source syntax and execution path.
     source: ValidatedSource,
 }
 
+/// Identifies the request syntax and source cardinality after validation.
+///
+/// Indices point into the request's owned `sources` vector. The hybrid variant
+/// stores the validated count so execution can detect an impossible mismatch
+/// instead of indexing unchecked input.
 #[derive(Debug, Clone, Copy)]
 enum ValidatedSource {
+    /// Legacy top-level vector source.
     LegacyVector,
+    /// Legacy top-level BM25 expression.
     LegacyBm25,
-    AlgebraAnn { index: usize },
-    AlgebraBm25 { index: usize },
-    AlgebraHybrid { source_count: usize },
+    /// One algebra ANN source at the given request position.
+    AlgebraAnn {
+        /// Zero-based position in [`QueryRequest::sources`].
+        index: usize,
+    },
+    /// One algebra BM25 source at the given request position.
+    AlgebraBm25 {
+        /// Zero-based position in [`QueryRequest::sources`].
+        index: usize,
+    },
+    /// Multiple algebra sources that require fusion.
+    AlgebraHybrid {
+        /// Cardinality checked again before source iteration.
+        source_count: usize,
+    },
 }
 
+/// Records the native score direction of an executed source.
+///
+/// ANN distances sort ascending; BM25 relevance sorts descending. Carrying this
+/// enum beside each response prevents fusion from guessing score direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuerySourceKind {
+    /// Approximate-neighbor distance, where lower is better.
     Ann,
+    /// Lexical relevance, where higher is better.
     Bm25,
 }
 
+/// Provides one source's executable inputs as borrowed or owned views.
+///
+/// Inline ANN coordinates borrow from [`QueryRequest`]. A vector loaded by ID
+/// is owned by [`Cow::Owned`] because it must survive after the fetch future
+/// returns. BM25 expressions always borrow the request.
+///
+/// ```text
+/// QueryRequest owns inline vector/rank_by ---- shared borrow ----+
+///                                                              |
+/// selected Manifest -> fetch vector by ID -> owned Vec<f32> ----+--> source execution
+/// ```
 #[derive(Debug)]
 enum QuerySourceRef<'a> {
+    /// ANN coordinates and an optional seed ID to remove from results.
     Ann {
+        /// Borrowed inline slice or owned by-ID vector.
         vector: Cow<'a, [f32]>,
+        /// Stored seed ID excluded after requesting one extra candidate.
         exclude_id: Option<String>,
     },
+    /// BM25 expression and effective final-token prefix setting.
     Bm25 {
+        /// Borrowed ranking AST from the request.
         rank_by: &'a RankBy,
+        /// Whether each field query's last token matches prefixes.
         last_as_prefix: bool,
     },
 }
 
+/// Couples a source response with the information needed to interpret scores.
 struct SourceQueryResponse {
+    /// Native score direction used by normalization and explain output.
     kind: QuerySourceKind,
+    /// Domain response, including source work counters and optional diagnostics.
     response: QueryResponse,
 }
 
+/// Default reciprocal-rank-fusion offset when the request omits `k`.
+///
+/// Rank one contributes `1 / 61`, which keeps any single top rank from
+/// overwhelming evidence contributed by another source.
 const DEFAULT_RRF_K: usize = 60;
 
+/// Supplies a preselected manifest and hydration policy to one execution.
+///
+/// Single live queries normally leave `manifest` absent so consistency-aware
+/// loading occurs here. Historical and batch/hybrid callers pass a snapshot so
+/// every source sees the same artifact membership.
 struct QueryExecutionOptions {
+    /// Manifest selected by the caller, or `None` to read the current one.
     manifest: Option<Manifest>,
+    /// Whether a live active segment should contribute to hydrator heat.
     notify_hydration: bool,
 }
 
-/// Query-string parameters for the single-query route.
+/// Parses optional point-in-time selection for the single-query route.
+///
+/// Unknown parameters are rejected. Batch queries intentionally have no
+/// corresponding extractor and always use a live manifest.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryRouteParams {
-    /// Optional point-in-time target: generation, RFC3339 timestamp, or `snapshot:name`.
+    /// Retained generation, RFC3339 timestamp, or `snapshot:name` selector.
     #[serde(default)]
     as_of: Option<String>,
 }
 
-/// Response body for a batch query request.
+/// Returns one positional outcome for every batch request entry.
+///
+/// The route itself returns HTTP 200 after it can interpret the outer batch;
+/// individual domain failures carry their single-query-equivalent status in
+/// [`BatchQueryError::status`]. Outer-body, size, and rate-limit failures remain
+/// top-level HTTP errors.
 #[derive(Debug, Serialize)]
 pub struct BatchQueryResponse {
-    /// Positional entry responses matching the request's `queries` order.
+    /// Success/error entries aligned one-for-one with the input requests.
     pub results: Vec<BatchQueryEntry>,
 }
 
-/// One positional batch query entry result.
+/// Represents either a complete query response or a canonical per-entry error.
+///
+/// Serde's untagged layout preserves the established `ok` discriminator while
+/// allowing success and error payloads to differ. `Box<QueryResponse>` keeps the
+/// enum's stack size small despite the larger success variant.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum BatchQueryEntry {
-    /// Successful entry with the same response body as the single-query route.
+    /// Successful entry with the same payload shape as the single-query route.
     Success {
         /// Always `true` for successful entries.
         ok: bool,
-        /// Single-query-compatible response for this entry.
+        /// Owned single-query response allocated behind a compact pointer.
         response: Box<QueryResponse>,
         /// Per-entry metadata.
         metadata: BatchQueryEntryMetadata,
     },
-    /// Failed entry with a canonical error envelope.
+    /// Failed entry that does not abort later batch entries.
     Error {
         /// Always `false` for failed entries.
         ok: bool,
-        /// Error envelope for this entry.
+        /// Client-safe projection of the domain error.
         error: BatchQueryError,
         /// Per-entry metadata.
         metadata: BatchQueryEntryMetadata,
     },
 }
 
-/// Metadata attached to each batch query entry.
+/// Reports work measured independently for one batch entry.
 #[derive(Debug, Serialize)]
 pub struct BatchQueryEntryMetadata {
-    /// Server-side latency for this entry, measured independently.
+    /// Milliseconds from entry execution/envelope construction to completion.
     pub latency_ms: u64,
 }
 
-/// Canonical error envelope embedded in a failed batch query entry.
+/// Projects a [`ZeppelinError`] into stable, client-safe batch fields.
+///
+/// The original error remains available to server logs. This type mirrors the
+/// single-query HTTP classification without leaking internal error details.
 #[derive(Debug, Serialize)]
 pub struct BatchQueryError {
-    /// Stable machine-readable error code.
+    /// Stable machine-readable code returned by [`ZeppelinError::error_code`].
     pub code: &'static str,
-    /// Client-safe human-readable error message.
+    /// Sanitized message suitable for an API response.
     pub error: String,
-    /// HTTP status code that this entry would have returned as a single query.
+    /// HTTP status the equivalent single-query failure would use.
     pub status: u16,
-    /// Whether retrying the same entry unchanged is reasonable.
+    /// Whether retrying unchanged may succeed according to the domain error.
     pub retryable: bool,
 }
 
 impl BatchQueryError {
+    /// Converts a domain error into the canonical public batch envelope.
+    ///
+    /// # Parameters
+    ///
+    /// - `err`: Borrowed error whose safe classification should be copied.
+    ///
+    /// # Returns
+    ///
+    /// An owned error envelope containing static code, safe text, status, and
+    /// retry advice.
+    ///
+    /// # Examples
+    ///
+    /// A dimension mismatch becomes a non-retryable 400-class entry while an
+    /// internal storage failure retains its server-error classification.
     fn from_error(err: &ZeppelinError) -> Self {
         Self {
             code: err.error_code(),
@@ -373,8 +720,71 @@ impl BatchQueryError {
     }
 }
 
-/// Query handler using direct serde_json deserialization (skips Axum's
-/// serde_path_to_error wrapper which adds 18-26% CPU overhead per query).
+/// Executes one query request against a live or retained manifest snapshot.
+///
+/// The handler parses JSON directly to avoid Axum's more expensive path-aware
+/// JSON wrapper, then validates the complete request shape before resolving the
+/// namespace or incrementing query metrics. After metadata and optional `as_of`
+/// resolution, it delegates source work to [`crate::query`] and applies the
+/// retrieval-algebra response pipeline defined in this module.
+///
+/// # Parameters
+///
+/// - `state`: Shared server services, runtime configuration, caches, store,
+///   namespace manager, WAL reader, and optional hydrator.
+/// - `ns`: Namespace captured from the route path.
+/// - `params`: Strict query-string parameters, including optional `as_of`.
+/// - `body`: Owned raw request bytes subject to router body limits.
+///
+/// # Returns
+///
+/// JSON containing ranked results, source scan counters, and requested optional
+/// cursor, groups, facets, explain, or debug sections.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] for malformed JSON or request combinations, missing
+/// namespaces, invalid dimensions/FTS fields, point-in-time retention failures,
+/// and manifest, WAL, segment, cache, or index errors. Shape failures occur
+/// before storage work and before query metrics are counted. No partial response
+/// is returned when source execution fails.
+///
+/// # Side Effects
+///
+/// Increments active/total query metrics after shape validation, records latency
+/// through `DurationGuard` on every later exit, logs successful completion, and
+/// may notify the background hydrator for a live active segment. It performs
+/// read-only object-store/cache operations and publishes no artifacts.
+///
+/// # Consistency
+///
+/// A live request loads a strong or eventual current manifest through the
+/// domain layer. An `as_of` request reads an exact retained manifest from object
+/// storage and passes that owned snapshot through every source; it does not
+/// notify live-segment hydration. The manifest controls visible WAL fragments
+/// and segments throughout execution.
+///
+/// # Performance
+///
+/// Direct deserialization is one full JSON parse. Shape checks are in-memory.
+/// Namespace metadata and `as_of` resolution may perform remote reads; source
+/// cost then depends on consistency, cache hits, visible WAL, active index,
+/// filters, `nprobe`, candidate width, and optional vector enrichment/reranking.
+///
+/// # Examples
+///
+/// A strong ANN request for ten results validates first, reads current namespace
+/// metadata and manifest, searches visible WAL and the active segment, and may
+/// notify hydration. The same body with `?as_of=12` searches only generation
+/// 12's artifacts. A malformed body sent to a missing namespace returns
+/// validation rather than allowing the missing namespace to mask that error.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Axum extractors move owned path/body values and a cheaply cloned shared state
+/// handle into the async future. `?`-style conversions preserve typed failures;
+/// RAII guards decrement the active gauge and observe duration even when an
+/// awaited operation returns early.
 #[instrument(skip(state, body), fields(namespace = %ns))]
 pub async fn query_namespace(
     State(state): State<AppState>,
@@ -448,7 +858,63 @@ pub async fn query_namespace(
     Ok(Json(result))
 }
 
-/// Batch query handler using direct serde_json deserialization.
+/// Executes a bounded positional batch while sharing namespace and manifest setup.
+///
+/// The router's read limiter charges one request before entry. This handler
+/// charges `N - 1` additional units, validates every body independently, and
+/// counts only shape-valid entries as queries. Namespace and manifest setup are
+/// shared; source executions remain sequential and each produces a success or
+/// error envelope without aborting later entries.
+///
+/// # Parameters
+///
+/// - `state`: Shared server services and configured batch/limit bounds.
+/// - `rate_limit_identity`: Client identity inserted by rate-limit middleware.
+/// - `ns`: Namespace captured from the route path.
+/// - `body`: Raw batch JSON bytes.
+///
+/// # Returns
+///
+/// JSON with exactly one [`BatchQueryEntry`] per input request, in the same
+/// order. Once the outer batch is accepted, namespace, manifest, validation,
+/// and execution failures are represented inside entries.
+///
+/// # Errors
+///
+/// Returns a top-level [`ApiError`] only when the outer JSON is malformed, the
+/// list is empty, the configured maximum batch size is exceeded, or additional
+/// rate-limit capacity is unavailable. Per-entry failures do not change the
+/// outer response into an HTTP error.
+///
+/// # Side Effects
+///
+/// Consumes read-rate tokens, increments total-query metrics for shape-valid
+/// entries, logs each entry failure at warning or error level, and may notify
+/// hydration once for the shared live active segment. It reads but does not
+/// publish object-store state.
+///
+/// # Consistency
+///
+/// If any valid entry requests strong consistency, manifest selection uses the
+/// strong path; otherwise it may use the eventual manifest cache. The selected
+/// owned manifest is cloned into every valid entry, so all batch entries share
+/// one visibility generation. Each entry still applies its own strong/eventual
+/// WAL scoring rules. Batch requests do not support `as_of`.
+///
+/// # Performance
+///
+/// Validation is linear in entry count and source count. Namespace and manifest
+/// setup happen once, but entries execute sequentially and may each perform WAL,
+/// index, cache, fusion, enrichment, or rerank work. Manifest clones duplicate
+/// its in-memory descriptors; they do not perform another GET.
+///
+/// # Examples
+///
+/// For three valid entries—strong ANN, eventual BM25, and invalid-dimension
+/// ANN—the handler reads one strongly verified manifest. It returns two normal
+/// responses and one 400-class error envelope in their original positions. If
+/// namespace lookup fails, all shape-valid entries receive that error while an
+/// independently malformed entry retains its more specific validation error.
 #[instrument(skip(state, body), fields(namespace = %ns))]
 pub async fn batch_query_namespace(
     State(state): State<AppState>,
@@ -576,6 +1042,35 @@ pub async fn batch_query_namespace(
     Ok(Json(BatchQueryResponse { results }))
 }
 
+/// Validates request-only constraints and freezes effective query controls.
+///
+/// This phase performs no namespace lookup or object-store access. It selects
+/// defaults from the already-captured [`QueryKnobs`] snapshot, validates source
+/// grammar and presentation options, and enforces configured top-k, ID, and
+/// nprobe limits.
+///
+/// # Parameters
+///
+/// - `req`: Borrowed deserialized request.
+/// - `knobs`: One immutable runtime-query snapshot for this request.
+/// - `state`: Server state used only for static configured bounds.
+///
+/// # Returns
+///
+/// A small [`ValidatedQuery`] containing effective widths, projection, and
+/// source path.
+///
+/// # Errors
+///
+/// Returns validation or not-implemented errors for conflicting source syntax,
+/// invalid widths, malformed cursor/fusion/grouping/facet options, invalid
+/// by-ID source IDs, and unsupported projection controls.
+///
+/// # Examples
+///
+/// With default `top_k = 10` and `nprobe = 8`, an ANN body omitting both gets
+/// those values and a default candidate frontier of 100. `nprobe = 0` fails
+/// here rather than executing an empty successful search.
 fn validate_query_shape(
     req: &QueryRequest,
     knobs: &QueryKnobs,
@@ -615,6 +1110,28 @@ fn validate_query_shape(
     })
 }
 
+/// Classifies legacy versus algebra source syntax and its nprobe override.
+///
+/// # Parameters
+///
+/// - `req`: Request whose source-bearing fields are inspected.
+/// - `max_vector_id_length`: Configured length bound for by-ID ANN seeds.
+///
+/// # Returns
+///
+/// The validated source path plus a single-source local nprobe when present.
+/// Hybrid per-source probe counts are resolved later by source index.
+///
+/// # Errors
+///
+/// Rejects missing or multiple legacy sources, mixing legacy fields with
+/// algebra, empty algebra sources, invalid source shapes, and invalid
+/// multi-source fusion/probe combinations.
+///
+/// # Examples
+///
+/// `{ "vector": [...] }` becomes `LegacyVector`; one algebra BM25 source
+/// becomes `AlgebraBm25 { index: 0 }`; two sources become `AlgebraHybrid`.
 fn validate_query_source(
     req: &QueryRequest,
     max_vector_id_length: usize,
@@ -678,6 +1195,27 @@ fn validate_query_source(
     }
 }
 
+/// Checks the mutually exclusive payload choices inside one candidate source.
+///
+/// # Parameters
+///
+/// - `source`: Candidate source borrowed from the request.
+/// - `max_vector_id_length`: Configured by-ID length limit.
+///
+/// # Returns
+///
+/// Unit when BM25 is structurally valid or ANN contains exactly one of inline
+/// coordinates and a request-valid stored ID.
+///
+/// # Errors
+///
+/// Returns validation when ANN supplies both/neither choice or when its ID is
+/// too long or contains forbidden path characters.
+///
+/// # Examples
+///
+/// ANN with `id = "seed-1"` succeeds; ANN with both `id` and `vector` fails
+/// before any lookup of `seed-1`.
 fn validate_candidate_source_shape(
     source: &CandidateSource,
     max_vector_id_length: usize,
@@ -696,6 +1234,29 @@ fn validate_candidate_source_shape(
     }
 }
 
+/// Validates controls whose meaning depends on having multiple sources.
+///
+/// # Parameters
+///
+/// - `req`: Full request containing top-level probe and fusion options.
+/// - `sources`: Non-empty source slice known to contain more than one entry.
+///
+/// # Returns
+///
+/// A hybrid source descriptor carrying the validated source count. Omitted
+/// fusion means default RRF.
+///
+/// # Errors
+///
+/// Rejects a top-level nprobe combined with any source-local nprobe, zero RRF
+/// offset, a weighted list with the wrong length, and explicit no-fusion.
+/// Weight finiteness is checked during fusion so the execution and explain paths
+/// share one rule.
+///
+/// # Examples
+///
+/// Two sources with two weights succeed. Two sources with one weight or with
+/// `{ "type": "none" }` fail.
 fn validate_multi_source_request(
     req: &QueryRequest,
     sources: &[CandidateSource],
@@ -755,6 +1316,22 @@ fn validate_multi_source_request(
     }
 }
 
+/// Detects algebra-only transforms used without an explicit `sources` array.
+///
+/// # Parameters
+///
+/// - `req`: Request to inspect.
+///
+/// # Returns
+///
+/// `true` when a candidate width, fusion, rerank, grouping, facets, projection,
+/// or cursor field is present. Explain/debug remain valid with legacy syntax and
+/// therefore do not trigger this check.
+///
+/// # Examples
+///
+/// A legacy vector plus `candidate_k` is classified as an invalid syntax mix;
+/// a legacy vector plus `explain = true` is not.
 fn retrieval_algebra_without_sources(req: &QueryRequest) -> bool {
     req.candidate_k.is_some()
         || req.fusion.is_some()
@@ -765,6 +1342,28 @@ fn retrieval_algebra_without_sources(req: &QueryRequest) -> bool {
         || req.cursor.is_some()
 }
 
+/// Validates cross-cutting retrieval-algebra presentation options.
+///
+/// # Parameters
+///
+/// - `req`: Request whose fusion, grouping, facets, and cursor are checked.
+///
+/// # Returns
+///
+/// Unit when option combinations and immediately decodable values are valid.
+///
+/// # Errors
+///
+/// Rejects non-none fusion without two sources, zero group capacity, grouping
+/// combined with cursoring, empty facet names, and malformed cursor tokens.
+/// Cursor/query fingerprint compatibility is checked later after the namespace
+/// and complete request are available.
+///
+/// # Examples
+///
+/// Grouping by `tenant` with two members per group succeeds. Adding an after
+/// cursor fails because there is no unambiguous flat page marker for grouped
+/// output.
 fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), ZeppelinError> {
     if let Some(fusion) = req.fusion.as_ref() {
         if req.sources.as_ref().map_or(0, Vec::len) < 2 && !fusion.is_none() {
@@ -809,6 +1408,27 @@ fn validate_retrieval_algebra_options(req: &QueryRequest) -> Result<(), Zeppelin
     Ok(())
 }
 
+/// Chooses the first-stage candidate frontier.
+///
+/// # Parameters
+///
+/// - `req`: Request that may explicitly set `candidate_k`.
+/// - `top_k`: Effective final result limit.
+///
+/// # Returns
+///
+/// An explicit positive value, or `max(top_k * 4, 100)` using saturating
+/// arithmetic. This helper does not force an explicit frontier to exceed
+/// `top_k`; downstream behavior follows the caller's requested bound.
+///
+/// # Errors
+///
+/// Returns validation only when an explicitly supplied value is zero.
+///
+/// # Examples
+///
+/// `top_k = 10` with no candidate width produces 100; explicit `candidate_k =
+/// 40` produces 40.
 fn validate_candidate_k(req: &QueryRequest, top_k: usize) -> Result<usize, ZeppelinError> {
     if let Some(candidate_k) = req.candidate_k {
         if candidate_k == 0 {
@@ -820,6 +1440,26 @@ fn validate_candidate_k(req: &QueryRequest, top_k: usize) -> Result<usize, Zeppe
     Ok(top_k.saturating_mul(4).max(100))
 }
 
+/// Applies the configured nprobe bound to every possible ANN setting.
+///
+/// # Parameters
+///
+/// - `req`: Request containing top-level and/or source-local probe counts.
+/// - `max_nprobe`: Inclusive server maximum.
+///
+/// # Returns
+///
+/// Unit when every present count is in `1..=max_nprobe`.
+///
+/// # Errors
+///
+/// Propagates the first invalid count found. BM25 sources have no local probe
+/// count and require no check.
+///
+/// # Examples
+///
+/// A hybrid request with ANN probe counts 4 and 12 passes when the maximum is
+/// 16; a source count of zero fails.
 fn validate_nprobe_requests(req: &QueryRequest, max_nprobe: usize) -> Result<(), ZeppelinError> {
     if let Some(nprobe) = req.nprobe {
         validate_nprobe(nprobe, max_nprobe)?;
@@ -838,6 +1478,25 @@ fn validate_nprobe_requests(req: &QueryRequest, max_nprobe: usize) -> Result<(),
     Ok(())
 }
 
+/// Validates one IVF probe count against nonzero and configured bounds.
+///
+/// # Parameters
+///
+/// - `nprobe`: Number of centroid clusters the ANN source would visit.
+/// - `max_nprobe`: Inclusive server limit.
+///
+/// # Returns
+///
+/// Unit for values from one through the maximum.
+///
+/// # Errors
+///
+/// Returns validation for zero or a value above the maximum.
+///
+/// # Examples
+///
+/// With maximum 64, `nprobe = 8` succeeds and `nprobe = 65` fails before index
+/// work begins.
 fn validate_nprobe(nprobe: usize, max_nprobe: usize) -> Result<(), ZeppelinError> {
     if nprobe == 0 {
         return Err(ZeppelinError::Validation("nprobe must be >= 1".into()));
@@ -851,6 +1510,27 @@ fn validate_nprobe(nprobe: usize, max_nprobe: usize) -> Result<(), ZeppelinError
     Ok(())
 }
 
+/// Resolves legacy and algebra attribute-projection controls.
+///
+/// # Parameters
+///
+/// - `req`: Request containing optional legacy and structured projection fields.
+///
+/// # Returns
+///
+/// Whether complete attribute maps should be included, defaulting to `true`.
+///
+/// # Errors
+///
+/// Rejects specifying both attribute flags. Any present field-list projection
+/// and `include_vectors = true` return explicit not-implemented errors;
+/// `include_vectors = false` is accepted.
+///
+/// # Examples
+///
+/// `projection.include_attributes = false` allows source execution to avoid
+/// returning metadata unless another transform needs it internally. Asking for
+/// `fields = ["title"]` fails instead of returning all fields silently.
 fn validate_projection(req: &QueryRequest) -> Result<bool, ZeppelinError> {
     let Some(projection) = req.projection.as_ref() else {
         return Ok(req.include_attributes.unwrap_or(true));
@@ -876,6 +1556,49 @@ fn validate_projection(req: &QueryRequest) -> Result<bool, ZeppelinError> {
         .unwrap_or(true))
 }
 
+/// Executes one already shape-validated legacy or single-source algebra query.
+///
+/// Hybrid requests are dispatched to `execute_hybrid_query`. Other paths select
+/// one manifest, resolve borrowed/owned source input, validate it against
+/// namespace metadata, execute the source, and run response transforms.
+///
+/// # Parameters
+///
+/// - `state`: Shared storage, query, cache, and hydration services.
+/// - `ns`: Resolved namespace name.
+/// - `meta`: Namespace dimensions, distance metric, and FTS configuration.
+/// - `req`: Original request retained for filter and response transforms.
+/// - `validated`: Effective widths, projection, and source path.
+/// - `knobs`: Runtime-query snapshot used consistently for this execution.
+/// - `options`: Optional caller-selected manifest and hydration notification flag.
+///
+/// # Returns
+///
+/// A fully transformed [`QueryResponse`] ready for JSON serialization.
+///
+/// # Errors
+///
+/// Propagates manifest, by-ID source, metadata validation, source execution,
+/// reranking, facets, grouping, cursor, and explain-integrity failures. It does
+/// not return a partially transformed response.
+///
+/// # Consistency
+///
+/// One owned manifest controls source retrieval, by-ID seed loading, and vector
+/// reranking. A preselected historical or batch snapshot is never replaced by
+/// a later live manifest.
+///
+/// # Performance
+///
+/// Performs one source query plus optional by-ID lookup, candidate enrichment,
+/// and reranking. Candidate width increases only when a requested downstream
+/// transform needs a wider frontier.
+///
+/// # Examples
+///
+/// A single BM25 algebra source retrieves 100 candidates for requested facets,
+/// counts facets on that frontier, truncates to `top_k`, and returns the source's
+/// scan counters unchanged.
 async fn execute_validated_query(
     state: &AppState,
     ns: &str,
@@ -952,6 +1675,47 @@ async fn execute_validated_query(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Executes every source in a validated hybrid request and fuses their results.
+///
+/// Sources run sequentially in request order against clones of one manifest.
+/// Stored-vector seed IDs are fetched from that snapshot, excluded from all
+/// source responses, and compensated for by requesting extra candidates before
+/// truncation. The fused frontier then enters the same rerank/presentation path
+/// as a single source.
+///
+/// # Parameters
+///
+/// - `state`, `ns`, `meta`, `req`, `validated`, `knobs`, and `options`: Same
+///   execution dependencies and frozen controls as `execute_validated_query`.
+/// - `source_count`: Source cardinality captured during shape validation.
+///
+/// # Returns
+///
+/// A fused, optionally reranked/grouped/paged [`QueryResponse`]. Scan counters
+/// and debug data aggregate work from every source.
+///
+/// # Errors
+///
+/// Returns validation if the request no longer matches its validated source
+/// count, and propagates snapshot, source, fusion, transform, and explain errors.
+/// A failure in any source aborts the entire hybrid response.
+///
+/// # Consistency
+///
+/// Every ANN/BM25 source and by-ID seed lookup receives the same manifest
+/// snapshot. This avoids fusing candidates from different visibility versions.
+///
+/// # Performance
+///
+/// Source costs add because the loop awaits them sequentially. Each source may
+/// scan WAL and an active segment; by-ID seeds add lookup work. Fusion is linear
+/// in returned candidates plus the final in-memory sort.
+///
+/// # Examples
+///
+/// An ANN-by-ID and BM25 request with `candidate_k = 100` fetches the seed,
+/// retrieves and trims 100 non-seed candidates from each source, combines them
+/// using requested/default fusion, then returns the requested page.
 async fn execute_hybrid_query(
     state: &AppState,
     ns: &str,
@@ -1051,6 +1815,23 @@ async fn execute_hybrid_query(
     .await
 }
 
+/// Chooses how many candidates first-stage retrieval must preserve.
+///
+/// # Parameters
+///
+/// - `req`: Request whose transforms may need a wider frontier.
+/// - `validated`: Effective final and candidate widths.
+///
+/// # Returns
+///
+/// `candidate_k` for explicit rerank, grouping, nonempty facets, or cursoring;
+/// otherwise `top_k`. Cursoring also guarantees at least `top_k + 1` so the
+/// handler can detect another page, using saturating arithmetic.
+///
+/// # Examples
+///
+/// A plain top-ten query retrieves ten. The same request with cursoring and
+/// `candidate_k = 10` retrieves eleven to decide whether `next_cursor` exists.
 fn first_stage_top_k(req: &QueryRequest, validated: ValidatedQuery) -> usize {
     if req.rerank.as_ref().is_some_and(RerankSpec::is_explicit)
         || grouping_requested(req)
@@ -1068,6 +1849,23 @@ fn first_stage_top_k(req: &QueryRequest, validated: ValidatedQuery) -> usize {
     }
 }
 
+/// Chooses how many candidates an explicit reranker may return before paging.
+///
+/// # Parameters
+///
+/// - `req`: Request used to detect cursor paging.
+/// - `validated`: Effective final width.
+/// - `first_stage_top_k`: Candidate width entering the reranker.
+///
+/// # Returns
+///
+/// The whole first-stage frontier for cursoring, because paging needs the extra
+/// marker candidates; otherwise the final `top_k`.
+///
+/// # Examples
+///
+/// Reranking 100 candidates for an unpaged top ten keeps ten. With cursoring it
+/// keeps the wider ranked frontier until page slicing.
 fn rerank_output_k(
     req: &QueryRequest,
     validated: ValidatedQuery,
@@ -1080,6 +1878,22 @@ fn rerank_output_k(
     }
 }
 
+/// Decides whether source execution must materialize attributes internally.
+///
+/// # Parameters
+///
+/// - `req`: Request whose transforms may consume metadata.
+/// - `include_attributes`: Effective client-facing projection.
+///
+/// # Returns
+///
+/// `true` when the response needs attributes or BM25 reranking, grouping, or
+/// facets needs them before final stripping.
+///
+/// # Examples
+///
+/// A client can request no attributes while grouping by `tenant`; sources still
+/// load attributes for grouping and the handler removes them from output later.
 fn first_stage_include_attributes(req: &QueryRequest, include_attributes: bool) -> bool {
     include_attributes
         || matches!(req.rerank, Some(RerankSpec::Bm25 { .. }))
@@ -1087,18 +1901,84 @@ fn first_stage_include_attributes(req: &QueryRequest, include_attributes: bool) 
         || facet_counts_requested(req)
 }
 
+/// Reports whether the request contains a cursor block, including `None`.
+///
+/// Presence requests cursor-aware frontier sizing and first-page token output.
+///
+/// # Parameters
+///
+/// - `req`: Request to inspect.
+///
+/// # Returns
+///
+/// `true` for either cursor variant and `false` when the field is absent.
+///
+/// # Examples
+///
+/// `cursor = { type: none }` returns `true` because it requests a first page and
+/// possible continuation token.
 fn cursor_requested(req: &QueryRequest) -> bool {
     req.cursor.is_some()
 }
 
+/// Reports whether at least one facet field requires counting.
+///
+/// An explicitly empty list produces an empty facet object but does not widen
+/// first-stage retrieval.
+///
+/// # Parameters
+///
+/// - `req`: Request to inspect.
+///
+/// # Returns
+///
+/// `true` only for a present, nonempty facet list.
+///
+/// # Examples
+///
+/// Facets `[]` return false; facets `["category"]` return true.
 fn facet_counts_requested(req: &QueryRequest) -> bool {
     req.facets.as_ref().is_some_and(|facets| !facets.is_empty())
 }
 
+/// Reports whether field-based grouping, rather than an explicit no-op, is requested.
+///
+/// # Parameters
+///
+/// - `req`: Request to inspect.
+///
+/// # Returns
+///
+/// `true` only for [`GroupingSpec::Field`].
+///
+/// # Examples
+///
+/// Omitted grouping and `{type: none}` return false.
 fn grouping_requested(req: &QueryRequest) -> bool {
     matches!(req.grouping, Some(GroupingSpec::Field { .. }))
 }
 
+/// Collects stored-vector seed IDs that must not appear as hybrid neighbors.
+///
+/// # Parameters
+///
+/// - `req`: Algebra request whose ANN sources may name stored IDs.
+///
+/// # Returns
+///
+/// An owned deduplicated set of seed IDs. Inline vectors and BM25 sources add
+/// nothing.
+///
+/// # Examples
+///
+/// Two ANN sources using the same `seed-1` produce a one-element exclusion set.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The iterator borrows the source slice, but `id.clone()` intentionally
+/// allocates owned keys because the set outlives each match borrow. Rust makes
+/// that ownership transition explicit; a C implementation would need matching
+/// allocation/free rules.
 fn algebra_seed_exclusion_ids(req: &QueryRequest) -> HashSet<String> {
     req.sources
         .as_deref()
@@ -1111,6 +1991,22 @@ fn algebra_seed_exclusion_ids(req: &QueryRequest) -> HashSet<String> {
         .collect()
 }
 
+/// Removes by-ID seeds from one source response and restores its target width.
+///
+/// # Parameters
+///
+/// - `response`: Mutable source response whose result vector is filtered in place.
+/// - `excluded_seed_ids`: Deduplicated seed IDs from the whole algebra request.
+/// - `top_k`: Maximum non-seed candidates to retain.
+///
+/// # Side Effects
+///
+/// Mutates only `response.results`; source scan/debug counters remain unchanged.
+///
+/// # Examples
+///
+/// If a source returns `[seed, a, b]` for target two, the result becomes
+/// `[a, b]`.
 fn exclude_seed_ids_from_response(
     response: &mut QueryResponse,
     excluded_seed_ids: &HashSet<String>,
@@ -1125,13 +2021,31 @@ fn exclude_seed_ids_from_response(
     response.results.truncate(top_k);
 }
 
+/// Accumulates observational explain data alongside real query execution.
+///
+/// This type never chooses candidates or scores. It mirrors the plan and score
+/// contributions already used by execution, then retains provenance only for
+/// IDs surviving the final response pipeline.
 struct ExplainAccumulator {
+    /// Requested verbosity; plan mode avoids per-result collection.
     mode: QueryExplainMode,
+    /// Effective plan assembled from validated controls.
     plan: QueryExplainPlan,
+    /// Full-mode provenance keyed by result ID until final response order is known.
     results: HashMap<String, QueryExplainResult>,
 }
 
 impl ExplainAccumulator {
+    /// Creates an empty accumulator for one effective plan.
+    ///
+    /// # Parameters
+    ///
+    /// - `mode`: Plan-only or full provenance mode.
+    /// - `plan`: Owned description of the execution already selected.
+    ///
+    /// # Returns
+    ///
+    /// An accumulator with no result provenance recorded yet.
     fn new(mode: QueryExplainMode, plan: QueryExplainPlan) -> Self {
         Self {
             mode,
@@ -1140,6 +2054,22 @@ impl ExplainAccumulator {
         }
     }
 
+    /// Records raw scores from one unfused candidate source in full mode.
+    ///
+    /// # Parameters
+    ///
+    /// - `source_index`: Position used by the request/explain source list.
+    /// - `kind`: Native ANN or BM25 score direction.
+    /// - `results`: Source-ranked candidates to observe.
+    ///
+    /// # Side Effects
+    ///
+    /// In full mode, inserts one source entry per result and treats the raw score
+    /// as both pre-fusion score and contribution. Plan mode is a no-op.
+    ///
+    /// # Examples
+    ///
+    /// A single ANN hit at distance `0.2` records raw and fused scores of `0.2`.
     fn capture_single_source(
         &mut self,
         source_index: usize,
@@ -1161,6 +2091,26 @@ impl ExplainAccumulator {
         }
     }
 
+    /// Records hybrid-source contributions using the requested fusion semantics.
+    ///
+    /// # Parameters
+    ///
+    /// - `fusion`: Explicit strategy or `None` for default RRF.
+    /// - `sources`: Source responses in request order.
+    ///
+    /// # Returns
+    ///
+    /// Unit after recording full-mode provenance; plan mode returns immediately.
+    ///
+    /// # Errors
+    ///
+    /// Propagates invalid no-fusion, mismatched/non-finite weights, and
+    /// non-finite source-score validation from the weighted path.
+    ///
+    /// # Examples
+    ///
+    /// A hit present in ANN and BM25 receives two RRF source entries whose
+    /// contributions sum to its fused score.
     fn capture_hybrid_sources(
         &mut self,
         fusion: Option<&FusionSpec>,
@@ -1187,6 +2137,21 @@ impl ExplainAccumulator {
         }
     }
 
+    /// Adds reciprocal-rank contributions for every source candidate.
+    ///
+    /// # Parameters
+    ///
+    /// - `sources`: Source-ranked lists in request order.
+    /// - `k`: Positive smoothing offset previously validated.
+    ///
+    /// # Side Effects
+    ///
+    /// Extends per-ID provenance and fused totals. Raw scores remain available,
+    /// but source magnitude/direction does not affect contribution.
+    ///
+    /// # Examples
+    ///
+    /// At `k = 60`, source ranks one and two contribute `1/61` and `1/62`.
     fn capture_rrf_sources(&mut self, sources: &[SourceQueryResponse], k: usize) {
         for (source_index, source) in sources.iter().enumerate() {
             for (rank, result) in source.response.results.iter().enumerate() {
@@ -1203,6 +2168,26 @@ impl ExplainAccumulator {
         }
     }
 
+    /// Adds direction-adjusted min-max weighted contributions.
+    ///
+    /// # Parameters
+    ///
+    /// - `sources`: Source responses whose raw score ranges are normalized independently.
+    /// - `weights`: Finite positional weights aligned with `sources`.
+    ///
+    /// # Returns
+    ///
+    /// Unit after provenance matches the weighted fusion calculation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects count mismatch, non-finite weights, and non-finite source scores.
+    /// An empty source contributes nothing.
+    ///
+    /// # Examples
+    ///
+    /// The best ANN distance and best BM25 relevance both normalize to `1.0`
+    /// before their separate weights are applied.
     fn capture_weighted_sources(
         &mut self,
         sources: &[SourceQueryResponse],
@@ -1251,6 +2236,21 @@ impl ExplainAccumulator {
         Ok(())
     }
 
+    /// Merges one observed source score into the result-provenance map.
+    ///
+    /// # Parameters
+    ///
+    /// - `id`: Stable record identifier.
+    /// - `source_index`: Request-order source position.
+    /// - `kind`: Native source kind.
+    /// - `raw_score`: Unmodified source distance or relevance.
+    /// - `normalized_score`: Direction-adjusted weighted-fusion value, if used.
+    /// - `contribution`: Amount added to the pre-rerank fused score.
+    ///
+    /// # Side Effects
+    ///
+    /// Allocates the ID on first sight, appends one source record, and adds the
+    /// contribution to the fused total.
     fn record_source_score(
         &mut self,
         id: &str,
@@ -1279,6 +2279,17 @@ impl ExplainAccumulator {
         entry.fused_score += contribution;
     }
 
+    /// Records final explicit-reranker scores for surviving candidate IDs.
+    ///
+    /// # Parameters
+    ///
+    /// - `results`: Reranked frontier before grouping/cursor/truncation.
+    ///
+    /// # Side Effects
+    ///
+    /// Updates existing full-mode provenance only. Plan mode and an ID missing
+    /// from the source map are ignored here; finalization catches missing data
+    /// for any ID that actually reaches output.
     fn capture_rerank_scores(&mut self, results: &[SearchResult]) {
         if self.mode != QueryExplainMode::Full {
             return;
@@ -1290,6 +2301,26 @@ impl ExplainAccumulator {
         }
     }
 
+    /// Finalizes explain output in the response's exact result order.
+    ///
+    /// # Parameters
+    ///
+    /// - `results`: Final flat response results after grouping/cursor/projection.
+    ///
+    /// # Returns
+    ///
+    /// The owned plan and, in full mode, provenance aligned with `results`.
+    /// Candidates removed by later transforms are discarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an index-integrity error if a final result has no captured source
+    /// provenance. This fails loudly rather than emitting misleading explain data.
+    ///
+    /// # Examples
+    ///
+    /// If cursoring returns IDs `[b, c]`, full explain returns only provenance
+    /// for `b` and `c` in that order, even when the source frontier also had `a`.
     fn finish(mut self, results: &[SearchResult]) -> Result<QueryExplain, ZeppelinError> {
         let results = if self.mode == QueryExplainMode::Full {
             let mut explain_results = Vec::with_capacity(results.len());
@@ -1314,6 +2345,20 @@ impl ExplainAccumulator {
     }
 }
 
+/// Converts the wire-level explain choice into an executable verbosity.
+///
+/// # Parameters
+///
+/// - `req`: Request containing optional boolean or named mode.
+///
+/// # Returns
+///
+/// `None` for absent/false/`none`, plan mode for `true`/`plan`, and full mode
+/// for `full`.
+///
+/// # Examples
+///
+/// `"explain": true` is shorthand for the plan without per-hit provenance.
 fn requested_explain_mode(req: &QueryRequest) -> Option<QueryExplainMode> {
     match req.explain.as_ref()? {
         ExplainSpec::Flag(false) => None,
@@ -1324,6 +2369,25 @@ fn requested_explain_mode(req: &QueryRequest) -> Option<QueryExplainMode> {
     }
 }
 
+/// Builds the explain plan after effective defaults and source widths are known.
+///
+/// # Parameters
+///
+/// - `req`: Original request supplying transform choices.
+/// - `validated`: Effective widths and projection.
+/// - `path`: Executed legacy/single/hybrid path.
+/// - `first_stage_top_k`: Actual source retrieval width.
+/// - `sources`: Effective source descriptions in request order.
+///
+/// # Returns
+///
+/// `None` when explain is disabled, otherwise an empty accumulator containing
+/// the complete effective plan.
+///
+/// # Examples
+///
+/// A hybrid request omitting fusion records default RRF with `k = 60`, not an
+/// ambiguous absent strategy.
 fn build_explain_accumulator(
     req: &QueryRequest,
     validated: ValidatedQuery,
@@ -1353,6 +2417,12 @@ fn build_explain_accumulator(
     ))
 }
 
+/// Describes the effective fusion strategy for explain output.
+///
+/// # Returns
+///
+/// The explicit variant, default RRF for multiple sources, or no fusion for a
+/// single source. Weight vectors are cloned into owned response metadata.
 fn explain_fusion(req: &QueryRequest) -> QueryExplainFusion {
     match req.fusion.as_ref() {
         Some(FusionSpec::None) => QueryExplainFusion::None,
@@ -1369,6 +2439,12 @@ fn explain_fusion(req: &QueryRequest) -> QueryExplainFusion {
     }
 }
 
+/// Converts an optional rerank request into its explain-only enum.
+///
+/// # Returns
+///
+/// `None` when omitted, otherwise the same strategy without copying large
+/// reranking vectors or ranking expressions.
 fn explain_rerank(rerank: Option<&RerankSpec>) -> Option<QueryExplainRerank> {
     rerank.map(|rerank| match rerank {
         RerankSpec::Default => QueryExplainRerank::Default,
@@ -1378,6 +2454,12 @@ fn explain_rerank(rerank: Option<&RerankSpec>) -> Option<QueryExplainRerank> {
     })
 }
 
+/// Copies grouping controls into explain metadata.
+///
+/// # Returns
+///
+/// `None` when grouping was omitted; otherwise an explicit no-op or an owned
+/// field name and capacity for field grouping.
 fn explain_grouping(grouping: Option<&GroupingSpec>) -> Option<QueryExplainGrouping> {
     grouping.map(|grouping| match grouping {
         GroupingSpec::None => QueryExplainGrouping::None,
@@ -1391,6 +2473,7 @@ fn explain_grouping(grouping: Option<&GroupingSpec>) -> Option<QueryExplainGroup
     })
 }
 
+/// Summarizes whether cursor paging and an after marker were requested.
 fn explain_cursor(cursor: Option<&CursorSpec>) -> QueryExplainCursor {
     QueryExplainCursor {
         requested: cursor.is_some(),
@@ -1398,6 +2481,10 @@ fn explain_cursor(cursor: Option<&CursorSpec>) -> QueryExplainCursor {
     }
 }
 
+/// Copies requested facet names into explain order without deduplicating them.
+///
+/// Actual counting deduplicates fields; preserving request order here explains
+/// exactly what the client sent.
 fn explain_facets(facets: Option<&[FacetSpec]>) -> Vec<String> {
     facets
         .unwrap_or_default()
@@ -1406,6 +2493,19 @@ fn explain_facets(facets: Option<&[FacetSpec]>) -> Vec<String> {
         .collect()
 }
 
+/// Describes one already-resolved source for explain output.
+///
+/// # Parameters
+///
+/// - `index`: Source position.
+/// - `source_ref`: Resolved ANN or BM25 input.
+/// - `nprobe`: Effective ANN probe count.
+/// - `candidate_k`: Executed source width.
+///
+/// # Returns
+///
+/// A source descriptor; BM25 omits nprobe because it does not probe IVF vector
+/// centroids.
 fn explain_source_for_ref(
     index: usize,
     source_ref: &QuerySourceRef<'_>,
@@ -1428,6 +2528,12 @@ fn explain_source_for_ref(
     }
 }
 
+/// Describes one request source without resolving its vector payload again.
+///
+/// # Errors
+///
+/// Returns validation if `sources` or the validated index is unexpectedly
+/// absent. This protects explain data from drifting away from execution.
 fn explain_source_for_request_source(
     req: &QueryRequest,
     index: usize,
@@ -1457,6 +2563,7 @@ fn explain_source_for_request_source(
     }
 }
 
+/// Maps the internal score-direction enum to its serializable explain counterpart.
 fn explain_source_kind(kind: QuerySourceKind) -> QueryExplainSourceKind {
     match kind {
         QuerySourceKind::Ann => QueryExplainSourceKind::Ann,
@@ -1464,6 +2571,7 @@ fn explain_source_kind(kind: QuerySourceKind) -> QueryExplainSourceKind {
     }
 }
 
+/// Maps validated request syntax to the public explain path classification.
 fn explain_path(source: ValidatedSource) -> QueryExplainPath {
     match source {
         ValidatedSource::LegacyVector => QueryExplainPath::LegacyVector,
@@ -1475,17 +2583,79 @@ fn explain_path(source: ValidatedSource) -> QueryExplainPath {
     }
 }
 
+/// Bundles the borrowed services and owned snapshot needed by response transforms.
+///
+/// Grouping these parameters keeps vector reranking and later transforms tied to
+/// the same namespace metadata, request, consistency mode, and manifest used by
+/// first-stage retrieval.
 struct RerankExecutionContext<'a> {
+    /// Shared server services.
     state: &'a AppState,
+    /// Namespace name.
     ns: &'a str,
+    /// Namespace dimensions, metric, and FTS field configuration.
     meta: &'a NamespaceMetadata,
+    /// Original request containing transform choices.
     req: &'a QueryRequest,
+    /// Final response/group/page width.
     top_k: usize,
+    /// Frontier width an explicit reranker may retain.
     rerank_limit: usize,
+    /// Whether attributes survive into client output.
     include_attributes: bool,
+    /// Owned visibility snapshot reused by vector-value fetches.
     manifest: Manifest,
 }
 
+/// Applies facets, optional reranking, grouping/cursoring, projection, and explain.
+///
+/// Ordering matters: facets observe the filtered first-stage frontier; explicit
+/// rerank changes candidate order; grouping or cursor paging shapes output;
+/// projection strips internal attributes last; explain is finalized against
+/// final result order.
+///
+/// ```text
+/// filtered source/fused frontier
+///       |
+///       +--> facet counts (snapshot before rerank/page)
+///       v
+/// explicit vector/BM25 rerank
+///       v
+/// grouping OR cursor paging
+///       v
+/// top-k + attribute stripping + explain finalization
+/// ```
+///
+/// # Parameters
+///
+/// - `ctx`: Borrowed request/services plus the owned manifest snapshot.
+/// - `response`: First-stage or fused response to transform.
+/// - `explain`: Optional accumulator populated during source execution.
+///
+/// # Returns
+///
+/// The completed response with requested enrichments and final result shape.
+///
+/// # Errors
+///
+/// Propagates facet conversion, vector fetch/distance, BM25 configuration,
+/// grouping conversion, cursor integrity, and explain-provenance errors.
+///
+/// # Side Effects
+///
+/// Vector reranking may read candidate values through caches/object storage.
+/// Other stages mutate owned in-memory response data only.
+///
+/// # Consistency
+///
+/// Vector enrichment uses `ctx.manifest`, preserving first-stage visibility.
+/// Facets, grouping, and paging never consult namespace state independently.
+///
+/// # Examples
+///
+/// A filtered hybrid request can facet 100 fused candidates, vector-rerank
+/// them, return page two of ten, omit attributes, and still expose full score
+/// provenance for only the ten final IDs.
 async fn apply_rerank_if_requested(
     ctx: RerankExecutionContext<'_>,
     response: QueryResponse,
@@ -1523,6 +2693,22 @@ async fn apply_rerank_if_requested(
     Ok(response)
 }
 
+/// Removes attributes that were loaded only for internal transforms.
+///
+/// # Parameters
+///
+/// - `response`: Flat and possibly grouped results to mutate.
+/// - `include_attributes`: Effective client projection.
+///
+/// # Side Effects
+///
+/// When false, sets attributes to `None` in both the flat result list and every
+/// cloned grouped result. Scores, IDs, grouping keys, and facets are preserved.
+///
+/// # Examples
+///
+/// Grouping may require `tenant` internally even when the client asks to omit
+/// attributes; this helper removes the maps after keys are established.
 fn strip_attributes_if_needed(response: &mut QueryResponse, include_attributes: bool) {
     if include_attributes {
         return;
@@ -1539,6 +2725,37 @@ fn strip_attributes_if_needed(response: &mut QueryResponse, include_attributes: 
     }
 }
 
+/// Counts requested attribute values over the current candidate frontier.
+///
+/// Fields and value keys use [`BTreeMap`] for deterministic response ordering.
+/// Duplicate requested field names are ignored. Missing fields do not create a
+/// value bucket; a requested field with no values remains an empty map. List
+/// attributes count every element.
+///
+/// # Parameters
+///
+/// - `req`: Request containing optional facet field names.
+/// - `results`: Filtered source/fused frontier before explicit rerank and paging.
+///
+/// # Returns
+///
+/// `None` when facets were omitted, otherwise counts for every distinct
+/// requested field, including an empty object for no matches.
+///
+/// # Errors
+///
+/// Rejects non-finite float attributes and reports an internal index error if
+/// the accumulator invariant is broken. No partial facet object is returned.
+///
+/// # Performance
+///
+/// Scans every frontier result and requested field. Scalar conversion allocates
+/// display strings; list fields may allocate one string per element.
+///
+/// # Examples
+///
+/// Faceting `category` over filtered candidates `[a, a, b]` yields counts
+/// `{a: 2, b: 1}` even when the final top-k page contains only one candidate.
 fn compute_facets_if_requested(
     req: &QueryRequest,
     results: &[SearchResult],
@@ -1578,6 +2795,26 @@ fn compute_facets_if_requested(
     Ok(Some(QueryFacets { fields }))
 }
 
+/// Converts one typed attribute into the string values used as facet buckets.
+///
+/// # Parameters
+///
+/// - `value`: Scalar or list attribute borrowed from a candidate.
+///
+/// # Returns
+///
+/// One string for scalar values and one per list element, preserving list order
+/// and duplicates.
+///
+/// # Errors
+///
+/// Returns validation for a non-finite scalar/list float because JSON-visible
+/// bucket names must be deterministic finite values.
+///
+/// # Examples
+///
+/// `StringList(["red", "fresh"])` contributes to both buckets; integer `7`
+/// contributes to bucket `"7"`.
 fn facet_attribute_values(value: &AttributeValue) -> Result<Vec<String>, ZeppelinError> {
     match value {
         AttributeValue::String(value) => Ok(vec![value.clone()]),
@@ -1604,6 +2841,49 @@ fn facet_attribute_values(value: &AttributeValue) -> Result<Vec<String>, Zeppeli
     }
 }
 
+/// Reorders the candidate frontier by exact distance to a second query vector.
+///
+/// The function fetches stored coordinates for all candidate IDs from the same
+/// manifest used by first-stage retrieval, replaces each score with distance
+/// according to the namespace metric, sorts lower-first with ID tie breaking,
+/// and truncates to the rerank frontier.
+///
+/// # Parameters
+///
+/// - `ctx`: Namespace metadata, consistency mode, services, and manifest snapshot.
+/// - `response`: Candidate response to score in place.
+/// - `rerank_vector`: Borrowed second-stage coordinates.
+///
+/// # Returns
+///
+/// The response with distance-ordered candidates and unchanged scan counters.
+/// Empty candidates return after rerank-vector validation without a fetch.
+///
+/// # Errors
+///
+/// Returns dimension/finite-value validation errors, propagates candidate vector
+/// fetch failures, and reports an index invariant error if a requested candidate
+/// has no vector value in the selected snapshot.
+///
+/// # Side Effects
+///
+/// Reads visible WAL/segment vector values and may populate immutable caches.
+/// It publishes no state.
+///
+/// # Consistency
+///
+/// The supplied manifest and request consistency govern enrichment; a reranker
+/// cannot fetch a value from a newer visibility generation.
+///
+/// # Performance
+///
+/// Fetch cost scales with candidate IDs and storage layout. Distance scoring is
+/// `O(candidates * dimensions)` and sorting is `O(candidates log candidates)`.
+///
+/// # Examples
+///
+/// ANN source ordering `[a, b]` can become `[b, a]` when `b` is nearer the
+/// rerank vector. Both returned scores are now distances, so smaller is better.
 async fn apply_vector_rerank(
     ctx: &RerankExecutionContext<'_>,
     mut response: QueryResponse,
@@ -1654,6 +2934,35 @@ async fn apply_vector_rerank(
     Ok(response)
 }
 
+/// Converts a ranked flat list into first-seen field groups when requested.
+///
+/// # Parameters
+///
+/// - `req`: Request containing optional grouping controls.
+/// - `response`: Ranked response consumed and rebuilt in place.
+/// - `top_k`: Maximum number of groups, not total members.
+/// - `include_attributes`: Whether cloned group/flat results retain attributes.
+///
+/// # Returns
+///
+/// Without field grouping, the original flat results and `groups = None`. With
+/// grouping, at most `top_k` groups in first ranked appearance order; each has
+/// at most `max_per_group` results, and `response.results` becomes their
+/// flattened member list.
+///
+/// # Errors
+///
+/// Propagates non-finite float conversion failures from grouping keys.
+///
+/// # Performance
+///
+/// One pass over ranked candidates plus clones when rebuilding the flat list.
+/// The hash map provides average constant-time group lookup.
+///
+/// # Examples
+///
+/// Ranked categories `[books, games, books]` with two members per group yields
+/// groups `books: [first, third]` then `games: [second]`.
 fn apply_grouping_if_requested(
     req: &QueryRequest,
     mut response: QueryResponse,
@@ -1706,6 +3015,27 @@ fn apply_grouping_if_requested(
     Ok(response)
 }
 
+/// Derives collision-resistant internal and client-visible group keys.
+///
+/// # Parameters
+///
+/// - `result`: Candidate whose attributes and ID are inspected.
+/// - `field`: Requested grouping attribute.
+///
+/// # Returns
+///
+/// Present values return `("field:<display>", "<display>")`. A missing field
+/// returns a unique `missing:<id>` internal key and the ID as display key so
+/// unrelated missing records remain singleton groups.
+///
+/// # Errors
+///
+/// Propagates non-finite float conversion errors.
+///
+/// # Examples
+///
+/// A record with `tenant = "acme"` joins the `acme` group. Missing-field record
+/// `doc-9` gets its own visible `doc-9` group.
 fn grouping_keys(result: &SearchResult, field: &str) -> Result<(String, String), ZeppelinError> {
     if let Some(value) = result
         .attributes
@@ -1718,6 +3048,26 @@ fn grouping_keys(result: &SearchResult, field: &str) -> Result<(String, String),
     Ok((format!("missing:{}", result.id), result.id.clone()))
 }
 
+/// Converts one typed attribute to the display representation used for grouping.
+///
+/// # Parameters
+///
+/// - `value`: Scalar or list attribute.
+///
+/// # Returns
+///
+/// Scalars use their ordinary string form; list elements are comma-joined in
+/// stored order. The representation is the current API contract and does not
+/// escape embedded commas, so distinct list shapes with the same joined text
+/// intentionally share a group.
+///
+/// # Errors
+///
+/// Rejects non-finite float values.
+///
+/// # Examples
+///
+/// Integer list `[1, 2]` becomes `"1,2"`; boolean `true` becomes `"true"`.
 fn group_attribute_value(value: &AttributeValue) -> Result<String, ZeppelinError> {
     match value {
         AttributeValue::String(value) => Ok(value.clone()),
@@ -1752,12 +3102,58 @@ fn group_attribute_value(value: &AttributeValue) -> Result<String, ZeppelinError
     }
 }
 
+/// Decoded fields carried by a version-one opaque cursor token.
 struct DecodedCursor {
+    /// Non-cryptographic fingerprint of namespace and ranking request.
     fingerprint: u64,
+    /// Exact IEEE-754 bits of the page-ending finite score.
     score_bits: u32,
+    /// UTF-8 ID used as deterministic tie breaker.
     id: String,
 }
 
+/// Sorts, filters, slices, and emits a stateless cursor page when requested.
+///
+/// Paging order follows final score semantics: ascending for single ANN/vector
+/// rerank distance and descending for fused/BM25 relevance, with ID ascending as
+/// the deterministic tie breaker. An after token must match the request
+/// fingerprint and filters out the marker plus everything before it.
+///
+/// # Parameters
+///
+/// - `ns`: Namespace bound into the cursor fingerprint.
+/// - `req`: Request defining ranking semantics and optional marker.
+/// - `response`: Ranked frontier with at least one extra entry when available.
+/// - `top_k`: Page size.
+///
+/// # Returns
+///
+/// Without a cursor field, clears `next_cursor` and preserves ordering. With a
+/// cursor field, returns at most `top_k` results and a new token only when
+/// another candidate remains in the supplied frontier.
+///
+/// # Errors
+///
+/// Rejects malformed/mismatched tokens and non-finite scores that cannot form a
+/// stable marker. Serialization failures while fingerprinting also propagate.
+///
+/// # Consistency
+///
+/// Tokens bind the query shape but not a manifest generation and exclude the
+/// consistency mode from the fingerprint. Live data may change between pages;
+/// clients requiring a frozen view should query an explicit retained `as_of`
+/// snapshot, although cursor syntax itself is algebra-only in this route.
+///
+/// # Performance
+///
+/// Sorts the candidate frontier in memory and, for an after token, scans it once
+/// to discard prior markers. It performs no storage I/O.
+///
+/// # Examples
+///
+/// For distance-ranked `[a:0.1, b:0.2, c:0.3]` and page size two, the first page
+/// returns `a,b` plus a token for `b`; the next page returns `c`. Reusing that
+/// token with another namespace or ranking vector fails validation.
 fn apply_cursor_if_requested(
     ns: &str,
     req: &QueryRequest,
@@ -1803,6 +3199,13 @@ fn apply_cursor_if_requested(
     Ok(response)
 }
 
+/// Selects the comparator matching the final score space.
+///
+/// # Returns
+///
+/// A plain function pointer that sorts ascending distance or descending
+/// fused/relevance score, always with ascending ID ties. A function pointer has
+/// no captured state and can be reused by sorting and marker filtering.
 fn cursor_result_cmp(req: &QueryRequest) -> fn(&SearchResult, &SearchResult) -> Ordering {
     if cursor_lower_score_is_better(req) {
         distance_result_cmp
@@ -1811,6 +3214,15 @@ fn cursor_result_cmp(req: &QueryRequest) -> fn(&SearchResult, &SearchResult) -> 
     }
 }
 
+/// Determines whether the final cursor score treats smaller values as better.
+///
+/// Explicit vector rerank and a single algebra ANN source use distance order.
+/// BM25 rerank, BM25 sources, and hybrid fused scores use descending order.
+///
+/// # Examples
+///
+/// A hybrid ANN+BM25 query followed by vector rerank returns `true` because the
+/// reranker replaces fused scores with distances.
 fn cursor_lower_score_is_better(req: &QueryRequest) -> bool {
     match req.rerank.as_ref() {
         Some(RerankSpec::Vector { .. }) => return true,
@@ -1823,10 +3235,37 @@ fn cursor_lower_score_is_better(req: &QueryRequest) -> bool {
     matches!(sources.as_slice(), [CandidateSource::Ann { .. }])
 }
 
+/// Orders distance results from nearest to farthest with stable ID ties.
 fn distance_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
     a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
 }
 
+/// Hashes namespace and ranking-affecting request fields into a cursor identity.
+///
+/// # Parameters
+///
+/// - `ns`: Namespace preventing cross-namespace token reuse.
+/// - `req`: Serializable request copied into a canonical struct-shaped JSON value.
+///
+/// # Returns
+///
+/// An XXH3 64-bit non-cryptographic fingerprint after removing cursor, debug,
+/// explain, facets, projection/attribute output, and consistency controls. Those
+/// fields do not define the score marker identity in the current contract.
+///
+/// # Errors
+///
+/// Propagates serialization failure or an impossible non-object request value.
+///
+/// # Consistency
+///
+/// XXH3 detects accidental query mismatch; it is not a MAC and does not protect
+/// against a client deliberately forging a token.
+///
+/// # Examples
+///
+/// Changing `top_k`, source vector, filter, fusion, or reranker changes the
+/// fingerprint. Toggling debug or attribute projection does not.
 fn cursor_fingerprint(ns: &str, req: &QueryRequest) -> Result<u64, ZeppelinError> {
     let mut value = serde_json::to_value(req)?;
     let object = value.as_object_mut().ok_or_else(|| {
@@ -1843,6 +3282,26 @@ fn cursor_fingerprint(ns: &str, req: &QueryRequest) -> Result<u64, ZeppelinError
     Ok(xxh3_64(&payload))
 }
 
+/// Encodes one finite page-ending result as a version-one cursor token.
+///
+/// # Parameters
+///
+/// - `fingerprint`: Query identity produced by `cursor_fingerprint`.
+/// - `result`: Final result whose score and ID form the exclusive marker.
+///
+/// # Returns
+///
+/// `zp1:<fingerprint-hex>:<score-bits-hex>:<id-utf8-hex>`. Encoding exact score
+/// bits avoids decimal round-trip changes at page boundaries.
+///
+/// # Errors
+///
+/// Rejects NaN or infinite scores.
+///
+/// # Examples
+///
+/// A result ID containing punctuation remains safe because its UTF-8 bytes are
+/// hex encoded rather than placed raw between separators.
 fn encode_cursor_token(fingerprint: u64, result: &SearchResult) -> Result<String, ZeppelinError> {
     if !result.score.is_finite() {
         return Err(ZeppelinError::Validation(
@@ -1856,6 +3315,26 @@ fn encode_cursor_token(fingerprint: u64, result: &SearchResult) -> Result<String
     ))
 }
 
+/// Parses and validates the structural contents of a version-one cursor token.
+///
+/// # Parameters
+///
+/// - `token`: Opaque token supplied by a client.
+///
+/// # Returns
+///
+/// Decoded fingerprint, exact score bits, and UTF-8 ID. Query compatibility is
+/// checked separately by `apply_cursor_if_requested`.
+///
+/// # Errors
+///
+/// Returns validation for wrong version/field count, invalid hex widths or
+/// digits, non-finite score bits, and non-UTF-8 IDs.
+///
+/// # Examples
+///
+/// Any truncated token or token beginning with another version prefix fails
+/// before it can affect result filtering.
 fn decode_cursor_token(token: &str) -> Result<DecodedCursor, ZeppelinError> {
     let parts: Vec<&str> = token.split(':').collect();
     if parts.len() != 4 || parts[0] != "zp1" {
@@ -1881,6 +3360,19 @@ fn decode_cursor_token(token: &str) -> Result<DecodedCursor, ZeppelinError> {
     })
 }
 
+/// Converts bytes to lowercase hexadecimal without an external allocation helper.
+///
+/// # Parameters
+///
+/// - `bytes`: Borrowed byte slice.
+///
+/// # Returns
+///
+/// An owned string with exactly two ASCII characters per byte.
+///
+/// # Examples
+///
+/// Bytes `[0x0a, 0xff]` become `"0aff"`.
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1891,6 +3383,15 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Decodes an even-length hexadecimal string into owned bytes.
+///
+/// # Errors
+///
+/// Rejects odd length or any non-hexadecimal digit through `hex_value`.
+///
+/// # Examples
+///
+/// `"646f63"` becomes the bytes for `doc`.
 fn hex_decode(input: &str) -> Result<Vec<u8>, ZeppelinError> {
     if input.len() % 2 != 0 {
         return Err(ZeppelinError::Validation("invalid cursor token hex".into()));
@@ -1906,6 +3407,15 @@ fn hex_decode(input: &str) -> Result<Vec<u8>, ZeppelinError> {
         .collect()
 }
 
+/// Maps one ASCII hexadecimal digit to its four-bit numeric value.
+///
+/// # Returns
+///
+/// Values zero through fifteen for decimal, lowercase, or uppercase hex.
+///
+/// # Errors
+///
+/// Returns validation for every other byte.
 fn hex_value(byte: u8) -> Result<u8, ZeppelinError> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -1915,21 +3425,73 @@ fn hex_value(byte: u8) -> Result<u8, ZeppelinError> {
     }
 }
 
+/// Prepared lexical query for one field used by candidate-local BM25 reranking.
 struct RerankFieldQuery {
+    /// Namespace attribute/FTS field name.
     field: String,
+    /// Query tokens produced with this field's tokenizer configuration.
     query_tokens: Vec<String>,
+    /// Field-specific BM25 saturation and length-normalization parameters.
     params: Bm25Params,
+    /// Owned tokenizer settings reused for candidate attribute text.
     config: FtsFieldConfig,
 }
 
+/// Candidate-frontier corpus statistics for one BM25 rerank field.
 struct RerankCorpusStats {
+    /// Candidates with a nonempty string value for this field.
     doc_count: u32,
+    /// Mean token count across those candidate documents.
     avg_doc_length: f32,
+    /// Number of candidate documents containing each distinct token.
     term_doc_freqs: HashMap<String, u32>,
 }
 
+/// Candidate ID -> field -> `(document length, token frequencies)`.
+///
+/// This is intentionally scoped to first-stage candidates, not persisted global
+/// FTS statistics. It supports an HTTP-layer second-stage scorer that cannot
+/// retrieve records outside its input frontier.
 type RerankFieldData = HashMap<String, HashMap<String, (u32, HashMap<String, u32>)>>;
 
+/// Reranks existing candidates using BM25 over their string attributes.
+///
+/// The scorer prepares configured field queries, tokenizes candidate text,
+/// computes document frequency and average length over the candidate frontier,
+/// evaluates the [`RankBy`] expression, and sorts higher scores first. This is
+/// candidate-local reranking, not the persisted/global BM25 source search.
+///
+/// # Parameters
+///
+/// - `meta`: Namespace FTS configuration and name for errors.
+/// - `response`: Candidate response whose scores/order are replaced.
+/// - `top_k`: Maximum reranked candidates to retain.
+/// - `include_attributes`: Whether attributes remain after scoring.
+/// - `rank_by`: BM25/arithmetic ranking expression to evaluate.
+///
+/// # Returns
+///
+/// The response ordered by descending rerank relevance, with ID tie breaking.
+/// Scan counters continue to describe first-stage retrieval.
+///
+/// # Errors
+///
+/// Returns `FtsFieldNotConfigured` if any expression field lacks namespace
+/// configuration and propagates ranking-expression errors. Candidate attributes
+/// that are absent, non-string, or tokenize empty simply contribute no field
+/// score.
+///
+/// # Performance
+///
+/// Tokenizes every candidate string for every referenced field, builds in-memory
+/// frequency maps, scores, and sorts. It performs no object-store reads because
+/// source execution materializes the attributes first.
+///
+/// # Examples
+///
+/// One hundred ANN candidates can be reranked by occurrences of `"database"`
+/// in configured `title` and `body` fields, then truncated to ten. A namespace
+/// without configured `body` fails instead of treating it as zero relevance.
 fn apply_bm25_rerank(
     meta: &NamespaceMetadata,
     mut response: QueryResponse,
@@ -1984,6 +3546,27 @@ fn apply_bm25_rerank(
     Ok(response)
 }
 
+/// Prepares all field-level token queries referenced by a rerank expression.
+///
+/// # Parameters
+///
+/// - `meta`: Namespace whose FTS configuration supplies tokenization and BM25 parameters.
+/// - `rank_by`: Expression from which `(field, query text)` pairs are extracted.
+///
+/// # Returns
+///
+/// Owned prepared queries in expression extraction order. Repeated fields stay
+/// repeated so expression semantics are preserved.
+///
+/// # Errors
+///
+/// Returns `FtsFieldNotConfigured` for the first referenced field absent from
+/// namespace metadata.
+///
+/// # Examples
+///
+/// A clause `title BM25 "rust storage"` becomes tokens using `title`'s
+/// lowercase/stemming configuration and copies that field's `k1`/`b` values.
 fn bm25_rerank_field_queries(
     meta: &NamespaceMetadata,
     rank_by: &RankBy,
@@ -2011,6 +3594,28 @@ fn bm25_rerank_field_queries(
         .collect()
 }
 
+/// Tokenizes candidate attributes into per-document rerank data.
+///
+/// # Parameters
+///
+/// - `results`: First-stage candidates with attributes materialized.
+/// - `field_queries`: Prepared fields and tokenization settings.
+///
+/// # Returns
+///
+/// Nested owned maps only for candidates/fields with a nonempty string value.
+/// Non-string values and missing attributes are omitted.
+///
+/// # Performance
+///
+/// Allocates token/frequency maps proportional to candidate text and referenced
+/// fields. Repeated prepared queries for one field may re-tokenize and replace
+/// the same stored field data.
+///
+/// # Examples
+///
+/// Candidate `a` with `title = "rust rust storage"` records length three and
+/// frequencies `{rust: 2, storage: 1}`.
 fn bm25_rerank_field_data(
     results: &[SearchResult],
     field_queries: &[RerankFieldQuery],
@@ -2042,6 +3647,22 @@ fn bm25_rerank_field_data(
     field_data
 }
 
+/// Computes candidate-local document statistics for every prepared field.
+///
+/// # Parameters
+///
+/// - `field_data`: Token lengths and term frequencies keyed by candidate/field.
+///
+/// # Returns
+///
+/// Per-field document count, average document length, and document frequencies.
+/// Each token counts at most once per document because the helper iterates term
+/// frequency keys.
+///
+/// # Examples
+///
+/// Field documents of lengths two and four yield `doc_count = 2` and average
+/// length three; a token present in both has document frequency two.
 fn bm25_rerank_corpus_stats(field_data: &RerankFieldData) -> HashMap<String, RerankCorpusStats> {
     let mut stats_by_field = HashMap::new();
     for doc_data in field_data.values() {
@@ -2068,6 +3689,28 @@ fn bm25_rerank_corpus_stats(field_data: &RerankFieldData) -> HashMap<String, Rer
     stats_by_field
 }
 
+/// Validates resolved source inputs against namespace metadata.
+///
+/// # Parameters
+///
+/// - `ns`: Namespace included in FTS configuration errors.
+/// - `meta`: Authoritative namespace dimensions and configured FTS fields.
+/// - `source_ref`: Resolved ANN coordinates or borrowed BM25 expression.
+///
+/// # Returns
+///
+/// Unit when every BM25 field is configured or ANN coordinates have matching
+/// dimensions and finite values.
+///
+/// # Errors
+///
+/// Returns field-configuration, dimension-mismatch, or non-finite validation
+/// errors. No source I/O has begun.
+///
+/// # Examples
+///
+/// A 384-dimensional namespace rejects a 768-dimensional embedding; a BM25
+/// clause over unconfigured `notes` returns a field-specific error.
 fn validate_query_source_metadata(
     ns: &str,
     meta: &NamespaceMetadata,
@@ -2102,6 +3745,38 @@ fn validate_query_source_metadata(
     }
 }
 
+/// Obtains the one manifest snapshot used by an execution and optionally records heat.
+///
+/// # Parameters
+///
+/// - `state`: Store, manifest cache, and optional hydrator.
+/// - `ns`: Namespace whose live manifest may be read.
+/// - `consistency`: Strong/eventual live-manifest policy when no snapshot is supplied.
+/// - `options`: Preselected snapshot and hydration-notification choice.
+///
+/// # Returns
+///
+/// The caller-supplied manifest or a consistency-aware current manifest.
+///
+/// # Errors
+///
+/// Propagates live manifest cache/store/decode failures. Hydration notification
+/// is best effort and does not turn queue pressure into a query failure.
+///
+/// # Side Effects
+///
+/// May read/populate the manifest cache and notify active-segment heat.
+///
+/// # Consistency
+///
+/// A supplied snapshot always wins and is returned unchanged. Cache state can
+/// optimize live lookup but cannot add artifacts absent from the manifest.
+///
+/// # Examples
+///
+/// A historical query passes generation 12 and disables hydration. A live strong
+/// query passes no manifest, verifies current state, and observes its active
+/// segment for possible background warming.
 async fn read_manifest_for_execution(
     state: &AppState,
     ns: &str,
@@ -2127,6 +3802,59 @@ async fn read_manifest_for_execution(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Runs one resolved ANN or BM25 source against a supplied manifest snapshot.
+///
+/// BM25 delegates to the lexical domain path with configured field settings,
+/// filter, cache, consistency, and full-scan budgets. ANN constructs
+/// [`crate::query::QueryParams`], delegates index/WAL work, and removes a by-ID
+/// seed after requesting one compensating candidate.
+///
+/// # Parameters
+///
+/// - `state`: Domain query dependencies and configured ANN oversampling.
+/// - `ns`, `meta`: Namespace identity and query metadata.
+/// - `req`: Filter and consistency controls.
+/// - `source_ref`: Resolved source payload.
+/// - `top_k`: Candidate width requested from this source.
+/// - `nprobe`: ANN cluster budget; ignored by BM25 execution.
+/// - `include_attributes`: Whether source hits should materialize metadata.
+/// - `knobs`: Runtime query limits and rerank coalescing controls.
+/// - `manifest`: Owned authoritative visibility snapshot.
+/// - `emit_debug`: Whether to collect detailed source diagnostics.
+///
+/// # Returns
+///
+/// The domain response paired with native score direction. ANN is lower-first;
+/// BM25 is higher-first.
+///
+/// # Errors
+///
+/// Rejects invalid dimensions/non-finite ANN values or unconfigured FTS fields,
+/// and propagates WAL, segment, cache, filter, index, and decoding failures.
+///
+/// # Side Effects
+///
+/// Increments the FTS query counter for BM25 and may populate immutable caches.
+/// It performs read-only storage work and publishes no manifest/artifact.
+///
+/// # Consistency
+///
+/// Both paths consume exactly `manifest`; no source reselects a current
+/// generation. Strong/eventual affects WAL participation inside the domain
+/// query functions.
+///
+/// # Performance
+///
+/// Source work may read visible WAL and active-segment ranges. ANN cost scales
+/// with `nprobe`, filters, quantization, oversampling, and rerank coalescing;
+/// BM25 cost depends on global/per-cluster index availability and configured
+/// full-scan budgets. Debug mode adds diagnostics collection.
+///
+/// # Examples
+///
+/// An ANN-by-ID source asking for ten requests eleven, removes its seed if
+/// present, then truncates back to ten. A BM25 source over an unconfigured field
+/// fails before scanning lexical artifacts.
 async fn execute_query_source_with_manifest(
     state: &AppState,
     ns: &str,
@@ -2257,6 +3985,35 @@ async fn execute_query_source_with_manifest(
     }
 }
 
+/// Combines multiple source responses and aggregates their observable work.
+///
+/// # Parameters
+///
+/// - `fusion`: Explicit strategy or `None` for default RRF.
+/// - `sources`: Owned source responses in request order.
+/// - `top_k`: Maximum fused candidates to retain.
+/// - `consistency`: Effective request consistency recorded in aggregate debug data.
+/// - `emit_debug`: Whether to synthesize a hybrid diagnostics block.
+///
+/// # Returns
+///
+/// A response with fused higher-is-better scores, summed scan counters, optional
+/// aggregate diagnostics, and response-transform fields initially empty.
+///
+/// # Errors
+///
+/// Rejects explicit no-fusion and propagates weighted count/finite validation.
+/// No partial fused response is returned.
+///
+/// # Performance
+///
+/// Consumes all source candidates into an ID map, then sorts unique IDs. RRF is
+/// linear before sort; weighted fusion also scans each source for min/max.
+///
+/// # Examples
+///
+/// If an ID appears in ANN and BM25 lists, its two contributions add into one
+/// hit while scan counters include work from both sources.
 fn fuse_source_responses(
     fusion: Option<&FusionSpec>,
     sources: Vec<SourceQueryResponse>,
@@ -2314,6 +4071,25 @@ fn fuse_source_responses(
     })
 }
 
+/// Sums per-source diagnostics into one hybrid query diagnostics block.
+///
+/// # Parameters
+///
+/// - `source_debugs`: Diagnostics actually emitted by sources.
+/// - `scanned_fragments`, `scanned_segments`: Already aggregated work counters.
+/// - `results_len`, `top_k`: Used to classify underfill.
+/// - `consistency`: Effective consistency reported to the client.
+///
+/// # Returns
+///
+/// Summed phase times, cache counts, and cluster probes. An underfilled response
+/// prefers `eventual_skipped_wal` when any source reports it; otherwise it uses
+/// `not_enough_matches`.
+///
+/// # Examples
+///
+/// ANN and BM25 cache hits 3 and 2 aggregate to 5. Their phase durations are
+/// summed as measured work, not claimed as end-to-end wall time.
 fn aggregate_source_debug(
     source_debugs: &[QueryDebug],
     scanned_fragments: usize,
@@ -2356,6 +4132,22 @@ fn aggregate_source_debug(
     }
 }
 
+/// Fuses source positions with reciprocal-rank contributions.
+///
+/// # Parameters
+///
+/// - `sources`: Owned ranked source responses.
+/// - `k`: Rank smoothing offset.
+/// - `top_k`: Maximum unique fused IDs.
+///
+/// # Returns
+///
+/// Higher-first fused results. A candidate at zero-based index `rank` contributes
+/// `1 / (k + rank + 1)` from that source.
+///
+/// # Examples
+///
+/// With `k = 60`, an ID ranked first in two sources receives `2 / 61`.
 fn fuse_rrf_results(
     sources: Vec<SourceQueryResponse>,
     k: usize,
@@ -2371,6 +4163,29 @@ fn fuse_rrf_results(
     sorted_fused_results(fused, top_k)
 }
 
+/// Fuses direction-adjusted normalized source scores with positional weights.
+///
+/// # Parameters
+///
+/// - `sources`: Owned ANN/BM25 responses.
+/// - `weights`: Finite weights aligned one-for-one with sources. Negative finite
+///   weights are accepted and subtract contribution.
+/// - `top_k`: Maximum unique fused IDs.
+///
+/// # Returns
+///
+/// Higher-first weighted results after independently normalizing every nonempty
+/// source to best=`1.0`, worst=`0.0`. A constant-score source assigns `1.0` to
+/// all its results.
+///
+/// # Errors
+///
+/// Rejects length mismatch, non-finite weights, and non-finite source scores.
+///
+/// # Examples
+///
+/// Weights `[1.0, 0.0]` preserve the first source's normalized evidence while
+/// still allowing IDs unique to the zero-weight source into tie-broken output.
 fn fuse_weighted_results(
     sources: Vec<SourceQueryResponse>,
     weights: &[f32],
@@ -2415,6 +4230,23 @@ fn fuse_weighted_results(
     Ok(sorted_fused_results(fused, top_k))
 }
 
+/// Converts one source-native score to a higher-is-better unit interval.
+///
+/// # Parameters
+///
+/// - `kind`: ANN distance or BM25 relevance direction.
+/// - `score`: Finite source score.
+/// - `min_score`, `max_score`: Finite range over that source's candidates.
+///
+/// # Returns
+///
+/// `1.0` for all values when the range is effectively constant. Otherwise ANN
+/// inverts the range while BM25 preserves it.
+///
+/// # Examples
+///
+/// ANN distances from `0.1` to `0.5` map `0.1` to one and `0.5` to zero; BM25
+/// relevance does the opposite mapping for the same numeric endpoints.
 fn normalize_source_score(
     kind: QuerySourceKind,
     score: f32,
@@ -2431,6 +4263,22 @@ fn normalize_source_score(
     }
 }
 
+/// Adds one candidate contribution to the fused ID map.
+///
+/// # Parameters
+///
+/// - `fused`: Unique candidates accumulated so far.
+/// - `result`: Owned source result whose score will be replaced/added.
+/// - `contribution`: RRF or weighted score contribution.
+///
+/// # Side Effects
+///
+/// Inserts a new candidate or adds to an existing score. The first available
+/// attribute map is retained; later attributes fill only an absent map.
+///
+/// # Examples
+///
+/// Contributions `0.02` and `0.01` for the same ID produce fused score `0.03`.
 fn add_fused_candidate(
     fused: &mut HashMap<String, SearchResult>,
     mut result: SearchResult,
@@ -2451,6 +4299,11 @@ fn add_fused_candidate(
     }
 }
 
+/// Sorts unique fused candidates by descending score and stable ID tie break.
+///
+/// # Returns
+///
+/// At most `top_k` owned results.
 fn sorted_fused_results(fused: HashMap<String, SearchResult>, top_k: usize) -> Vec<SearchResult> {
     let mut results: Vec<SearchResult> = fused.into_values().collect();
     results.sort_by(fused_result_cmp);
@@ -2458,10 +4311,39 @@ fn sorted_fused_results(fused: HashMap<String, SearchResult>, top_k: usize) -> V
     results
 }
 
+/// Orders higher fused/BM25 scores first with ascending ID ties.
 fn fused_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
     b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
 }
 
+/// Resolves a validated legacy or single algebra source into executable inputs.
+///
+/// # Parameters
+///
+/// - `state`, `ns`: Services and namespace used if an algebra ANN source loads by ID.
+/// - `req`: Request that owns borrowed inline vector/rank expressions.
+/// - `source`: Validated source path.
+/// - `manifest`: Snapshot used by any by-ID lookup.
+///
+/// # Returns
+///
+/// A [`QuerySourceRef`] borrowing request data or owning a fetched seed vector.
+///
+/// # Errors
+///
+/// Reports impossible missing validated fields, delegates algebra resolution
+/// errors, and rejects a hybrid descriptor because all hybrid sources must be
+/// handled together.
+///
+/// # Examples
+///
+/// A legacy vector returns a borrowed slice with no excluded ID; a single
+/// algebra by-ID source may return owned fetched coordinates and its seed ID.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The returned lifetime is tied to `req` only when data is borrowed. `Cow`
+/// erases the branch difference for callers without erasing ownership safety.
 async fn resolve_query_source_ref<'a>(
     state: &AppState,
     ns: &str,
@@ -2495,6 +4377,38 @@ async fn resolve_query_source_ref<'a>(
     }
 }
 
+/// Resolves one indexed algebra source, fetching stored ANN coordinates when needed.
+///
+/// # Parameters
+///
+/// - `state`, `ns`: Vector fetch services and namespace.
+/// - `req`: Request owning the source list and consistency choice.
+/// - `index`: Validated source position.
+/// - `manifest`: Visibility snapshot for a by-ID fetch.
+///
+/// # Returns
+///
+/// Borrowed inline ANN/BM25 input or an owned by-ID ANN vector. BM25 prefix mode
+/// prefers the source-local setting, then top-level setting, then `false`.
+///
+/// # Errors
+///
+/// Returns validation for missing/malformed source state, `VectorNotFound` for a
+/// seed absent from the snapshot, and propagates vector fetch errors.
+///
+/// # Side Effects
+///
+/// A by-ID source may read WAL/segment data and populate caches.
+///
+/// # Consistency
+///
+/// The seed is loaded with the request consistency mode from exactly the
+/// supplied manifest; no newer coordinates can leak into the query.
+///
+/// # Examples
+///
+/// Source `{id: "doc-7"}` loads `doc-7`'s coordinates and marks `doc-7` for
+/// exclusion. An absent ID fails rather than substituting an empty vector.
 async fn resolve_algebra_source_ref<'a>(
     state: &AppState,
     ns: &str,
@@ -2547,6 +4461,22 @@ async fn resolve_algebra_source_ref<'a>(
     }
 }
 
+/// Resolves the effective probe count for one algebra source position.
+///
+/// # Parameters
+///
+/// - `req`: Request containing source-local and top-level controls.
+/// - `index`: Validated source position.
+/// - `default_nprobe`: Runtime default captured for this execution.
+///
+/// # Returns
+///
+/// ANN uses source-local, then top-level, then default precedence. BM25 returns
+/// the default as an unused uniform argument to source execution.
+///
+/// # Errors
+///
+/// Returns validation if sources or the indexed source are missing.
 fn nprobe_for_algebra_source(
     req: &QueryRequest,
     index: usize,
@@ -2567,6 +4497,29 @@ fn nprobe_for_algebra_source(
     }
 }
 
+/// Reports a live query observation for the manifest's active segment.
+///
+/// # Parameters
+///
+/// - `state`: Server state containing the optional background hydrator.
+/// - `namespace`: Namespace whose heat should be recorded.
+/// - `manifest`: Same visibility snapshot selected for the query.
+///
+/// # Side Effects
+///
+/// If hydration is enabled and a matching active descriptor exists, updates heat
+/// policy and may non-blockingly enqueue immutable segment warming. Queue
+/// pressure or absence of a segment does not fail the query.
+///
+/// # Consistency
+///
+/// Only the descriptor selected from this manifest is observed. Hydration may
+/// warm cache bytes but cannot alter the query's artifact membership.
+///
+/// # Examples
+///
+/// Repeated live queries can enqueue active `seg-42`. Historical queries disable
+/// this notification so old snapshots do not heat the current-segment policy.
 fn notify_hydrator(state: &AppState, namespace: &str, manifest: &Manifest) {
     let Some(hydrator) = state.hydrator.as_ref() else {
         return;
@@ -2577,6 +4530,23 @@ fn notify_hydrator(state: &AppState, namespace: &str, manifest: &Manifest) {
     hydrator.observe_query(namespace, &segment);
 }
 
+/// Finds and clones the descriptor named by a manifest's active-segment ID.
+///
+/// # Parameters
+///
+/// - `manifest`: Query visibility snapshot.
+///
+/// # Returns
+///
+/// An owned [`SegmentRef`] when `active_segment` names an entry in `segments`,
+/// or `None` for no active segment or an unmatched ID. This helper is only for
+/// best-effort hydration notification; domain query execution validates/handles
+/// its own segment state.
+///
+/// # Examples
+///
+/// A manifest retaining old and current descriptors returns only the one named
+/// by `active_segment`.
 fn active_segment_snapshot(manifest: &Manifest) -> Option<SegmentRef> {
     let active_segment = manifest.active_segment.as_ref()?;
     manifest
@@ -2586,6 +4556,23 @@ fn active_segment_snapshot(manifest: &Manifest) -> Option<SegmentRef> {
         .cloned()
 }
 
+/// Chooses manifest-read freshness for a batch's shape-valid entries.
+///
+/// # Parameters
+///
+/// - `queries`: Positional request bodies.
+/// - `validations`: Positional validation outcomes of equal logical length.
+///
+/// # Returns
+///
+/// Strong when any validation-success entry requests strong; eventual otherwise.
+/// Invalid entries do not force manifest work or freshness.
+///
+/// # Examples
+///
+/// One valid strong entry plus three eventual entries selects a strongly
+/// verified shared manifest. A strong-but-invalid entry among valid eventual
+/// entries does not.
 fn strongest_consistency(
     queries: &[QueryRequest],
     validations: &[Result<ValidatedQuery, ZeppelinError>],
@@ -2603,6 +4590,16 @@ fn strongest_consistency(
     }
 }
 
+/// Wraps a successful domain response as one timed batch entry.
+///
+/// # Parameters
+///
+/// - `response`: Owned single-query response.
+/// - `start`: Entry-local start instant.
+///
+/// # Returns
+///
+/// `ok = true`, boxed response, and elapsed whole milliseconds.
 fn batch_success_entry(response: QueryResponse, start: Instant) -> BatchQueryEntry {
     BatchQueryEntry::Success {
         ok: true,
@@ -2613,6 +4610,21 @@ fn batch_success_entry(response: QueryResponse, start: Instant) -> BatchQueryEnt
     }
 }
 
+/// Logs and wraps one domain failure as a timed batch entry.
+///
+/// # Parameters
+///
+/// - `err`: Borrowed error to classify and expose safely.
+/// - `start`: Entry-local start instant.
+///
+/// # Returns
+///
+/// `ok = false`, canonical [`BatchQueryError`], and elapsed whole milliseconds.
+///
+/// # Side Effects
+///
+/// Logs 5xx-class failures at error level and client/other failures at warning
+/// level, preserving internal details in server telemetry.
 fn batch_error_entry(err: &ZeppelinError, start: Instant) -> BatchQueryEntry {
     let status = err.status_code();
     if status >= 500 {
@@ -2639,13 +4651,30 @@ fn batch_error_entry(err: &ZeppelinError, start: Instant) -> BatchQueryEntry {
     }
 }
 
-/// RAII guard that records query duration on drop (including error paths).
+/// Records one validated single-query duration when its scope exits.
+///
+/// This RAII guard covers namespace lookup, manifest resolution, and execution.
+/// It is constructed only after request-shape validation, matching query metric
+/// counting semantics.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Rust calls [`Drop::drop`] automatically during normal return and `?` error
+/// unwinding. It is analogous to Java `finally`; unlike a C cleanup convention,
+/// the compiler inserts the call for every scope exit.
 struct DurationGuard {
+    /// Monotonic start instant captured after validation.
     start: std::time::Instant,
+    /// Owned metric label that remains valid until drop.
     namespace: String,
 }
 
 impl Drop for DurationGuard {
+    /// Observes elapsed seconds in the namespace query-duration histogram.
+    ///
+    /// # Side Effects
+    ///
+    /// Updates process-local metrics exactly once for this guard.
     fn drop(&mut self) {
         let elapsed = self.start.elapsed();
         crate::metrics::QUERY_DURATION
