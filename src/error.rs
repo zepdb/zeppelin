@@ -1,6 +1,89 @@
+//! Central error vocabulary and client-safety policy for Zeppelin.
+//!
+//! Domain, storage, indexing, cache, WAL, and query code return
+//! [`crate::error::ZeppelinError`] through the module's
+//! [`crate::error::Result`] alias. The HTTP layer then uses
+//! [`crate::error::ZeppelinError::status_code`],
+//! [`crate::error::ZeppelinError::error_code`],
+//! [`crate::error::ZeppelinError::retryable`],
+//! [`crate::error::ZeppelinError::retry_after_secs`], and
+//! [`crate::error::ZeppelinError::client_message`] to build one stable response
+//! envelope. This keeps low-level failures descriptive in logs without exposing
+//! S3 keys, endpoints, lease-holder IDs, or fencing tokens to clients.
+//!
+//! ```text
+//! storage / WAL / index / query operation
+//!                  |
+//!                  | Result<T, ZeppelinError>
+//!                  v
+//!        full internal error (log this)
+//!                  |
+//!       +----------+-----------+----------------+
+//!       |                      |                |
+//!       v                      v                v
+//! HTTP status + stable code  retry policy  sanitized client message
+//!       |                      |                |
+//!       +----------------------+----------------+
+//!                              |
+//!                              v
+//!                    canonical HTTP envelope
+//! ```
+//!
+//! The most important classification invariant is that an S3 object missing
+//! beneath an existing manifest is [`crate::error::ZeppelinError::NotFound`], a
+//! server-side integrity failure. It is not interchangeable with
+//! [`crate::error::ZeppelinError::NamespaceNotFound`] or
+//! [`crate::error::ZeppelinError::ManifestNotFound`], which describe a
+//! client-visible missing namespace. Likewise, publication conflicts and stale
+//! fencing tokens are explicit retryable conflicts; they must never be silently
+//! treated as a successful write.
+//!
+//! ## Reading map
+//!
+//! 1. Read [`crate::error::ZeppelinError`] by subsystem to see which failures
+//!    cross module boundaries.
+//! 2. Read the `From` implementation and [`crate::error::Result`] alias to
+//!    understand error propagation with `?`.
+//! 3. Read [`crate::error::ZeppelinError::status_code`] and
+//!    [`crate::error::ZeppelinError::error_code`] for the public classification
+//!    contract.
+//! 4. Finish with [`crate::error::ZeppelinError::retryable`],
+//!    [`crate::error::ZeppelinError::retry_after_secs`], and
+//!    [`crate::error::ZeppelinError::client_message`] for client behavior and
+//!    redaction.
+//!
+//! ## Rust concepts used here
+//!
+//! [`thiserror::Error`] is a derive macro that generates Rust's standard
+//! [`std::error::Error`] and [`std::fmt::Display`] implementations from the
+//! `#[error(...)]` annotations. `#[from]` also generates conversions for nested
+//! source errors, allowing `?` to propagate them as
+//! [`crate::error::ZeppelinError`] without boilerplate. This is closest to a
+//! checked Java exception hierarchy, but the error is a returned enum value
+//! rather than an exception that unwinds the stack. In C, it replaces a numeric
+//! status plus separate out-of-band error storage with one tagged value that
+//! carries the relevant context.
+//!
+//! Exhaustive `match` expressions make the compiler part of API maintenance.
+//! In particular, adding a new error variant cannot compile until
+//! [`crate::error::ZeppelinError::error_code`] assigns it a stable code.
+
 use thiserror::Error;
 
-/// All errors that can occur within the Zeppelin vector search engine.
+/// A typed failure produced by a Zeppelin operation.
+///
+/// Variants preserve enough context for structured logs and programmatic
+/// handling. That internal detail is not automatically safe for an HTTP body;
+/// callers serving external requests must use [`ZeppelinError::client_message`]
+/// rather than [`std::string::ToString::to_string`].
+///
+/// # Example
+///
+/// A missing S3 cluster object becomes [`ZeppelinError::NotFound`] and maps to
+/// an internal error, while a request for a namespace that does not exist
+/// becomes [`ZeppelinError::NamespaceNotFound`] and maps to a client 404. A
+/// manifest compare-and-swap loss becomes [`ZeppelinError::ManifestConflict`]
+/// so the caller can reload authoritative state and retry.
 #[derive(Error, Debug)]
 pub enum ZeppelinError {
     // Storage errors
@@ -255,24 +338,90 @@ pub enum ZeppelinError {
 }
 
 impl From<Box<bincode::ErrorKind>> for ZeppelinError {
+    /// Converts bincode's boxed error representation into Zeppelin's error enum.
+    ///
+    /// The conversion preserves the diagnostic text but deliberately erases
+    /// bincode's concrete error kind so callers handle it through the common
+    /// [`ZeppelinError::Bincode`] category.
+    ///
+    /// # Parameters
+    ///
+    /// - `e`: Owned bincode error returned while encoding or decoding a binary
+    ///   artifact.
+    ///
+    /// # Returns
+    ///
+    /// Returns an owned [`ZeppelinError::Bincode`] containing the source error's
+    /// human-readable text.
+    ///
+    /// # Example
+    ///
+    /// When a decoder returns a boxed `bincode::ErrorKind`, the `?` operator can
+    /// invoke this conversion and return a `ZeppelinError` from the enclosing
+    /// function.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// `From<Source> for Target` is a compile-time conversion protocol. The `?`
+    /// operator uses it to convert an incompatible error before returning. It is
+    /// similar in purpose to catching a Java exception and wrapping it, or
+    /// translating one C error-code domain into another, but the compiler checks
+    /// that the conversion exists. Ownership of the box moves into this method
+    /// and its allocation is released after the message is copied into a new
+    /// [`String`].
     fn from(e: Box<bincode::ErrorKind>) -> Self {
         ZeppelinError::Bincode(e.to_string())
     }
 }
 
-/// A convenience type alias for `std::result::Result<T, ZeppelinError>`.
+/// The standard return shape for fallible Zeppelin operations.
+///
+/// `Ok(T)` carries a successful value and `Err(ZeppelinError)` carries one
+/// typed failure. The alias keeps signatures short without introducing a new
+/// runtime wrapper or changing the layout of [`std::result::Result`].
+///
+/// # Example
+///
+/// A function returning `Result<Manifest>` either yields an authoritative
+/// manifest or an explicit storage, decoding, or domain error; it never needs a
+/// sentinel manifest value.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// This resembles a Java method that declares a closed family of failures, or a
+/// C function returning a status alongside an output value, but success and
+/// failure are mutually exclusive enum variants. Callers must inspect or
+/// propagate the result before accessing `T`.
 pub type Result<T> = std::result::Result<T, ZeppelinError>;
 
 impl ZeppelinError {
-    /// Returns the HTTP status code appropriate for this error variant.
+    /// Classifies this error as an HTTP status code for the canonical API envelope.
     ///
-    /// Note the deliberate split of the S3-level `NotFound { key }`: an object
+    /// Note the deliberate split of the S3-level [`ZeppelinError::NotFound`]: an object
     /// key miss below the namespace layer (a segment/cluster/fragment that the
     /// manifest references but S3 can't return) is NOT a client-facing 404 —
     /// it's a server-side data-integrity failure (500). Only *namespace*-level
-    /// misses (`NamespaceNotFound`, `ManifestNotFound`) are true 404s. Leaking
-    /// the former as 404 made "your namespace is gone" out of "a segment file
-    /// went missing" (Task 11 I2).
+    /// misses such as [`ZeppelinError::NamespaceNotFound`] are true 404s.
+    ///
+    /// # Returns
+    ///
+    /// Returns the numeric status consumed by the Axum response layer. Unknown
+    /// future variants fall into the internal-server-error category until they
+    /// receive a more specific mapping.
+    ///
+    /// # Example
+    ///
+    /// A dimension mismatch maps to `400`; a manifest CAS conflict maps to
+    /// `409`; and a manifest-referenced S3 key that cannot be fetched maps to
+    /// `500`, not `404`.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The method borrows `&self`, so classification neither consumes nor
+    /// mutates the error. Java would pass an object reference; C would pass a
+    /// pointer to a tagged error struct. Rust additionally guarantees the
+    /// borrowed error stays valid for this call and cannot be mutated through
+    /// this shared reference.
     pub fn status_code(&self) -> u16 {
         match self {
             ZeppelinError::NamespaceNotFound { .. }
@@ -311,12 +460,31 @@ impl ZeppelinError {
         }
     }
 
-    /// Stable, machine-readable error code (SCREAMING_SNAKE_CASE).
+    /// Returns the stable, machine-readable code for this error variant.
     ///
-    /// Every variant maps to exactly one code; this is an EXHAUSTIVE match (no
-    /// wildcard arm) so a newly-added variant fails to compile until it is
-    /// assigned a code — see `test_every_variant_has_stable_code`. Clients key
-    /// off this, never the human `error` string or the numeric status.
+    /// Every variant maps to exactly one `SCREAMING_SNAKE_CASE` code. Clients
+    /// should branch on this code rather than parsing the human message or
+    /// assuming every condition with the same HTTP status has the same meaning.
+    ///
+    /// # Returns
+    ///
+    /// Returns a borrowed string literal with process-long (`'static`) lifetime;
+    /// classification performs no allocation.
+    ///
+    /// # Example
+    ///
+    /// [`ZeppelinError::ManifestConflict`] and lease conflicts all return
+    /// `"CONFLICT_RETRY"`, while [`ZeppelinError::DimensionMismatch`] returns
+    /// `"DIMENSION_MISMATCH"`.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The match intentionally has no wildcard arm. This is stronger than a
+    /// Java `switch` with `default`, or a C `switch` that silently falls through
+    /// to a generic code: adding an enum variant produces a compile error here
+    /// until the public contract is updated. Returning `&'static str` is like a
+    /// pointer to immutable static C storage and does not allocate a Java-style
+    /// string object per call.
     pub fn error_code(&self) -> &'static str {
         match self {
             ZeppelinError::NotFound { .. } => "INTERNAL_DATA_MISSING",
@@ -358,9 +526,23 @@ impl ZeppelinError {
         }
     }
 
-    /// Whether the client can reasonably retry the same request unchanged.
-    /// Conflicts (CAS/lease), concurrency, rate limits, and transient storage
-    /// errors are retryable; validation and namespace-shape errors are not.
+    /// Reports whether retrying the same logical request can reasonably succeed.
+    ///
+    /// Compare-and-swap or lease conflicts, temporary concurrency pressure,
+    /// rate limits, and storage-layer failures are retryable. Validation and
+    /// namespace-shape failures require a changed request or external action.
+    /// This is advice to clients, not an automatic retry loop inside Zeppelin.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` when an unchanged request may succeed after delay or state
+    /// refresh, and `false` when immediate repetition is not useful.
+    ///
+    /// # Example
+    ///
+    /// A client that receives [`ZeppelinError::ManifestConflict`] can reload and
+    /// retry. Retrying [`ZeppelinError::DimensionMismatch`] with the same vector
+    /// cannot succeed.
     pub fn retryable(&self) -> bool {
         matches!(
             self,
@@ -374,9 +556,22 @@ impl ZeppelinError {
         )
     }
 
-    /// Seconds to advertise in a `Retry-After` header, if applicable.
-    /// Rate-limit carries its own budget; conflict/concurrency get a short
-    /// default nudge so clients back off instead of hot-looping.
+    /// Returns the delay to advertise in an HTTP `Retry-After` header.
+    ///
+    /// Rate-limit errors carry their computed budget. Conflicts and concurrency
+    /// pressure receive a one-second hint so clients do not hot-loop. Other
+    /// variants do not prescribe a delay even when a broader policy may regard
+    /// them as retryable.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some(seconds)` when the response should include a delay, or
+    /// `None` when Zeppelin has no variant-specific delay to advertise.
+    ///
+    /// # Example
+    ///
+    /// A rate-limit error carrying `7` returns `Some(7)`; a manifest conflict
+    /// returns `Some(1)`; a validation error returns `None`.
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             ZeppelinError::RateLimitExceeded { retry_after_secs } => Some(*retry_after_secs),
@@ -389,12 +584,34 @@ impl ZeppelinError {
         }
     }
 
-    /// Human-readable message SAFE to return to clients — never leaks S3 keys,
-    /// bucket names, endpoints, fencing-token values, or lease-holder IDs
-    /// (those go to structured logs only; Task 11 I3). Variants whose `Display`
-    /// already carries only safe, caller-supplied context (validation text,
-    /// namespace names, dimensions) pass through; variants whose `Display`
-    /// embeds internal detail get a generic, actionable string instead.
+    /// Builds the human-readable error message that is safe to return to a client.
+    ///
+    /// S3 keys, bucket names, endpoints, fencing-token values, and lease-holder
+    /// IDs belong only in structured server logs. Variants whose generated
+    /// [`std::fmt::Display`] text contains internal detail are replaced with a
+    /// generic message; variants carrying only safe caller or schema context can
+    /// reuse their display text.
+    ///
+    /// # Returns
+    ///
+    /// Returns an owned, sanitized [`String`] suitable for the canonical HTTP
+    /// error envelope. Each call allocates a message so the result can outlive
+    /// the borrowed error.
+    ///
+    /// # Example
+    ///
+    /// If S3 reports that `secret-bucket/ns/segments/7` is missing, the server
+    /// log retains that path, but this method returns a generic internal-data
+    /// message. A stale fencing-token message may include the safe namespace
+    /// name but never the old or current numeric token.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// Pattern matching can borrow selected fields such as `namespace` without
+    /// moving them out of `self`. The returned `String` owns its buffer, similar
+    /// to constructing a new Java `String`; in C the caller and callee would need
+    /// an explicit allocation and ownership convention. Rust ties cleanup to the
+    /// returned value's lifetime through RAII.
     pub fn client_message(&self) -> String {
         match self {
             // Internal detail — return generic text, log the specifics elsewhere.
@@ -464,9 +681,11 @@ impl ZeppelinError {
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
+/// Regression tests for public classification, redaction, and conversion contracts.
 mod tests {
     use super::*;
 
+    /// Verifies an internal S3 key miss is a redacted server failure, not a client 404.
     #[test]
     fn test_internal_notfound_is_500_not_404() {
         // An S3 key miss below the namespace layer is a server-side data
@@ -484,6 +703,7 @@ mod tests {
         );
     }
 
+    /// Verifies a missing namespace is reported as a client-visible 404.
     #[test]
     fn test_namespace_not_found_status_code() {
         let err = ZeppelinError::NamespaceNotFound {
@@ -492,6 +712,7 @@ mod tests {
         assert_eq!(err.status_code(), 404);
     }
 
+    /// Verifies a namespace with no manifest is reported as a client-visible 404.
     #[test]
     fn test_manifest_not_found_status_code() {
         let err = ZeppelinError::ManifestNotFound {
@@ -500,6 +721,7 @@ mod tests {
         assert_eq!(err.status_code(), 404);
     }
 
+    /// Verifies creating an existing namespace is classified as a conflict.
     #[test]
     fn test_namespace_already_exists_status_code() {
         let err = ZeppelinError::NamespaceAlreadyExists {
@@ -508,6 +730,7 @@ mod tests {
         assert_eq!(err.status_code(), 409);
     }
 
+    /// Verifies a vector with the wrong dimension is classified as bad input.
     #[test]
     fn test_dimension_mismatch_status_code() {
         let err = ZeppelinError::DimensionMismatch {
@@ -517,12 +740,14 @@ mod tests {
         assert_eq!(err.status_code(), 400);
     }
 
+    /// Verifies general request-validation failures are classified as bad input.
     #[test]
     fn test_validation_status_code() {
         let err = ZeppelinError::Validation("bad input".into());
         assert_eq!(err.status_code(), 400);
     }
 
+    /// Verifies rate limiting produces status 429 and a useful internal display string.
     #[test]
     fn test_rate_limit_exceeded_status_code() {
         let err = ZeppelinError::RateLimitExceeded {
@@ -532,6 +757,7 @@ mod tests {
         assert!(err.to_string().contains("rate limit exceeded"));
     }
 
+    /// Verifies uncategorized internal subsystem failures default to status 500.
     #[test]
     fn test_default_status_code() {
         let err = ZeppelinError::Bincode("bad data".into());
@@ -547,6 +773,7 @@ mod tests {
         assert_eq!(err.status_code(), 500);
     }
 
+    /// Verifies generated display messages retain diagnostic fields for server logs.
     #[test]
     fn test_display_formatting() {
         let err = ZeppelinError::NotFound {
@@ -571,15 +798,15 @@ mod tests {
         assert!(msg.contains("222"));
     }
 
-    /// Exhaustive guard: every variant must yield a non-empty, uppercase-snake
-    /// stable code. The `match` in `error_code()` has no wildcard, so a new
-    /// variant won't compile until coded; this test additionally pins the
-    /// FORMAT so codes stay client-stable.
+    /// Verifies representative variants yield non-empty uppercase-snake stable codes.
+    ///
+    /// Exhaustiveness comes from the wildcard-free match in [`ZeppelinError::error_code`]:
+    /// a new variant cannot compile until it receives a code. This test separately
+    /// pins the format for representative constructible variants.
     #[test]
     fn test_every_variant_has_stable_code() {
-        // One representative per variant. If a variant is added, `error_code`'s
-        // exhaustive match fails to compile first; keep this list in sync so
-        // the format assertions cover it too.
+        // Keep representative values in sync with new public error categories;
+        // the exhaustive production match is the compiler-enforced backstop.
         let variants: Vec<ZeppelinError> = vec![
             ZeppelinError::NotFound { key: "k".into() },
             ZeppelinError::Storage(object_store::Error::NotFound {
@@ -681,6 +908,7 @@ mod tests {
         }
     }
 
+    /// Verifies retry advice and delay hints distinguish transient from permanent errors.
     #[test]
     fn test_retryable_and_retry_after() {
         // Conflicts / concurrency / rate-limit are retryable with a Retry-After.
@@ -720,6 +948,7 @@ mod tests {
         );
     }
 
+    /// Verifies client messages redact fencing, lease-holder, and storage details.
     #[test]
     fn test_client_message_hides_internals() {
         // Fencing token values and lease holder IDs must never reach clients.
@@ -757,6 +986,7 @@ mod tests {
         );
     }
 
+    /// Verifies bincode errors convert into the common Zeppelin error category.
     #[test]
     fn test_from_bincode_error() {
         let bincode_err: Box<bincode::ErrorKind> =
