@@ -1,3 +1,70 @@
+//! Coordinates time-bounded namespace ownership through an object-store lease.
+//!
+//! Writers and compactors enter this module through
+//! [`crate::wal::lease::LeaseManager::acquire`], keep long-running work alive
+//! with [`crate::wal::lease::LeaseManager::renew`], and finish with
+//! [`crate::wal::lease::LeaseManager::release`]. The authoritative lease is the
+//! JSON object at `<namespace>/lease.json`; the
+//! [`crate::wal::lease::Lease`] returned to a caller is only a snapshot of that
+//! object.
+//!
+//! A lease alone does not make a write safe. The monotonically increasing
+//! [`crate::wal::lease::Lease::fencing_token`] must travel into fenced manifest publication such as
+//! [`crate::wal::writer::WalWriter::append_with_lease`]. Publication then uses
+//! both a fencing check and an ETag compare-and-swap (CAS): the token rejects a
+//! known zombie, while CAS closes the race between checking the token and
+//! replacing the manifest.
+//!
+//! ```text
+//! holder A acquires token 7
+//!          |
+//!          | lease expires
+//!          v
+//! holder B CAS-takes over with token 8
+//!          |
+//!          v
+//! manifest records token 8 with ETag CAS
+//!          |
+//!          +---- A presents token 7 -> rejected as stale
+//!          `---- B presents token 8 -> may publish if CAS also succeeds
+//! ```
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`crate::wal::lease::Lease`] to understand the persisted
+//!    ownership record and its process-local ETag.
+//! 2. Read [`crate::wal::lease::LeaseManager::acquire`] for first acquisition
+//!    and expired-lease takeover.
+//! 3. Read [`crate::wal::lease::LeaseManager::renew`] for the heartbeat path.
+//! 4. Finish with [`crate::wal::lease::LeaseManager::release`] and
+//!    [`crate::wal::lease::LeaseManager::validate`] to see why cleanup and local
+//!    time checks are not fencing substitutes.
+//!
+//! ## Invariants and limits
+//!
+//! - Takeover preserves and increments the previous token. Deleting the lease
+//!   object resets a later first acquisition to token `1`.
+//! - An expired holder must be able to leave its cleanup path even after another
+//!   process takes over; release is deliberately best-effort.
+//! - Wall-clock expiry and holder identity are necessary coordination signals,
+//!   but correctness-sensitive writes still require fencing plus manifest CAS.
+//! - Initial creation is an unconditional PUT and relies on Zeppelin's v1
+//!   single-writer-per-namespace operating rule. Expired-object takeover and
+//!   renewal use ETag CAS.
+//!
+//! ## Rust concepts used here
+//!
+//! [`crate::wal::lease::LeaseManager`] owns a clonable
+//! [`crate::storage::ZeppelinStore`] handle and
+//! borrows `&self` across async object-store calls. Java would normally share a
+//! client reference and C would pass a client pointer; Rust additionally proves
+//! that the manager remains alive for the whole future.
+//! [`crate::error::Result`] and `?`
+//! provide explicit error propagation instead of Java exceptions or C status
+//! codes. The serialized [`crate::wal::lease::Lease`] uses `serde`, while its ETag is marked
+//! `#[serde(skip)]` because that value belongs to the current GET response, not
+//! to durable lease data.
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -7,41 +74,105 @@ use tracing::{debug, instrument, warn};
 use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
 
-/// A lease granting exclusive write access to a namespace.
+/// A process's snapshot of the time-bounded write lease for one namespace.
+///
+/// The serialized fields are stored in `<namespace>/lease.json`. The private
+/// `etag` field
+/// is filled from object-store metadata after a read and is intentionally not
+/// persisted. Possessing this value does not by itself prove current ownership:
+/// another holder may take over after expiration, so callers must renew and use
+/// [`Self::fencing_token`] on consistency-sensitive manifest writes.
+///
+/// # Examples
+///
+/// A compactor may receive token `12` with an expiry 30 seconds in the future.
+/// If another compactor later takes over with token `13`, the first snapshot
+/// still contains `12`; fenced publication rejects it rather than trusting the
+/// stale in-memory value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lease {
-    /// ID of the process that holds this lease.
+    /// Stable process or worker identity written as the current holder.
     pub holder_id: String,
-    /// Monotonically increasing fencing token to prevent zombie writes.
+    /// Namespace-local generation carried into fenced manifest writes.
+    ///
+    /// Takeover increments this value so work started by an older holder can be
+    /// distinguished from work started by the current holder.
     pub fencing_token: u64,
-    /// When the lease was acquired.
+    /// Wall-clock time at which this lease record was most recently built.
+    ///
+    /// Renewal rebuilds the record, so this is the current acquisition or
+    /// renewal time rather than necessarily the first time the holder acquired
+    /// the namespace.
     pub acquired_at: DateTime<Utc>,
-    /// When the lease expires (wall clock).
+    /// Wall-clock instant after which another manager may attempt takeover.
     pub expires_at: DateTime<Utc>,
-    /// ETag of the lease.json object — used for CAS on lease operations.
+    /// ETag observed when this snapshot was read from object storage.
+    ///
+    /// This process-local concurrency token is excluded from JSON. Current
+    /// renewal code obtains a fresh ETag directly rather than relying on this
+    /// stored value.
     #[serde(skip)]
     pub(crate) etag: String,
 }
 
-/// Manages namespace leases on S3.
+/// Acquires, renews, and best-effort releases namespace lease objects.
 ///
-/// Each namespace has at most one active lease (`{namespace}/lease.json`).
-/// Writers and compactors acquire a lease before writing to a namespace.
-/// The lease carries a monotonically increasing fencing token that prevents
-/// zombie writers from committing stale data.
+/// Each manager represents one `holder_id` and grants leases with one configured
+/// duration. The manager talks only through [`crate::storage::ZeppelinStore`];
+/// it has no local authority and does not cache the lease object.
+///
+/// The manager coordinates writers, but stale-write prevention is completed by
+/// passing the returned token into a manifest operation that performs both the
+/// fencing check and CAS.
 pub struct LeaseManager {
+    /// Shared handle to the authoritative object-store abstraction.
     store: ZeppelinStore,
+    /// Identity this manager writes into acquired and renewed lease records.
     holder_id: String,
+    /// Amount of wall-clock time granted by each acquisition or renewal.
     lease_duration: Duration,
 }
 
-/// S3 key for a namespace's lease object.
+/// Builds the object-store key for a namespace's authoritative lease record.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace prefix already validated by the calling layer.
+///
+/// # Returns
+///
+/// An owned key ending in `lease.json`.
+///
+/// # Examples
+///
+/// Namespace `catalog` maps to `catalog/lease.json`. This is an object key, not
+/// an HTTP path segment.
 fn lease_key(namespace: &str) -> String {
     format!("{namespace}/lease.json")
 }
 
 impl LeaseManager {
-    /// Create a new lease manager for the given store and holder.
+    /// Creates a manager for one holder identity and lease duration.
+    ///
+    /// Construction performs no object-store I/O and does not acquire a lease.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Handle used for all authoritative lease GETs and PUTs.
+    /// - `holder_id`: Process or worker identity persisted in leases created by
+    ///   this manager.
+    /// - `lease_duration`: Wall-clock lifetime granted by acquisition and each
+    ///   renewal. Conversion to Chrono's duration is checked later by
+    ///   `build_lease`.
+    ///
+    /// # Returns
+    ///
+    /// A manager that is ready to acquire namespaces but holds none yet.
+    ///
+    /// # Examples
+    ///
+    /// A compactor can construct one manager for `node-a` with a 30-second
+    /// duration, then use that manager for different namespace keys.
     pub fn new(store: ZeppelinStore, holder_id: String, lease_duration: Duration) -> Self {
         Self {
             store,
@@ -50,20 +181,76 @@ impl LeaseManager {
         }
     }
 
-    /// The lease duration this manager grants and renews with.
+    /// Returns the duration granted by this manager's acquisitions and renewals.
     ///
-    /// Heartbeats (e.g. the compaction lease renewal loop) derive their
-    /// renewal interval from this so the two can never drift apart.
+    /// Heartbeats such as [`crate::compaction::background`] derive their renewal
+    /// interval from this value so scheduling remains tied to the actual grant.
+    ///
+    /// # Returns
+    ///
+    /// A copied [`Duration`]; reading it performs no I/O or allocation.
+    ///
+    /// # Examples
+    ///
+    /// A 30-second lease can be renewed every 10 seconds by choosing one third
+    /// of this returned duration.
     #[must_use]
     pub fn lease_duration(&self) -> Duration {
         self.lease_duration
     }
 
-    /// Acquire the namespace lease.
+    /// Acquires a namespace lease or takes over its expired record.
     ///
-    /// - If no lease exists: creates one with `fencing_token = 1`.
-    /// - If a lease exists but is expired: takes over with `fencing_token + 1` (CAS).
-    /// - If a lease exists and is valid: returns `LeaseHeld`.
+    /// A missing lease object is created with token `1`. An unexpired object is
+    /// rejected with [`ZeppelinError::LeaseHeld`]. An expired object is replaced
+    /// conditionally using its ETag and a token one greater than the previous
+    /// value.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace whose `<namespace>/lease.json` object should be
+    ///   acquired.
+    ///
+    /// # Returns
+    ///
+    /// The lease bytes re-read after the successful PUT, including the ETag
+    /// returned by that GET.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or JSON errors when the authoritative object cannot be
+    /// read, written, or decoded. Returns [`ZeppelinError::LeaseHeld`] when an
+    /// unexpired holder exists or when expired-lease CAS loses a takeover race.
+    /// A successful PUT followed by a failed re-read leaves the lease changed in
+    /// object storage even though this caller receives an error.
+    ///
+    /// # Side Effects
+    ///
+    /// Performs one GET first. First acquisition then performs an unconditional
+    /// PUT and a GET; takeover performs a conditional PUT and a GET. It also
+    /// emits structured acquisition diagnostics.
+    ///
+    /// # Consistency
+    ///
+    /// Expired takeover uses ETag CAS, so two contenders based on the same lease
+    /// cannot both replace it. Initial creation is not conditional and therefore
+    /// relies on Zeppelin's v1 single-writer-per-namespace operating rule. The
+    /// returned token still must be used with fenced manifest CAS; lease
+    /// acquisition by itself does not publish or protect data artifacts.
+    ///
+    /// # Performance
+    ///
+    /// Uses two sequential object-store reads and one full lease-object write on
+    /// success. Lease JSON is small, so latency is dominated by remote roundtrips.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// no lease object       -> PUT token 1 -> re-read token 1 + ETag
+    /// live token 4          -> LeaseHeld; object unchanged
+    /// expired token 4, v20  -> PUT-if-v20 token 5 -> re-read token 5 + ETag
+    /// expired token 4 race  -> loser maps the CAS conflict to LeaseHeld
+    /// ```
     #[instrument(skip(self), fields(namespace = namespace, holder = %self.holder_id))]
     pub async fn acquire(&self, namespace: &str) -> Result<Lease> {
         let key = lease_key(namespace);
@@ -124,9 +311,51 @@ impl LeaseManager {
         }
     }
 
-    /// Renew an existing lease. Token stays the same, expiry extends.
+    /// Replaces a still-owned lease record with the same token and a fresh expiry.
     ///
-    /// Returns `LeaseExpired` if the lease was taken over by another holder.
+    /// Ownership is established by comparing the authoritative holder and token
+    /// with this manager and the supplied snapshot, then using the freshly read
+    /// ETag for a conditional PUT. The wall-clock expiry itself is not rejected:
+    /// an expired record may be renewed if no takeover has changed its identity
+    /// or token.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace whose lease should be renewed.
+    /// - `lease`: Previously acquired or renewed snapshot whose fencing token
+    ///   must still match authoritative state.
+    ///
+    /// # Returns
+    ///
+    /// A re-read [`Lease`] with the same fencing token, refreshed timestamps,
+    /// and the ETag of the renewed object.
+    ///
+    /// # Errors
+    ///
+    /// A missing object, different holder, or different token becomes
+    /// [`ZeppelinError::LeaseExpired`]. JSON, storage, and conditional-write
+    /// errors propagate; a CAS race currently remains the storage layer's
+    /// [`ZeppelinError::ManifestConflict`] variant. If the conditional write
+    /// succeeds but the final GET fails, the remote expiry may already be
+    /// extended even though no renewed snapshot is returned.
+    ///
+    /// # Side Effects
+    ///
+    /// Performs a GET, one conditional PUT, and a final GET on success. Renewal
+    /// rewrites `acquired_at` as well as `expires_at` but does not increment the
+    /// fencing token.
+    ///
+    /// # Consistency
+    ///
+    /// The ETag closes the race between checking holder/token and replacing the
+    /// lease. A heartbeat must still stop correctness-sensitive work when it can
+    /// no longer prove renewal before the last confirmed expiry.
+    ///
+    /// # Examples
+    ///
+    /// Holder `node-a` renews token `7`, extending its expiry while keeping token
+    /// `7`. If `node-b` has already taken over with token `8`, renewal returns
+    /// `LeaseExpired` and must not revive `node-a`'s ownership.
     #[instrument(skip(self, lease), fields(namespace = namespace, holder = %self.holder_id))]
     pub async fn renew(&self, namespace: &str, lease: &Lease) -> Result<Lease> {
         let key = lease_key(namespace);
@@ -162,13 +391,52 @@ impl LeaseManager {
         Ok(renewed)
     }
 
-    /// Release the lease. **Best-effort** — if the lease was taken over
-    /// (expired and re-acquired by another process), this returns `Ok(())`
-    /// rather than blocking or returning a hard error.
+    /// Marks this manager's current lease as expired on a best-effort basis.
     ///
-    /// This satisfies the TLA+ constraint from Bug #9 (deadlock on release
-    /// after expiry): a process must never get stuck trying to release a
-    /// lease it no longer holds.
+    /// Release never deletes the object, because preserving its token lets the
+    /// next acquisition increment the namespace generation. A missing object or
+    /// a record owned by another holder is already released from this caller's
+    /// perspective. Storage failures while reading or writing are warned and
+    /// suppressed so cleanup cannot deadlock a worker that has lost its lease.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace whose lease cleanup is being attempted.
+    /// - `lease`: Snapshot identifying the holder and fencing token this caller
+    ///   intends to release.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after marking the matching record expired, or after deciding
+    /// cleanup is unnecessary or failed best-effort.
+    ///
+    /// # Errors
+    ///
+    /// Lease GET/PUT failures and missing objects are swallowed, but malformed
+    /// lease JSON still returns a serialization error because the current record
+    /// cannot be safely interpreted.
+    ///
+    /// # Side Effects
+    ///
+    /// Performs one GET. When holder and token still match, performs one
+    /// unconditional PUT with an expiry one second in the past. Failures are
+    /// logged as warnings rather than promoted to the caller.
+    ///
+    /// # Consistency
+    ///
+    /// Holder/token comparison prevents an already-observed takeover from being
+    /// released by the old holder. The subsequent expiry write is intentionally
+    /// cleanup, not the write-safety boundary; correctness comes from fencing
+    /// and manifest CAS even if release loses a race or fails. This operation is
+    /// why an expired process can always move on instead of waiting for a lease
+    /// it no longer owns.
+    ///
+    /// # Examples
+    ///
+    /// If holder A still owns token `3`, release leaves token `3` in place but
+    /// expires it so the next acquisition receives token `4`. If holder B has
+    /// already taken over with token `4`, A returns `Ok(())` without modifying
+    /// B's observed record.
     #[instrument(skip(self, lease), fields(namespace = namespace, holder = %self.holder_id))]
     pub async fn release(&self, namespace: &str, lease: &Lease) -> Result<()> {
         let key = lease_key(namespace);
@@ -212,12 +480,65 @@ impl LeaseManager {
         }
     }
 
-    /// Check if a lease is still valid (not expired by wall clock, held by us).
+    /// Checks whether a lease snapshot names this manager and is unexpired locally.
+    ///
+    /// This is a cheap local preflight only. It performs no object-store read and
+    /// cannot discover a takeover that happened after the snapshot was returned.
+    ///
+    /// # Parameters
+    ///
+    /// - `lease`: Snapshot to compare with this manager's holder identity and the
+    ///   current process wall clock.
+    ///
+    /// # Returns
+    ///
+    /// `true` only when `expires_at` is in the future and `holder_id` matches;
+    /// otherwise `false`.
+    ///
+    /// # Consistency
+    ///
+    /// Never use this result instead of renewal or fenced manifest CAS. It says
+    /// nothing about the current authoritative lease object.
+    ///
+    /// # Examples
+    ///
+    /// A snapshot for `node-a` that expires in five seconds validates for
+    /// `node-a`. The same snapshot fails for `node-b`, and it fails for both
+    /// after its wall-clock expiry.
     pub fn validate(&self, lease: &Lease) -> bool {
         lease.expires_at > Utc::now() && lease.holder_id == self.holder_id
     }
 
-    /// Build a new Lease with the given token and current timestamps.
+    /// Builds an unpersisted lease record with current wall-clock timestamps.
+    ///
+    /// # Parameters
+    ///
+    /// - `fencing_token`: Generation to place in the new record. The caller is
+    ///   responsible for choosing `1`, preserving a renewal token, or
+    ///   incrementing an expired record.
+    ///
+    /// # Returns
+    ///
+    /// An owned lease with this manager's holder identity, an empty process-local
+    /// ETag, and expiry `lease_duration` after construction time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `lease_duration` cannot be represented by Chrono. This is a
+    /// configuration/programming error rather than a recoverable lease state.
+    ///
+    /// # Examples
+    ///
+    /// Building token `9` for a 30-second manager produces a record for this
+    /// holder whose expiry is approximately 30 seconds after `acquired_at`.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The holder string is cloned because the returned [`Lease`] owns its
+    /// serialized identity independently of the manager. Unlike copying a Java
+    /// reference or a C pointer, cloning a Rust [`String`] allocates and copies
+    /// its UTF-8 bytes. The `expect` is an explicit invariant assertion after a
+    /// checked standard-to-Chrono duration conversion.
     fn build_lease(&self, fencing_token: u64) -> Lease {
         let now = Utc::now();
         #[allow(clippy::expect_used)]
