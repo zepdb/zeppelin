@@ -1,6 +1,206 @@
-/// Background compaction task management.
+//! WAL-to-segment compaction and authoritative manifest publication.
+//!
+//! This module turns the immutable WAL fragments referenced by a namespace's
+//! live [`Manifest`][crate::wal::manifest::Manifest] into immutable vector,
+//! attribute, bitmap, quantization, sketch, membership, and optional full-text
+//! index artifacts. The object-store manifest remains the visibility boundary:
+//! uploading those artifacts does not make them queryable. Only a successful
+//! ETag compare-and-swap (CAS) that installs their
+//! [`SegmentRef`][crate::wal::manifest::SegmentRef] does.
+//!
+//! [`Compactor`][crate::compaction::Compactor] is the domain coordinator.
+//! Production normally enters it through
+//! [`background::compact_namespace_under_lease`][crate::compaction::background::compact_namespace_under_lease], which acquires and
+//! renews a per-namespace lease, supplies its fencing token, and runs on the
+//! dedicated compaction runtime. Direct entry points remain useful to tests and
+//! administrative tools. This file calls the WAL reader, IVF-Flat or
+//! hierarchical builders, full-text builders, the storage abstraction, and the
+//! manifest API; it does not serve queries or physically delete retired
+//! objects. [`gc`][crate::compaction::gc] owns that later reclamation step.
+//!
+//! ## WAL-to-segment lifecycle
+//!
+//! ```text
+//! authoritative Manifest snapshot
+//!        | exact uncompacted FragmentRef set
+//!        v
+//! read immutable WAL objects -> merge add/update/delete by manifest order
+//!        |
+//!        +--------------------+--------------------------+
+//!        |                    |                          |
+//!        v                    v                          v
+//! full retrain        reuse centroids, read all   bounded membership path
+//! all clusters new    survivors, rewrite touched  read touched clusters only
+//!        |                    |                          |
+//!        +--------------------+--------------------------+
+//!                             |
+//!                             v
+//! upload immutable segment/index artifacts
+//!      (objects exist, but are not yet visible)
+//!                             |
+//!                 optional fenced staging root for GC
+//!                             |
+//!                             v
+//! re-read Manifest + ETag -> fencing/lease checks -> conditional PUT
+//!                             |                         |
+//!                          success                  CAS miss
+//!                             |                         |
+//!                             v                         v
+//!                  new segment is visible       reload and retry only
+//!                  old keys are deferred        manifest publication
+//! ```
+//!
+//! The expensive WAL merge and index build happen once. A CAS conflict retries
+//! only the small manifest mutation, preserving fragments that arrived after
+//! the original snapshot. If publication ultimately fails, newly uploaded
+//! objects can remain unreferenced; fenced production compactions also publish
+//! a staging side object so storage GC does not race an upload still in flight.
+//!
+//! ## Incremental ownership and deletion safety
+//!
+//! ```text
+//! old logical segment S1
+//!   cluster 0 -> object under S1       touched by WAL
+//!   cluster 1 -> object under S0       unchanged carry-over
+//!                     |
+//!                     v
+//! new logical segment S2
+//!   cluster 0 owner = S2 -> new immutable object
+//!   cluster 1 owner = S0 -> same immutable object
+//!                     |
+//!                     v
+//! defer old S1 objects EXCEPT every key still referenced by S2
+//! ```
+//!
+//! A logical segment can therefore reference physical cluster data beneath an
+//! older segment prefix. Prefix age is never proof that an object is dead.
+//! `cluster_owners`, explicit grouped-object references, retained manifest
+//! history, and active staging roots all participate in reachability. The
+//! corresponding formal-model work is described in
+//! `tasks/FormalVerification/04-tla-incremental-artifact-closure.md`; staging
+//! and two-pass GC safety are described in
+//! `tasks/FormalVerification/02-tla-storage-gc-safety.md`.
+//!
+//! ## Formal models
+//!
+//! - [CompactionSafety](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/CompactionSafety.tla)
+//!   demonstrates why a stale unconditional manifest write loses a concurrent
+//!   WAL append and motivates the CAS loop.
+//! - [CompactionRetryConvergence](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/CompactionRetryConvergence.tla)
+//!   separates retry exhaustion as a liveness failure from data-loss safety.
+//! - [MultiWriterLease](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/MultiWriterLease.tla)
+//!   models lease acquisition, fencing, CAS, expiry, and stale-writer rejection.
+//! - [IndexAtomicity](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/IndexAtomicity.tla)
+//!   models upload-all-before-manifest publication.
+//! - [IncrementalArtifactClosure](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/IncrementalArtifactClosure.tla)
+//!   models carried cluster ownership and exact-key GC reachability.
+//! - [TwoPassGcSafety](https://github.com/Ghatage/zeppelin/blob/main/formal-verifications/tla/TwoPassGcSafety.tla)
+//!   models live/history/staging roots and fresh reachability at sweep time.
+//!
+//! ## CPU, I/O, and async ownership
+//!
+//! ```text
+//! caller owns Arc<Compactor>
+//!          |
+//!          | compact(&self): temporary shared borrow
+//!          v
+//! async future owns per-run Manifest, maps, vectors, and artifact Bytes
+//!          |
+//!          +-- async GET futures borrow &ZeppelinStore
+//!          |      `-- join_all overlaps network waits; no detached task
+//!          |
+//!          +-- index CPU runs on dedicated compaction runtime
+//!          |
+//!          +-- FTS CPU moves owned attrs/config into spawn_blocking tasks
+//!          |      `-- JoinHandle returns owned serialized indexes
+//!          |
+//!          `-- PUT futures borrow store and share cloned Bytes buffers
+//!                 |
+//!                 v
+//!       all borrows end when the compaction future completes
+//! ```
+//!
+//! The index build and serialization phases are CPU work; object GETs, PUTs,
+//! LISTs, staging, and manifest publication are I/O phases. Full-text building
+//! explicitly crosses from async into blocking workers. The other heavy index
+//! work stays isolated from query-serving threads because
+//! [`background`][crate::compaction::background] owns a dedicated Tokio runtime.
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`CompactionResult`][crate::compaction::CompactionResult] and
+//!    [`Compactor`][crate::compaction::Compactor] for the caller-facing API and
+//!    retained dependencies.
+//! 2. Read
+//!    [`Compactor::should_compact`][crate::compaction::Compactor::should_compact]
+//!    for count, age, byte, and index-layout trigger decisions.
+//! 3. Read
+//!    [`Compactor::compact_with_fts_signaled`][crate::compaction::Compactor::compact_with_fts_signaled]
+//!    for the complete snapshot, build, staging, fencing, CAS, and
+//!    deferred-deletion transaction.
+//! 4. Follow `incremental_build_bounded`, `incremental_build`, and
+//!    `write_incremental_segment` for the two centroid-reuse paths.
+//! 5. Finish with `load_touched_segment_vectors`, `load_segment_vectors`, and
+//!    `incremental_cluster_objects` to understand physical object ownership.
+//! 6. Continue into [`background`][crate::compaction::background] for lease
+//!    renewal, CPU isolation, cache warming, and periodic scheduling, then
+//!    [`gc`][crate::compaction::gc] for physical reclamation.
+//!
+//! ## Invariants
+//!
+//! - S3 or MinIO is authoritative. Memory holds a candidate snapshot only.
+//! - WAL fragments and segment artifacts are immutable; compaction creates new
+//!   objects and never edits the old objects in place.
+//! - The manifest CAS is the visibility commit. A stale ETag never overwrites a
+//!   newer fragment or segment inventory.
+//! - Lease fencing and CAS are separate defenses. The heartbeat abort flag
+//!   closes most of the interval between a fencing check and publication.
+//! - Production permits one lease-owning compactor per namespace. CAS retry
+//!   rebases the manifest edit over WAL appends; it does not rebuild a candidate
+//!   over a segment independently published by a competing compactor.
+//! - Fragment removal uses the exact IDs read by this run, never a ULID
+//!   watermark that could swallow a concurrent same-millisecond fragment.
+//! - Every carried cluster object and global sidecar remains reachable from the
+//!   new manifest; deletion favors leaks over deleting possibly live data.
+//! - Quantization calibration or codebooks are reused with carried codes.
+//!   Recalibrating only part of a segment would silently corrupt distances.
+//! - Missing or corrupt required artifacts fail the cycle or trigger an
+//!   explicitly metered correctness-preserving full rebuild; they are never
+//!   replaced with empty data.
+//!
+//! ## Rust concepts used here
+//!
+//! The coordinator borrows shared clients as `&self` across async operations,
+//! while owned manifests, vectors, and descriptors make each candidate build
+//! independent. In Java, this resembles a service with immutable request-local
+//! state; in C it would require an explicit ownership and cleanup convention.
+//! Rust prevents a borrowed value from outliving its owner and makes moved
+//! artifact descriptions unavailable at the old binding.
+//!
+//! [`bytes::Bytes`] clones share immutable buffers by reference count, so the
+//! parallel PUT phase does not deep-copy every payload. Iterator futures are
+//! collected with [`futures::future::join_all`] to overlap object-store I/O;
+//! CPU-heavy full-text construction is moved to [`tokio::task::spawn_blocking`]
+//! so it does not block an async worker. The production scheduler additionally
+//! places compaction on a dedicated Tokio runtime.
+//!
+//! Optional lease-loss state is shared as
+//! [`Arc<AtomicBool>`][std::sync::Arc] rather than a nullable raw pointer or a
+//! mutable global. Java would commonly use an `AtomicBoolean`; C would require
+//! explicit shared lifetime and atomic-ordering discipline. Rust's `Arc` keeps
+//! the flag alive until both heartbeat and compactor release it.
+
+/// Runs lease-protected background compaction and cache warming.
+///
+/// See
+/// [`background::compact_namespace_under_lease`]
+/// for the production entry point that supplies the fencing token and
+/// lease-loss signal used here.
 pub mod background;
-/// Exact-key reachability for future storage GC.
+/// Computes exact-key reachability and reclaims artifacts after a safety horizon.
+///
+/// Compaction records retired keys in the manifest; this module deliberately
+/// leaves the physical DELETE operations to [`gc`][crate::compaction::gc].
 pub mod gc;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -31,15 +231,57 @@ use crate::wal::manifest::{
 };
 use crate::wal::WalReader;
 
-/// Maximum CAS retry attempts for manifest updates.
+/// Maximum number of fresh-read/CAS publication attempts in one compaction.
+///
+/// Index artifacts are built once before this loop. Exhausting the attempts
+/// returns [`ZeppelinError::ManifestConflict`] and leaves the uploaded objects
+/// unreferenced rather than overwriting a newer manifest.
 const MAX_CAS_RETRIES: u32 = 10;
+/// Metrics label for bytes read from vector cluster objects.
 const COMPACTION_READ_CLASS_CLUSTER: &str = "cluster";
+/// Metrics label for bytes read from per-vector attribute sidecars.
 const COMPACTION_READ_CLASS_ATTRS: &str = "attrs";
+/// Metrics label for bytes read from the segment-global centroid artifact.
 const COMPACTION_READ_CLASS_CENTROIDS: &str = "centroids";
+/// Metrics label for scalar or product quantization calibration data.
 const COMPACTION_READ_CLASS_SQ: &str = "sq";
+/// Metrics label for bytes read from the resident coarse-search sketch.
 const COMPACTION_READ_CLASS_SKETCH: &str = "sketch";
+/// Metrics label for bytes read from the vector-to-cluster membership map.
 const COMPACTION_READ_CLASS_MEMBERSHIP: &str = "membership";
 
+/// Fetches one compaction artifact and attributes the operation and bytes read.
+///
+/// # Parameters
+///
+/// - `store`: Borrowed object-store boundary used for the GET.
+/// - `namespace`: Namespace label used for metrics; it does not alter `key`.
+/// - `key`: Complete immutable object key to fetch.
+/// - `class`: Stable low-cardinality artifact class used as a metric label.
+///
+/// # Returns
+///
+/// Shared immutable bytes containing the complete object.
+///
+/// # Errors
+///
+/// Propagates missing-object and storage failures. The operation counter has
+/// already advanced, but the byte counter advances only after a successful GET.
+///
+/// # Side Effects
+///
+/// Performs one object-store GET and updates compaction read metrics.
+///
+/// # Performance
+///
+/// Allocates no second payload copy beyond the store implementation's returned
+/// [`bytes::Bytes`]. Callers often run several of these futures concurrently.
+///
+/// # Examples
+///
+/// Loading a 4 KiB membership artifact increments the `membership` operation
+/// counter once and its byte counter by 4 KiB. A missing object increments only
+/// the attempted-operation counter and fails the compaction.
 async fn get_compaction_read(
     store: &ZeppelinStore,
     namespace: &str,
@@ -56,6 +298,27 @@ async fn get_compaction_read(
     Ok(data)
 }
 
+/// Resolves the manifest's active segment ID to its borrowed descriptor.
+///
+/// # Parameters
+///
+/// - `manifest`: Candidate or authoritative manifest view to inspect.
+///
+/// # Returns
+///
+/// The matching [`SegmentRef`] when both the active ID and its descriptor are
+/// present; `None` for a new manifest or internally inconsistent reference.
+///
+/// # Examples
+///
+/// A manifest whose `active_segment` is `seg_2` and whose segment list contains
+/// `seg_2` yields that descriptor without cloning it.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The returned reference borrows storage inside `manifest`. It resembles a
+/// Java object reference or C `const SegmentRef *`, but it is non-null in the
+/// `Some` branch and cannot outlive the manifest borrow.
 fn active_segment_ref(manifest: &Manifest) -> Option<&SegmentRef> {
     let active_segment = manifest.active_segment.as_ref()?;
     manifest
@@ -64,11 +327,47 @@ fn active_segment_ref(manifest: &Manifest) -> Option<&SegmentRef> {
         .find(|segment| segment.id == *active_segment)
 }
 
+/// Reports whether the active segment's physical layout differs from config.
+///
+/// # Parameters
+///
+/// - `manifest`: Manifest whose active segment is the current compacted view.
+/// - `config`: Effective namespace indexing configuration desired now.
+///
+/// # Returns
+///
+/// `true` only when an active descriptor exists and
+/// `segment_matches_index_config` rejects it. A namespace with no active segment
+/// has nothing to rewrite and returns `false`.
+///
+/// # Examples
+///
+/// Switching an existing flat segment to hierarchical indexing returns `true`
+/// even with no pending WAL fragments, allowing compaction to rebuild layout.
 fn manifest_needs_index_rewrite(manifest: &Manifest, config: &IndexingConfig) -> bool {
     active_segment_ref(manifest)
         .is_some_and(|segment| !segment_matches_index_config(segment, config))
 }
 
+/// Compares manifest-visible layout choices with the effective index config.
+///
+/// # Parameters
+///
+/// - `segment`: Active immutable segment descriptor.
+/// - `config`: Desired quantization, hierarchy, and centroid-count settings.
+///
+/// # Returns
+///
+/// `false` when quantization or hierarchy differ. Hierarchical layouts otherwise
+/// match without comparing leaf count. Flat layouts also require the cluster
+/// count to equal `min(default_num_centroids, vector_count)`.
+///
+/// # Examples
+///
+/// A ten-vector flat segment with ten clusters matches a configured 64-centroid
+/// target because a build cannot create more non-empty training clusters than
+/// vectors. The same descriptor does not match if scalar quantization is newly
+/// enabled.
 fn segment_matches_index_config(segment: &SegmentRef, config: &IndexingConfig) -> bool {
     if segment.quantization != config.quantization || segment.hierarchical != config.hierarchical {
         return false;
@@ -80,25 +379,53 @@ fn segment_matches_index_config(segment: &SegmentRef, config: &IndexingConfig) -
     segment.cluster_count == expected_clusters
 }
 
-/// Result of a compaction run.
+/// Caller-visible outcome of one complete compaction attempt.
+///
+/// This value describes the manifest change that successfully became visible.
+/// It does not claim that deferred old objects have already been deleted.
+///
+/// # Examples
+///
+/// Replacing `seg_old` with a 50,000-vector segment built from four fragments
+/// reports the new ID, `vectors_compacted = 50_000`,
+/// `fragments_removed = 4`, and `old_segment_removed = Some("seg_old")`.
+/// A namespace with no work returns all counts at zero and no segment IDs.
 #[derive(Debug)]
 pub struct CompactionResult {
-    /// ID of the new segment, or None if no-op.
+    /// ID of the newly published segment, or `None` for a no-op or all-deleted run.
     pub segment_id: Option<String>,
-    /// Number of vectors in the compacted segment.
+    /// Number of surviving vectors represented by the published segment.
+    ///
+    /// This is zero when all visible data was deleted or no work was needed.
     pub vectors_compacted: usize,
-    /// Number of WAL fragments that were removed.
+    /// Number of exact snapshot WAL fragment descriptors removed by the CAS.
     pub fragments_removed: usize,
-    /// ID of the old segment that was replaced, if any.
+    /// ID of the previously active segment removed from the live view, if any.
+    ///
+    /// Its physical objects may remain until deferred deletion and exact-key GC
+    /// prove them unreachable.
     pub old_segment_removed: Option<String>,
 }
 
-/// Compacts WAL fragments into IVF-Flat segments on S3.
+/// Coordinates immutable WAL compaction, index construction, and manifest CAS.
+///
+/// A compactor owns cheap-to-clone storage and WAL clients plus process-wide
+/// defaults. Per-namespace metadata can override indexing choices at run time.
+/// The type contains no authoritative namespace state between calls; every run
+/// starts by reading S3 or MinIO.
 pub struct Compactor {
+    /// Object-store abstraction used for all metadata and artifact I/O.
     store: ZeppelinStore,
+    /// Reader that decodes the exact manifest-referenced WAL snapshot.
     wal_reader: WalReader,
+    /// Trigger, retry-adjacent, and retention limits for compaction.
     config: CompactionConfig,
+    /// Process defaults overlaid by namespace-specific indexing metadata.
     indexing_config: IndexingConfig,
+    /// Maximum artifact-upload age allowed before publication.
+    ///
+    /// This is derived from GC configuration so in-flight objects cannot age
+    /// past the horizon that staging is intended to protect.
     upload_window: Duration,
     /// Test-only hook: artificial delay injected after index build and
     /// before the final manifest CAS loop, simulating a compaction whose
@@ -107,28 +434,91 @@ pub struct Compactor {
     test_pre_cas_delay: Option<Duration>,
 }
 
+/// Segment-global training state reused by an incremental IVF-Flat build.
+///
+/// Calibration bytes are retained as well as their decoded form because the
+/// new segment must publish byte-compatible global metadata while encoding
+/// rewritten clusters against the same numeric scale as carried clusters.
 struct IncrementalCentroidState {
+    /// Borrow-independent owned centroid vectors, one per logical cluster.
     centroids: Vec<Vec<f32>>,
+    /// Vector dimensionality encoded with the centroid artifact.
     dim: usize,
+    /// Original scalar-quantization calibration bytes, when SQ is active.
     sq_calibration_bytes: Option<bytes::Bytes>,
+    /// Decoded calibration used to encode rewritten cluster vectors.
     sq_calibration: Option<crate::index::quantization::sq::SqCalibration>,
 }
 
+/// Per-cluster rows and rewrite decisions for an incremental segment.
+///
+/// All four vectors have one entry per logical cluster. Untouched bounded-path
+/// clusters can carry IDs only: their vectors and attributes remain in the old
+/// immutable objects and are represented by placeholders here for cardinality.
 struct IncrementalClusterState {
+    /// Ordered vector IDs to record in the new membership artifact.
     cluster_ids: Vec<Vec<String>>,
+    /// Full values for rewritten clusters, or empty placeholders when carried.
     cluster_vecs: Vec<Vec<Vec<f32>>>,
+    /// Attribute rows aligned with `cluster_ids` for rewritten clusters.
     cluster_attrs: Vec<Vec<Option<HashMap<String, crate::types::AttributeValue>>>>,
+    /// Per-cluster flag selecting rewrite (`true`) or immutable carry-over.
     touched: Vec<bool>,
 }
 
 impl IncrementalClusterState {
+    /// Counts membership rows across all rewritten and carried clusters.
+    ///
+    /// # Returns
+    ///
+    /// Total logical vector count for the candidate segment.
+    ///
+    /// # Performance
+    ///
+    /// Runs in `O(number of clusters)` and does not inspect or clone vector data.
+    ///
+    /// # Examples
+    ///
+    /// Cluster ID lists of lengths 4, 0, and 7 report 11 even when the seven
+    /// rows belong to a carried cluster whose values are not resident.
     fn vector_count(&self) -> usize {
         self.cluster_ids.iter().map(Vec::len).sum()
     }
 }
 
 impl Compactor {
-    /// Create a new compactor with the given store and configuration.
+    /// Creates a stateless compaction coordinator from shared infrastructure.
+    ///
+    /// # Parameters
+    ///
+    /// - `store`: Cloneable object-store boundary for authoritative metadata and
+    ///   immutable artifact I/O.
+    /// - `wal_reader`: Reader configured for the same store and namespace key
+    ///   conventions.
+    /// - `config`: Compaction trigger and manifest-retention limits.
+    /// - `indexing_config`: Process-wide indexing defaults; namespace metadata
+    ///   may override supported fields for each run.
+    /// - `upload_window`: Maximum interval from segment-ID allocation to final
+    ///   publication, normally derived from the GC safety configuration.
+    ///
+    /// # Returns
+    ///
+    /// An owned compactor with no namespace state loaded and no background task
+    /// started. The production scheduler wraps it in [`std::sync::Arc`].
+    ///
+    /// # Examples
+    ///
+    /// Startup constructs one compactor and shares it with the HTTP state and
+    /// background loop. Each later `compact` call still reloads the namespace's
+    /// manifest rather than trusting state retained in this value.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// Parameters are moved into `Self`; callers cannot use non-`Copy` inputs
+    /// afterward unless they cloned them first. This resembles constructor
+    /// ownership in Java, but Java leaves aliases usable. In C, the equivalent
+    /// ownership transfer is only a convention; Rust enforces it at compile
+    /// time.
     pub fn new(
         store: ZeppelinStore,
         wal_reader: WalReader,
@@ -146,30 +536,119 @@ impl Compactor {
         }
     }
 
-    /// Test hook: inject an artificial delay between the index-build phase
-    /// and the final manifest CAS, so tests can hold a compaction in flight
-    /// longer than the lease duration. Not for production use.
+    /// Injects a test-only delay between artifact construction and manifest CAS.
+    ///
+    /// # Parameters
+    ///
+    /// - `delay`: Time to sleep before the publication loop. Tests choose a
+    ///   duration longer than the lease to exercise renewal and takeover paths.
+    ///
+    /// # Side Effects
+    ///
+    /// Mutates only this compactor's test hook. Production construction always
+    /// leaves it disabled.
+    ///
+    /// # Examples
+    ///
+    /// A test with a two-second lease can inject five seconds, observe heartbeat
+    /// renewal during the pause, and then verify that the same fencing token
+    /// publishes safely.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// Requiring `&mut self` gives the caller exclusive access for the update.
+    /// The compiler rejects concurrent use through ordinary references without
+    /// an explicit synchronization wrapper.
     #[doc(hidden)]
     pub fn set_test_pre_cas_delay(&mut self, delay: Duration) {
         self.test_pre_cas_delay = Some(delay);
     }
 
-    /// Return a reference to the compaction configuration.
+    /// Borrows the trigger and retention configuration used by this compactor.
+    ///
+    /// # Returns
+    ///
+    /// A read-only reference tied to the lifetime of `self`; no configuration
+    /// is cloned or reloaded from object storage.
+    ///
+    /// # Examples
+    ///
+    /// The background loop reads `interval_secs` through this accessor to
+    /// schedule its next namespace scan.
     pub fn config(&self) -> &CompactionConfig {
         &self.config
     }
 
-    /// Return the GC-owned compaction upload window.
+    /// Returns the GC-owned maximum duration of an unpublished artifact upload.
+    ///
+    /// # Returns
+    ///
+    /// A copied [`Duration`] used by the final publication guard.
+    ///
+    /// # Examples
+    ///
+    /// If GC supplies 42 seconds, a build whose upload phase exceeds 42 seconds
+    /// aborts before CAS instead of publishing after its protection window.
     #[must_use]
     pub fn compaction_upload_window(&self) -> Duration {
         self.upload_window
     }
 
-    /// Return a reference to the underlying store.
+    /// Borrows the object-store client used by compaction.
+    ///
+    /// # Returns
+    ///
+    /// A shared reference to [`ZeppelinStore`], primarily for orchestration and
+    /// tests. The caller does not receive a manifest snapshot or cache.
+    ///
+    /// # Examples
+    ///
+    /// A test can inspect immutable artifacts through this store after a
+    /// successful compaction without transferring ownership out of the
+    /// compactor.
     pub fn store(&self) -> &ZeppelinStore {
         &self.store
     }
 
+    /// Resolves process defaults with the namespace's current indexing overlay.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace whose metadata object should be read.
+    ///
+    /// # Returns
+    ///
+    /// An owned, validated [`IndexingConfig`]. If metadata has no index overlay,
+    /// or the metadata object is absent, the process defaults are cloned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZeppelinError::NamespaceDeleting`] when metadata marks the
+    /// namespace as deleting. Storage, decoding, and per-dimension validation
+    /// failures also propagate; no malformed overlay is silently ignored.
+    ///
+    /// # Consistency
+    ///
+    /// Namespace metadata controls the desired layout, while the manifest
+    /// controls which already-built layout is visible. This read occurs near the
+    /// beginning of each run so a config transition can request a rewrite.
+    ///
+    /// # Performance
+    ///
+    /// Performs one complete metadata-object GET and clones a small config.
+    ///
+    /// # Examples
+    ///
+    /// If process defaults request unquantized flat IVF but namespace metadata
+    /// enables scalar quantization, the returned config requests SQ and
+    /// `should_compact` can trigger a segment rewrite even without new WAL.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// Exhaustive `match` distinguishes a deliberately handled `NotFound` from
+    /// every other error. The `?` operator returns unexpected failures without
+    /// converting them into defaults, similar to checked-exception propagation
+    /// in Java or an immediate error-code branch in C.
     async fn effective_indexing_config(&self, namespace: &str) -> Result<IndexingConfig> {
         let key = NamespaceMetadata::s3_key(namespace);
         match self.store.get(&key).await {
@@ -191,7 +670,7 @@ impl Compactor {
         }
     }
 
-    /// Check whether compaction should be triggered for a namespace.
+    /// Determines whether a namespace currently meets any compaction trigger.
     ///
     /// Four independent triggers:
     /// - **count**: uncompacted fragments >= `max_wal_fragments_before_compact`
@@ -205,6 +684,48 @@ impl Compactor {
     ///
     /// A namespace with zero uncompacted fragments only triggers when an
     /// active-segment rewrite is needed for a staged index config change.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace whose live manifest and, when necessary,
+    ///   indexing metadata should be inspected.
+    ///
+    /// # Returns
+    ///
+    /// `true` when any threshold is met or the active layout must be rewritten;
+    /// otherwise `false`. The method does not start compaction.
+    ///
+    /// # Errors
+    ///
+    /// Propagates manifest read/decoding errors, metadata/config errors, and a
+    /// system-clock error if wall time is before the Unix epoch.
+    ///
+    /// # Consistency
+    ///
+    /// The decision uses the current object-store manifest. It is advisory: a
+    /// later compaction reads its own fresh snapshot and remains correct if the
+    /// manifest changes between check and execution.
+    ///
+    /// # Performance
+    ///
+    /// Performs one manifest GET. Idle namespaces require one additional
+    /// metadata GET only to check for an index-layout rewrite. Threshold checks
+    /// otherwise scan the in-memory fragment descriptors in linear time without
+    /// reading WAL payloads.
+    ///
+    /// # Examples
+    ///
+    /// Three small fresh fragments trigger when the count threshold is three.
+    /// One hour-old fragment can trigger by age even below count and byte
+    /// limits. An empty namespace remains idle unless its active segment no
+    /// longer matches the effective quantization or hierarchy configuration.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// `manifest.uncompacted_fragments()` returns a borrowed slice; the method
+    /// can aggregate its descriptors without copying them. Iterator chains are
+    /// statically specialized like hand-written C loops, rather than allocating
+    /// Java stream objects for each element.
     #[instrument(skip(self), fields(namespace = namespace))]
     pub async fn should_compact(&self, namespace: &str) -> Result<bool> {
         let manifest = Manifest::read(&self.store, namespace)
@@ -265,24 +786,87 @@ impl Compactor {
         Ok(false)
     }
 
-    /// Compact all uncompacted WAL fragments into a new IVF-Flat segment.
+    /// Compacts all currently visible WAL fragments without lease fencing.
     ///
-    /// Uses CAS (compare-and-swap) for manifest updates to prevent concurrent overwrites.
-    /// Fragment deletion is deferred: keys are added to `pending_deletes` in
-    /// the manifest and reclaimed by storage GC after the configured horizon.
+    /// Uses CAS (compare-and-swap) for manifest updates to prevent concurrent
+    /// overwrites. Fragment deletion is deferred: keys are added to
+    /// `pending_deletes` in the manifest and reclaimed by storage GC after the
+    /// configured horizon. Production background work normally uses the leased
+    /// entry point instead.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace whose manifest-visible WAL should be compacted.
+    ///
+    /// # Returns
+    ///
+    /// A [`CompactionResult`] describing the committed change, including a
+    /// no-op result when no fragments or layout rewrite are pending.
+    ///
+    /// # Errors
+    ///
+    /// Propagates every read, decode, build, upload, and publication failure.
+    /// Uploaded artifacts can remain invisible if a later step fails.
+    ///
+    /// # Side Effects
+    ///
+    /// May read WAL and segment objects, upload new immutable artifacts, and
+    /// conditionally replace the live manifest. It never deletes retired
+    /// artifacts synchronously.
+    ///
+    /// # Consistency
+    ///
+    /// ETag CAS preserves concurrent manifest changes, but this wrapper supplies
+    /// no lease fencing token. Use
+    /// [`background::compact_namespace_under_lease`] for production multi-node
+    /// coordination.
+    ///
+    /// # Examples
+    ///
+    /// A deterministic test may append two fragments, call `compact`, and find
+    /// one active segment plus both fragment keys in `pending_deletes`. Query
+    /// readers discover the segment only after the conditional manifest PUT.
     #[instrument(skip(self), fields(namespace = namespace))]
     pub async fn compact(&self, namespace: &str) -> Result<CompactionResult> {
         self.compact_with_lease(namespace, None).await
     }
 
-    /// Compact with an optional fencing token from a lease.
+    /// Compacts with an optional lease fencing token and no FTS fields.
     ///
     /// When `fencing_token` is `Some(token)`:
     /// - **Layer 1 (CheckFencing)**: Before each CAS write, checks
     ///   `manifest.fencing_token <= token`. If false → `FencingTokenStale`.
     /// - **Layer 2 (CAS)**: If the ETag changed, retries with re-check.
     ///
-    /// When `fencing_token` is `None`: behaves identically to `compact()`.
+    /// When `fencing_token` is `None`: behaves identically to [`Self::compact`].
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace to compact.
+    /// - `fencing_token`: Token from the currently acquired namespace lease, or
+    ///   `None` only for an explicitly unfenced caller.
+    ///
+    /// # Returns
+    ///
+    /// The committed [`CompactionResult`].
+    ///
+    /// # Errors
+    ///
+    /// In addition to normal compaction failures, returns
+    /// [`ZeppelinError::FencingTokenStale`] if a fresh manifest contains a newer
+    /// token. Because this wrapper has no heartbeat signal, it cannot detect a
+    /// lost lease until another writer publishes the newer token.
+    ///
+    /// # Consistency
+    ///
+    /// Fencing rejects a known-old lease holder; CAS rejects an old manifest
+    /// base. Both checks run on every publication retry.
+    ///
+    /// # Examples
+    ///
+    /// A holder with token 8 may publish over a manifest token 8. If a takeover
+    /// already published token 9, token 8 fails rather than making its segment
+    /// visible.
     #[instrument(skip(self), fields(namespace = namespace))]
     pub async fn compact_with_lease(
         &self,
@@ -293,7 +877,40 @@ impl Compactor {
             .await
     }
 
-    /// Compact with optional fencing token and FTS field configurations.
+    /// Compacts with optional fencing and caller-supplied FTS field definitions.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace to compact.
+    /// - `fencing_token`: Current lease token, or `None` for unfenced use.
+    /// - `fts_configs`: Fields and tokenization settings for new inverted
+    ///   indexes. An empty map omits FTS construction.
+    ///
+    /// # Returns
+    ///
+    /// The committed [`CompactionResult`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates WAL, index, FTS, storage, fencing, and CAS errors. A failure
+    /// after some PUTs can leave invisible immutable objects for GC.
+    ///
+    /// # Side Effects
+    ///
+    /// May upload per-cluster and global full-text indexes in addition to the
+    /// vector segment.
+    ///
+    /// # Performance
+    ///
+    /// Non-empty FTS configuration requires every cluster's attributes, so the
+    /// membership-bounded read path is disabled. Centroids may still be reused,
+    /// but all clusters are rewritten before FTS indexing.
+    ///
+    /// # Examples
+    ///
+    /// Configuring a `title` text field creates per-cluster inverted indexes and
+    /// one global index, then records `title` and `has_global_fts` in the new
+    /// segment descriptor.
     #[instrument(skip(self, fts_configs), fields(namespace = namespace))]
     pub async fn compact_with_fts(
         &self,
@@ -305,7 +922,7 @@ impl Compactor {
             .await
     }
 
-    /// Compact with an optional `lease_lost` abort signal.
+    /// Executes the complete compaction transaction with an optional abort signal.
     ///
     /// `lease_lost` is set by the lease-renewal heartbeat
     /// (`background::LeaseHeartbeat`) when a mid-compaction renewal fails —
@@ -315,6 +932,109 @@ impl Compactor {
     /// this closes the TOCTOU window between the fencing check and the CAS
     /// down to one heartbeat interval; the fencing+CAS layers remain the
     /// backstop for the residual race).
+    ///
+    /// ```text
+    /// initial Manifest M7
+    ///       |
+    ///       | snapshot fragment IDs {A, C}
+    ///       v
+    /// build/upload candidate segment S8 once
+    ///       |
+    ///       v
+    /// CAS attempt: read M8 + ETag E8
+    ///       |
+    ///       +-- lease_lost=true --------------------> LeaseExpired
+    ///       +-- manifest token > our token ---------> FencingTokenStale
+    ///       +-- conditional PUT loses --------------> backoff; read again
+    ///       `-- succeeds ---------------------------> S8 visible;
+    ///                                                  remove only A and C
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace whose live WAL snapshot should become a segment.
+    /// - `fencing_token`: Token obtained with the compaction lease, or `None`
+    ///   for an explicitly unfenced direct caller.
+    /// - `fts_configs`: Full-text fields to materialize when FTS indexing is
+    ///   enabled in the effective index config.
+    /// - `lease_lost`: Optional atomically shared heartbeat signal. `true`
+    ///   forbids every subsequent manifest commit attempt.
+    ///
+    /// # Returns
+    ///
+    /// The result of the manifest change that became authoritative. `segment_id`
+    /// is `None` for a no-op or when all surviving vectors were deleted.
+    ///
+    /// # Errors
+    ///
+    /// Fails on namespace metadata or manifest errors, WAL corruption, missing
+    /// required segment artifacts, dimension mismatch, index/FTS serialization,
+    /// any required object-store operation, lease loss, stale fencing, upload
+    /// window expiry, or exhausted CAS retries. The function intentionally does
+    /// not roll back immutable PUTs; failure after upload can leave orphaned
+    /// objects, and fenced staging may remain for GC to expire.
+    ///
+    /// Incremental build errors are logged and metered before a full rebuild is
+    /// attempted. That is a correctness-preserving cost fallback, not silent
+    /// data loss. An error from the full rebuild still reaches the caller.
+    ///
+    /// # Side Effects
+    ///
+    /// Reads authoritative metadata, the manifest, WAL objects, and some or all
+    /// old segment artifacts. It uploads immutable candidate artifacts, updates
+    /// metrics, may write/clear a compaction staging root, sleeps during CAS
+    /// backoff, and conditionally publishes a new live manifest whose
+    /// `pending_deletes` records retired keys.
+    ///
+    /// # Consistency
+    ///
+    /// The first manifest is only the build snapshot. Every CAS attempt reloads
+    /// the authoritative manifest and ETag, checks lease state and fencing, adds
+    /// the candidate segment, removes the exact snapshot fragment IDs, merges
+    /// concurrent pending-deletion entries, and writes conditionally. Fragments
+    /// appended after the snapshot remain visible. A missing manifest at commit
+    /// time fails with `ManifestNotFound` so namespace deletion cannot be
+    /// reversed by compaction.
+    ///
+    /// The production lease must serialize segment builds for a namespace. CAS
+    /// retries merge concurrent WAL-manifest updates but do not re-run the
+    /// expensive index build against a different concurrently published active
+    /// segment.
+    ///
+    /// # Performance
+    ///
+    /// The full path reads every surviving old vector and trains an index. The
+    /// centroid-reuse path avoids k-means but can still read all clusters. The
+    /// bounded path reads membership, the resident sketch, and touched clusters
+    /// only, then writes touched clusters plus segment-global sidecars. Full-text
+    /// indexing reads all attribute blobs, builds clusters on blocking workers,
+    /// and uploads per-cluster plus global artifacts. CAS retries do not repeat
+    /// the expensive build.
+    ///
+    /// # Examples
+    ///
+    /// With 100,000 vectors in 100 clusters and a WAL update touching clusters
+    /// 4 and 71, the bounded path reuses centroids and 98 physical clusters,
+    /// writes new objects for two clusters, publishes a new sketch/membership
+    /// closure, and keeps the carried old keys out of deferred deletion.
+    ///
+    /// If another writer appends fragment D during the build, the final CAS
+    /// removes only the snapshotted fragments and leaves D in the fresh
+    /// manifest. If the heartbeat reports takeover first, the candidate segment
+    /// remains invisible and the function returns `LeaseExpired`.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// The optional signal is an owned [`std::sync::Arc`] shared with the
+    /// heartbeat, then temporarily borrowed as `Option<&AtomicBool>` for each
+    /// check. Cloning `Arc` increments a reference count; it does not clone the
+    /// boolean. `Result` plus `?` makes early exit explicit, but it is not a
+    /// database rollback mechanism: remote PUTs completed before an error remain.
+    ///
+    /// Local maps own IDs and vectors so they survive across `.await` points.
+    /// Cloning a [`VectorEntry`] deep-clones its strings, vector values, and
+    /// attributes; cloning [`bytes::Bytes`] for concurrent PUTs shares its
+    /// immutable allocation instead.
     #[instrument(skip(self, fts_configs, lease_lost), fields(namespace = namespace))]
     pub async fn compact_with_fts_signaled(
         &self,
@@ -1184,11 +1904,13 @@ impl Compactor {
 }
 
 impl Compactor {
-    /// Incremental build: reuse centroids from old segment, reassign vectors,
-    /// and rewrite ONLY the clusters a WAL add/update/delete touched. Untouched
-    /// clusters are carried forward by reference (their S3 objects keep their
-    /// old keys), bounding per-cycle write I/O to O(touched clusters) instead
-    /// of O(dataset).
+    /// Reuses old centroids while assigning a fully materialized survivor set.
+    ///
+    /// Every surviving vector is assigned to its nearest old centroid. Only
+    /// clusters affected by a WAL add, update, delete, or cross-cluster move need
+    /// new physical objects; untouched clusters can remain under their resolved
+    /// older owner keys. When carry-over is disabled, all clusters are rewritten
+    /// while still avoiding k-means retraining.
     ///
     /// Returns `(cluster_count, bitmap_fields, cluster_owners, sketch_ref,
     /// bootstrap_ref, membership_ref, cluster_objects)`.
@@ -1214,6 +1936,80 @@ impl Compactor {
     /// fields stable (a carried cluster may still have bitmaps under its old
     /// key), we seed the set with the old segment's fields — see the caller,
     /// which is why `old_bitmap_fields` is passed in.
+    ///
+    /// ```text
+    /// all surviving VectorEntry values
+    ///           |
+    ///           v
+    /// assign each to nearest reused centroid
+    ///           |
+    ///           +-- WAL ID lands here ----------+
+    ///           +-- WAL ID used to live here ---+--> mark cluster touched
+    ///           |
+    ///           v
+    /// touched: rewrite under new segment ID
+    /// untouched: preserve resolved old owner and immutable objects
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace used to derive object keys and metric labels.
+    /// - `old_segment_id`: Previously active segment whose centroids and global
+    ///   quantization artifacts are reused.
+    /// - `indexing_config`: Effective layout and quantization configuration.
+    /// - `new_segment_id`: Unique owner for newly written artifacts.
+    /// - `vectors`: Complete sorted survivor set, including old and WAL rows.
+    /// - `wal_touched_ids`: IDs added, updated, or deleted in this snapshot.
+    /// - `old_id_to_cluster`: Old physical membership used to mark removals and
+    ///   cross-cluster moves.
+    /// - `old_cluster_owners`: Resolved owner overrides for carried clusters.
+    /// - `old_cluster_objects`: Explicit grouped-object layout, if present.
+    /// - `old_bitmap_fields`: Fields advertised by carried bitmap sidecars.
+    /// - `old_sketch_ref`: Existing resident sketch used for stitching.
+    /// - `allow_carryover`: Whether untouched clusters may keep old objects;
+    ///   FTS callers pass `false` because FTS rebuild expects new attr keys.
+    ///
+    /// # Returns
+    ///
+    /// Cluster count, advertised bitmap fields, optional owner overrides,
+    /// sketch/bootstrap/membership references, and the candidate's exact cluster
+    /// object descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Propagates old artifact reads and decoding, dimension/index calculations,
+    /// serialization, sketch stitching/rebuild, quantization, and any candidate
+    /// upload failure. Some new immutable objects may already exist.
+    ///
+    /// # Side Effects
+    ///
+    /// Reads old segment-global artifacts, computes assignments in memory, and
+    /// uploads new globals plus rewritten per-cluster objects.
+    ///
+    /// # Consistency
+    ///
+    /// This function does not publish a manifest. Its returned ownership closure
+    /// is safe to expose only through the caller's later fenced CAS.
+    ///
+    /// # Performance
+    ///
+    /// Assignment costs `O(vectors * clusters * dimensions)`. K-means is avoided;
+    /// upload volume is proportional to touched clusters when carry-over is
+    /// allowed, but this variant has already read the complete old segment.
+    ///
+    /// # Examples
+    ///
+    /// Updating an ID from old cluster 2 to nearest cluster 5 marks both 2 and
+    /// 5. Rewriting only cluster 5 would leave a ghost copy in cluster 2; the old
+    /// membership map prevents that error.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// Borrowed slices and maps express read-only views without copying. The
+    /// method constructs owned nested vectors for the new layout, then moves
+    /// them into `IncrementalClusterState`; the compiler rejects later use of
+    /// those moved containers. Iterator collection is monomorphized without
+    /// virtual stream dispatch.
     #[allow(clippy::too_many_arguments)]
     async fn incremental_build(
         &self,
@@ -1327,6 +2123,48 @@ impl Compactor {
         .await
     }
 
+    /// Loads reusable centroid and scalar-calibration state from the old segment.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace containing the old immutable artifacts.
+    /// - `old_segment_id`: Segment whose centroid coordinate system must remain
+    ///   stable for carried clusters.
+    /// - `indexing_config`: Effective quantization choice for the new segment.
+    ///
+    /// # Returns
+    ///
+    /// Owned centroids and dimension plus both encoded and decoded SQ
+    /// calibration when scalar quantization is active.
+    ///
+    /// # Errors
+    ///
+    /// Propagates missing/corrupt centroid data, a required legacy calibration
+    /// GET, or calibration decoding failure.
+    ///
+    /// # Side Effects
+    ///
+    /// Performs one centroid GET and, for legacy scalar segments whose centroid
+    /// blob does not embed calibration, one additional calibration GET.
+    ///
+    /// # Consistency
+    ///
+    /// Reusing these exact values is required: carried quantized rows were
+    /// encoded against the old coordinate system. This function never trains or
+    /// silently substitutes calibration.
+    ///
+    /// # Examples
+    ///
+    /// A current SQ segment returns embedded calibration with its centroids. An
+    /// older SQ segment triggers a read of its separate calibration artifact;
+    /// absence fails incremental construction so the caller can full-retrain.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// `Option::map(...).transpose()` converts
+    /// `Option<Result<Calibration>>` into `Result<Option<Calibration>>`. It is an
+    /// exhaustive, allocation-free way to say "decode only when present, but do
+    /// not hide a decode error," replacing nested null/error checks in Java or C.
     async fn load_incremental_centroid_state(
         &self,
         namespace: &str,
@@ -1376,6 +2214,80 @@ impl Compactor {
         })
     }
 
+    /// Builds an incremental candidate while reading only touched old clusters.
+    ///
+    /// The membership artifact supplies old ID-to-cluster placement and the
+    /// resident sketch supplies coarse data for untouched clusters. WAL rows are
+    /// assigned against reused centroids; only old clusters marked by an add,
+    /// update, delete, or move are fetched. Untouched rows are represented by
+    /// their IDs until the new membership and stitched sketch are written.
+    ///
+    /// ```text
+    /// membership IDs + WAL touched IDs + reused centroids
+    ///                   |
+    ///                   v
+    ///          compute touched cluster bitset
+    ///                   |
+    ///       +-----------+------------+
+    ///       |                        |
+    ///       v                        v
+    /// touched old cluster GETs   untouched IDs only
+    /// merge old survivors + WAL  carry old objects/sketch rows
+    ///       |                        |
+    ///       +-----------+------------+
+    ///                   v
+    ///       write one coherent candidate closure
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace used for keys, storage reads, and metrics.
+    /// - `old_segment_id`: Previously active physical segment root.
+    /// - `indexing_config`: Effective flat-IVF and quantization configuration.
+    /// - `new_segment_id`: Unique ID for newly written artifacts.
+    /// - `latest_vectors`: Last WAL upsert per ID after snapshot-order merge.
+    /// - `deleted_ids`: IDs whose last WAL operation is a delete.
+    /// - `wal_touched_ids`: Union of all add/update/delete IDs in the snapshot.
+    /// - `old_membership`: Decoded complete membership of the old segment.
+    /// - `old_cluster_owners`: Per-cluster physical owner overrides.
+    /// - `old_cluster_objects`: Explicit grouped cluster-object descriptors.
+    /// - `old_bitmap_fields`: Bitmap fields that carried clusters may retain.
+    /// - `old_sketch_ref`: Required old sketch descriptor for row stitching.
+    ///
+    /// # Returns
+    ///
+    /// The same complete manifest-facing artifact tuple as `incremental_build`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects membership/centroid count mismatch, out-of-range or missing
+    /// membership entries, unavailable/corrupt sketches, inconsistent touched
+    /// cluster contents, an empty resulting data set, and all downstream
+    /// read/build/upload failures. The caller meters this as an incremental
+    /// failure and attempts a full rebuild.
+    ///
+    /// # Side Effects
+    ///
+    /// Reads centroid, sketch, and touched cluster artifacts, records fallback
+    /// metrics for unavailable sketches, and uploads candidate artifacts.
+    ///
+    /// # Consistency
+    ///
+    /// Old membership is cross-checked against each loaded touched row before it
+    /// is trusted. Untouched clusters require a valid old sketch because this
+    /// path lacks their full vectors and cannot reconstruct coarse rows safely.
+    ///
+    /// # Performance
+    ///
+    /// Storage reads and per-vector merge work are bounded by WAL rows plus
+    /// touched clusters, apart from the compact membership and resident sketch
+    /// globals. This is the main large-namespace compaction fast path.
+    ///
+    /// # Examples
+    ///
+    /// Deleting one vector in cluster 12 loads cluster 12 and its attributes,
+    /// keeps 99 other clusters by reference, removes the ID from membership, and
+    /// stitches the old sketch with a rebuilt row for cluster 12.
     #[allow(clippy::too_many_arguments)]
     async fn incremental_build_bounded(
         &self,
@@ -1571,6 +2483,97 @@ impl Compactor {
         .await
     }
 
+    /// Serializes and uploads a complete incremental segment ownership closure.
+    ///
+    /// This shared finalizer writes new segment-global centroids, sketch,
+    /// bootstrap, and membership artifacts; serializes only touched cluster
+    /// vector/attribute/bitmap/quantization data; and returns explicit references
+    /// for everything carried or rewritten. It never publishes the manifest.
+    ///
+    /// ```text
+    /// IncrementalCentroidState + IncrementalClusterState
+    ///                         |
+    ///               resolve old owner chains
+    ///                         |
+    ///          +--------------+----------------+
+    ///          |                               |
+    /// touched cluster                     carried cluster
+    /// serialize under new ID              keep old exact key
+    ///          |                               |
+    ///          +--------------+----------------+
+    ///                         |
+    ///         rebuild/stitch globals using one calibration
+    ///                         |
+    ///                         v
+    ///              parallel immutable PUTs
+    ///                         |
+    ///                         v
+    ///       return SegmentRef components to CAS caller
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace used to construct every object key.
+    /// - `old_segment_id`: Prior logical segment used as default carried owner.
+    /// - `new_segment_id`: Candidate segment ID owning all new objects.
+    /// - `centroid_state`: Reused segment-global coordinate and SQ state.
+    /// - `cluster_state`: IDs, rewritten values/attributes, and touched flags.
+    /// - `old_cluster_owners`: Owner overrides to chain-compress when carrying.
+    /// - `old_cluster_objects`: Grouped-object descriptors for carried clusters.
+    /// - `old_bitmap_fields`: Advertised fields that carried bitmaps still serve.
+    /// - `old_sketch_ref`: Optional old sketch to fetch and stitch.
+    /// - `preloaded_old_sketch`: Already decoded sketch for the bounded path.
+    /// - `allow_sketch_rebuild`: Whether complete resident vectors permit a
+    ///   missing sketch to be rebuilt rather than rejecting incremental work.
+    /// - `indexing_config`: Bitmap and quantization format choices.
+    ///
+    /// # Returns
+    ///
+    /// Cluster count, bitmap fields, compressed owner map, sketch/bootstrap/
+    /// membership references, and exact cluster object descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Rejects mismatched per-cluster state, unavailable sketch when rebuilding
+    /// is unsafe, malformed old quantization data, missing grouped ownership,
+    /// serialization failures, and any required GET or PUT failure. Because PUTs
+    /// are parallel, a returned error can follow successful sibling uploads.
+    ///
+    /// # Side Effects
+    ///
+    /// Reads an old sketch or PQ codebook when required, computes artifacts, and
+    /// uploads all new payloads concurrently through the store abstraction.
+    ///
+    /// # Consistency
+    ///
+    /// Carried SQ codes retain the exact old calibration, and carried PQ codes
+    /// retain the exact old codebook copied under the new segment ID. Recomputing
+    /// either global would make old codes numerically incompatible. Every owner
+    /// is resolved to a physical segment rather than another forwarding logical
+    /// segment, preventing unbounded owner chains.
+    ///
+    /// # Performance
+    ///
+    /// CPU and upload volume scale with rewritten clusters plus the mandatory
+    /// global artifacts. [`bytes::Bytes`] payload clones are shallow, and
+    /// `join_all` overlaps PUT latency. The function holds no synchronous lock
+    /// across `.await`.
+    ///
+    /// # Examples
+    ///
+    /// If clusters 0 and 3 are touched in a ten-cluster SQ segment, both are
+    /// encoded with the reused calibration and written under the new ID. Eight
+    /// owner entries still point at their resolved old objects; the new centroid
+    /// artifact embeds the same calibration for query decoding.
+    ///
+    /// # Rust Notes for Java/C Engineers
+    ///
+    /// Destructuring moves owned fields out of the two state structs, making the
+    /// transition from "planning" to "serialization" explicit. The local
+    /// `resolve_old_owner` closure borrows the old owner slice and returns owned
+    /// `String` values, avoiding dangling references in the manifest candidate.
+    /// A `BTreeMap` later provides deterministic key order where a `HashMap`
+    /// deliberately would not.
     #[allow(clippy::too_many_arguments)]
     async fn write_incremental_segment(
         &self,
@@ -1918,6 +2921,23 @@ impl Compactor {
     }
 }
 
+/// Records that incremental sketch stitching could not be used.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace metric label.
+/// - `reason`: Structured log field describing the specific unavailable path.
+///
+/// # Side Effects
+///
+/// Increments the stable `sketch_stitch_unavailable` fallback metric and emits a
+/// debug record. The reason remains in logs rather than becoming an unbounded
+/// metric label.
+///
+/// # Examples
+///
+/// A missing old sketch increments the fallback family once with the stable
+/// category and logs `old_sketch_missing` for diagnosis.
 fn meter_sketch_unavailable(namespace: &str, reason: &str) {
     crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
         .with_label_values(&[namespace, "sketch_stitch_unavailable"])
@@ -1928,6 +2948,37 @@ fn meter_sketch_unavailable(namespace: &str, reason: &str) {
     );
 }
 
+/// Keeps finite vectors and loudly drops legacy rows containing NaN or infinity.
+///
+/// New API writes reject non-finite coordinates, but durable data from before
+/// that validation may still exist. Failing every future compaction would trap
+/// the namespace permanently, so this is the one deliberate data-quality
+/// degradation: each rejected row is observable through an error log and
+/// metric and is omitted from the next segment.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace label for the rejection metric and log.
+/// - `vector`: Borrowed candidate row to validate without cloning it.
+///
+/// # Returns
+///
+/// `true` when every coordinate is finite; `false` after reporting the first
+/// non-finite coordinate.
+///
+/// # Side Effects
+///
+/// On rejection, emits an error with ID, coordinate index, and value and
+/// increments `NON_FINITE_VECTORS_SKIPPED_TOTAL`.
+///
+/// # Examples
+///
+/// `[0.2, NaN, 0.8]` returns `false`, identifies dimension 1, and will not enter
+/// the new segment. `[0.2, -1.0, 0.8]` returns `true` without logging.
+///
+/// # Performance
+///
+/// Scans coordinates until the first invalid value and allocates nothing.
 fn keep_finite_compaction_vector(namespace: &str, vector: &VectorEntry) -> bool {
     // Defense in depth (Task 10 I4): the API boundary now rejects NaN/inf, but
     // data written BEFORE that fix may already be durable on S3. This skip is
@@ -1954,6 +3005,28 @@ fn keep_finite_compaction_vector(namespace: &str, vector: &VectorEntry) -> bool 
     }
 }
 
+/// Counts the logical survivor set without loading untouched cluster vectors.
+///
+/// # Parameters
+///
+/// - `old_membership`: Complete old ID-to-cluster inventory.
+/// - `latest_vectors`: Last WAL upsert per touched ID.
+/// - `deleted_ids`: IDs whose last WAL operation is deletion.
+///
+/// # Returns
+///
+/// Old IDs neither deleted nor replaced, plus finite latest WAL vectors. IDs in
+/// `latest_vectors` are excluded from the old count to avoid double counting.
+///
+/// # Performance
+///
+/// Runs in `O(old membership + latest WAL entries)` using expected constant-time
+/// hash lookups and performs no object-store I/O.
+///
+/// # Examples
+///
+/// With 100 old IDs, one delete, one updated ID, and two finite new IDs, the old
+/// side contributes 98 and the WAL side contributes three, for 101 survivors.
 fn bounded_survivor_count(
     old_membership: &MembershipData,
     latest_vectors: &HashMap<String, VectorEntry>,
@@ -1971,6 +3044,31 @@ fn bounded_survivor_count(
     old_survivors + wal_survivors
 }
 
+/// Selects the nearest centroid after validating the candidate dimensions.
+///
+/// # Parameters
+///
+/// - `centroids`: Non-empty centroid vectors expected to share one dimension.
+/// - `values`: Vector coordinates to assign.
+///
+/// # Returns
+///
+/// Zero-based index of the centroid with smallest Euclidean distance. Equal
+/// distances keep the earliest centroid because replacement uses strict `<`.
+///
+/// # Errors
+///
+/// Returns an index error for zero centroids or inconsistent centroid lengths,
+/// and [`ZeppelinError::DimensionMismatch`] when `values` has the wrong length.
+///
+/// # Performance
+///
+/// Computes every distance in `O(clusters * dimensions)` with no allocation.
+///
+/// # Examples
+///
+/// Centroids `[0, 0]` and `[10, 10]` assign `[9, 9]` to index 1. A three-value
+/// input returns a dimension error rather than reading mismatched slices.
 fn nearest_cluster(centroids: &[Vec<f32>], values: &[f32]) -> Result<usize> {
     use crate::index::distance::euclidean_distance;
 
@@ -2004,6 +3102,47 @@ fn nearest_cluster(centroids: &[Vec<f32>], values: &[f32]) -> Result<usize> {
     Ok(best_cluster)
 }
 
+/// Materializes a complete survivor set for a correctness-preserving full rebuild.
+///
+/// This helper is used after the membership-bounded incremental path fails. It
+/// reloads the old segment, overlays already-merged WAL upserts and deletes, and
+/// returns deterministic ID order for normal index construction.
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary used to load the prior segment.
+/// - `namespace`: Namespace containing the artifacts.
+/// - `old_segment_id`: Previous active ID, or `None` for a first segment.
+/// - `old_segment_ref`: Descriptor carrying hierarchy and object layout.
+/// - `old_cluster_owners`: Physical owner override for each logical cluster.
+/// - `latest_vectors`: Owned latest WAL upserts; the helper extends this map.
+/// - `deleted_ids`: IDs that must not be restored from the old segment.
+///
+/// # Returns
+///
+/// Owned finite survivors sorted lexicographically by vector ID.
+///
+/// # Errors
+///
+/// Propagates every required old segment read or decode failure. Partial reads
+/// do not produce a shortened result.
+///
+/// # Side Effects
+///
+/// May GET every vector and attribute object in the old segment. Legacy
+/// non-finite rows are loudly filtered through `keep_finite_compaction_vector`.
+///
+/// # Performance
+///
+/// Reads and materializes the complete old dataset, then sorts survivors in
+/// `O(n log n)`. This intentionally sacrifices the bounded fast path to retain
+/// correctness after an incremental artifact problem.
+///
+/// # Examples
+///
+/// If the old sketch is missing, a caller can pass two WAL updates and one
+/// delete; this helper reloads all old rows, applies those changes, and supplies
+/// a complete input for a new full IVF build.
 async fn load_full_surviving_vectors_for_fallback(
     store: &ZeppelinStore,
     namespace: &str,
@@ -2044,6 +3183,63 @@ async fn load_full_surviving_vectors_for_fallback(
     Ok(vectors)
 }
 
+/// Loads and validates only old clusters marked for incremental rewrite.
+///
+/// ```text
+/// touched bitset
+///      |
+///      +-- legacy layout -> vector GET || attrs GET per touched cluster
+///      |
+///      `-- grouped layout -> GET each intersecting object
+///                              + attrs GET per touched section
+///                                      |
+///                                      v
+///                          aligned Vec<VectorEntry> per cluster
+/// ```
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary for immutable GETs.
+/// - `namespace`: Namespace containing the old segment.
+/// - `segment_id`: Prior logical segment, used when no owner override exists.
+/// - `cluster_owners`: Resolved per-cluster physical segment owners.
+/// - `cluster_objects`: Explicit grouped-object layout, or empty for legacy
+///   one-object-per-cluster data.
+/// - `touched`: Rewrite selector indexed by logical cluster.
+///
+/// # Returns
+///
+/// One vector list per logical cluster. Untouched entries remain empty; touched
+/// entries contain finite owned rows in stored order.
+///
+/// # Errors
+///
+/// Propagates missing/corrupt vector or attribute data, rejects grouped objects
+/// that lack advertised sections or reference out-of-range clusters, and rejects
+/// attribute arrays shorter than their cluster row count.
+///
+/// # Side Effects
+///
+/// Performs parallel object-store reads and updates compaction read metrics.
+/// Legacy non-finite rows are logged and omitted.
+///
+/// # Consistency
+///
+/// Owner overrides and explicit object refs come from the manifest snapshot;
+/// prefix inference is used only for the legacy layout. Attributes are required
+/// because silently substituting `None` would change metadata filtering.
+///
+/// # Performance
+///
+/// Reads only objects intersecting `touched`. Legacy vector and attribute GETs
+/// for one cluster run concurrently; grouped vector objects are fetched once
+/// even when they contain multiple touched sections.
+///
+/// # Examples
+///
+/// For 100 clusters with bits 2 and 80 set, the legacy layout issues four GETs
+/// instead of 200. A grouped object containing both clusters is fetched once,
+/// followed by their two attribute GETs.
 async fn load_touched_segment_vectors(
     store: &ZeppelinStore,
     namespace: &str,
@@ -2173,6 +3369,44 @@ async fn load_touched_segment_vectors(
     Ok(clusters)
 }
 
+/// Builds exact grouped-object references for a mixed carried/rewritten segment.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace used to derive keys for rewritten singleton groups.
+/// - `new_segment_id`: Physical owner of rewritten cluster objects.
+/// - `num_clusters`: Expected logical cluster count.
+/// - `touched`: Per-cluster rewrite selector of exactly `num_clusters` entries.
+/// - `old_cluster_objects`: Complete old grouped layout.
+/// - `new_object_sizes`: Serialized size by rewritten object key.
+///
+/// # Returns
+///
+/// Deterministically key-ordered descriptors. Carried clusters sharing an old
+/// object remain grouped under that key; each rewritten cluster points at its
+/// newly serialized object. Returns an empty vector for a legacy old layout.
+///
+/// # Errors
+///
+/// Rejects touched-length mismatch, out-of-range or duplicate old cluster
+/// ownership, missing old ownership for a carried cluster, and missing size
+/// metadata for any emitted key.
+///
+/// # Consistency
+///
+/// The result is an exact manifest reachability closure. A carried key must not
+/// later be inferred dead from its older segment prefix.
+///
+/// # Performance
+///
+/// Runs in linear time over old references plus clusters. [`BTreeMap`] produces
+/// stable descriptor order independent of randomized hash iteration.
+///
+/// # Examples
+///
+/// If old object `group_A` owns clusters 0 and 1 and only cluster 1 is touched,
+/// the result retains `group_A -> [0]` and adds the new singleton key for
+/// cluster 1.
 fn incremental_cluster_objects(
     namespace: &str,
     new_segment_id: &str,
@@ -2247,12 +3481,46 @@ fn incremental_cluster_objects(
     Ok(object_refs)
 }
 
-/// Abort check for mid-compaction lease loss (invariant A2).
+/// Aborts publication after the lease heartbeat reports loss (invariant A2).
 ///
 /// The lease-renewal heartbeat flips `lease_lost` to `true` when a renewal
 /// fails because another node took the lease over. Called before every
 /// manifest CAS attempt so a fenced-out compaction aborts with a clean
 /// `LeaseExpired` error instead of racing its stale commit.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace included in the error and structured log.
+/// - `lease_lost`: Optional shared atomic flag. `None` means the caller chose an
+///   unfenced/no-heartbeat path; it does not mean a lease was checked and held.
+///
+/// # Returns
+///
+/// `Ok(())` while no supplied heartbeat has reported loss.
+///
+/// # Errors
+///
+/// Returns [`ZeppelinError::LeaseExpired`] when the flag is true. The candidate
+/// artifacts may already be uploaded but no manifest CAS follows this check.
+///
+/// # Consistency
+///
+/// This is one layer, not the whole protocol. The caller must still compare the
+/// fencing token in the fresh manifest and use ETag CAS because takeover can
+/// race immediately after the atomic load.
+///
+/// # Examples
+///
+/// A renewal task detects that token 12 was taken over, stores `true`, and the
+/// compactor returns `LeaseExpired` before publishing its candidate.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// [`AtomicBool::load`][std::sync::atomic::AtomicBool::load] with sequential
+/// consistency provides one global ordering model for the heartbeat and
+/// compactor. It resembles Java's `AtomicBoolean.get()`. In C, the corresponding
+/// `_Atomic bool` load must use compatible memory ordering and independently
+/// managed shared lifetime.
 fn check_lease_lost(
     namespace: &str,
     lease_lost: Option<&std::sync::atomic::AtomicBool>,
@@ -2278,6 +3546,21 @@ fn check_lease_lost(
 /// the Unix epoch), so no extra timestamp field is needed on `FragmentRef`.
 /// Clock skew can make a fragment's ULID timestamp sit slightly in the
 /// future relative to this node; saturate to 0 rather than underflow.
+///
+/// # Parameters
+///
+/// - `id`: Fragment ULID whose embedded millisecond timestamp is inspected.
+/// - `now_ms`: Current Unix time in milliseconds from the evaluating node.
+///
+/// # Returns
+///
+/// Whole elapsed seconds, truncating sub-second age. Future timestamps return
+/// zero.
+///
+/// # Examples
+///
+/// A ULID created 90,500 ms ago reports 90 seconds; one timestamped five seconds
+/// in the future reports zero rather than wrapping to a huge age.
 fn fragment_age_secs(id: &Ulid, now_ms: u64) -> u64 {
     now_ms.saturating_sub(id.timestamp_ms()) / 1000
 }
@@ -2289,6 +3572,33 @@ fn fragment_age_secs(id: &Ulid, now_ms: u64) -> u64 {
 /// GC ran. Wholesale replacement would drop those keys and leak the objects.
 /// Keep any entry we did not process in step 0, then append this cycle's
 /// keys (deduplicated).
+///
+/// # Parameters
+///
+/// - `manifest`: Fresh CAS candidate whose deletion queue is updated in place.
+/// - `deferred_deletes`: Retired WAL and segment keys discovered by this build.
+/// - `processed_deletes`: Keys confirmed processed earlier in the cycle.
+///
+/// # Side Effects
+///
+/// Removes only explicitly processed keys, preserves concurrent entries, and
+/// appends this cycle's keys once. It performs no physical object deletion.
+///
+/// # Consistency
+///
+/// The fresh manifest may contain queue entries absent from the original build
+/// snapshot. Merging rather than replacing prevents those concurrent keys from
+/// being forgotten and leaked.
+///
+/// # Performance
+///
+/// Builds a temporary hash set of existing borrowed strings and clones only new
+/// keys. Expected time is linear in the three collections.
+///
+/// # Examples
+///
+/// If the fresh queue contains `concurrent` and this run proposes
+/// `[concurrent, wal_A]`, the result keeps one `concurrent` followed by `wal_A`.
 fn merge_pending_deletes(
     manifest: &mut Manifest,
     deferred_deletes: &[String],
@@ -2306,6 +3616,39 @@ fn merge_pending_deletes(
     manifest.pending_deletes.extend(new_keys);
 }
 
+/// Publishes the current candidate artifact keys as a fenced GC staging root.
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary used to list and write staging metadata.
+/// - `namespace`: Namespace containing the unpublished segment prefix.
+/// - `segment_id`: Candidate segment whose already-uploaded keys are protected.
+/// - `fencing_token`: Current lease generation used to name/validate staging.
+///
+/// # Returns
+///
+/// `Ok(())` after the exact listed key set is stored in the compaction staging
+/// side object.
+///
+/// # Errors
+///
+/// Propagates prefix listing and staging serialization/write failures. The
+/// candidate objects already uploaded remain invisible.
+///
+/// # Side Effects
+///
+/// Performs one namespace-prefix LIST and writes a GC staging object.
+///
+/// # Consistency
+///
+/// Staging is a temporary GC root, not the visibility commit. The function is
+/// called after vector artifacts and again after optional FTS uploads so the
+/// root set reflects each completed upload phase.
+///
+/// # Examples
+///
+/// A fenced build uploads centroids and four cluster objects, lists those five
+/// keys, and stages them under its token before beginning manifest publication.
 async fn publish_compaction_staging(
     store: &ZeppelinStore,
     namespace: &str,
@@ -2317,6 +3660,25 @@ async fn publish_compaction_staging(
     gc::write_compaction_staging(store, namespace, fencing_token, keys).await
 }
 
+/// Best-effort clears a compaction staging root after success or safe abort.
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary containing the side object.
+/// - `namespace`: Namespace whose staging record should be cleared.
+/// - `fencing_token`: Token identifying this compaction's staging generation.
+///
+/// # Side Effects
+///
+/// Attempts a staging delete. Failure is warned and deliberately swallowed;
+/// leaving extra GC protection leaks temporary space but cannot hide a committed
+/// error or delete live data.
+///
+/// # Examples
+///
+/// After CAS success, clearing the token-7 staging record lets normal exact-key
+/// reachability govern the now-manifest-visible segment. A failed clear remains
+/// observable in logs and expires through the staging protocol.
 async fn drop_compaction_staging(store: &ZeppelinStore, namespace: &str, fencing_token: u64) {
     if let Err(e) = gc::clear_compaction_staging(store, namespace, fencing_token).await {
         warn!(
@@ -2328,6 +3690,36 @@ async fn drop_compaction_staging(store: &ZeppelinStore, namespace: &str, fencing
     }
 }
 
+/// Rejects a candidate whose unpublished upload phase exceeded its GC window.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace included in diagnostics.
+/// - `upload_phase_start`: Monotonic instant captured when the segment ID and
+///   upload phase began.
+/// - `upload_window`: Maximum permitted unpublished duration from GC config.
+///
+/// # Returns
+///
+/// `Ok(())` when elapsed time is at most the window.
+///
+/// # Errors
+///
+/// Returns an index error after the window is exceeded. Candidate artifacts are
+/// left unpublished; the caller clears fenced staging best-effort before
+/// returning.
+///
+/// # Consistency
+///
+/// This guard prevents publication after objects could have crossed the safety
+/// horizon assumed by the GC/staging design. It uses a monotonic
+/// [`std::time::Instant`] rather than wall time and therefore is immune to clock
+/// adjustments.
+///
+/// # Examples
+///
+/// A 45-second upload with a 42-second window logs both durations and aborts
+/// before CAS. An exactly 42-second upload remains permitted.
 fn check_upload_window(
     namespace: &str,
     upload_phase_start: std::time::Instant,
@@ -2360,9 +3752,86 @@ fn check_upload_window(
 /// index in this segment. The map drives incremental compaction's
 /// touched-cluster detection (a WAL delete/update of an old member must
 /// mark that member's cluster for rewrite) — it includes IDs that a later
-/// merge step will drop, since the segment on S3 still contains them.
-/// The map is empty for hierarchical segments (incremental carry-over is
-/// IVF-Flat only).
+/// merge step will drop, since the segment on S3 still contains them. The map
+/// is populated for either layout, although current incremental carry-over uses
+/// it only for IVF-Flat segments.
+///
+/// ```text
+/// SegmentRef layout
+///      |
+///      +-- hierarchical -> load tree metadata for leaf count
+///      `-- IVF-Flat ----> read segment-global centroids for cluster count
+///                             |
+///              +--------------+----------------+
+///              |                               |
+///       legacy cluster keys              explicit grouped objects
+///       vector GET || attrs GET          object GET + attrs GETs
+///              |                               |
+///              +--------------+----------------+
+///                             v
+///              flatten aligned rows + old membership map
+/// ```
+///
+/// # Parameters
+///
+/// - `store`: Object-store abstraction for all immutable artifact reads.
+/// - `namespace`: Namespace containing the segment.
+/// - `segment_id`: Logical segment whose global metadata is loaded.
+/// - `is_hierarchical`: Selects tree metadata versus flat centroid metadata for
+///   determining cluster count.
+/// - `cluster_owners`: Per-cluster physical owner overrides from the manifest.
+/// - `cluster_objects`: Explicit grouped data layout, or empty for legacy keys.
+///
+/// # Returns
+///
+/// All owned vector entries in cluster traversal order plus old ID-to-cluster
+/// membership. Current callers ignore the membership for hierarchical input
+/// because hierarchical segments are never incrementally carried.
+///
+/// # Errors
+///
+/// Propagates missing/corrupt tree metadata, centroids, cluster data, or invalid
+/// attribute JSON. Rejects explicit grouped objects that do not decode or omit
+/// an advertised section.
+///
+/// TODO(doc): Verify whether a decoded attribute array shorter than the cluster
+/// row count should be rejected here, as `load_touched_segment_vectors` does.
+/// The current full-load path uses `attrs.get(row).flatten()`, so a missing
+/// trailing attribute row currently becomes `None` rather than an error.
+///
+/// # Side Effects
+///
+/// Performs object-store GETs and records compaction read metrics. No cache or
+/// manifest state is mutated.
+///
+/// # Consistency
+///
+/// Global metadata always lives beneath `segment_id`; per-cluster keys resolve
+/// through owner overrides or exact object refs. The function reads one immutable
+/// segment closure from the caller's manifest snapshot and does not discover
+/// objects by treating a prefix listing as authority. Invalid attribute JSON
+/// fails, while the shorter-array behavior noted above currently synthesizes
+/// absent trailing attributes.
+///
+/// # Performance
+///
+/// Loads every cluster into memory. Legacy vector and attribute pairs run in
+/// parallel across clusters; grouped vector objects are each fetched once, then
+/// decoded sequentially. Cost is proportional to the entire old segment.
+///
+/// # Examples
+///
+/// A flat segment with clusters 0 and 2 carried from older owners reads its own
+/// centroids but resolves those cluster payloads under the owner IDs. The
+/// returned membership still maps each ID to its logical cluster number.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The `owner` closure returns a borrowed `&str` from either the owner slice or
+/// `segment_id`; Rust infers that both sources live long enough for each key
+/// construction. `tokio::join!` polls vector and attribute reads concurrently
+/// without spawning detached tasks, while `join_all` scales that pattern across
+/// clusters.
 async fn load_segment_vectors(
     store: &ZeppelinStore,
     namespace: &str,
@@ -2510,10 +3979,36 @@ async fn load_segment_vectors(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    //! Focused unit coverage for trigger arithmetic and manifest-queue merging.
+    //!
+    //! These tests use the in-memory object-store backend because they exercise
+    //! local trigger and candidate-manifest logic, not S3 semantics. Broader
+    //! integration suites cover full compaction, incremental ownership,
+    //! lease/fencing races, FTS, grouped objects, and storage GC against the
+    //! repository's storage harness.
+    //!
+    //! ## Reading map
+    //!
+    //! 1. The `mem_compactor` helpers construct isolated coordinators.
+    //! 2. The `should_compact` tests prove the independent count, age, and byte
+    //!    triggers plus the idle case.
+    //! 3. `test_fragment_age_from_ulid_timestamp` protects skew-safe arithmetic.
+    //! 4. `test_merge_pending_deletes_keeps_concurrent_keys` protects a CAS
+    //!    retry from dropping deletion work added by another writer.
+
     use super::*;
     use crate::config::{Config, GcConfig};
     use crate::wal::manifest::FragmentRef;
 
+    /// Creates an isolated in-memory compactor with the default GC upload window.
+    ///
+    /// # Parameters
+    ///
+    /// - `config`: Trigger policy under test.
+    ///
+    /// # Returns
+    ///
+    /// A compactor and WAL reader sharing one new in-memory object store.
     fn mem_compactor(config: CompactionConfig) -> Compactor {
         let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
         let store = ZeppelinStore::new(mem);
@@ -2527,6 +4022,12 @@ mod tests {
         )
     }
 
+    /// Returns current Unix wall time in milliseconds for ULID test fixtures.
+    ///
+    /// # Returns
+    ///
+    /// Milliseconds since the Unix epoch; tests panic if the host clock predates
+    /// the epoch because such a host cannot construct meaningful fixture ages.
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2534,6 +4035,16 @@ mod tests {
             .as_millis() as u64
     }
 
+    /// Builds a one-vector fragment descriptor for trigger tests.
+    ///
+    /// # Parameters
+    ///
+    /// - `id`: ULID carrying the desired test timestamp.
+    /// - `size_bytes`: Recorded serialized size used by the byte trigger.
+    ///
+    /// # Returns
+    ///
+    /// A descriptor with one vector, no deletes, and sequence number zero.
     fn fragment_ref(id: Ulid, size_bytes: u64) -> FragmentRef {
         FragmentRef {
             id,
@@ -2544,6 +4055,10 @@ mod tests {
         }
     }
 
+    /// Proves validated GC timing is threaded into the compactor unchanged.
+    ///
+    /// This catches configuration drift where horizon validation and the final
+    /// upload-window publication guard might use different values.
     #[test]
     fn gc_upload_window_drives_horizon_floor_and_compactor_abort_window() {
         let mut config = Config::default();
@@ -2566,6 +4081,16 @@ mod tests {
         );
     }
 
+    /// Creates an isolated compactor with an explicit publication time window.
+    ///
+    /// # Parameters
+    ///
+    /// - `config`: Compaction trigger and retention settings.
+    /// - `upload_window`: GC-derived duration to retain in the compactor.
+    ///
+    /// # Returns
+    ///
+    /// A compactor backed by a new in-memory object store.
     fn mem_compactor_with_upload_window(
         config: CompactionConfig,
         upload_window: Duration,
@@ -2582,6 +4107,17 @@ mod tests {
         )
     }
 
+    /// Publishes a test manifest containing the supplied fragment descriptors.
+    ///
+    /// # Parameters
+    ///
+    /// - `compactor`: Supplies the isolated in-memory store.
+    /// - `ns`: Test namespace key.
+    /// - `fragments`: Visible descriptors added in the provided order.
+    ///
+    /// # Side Effects
+    ///
+    /// Performs an unconditional test-only manifest write and panics on failure.
     async fn write_manifest(compactor: &Compactor, ns: &str, fragments: Vec<FragmentRef>) {
         let mut manifest = Manifest::new();
         for f in fragments {
@@ -2655,8 +4191,8 @@ mod tests {
         );
     }
 
-    /// I4: zero uncompacted fragments never triggers compaction, no matter
-    /// how aggressive the configuration is.
+    /// I4: zero uncompacted fragments and no active layout mismatch stays idle,
+    /// no matter how aggressive the WAL thresholds are.
     #[tokio::test]
     async fn test_should_compact_zero_fragments_never_triggers() {
         let compactor = mem_compactor(CompactionConfig {
@@ -2716,6 +4252,10 @@ mod tests {
         assert_eq!(fragment_age_secs(&same, now), 0);
     }
 
+    /// Proves the pending-delete merge preserves unprocessed concurrent work.
+    ///
+    /// The scenario removes a key processed earlier, retains a key appended by
+    /// another writer, and deduplicates that key against this cycle's additions.
     #[test]
     fn test_merge_pending_deletes_keeps_concurrent_keys() {
         // Keys added to pending_deletes by another writer after our step-0
