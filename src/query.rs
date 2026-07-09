@@ -1,3 +1,131 @@
+//! Executes ANN and BM25 retrieval against one authoritative manifest snapshot.
+//!
+//! This module is the domain query engine below the HTTP handlers. It reads the
+//! manifest that defines visible immutable artifacts, searches the active
+//! compacted segment, optionally scans uncompacted write-ahead-log (WAL)
+//! fragments, and merges both views without resurrecting deleted or superseded
+//! records. Callers enter through [`crate::query::execute_query`] for vector
+//! retrieval or [`crate::query::execute_bm25_query`] for lexical retrieval.
+//! Batch, historical (`as_of`),
+//! and retrieval-algebra callers may instead supply a manifest they selected
+//! earlier so every source observes the same snapshot.
+//!
+//! This file deliberately does **not** validate HTTP requests, choose historical
+//! manifests, fuse ANN and BM25 source lists, rerank fused candidates, paginate,
+//! group, or compute facets. Those orchestration steps live in
+//! `server::handlers::query`; this module returns
+//! [`crate::query::QueryResponse`] as the common carrier that those later stages
+//! enrich.
+//!
+//! Object storage remains authoritative. [`crate::wal::Manifest`] membership
+//! determines which immutable WAL fragments and segment descriptor are visible.
+//! A [`crate::cache::manifest_cache::ManifestCache`] may avoid downloading
+//! unchanged manifest bytes, while a [`crate::cache::DiskCache`] may serve
+//! immutable index objects; neither cache may introduce an artifact absent from
+//! the chosen snapshot.
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`crate::query::QueryParams`] and
+//!    [`crate::query::QueryResponse`] for the vector-query input and shared
+//!    response contracts.
+//! 2. Read [`crate::query::execute_query`] and then
+//!    `execute_query_with_manifest_scoped` for manifest selection, concurrent
+//!    WAL/segment work, refill, and merge.
+//! 3. Read `wal_scan`, `segment_search`, and `merge_results` for the vector
+//!    source implementations and latest-write-wins rules.
+//! 4. Read [`crate::query::execute_bm25_query`] and
+//!    `execute_bm25_query_with_manifest_scoped` for the equivalent lexical path.
+//! 5. Finish with `segment_bm25_search`, its global-index and compatibility
+//!    paths, and `merge_bm25_results`.
+//! 6. The `QueryExplain*` types describe plans assembled by the HTTP layer;
+//!    they are response data, not execution decisions made in this module.
+//!
+//! ## Query and visibility flow
+//!
+//! ```text
+//! chosen manifest snapshot (authority for this execution)
+//!        |
+//!        +-----------------------+------------------------+
+//!        |                        |                        |
+//!        v                        v                        v
+//! active immutable segment   uncompacted WAL         WAL tombstones
+//! ANN or BM25 index search    Strong: score live      Strong + Eventual:
+//!                             updates                 suppress old hits
+//!        |                        |                        |
+//!        +------------------------+------------------------+
+//!                                 v
+//!                    suppress superseded/deleted IDs
+//!                    and retain score-ordered top-k
+//!                                 |
+//!                                 v
+//!                          QueryResponse
+//! ```
+//!
+//! Strong reads score both live WAL updates and the active segment. Eventual
+//! reads skip WAL upsert scoring to reduce work, but still read tombstones:
+//! staleness may omit a recent write, but it must not resurrect a known delete.
+//! For ANN, smaller distance is better. For BM25, larger relevance is better.
+//! The two score directions are kept separate here; the HTTP retrieval-algebra
+//! layer normalizes or rank-fuses source results before hybrid reranking.
+//!
+//! ## Snapshot and cache boundaries
+//!
+//! ```text
+//! ordinary query                    as_of / batch / hybrid query
+//!       |                                      |
+//!       v                                      v
+//! read current manifest              caller selects one Manifest
+//! Strong: verify with S3              and clones that same snapshot
+//! Eventual: TTL cache allowed         for each source execution
+//!       |                                      |
+//!       +------------------+-------------------+
+//!                          v
+//!              immutable artifact reads
+//!          memory/disk cache hit -> otherwise S3
+//! ```
+//!
+//! A historical caller bypasses current-manifest selection by passing the
+//! already-read [`crate::wal::Manifest`]. That preserves point-in-time source
+//! membership; immutable artifact caches remain safe because a key's bytes never
+//! change. No source may silently substitute a newer manifest after execution
+//! begins.
+//!
+//! ## Invariants
+//!
+//! - A single owned [`crate::wal::Manifest`] snapshot governs one execution.
+//!   WAL and segment futures borrow that same value and never re-read visibility
+//!   state.
+//! - Only `active_segment` is queried; older segment descriptors retained for
+//!   history or garbage collection are not part of the active view.
+//! - WAL fragments replay oldest to newest. A later upsert replaces an earlier
+//!   value, and a tombstone removes any prior value for the same ID.
+//! - Strong merges suppress every segment ID with a live WAL replacement or
+//!   tombstone. Eventual merges suppress tombstones even though they omit live
+//!   WAL replacements.
+//! - Storage, decoding, index, and consistency failures are returned. A failed
+//!   branch does not produce a partial [`crate::query::QueryResponse`].
+//!
+//! ## Rust concepts used here
+//!
+//! [`crate::query::QueryParams`] borrows stores, caches, filters, and the query
+//! slice for the duration of an async call. This resembles passing object
+//! references in Java or `const` pointers in C, but Rust proves that none outlive
+//! their owners and that borrowed inputs remain valid across `.await`.
+//! [`std::sync::Arc`] clones share cache state by incrementing a reference count
+//! rather than deep-copying it.
+//!
+//! `tokio::join!` polls independent WAL and segment futures concurrently in the
+//! same task. It is closer to joining two Java `CompletableFuture` operations
+//! than to creating two OS threads; in C, the equivalent lifetime and cleanup
+//! bookkeeping would be manual. `Result` plus `?` makes either branch's failure
+//! abort the response while owned values are cleaned up by RAII.
+//!
+//! Iterator pipelines and the bounded `TopK` container consume owned
+//! candidates and retain only the useful frontier. Borrowed WAL vectors avoid
+//! cloning payloads during scoring; only IDs and attributes that must survive
+//! fragment ownership are materialized into the returned results.
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -26,16 +154,39 @@ use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 use crate::wal::WalReader;
 
-/// Query result containing ranked search results and scan statistics.
+/// Carries one ranked query result set and the optional HTTP enrichments.
 ///
-/// Serialized directly as the HTTP query response body.
+/// ANN execution stores distances in [`SearchResult::score`] and therefore
+/// orders smaller values first. BM25 execution stores relevance scores and
+/// orders larger values first. Consumers must use the executed source or
+/// explain plan to interpret the direction; the response does not normalize
+/// these two score spaces. The HTTP layer serializes this type directly and may
+/// populate pagination, grouping, facets, or explain data after this module
+/// returns the base results.
+///
+/// # Examples
+///
+/// A strong ANN query that scans two WAL fragments and one active segment may
+/// return five distance-ordered hits with `scanned_fragments = 2` and
+/// `scanned_segments = 1`. A later grouping phase keeps those counters and adds
+/// `groups` without changing which storage work already occurred.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `Option<T>` makes an omitted response section distinct from an empty
+/// section. Serde's `skip_serializing_if` omits `None` fields from JSON; Java
+/// would commonly use nullable fields plus serializer annotations, while C
+/// would need an explicit presence flag beside each payload.
 #[derive(Debug, Serialize)]
 pub struct QueryResponse {
-    /// Ranked search results ordered by relevance.
+    /// Ranked hits in the score direction of the executed source.
     pub results: Vec<SearchResult>,
-    /// Number of WAL fragments scanned during the query.
+    /// Number of WAL fragments whose live records were scored.
+    ///
+    /// Eventual reads may inspect tombstones while reporting zero here because
+    /// they deliberately skip WAL candidate scoring.
     pub scanned_fragments: usize,
-    /// Number of compacted segments scanned during the query.
+    /// Number of active compacted segments searched; currently zero or one.
     pub scanned_segments: usize,
     /// Optional query diagnostics, returned only when the request asks for them.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,7 +206,16 @@ pub struct QueryResponse {
     pub explain: Option<QueryExplain>,
 }
 
-/// One grouped result bucket.
+/// Groups ranked hits that share one response-level attribute value.
+///
+/// Grouping is performed by the HTTP query orchestrator after source retrieval
+/// and optional reranking. A hit with no requested group field receives its own
+/// ID as a singleton key so unrelated missing values are not collapsed.
+///
+/// # Examples
+///
+/// Grouping by `category` can produce key `"books"` with three ranked hits;
+/// missing-category hit `doc-9` appears alone under key `"doc-9"`.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResultGroup {
     /// Group key. Missing group fields use the hit id as the singleton key.
@@ -64,7 +224,16 @@ pub struct QueryResultGroup {
     pub results: Vec<SearchResult>,
 }
 
-/// Per-field facet counts keyed by stringified attribute value.
+/// Holds response-level facet counts for requested attribute fields.
+///
+/// The outer map is deterministic for stable JSON output. Each inner map counts
+/// stringified values over the candidate frontier selected by the HTTP layer,
+/// rather than over every record stored in the namespace.
+///
+/// # Examples
+///
+/// Faceting field `color` over four candidates can yield `red: 3` and
+/// `blue: 1`, nested beneath the `color` field key.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryFacets {
     /// Counts for each requested field.
@@ -72,7 +241,18 @@ pub struct QueryFacets {
     pub fields: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
-/// Optional query explain output.
+/// Describes the executed retrieval plan and, optionally, result provenance.
+///
+/// The HTTP layer constructs this after validating the request. Plan mode
+/// describes source selection and downstream transforms; full mode additionally
+/// records how each returned ID scored in its sources and during fusion/rerank.
+/// This is observational metadata and does not drive execution.
+///
+/// # Examples
+///
+/// A two-source ANN/BM25 request can report [`QueryExplainPath::AlgebraHybrid`]
+/// with reciprocal-rank fusion. In full mode, each final hit also lists the raw
+/// ANN distance, raw BM25 score, and each source's fusion contribution.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryExplain {
     /// Explain verbosity.
@@ -84,30 +264,43 @@ pub struct QueryExplain {
     pub results: Option<Vec<QueryExplainResult>>,
 }
 
-/// Explain verbosity.
+/// Selects how much already-executed query information appears in explain data.
+///
+/// This `Copy` enum is a small closed set: matching it is exhaustive, unlike a
+/// Java string constant or C integer whose unknown values require convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryExplainMode {
-    /// Plan-only explain.
+    /// Returns the physical plan but omits per-result score provenance.
     Plan,
-    /// Plan plus returned-result provenance.
+    /// Returns the plan and provenance for each result that survives all stages.
     Full,
 }
 
-/// Executed query plan details.
+/// Captures the effective query plan after validation and default expansion.
+///
+/// `candidate_k`, `first_stage_top_k`, and `top_k` may differ: the handler can
+/// retrieve a wider frontier for fusion, reranking, grouping, facets, or cursor
+/// detection before returning the requested page size.
+///
+/// # Examples
+///
+/// A request with `top_k = 10` and `candidate_k = 100` may execute two sources
+/// at a first-stage width of 100, fuse them, rerank a smaller frontier, and
+/// finally return ten hits. This plan records all three widths.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryExplainPlan {
     /// Physical query path.
     pub path: QueryExplainPath,
-    /// Client-visible candidate_k value after defaults.
+    /// Candidate frontier requested by the client or chosen by defaults.
     pub candidate_k: usize,
-    /// Effective first-stage result count passed to each source/fusion stage.
+    /// Actual width passed into each first-stage retrieval/fusion operation.
     pub first_stage_top_k: usize,
-    /// Client-visible top_k value after defaults.
+    /// Final hit count requested by the client or chosen by defaults.
     pub top_k: usize,
-    /// Effective consistency level.
+    /// Consistency mode applied to every source sharing this plan snapshot.
     pub consistency: ConsistencyLevel,
-    /// Executed candidate sources.
+    /// Candidate sources in request order, which also indexes fusion weights.
     pub sources: Vec<QueryExplainSource>,
     /// Fusion strategy.
     pub fusion: QueryExplainFusion,
@@ -117,98 +310,122 @@ pub struct QueryExplainPlan {
     pub grouping: Option<QueryExplainGrouping>,
     /// Cursor request details.
     pub cursor: QueryExplainCursor,
-    /// Requested facet fields.
+    /// Requested facet fields in client order.
     pub facets: Vec<String>,
     /// Projection details.
     pub projection: QueryExplainProjection,
 }
 
-/// Physical query path.
+/// Identifies which request syntax and number of retrieval sources were used.
+///
+/// Legacy and algebra paths can ultimately call the same ANN/BM25 primitives;
+/// this value explains orchestration, not a different persisted index format.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryExplainPath {
-    /// Legacy vector query path.
+    /// One ANN source selected through the legacy vector request fields.
     LegacyVector,
-    /// Legacy BM25 query path.
+    /// One BM25 source selected through the legacy lexical request fields.
     LegacyBm25,
-    /// Single-source retrieval-algebra query path.
+    /// One source selected through the explicit retrieval-algebra syntax.
     AlgebraSingle,
-    /// Multi-source retrieval-algebra query path.
+    /// Multiple retrieval-algebra sources combined by a fusion stage.
     AlgebraHybrid,
 }
 
-/// Executed candidate source details.
+/// Records one first-stage candidate source in request order.
+///
+/// ANN sources include their effective IVF probe count. BM25 sources leave
+/// `nprobe` absent because lexical index lookup does not use vector clusters as
+/// an approximation parameter.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryExplainSource {
-    /// Source position in the request.
+    /// Zero-based source position, also used to align weights and provenance.
     pub index: usize,
     /// Source kind.
     #[serde(rename = "type")]
     pub kind: QueryExplainSourceKind,
-    /// Effective IVF probe count for ANN sources.
+    /// Effective IVF probe count for ANN, or `None` for BM25.
     pub nprobe: Option<usize>,
     /// Candidate count requested from this source.
     pub candidate_k: usize,
 }
 
-/// Explain source kind.
+/// Distinguishes vector-distance retrieval from lexical-relevance retrieval.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryExplainSourceKind {
-    /// ANN vector source.
+    /// Approximate nearest-neighbor source where a lower raw distance is better.
     Ann,
-    /// BM25 text source.
+    /// BM25 text source where a higher raw relevance score is better.
     Bm25,
 }
 
-/// Fusion strategy in the explain plan.
+/// Describes how multiple source rankings were combined by the HTTP layer.
+///
+/// Raw ANN and BM25 scores point in opposite directions and have unrelated
+/// scales. Reciprocal rank fusion uses only position. Weighted fusion first
+/// min-max normalizes each source and then applies the listed weights.
+///
+/// # Examples
+///
+/// `Rrf { k: 60 }` gives a hit at source rank 1 a contribution of
+/// `1 / (60 + 1)` from that source. A hit present in both sources receives both
+/// contributions.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QueryExplainFusion {
-    /// No fusion.
+    /// No fusion because only one source executed.
     None,
     /// Reciprocal rank fusion.
     Rrf {
-        /// RRF smoothing constant.
+        /// Positive rank offset that controls how quickly contribution decays.
         k: usize,
     },
     /// Weighted min-max normalized fusion.
     Weighted {
-        /// Per-source weights.
+        /// Per-source weights aligned with [`QueryExplainSource::index`].
         weights: Vec<f32>,
     },
 }
 
-/// Rerank strategy in the explain plan.
+/// Describes the optional second-stage scorer applied after candidate retrieval.
+///
+/// Reranking may reorder the candidate frontier but cannot retrieve an ID that
+/// no first-stage source produced.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QueryExplainRerank {
-    /// Engine default rerank behavior.
+    /// Uses the engine's source-dependent default rerank behavior.
     Default,
-    /// Explicitly disabled rerank.
+    /// Preserves fusion or source ordering without a second-stage scorer.
     None,
-    /// Vector rerank.
+    /// Recomputes ordering with vector distance over candidate vectors.
     Vector,
-    /// BM25 rerank.
+    /// Recomputes ordering with lexical relevance over candidate documents.
     Bm25,
 }
 
-/// Grouping strategy in the explain plan.
+/// Describes the response-level grouping applied after ranking.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QueryExplainGrouping {
-    /// Explicitly disabled grouping.
+    /// Returns the ordinary flat ranked list.
     None,
     /// Field grouping.
     Field {
-        /// Attribute field used for grouping.
+        /// Attribute field whose stringified value selects a group.
         field: String,
-        /// Maximum results retained per group.
+        /// Maximum ranked hits retained in any one group.
         max_per_group: usize,
     },
 }
 
-/// Cursor details in the explain plan.
+/// Records whether cursor pagination participated in this execution.
+///
+/// `requested` distinguishes an explicitly requested first page from an
+/// ordinary unpaginated query. `after` records whether a prior-page token was
+/// decoded and applied.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct QueryExplainCursor {
     /// Whether the request included a cursor block.
@@ -217,19 +434,32 @@ pub struct QueryExplainCursor {
     pub after: bool,
 }
 
-/// Projection details in the explain plan.
+/// Records the response projection that affected retrieval materialization.
+///
+/// Attribute omission can avoid decoding or cloning metadata on hot query
+/// paths. Vector projection is not represented because this execution layer
+/// returns IDs, scores, and optional attributes rather than stored vectors.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct QueryExplainProjection {
     /// Whether result attributes are included in the response.
     pub include_attributes: bool,
 }
 
-/// Per-result provenance for full explain output.
+/// Traces one final result through source scoring, fusion, and explicit rerank.
+///
+/// Source entries remain in request order. `fused_score` is the value before an
+/// explicit reranker; when no fusion ran it is simply the single source's raw
+/// score. `rerank_score` is absent unless the handler ran an explicit reranker.
+///
+/// # Examples
+///
+/// A hybrid hit can show ANN raw distance `0.12`, BM25 raw score `8.4`, fused
+/// RRF score `0.031`, and a final vector rerank distance of `0.09`.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryExplainResult {
-    /// Result id.
+    /// Stable record ID of the returned hit.
     pub id: String,
-    /// Per-source score details.
+    /// Score details for sources that contributed or considered this ID.
     pub sources: Vec<QueryExplainResultSource>,
     /// Fused score before explicit rerank, or the source score for single-source queries.
     pub fused_score: f32,
@@ -238,24 +468,39 @@ pub struct QueryExplainResult {
     pub rerank_score: Option<f32>,
 }
 
-/// Per-source score details for one result.
+/// Explains one source's contribution to one final result.
+///
+/// `raw_score` retains the source-native direction. `normalized_score` is only
+/// present for weighted min-max fusion; RRF operates on rank position instead.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryExplainResultSource {
-    /// Source position in the request.
+    /// Zero-based request position identifying the candidate source.
     pub index: usize,
     /// Source kind.
     #[serde(rename = "type")]
     pub kind: QueryExplainSourceKind,
-    /// Raw source score before fusion.
+    /// Native ANN distance or BM25 relevance before fusion.
     pub raw_score: f32,
-    /// Normalized score used by weighted fusion.
+    /// Direction-adjusted, min-max score for weighted fusion, when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normalized_score: Option<f32>,
     /// Score contribution after fusion weighting or RRF contribution.
     pub contribution: f32,
 }
 
-/// Optional client-visible query diagnostics.
+/// Reports measured work for one source execution when debug mode is enabled.
+///
+/// Durations are phase wall times rather than a sum that predicts end-to-end
+/// latency: WAL and segment work normally overlap. For hybrid queries, the HTTP
+/// layer aggregates per-source diagnostics. Counters describe this execution,
+/// not global cache or index totals.
+///
+/// # Examples
+///
+/// An eventual query may report `fragments_scanned = 0`, one segment, and
+/// `underfill_reason = "eventual_skipped_wal"` even though it read WAL
+/// tombstones. The counter measures candidate scoring, while the reason exposes
+/// the deliberate freshness tradeoff.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryDebug {
     /// WAL scan phase latency in milliseconds.
@@ -268,17 +513,24 @@ pub struct QueryDebug {
     pub fragments_scanned: usize,
     /// Number of compacted segments scanned, matching `scanned_segments`.
     pub segments_scanned: usize,
-    /// Number of IVF clusters probed or BM25 fallback clusters scanned.
+    /// IVF clusters probed, or clusters scanned by BM25's compatibility path.
+    ///
+    /// Global BM25 index search reports zero because it does not fan out over
+    /// every per-cluster inverted index.
     pub clusters_probed: usize,
     /// Cache activity observed during this query.
     pub cache: QueryDebugCache,
     /// Effective consistency level used by execution.
     pub consistency_effective: ConsistencyLevel,
-    /// Why fewer than `top_k` results were returned, or null when filled.
+    /// Stable reason code for underfill, or `None` when `top_k` was filled.
     pub underfill_reason: Option<String>,
 }
 
-/// Cache hit/miss counters observed during a debug query.
+/// Counts immutable-object cache outcomes scoped to one debug execution.
+///
+/// A hit avoids an object-store body read. A miss may trigger one fetch whose
+/// bytes are then stored for later queries; these values do not describe the
+/// manifest cache's semantic freshness decision.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct QueryDebugCache {
     /// Cache hits observed during this query.
@@ -287,49 +539,126 @@ pub struct QueryDebugCache {
     pub misses: u64,
 }
 
-/// Parameters for a vector query, grouped to avoid excessive function arguments.
+/// Borrows every dependency and tuning value required by one ANN execution.
+///
+/// The HTTP layer validates dimensions and non-finite coordinates before
+/// constructing this value. This layer assumes the selected distance metric and
+/// query dimensions agree with namespace/index metadata. Grouping parameters
+/// keeps call sites explicit while avoiding a long positional argument list.
+///
+/// # Examples
+///
+/// A strong cosine query can borrow a 768-element vector, the namespace's
+/// readers and caches, request ten results, and probe eight IVF clusters. The
+/// struct itself owns none of those dependencies; they remain usable by the
+/// caller after the async query completes.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The single lifetime `'a` ties all references to a scope that outlives query
+/// execution. Java's garbage collector would keep referenced objects alive at
+/// runtime; C would rely on the caller's discipline. Rust rejects a future that
+/// could outlive any borrowed store, cache, filter, string, or slice. An
+/// `Option<&Arc<DiskCache>>` borrows the caller's shared-owner handle; cloning an
+/// `Arc` elsewhere increments a refcount, not the cached data.
 pub struct QueryParams<'a> {
-    /// S3 storage backend.
+    /// Object-store boundary used for authoritative S3/MinIO artifact reads.
     pub store: &'a ZeppelinStore,
-    /// WAL fragment reader.
+    /// Reader that decodes visible immutable WAL fragments and tombstones.
     pub wal_reader: &'a WalReader,
-    /// Target namespace name.
+    /// Validated namespace whose manifest and artifact keys are addressed.
     pub namespace: &'a str,
-    /// Query vector.
+    /// Borrowed query coordinates with the namespace's configured dimensions.
     pub query: &'a [f32],
-    /// Maximum number of results to return.
+    /// Maximum number of ranked results to return; zero yields an empty set.
     pub top_k: usize,
-    /// Number of IVF clusters to probe.
+    /// Requested IVF clusters to probe, trading object reads/CPU for recall.
     pub nprobe: usize,
-    /// Optional attribute filter.
+    /// Optional metadata predicate applied to WAL and segment candidates.
     pub filter: Option<&'a Filter>,
-    /// Read consistency level (strong or eventual).
+    /// Whether live WAL upserts participate in candidate retrieval.
     pub consistency: ConsistencyLevel,
-    /// Distance metric for scoring.
+    /// Namespace distance metric; lower computed distance is always ranked first.
     pub distance_metric: DistanceMetric,
-    /// Oversample multiplier for filtered queries.
+    /// Candidate multiplier used to compensate for post-filter rejection.
     pub oversample_factor: usize,
-    /// Maximum gap, in bytes, between rerank vector ranges merged into one GET.
+    /// Largest byte gap allowed when coalescing exact-rerank range GETs.
     pub rerank_coalesce_gap_bytes: usize,
-    /// Optional disk cache for cluster data.
+    /// Disposable immutable-artifact cache; absence reads through the store.
     pub cache: Option<&'a Arc<DiskCache>>,
-    /// Optional manifest cache to avoid redundant S3 reads.
+    /// Optional current-manifest cache with consistency-aware freshness rules.
     pub manifest_cache: Option<&'a Arc<ManifestCache>>,
-    /// Whether attributes should be included in returned results.
+    /// Whether winning hits should materialize response attributes.
     pub include_attributes: bool,
 }
 
+/// Orders ANN hits by distance ascending and then by ID ascending.
+///
+/// # Parameters
+///
+/// - `a`: First distance-scored hit.
+/// - `b`: Second distance-scored hit.
+///
+/// # Returns
+///
+/// A total ordering suitable for deterministic sorting and bounded top-k. The
+/// ID tie-break prevents hash-map iteration order from affecting equal scores.
+///
+/// # Examples
+///
+/// Distance `0.1` ranks before `0.2`; equal-distance IDs `a` and `b` rank in
+/// that lexical order.
 fn distance_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
     a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id))
 }
 
+/// Orders lexical hits by BM25 relevance descending and then by ID ascending.
+///
+/// # Parameters
+///
+/// - `a`: First relevance-scored hit.
+/// - `b`: Second relevance-scored hit.
+///
+/// # Returns
+///
+/// A deterministic total ordering with the highest score first.
+///
+/// # Examples
+///
+/// Relevance `8.0` ranks before `3.0`; equal-score IDs use lexical order.
 fn bm25_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
     b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
 }
 
 #[cfg(test)]
+/// Counts attribute-map clones performed while materializing WAL test results.
+///
+/// Production builds omit this counter entirely. Tests reset it before a scan
+/// and verify that rejected candidates do not pay a deep-clone cost.
 static WAL_ATTR_CLONES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Materializes one winning WAL candidate's borrowed attributes.
+///
+/// # Parameters
+///
+/// - `attrs`: Attribute map borrowed from a decoded immutable WAL fragment.
+///
+/// # Returns
+///
+/// An owned deep clone that can outlive the fragment batch. Test builds also
+/// increment `WAL_ATTR_CLONES`.
+///
+/// # Examples
+///
+/// A winning candidate with `{category: "book"}` receives an owned response
+/// map; a candidate discarded by top-k never calls this helper.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Cloning a `HashMap<String, AttributeValue>` allocates and clones its owned
+/// entries; this is not a cheap pointer copy. The query deliberately delays it
+/// until after top-k. Java references would normally share a mutable map unless
+/// explicitly copied, while C would require a hand-written deep-copy contract.
 fn clone_wal_result_attrs(
     attrs: &HashMap<String, AttributeValue>,
 ) -> HashMap<String, AttributeValue> {
@@ -338,6 +667,59 @@ fn clone_wal_result_attrs(
     attrs.clone()
 }
 
+/// Loads the manifest snapshot that will define one current query's visibility.
+///
+/// Strong consistency asks the manifest cache to verify freshness against
+/// object storage. Eventual consistency may reuse a TTL-valid cached snapshot.
+/// Without a cache, both modes read the current object directly; a missing
+/// object becomes an empty manifest for the namespace.
+///
+/// # Parameters
+///
+/// - `store`: Authoritative object-store boundary.
+/// - `namespace`: Namespace whose current manifest is required.
+/// - `consistency`: Freshness contract for cached manifest selection.
+/// - `manifest_cache`: Optional shared cache; `None` forces a direct read.
+///
+/// # Returns
+///
+/// An owned [`Manifest`] snapshot. Later query phases use this exact value and
+/// do not independently refresh it.
+///
+/// # Errors
+///
+/// Propagates object-store, conditional-read, and manifest-decode failures. A
+/// stale cache entry is not served as a fallback after a required refresh
+/// fails, and no query work has begun when this function returns an error.
+///
+/// # Side Effects
+///
+/// May perform a manifest GET or conditional GET and populate/refresh the
+/// shared manifest cache.
+///
+/// # Consistency
+///
+/// The returned value, not later cache changes, is the authority for this
+/// execution. Strong means remotely verified freshness; eventual means bounded
+/// manifest staleness plus the separate tombstone rules enforced downstream.
+///
+/// # Performance
+///
+/// A valid eventual cache entry avoids object-store I/O. Strong normally
+/// performs a conditional GET, which can avoid downloading unchanged bytes.
+/// Concurrent cache misses or verifications are coalesced per namespace.
+///
+/// # Examples
+///
+/// If cached generation 12 is still within the eventual TTL, an eventual query
+/// reuses it. A strong query verifies its ETag; if generation 13 is current,
+/// generation 13 is decoded and governs both WAL and segment work.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The nested exhaustive `match` covers both independent enums/options, so no
+/// null or mode falls through implicitly. `?` propagates a typed error and RAII
+/// releases any cache singleflight guard on every return path.
 pub(crate) async fn read_manifest_for_query(
     store: &ZeppelinStore,
     namespace: &str,
@@ -353,6 +735,28 @@ pub(crate) async fn read_manifest_for_query(
     }
 }
 
+/// Classifies why a debug query returned fewer than its requested top-k.
+///
+/// # Parameters
+///
+/// - `results_len`: Number of final ranked hits.
+/// - `top_k`: Requested result count.
+/// - `consistency`: Effective consistency mode.
+/// - `eventual_skipped_wal`: Whether visible uncompacted upserts were omitted.
+/// - `scanned_fragments`: WAL fragment scoring count.
+/// - `scanned_segments`: Active segment search count.
+///
+/// # Returns
+///
+/// `None` when the result set is full. Otherwise returns one stable reason code:
+/// eventual WAL omission takes precedence, then absence of any candidate source,
+/// then the general `not_enough_matches` condition.
+///
+/// # Examples
+///
+/// Three hits for `top_k = 10` with an eventual skipped WAL returns
+/// `eventual_skipped_wal`; zero hits with no WAL or segment returns
+/// `no_index_or_wal_data`.
 fn query_underfill_reason(
     results_len: usize,
     top_k: usize,
@@ -373,6 +777,34 @@ fn query_underfill_reason(
     Some("not_enough_matches".to_string())
 }
 
+/// Resolves the manifest's active segment ID to an owned descriptor.
+///
+/// # Parameters
+///
+/// - `manifest`: Chosen visibility snapshot.
+///
+/// # Returns
+///
+/// A cloned [`SegmentRef`] when `active_segment` names a retained descriptor;
+/// `None` when no active ID exists or the descriptor cannot be found. The
+/// current caller treats both cases as “no compacted segment” rather than
+/// reporting a malformed-manifest error.
+///
+/// # Consistency
+///
+/// Resolution is confined to the supplied snapshot; the helper never lists
+/// objects or chooses another retained segment as a fallback.
+///
+/// # Examples
+///
+/// A manifest retaining `seg_old` and active `seg_new` yields a clone of
+/// `seg_new`; historical descriptors are not searched.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `as_ref`, `and_then`, and `find` borrow through nested optional state, then
+/// `cloned` creates an owned descriptor so async closures can share it without
+/// retaining an iterator borrow into the manifest.
 fn active_segment_ref(manifest: &Manifest) -> Option<SegmentRef> {
     manifest.active_segment.as_ref().and_then(|segment_id| {
         manifest
@@ -383,6 +815,38 @@ fn active_segment_ref(manifest: &Manifest) -> Option<SegmentRef> {
     })
 }
 
+/// Decides whether suppression requires a wider second segment search.
+///
+/// A first segment search can fill `requested_top_k` entirely with IDs that a
+/// newer WAL upsert or tombstone will later remove. When that happens, this
+/// helper conservatively widens the segment frontier by the number of distinct
+/// IDs that *could* be suppressed, capped by the segment's vector count.
+///
+/// # Parameters
+///
+/// - `segment_results`: Initial score-ordered segment frontier.
+/// - `requested_top_k`: Original source result count.
+/// - `consistency`: Determines whether live WAL replacements suppress segment
+///   hits or only tombstones do.
+/// - `wal_overriding_ids`: Every live latest WAL ID.
+/// - `wal_deleted_ids`: Every effective WAL tombstone ID.
+/// - `segment_vector_count`: Manifest-declared upper bound on segment hits.
+///
+/// # Returns
+///
+/// A larger `top_k` for one retry, or `None` when the initial frontier is not
+/// full, contains no suppressed hit, cannot be widened, or requested zero.
+///
+/// # Performance
+///
+/// Scans the initial frontier and suppression sets in memory. Returning `Some`
+/// causes a second ANN segment search, including its cache/S3 and rerank costs.
+///
+/// # Examples
+///
+/// If top three segment hits contain two IDs replaced in strong WAL state and
+/// the segment has at least five records, this returns a retry width of five.
+/// Eventual mode ignores live replacements but still widens for tombstones.
 fn segment_refill_top_k(
     segment_results: &[SearchResult],
     requested_top_k: usize,
@@ -416,6 +880,23 @@ fn segment_refill_top_k(
         .map(|extra| requested_top_k + extra)
 }
 
+/// Counts initial segment hits that the selected consistency mode will remove.
+///
+/// # Parameters
+///
+/// - `segment_results`: Candidate frontier to inspect.
+/// - `consistency`: Strong or eventual suppression policy.
+/// - `wal_overriding_ids`: IDs with a newer live WAL version.
+/// - `wal_deleted_ids`: IDs whose latest WAL state is deleted.
+///
+/// # Returns
+///
+/// Number of candidates that cannot survive final merge.
+///
+/// # Examples
+///
+/// For segment IDs `[a, b, c]`, live WAL replacement `a`, and tombstone `b`,
+/// strong returns two while eventual returns one.
 fn count_suppressed_segment_hits(
     segment_results: &[SearchResult],
     consistency: ConsistencyLevel,
@@ -430,6 +911,25 @@ fn count_suppressed_segment_hits(
         .count()
 }
 
+/// Tests whether one segment ID is hidden by newer WAL state.
+///
+/// # Parameters
+///
+/// - `id`: Borrowed segment result ID.
+/// - `consistency`: Strong suppresses replacements and deletes; eventual only
+///   suppresses deletes.
+/// - `wal_overriding_ids`: Live latest WAL IDs.
+/// - `wal_deleted_ids`: Effective WAL tombstones.
+///
+/// # Returns
+///
+/// `true` when final merge must omit this segment version.
+///
+/// # Examples
+///
+/// A freshly updated ID is suppressed under strong consistency but remains the
+/// older segment version under eventual consistency; a deleted ID is always
+/// suppressed.
 fn segment_hit_suppressed(
     id: &str,
     consistency: ConsistencyLevel,
@@ -442,6 +942,23 @@ fn segment_hit_suppressed(
     }
 }
 
+/// Computes the maximum number of distinct segment IDs suppression may remove.
+///
+/// # Parameters
+///
+/// - `consistency`: Selects replacement-plus-delete or delete-only semantics.
+/// - `wal_overriding_ids`: Live latest WAL IDs.
+/// - `wal_deleted_ids`: Effective WAL tombstone IDs.
+///
+/// # Returns
+///
+/// Size of the union for strong reads or tombstone count for eventual reads.
+/// Overlapping replacement/delete sets count once.
+///
+/// # Examples
+///
+/// Override set `{a, b}` and tombstone set `{b, c}` produce a strong upper
+/// bound of three and an eventual upper bound of two.
 fn suppressed_segment_id_upper_bound(
     consistency: ConsistencyLevel,
     wal_overriding_ids: &HashSet<String>,
@@ -453,7 +970,62 @@ fn suppressed_segment_id_upper_bound(
     }
 }
 
-/// Execute a query against a namespace, combining WAL scan and segment search.
+/// Executes one vector query against the namespace's current manifest snapshot.
+///
+/// This convenience entry point first applies consistency-aware manifest
+/// loading, then searches the snapshot through the same path used by batch and
+/// historical callers. It does not add HTTP-level fusion, rerank, pagination,
+/// grouping, facets, or explain output.
+///
+/// # Parameters
+///
+/// - `params`: Borrowed vector query dependencies and tuning values. Callers
+///   must validate dimensions and finite coordinates before entering this hot
+///   path.
+///
+/// # Returns
+///
+/// A [`QueryResponse`] whose results are ordered by ascending distance and
+/// contain at most `top_k` entries. Debug and response-enrichment fields are
+/// absent.
+///
+/// # Errors
+///
+/// Propagates manifest freshness/read/decode failures, WAL reads, immutable
+/// segment loads, cache fetches, index decoding, and ANN search errors. If any
+/// concurrent branch fails, no partial response is returned.
+///
+/// # Side Effects
+///
+/// Reads the current manifest and visible immutable artifacts, may populate
+/// manifest/disk caches, and emits tracing events. It publishes no state.
+///
+/// # Consistency
+///
+/// Strong mode remotely verifies the current manifest and includes latest WAL
+/// upserts. Eventual mode may use a TTL-valid manifest and skips WAL upserts,
+/// but still reads visible WAL tombstones so deletes do not reappear.
+///
+/// # Performance
+///
+/// After manifest selection, WAL and segment branches run concurrently. A
+/// cache miss incurs object-store GETs for visible WAL/index artifacts. ANN
+/// segment cost depends on index family, `nprobe`, filtering, quantization, and
+/// exact-rerank range coalescing. Suppression can trigger one wider retry.
+///
+/// # Examples
+///
+/// With active segment `seg-9` and two uncompacted fragments, a strong query
+/// searches `seg-9`, replays both fragments, removes segment hits replaced or
+/// deleted by WAL state, and returns the nearest ten. If a required cluster
+/// object is missing, it returns an error rather than the WAL-only partial list.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `QueryParams<'_>` is moved into the async function, but its fields are
+/// borrows. Moving the wrapper does not move the stores or query coordinates.
+/// The `#[instrument(skip(params))]` macro adds tracing without trying to format
+/// large or sensitive borrowed inputs.
 #[instrument(skip(params), fields(namespace = params.namespace))]
 pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
     let manifest = read_manifest_for_query(
@@ -466,9 +1038,38 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
     execute_query_with_manifest_inner(params, manifest, false).await
 }
 
-/// Execute a vector query against an already-read manifest snapshot.
+/// Executes a vector query against an already-selected manifest snapshot.
 ///
-/// Batch query uses this to share one manifest freshness check across entries.
+/// Batch, hybrid, and historical query orchestration uses this to share one
+/// freshness/as-of decision instead of letting each source read a different
+/// current manifest.
+///
+/// # Parameters
+///
+/// - `params`: Borrowed ANN dependencies and settings; its manifest-cache field
+///   is ignored because visibility has already been selected.
+/// - `manifest`: Owned authoritative snapshot for this execution.
+///
+/// # Returns
+///
+/// Distance-ordered results and scan counts, with no debug block.
+///
+/// # Errors
+///
+/// Propagates artifact reads, cache operations, decoding, and index search
+/// failures. The supplied manifest is not replaced with a newer one on error.
+///
+/// # Consistency
+///
+/// `consistency` still controls WAL participation, but it does not change the
+/// supplied snapshot's artifact membership. This is what preserves `as_of` and
+/// same-snapshot multi-source semantics.
+///
+/// # Examples
+///
+/// A batch handler reads generation 42 once, clones it for three requests, and
+/// calls this function three times. A concurrently published generation 43 is
+/// not mixed into that batch.
 pub(crate) async fn execute_query_with_manifest(
     params: QueryParams<'_>,
     manifest: Manifest,
@@ -476,7 +1077,31 @@ pub(crate) async fn execute_query_with_manifest(
     execute_query_with_manifest_inner(params, manifest, false).await
 }
 
-/// Execute a vector query with an opt-in debug response block.
+/// Executes a supplied-snapshot vector query while collecting scoped diagnostics.
+///
+/// # Parameters
+///
+/// - `params`: Borrowed ANN dependencies and execution settings.
+/// - `manifest`: Owned visibility snapshot selected by the caller.
+///
+/// # Returns
+///
+/// The normal distance-ranked response plus WAL, segment, merge, cluster, cache,
+/// consistency, and underfill diagnostics.
+///
+/// # Errors
+///
+/// Returns the same failures as [`execute_query`]; diagnostics never turn a
+/// failed source into a partial successful response.
+///
+/// # Side Effects
+///
+/// Installs task-scoped cache counters for the duration of execution.
+///
+/// # Examples
+///
+/// A debug query whose immutable cluster is already cached reports a cache hit
+/// while returning exactly the same result ordering as the non-debug path.
 pub(crate) async fn execute_query_with_manifest_debug(
     params: QueryParams<'_>,
     manifest: Manifest,
@@ -484,6 +1109,38 @@ pub(crate) async fn execute_query_with_manifest_debug(
     execute_query_with_manifest_inner(params, manifest, true).await
 }
 
+/// Selects normal or diagnostic vector execution for one supplied snapshot.
+///
+/// # Parameters
+///
+/// - `params`: Borrowed ANN execution dependencies.
+/// - `manifest`: Owned visibility snapshot.
+/// - `emit_debug`: Whether cache diagnostics should be installed and returned.
+///
+/// # Returns
+///
+/// The completed query response, with `debug` populated only when requested.
+///
+/// # Errors
+///
+/// Propagates every error from scoped vector execution.
+///
+/// # Side Effects
+///
+/// Debug mode creates an [`Arc`] around per-query counters and installs it in
+/// task-local diagnostic scope. Normal mode avoids that allocation.
+///
+/// # Examples
+///
+/// `emit_debug = false` executes directly. `true` counts cache outcomes in
+/// nested index fetches without changing candidate selection.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `async move` transfers the wrapper values and one cloned `Arc` handle into
+/// the scoped future. The original counter remains shared through atomic
+/// reference counting; Rust prevents either handle from being freed while the
+/// future can still use it.
 async fn execute_query_with_manifest_inner(
     params: QueryParams<'_>,
     manifest: Manifest,
@@ -499,6 +1156,84 @@ async fn execute_query_with_manifest_inner(
     execute_query_with_manifest_scoped(params, manifest, None).await
 }
 
+/// Runs all vector-query phases against one immutable manifest view.
+///
+/// The function concurrently obtains the latest permitted WAL view and the
+/// active segment frontier, optionally widens segment search after WAL
+/// suppression, then performs a deterministic latest-write-wins merge.
+///
+/// ```text
+///                         one owned Manifest
+///                         /                \
+///                        v                  v
+///             WAL future                    segment future
+/// Strong: replay + score          active descriptor -> ANN search
+/// Eventual: tombstones only       IVF-Flat or hierarchical
+///                        \                  /
+///                         +------ join -----+
+///                                  |
+///                    suppressed hit in full frontier?
+///                       | no              | yes
+///                       |                 v
+///                       |       one wider segment retry
+///                       +-----------------+
+///                                  v
+///                 WAL overrides/tombstones -> top-k merge
+/// ```
+///
+/// # Parameters
+///
+/// - `params`: Borrowed vector, store/readers, consistency, filter, cache, and
+///   ANN tuning. The manifest-cache reference is intentionally unused because
+///   the snapshot is already fixed.
+/// - `manifest`: Owned snapshot defining visible WAL refs and active segment.
+/// - `cache_diagnostics`: Optional shared counters already installed in task
+///   scope by the wrapper.
+///
+/// # Returns
+///
+/// A response containing ascending-distance hits, scored-source counts, and an
+/// optional debug block. Enrichment fields remain absent for the HTTP layer.
+///
+/// # Errors
+///
+/// Returns if either concurrent branch fails, or if a later refill fails. No
+/// partial WAL-only or segment-only response escapes. Reads may already have
+/// warmed disposable caches before the error.
+///
+/// # Side Effects
+///
+/// Reads visible immutable objects, can populate disk cache entries, updates
+/// scoped cache counters, and emits phase tracing. It never mutates a manifest
+/// or artifact.
+///
+/// # Consistency
+///
+/// Both futures borrow the same manifest. Strong scans WAL live state and
+/// tombstones; eventual reads tombstones only. A live WAL ID suppresses an old
+/// segment version under strong mode even when the live record fails filtering
+/// or top-k. Tombstones suppress segment results under both modes.
+///
+/// # Performance
+///
+/// `tokio::join!` overlaps I/O but waits for both branches. `nprobe` is capped
+/// only for the debug counter; the index implementation owns effective probing.
+/// A full initial frontier containing suppressed IDs may cause one additional
+/// segment search with a bounded larger `top_k`.
+///
+/// # Examples
+///
+/// Segment top three are `a, b, c`; WAL contains a newer `a` that ranks poorly
+/// and tombstones `b`. Strong merge must not return stale `a` or deleted `b`.
+/// The refill asks for deeper segment candidates so `c, d, ...` can fill the
+/// response before the newer WAL `a` is considered by distance.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Destructuring `QueryParams` creates local borrowed bindings without cloning
+/// the underlying stores or vector. Both async blocks borrow immutable snapshot
+/// data, so Rust permits concurrent access. `tokio::join!` does not detach work:
+/// the function owns and polls both futures until both complete.
 async fn execute_query_with_manifest_scoped(
     params: QueryParams<'_>,
     manifest: Manifest,
@@ -711,22 +1446,121 @@ async fn execute_query_with_manifest_scoped(
     })
 }
 
-/// Result of an ANN WAL scan.
+/// Separates scored WAL hits from the metadata needed to suppress stale segments.
+///
+/// `results` alone is insufficient for correctness: a latest WAL upsert may
+/// fail a filter or fall outside top-k yet must still hide the same ID's older
+/// compacted version under strong consistency.
+///
+/// # Examples
+///
+/// If WAL updates `a` to metadata that fails the query filter and deletes `b`,
+/// `results` can be empty while `overriding_ids = {a}` and
+/// `deleted_ids = {b}`. Strong merge removes both old segment records.
 struct WalScanResult {
     /// Top-k scored search results, sorted ascending by distance.
     results: Vec<SearchResult>,
     /// All live WAL IDs after dedup/delete processing, including IDs that
     /// filter out or rank outside top-k. These suppress stale segment hits.
     overriding_ids: HashSet<String>,
-    /// Number of WAL fragments scanned.
+    /// Number of decoded fragments replayed, including delete-only fragments.
     fragment_count: usize,
-    /// IDs that were explicitly deleted in the WAL.
-    /// Used by the merge step to exclude these from segment results.
+    /// IDs whose latest effective WAL state is a delete tombstone.
+    ///
+    /// A later upsert removes an ID from this set. Both consistency modes use
+    /// it to prevent a compacted record from being resurrected.
     deleted_ids: HashSet<String>,
 }
 
-/// Scan all uncompacted WAL fragments, deduplicate, apply deletes, score, and filter.
-/// Reads fragments from the provided manifest snapshot (not re-reading manifest from S3).
+/// Replays and distance-scores every visible uncompacted WAL fragment.
+///
+/// Fragment refs come from the supplied manifest snapshot; this function never
+/// refreshes visibility state. It decodes the referenced immutable fragments,
+/// applies oldest-to-newest last-write-wins replay, evaluates metadata filters,
+/// and keeps a bounded nearest-neighbor frontier. It also preserves complete
+/// replacement/tombstone sets for final segment suppression.
+///
+/// ```text
+/// manifest.fragment refs (oldest -> newest)
+///                  |
+///                  v
+///       cache or S3 immutable reads
+///                  |
+///                  v
+/// deletes remove ID; later upserts replace/revive ID
+///                  |
+///          +-------+-------------------+
+///          |                           |
+///          v                           v
+/// all live IDs for suppression    filter -> distance -> TopK
+///                                      |
+///                                      v
+///                          clone attributes for winners only
+/// ```
+///
+/// # Parameters
+///
+/// - `wal_reader`: Reader for manifest-selected immutable fragment objects.
+/// - `namespace`: Namespace prefix used to resolve fragment keys.
+/// - `manifest`: Fixed authoritative snapshot; refs must be in replay order.
+/// - `query`: Borrowed query coordinates matching stored vector dimensions.
+/// - `filter`: Optional metadata predicate. A record without attributes fails
+///   any supplied filter.
+/// - `distance_metric`: Metric used for every live vector; lower is better.
+/// - `cache`: Optional immutable fragment cache.
+/// - `include_attributes`: Whether winning hits deep-clone their attributes.
+/// - `top_k`: Maximum number of scored results to materialize.
+///
+/// # Returns
+///
+/// Ranked WAL hits plus every effective live replacement ID, fragment count,
+/// and final tombstone ID. Results sort by distance then ID and contain at most
+/// `top_k` entries.
+///
+/// # Errors
+///
+/// Propagates fragment fetch and decode failures. Query reads intentionally use
+/// the unchecked reader because fragments were checksum-validated when written;
+/// this path does not silently skip a missing or malformed visible object.
+///
+/// # Panics
+///
+/// Distance kernels require query/stored vector dimensions to agree. The HTTP
+/// and write paths establish this invariant before execution; violating it can
+/// trigger a debug assertion and would make optimized kernels invalid.
+///
+/// # Side Effects
+///
+/// May populate the disk cache and emits one debug event. It performs no writes.
+///
+/// # Consistency
+///
+/// Slice order defines replay order. Deletes within one fragment are processed
+/// before its vectors, so an upsert for the same ID in that fragment is live.
+/// `overriding_ids` includes filtered and out-of-frontier live records because
+/// they still supersede compacted versions.
+///
+/// # Performance
+///
+/// Reads each visible uncompacted fragment, uses memory proportional to distinct
+/// replayed IDs, scores every latest live record passing the filter, and keeps
+/// only `top_k` scored wrappers. Vector payloads and attributes stay borrowed;
+/// IDs and optional attributes are allocated only for suppression metadata and
+/// final winners.
+///
+/// # Examples
+///
+/// Fragment 1 upserts `a` and `b`; fragment 2 deletes `a` and updates `b`.
+/// The scan returns no `a`, scores only the new `b`, records `a` as deleted,
+/// and records `b` as overriding even if `b` fails the filter.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `latest_vectors` stores `&str`, `&[f32]`, and attribute references into the
+/// owned fragment vector. Rust's lifetimes prevent those borrowed views from
+/// escaping after fragments are dropped. Java would retain object references;
+/// C would need manual guarantees that backing allocations remain alive. The
+/// final iterator converts only winners into fully owned API values.
 #[allow(clippy::too_many_arguments)]
 async fn wal_scan(
     wal_reader: &WalReader,
@@ -784,9 +1618,13 @@ async fn wal_scan(
         }
     }
 
+    /// Borrows one scored candidate until bounded selection chooses winners.
     struct ScoredWalVector<'a> {
+        /// Logical vector ID borrowed from the replay map.
         id: &'a str,
+        /// Source-native distance; smaller values rank first.
         score: f32,
+        /// Winning upsert's optional attributes, still borrowed from its fragment.
         attrs: Option<&'a HashMap<String, AttributeValue>>,
     }
 
@@ -849,11 +1687,85 @@ async fn wal_scan(
     })
 }
 
-/// Search a single segment via IVF-Flat or Hierarchical index.
+/// Searches one active immutable segment through its manifest-declared index family.
 ///
-/// Uses `SegmentRef` metadata to determine index type (hierarchical vs flat)
-/// without probing S3, and loads the IVF-Flat index with pre-known metadata
-/// to skip cluster-count probing and quantization detection.
+/// Manifest metadata selects hierarchical navigation or IVF-Flat directly,
+/// avoiding object-store probes to infer the layout. Bitmap-field metadata is
+/// attached after loading so the index search can prefilter candidates where
+/// persisted bitmaps exist. Both paths eventually return exact or approximate
+/// distance-scored candidates according to their index implementation.
+///
+/// ```text
+/// SegmentRef from chosen manifest
+///          |
+///          +-- hierarchical = true --> load hierarchy -> beam search
+///          |
+///          +-- hierarchical = false -> load IVF metadata -> nprobe clusters
+///                                                      |
+/// filter + bitmap fields ------------------------------+
+///                                                      v
+///                                    optional exact rerank -> distance top-k
+/// ```
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary for immutable segment artifacts.
+/// - `namespace`: Namespace prefix owning the logical segment.
+/// - `segment_ref`: Active descriptor from the fixed manifest snapshot.
+/// - `query`: Borrowed query coordinates matching the segment dimensions.
+/// - `top_k`: Maximum candidate results returned by the index.
+/// - `nprobe`: IVF cluster count or hierarchical beam width, depending on index
+///   family; larger values generally spend more I/O/CPU for better recall.
+/// - `filter`: Optional metadata predicate, using bitmap prefilter where
+///   available and exact attribute evaluation for correctness.
+/// - `distance_metric`: Namespace metric; returned scores are lower-is-better.
+/// - `oversample_factor`: Extra candidate multiplier for filtered retrieval.
+/// - `rerank_coalesce_gap_bytes`: Range gap threshold for coalescing exact
+///   rerank reads in applicable IVF layouts.
+/// - `cache`: Optional disposable cache for immutable artifacts.
+/// - `include_attributes`: Whether returned hits should carry attributes.
+///
+/// # Returns
+///
+/// At most `top_k` segment hits ordered by distance and ID according to the
+/// selected index implementation.
+///
+/// # Errors
+///
+/// Propagates missing/corrupt object, cache, index-load, bitmap/filter, cluster
+/// decode, and search failures. No alternate index family or partial result is
+/// substituted.
+///
+/// # Side Effects
+///
+/// Performs immutable object reads, may populate the disk cache, and updates no
+/// authoritative state.
+///
+/// # Consistency
+///
+/// The descriptor was selected by the manifest before this call. Object
+/// existence alone cannot make another segment visible, and retained older
+/// descriptors are never probed as fallback.
+///
+/// # Performance
+///
+/// Manifest-provided cluster count, quantization, ownership, packed-object,
+/// sketch, and bootstrap metadata avoid discovery GETs. Actual reads scale with
+/// index navigation, `nprobe`, filter selectivity, cache hits, and reranking.
+///
+/// # Examples
+///
+/// A flat segment with 100 clusters and `nprobe = 8` selects nearby clusters,
+/// reads their immutable data (or cache entries), filters candidates, and
+/// returns the nearest ten. A hierarchical descriptor uses `8` as beam width
+/// instead of pretending its artifacts are flat.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Both index values are owned locals; only one branch is constructed. Mutable
+/// access is used briefly to attach manifest bitmap metadata before the index is
+/// borrowed across async search. Rust prevents another alias from mutating that
+/// metadata during the await, unlike an unsynchronized Java object or C struct.
 #[allow(clippy::too_many_arguments)]
 async fn segment_search(
     store: &ZeppelinStore,
@@ -926,9 +1838,98 @@ async fn segment_search(
     Ok(results)
 }
 
-/// Execute a BM25 full-text search query against a namespace.
+/// Executes one BM25/ranking-expression query against the current manifest.
 ///
-/// Combines WAL brute-force scan with segment inverted index search.
+/// The function chooses a consistency-appropriate current snapshot, then runs
+/// WAL lexical scoring and active-segment inverted-index search concurrently.
+/// Strong merge keeps latest WAL documents and suppresses older segment
+/// versions. Eventual merge uses the segment ranking but still honors WAL
+/// tombstones. Larger scores rank first.
+///
+/// ```text
+///                    current Manifest
+///                    /              \
+///                   v                v
+/// Strong: WAL BM25 scan       active segment FTS
+/// Eventual: tombstones only   global index preferred
+///                   \                /
+///                    +------ join ---+
+///                            |
+///             suppress stale/deleted segment IDs
+///                            |
+///                            v
+///                  BM25 score descending
+/// ```
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary for manifest and immutable index reads.
+/// - `wal_reader`: Decoder for visible uncompacted WAL fragments/tombstones.
+/// - `namespace`: Validated namespace name.
+/// - `rank_by`: Parsed expression naming BM25 field/query leaves and how their
+///   scores combine.
+/// - `fts_configs`: Tokenizer and BM25 parameters for every configured field.
+///   Normal HTTP callers validate every `rank_by` field before this call.
+/// - `top_k`: Maximum relevance-ranked hits to return.
+/// - `filter`: Optional metadata predicate; missing attributes do not match.
+/// - `consistency`: Whether live uncompacted documents are scored.
+/// - `last_as_prefix`: Whether the final query token uses prefix matching.
+/// - `manifest_cache`: Optional consistency-aware current-manifest cache.
+/// - `fts_cache`: Optional CPU cache for WAL tokenization/statistics inputs.
+/// - `cache`: Optional disk cache for immutable WAL and segment objects.
+/// - `max_full_scan_clusters`: Circuit-breaker cluster limit when an old segment
+///   lacks the global FTS artifact; zero disables this limit.
+/// - `max_full_scan_vectors`: Equivalent vector-count circuit breaker; zero
+///   disables this limit.
+/// - `include_attributes`: Whether winning hits materialize attributes.
+///
+/// # Returns
+///
+/// A [`QueryResponse`] with at most `top_k` hits ordered by descending
+/// [`RankBy`] score, source scan counts, and no debug/enrichment fields.
+///
+/// # Errors
+///
+/// Propagates manifest/WAL/index object reads and decoding failures. Returns an
+/// index-unavailable error when the active segment lacks a requested FTS field,
+/// or when a missing global FTS index would exceed either compatibility-scan
+/// budget. No partial source list is returned.
+///
+/// # Side Effects
+///
+/// Reads current authority and immutable artifacts, may populate three distinct
+/// caches, evicts compacted fragment entries from the WAL FTS cache, emits
+/// tracing, and may emit an operator warning for the old full-scan path.
+///
+/// # Consistency
+///
+/// One manifest snapshot governs both futures. Strong reads include latest WAL
+/// documents; every live WAL ID suppresses its segment version even if it does
+/// not match the text/filter. Eventual reads omit live WAL documents but apply
+/// tombstones. Uploaded artifacts absent from the snapshot are invisible.
+///
+/// # Performance
+///
+/// WAL and segment I/O overlap. A modern segment uses one global inverted-index
+/// object plus only cluster ID/attribute objects for matching positions. An old
+/// segment fans out over every cluster and is refused before I/O when configured
+/// limits are exceeded. WAL and segment BM25 statistics are computed over their
+/// respective corpora; merge compares the resulting scores directly.
+///
+/// # Examples
+///
+/// A strong title/content query sees a newly updated WAL document immediately,
+/// suppresses its older compacted version, and may rank it with segment hits.
+/// If the segment predates the requested `title` FTS field, the query fails with
+/// an operator-facing index-unavailable error instead of silently searching
+/// only WAL content.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Most inputs are shared borrows, so the function cannot mutate or retain
+/// caller-owned request/config data beyond its future. Optional caches use
+/// `Option<&Arc<T>>`: the caller controls whether shared state exists, and Rust
+/// proves every reference stays valid across concurrent awaits.
 #[allow(clippy::too_many_arguments)]
 #[instrument(
     skip(
@@ -982,9 +1983,44 @@ pub async fn execute_bm25_query(
     .await
 }
 
-/// Execute a BM25 query against an already-read manifest snapshot.
+/// Executes BM25 retrieval against an already-selected manifest snapshot.
 ///
-/// Batch query uses this to share one manifest freshness check across entries.
+/// Batch, hybrid, and historical orchestration use this entry point so all
+/// sources share one current/as-of decision. Parameters match
+/// [`execute_bm25_query`] except that manifest loading is deliberately absent.
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary for immutable artifact reads.
+/// - `wal_reader`: Reader for visible WAL refs.
+/// - `namespace`: Namespace owning the snapshot artifacts.
+/// - `rank_by`: Validated lexical ranking expression.
+/// - `fts_configs`: Per-field tokenizer/BM25 configuration.
+/// - `top_k`: Maximum returned hits.
+/// - `filter`: Optional metadata predicate.
+/// - `consistency`: WAL inclusion policy applied within the supplied snapshot.
+/// - `last_as_prefix`: Whether the final query token is a prefix.
+/// - `fts_cache`: Optional shared WAL lexical cache.
+/// - `cache`: Optional immutable-object disk cache.
+/// - `max_full_scan_clusters`: Old-index cluster fan-out limit, or zero.
+/// - `max_full_scan_vectors`: Old-index vector-count limit, or zero.
+/// - `include_attributes`: Whether winners include attribute maps.
+/// - `manifest`: Owned authoritative snapshot selected by the caller.
+///
+/// # Returns
+///
+/// Descending-score results and scan counts, without diagnostics.
+///
+/// # Errors
+///
+/// Returns the artifact, decode, configuration-availability, and circuit-breaker
+/// errors described by [`execute_bm25_query`]. It never refreshes or substitutes
+/// the supplied snapshot.
+///
+/// # Examples
+///
+/// An `as_of` handler resolves generation 17 and passes it here. Even if current
+/// generation 20 exists, lexical source membership remains generation 17.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_bm25_query_with_manifest(
     store: &ZeppelinStore,
@@ -1024,7 +2060,33 @@ pub(crate) async fn execute_bm25_query_with_manifest(
     .await
 }
 
-/// Execute a BM25 query with an opt-in debug response block.
+/// Executes supplied-snapshot BM25 retrieval with scoped cache diagnostics.
+///
+/// # Parameters
+///
+/// Parameters have the same meaning and preconditions as
+/// `execute_bm25_query_with_manifest`; the function always enables debug
+/// measurement for this call.
+///
+/// # Returns
+///
+/// The normal relevance-ranked response with phase timings, cache counters,
+/// effective consistency, cluster work, and underfill reason populated.
+///
+/// # Errors
+///
+/// Returns the same fail-loud errors as [`execute_bm25_query`]. Debug collection
+/// does not permit partial results.
+///
+/// # Side Effects
+///
+/// Installs task-scoped cache counters in addition to normal immutable reads and
+/// WAL FTS cache maintenance.
+///
+/// # Examples
+///
+/// A global-index query can report `clusters_probed = 0` and a disk-cache hit;
+/// the same query on an old compatibility index reports every scanned cluster.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_bm25_query_with_manifest_debug(
     store: &ZeppelinStore,
@@ -1065,6 +2127,27 @@ pub(crate) async fn execute_bm25_query_with_manifest_debug(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Selects normal or diagnostic BM25 execution for a supplied snapshot.
+///
+/// # Parameters
+///
+/// - All retrieval parameters have the same contracts as
+///   `execute_bm25_query_with_manifest`.
+/// - `emit_debug`: Whether to allocate/install scoped cache diagnostics.
+///
+/// # Returns
+///
+/// The complete BM25 response with debug data present only when requested.
+///
+/// # Errors
+///
+/// Propagates every scoped-execution failure.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The debug branch clones only an `Arc` handle to shared counters, then moves
+/// borrowed references and the owned manifest into one future. RAII destroys the
+/// diagnostic scope and counter handles on both success and error.
 async fn execute_bm25_query_with_manifest_inner(
     store: &ZeppelinStore,
     wal_reader: &WalReader,
@@ -1130,6 +2213,62 @@ async fn execute_bm25_query_with_manifest_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Runs WAL and segment BM25 phases against one manifest and merges their scores.
+///
+/// The function also keeps the derived WAL FTS cache bounded by removing entries
+/// for fragments no longer uncompacted in this snapshot. A global segment index
+/// is preferred; an older per-cluster layout is subject to explicit fan-out
+/// budgets before any compatibility-scan I/O.
+///
+/// # Parameters
+///
+/// Retrieval arguments match `execute_bm25_query_with_manifest`.
+/// `cache_diagnostics` optionally owns the counters installed by the wrapper.
+///
+/// # Returns
+///
+/// At most `top_k` descending-score hits, scored fragment/segment counts, and
+/// optional diagnostics. Attributes are stripped after merge when not requested.
+///
+/// # Errors
+///
+/// Either concurrent branch can fail for storage, decode, missing FTS field, or
+/// compatibility budget reasons. Both futures are polled to completion by
+/// `tokio::join!`, but no partial response is returned. Cache warming or WAL FTS
+/// eviction may already have occurred.
+///
+/// # Side Effects
+///
+/// Evicts obsolete entries from [`WalFtsCache`], reads immutable objects, may
+/// populate caches, records diagnostics, and emits tracing/warnings.
+///
+/// # Consistency
+///
+/// Strong WAL replay yields both candidates and complete live override/delete
+/// sets. Eventual mode reads only deletes. Both branches use one manifest; an
+/// active segment is resolved from that value, never from object listing. As on
+/// the ANN path, an active ID with no matching retained descriptor is currently
+/// treated as no segment rather than a manifest error.
+///
+/// # Performance
+///
+/// WAL and segment futures overlap. When uncompacted fragments exist, segment
+/// search requests an unbounded intermediate frontier (`usize::MAX`) so later
+/// suppression cannot underfill BM25 results; final merge bounds it to `top_k`.
+/// The global index avoids scanning all clusters.
+///
+/// # Examples
+///
+/// Segment document `p7` scores 9, but strong WAL updates `p7` to text scoring
+/// zero. `p7` remains in `wal_overriding_ids`, so the stale score-9 segment hit
+/// is removed even though no WAL replacement appears in the response.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The two async blocks capture shared immutable borrows and the same owned
+/// manifest by reference. `tokio::join!` provides structured concurrency: work
+/// cannot outlive this call, and `?` propagates typed branch errors after local
+/// values are cleaned up.
 async fn execute_bm25_query_with_manifest_scoped(
     store: &ZeppelinStore,
     wal_reader: &WalReader,
@@ -1326,6 +2465,41 @@ async fn execute_bm25_query_with_manifest_scoped(
     })
 }
 
+/// Fetches one immutable query artifact through the optional disk cache.
+///
+/// # Parameters
+///
+/// - `cache`: Disposable cache shared by query operations, or `None` for a
+///   direct object-store read.
+/// - `store`: Authoritative backing object store.
+/// - `key`: Exact immutable artifact key copied/derived from manifest metadata.
+///
+/// # Returns
+///
+/// Shared [`bytes::Bytes`] containing the complete object body.
+///
+/// # Errors
+///
+/// Propagates cache coordination and object-store GET failures. Missing objects
+/// are errors; the helper never substitutes empty bytes or another key.
+///
+/// # Side Effects
+///
+/// A cache miss performs one GET and can persist the returned immutable bytes.
+///
+/// # Consistency
+///
+/// Cache use is safe only because artifact keys are write-once. Visibility still
+/// comes from the manifest; this helper does not list or discover objects.
+///
+/// # Performance
+///
+/// A hit avoids S3/MinIO. Cache miss coalescing is delegated to [`DiskCache`].
+///
+/// # Examples
+///
+/// Fetching `.../global_fts.bin` returns cached bytes when present; otherwise it
+/// downloads that exact object and makes it available to later queries.
 async fn fetch_query_object(
     cache: Option<&Arc<DiskCache>>,
     store: &ZeppelinStore,
@@ -1339,11 +2513,33 @@ async fn fetch_query_object(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Bounds the expensive per-cluster BM25 compatibility path.
+///
+/// A value of zero disables the corresponding bound. The type is `Copy` because
+/// it contains only two machine-size counters and carries no ownership.
 struct Bm25FullScanBudget {
+    /// Maximum segment cluster count accepted for a full scan, or zero.
     max_clusters: usize,
+    /// Maximum segment vector count accepted for a full scan, or zero.
     max_vectors: usize,
 }
 
+/// Builds the operator-facing error for an unusable segment FTS layout.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace requiring index maintenance.
+/// - `reason`: Specific missing capability or exceeded budget.
+///
+/// # Returns
+///
+/// [`crate::error::ZeppelinError::IndexUnavailable`] that distinguishes an
+/// operator/compaction condition from invalid client syntax.
+///
+/// # Examples
+///
+/// A segment missing its global FTS index can report that scanning 600 clusters
+/// exceeds limit 500 and instruct operators to rebuild through compaction.
 fn bm25_index_unavailable(namespace: &str, reason: impl AsRef<str>) -> crate::error::ZeppelinError {
     crate::error::ZeppelinError::IndexUnavailable(format!(
         "BM25 FTS index unavailable for namespace {namespace}: {}. \
@@ -1353,6 +2549,35 @@ fn bm25_index_unavailable(namespace: &str, reason: impl AsRef<str>) -> crate::er
     ))
 }
 
+/// Verifies that the active segment was built for every requested lexical field.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace included in an operator-facing error.
+/// - `segment_ref`: Manifest descriptor advertising persisted FTS fields.
+/// - `rank_by`: Ranking expression whose BM25 leaves name required fields.
+///
+/// # Returns
+///
+/// `Ok(())` when every requested field is advertised, including when the
+/// expression has no leaves. Otherwise returns an index-unavailable error that
+/// lists missing fields or identifies a pre-FTS segment.
+///
+/// # Errors
+///
+/// Returns only the availability error described above. It performs no I/O, so
+/// no partial search has started.
+///
+/// # Consistency
+///
+/// Capability comes from the active descriptor selected by the manifest. The
+/// function does not probe S3 and does not silently search only fields that
+/// happen to exist.
+///
+/// # Examples
+///
+/// A `RankBy` expression requiring `title` and `body` fails before reads if the
+/// segment advertises only `body`.
 fn ensure_segment_fts_fields_available(
     namespace: &str,
     segment_ref: &SegmentRef,
@@ -1380,6 +2605,36 @@ fn ensure_segment_fts_fields_available(
     Err(bm25_index_unavailable(namespace, reason))
 }
 
+/// Rejects an old segment whose BM25 fallback would exceed configured work.
+///
+/// Cluster count is checked first, then vector count. Each zero limit is
+/// disabled independently.
+///
+/// # Parameters
+///
+/// - `namespace`: Namespace included in the operator-facing error.
+/// - `segment_ref`: Descriptor whose declared size predicts fallback cost.
+/// - `budget`: Maximum accepted cluster and vector counts.
+///
+/// # Returns
+///
+/// `Ok(())` when both enabled limits admit the scan.
+///
+/// # Errors
+///
+/// Returns index-unavailable before artifact I/O when either declared count is
+/// over its enabled limit.
+///
+/// # Performance
+///
+/// Constant-time manifest metadata checks designed specifically to avoid an
+/// accidental object-store fan-out.
+///
+/// # Examples
+///
+/// A 20,001-vector legacy segment is rejected by a 20,000-vector budget even if
+/// its four clusters fit the cluster budget. Setting both limits to zero admits
+/// the compatibility scan.
 fn validate_bm25_full_scan_budget(
     namespace: &str,
     segment_ref: &SegmentRef,
@@ -1406,13 +2661,78 @@ fn validate_bm25_full_scan_budget(
     Ok(())
 }
 
-/// Search a segment's inverted indexes for a BM25 query.
+/// Selects the safe BM25 search path for one active immutable segment.
 ///
-/// Uses the global FTS index when available (1 S3 GET instead of N),
-/// falling back to full per-cluster scan for older segments.
+/// The descriptor must advertise every requested field. A modern segment uses
+/// its global inverted index. An older segment may use the per-cluster
+/// compatibility path only when both configured work budgets allow it.
 ///
-/// When `max_full_scan_clusters > 0` and the segment lacks a global FTS index,
-/// returns an error if the cluster count exceeds the limit (circuit breaker).
+/// ```text
+/// SegmentRef + RankBy
+///          |
+///          v
+/// all requested FTS fields present? -- no --> IndexUnavailable
+///          |
+///         yes
+///          v
+/// has_global_fts? -- yes --> one global index + matching cluster data
+///          |
+///         no
+///          v
+/// within cluster/vector budgets? -- no --> IndexUnavailable
+///          |
+///         yes
+///          v
+/// warn + scan every per-cluster index
+/// ```
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary for immutable index/cluster reads.
+/// - `namespace`: Namespace owning the logical segment.
+/// - `segment_ref`: Active descriptor from the selected manifest.
+/// - `rank_by`: Parsed BM25 expression and field/query leaves.
+/// - `fts_configs`: Tokenization and scoring configuration by field.
+/// - `filter`: Optional post-score metadata predicate.
+/// - `last_as_prefix`: Whether final query tokens use prefix lookup.
+/// - `cache`: Optional immutable-object disk cache.
+/// - `max_full_scan_clusters`: Old-layout cluster limit, or zero to disable.
+/// - `max_full_scan_vectors`: Old-layout vector limit, or zero to disable.
+/// - `top_k`: Maximum segment candidates; `usize::MAX` requests all for a
+///   later WAL-suppression merge.
+/// - `include_attributes`: Whether winning hits retain attributes.
+///
+/// # Returns
+///
+/// Segment-local hits ordered by descending final `RankBy` score.
+///
+/// # Errors
+///
+/// Returns index-unavailable for missing fields or an over-budget old layout.
+/// Otherwise propagates storage, cache, and decode/search errors. No alternate
+/// field or partial cluster set is used.
+///
+/// # Side Effects
+///
+/// Reads immutable artifacts, may populate cache entries, and warns when the
+/// compatibility path is used.
+///
+/// # Consistency
+///
+/// Layout and capability decisions come only from the manifest descriptor.
+/// This function neither discovers nor publishes segment artifacts.
+///
+/// # Performance
+///
+/// Modern global lookup avoids an all-cluster inverted-index fan-out. The
+/// compatibility path can issue reads for FTS, cluster IDs, and optional attrs
+/// for every cluster, which is why it is budgeted.
+///
+/// # Examples
+///
+/// A 400-cluster old segment is admitted by limit 500 and attempts full scan;
+/// a 600-cluster segment fails before any index GET. A modern descriptor routes
+/// directly to the global artifact regardless of fallback limits.
 #[allow(clippy::too_many_arguments)]
 async fn segment_bm25_search(
     store: &ZeppelinStore,
@@ -1477,7 +2797,76 @@ async fn segment_bm25_search(
     .await
 }
 
-/// BM25 search using the global FTS index (fast path).
+/// Scores a segment through its global inverted index and fetches matching rows.
+///
+/// The global index maps field terms to `(cluster, position, score)` without
+/// reading every cluster. After evaluating the `RankBy` expression, the function
+/// fetches IDs and, only when filtering or projection requires them, attributes
+/// for clusters containing positive candidates.
+///
+/// ```text
+/// global FTS object (one logical fetch)
+///          |
+/// field query tokenization + postings search
+///          |
+/// (cluster, position) -> per-field scores -> RankBy
+///          |
+/// only needed clusters: IDs + optional attrs
+///          |
+/// exact filter -> deduplicate by ID -> BM25 top-k
+/// ```
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary for global and cluster artifacts.
+/// - `namespace`: Namespace key prefix.
+/// - `segment_ref`: Active descriptor with `has_global_fts = true`.
+/// - `rank_by`: Expression combining per-field BM25 scores.
+/// - `fts_configs`: Per-field analyzer and BM25 parameters.
+/// - `filter`: Optional attribute predicate applied after row materialization.
+/// - `last_as_prefix`: Selects exact-token or last-token-prefix postings search.
+/// - `cache`: Optional immutable-object disk cache.
+/// - `top_k`: Maximum descending-score hits retained.
+/// - `include_attributes`: Whether response hits retain loaded attributes.
+///
+/// # Returns
+///
+/// Deduplicated segment hits ordered by score descending, then ID ascending.
+/// A missing field config is skipped; normal HTTP callers validate configs.
+///
+/// # Errors
+///
+/// Propagates global-index/cluster/attribute fetches, format decoding, packed
+/// object validation, and missing expected attribute data. Invalid positions
+/// or unresolvable cluster entries are skipped rather than indexed out of bounds.
+///
+/// # Side Effects
+///
+/// Reads and may cache immutable objects. No manifest or index bytes are changed.
+///
+/// # Consistency
+///
+/// Cluster ownership and packed-object keys come from the supplied descriptor,
+/// including references carried forward from older incremental compactions.
+///
+/// # Performance
+///
+/// Reads one global index object, then fans out only to clusters with lexical
+/// matches. Attribute objects are omitted when neither filtering nor response
+/// projection requires them. CPU scales with matched postings and candidates.
+///
+/// # Examples
+///
+/// Query `title: rust` may produce positions in clusters 2 and 9. The function
+/// fetches row IDs for only those clusters, loads attrs only if requested, drops
+/// filter failures, and retains the highest-scoring `top_k` IDs.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Maps own intermediate keys and scores, while borrowed request/config data is
+/// never copied wholesale. `entry(...).or_default()` performs typed in-place
+/// aggregation without nullable map values. Iterator collection consumes owned
+/// entries into final results, making transfer of ownership explicit.
 #[allow(clippy::too_many_arguments)]
 async fn segment_bm25_search_global(
     store: &ZeppelinStore,
@@ -1617,6 +3006,79 @@ async fn segment_bm25_search_global(
 }
 
 #[allow(clippy::type_complexity)]
+/// Loads row IDs and optional attributes for the clusters needed by global BM25.
+///
+/// The helper understands both legacy one-object-per-cluster layout and newer
+/// packed cluster objects. For packed layout it groups requested clusters by
+/// object key, fetches each relevant object once, and extracts individual
+/// cluster sections. Attribute artifacts remain per cluster and are fetched only
+/// when filtering or response projection requires them.
+///
+/// ```text
+/// needed cluster set + SegmentRef layout
+///            |
+///            +-- no cluster_objects --> parallel cluster.bin (+ attrs.bin)
+///            |
+///            +-- packed refs --------> group clusters by object key
+///                                         |          |
+///                                   fetch once    attrs if needed
+///                                         \          /
+///                                          decode sections
+///                                                |
+///                              cluster -> (optional attrs, row IDs)
+/// ```
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary for immutable cluster artifacts.
+/// - `namespace`: Namespace used for legacy/per-cluster attribute keys.
+/// - `segment_ref`: Descriptor supplying owners and packed-object membership.
+/// - `needed_clusters`: Cluster indexes referenced by positive global postings.
+/// - `load_attrs`: Whether attribute rows are required.
+/// - `cache`: Optional immutable-object disk cache.
+///
+/// # Returns
+///
+/// A map from cluster index to `(attributes, row IDs)`. Attributes are `None`
+/// when `load_attrs` is false; when loaded, the vector preserves row-position
+/// alignment and each row may itself have no attributes.
+///
+/// # Errors
+///
+/// Propagates object/cache reads and cluster/attribute decoding. Packed layout
+/// also errors when requested attrs are missing, a multi-cluster reference
+/// points at a legacy single-cluster body, or section metadata is malformed.
+/// Bytes fetched before another concurrent result fails may remain cached.
+///
+/// # Side Effects
+///
+/// Performs parallel immutable-object reads and may populate cache entries.
+///
+/// # Consistency
+///
+/// `cluster_owner` and `cluster_objects` come from the selected manifest and can
+/// route carried-forward clusters to older immutable segment keys. The helper
+/// never searches object listings for alternatives.
+///
+/// # Performance
+///
+/// `join_all` overlaps all requested reads. Legacy layout costs one cluster GET
+/// and optionally one attrs GET per needed cluster. Packed layout costs one GET
+/// per relevant packed object plus optional per-cluster attrs GETs.
+///
+/// # Examples
+///
+/// Needed clusters `{2, 3}` that share `clusters-0.bin` cause one packed-object
+/// fetch, not two. With `load_attrs = false`, the return carries both ID vectors
+/// and no attribute vectors.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// Async iterator closures borrow the store/cache but move each owned key and
+/// cluster list into its future. `join_all` owns those futures until completion,
+/// so Rust proves no borrowed reference or temporary key dangles. Java would
+/// rely on captured-object reachability; C would require explicit request-state
+/// allocation and cleanup for every concurrent operation.
 async fn fetch_bm25_cluster_attrs_and_ids(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1760,11 +3222,83 @@ async fn fetch_bm25_cluster_attrs_and_ids(
     Ok(cluster_data)
 }
 
-/// BM25 search using full per-cluster scan (backward compat fallback).
+/// Searches every legacy per-cluster inverted index when no global index exists.
 ///
-/// At 1M scale this is O(N × clusters) and can take 15+ seconds.
-/// Segments should be recompacted with `fts_index=true` to build a
-/// global FTS index, which reduces BM25 queries to 1 S3 GET.
+/// This compatibility path preserves queryability for older FTS-enabled
+/// segments, but it is intentionally guarded by manifest-size budgets in its
+/// caller. It first loads coarse IVF metadata to determine cluster count, then
+/// concurrently prefetches each cluster's inverted index and row-ID object plus
+/// attributes when needed. Recompaction should replace this fan-out with a
+/// global FTS artifact.
+///
+/// ```text
+/// legacy SegmentRef
+///       |
+/// load coarse metadata -> cluster count
+///       |
+///       +-- for every cluster, in parallel -------------------+
+///       |        FTS index + row IDs + optional attrs          |
+///       +------------------------------------------------------+
+///                               |
+///                    tokenize/search each field
+///                               |
+///                 RankBy -> filter -> deduplicate -> top-k
+/// ```
+///
+/// # Parameters
+///
+/// - `store`: Object-store boundary for immutable legacy artifacts.
+/// - `namespace`: Namespace key prefix.
+/// - `segment_ref`: Active descriptor known to lack a global FTS index.
+/// - `rank_by`: Expression combining field BM25 scores.
+/// - `fts_configs`: Per-field analyzer and BM25 settings.
+/// - `filter`: Optional attribute predicate applied after lexical scoring.
+/// - `last_as_prefix`: Whether to prefix-match the final query token.
+/// - `cache`: Optional cache for per-cluster FTS, ID, and attribute bodies.
+/// - `top_k`: Maximum descending-score hits retained.
+/// - `include_attributes`: Whether result maps retain loaded attributes.
+///
+/// # Returns
+///
+/// Deduplicated segment hits ordered by score descending and ID ascending.
+///
+/// # Errors
+///
+/// Propagates coarse metadata, per-cluster FTS/ID/attribute reads, and decode
+/// failures. The compatibility reader resolves legacy per-cluster keys through
+/// `cluster_owner`; a descriptor/object mismatch fails rather than guessing a
+/// replacement layout. Some concurrent reads may have warmed cache before an
+/// error is observed.
+///
+/// # Side Effects
+///
+/// Performs parallel immutable reads and may populate cache entries.
+///
+/// # Consistency
+///
+/// Cluster count, owners, and field capability all come from the chosen
+/// manifest snapshot. Carried-forward clusters may resolve under older segment
+/// IDs, but no object absent from the descriptor becomes visible.
+///
+/// # Performance
+///
+/// Object-store request count grows linearly with cluster count: every cluster
+/// needs an FTS and ID object, plus attrs when filtering/projection requires
+/// them. `join_all` overlaps these requests but also holds every result until
+/// all complete. CPU scans matching postings across all cluster indexes.
+///
+/// # Examples
+///
+/// A 100-cluster legacy segment issues 200 logical object fetches without attrs
+/// or 300 with attrs, subject to cache hits. A modern global index would first
+/// fetch one postings object and then row data only for matching clusters.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The future vector owns every in-flight operation and `join_all` awaits them
+/// as a group. Each tuple contains `Result` values rather than throwing from a
+/// worker; the processing loop returns the first observed error and RAII drops
+/// all fetched buffers that are no longer needed.
 #[allow(clippy::too_many_arguments)]
 async fn segment_bm25_search_full_scan(
     store: &ZeppelinStore,
@@ -1941,9 +3475,63 @@ async fn segment_bm25_search_full_scan(
     Ok(results)
 }
 
-/// Merge BM25 WAL and segment results (higher score = better).
-/// `wal_deleted_ids` contains IDs explicitly deleted in the WAL — these must
-/// not appear in the final results even if they exist in the segment.
+/// Merges BM25 WAL and segment candidates without exposing stale document versions.
+///
+/// Strong mode first admits WAL hits, then admits only segment IDs absent from
+/// the complete live-WAL override and tombstone sets. Eventual mode intentionally
+/// ignores WAL candidates and live overrides, but removes tombstoned segment IDs.
+/// Higher score wins and IDs make ties deterministic.
+///
+/// ```text
+/// Strong                               Eventual
+/// WAL scored hits ----+                segment hits
+///                     |                     |
+/// segment hits -- suppress live WAL         +-- suppress tombstones
+///                 IDs + tombstones          |
+///                     |                     v
+///                     v              BM25 top-k only
+///              BM25 TopK merge
+/// ```
+///
+/// # Parameters
+///
+/// - `wal_results`: Owned positive-score hits from latest WAL documents.
+/// - `wal_overriding_ids`: All live WAL IDs, including non-matches and results
+///   outside the WAL top-k.
+/// - `segment_results`: Owned active-segment candidates.
+/// - `top_k`: Maximum merged results.
+/// - `consistency`: Selects strong or eventual participation rules.
+/// - `wal_deleted_ids`: Effective tombstones that always suppress segment hits.
+///
+/// # Returns
+///
+/// Owned hits ordered by score descending and ID ascending, truncated to
+/// `top_k`. Input vectors are consumed.
+///
+/// # Consistency
+///
+/// WAL overwrite authority is by ID, not by score: a lower-scoring or
+/// non-matching latest WAL record still hides a higher-scoring old segment
+/// version under strong consistency. Deletes are honored under both modes.
+///
+/// # Performance
+///
+/// Uses a bounded heap and suppression-set lookups; memory is proportional to
+/// `top_k` plus the already-built sets. Eventual mode filters its segment vector
+/// in place before partial top-k selection.
+///
+/// # Examples
+///
+/// Segment `a` scores 10, but WAL updates `a` to text scoring zero. In strong
+/// mode `a` is absent because its ID is overriding; the stale score 10 cannot
+/// win. In eventual mode the old segment `a` may remain unless WAL deleted it.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The vectors are moved into this function and then their elements are moved
+/// into the result frontier, avoiding deep copies. Java collections would still
+/// be usable aliases unless convention forbade it; C would need an explicit
+/// ownership-transfer rule. Rust rejects use of the consumed vectors afterward.
 fn merge_bm25_results(
     wal_results: Vec<SearchResult>,
     wal_overriding_ids: &HashSet<String>,
@@ -1982,14 +3570,45 @@ fn merge_bm25_results(
     }
 }
 
-/// Merge WAL results and segment results.
+/// Merges distance-scored WAL and segment candidates under read-consistency rules.
 ///
-/// For Strong consistency: filter segment results to remove any IDs that were
-/// deleted or updated in the WAL, then merge both sorted lists and truncate to top_k.
+/// Strong mode treats latest WAL state as authoritative over the compacted
+/// segment: it inserts WAL hits and excludes every segment ID with a live WAL
+/// replacement or tombstone. Eventual mode uses segment candidates only, while
+/// still excluding tombstoned IDs. Lower distance wins.
 ///
-/// `wal_deleted_ids` contains IDs explicitly deleted in the WAL — these must
-/// be excluded from segment results even though they produce no WAL result
-/// (a tombstone for an already-compacted vector has no live WAL entry).
+/// # Parameters
+///
+/// - `wal_results`: Owned latest-WAL candidates sorted by ascending distance.
+/// - `wal_overriding_ids`: Every live latest WAL ID, not only scored winners.
+/// - `segment_results`: Owned active-segment candidates.
+/// - `top_k`: Maximum final result count.
+/// - `consistency`: Determines whether live WAL candidates/replacements apply.
+/// - `wal_deleted_ids`: Effective tombstones applied in both modes.
+///
+/// # Returns
+///
+/// At most `top_k` owned results ordered by distance ascending, then ID. No ID
+/// can appear from both its old segment version and latest WAL version.
+///
+/// # Consistency
+///
+/// Suppression is independent of whether the newer WAL vector passed filtering
+/// or fit the WAL frontier. This prevents a filtered-out update from revealing
+/// stale attributes/vector values in the segment. Eventual staleness permits an
+/// older non-deleted value but never a tombstoned one.
+///
+/// # Performance
+///
+/// Strong merge performs hash-set checks and bounded heap insertion over both
+/// candidate lists. Eventual filters the segment list and uses partial top-k.
+/// Inputs are consumed rather than cloned.
+///
+/// # Examples
+///
+/// Segment holds `a@0.1`; WAL updates `a@0.5` and adds `b@0.2`. Strong returns
+/// `b` then the new `a` (subject to `top_k`), never old `a@0.1`. Eventual may
+/// return old `a@0.1`. If `a` is tombstoned, neither mode returns it.
 fn merge_results(
     wal_results: Vec<SearchResult>,
     wal_overriding_ids: &HashSet<String>,
@@ -2033,8 +3652,30 @@ fn merge_results(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::single_match)]
 #[cfg(test)]
 mod tests {
+    //! Protects query merge freshness, WAL materialization, and BM25 fallback limits.
+    //!
+    //! The merge tests use small owned result lists so failures identify the
+    //! exact override/tombstone rule. WAL and circuit-breaker tests use the
+    //! in-memory object-store implementation because they exercise decoding and
+    //! pre-I/O decisions rather than S3 integration semantics.
+
     use super::*;
 
+    /// Constructs a minimal owned hit for merge-policy tests.
+    ///
+    /// # Parameters
+    ///
+    /// - `id`: Logical record ID.
+    /// - `score`: Source-native distance or BM25 score chosen by the test.
+    ///
+    /// # Returns
+    ///
+    /// A result with no attributes.
+    ///
+    /// # Examples
+    ///
+    /// `make_result("a", 0.1)` represents a close ANN hit; the same helper can
+    /// represent BM25 by interpreting the score as higher-is-better.
     fn make_result(id: &str, score: f32) -> SearchResult {
         SearchResult {
             id: id.to_string(),
@@ -2043,6 +3684,21 @@ mod tests {
         }
     }
 
+    /// Builds a two-dimensional WAL vector with a clone-detectable payload.
+    ///
+    /// # Parameters
+    ///
+    /// - `id`: Vector ID used in both the record and payload string.
+    /// - `offset`: First coordinate, controlling distance from the zero query.
+    ///
+    /// # Returns
+    ///
+    /// An owned vector `[offset, 0]` with one string attribute.
+    ///
+    /// # Examples
+    ///
+    /// ID `v_003` and offset `3` produce payload `payload-v_003`, allowing the
+    /// test to verify winner-only attribute cloning.
     fn wal_vector_with_attrs(id: &str, offset: f32) -> crate::types::VectorEntry {
         let mut attrs = HashMap::new();
         attrs.insert(
@@ -2056,6 +3712,12 @@ mod tests {
         }
     }
 
+    /// Verifies that WAL attributes are deep-cloned only for returned winners.
+    ///
+    /// The test writes 100 live vectors, requests top five twice, and checks the
+    /// test-only counter: projection disabled performs zero clones; projection
+    /// enabled performs exactly five. It catches eager cloning before bounded
+    /// top-k selection.
     #[tokio::test]
     async fn test_wal_scan_materializes_attrs_only_for_returned_topk() {
         let store = crate::storage::ZeppelinStore::new(std::sync::Arc::new(
@@ -2127,6 +3789,10 @@ mod tests {
         );
     }
 
+    /// Ensures a WAL tombstone removes an already-compacted ANN hit.
+    ///
+    /// The deleted ID has no live WAL result, so this test catches merges that
+    /// suppress only IDs present in `wal_results` instead of using tombstones.
     #[test]
     fn test_merge_strong_excludes_wal_deleted_segment_results() {
         // Vector "compacted" lives only in the segment; its WAL tombstone
@@ -2149,6 +3815,10 @@ mod tests {
         assert_eq!(ids, vec!["fresh", "kept"]);
     }
 
+    /// Ensures a live WAL ANN version replaces, rather than duplicates, a segment ID.
+    ///
+    /// The stale segment version has the better distance deliberately. The test
+    /// proves freshness by ID takes precedence over score.
     #[test]
     fn test_merge_strong_wal_overrides_segment() {
         // Same ID in WAL and segment: WAL version wins, no duplicate.
@@ -2170,6 +3840,11 @@ mod tests {
         assert_eq!(merged[0].score, 0.5);
     }
 
+    /// Ensures strong ANN search refills after its initial segment hits are suppressed.
+    ///
+    /// Two of three initial hits are hidden by WAL state. The test checks a
+    /// segment-size-capped retry width and proves the deeper candidate survives
+    /// final top-k merge.
     #[test]
     fn test_strong_segment_refill_after_wal_suppression() {
         let initial_segment_results = vec![
@@ -2214,6 +3889,10 @@ mod tests {
         assert_eq!(ids, vec!["c", "d", "a"]);
     }
 
+    /// Ensures eventual ANN reads still apply uncompacted delete tombstones.
+    ///
+    /// It catches the incorrect interpretation that eventual mode may resurrect
+    /// deleted data merely because it skips live WAL upsert scoring.
     #[test]
     fn test_merge_eventual_applies_tombstones() {
         // Eventual skips WAL vector scoring, but deletes are correctness:
@@ -2234,6 +3913,10 @@ mod tests {
         assert_eq!(ids, vec!["b"]);
     }
 
+    /// Ensures eventual BM25 reads enforce the same delete rule as ANN reads.
+    ///
+    /// The higher-scoring segment document is tombstoned and must disappear even
+    /// though eventual lexical merge has no WAL candidates.
     #[test]
     fn test_merge_bm25_eventual_applies_tombstones() {
         // Same invariant for BM25/rank_by: Eventual segment hits must not
@@ -2254,6 +3937,18 @@ mod tests {
         assert_eq!(ids, vec!["b"]);
     }
 
+    /// Builds the minimal flat segment descriptor needed by BM25 path tests.
+    ///
+    /// # Parameters
+    ///
+    /// - `cluster_count`: Declared fallback fan-out.
+    /// - `has_global_fts`: Whether the dispatcher should bypass full-scan limits.
+    ///
+    /// # Returns
+    ///
+    /// A 10,000-vector descriptor advertising FTS field `text`, with no actual
+    /// artifact objects. Tests can therefore distinguish pre-I/O availability
+    /// rejection from the later expected missing-object error.
     fn make_segment_ref(cluster_count: usize, has_global_fts: bool) -> SegmentRef {
         SegmentRef {
             id: "seg_test".to_string(),
@@ -2272,6 +3967,10 @@ mod tests {
         }
     }
 
+    /// Verifies that excessive legacy cluster fan-out fails before object reads.
+    ///
+    /// A 600-cluster segment under limit 500 must return the operator-facing
+    /// index-unavailable variant with both counts in its message.
     #[tokio::test]
     async fn test_bm25_circuit_breaker_rejects_over_limit() {
         let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
@@ -2311,6 +4010,10 @@ mod tests {
         }
     }
 
+    /// Verifies that the independent vector-count budget is enforced before I/O.
+    ///
+    /// Cluster count is within limit, so the test catches implementations that
+    /// forget to protect large few-cluster segments.
     #[test]
     fn test_bm25_full_scan_budget_rejects_vector_count_before_io() {
         let mut seg = make_segment_ref(4, false);
@@ -2336,6 +4039,10 @@ mod tests {
         }
     }
 
+    /// Verifies that an under-limit legacy segment proceeds to artifact loading.
+    ///
+    /// No artifacts are installed, so a non-availability failure proves the
+    /// circuit breaker admitted the scan without requiring a successful query.
     #[tokio::test]
     async fn test_bm25_circuit_breaker_allows_under_limit() {
         let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
@@ -2375,6 +4082,10 @@ mod tests {
         }
     }
 
+    /// Verifies that zero disables both BM25 full-scan limits.
+    ///
+    /// Even a 9,999-cluster descriptor must reach the expected missing-object
+    /// path instead of returning index-unavailable from budget validation.
     #[tokio::test]
     async fn test_bm25_circuit_breaker_disabled_when_zero() {
         let mem = std::sync::Arc::new(object_store::memory::InMemory::new());
