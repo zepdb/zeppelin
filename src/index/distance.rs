@@ -1,14 +1,81 @@
-//! Distance functions for vector comparison.
+//! Shared vector-distance kernels for indexing, query search, and reranking.
 //!
-//! Provides cosine, euclidean, and dot-product distance metrics with scalar
-//! implementations and architecture-specific SIMD hints for auto-vectorization.
+//! Every index implementation enters through
+//! [`crate::index::distance::compute_distance`] or a metric-specific helper.
+//! The central contract is that **smaller values always rank as closer**:
+//! Euclidean distance is squared, cosine similarity becomes `1 - similarity`,
+//! and dot-product similarity is negated. This lets top-k code use one ascending
+//! ordering regardless of the namespace metric.
+//!
+//! ```text
+//! equal-length f32 slices + DistanceMetric
+//!                    |
+//!                    v
+//!             compute_distance
+//!          / cosine | euclidean \ dot
+//!         v         v             v
+//! compile-time scalar, AVX2, or NEON kernel
+//!                    |
+//!                    v
+//!       one f32 distance; lower ranks first
+//! ```
+//!
+//! These functions are pure CPU operations: they perform no allocation, object
+//! storage I/O, cache access, or manifest lookup. Callers must already have
+//! validated equal vector dimensions and finite values at the API boundary.
+//!
+//! ## Reading map
+//!
+//! 1. Start with [`crate::index::distance::compute_distance`] for metric
+//!    dispatch and the shared ordering rule.
+//! 2. Read the three public metric functions for mathematical behavior.
+//! 3. Read the `*_inner` and `cosine_components` variants to see how `cfg`
+//!    selects scalar or architecture-specific kernels at compile time.
+//! 4. Finish with [`crate::index::distance::normalize`] for in-place unit-vector
+//!    preparation.
+//!
+//! ## Rust concepts used here
+//!
+//! Borrowed slices (`&[f32]`) are non-owning pointer-and-length views. They are
+//! similar to Java array ranges or C pointer/length pairs, but Rust guarantees
+//! that the backing allocation remains alive and cannot be mutated through the
+//! shared borrow. `#[cfg]` compiles exactly one kernel per target. The AVX2 and
+//! NEON paths contain `unsafe` pointer loads; their safety depends on the
+//! equal-length precondition already established by callers.
 
 use crate::types::DistanceMetric;
 
-/// Dispatch to the appropriate distance function based on the metric.
+/// Dispatches to the metric selected for a namespace.
 ///
 /// All distance functions return a *distance* (lower is closer) so that
 /// callers can sort ascending and take the first `k` results.
+///
+/// # Parameters
+///
+/// - `a`: First borrowed vector coordinate slice.
+/// - `b`: Second borrowed vector coordinate slice with the same length as `a`.
+/// - `metric`: Mathematical comparison selected by namespace metadata.
+///
+/// # Returns
+///
+/// Returns one distance where a smaller value ranks first. Dot-product results
+/// may be negative because similarity is negated.
+///
+/// # Panics
+///
+/// Metric helpers debug-assert equal dimensions. Scalar kernels may also panic
+/// on indexing if `b` is shorter in a release build. Callers must validate
+/// dimensions before entering this hot path.
+///
+/// # Performance
+///
+/// Performs one linear pass over the coordinates with no allocation. The
+/// selected target may use scalar, AVX2, or NEON instructions.
+///
+/// # Examples
+///
+/// For orthogonal unit vectors, cosine distance is `1`, squared Euclidean
+/// distance is `2`, and dot-product distance is `0`.
 #[inline]
 pub fn compute_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
     match metric {
@@ -18,10 +85,35 @@ pub fn compute_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
     }
 }
 
-/// Cosine distance: `1.0 - cosine_similarity(a, b)`.
+/// Computes cosine distance as `1 - cosine_similarity(a, b)`.
 ///
 /// Returns 0.0 for identical directions and 2.0 for opposite directions.
 /// If either vector has zero magnitude, returns 1.0 (orthogonal).
+///
+/// # Parameters
+///
+/// - `a`: First borrowed vector.
+/// - `b`: Equal-length second vector.
+///
+/// # Returns
+///
+/// Returns a clamped value from `0` for the same direction through `2` for the
+/// opposite direction. A zero-magnitude input returns `1`.
+///
+/// # Panics
+///
+/// Debug-asserts equal lengths. The SIMD kernels rely on that equality for safe
+/// pointer loads, so callers must not pass mismatched dimensions.
+///
+/// # Performance
+///
+/// Accumulates dot product and both squared norms in one linear pass, then
+/// performs one square root.
+///
+/// # Examples
+///
+/// `[1, 0]` compared with `[1, 0]` returns `0`; compared with `[-1, 0]` it
+/// returns `2`.
 #[inline]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
@@ -38,20 +130,65 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - similarity.clamp(-1.0, 1.0)
 }
 
-/// Squared Euclidean distance: `sum((a_i - b_i)^2)`.
+/// Computes squared Euclidean distance, `sum((a_i - b_i)^2)`.
 ///
 /// We return squared distance to avoid the sqrt cost. This preserves
 /// ordering for top-k selection.
+///
+/// # Parameters
+///
+/// - `a`: First borrowed vector.
+/// - `b`: Equal-length second vector.
+///
+/// # Returns
+///
+/// Returns a non-negative squared distance for finite coordinates.
+///
+/// # Panics
+///
+/// Debug-asserts equal lengths; callers must validate dimensions before this
+/// hot path.
+///
+/// # Performance
+///
+/// Performs a linear pass and deliberately avoids a square root because
+/// squaring preserves nearest-neighbor order.
+///
+/// # Examples
+///
+/// `[0, 0]` and `[3, 4]` return `25`, not `5`.
 #[inline]
 pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
     euclidean_squared_inner(a, b)
 }
 
-/// Dot-product distance: `-dot(a, b)`.
+/// Computes dot-product distance as the negated inner product.
 ///
 /// Negated so that higher similarity (larger dot product) yields a
 /// smaller distance value, keeping the "lower is closer" invariant.
+///
+/// # Parameters
+///
+/// - `a`: First borrowed vector.
+/// - `b`: Equal-length second vector.
+///
+/// # Returns
+///
+/// Returns the negative sum of pairwise products. More similar vectors therefore
+/// produce smaller values.
+///
+/// # Panics
+///
+/// Debug-asserts equal lengths; callers must validate dimensions first.
+///
+/// # Performance
+///
+/// Performs one linear pass without allocation.
+///
+/// # Examples
+///
+/// `[1, 2]` compared with itself has similarity `5` and distance `-5`.
 #[inline]
 pub fn dot_product_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
@@ -67,7 +204,21 @@ pub fn dot_product_distance(a: &[f32], b: &[f32]) -> f32 {
 // aarch64 in the future.
 // ---------------------------------------------------------------------------
 
-/// Compute (dot, ||a||^2, ||b||^2) in a single pass.
+/// Accumulates dot product and both squared norms with the scalar kernel.
+///
+/// # Parameters
+///
+/// - `a`: First vector.
+/// - `b`: Equal-length second vector.
+///
+/// # Returns
+///
+/// Returns `(a · b, ||a||², ||b||²)`.
+///
+/// # Performance
+///
+/// Processes eight coordinates per outer iteration to encourage LLVM
+/// auto-vectorization, then handles the remainder.
 #[cfg(not(any(
     all(target_arch = "x86_64", target_feature = "avx2"),
     all(target_arch = "aarch64", target_feature = "neon"),
@@ -113,7 +264,25 @@ fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     (dot, norm_a, norm_b)
 }
 
-/// AVX2 cosine components for x86_64.
+/// Accumulates cosine components with AVX2 fused multiply-add instructions.
+///
+/// This definition exists only when the target enables x86-64 AVX2. It loads
+/// unaligned groups of eight coordinates and handles the tail scalarly.
+///
+/// # Parameters
+///
+/// - `a`: First vector.
+/// - `b`: Equal-length second vector.
+///
+/// # Returns
+///
+/// Returns `(a · b, ||a||², ||b||²)`.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The intrinsics require `unsafe` because raw pointer arithmetic is not bounds
+/// checked. Slice lifetimes keep the allocations alive, while the caller's
+/// equal-length invariant ensures every eight-float load is inside both slices.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
 fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
@@ -157,7 +326,25 @@ fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     }
 }
 
-/// NEON cosine components for aarch64.
+/// Accumulates cosine components with AArch64 NEON instructions.
+///
+/// This compile-time variant loads four coordinates at a time and handles the
+/// remainder with scalar indexing.
+///
+/// # Parameters
+///
+/// - `a`: First vector.
+/// - `b`: Equal-length second vector.
+///
+/// # Returns
+///
+/// Returns `(a · b, ||a||², ||b||²)`.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// The unsafe block is narrowly scoped around architecture intrinsics. Rust
+/// still manages the slice allocations; only the compiler-checked bounds are
+/// replaced by the established equal-length and chunk-count argument.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline]
 fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
@@ -198,7 +385,20 @@ fn cosine_components(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
     }
 }
 
-/// Squared Euclidean distance scalar kernel.
+/// Accumulates squared Euclidean distance with the scalar kernel.
+///
+/// # Parameters
+///
+/// - `a`: First vector.
+/// - `b`: Equal-length second vector.
+///
+/// # Returns
+///
+/// Returns the sum of squared coordinate differences.
+///
+/// # Performance
+///
+/// Processes eight coordinates per outer loop to encourage auto-vectorization.
 #[cfg(not(any(
     all(target_arch = "x86_64", target_feature = "avx2"),
     all(target_arch = "aarch64", target_feature = "neon"),
@@ -232,6 +432,10 @@ fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
+/// Accumulates squared Euclidean distance with x86-64 AVX2.
+///
+/// Unaligned eight-float loads are safe only because callers supply equal-length
+/// slices and the chunk count is derived from that common length.
 fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
@@ -261,6 +465,10 @@ fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline]
+/// Accumulates squared Euclidean distance with AArch64 NEON.
+///
+/// Four-float vector loads cover complete chunks and checked scalar indexing
+/// handles the tail.
 fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
 
@@ -287,7 +495,20 @@ fn euclidean_squared_inner(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Dot-product scalar kernel.
+/// Accumulates a dot product with the scalar kernel.
+///
+/// # Parameters
+///
+/// - `a`: First vector.
+/// - `b`: Equal-length second vector.
+///
+/// # Returns
+///
+/// Returns the non-negated inner product.
+///
+/// # Performance
+///
+/// Processes eight products per outer iteration to encourage auto-vectorization.
 #[cfg(not(any(
     all(target_arch = "x86_64", target_feature = "avx2"),
     all(target_arch = "aarch64", target_feature = "neon"),
@@ -319,6 +540,9 @@ fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
+/// Accumulates a dot product with x86-64 AVX2 fused multiply-add.
+///
+/// Unaligned loads cover groups of eight coordinates; the tail remains scalar.
 fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
@@ -346,6 +570,9 @@ fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline]
+/// Accumulates a dot product with AArch64 NEON fused multiply-add.
+///
+/// Vector loads cover groups of four coordinates; the tail remains scalar.
 fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::aarch64::*;
 
@@ -370,7 +597,20 @@ fn dot_product_inner(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Horizontal sum of an AVX 256-bit float register.
+/// Reduces eight AVX float lanes to one scalar sum.
+///
+/// # Parameters
+///
+/// - `v`: Initialized AVX register whose lanes should be added.
+///
+/// # Returns
+///
+/// Returns the arithmetic sum of all eight lanes.
+///
+/// # Safety
+///
+/// The caller must execute on a target where AVX2 is enabled and pass a valid
+/// initialized `__m256`. The function is compiled only under that target feature.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline]
 unsafe fn hsum_avx(v: std::arch::x86_64::__m256) -> f32 {
@@ -387,7 +627,23 @@ unsafe fn hsum_avx(v: std::arch::x86_64::__m256) -> f32 {
     _mm_cvtss_f32(sums2)
 }
 
-/// Compute the L2 norm of a vector.
+/// Computes a vector's Euclidean, or L2, norm.
+///
+/// # Parameters
+///
+/// - `v`: Borrowed vector coordinates.
+///
+/// # Returns
+///
+/// Returns `sqrt(sum(x²))`; the empty or all-zero vector returns zero.
+///
+/// # Performance
+///
+/// Performs one linear scalar pass and one square root without allocation.
+///
+/// # Examples
+///
+/// The norm of `[3, 4]` is `5`.
 #[inline]
 pub fn l2_norm(v: &[f32]) -> f32 {
     let mut sum: f32 = 0.0;
@@ -397,7 +653,36 @@ pub fn l2_norm(v: &[f32]) -> f32 {
     sum.sqrt()
 }
 
-/// Normalize a vector in-place to unit length.
+/// Normalizes a mutable vector in place to unit L2 length.
+///
+/// Zero and near-zero vectors remain unchanged to avoid division by a value
+/// below [`f32::EPSILON`].
+///
+/// # Parameters
+///
+/// - `v`: Exclusively borrowed coordinate slice to update.
+///
+/// # Returns
+///
+/// Returns unit after scaling, or immediately for a near-zero norm.
+///
+/// # Side Effects
+///
+/// Mutates every coordinate in the caller's slice when normalization occurs.
+///
+/// # Performance
+///
+/// Uses one pass to compute the norm and a second pass to scale coordinates.
+///
+/// # Examples
+///
+/// `[3, 4]` becomes approximately `[0.6, 0.8]`; `[0, 0]` stays unchanged.
+///
+/// # Rust Notes for Java/C Engineers
+///
+/// `&mut [f32]` is an exclusive borrow. While this function runs, Rust prevents
+/// any other ordinary reference from reading or writing the same slice. Java
+/// allows shared array aliases; C relies on caller discipline or `restrict`.
 #[inline]
 pub fn normalize(v: &mut [f32]) {
     let norm = l2_norm(v);
@@ -412,8 +697,12 @@ pub fn normalize(v: &mut [f32]) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    //! Regression tests for metric definitions, ordering, normalization, and
+    //! scalar/SIMD remainder handling.
+
     use super::*;
 
+    /// Verifies identical directions have zero cosine distance.
     #[test]
     fn test_cosine_identical() {
         let a = vec![1.0, 2.0, 3.0];
@@ -424,6 +713,7 @@ mod tests {
         );
     }
 
+    /// Verifies opposite directions reach the maximum cosine distance.
     #[test]
     fn test_cosine_opposite() {
         let a = vec![1.0, 0.0, 0.0];
@@ -435,6 +725,7 @@ mod tests {
         );
     }
 
+    /// Verifies a vector has zero squared Euclidean distance from itself.
     #[test]
     fn test_euclidean_zero() {
         let a = vec![3.0, 4.0];
@@ -442,6 +733,7 @@ mod tests {
         assert!((d - 0.0).abs() < 1e-6);
     }
 
+    /// Verifies the Euclidean helper deliberately returns the squared value.
     #[test]
     fn test_euclidean_known() {
         let a = vec![0.0, 0.0];
@@ -451,6 +743,7 @@ mod tests {
         assert!((d - 25.0).abs() < 1e-6);
     }
 
+    /// Verifies orthogonal vectors have zero dot-product distance.
     #[test]
     fn test_dot_product_orthogonal() {
         let a = vec![1.0, 0.0];
@@ -459,6 +752,7 @@ mod tests {
         assert!((d - 0.0).abs() < 1e-6, "orthogonal => dot=0 => distance=0");
     }
 
+    /// Verifies dot-product similarity is negated for ascending ranking.
     #[test]
     fn test_dot_product_parallel() {
         let a = vec![1.0, 2.0, 3.0];
@@ -468,6 +762,7 @@ mod tests {
         assert!((d - (-14.0)).abs() < 1e-6);
     }
 
+    /// Verifies metric dispatch preserves each public helper's result.
     #[test]
     fn test_compute_distance_dispatch() {
         let a = vec![1.0, 0.0];
@@ -480,6 +775,7 @@ mod tests {
         assert!((de - 2.0).abs() < 1e-6);
     }
 
+    /// Verifies in-place normalization produces unit L2 length.
     #[test]
     fn test_normalize() {
         let mut v = vec![3.0, 4.0];
@@ -488,6 +784,7 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-6);
     }
 
+    /// Exercises full SIMD-sized chunks plus a scalar remainder.
     #[test]
     fn test_large_dimension() {
         // Test with a dimension that exercises the chunked loop + remainder.
