@@ -373,6 +373,86 @@ fn query_underfill_reason(
     Some("not_enough_matches".to_string())
 }
 
+fn active_segment_ref(manifest: &Manifest) -> Option<SegmentRef> {
+    manifest.active_segment.as_ref().and_then(|segment_id| {
+        manifest
+            .segments
+            .iter()
+            .find(|segment| segment.id == *segment_id)
+            .cloned()
+    })
+}
+
+fn segment_refill_top_k(
+    segment_results: &[SearchResult],
+    requested_top_k: usize,
+    consistency: ConsistencyLevel,
+    wal_overriding_ids: &HashSet<String>,
+    wal_deleted_ids: &HashSet<String>,
+    segment_vector_count: usize,
+) -> Option<usize> {
+    if requested_top_k == 0 || segment_results.len() != requested_top_k {
+        return None;
+    }
+    if count_suppressed_segment_hits(
+        segment_results,
+        consistency,
+        wal_overriding_ids,
+        wal_deleted_ids,
+    ) == 0
+    {
+        return None;
+    }
+    let suppressed_upper_bound =
+        suppressed_segment_id_upper_bound(consistency, wal_overriding_ids, wal_deleted_ids);
+    if suppressed_upper_bound == 0 {
+        return None;
+    }
+    requested_top_k
+        .saturating_add(suppressed_upper_bound)
+        .min(segment_vector_count)
+        .checked_sub(requested_top_k)
+        .filter(|extra| *extra > 0)
+        .map(|extra| requested_top_k + extra)
+}
+
+fn count_suppressed_segment_hits(
+    segment_results: &[SearchResult],
+    consistency: ConsistencyLevel,
+    wal_overriding_ids: &HashSet<String>,
+    wal_deleted_ids: &HashSet<String>,
+) -> usize {
+    segment_results
+        .iter()
+        .filter(|result| {
+            segment_hit_suppressed(&result.id, consistency, wal_overriding_ids, wal_deleted_ids)
+        })
+        .count()
+}
+
+fn segment_hit_suppressed(
+    id: &str,
+    consistency: ConsistencyLevel,
+    wal_overriding_ids: &HashSet<String>,
+    wal_deleted_ids: &HashSet<String>,
+) -> bool {
+    match consistency {
+        ConsistencyLevel::Strong => wal_overriding_ids.contains(id) || wal_deleted_ids.contains(id),
+        ConsistencyLevel::Eventual => wal_deleted_ids.contains(id),
+    }
+}
+
+fn suppressed_segment_id_upper_bound(
+    consistency: ConsistencyLevel,
+    wal_overriding_ids: &HashSet<String>,
+    wal_deleted_ids: &HashSet<String>,
+) -> usize {
+    match consistency {
+        ConsistencyLevel::Strong => wal_overriding_ids.union(wal_deleted_ids).count(),
+        ConsistencyLevel::Eventual => wal_deleted_ids.len(),
+    }
+}
+
 /// Execute a query against a namespace, combining WAL scan and segment search.
 #[instrument(skip(params), fields(namespace = params.namespace))]
 pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
@@ -442,6 +522,7 @@ async fn execute_query_with_manifest_scoped(
     } = params;
     let eventual_skipped_wal =
         consistency == ConsistencyLevel::Eventual && !manifest.uncompacted_fragments().is_empty();
+    let segment_ref = active_segment_ref(&manifest);
 
     // WAL work and segment search are independent — they share only the
     // manifest snapshot — so run them concurrently. Strong scans and scores
@@ -498,20 +579,12 @@ async fn execute_query_with_manifest_scoped(
 
     let segment_future = async {
         let segment_start = std::time::Instant::now();
-        // Look up the full SegmentRef from the manifest.
-        let segment_ref = manifest.active_segment.as_ref().and_then(|segment_id| {
-            manifest
-                .segments
-                .iter()
-                .find(|s| s.id == *segment_id)
-                .cloned()
-        });
-        let (results, scanned, clusters_probed) = if let Some(seg_ref) = segment_ref {
+        let (results, scanned, clusters_probed) = if let Some(seg_ref) = segment_ref.as_ref() {
             let clusters_probed = nprobe.min(seg_ref.cluster_count);
             let results = segment_search(
                 store,
                 namespace,
-                &seg_ref,
+                seg_ref,
                 query,
                 top_k,
                 nprobe,
@@ -546,7 +619,41 @@ async fn execute_query_with_manifest_scoped(
         },
         wal_ms,
     ) = wal_result?;
-    let (segment_results, scanned_segments, segment_ms, clusters_probed) = segment_result?;
+    let (mut segment_results, scanned_segments, mut segment_ms, clusters_probed) = segment_result?;
+
+    if let Some(seg_ref) = segment_ref.as_ref() {
+        if let Some(refill_top_k) = segment_refill_top_k(
+            &segment_results,
+            top_k,
+            consistency,
+            &wal_overriding_ids,
+            &wal_deleted_ids,
+            seg_ref.vector_count,
+        ) {
+            let segment_retry_start = std::time::Instant::now();
+            segment_results = segment_search(
+                store,
+                namespace,
+                seg_ref,
+                query,
+                refill_top_k,
+                nprobe,
+                filter,
+                distance_metric,
+                oversample_factor,
+                rerank_coalesce_gap_bytes,
+                cache,
+                include_attributes,
+            )
+            .await?;
+            let segment_retry_ms = segment_retry_start.elapsed().as_millis() as u64;
+            segment_ms += segment_retry_ms;
+            debug!(
+                segment_retry_duration_ms = segment_retry_ms,
+                refill_top_k, "query phase: segment refill search"
+            );
+        }
+    }
 
     // Merge results — pass WAL tombstones so segment results for deleted
     // vectors are excluded (a delete of an already-compacted vector exists
@@ -2061,6 +2168,50 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "v1");
         assert_eq!(merged[0].score, 0.5);
+    }
+
+    #[test]
+    fn test_strong_segment_refill_after_wal_suppression() {
+        let initial_segment_results = vec![
+            make_result("a", 10.0),
+            make_result("b", 20.0),
+            make_result("c", 30.0),
+        ];
+        let wal_results = vec![make_result("a", 100.0), make_result("b", 130.0)];
+        let overriding: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        let deleted: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+
+        let refill_top_k = segment_refill_top_k(
+            &initial_segment_results,
+            3,
+            ConsistencyLevel::Strong,
+            &overriding,
+            &deleted,
+            4,
+        );
+
+        assert_eq!(refill_top_k, Some(4));
+
+        let refilled_segment_results = vec![
+            make_result("a", 10.0),
+            make_result("b", 20.0),
+            make_result("c", 30.0),
+            make_result("d", 40.0),
+        ];
+        let merged = merge_results(
+            wal_results,
+            &overriding,
+            refilled_segment_results,
+            3,
+            ConsistencyLevel::Strong,
+            &deleted,
+        );
+
+        let ids = merged
+            .iter()
+            .map(|result| result.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["c", "d", "a"]);
     }
 
     #[test]
