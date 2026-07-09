@@ -1293,6 +1293,7 @@ fn check_i7_fts_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
     if query_words.is_empty() {
         return Vec::new();
     }
+    let enforce_text_membership = is_pure_bm25_query(&q.body);
     let Some(ns_model) = model.namespaces.get(ns) else {
         return Vec::new();
     };
@@ -1310,6 +1311,9 @@ fn check_i7_fts_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
             ));
             continue;
         };
+        if !enforce_text_membership {
+            continue;
+        }
         let Some(text) = record
             .attributes
             .as_ref()
@@ -1341,6 +1345,18 @@ fn check_i7_fts_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
         }
     }
     violations
+}
+
+fn is_pure_bm25_query(body: &serde_json::Value) -> bool {
+    match body.get("sources").and_then(serde_json::Value::as_array) {
+        Some(sources) => {
+            !sources.is_empty()
+                && sources.iter().all(|source| {
+                    source.get("type").and_then(serde_json::Value::as_str) == Some("bm25")
+                })
+        }
+        None => body.get("rank_by").is_some(),
+    }
 }
 
 fn check_i13_probe_sandwich(rec: &OpRecord) -> Vec<Violation> {
@@ -1827,3 +1843,119 @@ const KNOWN_ERROR_CODES: &[&str] = &[
     "CONCURRENCY_LIMIT",
     "RATE_LIMITED",
 ];
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use zeppelin::index::quantization::QuantizationType;
+    use zeppelin::types::DistanceMetric;
+
+    use crate::adversarial::ops::NamespaceSpec;
+
+    use super::*;
+
+    const NS: &str = "ns";
+
+    fn namespace_spec() -> NamespaceSpec {
+        NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Euclidean,
+            quantization: QuantizationType::None,
+            num_centroids: 1,
+            fts_fields: vec!["body".to_string()],
+            bitmap: false,
+        }
+    }
+
+    fn model_with_record(id: &str, attributes: Option<HashMap<String, AttributeValue>>) -> Model {
+        let mut ns_model = NsModel::new(namespace_spec(), 1);
+        ns_model.live.insert(
+            id.to_string(),
+            ModelRecord {
+                values: vec![0.0, 0.0],
+                attributes,
+            },
+        );
+        Model {
+            namespaces: BTreeMap::from([(NS.to_string(), ns_model)]),
+        }
+    }
+
+    fn query_record(body: serde_json::Value) -> OpRecord {
+        OpRecord {
+            index: 1,
+            wall_ms: 0,
+            op: Op::Query {
+                ns: NS.to_string(),
+                q: GeneratedQuery {
+                    body,
+                    class: QueryOracleClass::Membership {
+                        consistency: ConsistencyLevel::Strong,
+                    },
+                    pattern_tags: vec!["fts".to_string()],
+                },
+                as_of: None,
+            },
+            method: "POST".to_string(),
+            path: format!("/v1/namespaces/{NS}/query"),
+            status: 200,
+            response: json!({
+                "results": [{
+                    "id": "row",
+                    "score": 1.0,
+                    "attributes": null
+                }]
+            }),
+            gen_after: Some(1),
+            duration_ms: 1,
+            violations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn i7_allows_hybrid_ann_rows_without_bm25_text() {
+        let model = model_with_record("row", None);
+        let rec = query_record(json!({
+            "sources": [{
+                "type": "ann",
+                "vector": [0.0, 0.0],
+                "nprobe": 1
+            }, {
+                "type": "bm25",
+                "rank_by": ["body", "BM25", "needle"]
+            }],
+            "fusion": { "type": "rrf", "k": 60 },
+            "top_k": 1,
+            "consistency": "strong",
+            "explain": "full"
+        }));
+
+        let violations = check_i7_fts_membership(&model, &rec);
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn i7_rejects_pure_bm25_rows_without_query_words() {
+        let mut attributes = HashMap::new();
+        attributes.insert(
+            "body".to_string(),
+            AttributeValue::String("orange pear".to_string()),
+        );
+        let model = model_with_record("row", Some(attributes));
+        let rec = query_record(json!({
+            "rank_by": ["body", "BM25", "needle"],
+            "top_k": 1,
+            "consistency": "strong"
+        }));
+
+        let violations = check_i7_fts_membership(&model, &rec);
+
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I7FtsMembership);
+        assert_eq!(
+            violations[0].detail,
+            "FTS query returned id whose body had none of the query words"
+        );
+    }
+}
