@@ -1,0 +1,147 @@
+schema_version = 1
+scenario = "upsert_single"
+
+[dataset]
+vectors = 512
+dims = 64
+nlist = 4
+seed = 11
+attrs = "none"
+fts = "none"
+
+[server_config]
+manifest_cache_ttl_ms = 0
+memory_cache_max_mb = 256
+max_wal_fragments_before_compact = 64
+
+[run]
+cache_state = "warm"
+repeats = 8
+
+[run.measure]
+op = "upsert"
+batch = 1
+
+[baseline]
+git_rev = "75271612523250f04cdb466a683137fcbc709ba7"
+captured = "2026-07-10T01:40:20.713597+00:00"
+approved_by = "anup"
+reason = "initial freeze"
+
+[assert.depth.put_get]
+mode = "exact"
+value = 4
+why = "current HEAD: one WAL PUT, manifest GET, history PUT, and manifest CAS"
+
+[assert.gets]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 0
+fts = 0
+manifest = 1
+other = 0
+sketch = 0
+sq = 0
+total = 1
+wal = 0
+
+[assert.puts]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 0
+fts = 0
+manifest = 1
+other = 1
+sketch = 0
+sq = 0
+total = 3
+wal = 1
+
+[assert.get_bytes.attrs]
+exact = 0
+
+[assert.get_bytes.bitmap]
+exact = 0
+
+[assert.get_bytes.bootstrap]
+exact = 0
+
+[assert.get_bytes.centroids]
+exact = 0
+
+[assert.get_bytes.cluster]
+exact = 0
+
+[assert.get_bytes.fts]
+exact = 0
+
+[assert.get_bytes.manifest]
+min = 977
+max = 1215
+why = "manifest GET bytes grow across the eight measured repeats"
+
+[assert.get_bytes.other]
+exact = 0
+
+[assert.get_bytes.sketch]
+exact = 0
+
+[assert.get_bytes.sq]
+exact = 0
+
+[assert.get_bytes.total]
+min = 977
+max = 1215
+why = "manifest GET bytes grow across the eight measured repeats"
+
+[assert.get_bytes.wal]
+exact = 0
+
+[assert.put_bytes.attrs]
+exact = 0
+
+[assert.put_bytes.bitmap]
+exact = 0
+
+[assert.put_bytes.bootstrap]
+exact = 0
+
+[assert.put_bytes.centroids]
+exact = 0
+
+[assert.put_bytes.cluster]
+exact = 0
+
+[assert.put_bytes.fts]
+exact = 0
+
+[assert.put_bytes.manifest]
+min = 1011
+max = 1249
+why = "manifest CAS bytes grow across the eight measured repeats"
+
+[assert.put_bytes.other]
+min = 1011
+max = 1249
+why = "history PUT bytes grow across the eight measured repeats"
+
+[assert.put_bytes.sketch]
+exact = 0
+
+[assert.put_bytes.sq]
+exact = 0
+
+[assert.put_bytes.total]
+min = 2408
+max = 2884
+why = "manifest and history bytes grow while WAL bytes remain fixed"
+
+[assert.put_bytes.wal]
+exact = 386
+
+[assert.put_keys]
+"manifests/" = 1

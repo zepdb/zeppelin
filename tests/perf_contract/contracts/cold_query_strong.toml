@@ -1,0 +1,143 @@
+schema_version = 1
+scenario = "cold_query_strong"
+
+[dataset]
+vectors = 4096
+dims = 64
+nlist = 8
+seed = 7
+attrs = "none"
+fts = "none"
+
+[ns_config]
+quantization = "sq8"
+
+[server_config]
+nprobe = 4
+manifest_cache_ttl_ms = 0
+memory_cache_max_mb = 256
+
+[run]
+cache_state = "cold"
+repeats = 1
+
+[run.measure]
+op = "query"
+consistency = "strong"
+top_k = 10
+query_index = 0
+
+[baseline]
+git_rev = "75271612523250f04cdb466a683137fcbc709ba7"
+captured = "2026-07-10T01:40:20.713597+00:00"
+approved_by = "anup"
+reason = "initial freeze"
+
+[assert.depth.get]
+mode = "max"
+value = 7
+why = "100 samples: {6: 99, 7: 1}; parallel grouped header/SQ pipelines have completion-order jitter before rerank"
+
+[assert.gets]
+attrs = 0
+bitmap = 0
+bootstrap = 1
+centroids = 0
+cluster = 7
+fts = 0
+manifest = 1
+other = 1
+sketch = 0
+sq = 0
+total = 10
+wal = 0
+
+[assert.puts]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 0
+fts = 0
+manifest = 0
+other = 0
+sketch = 0
+sq = 0
+total = 0
+wal = 0
+
+[assert.get_bytes.attrs]
+exact = 0
+
+[assert.get_bytes.bitmap]
+exact = 0
+
+[assert.get_bytes.bootstrap]
+exact = 330365
+why = "capture pins the immutable bootstrap object size"
+
+[assert.get_bytes.centroids]
+exact = 0
+
+[assert.get_bytes.cluster]
+exact = 429303
+why = "capture pins the seven measured cluster GETs"
+
+[assert.get_bytes.fts]
+exact = 0
+
+[assert.get_bytes.manifest]
+exact = 2583
+why = "fresh manifest serialization includes generation and timestamps"
+
+[assert.get_bytes.other]
+exact = 648
+why = "fresh namespace metadata GET"
+
+[assert.get_bytes.sketch]
+exact = 0
+
+[assert.get_bytes.sq]
+exact = 0
+
+[assert.get_bytes.total]
+exact = 762899
+
+[assert.get_bytes.wal]
+exact = 0
+
+[assert.put_bytes.attrs]
+exact = 0
+
+[assert.put_bytes.bitmap]
+exact = 0
+
+[assert.put_bytes.bootstrap]
+exact = 0
+
+[assert.put_bytes.centroids]
+exact = 0
+
+[assert.put_bytes.cluster]
+exact = 0
+
+[assert.put_bytes.fts]
+exact = 0
+
+[assert.put_bytes.manifest]
+exact = 0
+
+[assert.put_bytes.other]
+exact = 0
+
+[assert.put_bytes.sketch]
+exact = 0
+
+[assert.put_bytes.sq]
+exact = 0
+
+[assert.put_bytes.total]
+exact = 0
+
+[assert.put_bytes.wal]
+exact = 0

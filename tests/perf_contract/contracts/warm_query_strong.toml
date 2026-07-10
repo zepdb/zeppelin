@@ -1,0 +1,141 @@
+schema_version = 1
+scenario = "warm_query_strong"
+
+[dataset]
+vectors = 4096
+dims = 64
+nlist = 8
+seed = 7
+attrs = "none"
+fts = "none"
+
+[ns_config]
+quantization = "sq8"
+
+[server_config]
+nprobe = 4
+manifest_cache_ttl_ms = 3600000
+memory_cache_max_mb = 256
+
+[run]
+cache_state = "warm"
+repeats = 8
+
+[run.measure]
+op = "query"
+consistency = "strong"
+top_k = 10
+query_index = 0
+
+[baseline]
+git_rev = "75271612523250f04cdb466a683137fcbc709ba7"
+captured = "2026-07-10T01:40:20.713597+00:00"
+approved_by = "anup"
+reason = "initial freeze"
+
+[assert.depth.get]
+mode = "exact"
+value = 3
+why = "conditional manifest verification, parallel SQ coarse reads, then exact rerank"
+
+[assert.gets]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 4
+fts = 0
+manifest = 1
+other = 0
+sketch = 0
+sq = 0
+total = 5
+wal = 0
+
+[assert.puts]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 0
+fts = 0
+manifest = 0
+other = 0
+sketch = 0
+sq = 0
+total = 0
+wal = 0
+
+[assert.get_bytes.attrs]
+exact = 0
+
+[assert.get_bytes.bitmap]
+exact = 0
+
+[assert.get_bytes.bootstrap]
+exact = 0
+
+[assert.get_bytes.centroids]
+exact = 0
+
+[assert.get_bytes.cluster]
+exact = 429027
+why = "capture pins four grouped-cluster GETs at their measured live-span bytes"
+
+[assert.get_bytes.fts]
+exact = 0
+
+[assert.get_bytes.manifest]
+exact = 0
+why = "the conditional manifest GET returned no response bytes"
+
+[assert.get_bytes.other]
+exact = 0
+
+[assert.get_bytes.sketch]
+exact = 0
+
+[assert.get_bytes.sq]
+exact = 0
+
+[assert.get_bytes.total]
+exact = 429027
+
+[assert.get_bytes.wal]
+exact = 0
+
+[assert.put_bytes.attrs]
+exact = 0
+
+[assert.put_bytes.bitmap]
+exact = 0
+
+[assert.put_bytes.bootstrap]
+exact = 0
+
+[assert.put_bytes.centroids]
+exact = 0
+
+[assert.put_bytes.cluster]
+exact = 0
+
+[assert.put_bytes.fts]
+exact = 0
+
+[assert.put_bytes.manifest]
+exact = 0
+
+[assert.put_bytes.other]
+exact = 0
+
+[assert.put_bytes.sketch]
+exact = 0
+
+[assert.put_bytes.sq]
+exact = 0
+
+[assert.put_bytes.total]
+exact = 0
+
+[assert.put_bytes.wal]
+exact = 0
