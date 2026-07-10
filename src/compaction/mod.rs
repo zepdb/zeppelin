@@ -360,7 +360,7 @@ fn manifest_needs_index_rewrite(manifest: &Manifest, config: &IndexingConfig) ->
 ///
 /// `false` when quantization or hierarchy differ. Hierarchical layouts otherwise
 /// match without comparing leaf count. Flat layouts also require the cluster
-/// count to equal `min(default_num_centroids, vector_count)`.
+/// count to equal the scale-aware centroid target for `vector_count`.
 ///
 /// # Examples
 ///
@@ -375,7 +375,7 @@ fn segment_matches_index_config(segment: &SegmentRef, config: &IndexingConfig) -
     if segment.hierarchical {
         return true;
     }
-    let expected_clusters = config.default_num_centroids.min(segment.vector_count);
+    let expected_clusters = config.effective_num_centroids(segment.vector_count);
     segment.cluster_count == expected_clusters
 }
 
@@ -4020,6 +4020,31 @@ mod tests {
             IndexingConfig::default(),
             Duration::from_secs(GcConfig::default().compaction_upload_window_secs),
         )
+    }
+
+    /// Scale-aware flat segments match only their row-derived centroid count.
+    #[test]
+    fn segment_layout_match_uses_scale_aware_centroid_count() {
+        let config = IndexingConfig::default();
+        let mut segment = SegmentRef {
+            id: "seg_scale_aware".to_string(),
+            vector_count: 1_000_000,
+            cluster_count: 334,
+            quantization: config.quantization,
+            hierarchical: false,
+            bitmap_fields: Vec::new(),
+            fts_fields: Vec::new(),
+            has_global_fts: false,
+            cluster_owners: Vec::new(),
+            sketch: None,
+            cluster_objects: Vec::new(),
+            bootstrap: None,
+            membership: None,
+        };
+
+        assert!(segment_matches_index_config(&segment, &config));
+        segment.cluster_count = 256;
+        assert!(!segment_matches_index_config(&segment, &config));
     }
 
     /// Returns current Unix wall time in milliseconds for ULID test fixtures.

@@ -577,6 +577,34 @@ mod tests {
                 vec!["indexing.default_nprobe", "indexing.max_nprobe"],
             ),
             (
+                "target rows per cluster must be nonzero",
+                Box::new(|config| config.indexing.target_rows_per_cluster = 0),
+                vec!["indexing.target_rows_per_cluster"],
+            ),
+            (
+                "centroid cap must cover the floor",
+                Box::new(|config| config.indexing.max_num_centroids = 128),
+                vec![
+                    "indexing.default_num_centroids",
+                    "indexing.max_num_centroids",
+                ],
+            ),
+            (
+                "probe fraction must be finite and positive",
+                Box::new(|config| config.indexing.default_probe_fraction = f64::NAN),
+                vec!["indexing.default_probe_fraction"],
+            ),
+            (
+                "balance ratio must be disabled or at least one",
+                Box::new(|config| config.indexing.balance_max_ratio = 0.5),
+                vec!["indexing.balance_max_ratio"],
+            ),
+            (
+                "enabled balance repair needs a round budget",
+                Box::new(|config| config.indexing.balance_repair_rounds = 0),
+                vec!["indexing.balance_repair_rounds"],
+            ),
+            (
                 "default top k must be nonzero",
                 Box::new(|config| config.server.default_top_k = 0),
                 vec!["server.default_top_k"],
@@ -689,6 +717,29 @@ mod tests {
             config.indexing.max_nprobe >= config.indexing.default_num_centroids,
             "default max_nprobe must allow probing all default centroids"
         );
+    }
+
+    /// Pins the measured scale-aware IVF defaults and their segment sizing.
+    #[test]
+    fn scale_aware_ivf_defaults_and_bounds() {
+        let config = Config::default();
+
+        assert_eq!(config.indexing.target_rows_per_cluster, 3_000);
+        assert_eq!(config.indexing.max_num_centroids, 4_096);
+        assert_eq!(config.indexing.default_nprobe, 32);
+        assert_eq!(config.indexing.default_probe_fraction, 3.0 / 16.0);
+        assert_eq!(config.indexing.balance_max_ratio, 4.0);
+        assert_eq!(config.indexing.balance_repair_rounds, 8);
+
+        assert_eq!(config.indexing.effective_num_centroids(100), 100);
+        assert_eq!(config.indexing.effective_num_centroids(1_000_000), 334);
+        assert_eq!(config.indexing.effective_num_centroids(2_000_000), 667);
+        assert_eq!(config.indexing.effective_num_centroids(20_000_000), 4_096);
+        assert_eq!(config.indexing.effective_default_nprobe(10), 10);
+        assert_eq!(config.indexing.effective_default_nprobe(256), 48);
+        assert_eq!(config.indexing.effective_default_nprobe(334), 63);
+        assert_eq!(config.indexing.effective_default_nprobe(667), 126);
+        assert_eq!(config.indexing.effective_default_nprobe(4_096), 256);
     }
 
     /// Verifies explicit query gaps and the compiled fallback through full loading.
@@ -1282,18 +1333,27 @@ pub enum HydrationPolicyKind {
 ///
 /// # Example
 ///
-/// With 256 centroids and `default_nprobe = 16`, an ordinary query searches 16
-/// candidate clusters. A caller may request a larger value, but the API must
-/// reject a value above `max_nprobe`.
+/// With 334 centroids and a `3/16` probe fraction, an ordinary query searches
+/// 63 candidate clusters. A caller may request a larger value, but the API
+/// must reject a value above `max_nprobe`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingConfig {
-    /// Default number of IVF centroids per segment. Default: `256`.
+    /// Minimum number of IVF centroids per flat segment. Default: `256`.
     #[serde(default = "default_num_centroids")]
     pub default_num_centroids: usize,
-    /// Default number of clusters to probe at query time. Default: `16`.
+    /// Target logical rows per flat IVF cluster. Default: `3000`.
+    #[serde(default = "default_target_rows_per_cluster")]
+    pub target_rows_per_cluster: usize,
+    /// Maximum number of centroids in one flat IVF segment. Default: `4096`.
+    #[serde(default = "default_max_num_centroids")]
+    pub max_num_centroids: usize,
+    /// Minimum default number of clusters to probe at query time. Default: `32`.
     #[serde(default = "default_nprobe")]
     pub default_nprobe: usize,
+    /// Fraction of a flat segment's clusters probed by default. Default: `3/16`.
+    #[serde(default = "default_probe_fraction")]
+    pub default_probe_fraction: f64,
     /// Hard upper bound on nprobe to prevent expensive full scans. Default: `256`.
     #[serde(default = "default_max_nprobe")]
     pub max_nprobe: usize,
@@ -1303,6 +1363,13 @@ pub struct IndexingConfig {
     /// k-means convergence threshold (stop when delta < epsilon). Default: `1e-4`.
     #[serde(default = "default_kmeans_convergence_epsilon")]
     pub kmeans_convergence_epsilon: f64,
+    /// Maximum occupancy divided by mean occupancy after repair. Default: `4.0`.
+    /// Set to `0.0` to disable deterministic balance repair.
+    #[serde(default = "default_balance_max_ratio")]
+    pub balance_max_ratio: f64,
+    /// Maximum deterministic balance-repair passes. Default: `8`.
+    #[serde(default = "default_balance_repair_rounds")]
+    pub balance_repair_rounds: usize,
     /// Oversampling factor for k-means initialization. Default: `3`.
     #[serde(default = "default_oversample_factor")]
     pub oversample_factor: usize,
@@ -1340,6 +1407,64 @@ pub struct IndexingConfig {
     /// Set to 0 to disable the vector-count breaker. Default: 100000.
     #[serde(default = "default_bm25_max_full_scan_vectors")]
     pub bm25_max_full_scan_vectors: usize,
+}
+
+impl IndexingConfig {
+    /// Resolves the flat IVF centroid count for one immutable segment.
+    ///
+    /// The row-count target scales large segments while the configured floor
+    /// preserves small-segment behavior and the cap bounds resident centroid
+    /// memory. A non-empty segment never receives more centroids than rows.
+    #[must_use]
+    pub fn effective_num_centroids(&self, vector_count: usize) -> usize {
+        if vector_count == 0 {
+            return 0;
+        }
+        assert!(
+            self.target_rows_per_cluster > 0,
+            "indexing.target_rows_per_cluster must be greater than zero"
+        );
+        assert!(
+            self.default_num_centroids > 0,
+            "indexing.default_num_centroids must be greater than zero"
+        );
+        assert!(
+            self.max_num_centroids >= self.default_num_centroids,
+            "indexing.max_num_centroids must cover default_num_centroids"
+        );
+
+        vector_count
+            .div_ceil(self.target_rows_per_cluster)
+            .clamp(self.default_num_centroids, self.max_num_centroids)
+            .min(vector_count)
+    }
+
+    /// Resolves the omitted probe count against a segment's actual clusters.
+    ///
+    /// The measured probe fraction scales with nlist, while
+    /// `default_nprobe` remains the minimum and `max_nprobe` remains the hard
+    /// query-cost ceiling. Empty segment sets resolve to zero.
+    #[must_use]
+    pub fn effective_default_nprobe(&self, cluster_count: usize) -> usize {
+        if cluster_count == 0 {
+            return 0;
+        }
+        assert!(
+            self.default_probe_fraction.is_finite()
+                && self.default_probe_fraction > 0.0
+                && self.default_probe_fraction <= 1.0,
+            "indexing.default_probe_fraction must be finite and in (0, 1]"
+        );
+        assert!(
+            self.default_nprobe > 0 && self.default_nprobe <= self.max_nprobe,
+            "indexing.default_nprobe must be positive and at most max_nprobe"
+        );
+
+        ((self.default_probe_fraction * cluster_count as f64).ceil() as usize)
+            .max(self.default_nprobe)
+            .min(self.max_nprobe)
+            .min(cluster_count)
+    }
 }
 
 /// Background WAL-to-segment compaction schedule, triggers, retention, and lease.
@@ -1523,9 +1648,21 @@ fn default_hydration_max_segment_fraction() -> f64 {
 fn default_num_centroids() -> usize {
     256
 }
+/// Returns the target number of rows represented by one flat IVF centroid.
+fn default_target_rows_per_cluster() -> usize {
+    3_000
+}
+/// Returns the resident-memory cap on flat IVF centroids per segment.
+fn default_max_num_centroids() -> usize {
+    4_096
+}
 /// Returns the default number of IVF clusters probed by a vector query.
 fn default_nprobe() -> usize {
-    16
+    32
+}
+/// Returns the default fraction of flat IVF clusters probed by a query.
+fn default_probe_fraction() -> f64 {
+    3.0 / 16.0
 }
 /// Returns the default maximum number of IVF clusters a query may probe.
 fn default_max_nprobe() -> usize {
@@ -1538,6 +1675,14 @@ fn default_kmeans_max_iterations() -> usize {
 /// Returns the default k-means convergence threshold.
 fn default_kmeans_convergence_epsilon() -> f64 {
     1e-4
+}
+/// Returns the maximum allowed occupancy-to-mean ratio after repair.
+fn default_balance_max_ratio() -> f64 {
+    4.0
+}
+/// Returns the maximum number of deterministic balance-repair passes.
+fn default_balance_repair_rounds() -> usize {
+    8
 }
 /// Returns the default k-means initialization oversampling factor.
 fn default_oversample_factor() -> usize {
@@ -1698,10 +1843,15 @@ impl Default for IndexingConfig {
     fn default() -> Self {
         Self {
             default_num_centroids: default_num_centroids(),
+            target_rows_per_cluster: default_target_rows_per_cluster(),
+            max_num_centroids: default_max_num_centroids(),
             default_nprobe: default_nprobe(),
+            default_probe_fraction: default_probe_fraction(),
             max_nprobe: default_max_nprobe(),
             kmeans_max_iterations: default_kmeans_max_iterations(),
             kmeans_convergence_epsilon: default_kmeans_convergence_epsilon(),
+            balance_max_ratio: default_balance_max_ratio(),
+            balance_repair_rounds: default_balance_repair_rounds(),
             oversample_factor: default_oversample_factor(),
             quantization: default_quantization(),
             pq_m: default_pq_m(),
@@ -2007,6 +2157,44 @@ impl Config {
             ));
         }
 
+        if self.indexing.default_num_centroids == 0 {
+            violations.push("indexing.default_num_centroids must be greater than zero".to_string());
+        }
+        if self.indexing.target_rows_per_cluster == 0 {
+            violations
+                .push("indexing.target_rows_per_cluster must be greater than zero".to_string());
+        }
+        if self.indexing.max_num_centroids == 0 {
+            violations.push("indexing.max_num_centroids must be greater than zero".to_string());
+        } else if self.indexing.default_num_centroids > self.indexing.max_num_centroids {
+            violations.push(format!(
+                "indexing.default_num_centroids ({}) must be <= indexing.max_num_centroids ({})",
+                self.indexing.default_num_centroids, self.indexing.max_num_centroids
+            ));
+        }
+        if !self.indexing.default_probe_fraction.is_finite()
+            || self.indexing.default_probe_fraction <= 0.0
+            || self.indexing.default_probe_fraction > 1.0
+        {
+            violations.push(format!(
+                "indexing.default_probe_fraction ({}) must be finite and in (0, 1]",
+                self.indexing.default_probe_fraction
+            ));
+        }
+        if !self.indexing.balance_max_ratio.is_finite()
+            || (self.indexing.balance_max_ratio != 0.0 && self.indexing.balance_max_ratio < 1.0)
+        {
+            violations.push(format!(
+                "indexing.balance_max_ratio ({}) must be 0 or finite and >= 1",
+                self.indexing.balance_max_ratio
+            ));
+        }
+        if self.indexing.balance_max_ratio > 0.0 && self.indexing.balance_repair_rounds == 0 {
+            violations.push(
+                "indexing.balance_repair_rounds must be greater than zero when balance repair is enabled"
+                    .to_string(),
+            );
+        }
         if self.indexing.default_nprobe == 0 {
             violations.push("indexing.default_nprobe must be greater than zero".to_string());
         }

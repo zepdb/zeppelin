@@ -43,6 +43,16 @@ struct EvalMetrics {
     full_probe_recall_at_100: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EvaluationData<'a> {
+    corpus: &'a [f32],
+    queries: &'a [f32],
+    ground_truth: &'a [u32],
+    dim: usize,
+    logical_rows: usize,
+    query_n: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Candidate {
     distance: f32,
@@ -244,15 +254,10 @@ fn recall_at_k(retrieved: &[u32], ground_truth: &[u32], k: usize) -> f64 {
 
 fn evaluate_partition(
     partition: &IvfPartition,
-    corpus: &[f32],
-    queries: &[f32],
-    ground_truth: &[u32],
-    dim: usize,
-    logical_rows: usize,
-    query_n: usize,
+    data: EvaluationData<'_>,
     nprobe: usize,
 ) -> EvalMetrics {
-    let ranges = thread_ranges(query_n, QUERY_THREADS);
+    let ranges = thread_ranges(data.query_n, QUERY_THREADS);
     let partials: Vec<(f64, f64, f64, u64)> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for (query_start, query_end) in ranges {
@@ -262,7 +267,7 @@ fn evaluate_partition(
                 let mut full_recall100 = 0.0;
                 let mut scanned = 0u64;
                 for query_idx in query_start..query_end {
-                    let query = &queries[query_idx * dim..(query_idx + 1) * dim];
+                    let query = &data.queries[query_idx * data.dim..(query_idx + 1) * data.dim];
                     let mut centroid_distances: Vec<(usize, f32)> = partition
                         .centroids
                         .iter()
@@ -284,7 +289,8 @@ fn evaluate_partition(
                             scanned += rows.len() as u64;
                         }
                         for &row in rows {
-                            let vector = &corpus[row as usize * dim..(row as usize + 1) * dim];
+                            let vector = &data.corpus
+                                [row as usize * data.dim..(row as usize + 1) * data.dim];
                             let candidate = Candidate {
                                 distance: compute_distance(query, vector, DistanceMetric::Cosine),
                                 row,
@@ -300,7 +306,7 @@ fn evaluate_partition(
                     let full_rows = full_top.sorted_rows();
                     assert_eq!(default_rows.len(), TOP_K, "default probe underfilled");
                     assert_eq!(full_rows.len(), TOP_K, "full probe underfilled");
-                    let expected = &ground_truth[query_idx * TOP_K..(query_idx + 1) * TOP_K];
+                    let expected = &data.ground_truth[query_idx * TOP_K..(query_idx + 1) * TOP_K];
                     recall10 += recall_at_k(&default_rows, expected, 10);
                     recall100 += recall_at_k(&default_rows, expected, TOP_K);
                     full_recall100 += recall_at_k(&full_rows, expected, TOP_K);
@@ -314,13 +320,14 @@ fn evaluate_partition(
             .collect()
     });
 
-    let query_n_f64 = query_n as f64;
+    let query_n_f64 = data.query_n as f64;
     let scored_rows = partials.iter().map(|partial| partial.3).sum::<u64>();
     EvalMetrics {
         recall_at_10: partials.iter().map(|partial| partial.0).sum::<f64>() / query_n_f64,
         recall_at_100: partials.iter().map(|partial| partial.1).sum::<f64>() / query_n_f64,
-        scan_fraction: scored_rows as f64 / query_n_f64 / logical_rows as f64,
-        storage_inflation: (logical_rows + partition.spilled) as f64 / logical_rows as f64,
+        scan_fraction: scored_rows as f64 / query_n_f64 / data.logical_rows as f64,
+        storage_inflation: (data.logical_rows + partition.spilled) as f64
+            / data.logical_rows as f64,
         full_probe_recall_at_100: partials.iter().map(|partial| partial.2).sum::<f64>()
             / query_n_f64,
     }
@@ -398,12 +405,14 @@ fn run_dataset(root: &Path, name: &str, config: &IndexingConfig) -> EvalMetrics 
     let nprobe = config.default_nprobe.min(partition.centroids.len());
     let metrics = evaluate_partition(
         &partition,
-        &dataset.corpus,
-        &dataset.queries,
-        &dataset.ground_truth,
-        dataset.dim,
-        dataset.corpus_n,
-        dataset.query_n,
+        EvaluationData {
+            corpus: &dataset.corpus,
+            queries: &dataset.queries,
+            ground_truth: &dataset.ground_truth,
+            dim: dataset.dim,
+            logical_rows: dataset.corpus_n,
+            query_n: dataset.query_n,
+        },
         nprobe,
     );
     report(name, &partition, nprobe, metrics);
@@ -443,12 +452,14 @@ fn run_dataset(root: &Path, name: &str, config: &IndexingConfig) -> EvalMetrics 
         let prefix_nprobe = config.default_nprobe.min(prefix_partition.centroids.len());
         let prefix_metrics = evaluate_partition(
             &prefix_partition,
-            prefix_corpus,
-            &dataset.queries,
-            &prefix_ground_truth,
-            dataset.dim,
-            prefix_rows,
-            dataset.query_n,
+            EvaluationData {
+                corpus: prefix_corpus,
+                queries: &dataset.queries,
+                ground_truth: &prefix_ground_truth,
+                dim: dataset.dim,
+                logical_rows: prefix_rows,
+                query_n: dataset.query_n,
+            },
             prefix_nprobe,
         );
         report(

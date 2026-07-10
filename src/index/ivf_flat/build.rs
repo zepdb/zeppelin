@@ -153,7 +153,7 @@ use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, VectorEntry};
 use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef};
 
-use super::kmeans::train_kmeans;
+use super::kmeans::{repair_cluster_balance, train_kmeans};
 use super::membership::build_membership_artifact;
 use super::sketch::{build_resident_sketch, ResidentSketch};
 use super::IvfFlatIndex;
@@ -2618,7 +2618,7 @@ pub struct IvfPartition {
 /// Returns an index error for empty input, zero dimension, or an input too
 /// large for persisted `u32` row indexes. Returns a dimension mismatch when a
 /// row length differs from `dim`, and propagates k-means training failures.
-#[must_use]
+#[must_use = "the IVF partition result must be handled"]
 pub fn partition_vectors(
     vectors: &[&[f32]],
     dim: usize,
@@ -2647,14 +2647,21 @@ pub fn partition_vectors(
         }
     }
 
-    let k = config.default_num_centroids.min(vectors.len());
-    let centroids = train_kmeans(
+    let k = config.effective_num_centroids(vectors.len());
+    let mut centroids = train_kmeans(
         vectors,
         dim,
         k,
         config.kmeans_max_iterations,
         config.kmeans_convergence_epsilon,
     )?;
+    repair_cluster_balance(
+        vectors,
+        dim,
+        &mut centroids,
+        config.balance_max_ratio,
+        config.balance_repair_rounds,
+    );
     let num_clusters = centroids.len();
     let mut clusters = vec![Vec::new(); num_clusters];
     let mut primary = Vec::with_capacity(vectors.len());
@@ -3687,8 +3694,10 @@ mod tests {
             vec![1.0, 0.0],
         ];
         let refs: Vec<&[f32]> = values.iter().map(Vec::as_slice).collect();
-        let mut config = IndexingConfig::default();
-        config.default_num_centroids = 2;
+        let config = IndexingConfig {
+            default_num_centroids: 2,
+            ..IndexingConfig::default()
+        };
 
         let partition = partition_vectors(&refs, 2, &config).unwrap();
 

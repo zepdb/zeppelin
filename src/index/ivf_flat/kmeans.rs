@@ -72,11 +72,23 @@ use crate::error::{Result, ZeppelinError};
 /// mini-batch path begins at the next row.
 const MINI_BATCH_THRESHOLD: usize = 10_000;
 
-/// Maximum number of vectors sampled by one mini-batch iteration.
-///
-/// Smaller data sets use their full length, although automatic mode selection
-/// normally calls the mini-batch path only above [`MINI_BATCH_THRESHOLD`].
+/// Minimum vectors sampled by one mini-batch iteration.
 const DEFAULT_BATCH_SIZE: usize = 1024;
+
+/// Training rows sampled per centroid by a mini-batch iteration.
+const BATCH_ROWS_PER_CENTROID: usize = 32;
+
+/// Fixed worker count keeps balance-repair reduction order reproducible.
+const BALANCE_REPAIR_WORKERS: usize = 12;
+
+/// Resolves a k-scaled mini-batch without exceeding the available rows.
+#[must_use]
+fn mini_batch_size(n: usize, k: usize) -> usize {
+    let scaled = k
+        .checked_mul(BATCH_ROWS_PER_CENTROID)
+        .unwrap_or_else(|| panic!("k-means mini-batch size overflow"));
+    DEFAULT_BATCH_SIZE.max(scaled).min(n)
+}
 
 /// Trains deterministic centroids for an IVF index or quantization codebook.
 ///
@@ -118,8 +130,9 @@ const DEFAULT_BATCH_SIZE: usize = 1024;
 /// # Performance
 ///
 /// K-means++ costs `O(n * k * dim)`. Each Lloyd pass has the same order and
-/// stores one assignment per vector. Mini-batch passes score at most 1,024
-/// sampled vectors but also shuffle an `O(n)` index array on each pass.
+/// stores one assignment per vector. Mini-batch passes score
+/// `min(n, max(1,024, 32 * k))` sampled vectors and also shuffle an `O(n)`
+/// index array on each pass.
 /// Centroid buffers occupy `O(k * dim)` floats.
 ///
 /// # Examples
@@ -190,9 +203,10 @@ pub fn train_kmeans(
 
     // Choose training mode based on dataset size
     if n > MINI_BATCH_THRESHOLD {
+        let batch_size = mini_batch_size(n, effective_k);
         info!(
             n = n,
-            batch_size = DEFAULT_BATCH_SIZE,
+            batch_size = batch_size,
             "using mini-batch k-means (dataset exceeds threshold)"
         );
         train_mini_batch(
@@ -377,16 +391,17 @@ fn train_lloyds(
 ///
 /// # Performance
 ///
-/// Each pass shuffles `O(n)` indexes and scores at most
-/// [`DEFAULT_BATCH_SIZE`] rows against all `k` centroids. It allocates the
-/// index vector once and an `O(batch_size)` assignment vector per pass;
+/// Each pass shuffles `O(n)` indexes and scores
+/// `min(n, max(1,024, 32 * k))` rows against all `k` centroids. It allocates
+/// the index vector once and an `O(batch_size)` assignment vector per pass;
 /// centroid history costs `O(k * dim)`.
 ///
 /// # Examples
 ///
-/// For twelve thousand rows, a pass shuffles row indexes, uses the first 1,024,
-/// and nudges each winning centroid by `1 / observations_for_that_centroid`.
-/// Later observations therefore make progressively smaller changes.
+/// For twelve thousand rows and 256 centroids, a pass shuffles row indexes,
+/// uses the first 8,192, and nudges each winning centroid by
+/// `1 / observations_for_that_centroid`. Later observations therefore make
+/// progressively smaller changes.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
@@ -404,7 +419,7 @@ fn train_mini_batch(
     rng: &mut StdRng,
 ) -> Result<Vec<Vec<f32>>> {
     let n = vectors.len();
-    let batch_size = DEFAULT_BATCH_SIZE.min(n);
+    let batch_size = mini_batch_size(n, k);
 
     // Per-centroid sample count (for learning rate decay)
     let mut centroid_counts = vec![0u64; k];
@@ -485,6 +500,191 @@ fn train_mini_batch(
         "mini-batch k-means did not converge, using current centroids"
     );
     Ok(centroids)
+}
+
+/// Repairs pathologically overfull clusters by deterministic centroid splits.
+///
+/// Each round assigns all rows in fixed contiguous worker ranges, joins those
+/// ranges in row order, and recomputes centroid means in input order. The
+/// largest overfull clusters donate their farthest, lowest-index row to the
+/// emptiest available centroid slots. Rows naturally re-home on the next
+/// round; no row is copied or persisted by this CPU-only stage.
+///
+/// A `max_ratio` of zero explicitly disables repair. Reaching `max_rounds`
+/// emits a warning and returns the last deterministic centroid state.
+pub(crate) fn repair_cluster_balance(
+    vectors: &[&[f32]],
+    dim: usize,
+    centroids: &mut [Vec<f32>],
+    max_ratio: f64,
+    max_rounds: usize,
+) {
+    if max_ratio == 0.0 {
+        return;
+    }
+    assert!(
+        max_ratio.is_finite() && max_ratio >= 1.0,
+        "balance max ratio must be zero or finite and at least one"
+    );
+    assert!(
+        max_rounds > 0,
+        "enabled balance repair requires at least one round"
+    );
+    assert!(!vectors.is_empty(), "balance repair requires input rows");
+    assert!(!centroids.is_empty(), "balance repair requires centroids");
+    assert!(
+        vectors.iter().all(|vector| vector.len() == dim),
+        "balance repair vector dimension mismatch"
+    );
+    assert!(
+        centroids.iter().all(|centroid| centroid.len() == dim),
+        "balance repair centroid dimension mismatch"
+    );
+
+    let cluster_count = centroids.len();
+    let mean_occupancy = vectors.len() as f64 / cluster_count as f64;
+    let worker_count = BALANCE_REPAIR_WORKERS.min(vectors.len());
+    let rows_per_worker = vectors.len().div_ceil(worker_count);
+
+    for round in 0..max_rounds {
+        let centroid_view: &[Vec<f32>] = centroids;
+        let partials: Vec<(usize, Vec<usize>, Vec<f32>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..worker_count)
+                .filter_map(|worker| {
+                    let start = worker * rows_per_worker;
+                    let end = ((worker + 1) * rows_per_worker).min(vectors.len());
+                    (start < end).then(|| {
+                        scope.spawn(move || {
+                            let mut assignments = Vec::with_capacity(end - start);
+                            let mut distances = Vec::with_capacity(end - start);
+                            for vector in &vectors[start..end] {
+                                let mut best_cluster = 0usize;
+                                let mut best_distance = f32::MAX;
+                                for (cluster, centroid) in centroid_view.iter().enumerate() {
+                                    let distance = squared_l2(vector, centroid);
+                                    if distance < best_distance {
+                                        best_distance = distance;
+                                        best_cluster = cluster;
+                                    }
+                                }
+                                assignments.push(best_cluster);
+                                distances.push(best_distance);
+                            }
+                            (start, assignments, distances)
+                        })
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| panic!("balance repair worker panicked"))
+                })
+                .collect()
+        });
+
+        let mut assignments = vec![0usize; vectors.len()];
+        let mut distances = vec![0.0f32; vectors.len()];
+        for (start, worker_assignments, worker_distances) in partials {
+            let end = start + worker_assignments.len();
+            assignments[start..end].copy_from_slice(&worker_assignments);
+            distances[start..end].copy_from_slice(&worker_distances);
+        }
+
+        let mut counts = vec![0usize; cluster_count];
+        let mut sums = vec![vec![0.0f64; dim]; cluster_count];
+        for (row, &cluster) in assignments.iter().enumerate() {
+            counts[cluster] += 1;
+            for (sum, &value) in sums[cluster].iter_mut().zip(vectors[row]) {
+                *sum += f64::from(value);
+            }
+        }
+
+        let mut overfull: Vec<usize> = (0..cluster_count)
+            .filter(|&cluster| counts[cluster] as f64 > max_ratio * mean_occupancy)
+            .collect();
+        overfull.sort_by(|&left, &right| {
+            counts[right]
+                .cmp(&counts[left])
+                .then_with(|| left.cmp(&right))
+        });
+        if overfull.is_empty() {
+            info!(
+                rounds = round,
+                max_ratio = max_ratio,
+                "k-means balance repair converged"
+            );
+            return;
+        }
+
+        for cluster in 0..cluster_count {
+            if counts[cluster] == 0 {
+                continue;
+            }
+            let inverse = 1.0 / counts[cluster] as f64;
+            for (value, &sum) in centroids[cluster].iter_mut().zip(&sums[cluster]) {
+                *value = (sum * inverse) as f32;
+            }
+        }
+
+        let mut donors: Vec<usize> = (0..cluster_count).collect();
+        donors.sort_by_key(|&cluster| (counts[cluster], cluster));
+        let mut is_overfull = vec![false; cluster_count];
+        for &cluster in &overfull {
+            is_overfull[cluster] = true;
+        }
+        let mut used_donors = vec![false; cluster_count];
+        let mut splits = Vec::with_capacity(overfull.len());
+        for &source in &overfull {
+            let donor = donors
+                .iter()
+                .copied()
+                .find(|&candidate| {
+                    candidate != source && !is_overfull[candidate] && !used_donors[candidate]
+                })
+                .unwrap_or_else(|| {
+                    panic!("balance repair requires one donor per overfull cluster")
+                });
+            used_donors[donor] = true;
+
+            let mut farthest_row = None;
+            let mut farthest_distance = f32::NEG_INFINITY;
+            for (row, (&cluster, &distance)) in assignments.iter().zip(&distances).enumerate() {
+                if cluster == source && distance > farthest_distance {
+                    farthest_row = Some(row);
+                    farthest_distance = distance;
+                }
+            }
+            splits.push((
+                donor,
+                farthest_row.unwrap_or_else(|| panic!("overfull cluster must contain a row")),
+            ));
+        }
+
+        for (donor, row) in splits.iter().copied() {
+            centroids[donor].copy_from_slice(vectors[row]);
+        }
+        info!(
+            round = round + 1,
+            splits = splits.len(),
+            max_occupancy = counts
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or_else(|| panic!("balance repair occupancy cannot be empty")),
+            max_ratio = max_ratio,
+            "k-means balance repair split overfull clusters"
+        );
+    }
+
+    warn!(
+        max_rounds = max_rounds,
+        max_ratio = max_ratio,
+        "k-means balance repair exhausted its round budget"
+    );
 }
 
 /// Chooses spread-out initial centroids with k-means++ weighted sampling.
@@ -818,5 +1018,52 @@ mod tests {
         let second = train_kmeans(&refs, 2, 3, 25, 1e-4).unwrap();
 
         assert_eq!(first, second);
+    }
+
+    /// The sampled training budget grows with centroid count and caps at N.
+    #[test]
+    fn mini_batch_budget_scales_with_centroid_count() {
+        assert_eq!(mini_batch_size(2_000_000, 256), 8_192);
+        assert_eq!(mini_batch_size(2_000_000, 667), 21_344);
+        assert_eq!(mini_batch_size(100, 667), 100);
+    }
+
+    /// Repair deterministically splits a synthetic 10:1 occupancy skew.
+    #[test]
+    fn balance_repair_eliminates_synthetic_skew_deterministically() {
+        let mut data = Vec::new();
+        for row in 0..90 {
+            data.push(vec![row as f32 * 0.01, 0.0]);
+        }
+        for row in 0..10 {
+            data.push(vec![100.0 + row as f32 * 0.01, 0.0]);
+        }
+        let refs: Vec<&[f32]> = data.iter().map(Vec::as_slice).collect();
+        let initial: Vec<Vec<f32>> = std::iter::once(vec![0.0, 0.0])
+            .chain(std::iter::repeat_n(vec![100.0, 0.0], 9))
+            .collect();
+        let mut first = initial.clone();
+        let mut second = initial;
+
+        repair_cluster_balance(&refs, 2, &mut first, 4.0, 8);
+        repair_cluster_balance(&refs, 2, &mut second, 4.0, 8);
+
+        assert_eq!(first, second);
+        let mut occupancy = vec![0usize; first.len()];
+        for vector in &refs {
+            let cluster = first
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    squared_l2(vector, left).total_cmp(&squared_l2(vector, right))
+                })
+                .unwrap()
+                .0;
+            occupancy[cluster] += 1;
+        }
+        assert!(
+            occupancy.iter().copied().max().unwrap() <= 40,
+            "repair left occupancy above 4x mean: {occupancy:?}"
+        );
     }
 }
