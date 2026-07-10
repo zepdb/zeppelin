@@ -390,9 +390,20 @@ fn report(name: &str, partition: &IvfPartition, nprobe: usize, metrics: EvalMetr
 fn run_dataset(root: &Path, name: &str, config: &IndexingConfig) -> EvalMetrics {
     let dataset = load_dataset(root, name);
     let refs: Vec<&[f32]> = dataset.corpus.chunks_exact(dataset.dim).collect();
-    let partition = partition_vectors(&refs, dataset.dim, config).expect("partition build failed");
-    let repeated = partition_vectors(&refs, dataset.dim, config)
-        .expect("repeated deterministic partition build failed");
+    let (partition, repeated) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| partition_vectors(&refs, dataset.dim, config));
+        let second = scope.spawn(|| partition_vectors(&refs, dataset.dim, config));
+        (
+            first
+                .join()
+                .expect("first partition worker panicked")
+                .expect("partition build failed"),
+            second
+                .join()
+                .expect("second partition worker panicked")
+                .expect("repeated deterministic partition build failed"),
+        )
+    });
     assert_eq!(
         assignment_hash(&partition.primary),
         assignment_hash(&repeated.primary),
@@ -400,9 +411,7 @@ fn run_dataset(root: &Path, name: &str, config: &IndexingConfig) -> EvalMetrics 
     );
     drop(repeated);
 
-    // Commit 1 uses the current constant default. Commit 3 replaces this with
-    // the production scale-aware default resolver once that policy lands.
-    let nprobe = config.default_nprobe.min(partition.centroids.len());
+    let nprobe = config.effective_default_nprobe(partition.centroids.len());
     let metrics = evaluate_partition(
         &partition,
         EvaluationData {
@@ -449,7 +458,7 @@ fn run_dataset(root: &Path, name: &str, config: &IndexingConfig) -> EvalMetrics 
             prefix_rows,
             dataset.query_n,
         );
-        let prefix_nprobe = config.default_nprobe.min(prefix_partition.centroids.len());
+        let prefix_nprobe = config.effective_default_nprobe(prefix_partition.centroids.len());
         let prefix_metrics = evaluate_partition(
             &prefix_partition,
             EvaluationData {

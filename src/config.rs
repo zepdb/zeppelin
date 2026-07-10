@@ -740,6 +740,10 @@ mod tests {
         assert_eq!(config.indexing.effective_default_nprobe(334), 63);
         assert_eq!(config.indexing.effective_default_nprobe(667), 126);
         assert_eq!(config.indexing.effective_default_nprobe(4_096), 256);
+        assert_eq!(
+            config.indexing.effective_default_nprobe_with_floor(334, 80),
+            80
+        );
     }
 
     /// Verifies explicit query gaps and the compiled fallback through full loading.
@@ -1446,6 +1450,20 @@ impl IndexingConfig {
     /// query-cost ceiling. Empty segment sets resolve to zero.
     #[must_use]
     pub fn effective_default_nprobe(&self, cluster_count: usize) -> usize {
+        self.effective_default_nprobe_with_floor(cluster_count, self.default_nprobe)
+    }
+
+    /// Resolves an omitted probe count with a captured runtime floor.
+    ///
+    /// This variant preserves per-request runtime snapshot semantics while
+    /// sharing the boot-configured fraction and hard maximum. The caller must
+    /// supply a positive floor no greater than `max_nprobe`.
+    #[must_use]
+    pub fn effective_default_nprobe_with_floor(
+        &self,
+        cluster_count: usize,
+        default_nprobe_floor: usize,
+    ) -> usize {
         if cluster_count == 0 {
             return 0;
         }
@@ -1456,12 +1474,12 @@ impl IndexingConfig {
             "indexing.default_probe_fraction must be finite and in (0, 1]"
         );
         assert!(
-            self.default_nprobe > 0 && self.default_nprobe <= self.max_nprobe,
-            "indexing.default_nprobe must be positive and at most max_nprobe"
+            default_nprobe_floor > 0 && default_nprobe_floor <= self.max_nprobe,
+            "runtime default_nprobe must be positive and at most max_nprobe"
         );
 
         ((self.default_probe_fraction * cluster_count as f64).ceil() as usize)
-            .max(self.default_nprobe)
+            .max(default_nprobe_floor)
             .min(self.max_nprobe)
             .min(cluster_count)
     }

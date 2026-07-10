@@ -2696,6 +2696,13 @@ pub fn partition_vectors(
         primary.push(best_cluster as u32);
     }
 
+    let stored_rows = clusters.iter().map(Vec::len).sum::<usize>();
+    assert_eq!(
+        stored_rows,
+        vectors.len(),
+        "no-spill IVF partition must store every logical row exactly once"
+    );
+
     Ok(IvfPartition {
         centroids,
         clusters,
@@ -3705,6 +3712,34 @@ mod tests {
         assert_eq!(partition.clusters, vec![vec![2, 3], vec![0, 1]]);
         assert_eq!(partition.spilled, 0);
         assert_eq!(partition.buddy_affinity, vec![vec![0, 4], vec![4, 0]]);
+    }
+
+    /// Every logical row has exactly one stored location under no-spill policy.
+    #[test]
+    fn partition_vectors_stores_each_row_exactly_once() {
+        let values: Vec<Vec<f32>> = (0..64)
+            .map(|row| vec![row as f32, (row % 7) as f32])
+            .collect();
+        let refs: Vec<&[f32]> = values.iter().map(Vec::as_slice).collect();
+        let config = IndexingConfig {
+            default_num_centroids: 8,
+            max_num_centroids: 8,
+            target_rows_per_cluster: usize::MAX,
+            ..IndexingConfig::default()
+        };
+
+        let partition = partition_vectors(&refs, 2, &config).unwrap();
+        let mut occurrences = vec![0usize; values.len()];
+        for (cluster, rows) in partition.clusters.iter().enumerate() {
+            for &row in rows {
+                occurrences[row as usize] += 1;
+                assert_eq!(partition.primary[row as usize], cluster as u32);
+            }
+        }
+
+        assert_eq!(partition.spilled, 0);
+        assert_eq!(partition.clusters.iter().map(Vec::len).sum::<usize>(), 64);
+        assert!(occurrences.into_iter().all(|count| count == 1));
     }
 
     /// Proves current centroid bytes preserve row order, values, and dimension.

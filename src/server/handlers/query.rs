@@ -152,6 +152,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, instrument};
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::config::IndexingConfig;
 use crate::error::ZeppelinError;
 use crate::fts::bm25::{self, Bm25Params};
 use crate::fts::rank_by::RankBy;
@@ -516,8 +517,8 @@ struct ValidatedQuery {
     top_k: usize,
     /// Per-source frontier retained for transforms that need extra candidates.
     candidate_k: usize,
-    /// Effective top-level or single-source ANN probe count.
-    nprobe: usize,
+    /// Explicit top-level or single-source ANN probes; `None` preserves omission.
+    nprobe: Option<usize>,
     /// Effective response attribute projection.
     include_attributes: bool,
     /// Validated source syntax and execution path.
@@ -1068,9 +1069,9 @@ pub async fn batch_query_namespace(
 ///
 /// # Examples
 ///
-/// With default `top_k = 10` and `nprobe = 8`, an ANN body omitting both gets
-/// those values and a default candidate frontier of 100. `nprobe = 0` fails
-/// here rather than executing an empty successful search.
+/// With default `top_k = 10`, an ANN body omitting `nprobe` retains that
+/// omission until its manifest segment is known. `nprobe = 0` fails here
+/// rather than executing an empty successful search.
 fn validate_query_shape(
     req: &QueryRequest,
     knobs: &QueryKnobs,
@@ -1099,7 +1100,7 @@ fn validate_query_shape(
     // regardless of path: nprobe:0 previously slipped through and probed zero
     // clusters, returning an empty 200 (Task 14 I1).
     validate_nprobe_requests(req, state.config.indexing.max_nprobe)?;
-    let nprobe = source_nprobe.or(req.nprobe).unwrap_or(knobs.default_nprobe);
+    let nprobe = source_nprobe.or(req.nprobe);
 
     Ok(ValidatedQuery {
         top_k,
@@ -1631,8 +1632,14 @@ async fn execute_validated_query(
     let rerank_limit = rerank_output_k(req, validated, first_stage_top_k);
     let first_stage_include_attributes =
         first_stage_include_attributes(req, validated.include_attributes);
-    let explain_source =
-        explain_source_for_ref(0, &source_ref, validated.nprobe, first_stage_top_k);
+    let nprobe = resolve_source_nprobe(
+        &source_ref,
+        &manifest,
+        validated.nprobe,
+        &state.config.indexing,
+        knobs.default_nprobe,
+    )?;
+    let explain_source = explain_source_for_ref(0, &source_ref, nprobe, first_stage_top_k);
     let mut explain = build_explain_accumulator(
         req,
         validated,
@@ -1647,7 +1654,7 @@ async fn execute_validated_query(
         req,
         source_ref,
         first_stage_top_k,
-        validated.nprobe,
+        nprobe,
         first_stage_include_attributes,
         knobs,
         manifest.clone(),
@@ -1752,7 +1759,14 @@ async fn execute_hybrid_query(
         let source_ref =
             resolve_algebra_source_ref(state, ns, req, index, manifest.clone()).await?;
         validate_query_source_metadata(ns, meta, &source_ref)?;
-        let nprobe = nprobe_for_algebra_source(req, index, knobs.default_nprobe)?;
+        let requested_nprobe = nprobe_for_algebra_source(req, index)?;
+        let nprobe = resolve_source_nprobe(
+            &source_ref,
+            &manifest,
+            requested_nprobe,
+            &state.config.indexing,
+            knobs.default_nprobe,
+        )?;
         explain_sources.push(explain_source_for_request_source(
             req,
             index,
@@ -4467,12 +4481,11 @@ async fn resolve_algebra_source_ref<'a>(
 ///
 /// - `req`: Request containing source-local and top-level controls.
 /// - `index`: Validated source position.
-/// - `default_nprobe`: Runtime default captured for this execution.
 ///
 /// # Returns
 ///
-/// ANN uses source-local, then top-level, then default precedence. BM25 returns
-/// the default as an unused uniform argument to source execution.
+/// ANN uses source-local then top-level precedence while preserving omission.
+/// BM25 returns `None` because it does not probe vector clusters.
 ///
 /// # Errors
 ///
@@ -4480,20 +4493,66 @@ async fn resolve_algebra_source_ref<'a>(
 fn nprobe_for_algebra_source(
     req: &QueryRequest,
     index: usize,
-    default_nprobe: usize,
-) -> Result<usize, ZeppelinError> {
+) -> Result<Option<usize>, ZeppelinError> {
     let sources = req
         .sources
         .as_ref()
         .ok_or_else(|| ZeppelinError::Validation("retrieval algebra sources missing".into()))?;
     match sources.get(index) {
-        Some(CandidateSource::Ann { nprobe, .. }) => {
-            Ok(nprobe.or(req.nprobe).unwrap_or(default_nprobe))
-        }
-        Some(CandidateSource::Bm25 { .. }) => Ok(default_nprobe),
+        Some(CandidateSource::Ann { nprobe, .. }) => Ok(nprobe.or(req.nprobe)),
+        Some(CandidateSource::Bm25 { .. }) => Ok(None),
         None => Err(ZeppelinError::Validation(
             "validated algebra source is missing".into(),
         )),
+    }
+}
+
+/// Resolves one source's effective probe count from the fixed manifest.
+fn resolve_source_nprobe(
+    source: &QuerySourceRef<'_>,
+    manifest: &Manifest,
+    requested_nprobe: Option<usize>,
+    config: &IndexingConfig,
+    default_nprobe_floor: usize,
+) -> Result<usize, ZeppelinError> {
+    match source {
+        QuerySourceRef::Ann { .. } => {
+            let active_segment = active_segment_snapshot(manifest);
+            resolve_ann_nprobe(
+                config,
+                active_segment.as_ref(),
+                requested_nprobe,
+                default_nprobe_floor,
+            )
+        }
+        QuerySourceRef::Bm25 { .. } => Ok(default_nprobe_floor),
+    }
+}
+
+/// Resolves explicit or omitted ANN probes without changing hierarchy policy.
+fn resolve_ann_nprobe(
+    config: &IndexingConfig,
+    active_segment: Option<&SegmentRef>,
+    requested_nprobe: Option<usize>,
+    default_nprobe_floor: usize,
+) -> Result<usize, ZeppelinError> {
+    if let Some(segment) = active_segment {
+        if !segment.hierarchical && segment.cluster_count == 0 {
+            return Err(ZeppelinError::Index(format!(
+                "active flat segment {} advertises zero clusters",
+                segment.id
+            )));
+        }
+    }
+    if let Some(nprobe) = requested_nprobe {
+        return Ok(nprobe);
+    }
+    match active_segment {
+        Some(segment) if !segment.hierarchical => {
+            Ok(config
+                .effective_default_nprobe_with_floor(segment.cluster_count, default_nprobe_floor))
+        }
+        _ => Ok(default_nprobe_floor),
     }
 }
 
@@ -4680,5 +4739,68 @@ impl Drop for DurationGuard {
         crate::metrics::QUERY_DURATION
             .with_label_values(&[&self.namespace])
             .observe(elapsed.as_secs_f64());
+    }
+}
+
+#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    //! Pins omitted-probe resolution without object-store I/O.
+
+    use super::*;
+    use crate::config::IndexingConfig;
+
+    fn segment(cluster_count: usize, hierarchical: bool) -> SegmentRef {
+        SegmentRef {
+            id: "seg_probe_policy".to_string(),
+            vector_count: 1_000_000,
+            cluster_count,
+            quantization: crate::index::quantization::QuantizationType::Scalar,
+            hierarchical,
+            bitmap_fields: Vec::new(),
+            fts_fields: Vec::new(),
+            has_global_fts: false,
+            cluster_owners: Vec::new(),
+            sketch: None,
+            cluster_objects: Vec::new(),
+            bootstrap: None,
+            membership: None,
+        }
+    }
+
+    /// Omitted flat probes scale per segment while explicit values stay exact.
+    #[test]
+    fn ann_nprobe_resolves_omission_per_flat_segment() {
+        let config = IndexingConfig::default();
+        let one_million = segment(334, false);
+        let two_million = segment(667, false);
+
+        assert_eq!(
+            resolve_ann_nprobe(&config, Some(&one_million), None, 32).unwrap(),
+            63
+        );
+        assert_eq!(
+            resolve_ann_nprobe(&config, Some(&two_million), None, 32).unwrap(),
+            126
+        );
+        assert_eq!(
+            resolve_ann_nprobe(&config, Some(&two_million), Some(7), 32).unwrap(),
+            7
+        );
+    }
+
+    /// Hierarchical and WAL-only queries retain the captured runtime floor.
+    #[test]
+    fn ann_nprobe_keeps_non_flat_default_semantics() {
+        let config = IndexingConfig::default();
+        let hierarchical = segment(667, true);
+        let invalid_flat = segment(0, false);
+
+        assert_eq!(
+            resolve_ann_nprobe(&config, Some(&hierarchical), None, 40).unwrap(),
+            40
+        );
+        assert_eq!(resolve_ann_nprobe(&config, None, None, 40).unwrap(), 40);
+        assert!(resolve_ann_nprobe(&config, Some(&invalid_flat), None, 40).is_err());
     }
 }
