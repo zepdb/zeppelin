@@ -1,0 +1,145 @@
+schema_version = 1
+scenario = "warm_query_eventual"
+
+[dataset]
+vectors = 4096
+dims = 64
+nlist = 8
+seed = 7
+attrs = "none"
+fts = "none"
+
+[ns_config]
+quantization = "sq8"
+
+[server_config]
+nprobe = 4
+manifest_cache_ttl_ms = 3600000
+memory_cache_max_mb = 256
+
+[run]
+cache_state = "warm"
+repeats = 8
+
+[run.measure]
+op = "query"
+consistency = "eventual"
+top_k = 10
+query_index = 0
+
+[baseline]
+git_rev = "ff182073ebe01ece19e771f5e4fc6b7b433153b3"
+captured = "2026-07-10T04:48:07.975324+00:00"
+approved_by = "anup"
+reason = "Initial Phase 2 freeze after audited MinIO capture: two tombstone WAL reads feed four grouped-cluster reads at exact depth two."
+
+[assert.depth.get]
+mode = "exact"
+value = 2
+why = "two tombstone WAL reads feed four grouped-cluster reads at exact depth two."
+
+[assert.gets]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 4
+fts = 0
+manifest = 0
+other = 0
+sketch = 0
+sq = 0
+total = 6
+wal = 2
+
+[assert.puts]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 0
+fts = 0
+manifest = 0
+other = 0
+sketch = 0
+sq = 0
+total = 0
+wal = 0
+
+[assert.get_bytes.attrs]
+exact = 0
+
+[assert.get_bytes.bitmap]
+exact = 0
+
+[assert.get_bytes.bootstrap]
+exact = 0
+
+[assert.get_bytes.centroids]
+exact = 0
+
+[assert.get_bytes.cluster]
+exact = 429027
+
+[assert.get_bytes.fts]
+exact = 0
+
+[assert.get_bytes.manifest]
+exact = 0
+
+[assert.get_bytes.other]
+exact = 0
+
+[assert.get_bytes.sketch]
+exact = 0
+
+[assert.get_bytes.sq]
+exact = 0
+
+[assert.get_bytes.total]
+exact = 429135
+
+[assert.get_bytes.wal]
+exact = 108
+
+[assert.put_bytes.attrs]
+exact = 0
+
+[assert.put_bytes.bitmap]
+exact = 0
+
+[assert.put_bytes.bootstrap]
+exact = 0
+
+[assert.put_bytes.centroids]
+exact = 0
+
+[assert.put_bytes.cluster]
+exact = 0
+
+[assert.put_bytes.fts]
+exact = 0
+
+[assert.put_bytes.manifest]
+exact = 0
+
+[assert.put_bytes.other]
+exact = 0
+
+[assert.put_bytes.sketch]
+exact = 0
+
+[assert.put_bytes.sq]
+exact = 0
+
+[assert.put_bytes.total]
+exact = 0
+
+[assert.put_bytes.wal]
+exact = 0
+
+[assert.ops]
+copy = 0
+delete = 0
+head = 0
+list = 0

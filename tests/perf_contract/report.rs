@@ -1,4 +1,4 @@
-//! Run-scoped artifacts and the Phase-1 performance-contract report.
+//! Run-scoped artifacts and the complete performance-contract report.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -18,7 +18,7 @@ use super::scenario::{RepeatCounters, ScenarioOutcome};
 use super::PerfEnv;
 
 const SOUNDNESS_PRECONDITION: &str =
-    "exactly one client request in flight; no background compaction, GC, or hydration";
+    "exactly one measured operation in flight; no unrelated background compaction, GC, or hydration";
 
 /// All artifacts produced by one performance-contract entry invocation.
 #[derive(Debug)]
@@ -30,6 +30,7 @@ pub struct RunArtifacts {
     test_backend: Option<String>,
     scenario_labels: Vec<String>,
     scenarios: Mutex<BTreeMap<String, ScenarioReport>>,
+    proposed_diffs: Mutex<BTreeMap<String, Vec<ProposedDiff>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +118,7 @@ struct SpanLine<'a> {
 #[derive(Debug, Clone)]
 struct ScenarioReport {
     passed: bool,
+    configuration_error: Option<String>,
     violations: Vec<CostViolation>,
     repeats: Vec<ReportRepeat>,
 }
@@ -127,7 +129,21 @@ struct ReportRepeat {
     totals: ClassStats,
     get: DepthSummary,
     put_get: DepthSummary,
-    post_response_ops: usize,
+    post_response: Vec<PostResponseOp>,
+}
+
+#[derive(Debug, Clone)]
+struct PostResponseOp {
+    kind: String,
+    class: String,
+    key: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProposedDiff {
+    field: String,
+    old: String,
+    new: String,
 }
 
 impl RunArtifacts {
@@ -166,6 +182,7 @@ impl RunArtifacts {
             test_backend,
             scenario_labels: scenario_labels.to_vec(),
             scenarios: Mutex::new(BTreeMap::new()),
+            proposed_diffs: Mutex::new(BTreeMap::new()),
         };
         let metadata = RunMetadata {
             run_id: &artifacts.run_id,
@@ -265,8 +282,32 @@ impl RunArtifacts {
             label.to_string(),
             ScenarioReport {
                 passed: violations.is_empty(),
+                configuration_error: None,
                 violations: violations.to_vec(),
                 repeats: report_repeats(&outcome.per_repeat),
+            },
+        );
+    }
+
+    /// Record a checked-in contract configuration failure for the final report.
+    pub fn write_contract_error(&self, label: &str, error: String) {
+        validate_component(label, "scenario label");
+        assert!(!error.trim().is_empty(), "contract error cannot be empty");
+        let mut reports = self
+            .scenarios
+            .lock()
+            .expect("performance-contract report mutex poisoned");
+        assert!(
+            !reports.contains_key(label),
+            "scenario report already written for {label:?}"
+        );
+        reports.insert(
+            label.to_string(),
+            ScenarioReport {
+                passed: false,
+                configuration_error: Some(error),
+                violations: Vec::new(),
+                repeats: Vec::new(),
             },
         );
     }
@@ -287,9 +328,27 @@ impl RunArtifacts {
         });
         let path = proposed.join(format!("{name}.toml"));
         write_text(&path, toml, "proposed contract");
+        let checked_in = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/perf_contract/contracts")
+            .join(format!("{name}.toml"));
+        let source = fs::read_to_string(&checked_in).unwrap_or_else(|error| {
+            panic!(
+                "failed to read checked-in contract {} for proposal diff: {error}",
+                checked_in.display()
+            )
+        });
+        let diffs = diff_toml(&source, toml);
+        let mut proposed_diffs = self
+            .proposed_diffs
+            .lock()
+            .expect("performance-contract proposal mutex poisoned");
+        assert!(
+            proposed_diffs.insert(name.to_string(), diffs).is_none(),
+            "proposal diff already recorded for {name:?}"
+        );
     }
 
-    /// Write the minimal Phase-1 Markdown report for all declared scenarios.
+    /// Write the complete Markdown report for all declared scenarios.
     pub fn write_report(&self) -> PathBuf {
         let scenarios = self
             .scenarios
@@ -324,7 +383,7 @@ fn depth_artifact(repeats: &[RepeatCounters]) -> DepthArtifact {
                 repeat,
                 get: summarize_depth(&counters.get_path),
                 put_get: summarize_depth(&counters.put_get_path),
-                post_response_ops: post_response_ops(counters),
+                post_response_ops: post_response_ops(counters).len(),
             })
             .collect(),
     }
@@ -338,17 +397,22 @@ fn report_repeats(repeats: &[RepeatCounters]) -> Vec<ReportRepeat> {
             totals: counters.totals,
             get: summarize_depth(&counters.get_path),
             put_get: summarize_depth(&counters.put_get_path),
-            post_response_ops: post_response_ops(counters),
+            post_response: post_response_ops(counters),
         })
         .collect()
 }
 
-fn post_response_ops(counters: &RepeatCounters) -> usize {
+fn post_response_ops(counters: &RepeatCounters) -> Vec<PostResponseOp> {
     counters
         .spans
         .iter()
         .filter(|span| span.wall_start_us > counters.response_cutoff_us)
-        .count()
+        .map(|span| PostResponseOp {
+            kind: format!("{:?}", span.kind).to_lowercase(),
+            class: span.class.name().to_string(),
+            key: stable_depth_key(&span.key),
+        })
+        .collect()
 }
 
 fn summarize_depth(path: &CriticalPath) -> DepthSummary {
@@ -386,7 +450,12 @@ fn write_spans(path: &Path, repeats: &[RepeatCounters]) {
 }
 
 fn build_report(artifacts: &RunArtifacts, scenarios: &BTreeMap<String, ScenarioReport>) -> String {
-    let passed = scenarios.values().all(|scenario| scenario.passed);
+    let passed_count = scenarios
+        .values()
+        .filter(|scenario| scenario.passed)
+        .count();
+    let failed_count = scenarios.len() - passed_count;
+    let passed = failed_count == 0;
     let mut out = String::new();
     out.push_str("# Zeppelin Performance Contract Report\n\n");
     out.push_str(&format!("- run: `{}`\n", artifacts.run_id));
@@ -396,7 +465,9 @@ fn build_report(artifacts: &RunArtifacts, scenarios: &BTreeMap<String, ScenarioR
         "- TEST_BACKEND: `{}`\n",
         artifacts.test_backend.as_deref().unwrap_or("unset")
     ));
-    out.push_str(&format!("- scenarios: {}\n", scenarios.len()));
+    out.push_str(&format!("- scenarios run: {}\n", scenarios.len()));
+    out.push_str(&format!("- scenarios passed: {passed_count}\n"));
+    out.push_str(&format!("- scenarios failed: {failed_count}\n"));
     out.push_str(&format!(
         "- status: **{}**\n",
         if passed { "PASS" } else { "FAIL" }
@@ -405,54 +476,114 @@ fn build_report(artifacts: &RunArtifacts, scenarios: &BTreeMap<String, ScenarioR
         "- depth soundness: {}\n\n",
         SOUNDNESS_PRECONDITION
     ));
+    out.push_str(
+        "> CI command: `TEST_BACKEND=minio cargo test --test perf_contract_tests contracts -- --ignored`. Capture is never run in CI.\n\n",
+    );
+
+    let configuration_failures = scenarios
+        .iter()
+        .filter_map(|(label, scenario)| {
+            scenario
+                .configuration_error
+                .as_ref()
+                .map(|error| (label, error))
+        })
+        .collect::<Vec<_>>();
+    if !configuration_failures.is_empty() {
+        out.push_str("## Contract Configuration Failures\n\n");
+        out.push_str("These checked-in contracts were rejected before execution.\n\n");
+        for (label, error) in configuration_failures {
+            out.push_str(&format!(
+                "- **`{}`**: {}\n",
+                markdown_cell(label),
+                markdown_cell(error)
+            ));
+        }
+        out.push('\n');
+    }
 
     out.push_str("## Scenarios\n\n");
     out.push_str(
-        "| scenario | status | violations | GET depth + chain | PUT+GET depth + chain | get_ops | get_bytes | put_ops | put_bytes |\n",
+        "| scenario | status | GET depth + chain | GET ops by class | PUT ops by class | GET bytes | PUT bytes | delta vs baseline |\n",
     );
-    out.push_str("| --- | --- | ---: | --- | --- | ---: | ---: | ---: | ---: |\n");
+    out.push_str("| --- | --- | --- | --- | --- | ---: | ---: | --- |\n");
     for label in &artifacts.scenario_labels {
         let scenario = &scenarios[label];
-        let first = scenario
-            .repeats
-            .first()
-            .expect("written scenario report must have at least one repeat");
-        out.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n",
-            markdown_cell(label),
-            if scenario.passed { "PASS" } else { "FAIL" },
-            scenario.violations.len(),
-            format_depth(&first.get),
-            format_depth(&first.put_get),
-            first.totals.get_ops,
-            first.totals.get_bytes,
-            first.totals.put_ops,
-            first.totals.put_bytes,
-        ));
+        if let Some(first) = scenario.repeats.first() {
+            out.push_str(&format!(
+                "| `{}` | {} | {} | {} | {} | {} | {} | {} |\n",
+                markdown_cell(label),
+                if scenario.passed { "PASS" } else { "FAIL" },
+                format_depth(&first.get),
+                format_class_ops(&first.classes, true),
+                format_class_ops(&first.classes, false),
+                first.totals.get_bytes,
+                first.totals.put_bytes,
+                format_violation_deltas(&scenario.violations),
+            ));
+        } else {
+            out.push_str(&format!(
+                "| `{}` | FAIL | configuration error | n/a | n/a | 0 | 0 | {} |\n",
+                markdown_cell(label),
+                markdown_cell(
+                    scenario
+                        .configuration_error
+                        .as_deref()
+                        .expect("scenario without repeats must be a configuration failure")
+                )
+            ));
+        }
     }
     out.push('\n');
 
+    out.push_str("## Object-Store Totals\n\n");
+    out.push_str("| class | get_ops | get_bytes | put_ops | put_bytes |\n");
+    out.push_str("| --- | ---: | ---: | ---: | ---: |\n");
+    let totals = aggregate_class_totals(scenarios);
+    for (class, stats) in &totals {
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} |\n",
+            markdown_cell(class),
+            stats.get_ops,
+            stats.get_bytes,
+            stats.put_ops,
+            stats.put_bytes,
+        ));
+    }
+    let grand = sum_class_stats(totals.values().copied());
+    out.push_str(&format!(
+        "| **TOTAL** | **{}** | **{}** | **{}** | **{}** |\n\n",
+        grand.get_ops, grand.get_bytes, grand.put_ops, grand.put_bytes
+    ));
+
     for label in &artifacts.scenario_labels {
         let scenario = &scenarios[label];
-        let first = scenario
-            .repeats
-            .first()
-            .expect("written scenario report must have at least one repeat");
         out.push_str(&format!("## `{}`\n\n", markdown_cell(label)));
         out.push_str(&format!(
             "- status: **{}**\n",
             if scenario.passed { "PASS" } else { "FAIL" }
         ));
+        if let Some(error) = &scenario.configuration_error {
+            out.push_str(&format!(
+                "- configuration error: **{}**\n\n",
+                markdown_cell(error)
+            ));
+            continue;
+        }
+        let first = scenario
+            .repeats
+            .first()
+            .expect("executed scenario report must have at least one repeat");
         out.push_str(&format!("- violations: {}\n", scenario.violations.len()));
         out.push_str(&format!("- measured repeats: {}\n", scenario.repeats.len()));
         out.push_str(&format!("- GET path: {}\n", format_depth(&first.get)));
         out.push_str(&format!(
-            "- PUT+GET path: {}\n\n",
+            "- PUT+GET path: {}\n",
             format_depth(&first.put_get)
         ));
         out.push_str(&format!(
-            "- post-response operations: {}\n\n",
-            first.post_response_ops
+            "- delta vs baseline: {}\n\n",
+            format_violation_deltas(&scenario.violations)
         ));
         out.push_str("### Object-Store Totals\n\n");
         out.push_str("| class | get_ops | get_bytes | put_ops | put_bytes |\n");
@@ -484,7 +615,200 @@ fn build_report(artifacts: &RunArtifacts, scenarios: &BTreeMap<String, ScenarioR
             out.push('\n');
         }
     }
+
+    out.push_str("## Proposed Re-baselines\n\n");
+    let proposed_diffs = artifacts
+        .proposed_diffs
+        .lock()
+        .expect("performance-contract proposal mutex poisoned");
+    if proposed_diffs.is_empty() {
+        out.push_str("Capture was not requested; no proposal was generated.\n\n");
+    } else {
+        out.push_str("Proposals are run artifacts only and require human approval.\n\n");
+        for label in &artifacts.scenario_labels {
+            if let Some(diffs) = proposed_diffs.get(label) {
+                out.push_str(&format!("### `{}`\n\n", markdown_cell(label)));
+                if diffs.is_empty() {
+                    out.push_str("No fields changed.\n\n");
+                } else {
+                    for diff in diffs {
+                        out.push_str(&format!(
+                            "- `{}`: `{}` -> `{}`\n",
+                            markdown_cell(&diff.field),
+                            markdown_cell(&diff.old),
+                            markdown_cell(&diff.new)
+                        ));
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+    }
+
+    out.push_str("## Post-response Ops\n\n");
+    let mut excluded = 0usize;
+    for label in &artifacts.scenario_labels {
+        for (repeat, measured) in scenarios[label].repeats.iter().enumerate() {
+            for operation in &measured.post_response {
+                excluded += 1;
+                out.push_str(&format!(
+                    "- `{}` repeat {}: {} {} `{}`\n",
+                    markdown_cell(label),
+                    repeat,
+                    markdown_cell(&operation.kind),
+                    markdown_cell(&operation.class),
+                    markdown_cell(&operation.key)
+                ));
+            }
+        }
+    }
+    if excluded == 0 {
+        out.push_str("No spans were excluded by the response cutoff.\n");
+    }
     out
+}
+
+fn format_class_ops(classes: &BTreeMap<String, ClassStats>, gets: bool) -> String {
+    let values = classes
+        .iter()
+        .filter_map(|(class, stats)| {
+            let count = if gets { stats.get_ops } else { stats.put_ops };
+            (count > 0).then(|| format!("{class}={count}"))
+        })
+        .collect::<Vec<_>>();
+    let rendered = if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(", ")
+    };
+    markdown_cell(&rendered)
+}
+
+fn format_violation_deltas(violations: &[CostViolation]) -> String {
+    if violations.is_empty() {
+        return "none".to_string();
+    }
+    let values = violations
+        .iter()
+        .map(|violation| match violation {
+            CostViolation::OpCount {
+                class,
+                kind,
+                expected,
+                actual,
+            } => format!("{:?}.{class}: {expected}->{actual}", kind).to_lowercase(),
+            CostViolation::KeyCount {
+                substring,
+                kind,
+                expected,
+                actual,
+            } => format!("{:?}[{substring}]: {expected}->{actual}", kind).to_lowercase(),
+            CostViolation::Bytes {
+                class,
+                bound,
+                actual,
+            } => format!(
+                "bytes.{class}: {}->{actual}",
+                serde_json::to_string(bound).expect("byte bound must serialize")
+            ),
+            CostViolation::Depth {
+                kinds,
+                mode,
+                limit,
+                actual,
+                ..
+            } => format!("depth.{kinds}({mode:?}): {limit}->{actual}"),
+            CostViolation::RepeatDrift { repeat, detail } => {
+                format!("repeat {repeat}: {detail}")
+            }
+            CostViolation::BaselineDrift { field, detail } => format!("{field}: {detail}"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    markdown_cell(&values)
+}
+
+fn aggregate_class_totals(
+    scenarios: &BTreeMap<String, ScenarioReport>,
+) -> BTreeMap<String, ClassStats> {
+    let mut totals = BTreeMap::new();
+    for first in scenarios
+        .values()
+        .filter_map(|scenario| scenario.repeats.first())
+    {
+        for (class, stats) in &first.classes {
+            let total = totals
+                .entry(class.clone())
+                .or_insert_with(ClassStats::default);
+            total.get_ops += stats.get_ops;
+            total.get_bytes += stats.get_bytes;
+            total.put_ops += stats.put_ops;
+            total.put_bytes += stats.put_bytes;
+        }
+    }
+    totals
+}
+
+fn sum_class_stats(values: impl Iterator<Item = ClassStats>) -> ClassStats {
+    values.fold(ClassStats::default(), |mut total, stats| {
+        total.get_ops += stats.get_ops;
+        total.get_bytes += stats.get_bytes;
+        total.put_ops += stats.put_ops;
+        total.put_bytes += stats.put_bytes;
+        total
+    })
+}
+
+fn diff_toml(old: &str, new: &str) -> Vec<ProposedDiff> {
+    let old = old
+        .parse::<toml::Value>()
+        .unwrap_or_else(|error| panic!("checked-in contract is invalid TOML: {error}"));
+    let new = new
+        .parse::<toml::Value>()
+        .unwrap_or_else(|error| panic!("proposed contract is invalid TOML: {error}"));
+    let mut old_fields = BTreeMap::new();
+    let mut new_fields = BTreeMap::new();
+    flatten_toml("", &old, &mut old_fields);
+    flatten_toml("", &new, &mut new_fields);
+    old_fields
+        .keys()
+        .chain(new_fields.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|field| {
+            let old = old_fields
+                .get(field)
+                .cloned()
+                .unwrap_or_else(|| "<absent>".to_string());
+            let new = new_fields
+                .get(field)
+                .cloned()
+                .unwrap_or_else(|| "<absent>".to_string());
+            (old != new).then(|| ProposedDiff {
+                field: field.clone(),
+                old,
+                new,
+            })
+        })
+        .collect()
+}
+
+fn flatten_toml(prefix: &str, value: &toml::Value, fields: &mut BTreeMap<String, String>) {
+    if let toml::Value::Table(table) = value {
+        if table.is_empty() && !prefix.is_empty() {
+            fields.insert(prefix.to_string(), "{}".to_string());
+        }
+        for (name, child) in table {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            flatten_toml(&path, child, fields);
+        }
+    } else {
+        fields.insert(prefix.to_string(), value.to_string());
+    }
 }
 
 fn stable_depth_key(key: &str) -> String {

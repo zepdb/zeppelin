@@ -1,4 +1,4 @@
-//! Scenario lifecycle and Phase-1 entry orchestration.
+//! Scenario lifecycle and performance-contract entry orchestration.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -6,9 +6,14 @@ use std::sync::Arc;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use zeppelin::config::Config;
+use zeppelin::compaction::gc;
+use zeppelin::config::{Config, GcConfig};
+use zeppelin::fts::global_index::global_fts_key;
+use zeppelin::index::bitmap::bitmap_key;
+use zeppelin::index::ivf_flat::build::attrs_key;
 use zeppelin::index::ivf_flat::membership::deserialize_membership;
 use zeppelin::index::quantization::QuantizationType;
+use zeppelin::wal::manifest::SegmentRef;
 use zeppelin::wal::Manifest;
 
 use crate::common::counting::{counting_store, ClassStats, GetCounter};
@@ -32,13 +37,16 @@ const STABILITY_REPEATS: usize = 100;
 /// Namespace options passed as a raw HTTP creation body.
 pub type NsConfig = Value;
 
-/// Contract-pinned server values that affect Phase-1 measurements.
+/// Contract-pinned server values that affect measured storage costs.
 #[derive(Debug, Clone)]
 pub struct ServerKnobs {
     pub nprobe: usize,
     pub manifest_cache_ttl_ms: u64,
     pub memory_cache_max_mb: usize,
     pub max_wal_fragments_before_compact: usize,
+    pub bitmap_index: bool,
+    pub fts_index: bool,
+    pub hydration_enabled: bool,
 }
 
 /// One explicit cache precondition.
@@ -53,6 +61,19 @@ pub enum CacheState {
 #[derive(Debug, Clone, Copy)]
 pub enum Step {
     Measure,
+    Query,
+}
+
+/// Deterministic setup lifecycle executed before the measured operation.
+#[derive(Debug, Clone)]
+pub enum SetupPlan {
+    Compacted,
+    EventualDeletes { fragments: usize },
+    AsOfRetainedGeneration,
+    CompactionFull { fragments: usize },
+    CompactionIncremental { fragments: usize },
+    GcNothingEligible,
+    Hydration,
 }
 
 /// The one operation measured by a scenario.
@@ -62,9 +83,50 @@ pub enum MeasureOp {
         consistency: &'static str,
         top_k: usize,
         query_index: usize,
+        filter: Option<(String, String)>,
+    },
+    FtsQuery {
+        consistency: &'static str,
+        top_k: usize,
+        field: String,
+        query: String,
+    },
+    HybridQuery {
+        consistency: &'static str,
+        top_k: usize,
+        candidate_k: usize,
+        query_index: usize,
+        field: String,
+        query: String,
+    },
+    AsOfQuery {
+        consistency: &'static str,
+        top_k: usize,
+        query_index: usize,
+    },
+    QueryPages {
+        consistency: &'static str,
+        pages: usize,
+        page_size: usize,
+        query_index: usize,
+    },
+    Fetch {
+        consistency: &'static str,
+        ids: usize,
     },
     Upsert {
         batch: usize,
+    },
+    Delete {
+        count: usize,
+    },
+    Compact {
+        fragments: usize,
+        incremental: bool,
+    },
+    Gc,
+    Hydrate {
+        attempts: usize,
     },
 }
 
@@ -75,6 +137,7 @@ pub struct ScenarioSpec {
     pub dataset: DatasetSpec,
     pub ns_config: NsConfig,
     pub server_config: ServerKnobs,
+    pub setup: SetupPlan,
     pub cache_state: CacheState,
     pub measure: MeasureOp,
     pub repeats: usize,
@@ -88,6 +151,8 @@ pub struct RepeatCounters {
     pub get_path: CriticalPath,
     pub put_get_path: CriticalPath,
     pub spans: Vec<OpSpan>,
+    pub op_counts: BTreeMap<String, u64>,
+    pub labeled: Vec<LabeledCounters>,
     #[serde(skip)]
     pub response_cutoff_us: u64,
     /// Unfiltered paths are diagnostic inputs for the stability study only.
@@ -95,6 +160,24 @@ pub struct RepeatCounters {
     pub raw_get_path: CriticalPath,
     #[serde(skip)]
     pub raw_put_get_path: CriticalPath,
+}
+
+/// Counters for one named sub-operation inside a compound measurement.
+#[derive(Debug, Clone, Serialize)]
+pub struct LabeledCounters {
+    pub label: String,
+    /// GET count used by labeled contract assertions. Compound operations may
+    /// scope this to their documented data-plane classes while totals retain
+    /// every physical object-store operation.
+    pub contract_get_ops: u64,
+    pub classes: BTreeMap<String, ClassStats>,
+    pub totals: ClassStats,
+    pub get_path: CriticalPath,
+    pub put_get_path: CriticalPath,
+    pub spans: Vec<OpSpan>,
+    pub op_counts: BTreeMap<String, u64>,
+    #[serde(skip)]
+    pub response_cutoff_us: u64,
 }
 
 struct NamespaceCleanupGuard {
@@ -169,7 +252,16 @@ pub struct ScenarioOutcome {
     pub expected: DatasetExpectations,
 }
 
-/// Run and check the three checked-in contracts (or an env-selected subset).
+#[derive(Debug, Default)]
+struct WorldState {
+    as_of_generation: Option<String>,
+    hydration_keys: Vec<String>,
+    eventual_wal_keys: Vec<String>,
+    repeat_cache_keys: Vec<String>,
+    measure_offset: usize,
+}
+
+/// Run and check the complete checked-in catalog (or an env-selected subset).
 pub async fn run_contracts_entry() {
     let env = PerfEnv::from_env();
     require_minio();
@@ -181,13 +273,20 @@ pub async fn run_contracts_entry() {
     let mut failures = Vec::new();
 
     for name in &env.scenarios {
-        let contract = load_or_panic(name);
+        let contract = match load_contract(name) {
+            Ok(contract) => contract,
+            Err(error) => {
+                artifacts.write_contract_error(name, error.clone());
+                failures.push(format!("{name}: {error}"));
+                continue;
+            }
+        };
         let spec = scenarios::build(&contract, env.repeats);
         let outcome = run_scenario(&spec, None).await;
         let violations = check_contract(&contract, &outcome);
         artifacts.write_scenario(name, &outcome, &violations);
         if !violations.is_empty() {
-            failures.push((name.clone(), violations));
+            failures.push(format!("{name}: {violations:#?}"));
         }
     }
 
@@ -209,9 +308,17 @@ pub async fn run_capture_entry() {
     );
     let artifacts = RunArtifacts::create(&env, "capture", &env.scenarios);
     let captured = chrono::Utc::now().to_rfc3339();
+    let mut failures = Vec::new();
 
     for name in &env.scenarios {
-        let contract = load_or_panic(name);
+        let contract = match load_contract(name) {
+            Ok(contract) => contract,
+            Err(error) => {
+                artifacts.write_contract_error(name, error.clone());
+                failures.push(format!("{name}: {error}"));
+                continue;
+            }
+        };
         let spec = scenarios::build(&contract, env.repeats);
         let outcome = run_scenario(&spec, None).await;
         artifacts.write_scenario(name, &outcome, &[]);
@@ -232,6 +339,10 @@ pub async fn run_capture_entry() {
         artifacts.root().display()
     );
     println!("performance-contract report: {}", report.display());
+    assert!(
+        failures.is_empty(),
+        "performance contract capture configuration failures: {failures:#?}"
+    );
 }
 
 /// Prove the checker detects every planned regression and accepts a clean run.
@@ -371,7 +482,8 @@ pub async fn run_stability_entry() {
 
 async fn stability_outcome(spec: &ScenarioSpec) -> ScenarioOutcome {
     match (&spec.cache_state, &spec.measure) {
-        (CacheState::Cold, _) => {
+        (CacheState::Cold | CacheState::WarmHydrated, _)
+        | (_, MeasureOp::Compact { .. } | MeasureOp::Gc | MeasureOp::Hydrate { .. }) => {
             let worlds = (0..STABILITY_REPEATS).map(|_| {
                 let mut sample = spec.clone();
                 sample.repeats = 1;
@@ -379,12 +491,20 @@ async fn stability_outcome(spec: &ScenarioSpec) -> ScenarioOutcome {
             });
             run_stability_worlds(worlds).await
         }
-        (CacheState::Warm { .. }, MeasureOp::Query { .. }) => {
+        (
+            CacheState::Warm { .. },
+            MeasureOp::Query { .. }
+            | MeasureOp::FtsQuery { .. }
+            | MeasureOp::HybridQuery { .. }
+            | MeasureOp::AsOfQuery { .. }
+            | MeasureOp::QueryPages { .. }
+            | MeasureOp::Fetch { .. },
+        ) => {
             let mut sample = spec.clone();
             sample.repeats = STABILITY_REPEATS;
             run_scenario(&sample, None).await
         }
-        (CacheState::Warm { .. }, MeasureOp::Upsert { .. }) => {
+        (CacheState::Warm { .. }, MeasureOp::Upsert { .. } | MeasureOp::Delete { .. }) => {
             let per_world = spec
                 .server_config
                 .max_wal_fragments_before_compact
@@ -402,7 +522,6 @@ async fn stability_outcome(spec: &ScenarioSpec) -> ScenarioOutcome {
             }
             run_stability_worlds(worlds).await
         }
-        (CacheState::WarmHydrated, _) => panic!("WarmHydrated cache state requires Phase 2"),
     }
 }
 
@@ -441,9 +560,11 @@ async fn run_scenario(spec: &ScenarioSpec, injection: Option<Injection>) -> Scen
         matches!(spec.server_config.manifest_cache_ttl_ms, 0 | 3_600_000),
         "manifest cache TTL must be pinned to 0 or 3600000"
     );
-    if matches!(&spec.cache_state, CacheState::WarmHydrated) {
-        panic!("WarmHydrated cache state requires Phase 2");
-    }
+    assert!(
+        !matches!(&spec.cache_state, CacheState::WarmHydrated)
+            || matches!(&spec.setup, SetupPlan::Hydration),
+        "WarmHydrated cache state requires the hydration setup"
+    );
 
     let mut generated = generate(spec.dataset.clone());
     for probes in &mut generated.expected.probe_clusters {
@@ -469,9 +590,7 @@ async fn run_scenario(spec: &ScenarioSpec, injection: Option<Injection>) -> Scen
     let namespace = api_ns(&harness, &spec.name);
     let cleanup_guard = NamespaceCleanupGuard::new(instrumented_store.clone(), namespace.clone());
     create_namespace(&client, &setup_server, &namespace, spec).await;
-    upsert_dataset(&client, &setup_server, &namespace, &generated).await;
-    compact_until_ready(&client, &setup_server, &namespace).await;
-    verify_cluster_balance(&setup_server, &namespace, &generated.expected, spec).await;
+    let mut world = setup_world(&client, &setup_server, &namespace, &generated, spec).await;
 
     let mut cold_server = None;
     match &spec.cache_state {
@@ -492,22 +611,45 @@ async fn run_scenario(spec: &ScenarioSpec, injection: Option<Injection>) -> Scen
             for step in prime {
                 match step {
                     Step::Measure => {
-                        execute_measure(
+                        execute_measure_operation(
                             &client,
                             &setup_server,
                             &namespace,
                             &generated,
                             &spec.measure,
+                            &world,
+                            world.measure_offset,
                             &tracker,
                         )
                         .await;
+                        await_tracker_idle(&tracker).await;
+                        if measure_mutates(&spec.measure) {
+                            world.measure_offset += 1;
+                        }
+                    }
+                    Step::Query => {
+                        prime_query(&client, &setup_server, &namespace, &generated).await;
                         await_tracker_idle(&tracker).await;
                     }
                 }
             }
         }
-        CacheState::WarmHydrated => unreachable!("checked before setup"),
+        CacheState::WarmHydrated => {
+            cold_server = Some(
+                start_test_server_full(server_store, Some(harness.prefix.clone()), config, false)
+                    .await,
+            );
+        }
     }
+    post_prime_setup(
+        &client,
+        &setup_server,
+        &namespace,
+        &generated,
+        spec,
+        &mut world,
+    )
+    .await;
     let measured_server = cold_server.as_ref().unwrap_or(&setup_server);
 
     counter.reset();
@@ -518,46 +660,39 @@ async fn run_scenario(spec: &ScenarioSpec, injection: Option<Injection>) -> Scen
         spec.repeats
     };
     let mut per_repeat = Vec::with_capacity(repeat_count);
-    for _ in 0..repeat_count {
-        let cutoff_us = execute_measure(
+    for repeat in 0..repeat_count {
+        for key in world
+            .eventual_wal_keys
+            .iter()
+            .chain(&world.repeat_cache_keys)
+        {
+            measured_server
+                .cache
+                .invalidate(key)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to invalidate measured cache key {key}: {error}")
+                });
+        }
+        let measured = execute_measure_once(
             &client,
             measured_server,
             &namespace,
             &generated,
-            &spec.measure,
+            spec,
+            &world,
+            world.measure_offset + repeat,
+            &counter,
             &tracker,
         )
         .await;
-        await_tracker_idle(&tracker).await;
-        let classes = class_snapshot(&counter);
-        let totals = sum_stats(classes.values().copied());
-        let spans = tracker.take_spans();
-        let raw_get_path =
-            DepthTracker::critical_path(&spans, &[SpanKind::Get, SpanKind::Head], None);
-        let raw_put_get_path = DepthTracker::critical_path(
-            &spans,
-            &[SpanKind::Get, SpanKind::Head, SpanKind::Put],
-            None,
-        );
-        let get_path =
-            DepthTracker::critical_path(&spans, &[SpanKind::Get, SpanKind::Head], Some(cutoff_us));
-        let put_get_path = DepthTracker::critical_path(
-            &spans,
-            &[SpanKind::Get, SpanKind::Head, SpanKind::Put],
-            Some(cutoff_us),
-        );
-        per_repeat.push(RepeatCounters {
-            classes,
-            totals,
-            get_path,
-            put_get_path,
-            spans,
-            response_cutoff_us: cutoff_us,
-            raw_get_path,
-            raw_put_get_path,
-        });
+        per_repeat.push(measured);
         counter.reset();
         tracker.reset();
+    }
+
+    if matches!(&spec.measure, MeasureOp::Compact { .. }) {
+        verify_cluster_balance(measured_server, &namespace, &generated.expected, spec).await;
     }
 
     assert_fragment_window(measured_server, &namespace, spec).await;
@@ -567,6 +702,103 @@ async fn run_scenario(spec: &ScenarioSpec, injection: Option<Injection>) -> Scen
     ScenarioOutcome {
         per_repeat,
         expected: generated.expected,
+    }
+}
+
+async fn setup_world(
+    client: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    generated: &GeneratedDataset,
+    spec: &ScenarioSpec,
+) -> WorldState {
+    match &spec.setup {
+        SetupPlan::CompactionFull { fragments } => {
+            upsert_dataset_in_fragments(client, server, namespace, generated, *fragments).await;
+            assert_manifest_fragment_count(server, namespace, *fragments).await;
+            WorldState::default()
+        }
+        SetupPlan::Compacted
+        | SetupPlan::EventualDeletes { .. }
+        | SetupPlan::AsOfRetainedGeneration
+        | SetupPlan::CompactionIncremental { .. }
+        | SetupPlan::GcNothingEligible
+        | SetupPlan::Hydration => {
+            upsert_dataset(client, server, namespace, generated).await;
+            compact_until_ready(client, server, namespace, spec).await;
+            verify_cluster_balance(server, namespace, &generated.expected, spec).await;
+
+            let mut world = WorldState::default();
+            match &spec.setup {
+                SetupPlan::AsOfRetainedGeneration => {
+                    let manifest = live_manifest(server, namespace).await;
+                    world.as_of_generation = Some(manifest.version().to_string());
+                    let vector = GenVector {
+                        id: "perf-as-of-live-advance".to_string(),
+                        values: generated.queries[0].vector.clone(),
+                        attributes: generated.vectors[0].attributes.clone(),
+                    };
+                    upsert_rows(client, server, namespace, &[vector]).await;
+                }
+                SetupPlan::CompactionIncremental { fragments } => {
+                    write_incremental_fragments(client, server, namespace, generated, *fragments)
+                        .await;
+                    assert_manifest_fragment_count(server, namespace, *fragments).await;
+                }
+                SetupPlan::Hydration => {
+                    let manifest = live_manifest(server, namespace).await;
+                    let segment = active_segment(&manifest, namespace);
+                    world.hydration_keys = hydration_keys(namespace, segment);
+                    assert!(
+                        !world.hydration_keys.is_empty(),
+                        "hydration setup produced no cacheable artifacts"
+                    );
+                }
+                SetupPlan::Compacted
+                | SetupPlan::EventualDeletes { .. }
+                | SetupPlan::GcNothingEligible => {}
+                SetupPlan::CompactionFull { .. } => unreachable!(),
+            }
+            let manifest = live_manifest(server, namespace).await;
+            let segment = active_segment(&manifest, namespace);
+            world.repeat_cache_keys = measured_sidecar_cache_keys(namespace, segment, spec);
+            world
+        }
+    }
+}
+
+async fn post_prime_setup(
+    client: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    generated: &GeneratedDataset,
+    spec: &ScenarioSpec,
+    world: &mut WorldState,
+) {
+    if let SetupPlan::EventualDeletes { fragments } = &spec.setup {
+        for index in 0..*fragments {
+            delete_rows(
+                client,
+                server,
+                namespace,
+                &[generated.vectors[index].id.clone()],
+            )
+            .await;
+        }
+        assert_manifest_fragment_count(server, namespace, *fragments).await;
+        let manifest = live_manifest(server, namespace).await;
+        world.eventual_wal_keys = manifest
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.delete_count > 0)
+            .map(|fragment| format!("wal_fragments/{}.wal", fragment.id))
+            .collect();
+        assert_eq!(
+            world.eventual_wal_keys.len(),
+            *fragments,
+            "eventual setup did not publish exactly the requested tombstone fragments"
+        );
+        world.measure_offset = *fragments;
     }
 }
 
@@ -650,6 +882,41 @@ async fn upsert_dataset(
     }
 }
 
+async fn upsert_dataset_in_fragments(
+    client: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    generated: &GeneratedDataset,
+    fragments: usize,
+) {
+    assert!(fragments > 0, "setup fragment count must be nonzero");
+    assert_eq!(
+        generated.vectors.len() % fragments,
+        0,
+        "dataset rows must divide evenly across setup fragments"
+    );
+    let rows_per_fragment = generated.vectors.len() / fragments;
+    for rows in generated.vectors.chunks(rows_per_fragment) {
+        upsert_rows(client, server, namespace, rows).await;
+    }
+}
+
+async fn write_incremental_fragments(
+    client: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    generated: &GeneratedDataset,
+    fragments: usize,
+) {
+    assert!(
+        fragments <= generated.vectors.len(),
+        "incremental fragment count exceeds generated rows"
+    );
+    for vector in generated.vectors.iter().take(fragments) {
+        upsert_rows(client, server, namespace, std::slice::from_ref(vector)).await;
+    }
+}
+
 async fn upsert_rows(
     client: &Client,
     server: &FullTestServer,
@@ -686,7 +953,125 @@ async fn upsert_rows(
     );
 }
 
-async fn compact_until_ready(client: &Client, server: &FullTestServer, namespace: &str) {
+async fn delete_rows(client: &Client, server: &FullTestServer, namespace: &str, ids: &[String]) {
+    assert!(!ids.is_empty(), "delete batch cannot be empty");
+    let response = client
+        .delete(format!(
+            "{}/v1/namespaces/{namespace}/vectors",
+            server.base_url
+        ))
+        .json(&json!({ "ids": ids }))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("delete request failed for {namespace}: {error}"));
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .unwrap_or_else(|error| panic!("delete response read failed for {namespace}: {error}"));
+    assert_eq!(
+        status.as_u16(),
+        204,
+        "delete failed for {namespace}: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        bytes.is_empty(),
+        "204 delete response unexpectedly had a body"
+    );
+}
+
+async fn assert_manifest_fragment_count(server: &FullTestServer, namespace: &str, expected: usize) {
+    let manifest = live_manifest(server, namespace).await;
+    assert_eq!(
+        manifest.fragments.len(),
+        expected,
+        "manifest fragment count mismatch for {namespace}"
+    );
+}
+
+async fn live_manifest(server: &FullTestServer, namespace: &str) -> Manifest {
+    Manifest::read(&server.store, namespace)
+        .await
+        .unwrap_or_else(|error| panic!("failed to read manifest for {namespace}: {error}"))
+        .unwrap_or_else(|| panic!("manifest disappeared for {namespace}"))
+}
+
+fn active_segment<'a>(manifest: &'a Manifest, namespace: &str) -> &'a SegmentRef {
+    let active_id = manifest
+        .active_segment
+        .as_deref()
+        .unwrap_or_else(|| panic!("manifest has no active segment for {namespace}"));
+    manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == active_id)
+        .unwrap_or_else(|| panic!("active segment {active_id} missing for {namespace}"))
+}
+
+fn hydration_keys(namespace: &str, segment: &SegmentRef) -> Vec<String> {
+    let mut keys = segment
+        .cluster_objects
+        .iter()
+        .map(|object| object.key.clone())
+        .collect::<Vec<_>>();
+    for cluster in 0..segment.cluster_count {
+        let owner = segment.cluster_owner(cluster);
+        keys.push(attrs_key(namespace, owner, cluster));
+        if !segment.bitmap_fields.is_empty() {
+            keys.push(bitmap_key(namespace, owner, cluster));
+        }
+    }
+    if segment.has_global_fts {
+        keys.push(global_fts_key(namespace, &segment.id));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn measured_sidecar_cache_keys(
+    namespace: &str,
+    segment: &SegmentRef,
+    spec: &ScenarioSpec,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    match &spec.measure {
+        MeasureOp::Query {
+            filter: Some(_), ..
+        } => {
+            for cluster in 0..segment.cluster_count {
+                let owner = segment.cluster_owner(cluster);
+                if spec.server_config.bitmap_index {
+                    keys.push(bitmap_key(namespace, owner, cluster));
+                } else {
+                    keys.push(attrs_key(namespace, owner, cluster));
+                }
+            }
+        }
+        MeasureOp::FtsQuery { .. } if segment.has_global_fts => {
+            keys.push(global_fts_key(namespace, &segment.id));
+        }
+        MeasureOp::HybridQuery { .. } if segment.has_global_fts => {
+            keys.extend(
+                segment
+                    .cluster_objects
+                    .iter()
+                    .map(|object| object.key.clone()),
+            );
+            keys.push(global_fts_key(namespace, &segment.id));
+        }
+        _ => {}
+    }
+    keys
+}
+
+async fn compact_until_ready(
+    client: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    spec: &ScenarioSpec,
+) {
     let mut last_status = Value::Null;
     for _ in 0..COMPACTION_ATTEMPTS {
         last_status = compaction_status(client, server, namespace).await;
@@ -704,11 +1089,23 @@ async fn compact_until_ready(client: &Client, server: &FullTestServer, namespace
             return;
         }
 
-        let result = server
-            .compactor
-            .compact(namespace)
-            .await
-            .unwrap_or_else(|error| panic!("inline compaction failed for {namespace}: {error}"));
+        let result = if spec.server_config.fts_index {
+            let configs = std::collections::HashMap::from([(
+                "content".to_string(),
+                zeppelin::fts::FtsFieldConfig {
+                    stemming: true,
+                    remove_stopwords: true,
+                    ..Default::default()
+                },
+            )]);
+            server
+                .compactor
+                .compact_with_fts(namespace, None, &configs)
+                .await
+        } else {
+            server.compactor.compact(namespace).await
+        }
+        .unwrap_or_else(|error| panic!("inline compaction failed for {namespace}: {error}"));
         assert!(
             result.segment_id.is_some(),
             "inline compaction with pending fragments produced no segment for {namespace}"
@@ -814,15 +1211,16 @@ fn scenario_config(spec: &ScenarioSpec) -> Config {
     config.cache.manifest_cache_ttl_ms = spec.server_config.manifest_cache_ttl_ms;
     config.cache.namespace_registry_ttl_ms = 3_600_000;
     config.cache.memory_cache_max_mb = spec.server_config.memory_cache_max_mb;
-    config.cache.hydration_enabled = false;
+    config.cache.hydration_enabled = spec.server_config.hydration_enabled;
+    config.cache.hydration_parallelism = 1;
     config.server.max_concurrent_queries = 1;
     config.indexing.default_num_centroids = spec.dataset.nlist;
     config.indexing.default_nprobe = spec.server_config.nprobe;
     config.indexing.max_nprobe = spec.dataset.nlist.max(spec.server_config.nprobe);
     config.indexing.quantization = QuantizationType::Scalar;
     config.indexing.hierarchical = false;
-    config.indexing.bitmap_index = false;
-    config.indexing.fts_index = false;
+    config.indexing.bitmap_index = spec.server_config.bitmap_index;
+    config.indexing.fts_index = spec.server_config.fts_index;
     config.query.rerank_coalesce_gap_bytes =
         Some(zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES);
     config.query.cost_latency_profile = None;
@@ -831,19 +1229,104 @@ fn scenario_config(spec: &ScenarioSpec) -> Config {
     config
 }
 
-async fn execute_measure(
+async fn prime_query(
+    client: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    generated: &GeneratedDataset,
+) {
+    let body = json!({
+        "vector": generated.queries[0].vector,
+        "top_k": 10,
+        "consistency": "strong",
+        "include_attributes": false,
+    });
+    let _ = post_query(client, server, namespace, body, None).await;
+}
+
+fn measure_mutates(measure: &MeasureOp) -> bool {
+    matches!(measure, MeasureOp::Upsert { .. } | MeasureOp::Delete { .. })
+}
+
+async fn execute_measure_once(
+    client: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    generated: &GeneratedDataset,
+    spec: &ScenarioSpec,
+    world: &WorldState,
+    repeat_index: usize,
+    counter: &GetCounter,
+    tracker: &DepthTracker,
+) -> RepeatCounters {
+    match &spec.measure {
+        MeasureOp::QueryPages {
+            consistency,
+            pages,
+            page_size,
+            query_index,
+        } => {
+            execute_query_pages(
+                client,
+                server,
+                namespace,
+                generated,
+                consistency,
+                *pages,
+                *page_size,
+                *query_index,
+                counter,
+                tracker,
+            )
+            .await
+        }
+        MeasureOp::Hydrate { attempts } => {
+            execute_hydration(
+                client,
+                server,
+                namespace,
+                *attempts,
+                &world.hydration_keys,
+                counter,
+                tracker,
+            )
+            .await
+        }
+        measure => {
+            let cutoff_us = execute_measure_operation(
+                client,
+                server,
+                namespace,
+                generated,
+                measure,
+                world,
+                repeat_index,
+                tracker,
+            )
+            .await;
+            await_tracker_idle(tracker).await;
+            snapshot_repeat(counter, tracker, cutoff_us, Vec::new())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_measure_operation(
     client: &Client,
     server: &FullTestServer,
     namespace: &str,
     generated: &GeneratedDataset,
     measure: &MeasureOp,
+    world: &WorldState,
+    repeat_index: usize,
     tracker: &DepthTracker,
 ) -> u64 {
-    let (status, bytes) = match measure {
+    match measure {
         MeasureOp::Query {
             consistency,
             top_k,
             query_index,
+            filter,
         } => {
             let query = generated.queries.get(*query_index).unwrap_or_else(|| {
                 panic!(
@@ -851,74 +1334,492 @@ async fn execute_measure(
                     generated.queries.len()
                 )
             });
+            let mut body = json!({
+                "vector": query.vector,
+                "top_k": top_k,
+                "consistency": consistency,
+                "include_attributes": false,
+            });
+            if let Some((field, value)) = filter {
+                body["filter"] = json!({
+                    "op": "eq",
+                    "field": field,
+                    "value": value,
+                });
+            }
+            let _ = post_query(client, server, namespace, body, None).await;
+        }
+        MeasureOp::FtsQuery {
+            consistency,
+            top_k,
+            field,
+            query,
+        } => {
+            let body = json!({
+                "rank_by": [field, "BM25", query],
+                "top_k": top_k,
+                "consistency": consistency,
+                "include_attributes": false,
+            });
+            let _ = post_query(client, server, namespace, body, None).await;
+        }
+        MeasureOp::HybridQuery {
+            consistency,
+            top_k,
+            candidate_k,
+            query_index,
+            field,
+            query,
+        } => {
+            let planned = generated.queries.get(*query_index).unwrap_or_else(|| {
+                panic!("hybrid query_index {query_index} outside generated query count")
+            });
+            let body = json!({
+                "sources": [
+                    {"type": "ann", "vector": planned.vector},
+                    {"type": "bm25", "rank_by": [field, "BM25", query]},
+                ],
+                "fusion": {"type": "rrf", "k": 60},
+                "candidate_k": candidate_k,
+                "top_k": top_k,
+                "consistency": consistency,
+                "projection": {"include_attributes": false},
+            });
+            let _ = post_query(client, server, namespace, body, None).await;
+        }
+        MeasureOp::AsOfQuery {
+            consistency,
+            top_k,
+            query_index,
+        } => {
+            let planned = generated.queries.get(*query_index).unwrap_or_else(|| {
+                panic!("as-of query_index {query_index} outside generated query count")
+            });
+            let generation = world
+                .as_of_generation
+                .as_deref()
+                .expect("as-of measure missing retained generation setup");
+            let body = json!({
+                "vector": planned.vector,
+                "top_k": top_k,
+                "consistency": consistency,
+                "include_attributes": false,
+            });
+            let _ = post_query(client, server, namespace, body, Some(generation)).await;
+        }
+        MeasureOp::Fetch { consistency, ids } => {
+            assert!(*ids > 0, "fetch id count must be nonzero");
+            assert!(
+                *ids <= generated.vectors.len(),
+                "fetch id count exceeds generated rows"
+            );
+            let requested = generated
+                .vectors
+                .iter()
+                .take(*ids)
+                .map(|vector| vector.id.as_str())
+                .collect::<Vec<_>>();
             let response = client
                 .post(format!(
-                    "{}/v1/namespaces/{namespace}/query",
+                    "{}/v1/namespaces/{namespace}/vectors/get",
                     server.base_url
                 ))
                 .json(&json!({
-                    "vector": query.vector,
-                    "top_k": top_k,
-                    "consistency": consistency,
+                    "ids": requested,
+                    "include_vector": false,
                     "include_attributes": false,
+                    "consistency": consistency,
                 }))
                 .send()
                 .await
-                .unwrap_or_else(|error| panic!("query request failed for {namespace}: {error}"));
+                .unwrap_or_else(|error| panic!("fetch request failed for {namespace}: {error}"));
             let status = response.status();
-            let bytes = response.bytes().await.unwrap_or_else(|error| {
-                panic!("query response read failed for {namespace}: {error}")
-            });
-            (status, bytes)
+            let body: Value = response
+                .json()
+                .await
+                .unwrap_or_else(|error| panic!("fetch response was invalid JSON: {error}"));
+            assert_eq!(status.as_u16(), 200, "fetch failed for {namespace}: {body}");
+            assert_eq!(
+                body["results"].as_array().map(Vec::len),
+                Some(*ids),
+                "fetch returned the wrong number of rows"
+            );
         }
         MeasureOp::Upsert { batch } => {
             assert!(*batch > 0, "measured upsert batch must be nonzero");
             let values = &generated.queries[0].vector;
             let vectors = (0..*batch)
                 .map(|index| GenVector {
-                    id: format!("perf-measure-{index:08}"),
+                    id: if *batch == 1 {
+                        format!("perf-measure-{index:08}")
+                    } else {
+                        format!("perf-measure-{repeat_index:04}-{index:08}")
+                    },
                     values: values.clone(),
                     attributes: None,
                 })
                 .collect::<Vec<_>>();
-            let response = client
-                .post(format!(
-                    "{}/v1/namespaces/{namespace}/vectors",
-                    server.base_url
-                ))
-                .json(&json!({ "vectors": vectors }))
-                .send()
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("measured upsert request failed for {namespace}: {error}")
-                });
-            let status = response.status();
-            let bytes = response.bytes().await.unwrap_or_else(|error| {
-                panic!("measured upsert response read failed for {namespace}: {error}")
-            });
-            (status, bytes)
+            upsert_rows(client, server, namespace, &vectors).await;
         }
-    };
-    let cutoff_us = tracker.elapsed_us();
-    assert!(
-        status.is_success(),
-        "measured operation failed for {namespace}: status={status}, body={}",
-        String::from_utf8_lossy(&bytes)
-    );
-    let body: Value = serde_json::from_slice(&bytes)
-        .unwrap_or_else(|error| panic!("measured response returned invalid JSON: {error}"));
-    match measure {
-        MeasureOp::Query { .. } => assert!(
-            body["results"].is_array(),
-            "query response omitted results for {namespace}: {body}"
-        ),
-        MeasureOp::Upsert { batch } => assert_eq!(
-            body["upserted"].as_u64(),
-            Some(*batch as u64),
-            "measured upsert count mismatch for {namespace}"
-        ),
+        MeasureOp::Delete { count } => {
+            assert!(*count > 0, "measured delete count must be nonzero");
+            let start = repeat_index
+                .checked_mul(*count)
+                .expect("measured delete index overflowed");
+            assert!(
+                start + count <= generated.vectors.len(),
+                "measured deletes exhausted generated ids"
+            );
+            let ids = generated.vectors[start..start + count]
+                .iter()
+                .map(|vector| vector.id.clone())
+                .collect::<Vec<_>>();
+            delete_rows(client, server, namespace, &ids).await;
+        }
+        MeasureOp::Compact {
+            fragments,
+            incremental,
+        } => {
+            assert_manifest_fragment_count(server, namespace, *fragments).await;
+            let result = server
+                .compactor
+                .compact(namespace)
+                .await
+                .unwrap_or_else(|error| panic!("measured compaction failed: {error}"));
+            assert!(
+                result.segment_id.is_some(),
+                "measured compaction produced no segment"
+            );
+            assert_eq!(
+                matches!(world.as_of_generation, Some(_)),
+                false,
+                "compaction world unexpectedly carried an as-of generation"
+            );
+            if *incremental {
+                assert!(
+                    matches!(
+                        measure,
+                        MeasureOp::Compact {
+                            incremental: true,
+                            ..
+                        }
+                    ),
+                    "incremental compaction flag changed during execution"
+                );
+            }
+            server.manifest_cache.invalidate(namespace);
+        }
+        MeasureOp::Gc => {
+            let config = GcConfig {
+                horizon_secs: 0,
+                compaction_upload_window_secs: 0,
+                skew_slop_secs: 0,
+                allow_unsafe_short_horizon: true,
+                manifest_history_keep_count: 1_024,
+                pitr_retention_secs: 0,
+            };
+            let report = gc::run_gc_cycle(&server.store, namespace, &config)
+                .await
+                .unwrap_or_else(|error| panic!("measured GC cycle failed: {error}"));
+            assert_eq!(
+                report.objects_deleted, 0,
+                "nothing-eligible GC deleted objects"
+            );
+            assert_eq!(
+                report.pending_deletes_deleted, 0,
+                "nothing-eligible GC deleted pending objects"
+            );
+            server.manifest_cache.invalidate(namespace);
+        }
+        MeasureOp::QueryPages { .. } | MeasureOp::Hydrate { .. } => {
+            unreachable!("compound measures are executed by dedicated paths")
+        }
     }
-    cutoff_us
+    tracker.elapsed_us()
+}
+
+async fn post_query(
+    client: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    body: Value,
+    as_of: Option<&str>,
+) -> Value {
+    let mut request = client
+        .post(format!(
+            "{}/v1/namespaces/{namespace}/query",
+            server.base_url
+        ))
+        .json(&body);
+    if let Some(generation) = as_of {
+        request = request.query(&[("as_of", generation)]);
+    }
+    let response = request
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("query request failed for {namespace}: {error}"));
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .unwrap_or_else(|error| panic!("query response was invalid JSON: {error}"));
+    assert_eq!(status.as_u16(), 200, "query failed for {namespace}: {body}");
+    assert!(
+        body["results"].is_array(),
+        "query response omitted results for {namespace}: {body}"
+    );
+    body
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_query_pages(
+    client: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    generated: &GeneratedDataset,
+    consistency: &str,
+    pages: usize,
+    page_size: usize,
+    query_index: usize,
+    counter: &GetCounter,
+    tracker: &DepthTracker,
+) -> RepeatCounters {
+    assert_eq!(pages, 2, "pagination contract requires exactly two pages");
+    assert!(page_size > 0, "pagination page size must be nonzero");
+    let query = generated.queries.get(query_index).unwrap_or_else(|| {
+        panic!("pagination query_index {query_index} outside generated query count")
+    });
+    let mut cursor = json!({"type": "none"});
+    let mut labeled = Vec::with_capacity(pages);
+    for page in 0..pages {
+        let body = json!({
+            "sources": [{"type": "ann", "vector": query.vector}],
+            "top_k": page_size,
+            "cursor": cursor,
+            "consistency": consistency,
+            "projection": {"include_attributes": false},
+        });
+        let response = post_query(client, server, namespace, body, None).await;
+        if page + 1 < pages {
+            let token = response["next_cursor"]
+                .as_str()
+                .unwrap_or_else(|| panic!("page {} omitted next_cursor", page + 1));
+            cursor = json!({"type": "after", "token": token});
+        }
+        let cutoff_us = tracker.elapsed_us();
+        await_tracker_idle(tracker).await;
+        let snapshot = snapshot_repeat(counter, tracker, cutoff_us, Vec::new());
+        labeled.push(labeled_snapshot(format!("page_{}", page + 1), snapshot));
+        counter.reset();
+        tracker.reset();
+    }
+    combine_labeled(labeled)
+}
+
+async fn execute_hydration(
+    client: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    attempts: usize,
+    hydration_keys: &[String],
+    counter: &GetCounter,
+    tracker: &DepthTracker,
+) -> RepeatCounters {
+    assert_eq!(attempts, 2, "hydration contract requires two attempts");
+    assert!(!hydration_keys.is_empty(), "hydration key plan is empty");
+    let mut labeled = Vec::with_capacity(attempts);
+    for attempt in 0..attempts {
+        let response = client
+            .post(format!(
+                "{}/v1/namespaces/{namespace}/hydrate",
+                server.base_url
+            ))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("hydrate request failed: {error}"));
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("hydrate response was invalid JSON: {error}"));
+        assert_eq!(status.as_u16(), 202, "hydrate request failed: {body}");
+        await_hydration_cache(server, hydration_keys).await;
+        await_tracker_idle(tracker).await;
+        let cutoff_us = tracker.elapsed_us();
+        let snapshot = snapshot_repeat(counter, tracker, cutoff_us, Vec::new());
+        let hydrated_gets = ["cluster", "attrs", "bitmap", "fts"]
+            .into_iter()
+            .map(|class| snapshot.classes[class].get_ops)
+            .sum::<u64>();
+        if attempt == 0 {
+            assert_eq!(
+                hydrated_gets,
+                hydration_keys.len() as u64,
+                "hydrate GET count did not match the planned warm-set artifacts"
+            );
+        } else {
+            assert_eq!(
+                hydrated_gets, 0,
+                "repeat hydration fetched reachable artifact data"
+            );
+        }
+        labeled.push(labeled_snapshot_with_get_ops(
+            format!("hydrate_{}", attempt + 1),
+            snapshot,
+            hydrated_gets,
+        ));
+        counter.reset();
+        tracker.reset();
+    }
+    combine_labeled(labeled)
+}
+
+async fn await_hydration_cache(server: &FullTestServer, keys: &[String]) {
+    const MAX_YIELDS: usize = 65_536;
+    for _ in 0..MAX_YIELDS {
+        let mut complete = true;
+        for key in keys {
+            if server.cache.get(key).await.is_none() {
+                complete = false;
+                break;
+            }
+        }
+        if complete {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    let missing = futures::future::join_all(keys.iter().map(|key| server.cache.get(key)))
+        .await
+        .into_iter()
+        .zip(keys)
+        .filter_map(|(value, key)| value.is_none().then_some(key.clone()))
+        .collect::<Vec<_>>();
+    panic!("hydration did not populate its deterministic cache plan: {missing:?}");
+}
+
+fn snapshot_repeat(
+    counter: &GetCounter,
+    tracker: &DepthTracker,
+    cutoff_us: u64,
+    labeled: Vec<LabeledCounters>,
+) -> RepeatCounters {
+    let classes = class_snapshot(counter);
+    let totals = sum_stats(classes.values().copied());
+    let spans = tracker.take_spans();
+    let raw_get_path = DepthTracker::critical_path(&spans, &[SpanKind::Get, SpanKind::Head], None);
+    let raw_put_get_path = DepthTracker::critical_path(
+        &spans,
+        &[SpanKind::Get, SpanKind::Head, SpanKind::Put],
+        None,
+    );
+    let get_path =
+        DepthTracker::critical_path(&spans, &[SpanKind::Get, SpanKind::Head], Some(cutoff_us));
+    let put_get_path = DepthTracker::critical_path(
+        &spans,
+        &[SpanKind::Get, SpanKind::Head, SpanKind::Put],
+        Some(cutoff_us),
+    );
+    let op_counts = operation_counts(&spans);
+    RepeatCounters {
+        classes,
+        totals,
+        get_path,
+        put_get_path,
+        spans,
+        op_counts,
+        labeled,
+        response_cutoff_us: cutoff_us,
+        raw_get_path,
+        raw_put_get_path,
+    }
+}
+
+fn labeled_snapshot(label: String, snapshot: RepeatCounters) -> LabeledCounters {
+    let contract_get_ops = snapshot.totals.get_ops;
+    labeled_snapshot_with_get_ops(label, snapshot, contract_get_ops)
+}
+
+fn labeled_snapshot_with_get_ops(
+    label: String,
+    snapshot: RepeatCounters,
+    contract_get_ops: u64,
+) -> LabeledCounters {
+    LabeledCounters {
+        label,
+        contract_get_ops,
+        classes: snapshot.classes,
+        totals: snapshot.totals,
+        get_path: snapshot.get_path,
+        put_get_path: snapshot.put_get_path,
+        spans: snapshot.spans,
+        op_counts: snapshot.op_counts,
+        response_cutoff_us: snapshot.response_cutoff_us,
+    }
+}
+
+fn combine_labeled(labeled: Vec<LabeledCounters>) -> RepeatCounters {
+    assert!(!labeled.is_empty(), "compound measure produced no labels");
+    let mut classes = class_snapshot(&GetCounter::default());
+    let mut spans = Vec::new();
+    let mut cutoff_us = 0;
+    for part in &labeled {
+        for (class, stats) in &part.classes {
+            let total = classes
+                .get_mut(class)
+                .expect("labeled class missing from complete class map");
+            total.get_ops += stats.get_ops;
+            total.get_bytes += stats.get_bytes;
+            total.put_ops += stats.put_ops;
+            total.put_bytes += stats.put_bytes;
+        }
+        spans.extend(part.spans.clone());
+        cutoff_us = cutoff_us.max(part.response_cutoff_us);
+    }
+    let totals = sum_stats(classes.values().copied());
+    let raw_get_path = DepthTracker::critical_path(&spans, &[SpanKind::Get, SpanKind::Head], None);
+    let raw_put_get_path = DepthTracker::critical_path(
+        &spans,
+        &[SpanKind::Get, SpanKind::Head, SpanKind::Put],
+        None,
+    );
+    let get_path =
+        DepthTracker::critical_path(&spans, &[SpanKind::Get, SpanKind::Head], Some(cutoff_us));
+    let put_get_path = DepthTracker::critical_path(
+        &spans,
+        &[SpanKind::Get, SpanKind::Head, SpanKind::Put],
+        Some(cutoff_us),
+    );
+    let op_counts = operation_counts(&spans);
+    RepeatCounters {
+        classes,
+        totals,
+        get_path,
+        put_get_path,
+        spans,
+        op_counts,
+        labeled,
+        response_cutoff_us: cutoff_us,
+        raw_get_path,
+        raw_put_get_path,
+    }
+}
+
+fn operation_counts(spans: &[OpSpan]) -> BTreeMap<String, u64> {
+    [
+        ("head", SpanKind::Head),
+        ("list", SpanKind::List),
+        ("copy", SpanKind::Copy),
+        ("delete", SpanKind::Delete),
+    ]
+    .into_iter()
+    .map(|(name, kind)| {
+        (
+            name.to_string(),
+            spans.iter().filter(|span| span.kind == kind).count() as u64,
+        )
+    })
+    .collect()
 }
 
 async fn await_tracker_idle(tracker: &DepthTracker) {
@@ -1007,8 +1908,17 @@ fn assert_expected_injection(injection: Injection, violations: &[CostViolation])
 
 fn relevant_depths(measure: &MeasureOp, repeat: &RepeatCounters) -> (u32, u32) {
     match measure {
-        MeasureOp::Query { .. } => (repeat.raw_get_path.depth, repeat.get_path.depth),
-        MeasureOp::Upsert { .. } => (repeat.raw_put_get_path.depth, repeat.put_get_path.depth),
+        MeasureOp::Query { .. }
+        | MeasureOp::FtsQuery { .. }
+        | MeasureOp::HybridQuery { .. }
+        | MeasureOp::AsOfQuery { .. }
+        | MeasureOp::QueryPages { .. }
+        | MeasureOp::Fetch { .. }
+        | MeasureOp::Gc
+        | MeasureOp::Hydrate { .. } => (repeat.raw_get_path.depth, repeat.get_path.depth),
+        MeasureOp::Upsert { .. } | MeasureOp::Delete { .. } | MeasureOp::Compact { .. } => {
+            (repeat.raw_put_get_path.depth, repeat.put_get_path.depth)
+        }
     }
 }
 
@@ -1019,8 +1929,17 @@ fn stability_contract_violations(
     cutoff: &BTreeMap<u32, usize>,
 ) -> Vec<CostViolation> {
     let name = match measure {
-        MeasureOp::Query { .. } => "get",
-        MeasureOp::Upsert { .. } => "put_get",
+        MeasureOp::Query { .. }
+        | MeasureOp::FtsQuery { .. }
+        | MeasureOp::HybridQuery { .. }
+        | MeasureOp::AsOfQuery { .. }
+        | MeasureOp::QueryPages { .. }
+        | MeasureOp::Fetch { .. }
+        | MeasureOp::Gc
+        | MeasureOp::Hydrate { .. } => "get",
+        MeasureOp::Upsert { .. } | MeasureOp::Delete { .. } | MeasureOp::Compact { .. } => {
+            "put_get"
+        }
     };
     let assertion =
         contract.assertions.depth.get(name).unwrap_or_else(|| {

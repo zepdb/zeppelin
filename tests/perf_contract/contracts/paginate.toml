@@ -1,0 +1,153 @@
+schema_version = 1
+scenario = "paginate"
+
+[dataset]
+vectors = 4096
+dims = 64
+nlist = 8
+seed = 7
+attrs = "none"
+fts = "none"
+
+[ns_config]
+quantization = "sq8"
+
+[server_config]
+nprobe = 4
+manifest_cache_ttl_ms = 3600000
+memory_cache_max_mb = 256
+
+[run]
+cache_state = "warm"
+repeats = 8
+
+[run.measure]
+op = "query_pages"
+consistency = "strong"
+pages = 2
+page_size = 2
+query_index = 0
+
+[baseline]
+git_rev = "ff182073ebe01ece19e771f5e4fc6b7b433153b3"
+captured = "2026-07-10T04:59:29.866075+00:00"
+approved_by = "anup"
+reason = "Initial Phase 2 freeze after audited MinIO capture: two serialized cursor pages each retain their measured three-stage read anatomy."
+
+[assert.depth.get]
+mode = "exact"
+value = 6
+why = "two serialized cursor pages each retain their measured three-stage read anatomy."
+
+[assert.gets]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 8
+fts = 0
+manifest = 2
+other = 0
+sketch = 0
+sq = 0
+total = 10
+wal = 0
+
+[assert.puts]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 0
+fts = 0
+manifest = 0
+other = 0
+sketch = 0
+sq = 0
+total = 0
+wal = 0
+
+[assert.get_bytes.attrs]
+exact = 0
+
+[assert.get_bytes.bitmap]
+exact = 0
+
+[assert.get_bytes.bootstrap]
+exact = 0
+
+[assert.get_bytes.centroids]
+exact = 0
+
+[assert.get_bytes.cluster]
+exact = 860238
+
+[assert.get_bytes.fts]
+exact = 0
+
+[assert.get_bytes.manifest]
+exact = 0
+
+[assert.get_bytes.other]
+exact = 0
+
+[assert.get_bytes.sketch]
+exact = 0
+
+[assert.get_bytes.sq]
+exact = 0
+
+[assert.get_bytes.total]
+exact = 860238
+
+[assert.get_bytes.wal]
+exact = 0
+
+[assert.put_bytes.attrs]
+exact = 0
+
+[assert.put_bytes.bitmap]
+exact = 0
+
+[assert.put_bytes.bootstrap]
+exact = 0
+
+[assert.put_bytes.centroids]
+exact = 0
+
+[assert.put_bytes.cluster]
+exact = 0
+
+[assert.put_bytes.fts]
+exact = 0
+
+[assert.put_bytes.manifest]
+exact = 0
+
+[assert.put_bytes.other]
+exact = 0
+
+[assert.put_bytes.sketch]
+exact = 0
+
+[assert.put_bytes.sq]
+exact = 0
+
+[assert.put_bytes.total]
+exact = 0
+
+[assert.put_bytes.wal]
+exact = 0
+
+[assert.ops]
+copy = 0
+delete = 0
+head = 0
+list = 0
+
+[assert.labeled_gets]
+page_1 = 5
+page_2 = 5
+
+[assert.labeled_gets_le]
+page_2 = "page_1"

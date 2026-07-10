@@ -1,0 +1,152 @@
+schema_version = 1
+scenario = "hybrid_query"
+
+[dataset]
+vectors = 4096
+dims = 64
+nlist = 8
+seed = 7
+attrs = "none"
+
+[dataset.fts.vocab]
+words = 32
+doc_len = 8
+
+[ns_config]
+quantization = "sq8"
+fts_index = true
+
+[server_config]
+nprobe = 4
+manifest_cache_ttl_ms = 3600000
+memory_cache_max_mb = 256
+
+[run]
+cache_state = "warm"
+repeats = 8
+
+[run.measure]
+op = "hybrid_query"
+consistency = "strong"
+top_k = 10
+candidate_k = 20
+query_index = 0
+field = "content"
+query = "alpha"
+
+[baseline]
+git_rev = "ff182073ebe01ece19e771f5e4fc6b7b433153b3"
+captured = "2026-07-10T04:58:57.121904+00:00"
+approved_by = "anup"
+reason = "Initial Phase 2 freeze after audited MinIO capture: the ANN and global-FTS union, including rerank, forms exact depth five without duplicate FTS reads."
+
+[assert.depth.get]
+mode = "exact"
+value = 5
+why = "the ANN and global-FTS union, including rerank, forms exact depth five without duplicate FTS reads."
+
+[assert.gets]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 8
+fts = 1
+manifest = 1
+other = 0
+sketch = 0
+sq = 0
+total = 10
+wal = 0
+
+[assert.puts]
+attrs = 0
+bitmap = 0
+bootstrap = 0
+centroids = 0
+cluster = 0
+fts = 0
+manifest = 0
+other = 0
+sketch = 0
+sq = 0
+total = 0
+wal = 0
+
+[assert.get_bytes.attrs]
+exact = 0
+
+[assert.get_bytes.bitmap]
+exact = 0
+
+[assert.get_bytes.bootstrap]
+exact = 0
+
+[assert.get_bytes.centroids]
+exact = 0
+
+[assert.get_bytes.cluster]
+exact = 1879459
+
+[assert.get_bytes.fts]
+exact = 172497
+
+[assert.get_bytes.manifest]
+exact = 0
+
+[assert.get_bytes.other]
+exact = 0
+
+[assert.get_bytes.sketch]
+exact = 0
+
+[assert.get_bytes.sq]
+exact = 0
+
+[assert.get_bytes.total]
+exact = 2051956
+
+[assert.get_bytes.wal]
+exact = 0
+
+[assert.put_bytes.attrs]
+exact = 0
+
+[assert.put_bytes.bitmap]
+exact = 0
+
+[assert.put_bytes.bootstrap]
+exact = 0
+
+[assert.put_bytes.centroids]
+exact = 0
+
+[assert.put_bytes.cluster]
+exact = 0
+
+[assert.put_bytes.fts]
+exact = 0
+
+[assert.put_bytes.manifest]
+exact = 0
+
+[assert.put_bytes.other]
+exact = 0
+
+[assert.put_bytes.sketch]
+exact = 0
+
+[assert.put_bytes.sq]
+exact = 0
+
+[assert.put_bytes.total]
+exact = 0
+
+[assert.put_bytes.wal]
+exact = 0
+
+[assert.ops]
+copy = 0
+delete = 0
+head = 0
+list = 0

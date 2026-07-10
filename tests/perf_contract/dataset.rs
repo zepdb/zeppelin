@@ -9,11 +9,16 @@ use serde::{Deserialize, Serialize};
 const CENTER_SCALE: f32 = 100.0;
 const POINT_JITTER: f32 = 0.5;
 
+/// Closed, stem-stable vocabulary used only by performance-contract datasets.
+pub const PERF_VOCAB: [&str; 32] = [
+    "alpha", "beta", "gamma", "delta", "vector", "matrix", "query", "index", "forest", "river",
+    "mountain", "planet", "signal", "orbit", "canvas", "copper", "silver", "gold", "crystal",
+    "ember", "velvet", "anchor", "bridge", "circle", "dragon", "engine", "fabric", "galaxy",
+    "harbor", "island", "jungle", "kernel",
+];
+
 /// Shape of generated filterable attributes.
 ///
-/// Phase 1 supports only [`Self::None`]. The category variant is part of the
-/// serialized contract now so Phase 2 can implement it without changing the
-/// contract shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttrShape {
@@ -23,8 +28,6 @@ pub enum AttrShape {
 
 /// Shape of generated full-text-search documents.
 ///
-/// Phase 1 supports only [`Self::None`]. The vocabulary variant is reserved for
-/// the closed, stem-stable vocabulary added in Phase 2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FtsShape {
@@ -43,6 +46,26 @@ pub struct DatasetSpec {
     pub attrs: AttrShape,
     pub fts: FtsShape,
 }
+
+/// Stable small shape shared by the Tier-1 catalog and later scaling checks.
+pub const SHAPE_SMALL: DatasetSpec = DatasetSpec {
+    vectors: 4_096,
+    dims: 64,
+    nlist: 8,
+    seed: 7,
+    attrs: AttrShape::None,
+    fts: FtsShape::None,
+};
+
+/// Stable medium shape reserved for Phase-3 shape-scaling validation.
+pub const SHAPE_MEDIUM: DatasetSpec = DatasetSpec {
+    vectors: 32_768,
+    dims: 128,
+    nlist: 32,
+    seed: 7,
+    attrs: AttrShape::None,
+    fts: FtsShape::None,
+};
 
 /// A generated vector in the row-oriented HTTP upsert shape.
 ///
@@ -79,6 +102,12 @@ pub struct DatasetExpectations {
     pub rows_per_cluster: usize,
     pub cluster_f32_bytes: u64,
     pub probe_clusters: Vec<Vec<usize>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_matches_per_value: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fts_vocab_words: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fts_doc_len: Option<usize>,
 }
 
 /// Generated rows, their construction-time blobs, planned probes, and all
@@ -102,13 +131,6 @@ pub struct GeneratedDataset {
 pub fn generate(spec: DatasetSpec) -> GeneratedDataset {
     validate_spec(&spec);
 
-    if !matches!(&spec.attrs, AttrShape::None) {
-        panic!("perf dataset AttrShape variants other than None require Phase 2");
-    }
-    if !matches!(&spec.fts, FtsShape::None) {
-        panic!("perf dataset FtsShape variants other than None require Phase 2");
-    }
-
     let rows_per_cluster = spec.vectors / spec.nlist;
     let centers = blob_centers(spec.nlist, spec.dims);
     let mut rng = StdRng::seed_from_u64(spec.seed);
@@ -122,10 +144,11 @@ pub fn generate(spec: DatasetSpec) -> GeneratedDataset {
                 .map(|coordinate| coordinate + rng.gen_range(-POINT_JITTER..=POINT_JITTER))
                 .collect();
             let vector_index = blob * rows_per_cluster + row;
+            let attributes = generated_attributes(&spec, vector_index);
             vectors.push(GenVector {
                 id: format!("perf-{vector_index:08}"),
                 values,
-                attributes: None,
+                attributes,
             });
             blob_of.push(blob);
         }
@@ -152,6 +175,18 @@ pub fn generate(spec: DatasetSpec) -> GeneratedDataset {
         .iter()
         .map(|query| query.probe_clusters.clone())
         .collect();
+    let category_matches_per_value = match &spec.attrs {
+        AttrShape::None => None,
+        AttrShape::Category { cardinality } => Some(spec.vectors / cardinality),
+    };
+    let fts_vocab_words = match &spec.fts {
+        FtsShape::None => None,
+        FtsShape::Vocab { words, .. } => Some(*words),
+    };
+    let fts_doc_len = match &spec.fts {
+        FtsShape::None => None,
+        FtsShape::Vocab { doc_len, .. } => Some(*doc_len),
+    };
 
     GeneratedDataset {
         spec,
@@ -162,8 +197,32 @@ pub fn generate(spec: DatasetSpec) -> GeneratedDataset {
             rows_per_cluster,
             cluster_f32_bytes,
             probe_clusters,
+            category_matches_per_value,
+            fts_vocab_words,
+            fts_doc_len,
         },
     }
+}
+
+fn generated_attributes(
+    spec: &DatasetSpec,
+    vector_index: usize,
+) -> Option<BTreeMap<String, serde_json::Value>> {
+    let mut attributes = BTreeMap::new();
+    if let AttrShape::Category { cardinality } = spec.attrs {
+        attributes.insert(
+            "cat".to_string(),
+            serde_json::Value::String(format!("c{}", vector_index % cardinality)),
+        );
+    }
+    if let FtsShape::Vocab { words, doc_len } = spec.fts {
+        let content = (0..doc_len)
+            .map(|offset| PERF_VOCAB[(vector_index + offset) % words])
+            .collect::<Vec<_>>()
+            .join(" ");
+        attributes.insert("content".to_string(), serde_json::Value::String(content));
+    }
+    (!attributes.is_empty()).then_some(attributes)
 }
 
 fn validate_spec(spec: &DatasetSpec) {
@@ -184,6 +243,22 @@ fn validate_spec(spec: &DatasetSpec) {
         0,
         "perf dataset vectors must be an exact multiple of nlist"
     );
+    if let AttrShape::Category { cardinality } = spec.attrs {
+        assert!(cardinality > 0, "category cardinality must be nonzero");
+        assert_eq!(
+            spec.vectors % cardinality,
+            0,
+            "category cardinality must divide the vector count"
+        );
+    }
+    if let FtsShape::Vocab { words, doc_len } = spec.fts {
+        assert!(words > 0, "FTS vocabulary size must be nonzero");
+        assert!(
+            words <= PERF_VOCAB.len(),
+            "FTS vocabulary size exceeds the closed vocabulary"
+        );
+        assert!(doc_len > 0, "FTS document length must be nonzero");
+    }
 }
 
 fn blob_centers(nlist: usize, dims: usize) -> Vec<Vec<f32>> {
@@ -272,22 +347,77 @@ mod tests {
 
     #[test]
     #[ignore = "perf-contract selftest; run explicitly"]
-    #[should_panic(expected = "AttrShape variants other than None require Phase 2")]
-    fn future_attribute_shapes_fail_loud() {
+    fn category_shape_is_uniform_and_deterministic() {
         let mut spec = test_spec();
         spec.attrs = AttrShape::Category { cardinality: 4 };
-        let _ = generate(spec);
+        let generated = generate(spec);
+
+        assert_eq!(generated.expected.category_matches_per_value, Some(4));
+        for (index, vector) in generated.vectors.iter().enumerate() {
+            assert_eq!(
+                vector.attributes.as_ref().unwrap()["cat"],
+                serde_json::json!(format!("c{}", index % 4))
+            );
+        }
     }
 
     #[test]
     #[ignore = "perf-contract selftest; run explicitly"]
-    #[should_panic(expected = "FtsShape variants other than None require Phase 2")]
-    fn future_fts_shapes_fail_loud() {
+    fn fts_shape_uses_only_the_closed_vocabulary() {
         let mut spec = test_spec();
         spec.fts = FtsShape::Vocab {
-            words: 16,
-            doc_len: 8,
+            words: 4,
+            doc_len: 6,
         };
-        let _ = generate(spec);
+        let generated = generate(spec);
+
+        assert_eq!(generated.expected.fts_vocab_words, Some(4));
+        assert_eq!(generated.expected.fts_doc_len, Some(6));
+        assert_eq!(
+            generated.vectors[0].attributes.as_ref().unwrap()["content"],
+            serde_json::json!("alpha beta gamma delta alpha beta")
+        );
+        assert_eq!(
+            generated.vectors[1].attributes.as_ref().unwrap()["content"],
+            serde_json::json!("beta gamma delta alpha beta gamma")
+        );
+    }
+
+    #[test]
+    #[ignore = "perf-contract selftest; run explicitly"]
+    fn vocabulary_tokens_are_stable_and_distinct() {
+        use zeppelin::fts::tokenizer::tokenize_text;
+        use zeppelin::fts::FtsFieldConfig;
+
+        let config = FtsFieldConfig::default();
+        let mut stems = BTreeMap::new();
+        for word in PERF_VOCAB {
+            let tokens = tokenize_text(word, &config, false);
+            assert_eq!(tokens.len(), 1, "{word} produced {tokens:?}");
+            let stem = tokens[0].clone();
+            assert!(!stem.is_empty(), "{word} was removed by the tokenizer");
+            assert_eq!(
+                tokenize_text(&stem, &config, false),
+                vec![stem.clone()],
+                "{word} stem {stem} was not stable"
+            );
+            assert!(
+                stems.insert(stem.clone(), word).is_none(),
+                "{word} collided on stem {stem}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "perf-contract selftest; run explicitly"]
+    fn standard_shapes_remain_pinned() {
+        assert_eq!(
+            (SHAPE_SMALL.vectors, SHAPE_SMALL.dims, SHAPE_SMALL.nlist),
+            (4_096, 64, 8)
+        );
+        assert_eq!(
+            (SHAPE_MEDIUM.vectors, SHAPE_MEDIUM.dims, SHAPE_MEDIUM.nlist),
+            (32_768, 128, 32)
+        );
     }
 }

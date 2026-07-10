@@ -1,4 +1,8 @@
 //! Checked-in performance-contract schema, validation, and cost checker.
+//!
+//! Schema version 1 accepts additive optional fields. A semantic change to an
+//! existing field requires a version bump and migration of every checked-in
+//! contract in the same commit.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -36,6 +40,10 @@ pub struct ContractSpec {
 #[serde(deny_unknown_fields)]
 pub struct NsConfig {
     pub quantization: Quantization,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bitmap_index: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fts_index: bool,
 }
 
 /// Quantization modes admitted by the Phase-1 contract schema.
@@ -84,10 +92,60 @@ pub enum MeasureSpec {
         consistency: Consistency,
         top_k: usize,
         query_index: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<FilterMeasure>,
+    },
+    FtsQuery {
+        consistency: Consistency,
+        top_k: usize,
+        field: String,
+        query: String,
+    },
+    HybridQuery {
+        consistency: Consistency,
+        top_k: usize,
+        candidate_k: usize,
+        query_index: usize,
+        field: String,
+        query: String,
+    },
+    AsOfQuery {
+        consistency: Consistency,
+        top_k: usize,
+        query_index: usize,
+    },
+    QueryPages {
+        consistency: Consistency,
+        pages: usize,
+        page_size: usize,
+        query_index: usize,
+    },
+    Fetch {
+        consistency: Consistency,
+        ids: usize,
     },
     Upsert {
         batch: usize,
     },
+    Delete {
+        count: usize,
+    },
+    Compact {
+        fragments: usize,
+        incremental: bool,
+    },
+    Gc,
+    Hydrate {
+        attempts: usize,
+    },
+}
+
+/// One deterministic equality filter used by a measured ANN query.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FilterMeasure {
+    pub field: String,
+    pub value: String,
 }
 
 /// Query consistency modes represented in contract TOML.
@@ -126,6 +184,16 @@ pub struct AssertionSpec {
     pub get_keys: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub put_keys: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ops: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labeled_gets: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labeled_gets_le: BTreeMap<String, String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Exact or upper-bound roundtrip-depth policy.
@@ -311,6 +379,25 @@ fn validate_contract(scenario: &str, contract: &ContractSpec) -> Result<(), Stri
     validate_complete_class_map("assert.puts", &contract.assertions.puts)?;
     validate_complete_class_map("assert.get_bytes", &contract.assertions.get_bytes)?;
     validate_complete_class_map("assert.put_bytes", &contract.assertions.put_bytes)?;
+    for operation in contract.assertions.ops.keys() {
+        if !matches!(operation.as_str(), "head" | "list" | "copy" | "delete") {
+            return Err(format!(
+                "unknown assert.ops key {operation:?}; expected head, list, copy, or delete"
+            ));
+        }
+    }
+    for (label, upper) in &contract.assertions.labeled_gets_le {
+        if !contract.assertions.labeled_gets.contains_key(label) {
+            return Err(format!(
+                "assert.labeled_gets_le key {label:?} is absent from assert.labeled_gets"
+            ));
+        }
+        if !contract.assertions.labeled_gets.contains_key(upper) {
+            return Err(format!(
+                "assert.labeled_gets_le target {upper:?} is absent from assert.labeled_gets"
+            ));
+        }
+    }
 
     for (name, assertion) in &contract.assertions.depth {
         if !matches!(name.as_str(), "get" | "put_get") {
@@ -330,16 +417,48 @@ fn validate_contract(scenario: &str, contract: &ContractSpec) -> Result<(), Stri
         }
     }
     match &contract.run.measure {
-        MeasureSpec::Query { .. } if !contract.assertions.depth.contains_key("get") => {
-            return Err("Phase-1 query contracts require assert.depth.get".to_string());
+        MeasureSpec::Query { .. }
+        | MeasureSpec::FtsQuery { .. }
+        | MeasureSpec::HybridQuery { .. }
+        | MeasureSpec::AsOfQuery { .. }
+        | MeasureSpec::QueryPages { .. }
+        | MeasureSpec::Fetch { .. }
+        | MeasureSpec::Gc
+        | MeasureSpec::Hydrate { .. }
+            if !contract.assertions.depth.contains_key("get") =>
+        {
+            return Err("read contracts require assert.depth.get".to_string());
         }
-        MeasureSpec::Upsert { .. } if !contract.assertions.depth.contains_key("put_get") => {
-            return Err("Phase-1 upsert contracts require assert.depth.put_get".to_string());
+        MeasureSpec::Upsert { .. } | MeasureSpec::Delete { .. } | MeasureSpec::Compact { .. }
+            if !contract.assertions.depth.contains_key("put_get") =>
+        {
+            return Err("write contracts require assert.depth.put_get".to_string());
         }
-        MeasureSpec::Upsert { .. } if !contract.assertions.put_keys.contains_key("manifests/") => {
-            return Err(
-                "Phase-1 upsert contracts require assert.put_keys[\"manifests/\"]".to_string(),
-            );
+        MeasureSpec::Upsert { .. } | MeasureSpec::Delete { .. }
+            if !contract.assertions.put_keys.contains_key("manifests/") =>
+        {
+            return Err("write contracts require assert.put_keys[\"manifests/\"]".to_string());
+        }
+        MeasureSpec::QueryPages { pages, .. } => {
+            if *pages != 2 {
+                return Err("Phase-2 pagination requires exactly two pages".to_string());
+            }
+            require_labeled_get(&contract.assertions, "page_1")?;
+            require_labeled_get(&contract.assertions, "page_2")?;
+        }
+        MeasureSpec::Hydrate { attempts } => {
+            if *attempts != 2 {
+                return Err("Phase-2 hydration requires exactly two attempts".to_string());
+            }
+            require_labeled_get(&contract.assertions, "hydrate_1")?;
+            require_labeled_get(&contract.assertions, "hydrate_2")?;
+        }
+        MeasureSpec::Gc => {
+            for operation in ["list", "delete"] {
+                if !contract.assertions.ops.contains_key(operation) {
+                    return Err(format!("GC contracts require assert.ops.{operation}"));
+                }
+            }
         }
         _ => {}
     }
@@ -353,6 +472,16 @@ fn validate_contract(scenario: &str, contract: &ContractSpec) -> Result<(), Stri
     }
 
     Ok(())
+}
+
+fn require_labeled_get(assertions: &AssertionSpec, label: &str) -> Result<(), String> {
+    if assertions.labeled_gets.contains_key(label) {
+        Ok(())
+    } else {
+        Err(format!(
+            "compound measure requires assert.labeled_gets.{label}"
+        ))
+    }
 }
 
 fn validate_complete_class_map<T>(
@@ -466,6 +595,13 @@ pub fn check_contract(contract: &ContractSpec, outcome: &ScenarioOutcome) -> Vec
             &contract.assertions.depth,
             &mut violations,
         );
+        check_aux_ops(
+            repeat_index,
+            repeat,
+            &contract.assertions.ops,
+            &mut violations,
+        );
+        check_labeled_gets(repeat_index, repeat, &contract.assertions, &mut violations);
     }
 
     violations
@@ -513,7 +649,10 @@ fn compare_repeat_counters(
         return;
     }
 
-    let is_upsert = matches!(&contract.run.measure, MeasureSpec::Upsert { .. });
+    let is_mutating = matches!(
+        &contract.run.measure,
+        MeasureSpec::Upsert { .. } | MeasureSpec::Delete { .. }
+    );
     for (class, first_stats) in &first.classes {
         let repeat_stats = repeat
             .classes
@@ -531,8 +670,27 @@ fn compare_repeat_counters(
     {
         details.push("total operation counts differ");
     }
+    if first.op_counts != repeat.op_counts {
+        details.push("non-GET/PUT operation counts differ");
+    }
+    if first.labeled.len() != repeat.labeled.len()
+        || first
+            .labeled
+            .iter()
+            .zip(&repeat.labeled)
+            .any(|(left, right)| {
+                left.label != right.label
+                    || left.classes != right.classes
+                    || left.totals != right.totals
+                    || left.op_counts != right.op_counts
+                    || left.get_path.depth != right.get_path.depth
+                    || left.put_get_path.depth != right.put_get_path.depth
+            })
+    {
+        details.push("labeled sub-operation counters differ");
+    }
 
-    if is_upsert {
+    if is_mutating {
         for (class, first_stats) in &first.classes {
             if matches!(class.as_str(), "manifest" | "wal" | "other") {
                 continue;
@@ -713,6 +871,91 @@ fn check_depths(
     }
 }
 
+fn check_aux_ops(
+    repeat_index: usize,
+    repeat: &RepeatCounters,
+    assertions: &BTreeMap<String, u64>,
+    violations: &mut Vec<CostViolation>,
+) {
+    for (operation, expected) in assertions {
+        let actual = repeat.op_counts.get(operation).copied().unwrap_or(0);
+        let kind = span_kind(operation);
+        match actual.cmp(expected) {
+            std::cmp::Ordering::Greater => violations.push(CostViolation::OpCount {
+                class: "total".to_string(),
+                kind,
+                expected: *expected,
+                actual,
+            }),
+            std::cmp::Ordering::Less => push_baseline_drift(
+                violations,
+                format!("assert.ops.{operation}"),
+                repeat_index,
+                *expected,
+                actual,
+            ),
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+}
+
+fn check_labeled_gets(
+    repeat_index: usize,
+    repeat: &RepeatCounters,
+    assertions: &AssertionSpec,
+    violations: &mut Vec<CostViolation>,
+) {
+    let labeled = repeat
+        .labeled
+        .iter()
+        .map(|counters| (counters.label.as_str(), counters.contract_get_ops))
+        .collect::<BTreeMap<_, _>>();
+    for (label, expected) in &assertions.labeled_gets {
+        let actual = labeled
+            .get(label.as_str())
+            .copied()
+            .unwrap_or_else(|| panic!("measured repeat omitted required label {label:?}"));
+        match actual.cmp(expected) {
+            std::cmp::Ordering::Greater => violations.push(CostViolation::OpCount {
+                class: format!("label:{label}"),
+                kind: SpanKind::Get,
+                expected: *expected,
+                actual,
+            }),
+            std::cmp::Ordering::Less => push_baseline_drift(
+                violations,
+                format!("assert.labeled_gets.{label}"),
+                repeat_index,
+                *expected,
+                actual,
+            ),
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    for (label, upper_label) in &assertions.labeled_gets_le {
+        let actual = labeled[label.as_str()];
+        let upper = labeled[upper_label.as_str()];
+        if actual > upper {
+            violations.push(CostViolation::RepeatDrift {
+                repeat: repeat_index,
+                detail: format!(
+                    "labeled GET relation failed: {label}={actual} exceeds {upper_label}={upper}"
+                ),
+            });
+        }
+    }
+}
+
+fn span_kind(operation: &str) -> SpanKind {
+    match operation {
+        "head" => SpanKind::Head,
+        "list" => SpanKind::List,
+        "copy" => SpanKind::Copy,
+        "delete" => SpanKind::Delete,
+        _ => panic!("unvalidated auxiliary operation {operation:?}"),
+    }
+}
+
 fn stats_for(repeat: &RepeatCounters, class: &str) -> ClassStats {
     if class == "total" {
         repeat.totals
@@ -791,6 +1034,8 @@ pub fn capture_contract(
         SpanKind::Put,
         "PUT key count",
     );
+    let ops = capture_aux_ops(outcome);
+    let labeled_gets = capture_labeled_gets(outcome);
     let mut run = source.run.clone();
     run.repeats = outcome.per_repeat.len();
 
@@ -815,8 +1060,58 @@ pub fn capture_contract(
             put_bytes,
             get_keys,
             put_keys,
+            ops,
+            labeled_gets,
+            labeled_gets_le: source.assertions.labeled_gets_le.clone(),
         },
     }
+}
+
+fn capture_aux_ops(outcome: &ScenarioOutcome) -> BTreeMap<String, u64> {
+    ["head", "list", "copy", "delete"]
+        .into_iter()
+        .map(|operation| {
+            let values = outcome
+                .per_repeat
+                .iter()
+                .map(|repeat| repeat.op_counts.get(operation).copied().unwrap_or(0))
+                .collect::<Vec<_>>();
+            (
+                operation.to_string(),
+                require_identical("auxiliary ops", operation, &values),
+            )
+        })
+        .collect()
+}
+
+fn capture_labeled_gets(outcome: &ScenarioOutcome) -> BTreeMap<String, u64> {
+    let Some(first) = outcome.per_repeat.first() else {
+        return BTreeMap::new();
+    };
+    first
+        .labeled
+        .iter()
+        .map(|labeled| {
+            let values = outcome
+                .per_repeat
+                .iter()
+                .map(|repeat| {
+                    repeat
+                        .labeled
+                        .iter()
+                        .find(|candidate| candidate.label == labeled.label)
+                        .unwrap_or_else(|| {
+                            panic!("capture repeat omitted label {:?}", labeled.label)
+                        })
+                        .contract_get_ops
+                })
+                .collect::<Vec<_>>();
+            (
+                labeled.label.clone(),
+                require_identical("labeled GET ops", &labeled.label, &values),
+            )
+        })
+        .collect()
 }
 
 fn capture_exact_stats(
@@ -1100,6 +1395,8 @@ total = { exact = 0 }
             get_path: path(get_depth),
             put_get_path: path(put_get_depth),
             spans: Vec::new(),
+            op_counts: BTreeMap::new(),
+            labeled: Vec::new(),
             response_cutoff_us: 0,
             raw_get_path: path(get_depth),
             raw_put_get_path: path(put_get_depth),
@@ -1122,6 +1419,9 @@ total = { exact = 0 }
                 rows_per_cluster: 4,
                 cluster_f32_bytes: 128,
                 probe_clusters: Vec::new(),
+                category_matches_per_value: None,
+                fts_vocab_words: None,
+                fts_doc_len: None,
             },
         }
     }
@@ -1238,8 +1538,8 @@ total = { exact = 0 }
 
     #[test]
     #[ignore = "perf-contract schema selftest; run explicitly"]
-    fn checked_in_phase1_contracts_pass_strict_validation() {
-        for scenario in ["warm_query_strong", "cold_query_strong", "upsert_single"] {
+    fn checked_in_catalog_contracts_pass_strict_validation() {
+        for scenario in super::super::ALL_SCENARIOS {
             load_contract(scenario)
                 .unwrap_or_else(|error| panic!("checked-in {scenario} contract failed: {error}"));
         }

@@ -17,6 +17,45 @@ pub use scenario::{
 /// Phase-1 scenario names in their stable execution order.
 pub const PHASE1_SCENARIOS: [&str; 3] = ["warm_query_strong", "cold_query_strong", "upsert_single"];
 
+/// Phase-2 scenario names in their stable execution order.
+pub const PHASE2_SCENARIOS: [&str; 14] = [
+    "warm_query_eventual",
+    "filtered_query",
+    "filtered_query_bitmap",
+    "fts_query",
+    "hybrid_query",
+    "as_of_query",
+    "paginate",
+    "fetch_strong",
+    "upsert_batch",
+    "delete_single",
+    "compaction_cycle",
+    "compaction_incremental",
+    "gc_cycle",
+    "hydration",
+];
+
+/// Complete Tier-1 catalog run by default and in gating CI.
+pub const ALL_SCENARIOS: [&str; 17] = [
+    "warm_query_strong",
+    "cold_query_strong",
+    "upsert_single",
+    "warm_query_eventual",
+    "filtered_query",
+    "filtered_query_bitmap",
+    "fts_query",
+    "hybrid_query",
+    "as_of_query",
+    "paginate",
+    "fetch_strong",
+    "upsert_batch",
+    "delete_single",
+    "compaction_cycle",
+    "compaction_incremental",
+    "gc_cycle",
+    "hydration",
+];
+
 /// Process-level runner configuration parsed from `ZEPPELIN_PERF_*`.
 #[derive(Debug, Clone)]
 pub struct PerfEnv {
@@ -28,7 +67,7 @@ pub struct PerfEnv {
 }
 
 impl PerfEnv {
-    /// Parse the complete Phase-1 environment contract.
+    /// Parse the complete Tier-1 environment contract.
     #[must_use]
     pub fn from_env() -> Self {
         let scenarios = match std::env::var("ZEPPELIN_PERF_SCENARIOS") {
@@ -45,7 +84,7 @@ impl PerfEnv {
                 );
                 parsed
             }
-            Err(std::env::VarError::NotPresent) => PHASE1_SCENARIOS
+            Err(std::env::VarError::NotPresent) => ALL_SCENARIOS
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect(),
@@ -53,7 +92,7 @@ impl PerfEnv {
         };
         for name in &scenarios {
             assert!(
-                PHASE1_SCENARIOS.contains(&name.as_str()),
+                ALL_SCENARIOS.contains(&name.as_str()),
                 "unknown performance-contract scenario: {name}"
             );
         }
@@ -107,11 +146,13 @@ mod tests {
 
     #[test]
     #[ignore = "environment parsing is exercised explicitly"]
-    fn phase1_catalog_has_no_duplicates() {
-        let unique = PHASE1_SCENARIOS
+    fn full_catalog_has_no_duplicates_and_keeps_phase1_prefix() {
+        let unique = ALL_SCENARIOS
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), PHASE1_SCENARIOS.len());
+        assert_eq!(unique.len(), ALL_SCENARIOS.len());
+        assert_eq!(&ALL_SCENARIOS[..PHASE1_SCENARIOS.len()], &PHASE1_SCENARIOS);
+        assert_eq!(&ALL_SCENARIOS[PHASE1_SCENARIOS.len()..], &PHASE2_SCENARIOS);
     }
 }

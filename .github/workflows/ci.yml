@@ -73,6 +73,46 @@ jobs:
           MINIO_SECRET_KEY: minioadmin
         run: cargo test --tests -j 1 -- --nocapture
 
+  perf-contracts:
+    name: Performance Contracts (MinIO)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUSTFLAGS: -C link-arg=-Wl,--threads=1
+      TEST_BACKEND: minio
+      TEST_S3_BUCKET: stormcrow-test
+      MINIO_ENDPOINT: http://localhost:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest \
+            server /data
+          for i in $(seq 1 10); do
+            if curl -sf http://localhost:9000/minio/health/live; then
+              echo "MinIO is ready"
+              break
+            fi
+            echo "Waiting for MinIO... ($i/10)"
+            sleep 2
+          done
+      - name: Create MinIO test bucket
+        run: |
+          curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
+          chmod +x /usr/local/bin/mc
+          mc alias set local http://localhost:9000 minioadmin minioadmin
+          mc mb local/stormcrow-test
+      - name: Gate object-store performance contracts
+        run: cargo test --test perf_contract_tests contracts -- --ignored
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
