@@ -147,24 +147,41 @@ fn parse_flag(name: &str) -> bool {
 }
 
 pub(crate) fn require_minio() {
-    match std::env::var("TEST_BACKEND") {
-        Ok(backend) if backend == "minio" => {}
-        Ok(backend) => {
-            panic!("performance contracts require TEST_BACKEND=minio, got {backend:?}")
-        }
-        Err(std::env::VarError::NotPresent) => {
-            panic!("performance contracts require TEST_BACKEND=minio")
-        }
+    let backend = match std::env::var("TEST_BACKEND") {
+        Ok(backend) => Some(backend),
+        Err(std::env::VarError::NotPresent) => None,
         Err(error) => panic!("failed to read TEST_BACKEND: {error}"),
+    };
+    let grouping = match std::env::var("ZEPPELIN_MAX_CLUSTERS_PER_OBJECT") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => panic!("failed to read ZEPPELIN_MAX_CLUSTERS_PER_OBJECT: {error}"),
+    };
+    if let Err(error) = validate_minio_environment(backend.as_deref(), grouping.as_deref()) {
+        panic!("{error}");
     }
-    match std::env::var("ZEPPELIN_MAX_CLUSTERS_PER_OBJECT") {
-        Err(std::env::VarError::NotPresent) => {}
-        Ok(value) => panic!(
+}
+
+fn validate_minio_environment(
+    backend: Option<&str>,
+    grouping_override: Option<&str>,
+) -> Result<(), String> {
+    match backend {
+        Some("minio") => {}
+        Some(backend) => {
+            return Err(format!(
+                "performance contracts require TEST_BACKEND=minio, got {backend:?}"
+            ));
+        }
+        None => return Err("performance contracts require TEST_BACKEND=minio".to_string()),
+    }
+    if let Some(value) = grouping_override {
+        return Err(format!(
             "performance contracts require ZEPPELIN_MAX_CLUSTERS_PER_OBJECT \
              to be unset, got {value:?}"
-        ),
-        Err(error) => panic!("failed to read ZEPPELIN_MAX_CLUSTERS_PER_OBJECT: {error}"),
+        ));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -172,7 +189,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "environment parsing is exercised explicitly"]
     fn full_catalog_has_no_duplicates_and_keeps_phase1_prefix() {
         let unique = ALL_SCENARIOS
             .iter()
@@ -181,5 +197,15 @@ mod tests {
         assert_eq!(unique.len(), ALL_SCENARIOS.len());
         assert_eq!(&ALL_SCENARIOS[..PHASE1_SCENARIOS.len()], &PHASE1_SCENARIOS);
         assert_eq!(&ALL_SCENARIOS[PHASE1_SCENARIOS.len()..], &PHASE2_SCENARIOS);
+    }
+
+    #[test]
+    fn cluster_grouping_override_is_rejected() {
+        let error = validate_minio_environment(Some("minio"), Some("4")).unwrap_err();
+        assert_eq!(
+            error,
+            "performance contracts require ZEPPELIN_MAX_CLUSTERS_PER_OBJECT \
+             to be unset, got \"4\""
+        );
     }
 }

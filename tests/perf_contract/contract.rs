@@ -1428,7 +1428,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract schema selftest; run explicitly"]
     fn unknown_nested_keys_are_rejected() {
         let source = VALID_CONTRACT.replace(
             "manifest_cache_ttl_ms = 0",
@@ -1440,7 +1439,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract schema selftest; run explicitly"]
     fn byte_bands_require_a_reason() {
         let source = VALID_CONTRACT.replacen(
             "manifest = { exact = 0 }",
@@ -1456,7 +1454,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract schema selftest; run explicitly"]
     fn inverted_byte_bands_are_rejected() {
         let source = VALID_CONTRACT.replacen(
             "manifest = { exact = 0 }",
@@ -1472,7 +1469,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract schema selftest; run explicitly"]
     fn checked_in_governance_requires_approval_and_reason() {
         for (field, replacement) in [
             ("baseline.approved_by", "approved_by = \"   \""),
@@ -1490,7 +1486,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract schema selftest; run explicitly"]
     fn max_depth_requires_a_reason() {
         let source = VALID_CONTRACT.replace(
             "mode = \"exact\"\nvalue = 1\nwhy = \"stable test depth\"",
@@ -1505,7 +1500,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract schema selftest; run explicitly"]
     fn every_counter_and_byte_map_must_be_complete() {
         for table in [
             "assert.gets",
@@ -1538,7 +1532,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract schema selftest; run explicitly"]
     fn checked_in_catalog_contracts_pass_strict_validation() {
         for scenario in super::super::ALL_SCENARIOS {
             load_contract(scenario)
@@ -1547,7 +1540,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract schema selftest; run explicitly"]
     fn phase1_measures_require_their_anatomy_assertions() {
         let no_depth = VALID_CONTRACT.replace(
             "[assert.depth.put_get]\nmode = \"exact\"\nvalue = 1\nwhy = \"stable test depth\"\n\n",
@@ -1569,7 +1561,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract capture selftest; run explicitly"]
     fn capture_preserves_depth_policy_and_records_actual_repeats() {
         let mut source = parsed_contract();
         source.run.repeats = 99;
@@ -1592,7 +1583,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract capture selftest; run explicitly"]
     #[should_panic(expected = "cannot capture exact depth")]
     fn capture_refuses_variable_exact_depth() {
         let source = parsed_contract();
@@ -1601,7 +1591,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract capture selftest; run explicitly"]
     fn capture_bands_only_serialization_variable_bytes() {
         let source = parsed_contract();
         let mut first = repeat(0, 4);
@@ -1630,7 +1619,6 @@ total = { exact = 0 }
     }
 
     #[test]
-    #[ignore = "perf-contract capture selftest; run explicitly"]
     #[should_panic(expected = "byte bands are limited to manifest, wal, other, and total")]
     fn capture_refuses_variable_bytes_for_stable_classes() {
         let source = parsed_contract();

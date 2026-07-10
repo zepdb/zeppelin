@@ -840,7 +840,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "perf-contract latency sampler selftest; run explicitly"]
     fn sampling_is_deterministic_and_tracks_ordinals() {
         let distribution = LognormalMs::from_percentiles(15.0, 60.0);
         let ledger = LatencyLedger::new(42);
@@ -855,7 +854,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf-contract latency sampler selftest; run explicitly"]
     fn percentile_fit_is_exact_at_distribution_quantiles() {
         let fitted = LognormalMs::from_percentiles(15.0, 60.0);
         assert!((fitted.mu.exp() - 15.0).abs() < 1e-12);

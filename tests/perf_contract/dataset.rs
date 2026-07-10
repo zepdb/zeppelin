@@ -306,7 +306,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf-contract selftest; run explicitly"]
     fn generation_is_byte_identical_for_the_same_spec() {
         let spec = test_spec();
         let first = serde_json::to_vec(&generate(spec.clone())).unwrap();
@@ -316,7 +315,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf-contract selftest; run explicitly"]
     fn expectations_cover_every_center_and_the_first_midpoint() {
         let generated = generate(test_spec());
 
@@ -337,7 +335,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf-contract selftest; run explicitly"]
     #[should_panic(expected = "vectors must be an exact multiple of nlist")]
     fn rejects_unbalanced_blobs() {
         let mut spec = test_spec();
@@ -346,7 +343,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf-contract selftest; run explicitly"]
     fn category_shape_is_uniform_and_deterministic() {
         let mut spec = test_spec();
         spec.attrs = AttrShape::Category { cardinality: 4 };
@@ -362,7 +358,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf-contract selftest; run explicitly"]
     fn fts_shape_uses_only_the_closed_vocabulary() {
         let mut spec = test_spec();
         spec.fts = FtsShape::Vocab {
@@ -384,7 +379,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf-contract selftest; run explicitly"]
     fn vocabulary_tokens_are_stable_and_distinct() {
         use zeppelin::fts::tokenizer::tokenize_text;
         use zeppelin::fts::FtsFieldConfig;
@@ -409,7 +403,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "perf-contract selftest; run explicitly"]
     fn standard_shapes_remain_pinned() {
         assert_eq!(
             (SHAPE_SMALL.vectors, SHAPE_SMALL.dims, SHAPE_SMALL.nlist),

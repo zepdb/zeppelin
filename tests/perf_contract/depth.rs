@@ -584,7 +584,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn pure_parallel_batch_has_depth_one() {
         let spans = vec![
             span("cluster_0.bin", 0, 1),
@@ -599,7 +598,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn two_parallel_stages_have_depth_two() {
         let spans = vec![
             span("coarse_0.bin", 0, 1),
@@ -616,7 +614,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn overlapping_intervals_do_not_chain() {
         let spans = vec![span("cluster_0.bin", 0, 2), span("cluster_1.bin", 1, 3)];
 
@@ -627,7 +624,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn successful_get_finishes_only_after_payload_eof() {
         let (result, tracker) = instrumented_get(b"payload").await;
         assert!(tracker.take_spans().is_empty());
@@ -643,7 +639,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn dropping_get_payload_finishes_once_as_failed() {
         let (result, tracker) = instrumented_get(b"payload").await;
         assert!(tracker.take_spans().is_empty());
@@ -657,7 +652,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn get_payload_error_finishes_once_as_failed() {
         let tracker = DepthTracker::new();
         let pending = tracker.begin(
@@ -683,7 +677,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn active_get_operations_include_payload_lifetime() {
         let (result, tracker) = instrumented_get(b"payload").await;
         assert_eq!(tracker.active_operations(), 1);

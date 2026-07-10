@@ -2429,7 +2429,6 @@ mod tests {
     use object_store::memory::InMemory;
 
     #[tokio::test]
-    #[ignore = "focused helper test"]
     async fn cold_clone_uses_the_manifest_version_reset_api() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let mut manifest = Manifest::new();
@@ -2442,7 +2441,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "focused helper test"]
     #[should_panic(expected = "cold clone byte stability requires source manifest version <= 127")]
     async fn cold_clone_rejects_multibyte_source_generation() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
@@ -2459,7 +2457,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "focused helper test"]
     fn approved_max_accepts_samples_below_the_bound() {
         let contract = load_or_panic("cold_query_strong");
         let measure = scenarios::build(&contract, 1).measure;
@@ -2472,7 +2469,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "focused helper test"]
     fn approved_max_rejects_samples_above_the_bound() {
         let contract = load_or_panic("cold_query_strong");
         let measure = scenarios::build(&contract, 1).measure;

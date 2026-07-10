@@ -216,7 +216,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "perf-contract profile selftest; run explicitly"]
     fn all_shipped_profiles_parse_strictly() {
         for name in SHIPPED_PROFILES {
             let profile = load_profile(name);
