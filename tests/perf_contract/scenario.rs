@@ -37,6 +37,7 @@ use super::{scenarios, PerfEnv};
 const SETUP_BATCH_SIZE: usize = 256;
 const COMPACTION_ATTEMPTS: usize = 4;
 const STABILITY_REPEATS: usize = 100;
+const MSGPACK_POSITIVE_FIXINT_MAX: u64 = 127;
 
 /// Namespace options passed as a raw HTTP creation body.
 pub type NsConfig = Value;
@@ -1236,16 +1237,23 @@ async fn clone_namespace_for_cold(
             object.key = rewrite_cold_key(source, target, &object.key);
         }
     }
-    let mut value = serde_json::to_value(&manifest)
-        .unwrap_or_else(|error| panic!("failed to encode cold clone manifest: {error}"));
-    value["version"] = json!(0);
-    manifest = serde_json::from_value(value)
-        .unwrap_or_else(|error| panic!("failed to reset cold clone generation: {error}"));
+    reset_cold_clone_manifest_version(&mut manifest);
     manifest
         .write(&server.store, target)
         .await
         .unwrap_or_else(|error| panic!("failed to publish cold clone manifest: {error}"));
     server.manifest_cache.invalidate(target);
+}
+
+fn reset_cold_clone_manifest_version(manifest: &mut Manifest) {
+    assert!(
+        manifest.version() <= MSGPACK_POSITIVE_FIXINT_MAX,
+        "cold clone byte stability requires source manifest version <= \
+         {MSGPACK_POSITIVE_FIXINT_MAX}; generation {} uses a wider MessagePack \
+         integer than the reset clone",
+        manifest.version()
+    );
+    manifest.reset_version_for_clone();
 }
 
 fn rewrite_cold_key(source: &str, target: &str, key: &str) -> String {
@@ -2436,6 +2444,37 @@ fn stability_contract_violations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    #[ignore = "focused helper test"]
+    async fn cold_clone_uses_the_manifest_version_reset_api() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let mut manifest = Manifest::new();
+        manifest.write(&store, "cold-clone-reset").await.unwrap();
+        assert_eq!(manifest.version(), 1);
+
+        manifest.reset_version_for_clone();
+
+        assert_eq!(manifest.version(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "focused helper test"]
+    #[should_panic(expected = "cold clone byte stability requires source manifest version <= 127")]
+    async fn cold_clone_rejects_multibyte_source_generation() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let mut manifest = Manifest::new();
+        for _ in 0..=MSGPACK_POSITIVE_FIXINT_MAX {
+            manifest
+                .write(&store, "cold-clone-multibyte")
+                .await
+                .unwrap();
+        }
+        assert_eq!(manifest.version(), MSGPACK_POSITIVE_FIXINT_MAX + 1);
+
+        reset_cold_clone_manifest_version(&mut manifest);
+    }
 
     #[test]
     #[ignore = "focused helper test"]

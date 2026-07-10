@@ -708,7 +708,7 @@ impl Manifest {
     /// Cloning source generation 42 resets it to zero, then
     /// [`Manifest::write`] publishes destination generation 1.
     ///
-    pub(crate) fn reset_version_for_clone(&mut self) {
+    pub fn reset_version_for_clone(&mut self) {
         self.version = 0;
     }
 
