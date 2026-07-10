@@ -168,6 +168,14 @@ src/
 
 Writes land in the WAL as immutable fragments. Background compaction merges fragments into indexed segments (IVF, bitmap pre-filters, BM25 inverted indexes). Queries probe the closest centroids and merge results from any un-compacted WAL fragments.
 
+Flat IVF segments scale their centroid count with segment size: one centroid
+per 3,000 logical rows, bounded by a 256-centroid floor and a 4,096-centroid
+resident-memory cap. An omitted flat `nprobe` searches 3/16 of the active
+segment's clusters with a runtime-configurable floor of 32. Each logical row
+is stored in exactly one cluster. The ignored `ivf_recall_gate` integration
+test is the binding recall, scan, storage, full-probe, and determinism check for
+changes to this policy.
+
 ### Consistency semantics
 
 Consistency is selected per-query via the `consistency` field:

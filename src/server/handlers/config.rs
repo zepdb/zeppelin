@@ -77,8 +77,9 @@ use super::ApiError;
 ///
 /// # Examples
 ///
-/// If the current defaults are `top_k = 10` and `nprobe = 16`, GET returns both
-/// values even while an older in-flight query retains a previous snapshot.
+/// If the current defaults are `top_k = 10` and the nprobe floor is 32, GET
+/// returns both values even while an older in-flight query retains a previous
+/// snapshot. Flat segments may resolve an omitted nprobe above that floor.
 pub async fn get_query_config(State(state): State<AppState>) -> Json<QueryKnobs> {
     Json(state.runtime_query_config.snapshot().as_ref().clone())
 }

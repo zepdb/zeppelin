@@ -183,9 +183,10 @@ use super::ApiError;
 /// projection, cursoring, and explain output. Unknown JSON fields are rejected
 /// so misspelled controls never degrade silently into defaults.
 ///
-/// `consistency` defaults to [`ConsistencyLevel::Strong`]. `top_k`, `nprobe`,
-/// and the wider `candidate_k` frontier are finalized from a single runtime
-/// configuration snapshot during validation.
+/// `consistency` defaults to [`ConsistencyLevel::Strong`]. `top_k` and the
+/// wider `candidate_k` frontier are finalized from one runtime snapshot during
+/// validation. An omitted `nprobe` remains absent until the fixed manifest
+/// reveals the active flat segment's cluster count.
 ///
 /// # Examples
 ///
@@ -506,11 +507,11 @@ pub struct BatchQueryRequest {
     pub queries: Vec<QueryRequest>,
 }
 
-/// I/O-free result of expanding defaults and validating request shape.
+/// I/O-free result of expanding non-segment defaults and validating shape.
 ///
 /// This compact `Copy` value is passed through execution so downstream code
-/// cannot accidentally reinterpret absent request fields with a newer runtime
-/// configuration snapshot.
+/// cannot reinterpret absent fields with a newer runtime snapshot. Omitted
+/// nprobe remains explicit in this value until manifest-aware resolution.
 #[derive(Debug, Clone, Copy)]
 struct ValidatedQuery {
     /// Final response/page/group limit after configuration defaults.

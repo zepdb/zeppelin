@@ -4175,8 +4175,19 @@ mod tests {
 
         assert_eq!(adaptive_sketch_budget(8).max_clusters(), 8);
         assert_eq!(adaptive_sketch_budget(16).max_clusters(), 14);
+        // Scale-aware IVF defaults begin at 32 probes. These measured policy
+        // points deliberately disable sketch pruning so the coarse sketch
+        // cannot erase recall bought by the larger probe set; grouped objects
+        // still coalesce their physical GETs.
+        assert_eq!(adaptive_sketch_budget(32).max_clusters(), 32);
+        assert_eq!(adaptive_sketch_budget(48).max_clusters(), 48);
+        assert_eq!(adaptive_sketch_budget(63).max_clusters(), 63);
+        assert_eq!(adaptive_sketch_budget(126).max_clusters(), 126);
         assert_eq!(adaptive_sketch_budget(128).max_clusters(), 128);
         assert_eq!(grouped_object_cap_for_arity(4, 16), 6);
+        assert_eq!(grouped_object_cap_for_arity(4, 48), 48);
+        assert_eq!(grouped_object_cap_for_arity(4, 63), 63);
+        assert_eq!(grouped_object_cap_for_arity(4, 126), 126);
         assert_eq!(grouped_object_cap_for_arity(4, 128), 128);
     }
 

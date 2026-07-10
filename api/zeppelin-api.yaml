@@ -899,7 +899,10 @@ components:
         default_nprobe:
           type: integer
           minimum: 1
-          description: Default IVF clusters probed when a query omits nprobe.
+          description: |
+            Runtime floor for an omitted nprobe. Flat segments probe the
+            greater of this floor and 3/16 of their actual cluster count;
+            hierarchical queries use the floor directly.
         default_top_k:
           type: integer
           minimum: 1
@@ -930,7 +933,9 @@ components:
         default_nprobe:
           type: integer
           minimum: 1
-          description: Default IVF clusters probed when a query omits nprobe.
+          description: |
+            Runtime floor for an omitted nprobe. Flat segments may resolve
+            above it from their actual cluster count.
         default_top_k:
           type: integer
           minimum: 1
@@ -1819,7 +1824,9 @@ components:
             Number of IVF clusters to probe (vector search only). Values
             above the configured `indexing.max_nprobe` cap return 400 with
             the canonical error envelope; values above the segment's actual
-            cluster count behave as probing all clusters.
+            cluster count behave as probing all clusters. When omitted, a
+            flat segment uses 3/16 of its actual clusters with the runtime
+            default_nprobe as a floor; hierarchical queries use that floor.
         include_attributes:
           type: boolean
           default: true

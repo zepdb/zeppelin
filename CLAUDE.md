@@ -61,3 +61,13 @@ See `tasks/learnings.md` (local, gitignored) for the full list of bugs encounter
 8. **Enable `S3ConditionalPut::ETagMatch` in the S3 builder.** Without it, `put_opts` with `PutMode::Update` returns `NotImplemented` — CAS is silently broken. Always set `.with_conditional_put(S3ConditionalPut::ETagMatch)`.
 9. **Two-layer defense for distributed writes: fencing check + CAS.** Neither alone prevents zombie writes. Fencing has a TOCTOU gap; CAS alone doesn't detect stale tokens. Both layers are essential.
 10. **Lease release must be best-effort.** A process whose lease expired and was taken over must handle release gracefully (Ok or non-fatal error), never block or deadlock.
+11. **The pinned IVF recall gate is the quality authority.** Changes to flat
+    partitioning or omitted-probe policy must run
+    `tests/ivf_recall_gate.rs` against both `wikidpr1m` and `wikidpr2m`.
+    Offline evaluators must call the production `partition_vectors` seam, not
+    carry an independent IVF implementation.
+12. **Flat IVF defaults are scale-aware and no-spill.** Resolve nlist from a
+    3,000-row target within the default 256–4096 bounds, and resolve an
+    omitted nprobe as 3/16 of the active flat segment's clusters with a
+    runtime floor of 32. Every logical row has exactly one stored location;
+    do not add duplicate-row spill or query dedup without a new measured plan.

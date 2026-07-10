@@ -64,7 +64,7 @@ use crate::error::{Result, ZeppelinError};
 pub struct QueryKnobs {
     /// Maximum gap, in bytes, between rerank f32 ranges merged into one GET.
     pub rerank_coalesce_gap_bytes: usize,
-    /// Default IVF clusters to probe when a query omits `nprobe`.
+    /// Minimum probes for an omitted query; flat segments may scale above it.
     pub default_nprobe: usize,
     /// Default result count when a query omits `top_k`.
     pub default_top_k: usize,
@@ -95,7 +95,7 @@ pub struct QueryKnobsPatch {
     /// Preset profile that resolves to a rerank coalesce gap.
     #[serde(default)]
     pub cost_latency_profile: Option<CostLatencyProfile>,
-    /// Default IVF clusters to probe when a query omits `nprobe`.
+    /// Minimum probes for an omitted query; flat segments may scale above it.
     #[serde(default)]
     pub default_nprobe: Option<usize>,
     /// Default result count when a query omits `top_k`.
@@ -169,8 +169,9 @@ impl RuntimeQueryConfig {
     ///
     /// # Examples
     ///
-    /// With `default_nprobe = 16`, a query that omits `nprobe` initially uses
-    /// 16 until an administrator publishes a different valid default.
+    /// With `default_nprobe = 32`, a hierarchical query uses 32 as its default.
+    /// A flat query treats 32 as its floor and may scale higher after reading
+    /// the active segment's cluster count.
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
         Self {
