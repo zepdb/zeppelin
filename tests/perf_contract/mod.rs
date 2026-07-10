@@ -146,6 +146,27 @@ fn parse_flag(name: &str) -> bool {
     }
 }
 
+pub(crate) fn require_minio() {
+    match std::env::var("TEST_BACKEND") {
+        Ok(backend) if backend == "minio" => {}
+        Ok(backend) => {
+            panic!("performance contracts require TEST_BACKEND=minio, got {backend:?}")
+        }
+        Err(std::env::VarError::NotPresent) => {
+            panic!("performance contracts require TEST_BACKEND=minio")
+        }
+        Err(error) => panic!("failed to read TEST_BACKEND: {error}"),
+    }
+    match std::env::var("ZEPPELIN_MAX_CLUSTERS_PER_OBJECT") {
+        Err(std::env::VarError::NotPresent) => {}
+        Ok(value) => panic!(
+            "performance contracts require ZEPPELIN_MAX_CLUSTERS_PER_OBJECT \
+             to be unset, got {value:?}"
+        ),
+        Err(error) => panic!("failed to read ZEPPELIN_MAX_CLUSTERS_PER_OBJECT: {error}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -32,7 +32,7 @@ use super::dataset::{generate, DatasetExpectations, DatasetSpec, GenVector, Gene
 use super::depth::{depth_store, CriticalPath, DepthTracker, OpSpan, SpanKind};
 use super::injection::{inject_store, Injection};
 use super::report::RunArtifacts;
-use super::{scenarios, PerfEnv};
+use super::{require_minio, scenarios, PerfEnv};
 
 const SETUP_BATCH_SIZE: usize = 256;
 const COMPACTION_ATTEMPTS: usize = 4;
@@ -1090,24 +1090,6 @@ async fn post_prime_setup(
             "eventual setup did not publish exactly the requested tombstone fragments"
         );
         world.measure_offset = *fragments;
-    }
-}
-
-fn require_minio() {
-    match std::env::var("TEST_BACKEND") {
-        Ok(backend) if backend == "minio" => {}
-        Ok(backend) => panic!("performance contracts require TEST_BACKEND=minio, got {backend:?}"),
-        Err(std::env::VarError::NotPresent) => {
-            panic!("performance contracts require TEST_BACKEND=minio")
-        }
-        Err(error) => panic!("failed to read TEST_BACKEND: {error}"),
-    }
-    match std::env::var("ZEPPELIN_MAX_CLUSTERS_PER_OBJECT") {
-        Err(std::env::VarError::NotPresent) => {}
-        Ok(value) => panic!(
-            "performance contracts require ZEPPELIN_MAX_CLUSTERS_PER_OBJECT to be unset, got {value:?}"
-        ),
-        Err(error) => panic!("failed to read ZEPPELIN_MAX_CLUSTERS_PER_OBJECT: {error}"),
     }
 }
 

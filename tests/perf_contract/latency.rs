@@ -41,7 +41,7 @@ use super::scenario::{
     run_closed_loop_scenario, run_scenario, run_scenario_decorated, ClosedLoopOutcome,
     ScenarioOutcome, ScenarioSpec,
 };
-use super::{scenarios, PerfEnv, ALL_SCENARIOS};
+use super::{require_minio, scenarios, PerfEnv, ALL_SCENARIOS};
 
 const NORMAL_P99_Z: f64 = 2.326;
 const BYTES_PER_MB: f64 = 1_000_000.0;
@@ -799,14 +799,6 @@ fn assert_closed_loop_supported(spec: &ScenarioSpec) {
         ),
         "latency_validate closed-loop pass does not support scenario {:?}",
         spec.name
-    );
-}
-
-fn require_minio() {
-    assert_eq!(
-        std::env::var("TEST_BACKEND").as_deref(),
-        Ok("minio"),
-        "latency_validate requires TEST_BACKEND=minio"
     );
 }
 

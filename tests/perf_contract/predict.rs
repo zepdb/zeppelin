@@ -10,7 +10,7 @@ use super::ground_truth::{load_gt_a, load_gt_b, GroundTruthA, GroundTruthB};
 use super::profiles::{load_profile, selected_profiles, Profile, WhatIfProfile};
 use super::report::RunArtifacts;
 use super::scenario::{run_scenario, RepeatCounters, ScenarioOutcome};
-use super::{scenarios, PerfEnv};
+use super::{require_minio, scenarios, PerfEnv};
 
 const BYTES_PER_MB: f64 = 1_000_000.0;
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
@@ -745,17 +745,49 @@ fn relative_error(predicted: f64, actual: f64) -> f64 {
     (predicted - actual).abs() / actual
 }
 
-fn require_minio() {
-    assert_eq!(
-        std::env::var("TEST_BACKEND").as_deref(),
-        Ok("minio"),
-        "predict requires TEST_BACKEND=minio"
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "perf-contract environment selftest; run explicitly"]
+    fn predict_rejects_cluster_grouping_override() {
+        let previous_backend = std::env::var_os("TEST_BACKEND");
+        let previous_grouping = std::env::var_os("ZEPPELIN_MAX_CLUSTERS_PER_OBJECT");
+        std::env::set_var("TEST_BACKEND", "minio");
+        std::env::set_var("ZEPPELIN_MAX_CLUSTERS_PER_OBJECT", "4");
+
+        let result = std::panic::catch_unwind(require_minio);
+
+        restore_env("TEST_BACKEND", previous_backend);
+        restore_env("ZEPPELIN_MAX_CLUSTERS_PER_OBJECT", previous_grouping);
+        let panic = result.expect_err("predict accepted a cluster-grouping override");
+        let message = panic_message(&panic);
+        assert!(
+            message.contains("ZEPPELIN_MAX_CLUSTERS_PER_OBJECT") && message.contains("unset"),
+            "unexpected guard failure: {message}"
+        );
+    }
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+
+    fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                panic
+                    .downcast_ref::<&str>()
+                    .map(|value| (*value).to_string())
+            })
+            .unwrap_or_else(|| "non-string panic".to_string())
+    }
 
     #[test]
     #[ignore = "perf-contract predictor selftest; run explicitly"]
