@@ -1420,6 +1420,10 @@ impl Compactor {
                         cluster_objects,
                     )
                 }
+                Err(error @ ZeppelinError::CoarseSketch(_)) => {
+                    error!(error = %error, "bounded incremental rejected corrupt resident sketch");
+                    return Err(error);
+                }
                 Err(e) => {
                     crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
                         .with_label_values(&[namespace, "build_failed"])
@@ -1514,6 +1518,10 @@ impl Compactor {
                         Some(membership_ref),
                         cluster_objects,
                     )
+                }
+                Err(error @ ZeppelinError::CoarseSketch(_)) => {
+                    error!(error = %error, "incremental build rejected corrupt resident sketch");
+                    return Err(error);
                 }
                 Err(e) => {
                     crate::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
@@ -2312,7 +2320,7 @@ impl Compactor {
         MembershipRef,
         Vec<ClusterDataObjectRef>,
     )> {
-        use crate::index::ivf_flat::sketch::ResidentSketch;
+        use crate::index::ivf_flat::sketch::decode_resident_sketch;
 
         let centroid_state = self
             .load_incremental_centroid_state(namespace, old_segment_id, indexing_config)
@@ -2346,20 +2354,26 @@ impl Compactor {
                     "old resident sketch missing for bounded incremental stitching"
                 );
                 meter_sketch_unavailable(namespace, "old_sketch_missing");
-                return Err(ZeppelinError::Index(
-                    "bounded incremental old resident sketch is missing".into(),
-                ));
+                return Err(ZeppelinError::CoarseSketch(format!(
+                    "bounded incremental referenced resident sketch is missing: {key}"
+                )));
             }
             Err(error) => return Err(error),
         };
-        let old_sketch = ResidentSketch::from_bytes(&old_sketch_data).map_err(|error| {
+        let old_sketch = decode_resident_sketch(
+            old_sketch_data,
+            old_sketch_ref,
+            &centroid_state.centroids,
+            old_membership.entries.len(),
+        )
+        .map_err(|error| {
             warn!(
                 error = %error,
                 key = %old_sketch_ref.key,
                 "old resident sketch could not be decoded for bounded incremental stitching"
             );
             meter_sketch_unavailable(namespace, "old_sketch_decode_failed");
-            error
+            ZeppelinError::CoarseSketch(error.to_string())
         })?;
 
         let mut old_id_to_cluster: HashMap<String, usize> =
@@ -2684,6 +2698,7 @@ impl Compactor {
                 namespace,
                 new_segment_id,
                 dim,
+                &centroids,
                 old_sketch,
                 &touched,
                 &cluster_vecs,
@@ -2707,13 +2722,19 @@ impl Compactor {
             .await
             {
                 Ok(old_sketch_data) => {
-                    match crate::index::ivf_flat::sketch::ResidentSketch::from_bytes(
-                        &old_sketch_data,
-                    ) {
+                    match crate::index::ivf_flat::sketch::ResidentSketch::from_owned_bytes(
+                        old_sketch_data,
+                    )
+                    .and_then(|sketch| {
+                        sketch.validate_reference(old_sketch_ref)?;
+                        sketch.validate_centroid_shape(&centroids)?;
+                        sketch.with_centroids(&centroids)
+                    }) {
                         Ok(old_sketch) => match stitch_resident_sketch(
                             namespace,
                             new_segment_id,
                             dim,
+                            &centroids,
                             &old_sketch,
                             &touched,
                             &cluster_vecs,
@@ -2733,8 +2754,7 @@ impl Compactor {
                                 key = %old_sketch_ref.key,
                                 "old resident sketch could not be decoded for stitching"
                             );
-                            sketch_unavailable_reason = Some("old_sketch_decode_failed");
-                            None
+                            return Err(ZeppelinError::CoarseSketch(error.to_string()));
                         }
                     }
                 }
@@ -2743,8 +2763,9 @@ impl Compactor {
                         key = %key,
                         "old resident sketch missing for incremental stitching"
                     );
-                    sketch_unavailable_reason = Some("old_sketch_missing");
-                    None
+                    return Err(ZeppelinError::CoarseSketch(format!(
+                        "incremental referenced resident sketch is missing: {key}"
+                    )));
                 }
                 Err(error) => return Err(error),
             }
@@ -2752,6 +2773,10 @@ impl Compactor {
             sketch_unavailable_reason = Some("old_sketch_ref_missing");
             None
         };
+        // The stitched rows own their new immutable allocation. Release the
+        // potentially multi-gigabyte old resident artifact before assembling a
+        // second copy inside the bootstrap object.
+        drop(preloaded_old_sketch);
         let (sketch_ref, sketch_data, _resident_sketch) =
             if let Some(stitched_sketch) = stitched_sketch {
                 stitched_sketch
@@ -2775,6 +2800,7 @@ impl Compactor {
                     namespace,
                     new_segment_id,
                     dim,
+                    &centroids,
                     &cluster_vecs,
                     &cluster_attrs,
                 )?

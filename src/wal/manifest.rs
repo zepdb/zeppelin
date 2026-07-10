@@ -191,6 +191,12 @@ pub struct SketchRef {
     pub bytes_per_vector: usize,
     /// Serialized artifact size in bytes.
     pub size_bytes: u64,
+    /// Rotation seed for ZSK1 v4; legacy PQ sketches have no rotation.
+    ///
+    /// NOTE: this field must stay LAST. MessagePack encodes structs as arrays,
+    /// so the default preserves manifests written before RaBitQ sketches.
+    #[serde(default)]
+    pub rotation_seed: Option<u64>,
 }
 
 /// Location of an immutable segment bootstrap object.
@@ -2310,6 +2316,49 @@ mod tests {
             bootstrap: None,
             membership: None,
         }
+    }
+
+    /// Sketch refs written before v4 decode with no invented rotation seed.
+    #[test]
+    fn legacy_sketch_ref_decodes_without_rotation_seed() {
+        #[derive(serde::Serialize)]
+        struct LegacySketchRef {
+            key: String,
+            version: u32,
+            code_dims: usize,
+            bytes_per_vector: usize,
+            size_bytes: u64,
+        }
+
+        let bytes = rmp_serde::to_vec(&LegacySketchRef {
+            key: "ns/segments/old/coarse_sketch.bin".into(),
+            version: 3,
+            code_dims: 64,
+            bytes_per_vector: 64,
+            size_bytes: 4096,
+        })
+        .unwrap();
+        let decoded: SketchRef = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(decoded.version, 3);
+        assert_eq!(decoded.rotation_seed, None);
+    }
+
+    /// V4 sketch refs preserve their rotation seed through MessagePack.
+    #[test]
+    fn v4_sketch_ref_roundtrip_preserves_rotation_seed() {
+        let sketch_ref = SketchRef {
+            key: "ns/segments/new/coarse_sketch.bin".into(),
+            version: 4,
+            code_dims: 768,
+            bytes_per_vector: 200,
+            size_bytes: 4_200_000_000,
+            rotation_seed: Some(0x5a45_5050_454c_494e),
+        };
+        let bytes = rmp_serde::to_vec(&sketch_ref).unwrap();
+        let decoded: SketchRef = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(decoded, sketch_ref);
     }
 
     /// Verifies that each successful conditional publication advances exactly

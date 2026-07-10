@@ -2327,6 +2327,7 @@ mod tests {
             code_dims: 8,
             bytes_per_vector: 8,
             size_bytes: 512,
+            rotation_seed: None,
         });
         metadata.bootstrap = Some(BootstrapRef {
             key: bootstrap_key(NS, "seg_meta"),

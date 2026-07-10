@@ -67,6 +67,9 @@
 //! small discriminant and does not allocate or transfer ownership.
 
 pub mod pq;
+#[allow(dead_code)]
+#[cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
+pub(crate) mod rabitq;
 pub mod sq;
 
 use serde::{Deserialize, Serialize};

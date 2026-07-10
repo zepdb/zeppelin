@@ -14,6 +14,12 @@ profiling = ["dep:pprof"]
 name = "zeppelin"
 path = "src/main.rs"
 
+[[bin]]
+name = "quant_bakeoff"
+path = "src/bin/quant_bakeoff.rs"
+test = false
+bench = false
+
 [dependencies]
 # HTTP server
 axum = { version = "0.7", features = ["macros"] }

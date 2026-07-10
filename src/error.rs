@@ -236,6 +236,14 @@ pub enum ZeppelinError {
     #[error("index error: {0}")]
     Index(String),
 
+    /// A persisted resident coarse-sketch artifact is corrupt or inconsistent.
+    #[error("coarse sketch error: {0}")]
+    CoarseSketch(String),
+
+    /// A RaBitQ rotation, encoding, or scoring operation failed.
+    #[error("RaBitQ error: {0}")]
+    Rabitq(String),
+
     /// A segment membership artifact operation failed.
     #[error("membership artifact error: {0}")]
     Membership(String),
@@ -374,6 +382,12 @@ impl From<Box<bincode::ErrorKind>> for ZeppelinError {
     }
 }
 
+impl From<crate::index::quantization::rabitq::RabitqError> for ZeppelinError {
+    fn from(error: crate::index::quantization::rabitq::RabitqError) -> Self {
+        Self::Rabitq(error.to_string())
+    }
+}
+
 /// The standard return shape for fallible Zeppelin operations.
 ///
 /// `Ok(T)` carries a successful value and `Err(ZeppelinError)` carries one
@@ -507,6 +521,8 @@ impl ZeppelinError {
             ZeppelinError::NamespaceDeleting { .. } => "NAMESPACE_DELETING",
             ZeppelinError::NamespaceDeleteIncomplete { .. } => "INTERNAL_ERROR",
             ZeppelinError::Index(_) => "INTERNAL_ERROR",
+            ZeppelinError::CoarseSketch(_) => "INTERNAL_ERROR",
+            ZeppelinError::Rabitq(_) => "INTERNAL_ERROR",
             ZeppelinError::Membership(_) => "INTERNAL_ERROR",
             ZeppelinError::KMeansConvergence { .. } => "INTERNAL_ERROR",
             ZeppelinError::DimensionMismatch { .. } => "DIMENSION_MISMATCH",
@@ -625,6 +641,8 @@ impl ZeppelinError {
             | ZeppelinError::Bincode(_)
             | ZeppelinError::Serialization(_)
             | ZeppelinError::Index(_)
+            | ZeppelinError::CoarseSketch(_)
+            | ZeppelinError::Rabitq(_)
             | ZeppelinError::Membership(_)
             | ZeppelinError::KMeansConvergence { .. }
             | ZeppelinError::Config(_)

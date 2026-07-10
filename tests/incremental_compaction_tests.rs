@@ -24,21 +24,25 @@ use std::ops::Range;
 
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
+use zeppelin::error::ZeppelinError;
 use zeppelin::index::ivf_flat::build::{attrs_key, build_ivf_flat};
 use zeppelin::index::ivf_flat::membership::{deserialize_membership, MembershipData};
 use zeppelin::index::quantization::sq::{serialize_sq_cluster, SqCalibration};
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, VectorEntry};
-use zeppelin::wal::manifest::{ClusterDataObjectRef, Manifest, MembershipRef, SegmentRef};
+use zeppelin::wal::manifest::{
+    ClusterDataObjectRef, Manifest, MembershipRef, SegmentRef, SketchRef,
+};
 use zeppelin::wal::{WalReader, WalWriter};
 
 const DIM: usize = 16;
 const N_CLUSTERS: usize = 6;
 const BASELINE_CLUSTERS: usize = 16;
 const BASELINE_VECTORS_PER_CLUSTER: usize = 4;
-const SKETCH_HEADER_LEN: usize = 28;
-const SKETCH_K: usize = 256;
+const SKETCH_V4_HEADER_LEN: usize = 44;
+const SKETCH_V4_ROTATION_SCHEME: u32 = 1;
+const SKETCH_V4_BIT_WIDTH: u32 = 2;
 
 /// Compactor whose config reuses centroids (high retrain threshold) and never
 /// quantizes, so the incremental IVF-Flat carry-over path is exercised.
@@ -288,68 +292,205 @@ fn read_f32(data: &[u8], offset: usize) -> f32 {
 #[derive(Clone, Debug)]
 struct RawSketchLayout {
     dim: usize,
-    subquantizers: usize,
+    code_dims: usize,
     cluster_count: usize,
     vector_count: usize,
-    codebook_range: Range<usize>,
+    rotation_seed: u64,
+    rotation_scheme: u32,
+    bit_width: u32,
     attr_range: Range<usize>,
     counts: Vec<usize>,
-    codes_range: Range<usize>,
-    packed_code_bytes: usize,
+    rows_range: Range<usize>,
+    row_bytes: usize,
 }
 
 fn raw_sketch_layout(data: &[u8]) -> RawSketchLayout {
     assert!(data.starts_with(b"ZSK1"), "sketch magic must match");
-    assert_eq!(read_u32(data, 4), 3, "tests cover the v3 sketch format");
+    assert_eq!(read_u32(data, 4), 4, "tests cover the v4 sketch format");
     let dim = read_u32(data, 8) as usize;
-    let subquantizers = read_u32(data, 12) as usize;
+    let code_dims = read_u32(data, 12) as usize;
     let cluster_count = read_u32(data, 16) as usize;
     let vector_count = read_u64(data, 20) as usize;
-    let codebook_len = dim * SKETCH_K * 4;
-    let codebook_start = SKETCH_HEADER_LEN;
-    let attr_start = codebook_start + codebook_len;
+    let rotation_seed = read_u64(data, 28);
+    let rotation_scheme = read_u32(data, 36);
+    let bit_width = read_u32(data, 40);
+    assert!(code_dims >= dim, "v4 code_dims must cover the logical dim");
+    assert_eq!(
+        code_dims % 256,
+        0,
+        "v4 code_dims must use 256-dimension blocks"
+    );
+    assert_eq!(
+        rotation_scheme, SKETCH_V4_ROTATION_SCHEME,
+        "v4 rotation scheme must remain pinned"
+    );
+    assert_eq!(
+        bit_width, SKETCH_V4_BIT_WIDTH,
+        "v4 bit width must remain pinned"
+    );
+    let attr_start = SKETCH_V4_HEADER_LEN;
     let attr_len = cluster_count.div_ceil(8);
     let counts_start = attr_start + attr_len;
     let mut counts = Vec::with_capacity(cluster_count);
     for cluster_idx in 0..cluster_count {
         counts.push(read_u32(data, counts_start + cluster_idx * 4) as usize);
     }
-    let codes_start = counts_start + cluster_count * 4;
-    let packed_code_bytes = subquantizers;
-    let codes_len = vector_count * packed_code_bytes;
+    let rows_start = counts_start + cluster_count * 4;
+    let row_bytes = code_dims / 8 * bit_width as usize + 2 * std::mem::size_of::<f32>();
+    let rows_len = vector_count * row_bytes;
     assert_eq!(
         data.len(),
-        codes_start + codes_len,
+        rows_start + rows_len,
         "sketch length must match header/counts"
     );
     RawSketchLayout {
         dim,
-        subquantizers,
+        code_dims,
         cluster_count,
         vector_count,
-        codebook_range: codebook_start..attr_start,
+        rotation_seed,
+        rotation_scheme,
+        bit_width,
         attr_range: attr_start..attr_start + attr_len,
         counts,
-        codes_range: codes_start..codes_start + codes_len,
-        packed_code_bytes,
+        rows_range: rows_start..rows_start + rows_len,
+        row_bytes,
     }
 }
 
-fn raw_sketch_code_section<'a>(
+fn raw_sketch_row_section<'a>(
     data: &'a [u8],
     layout: &RawSketchLayout,
     cluster_idx: usize,
 ) -> &'a [u8] {
     let row_start: usize = layout.counts[..cluster_idx].iter().sum();
     let row_end = row_start + layout.counts[cluster_idx];
-    let start = layout.codes_range.start + row_start * layout.packed_code_bytes;
-    let end = layout.codes_range.start + row_end * layout.packed_code_bytes;
+    let start = layout.rows_range.start + row_start * layout.row_bytes;
+    let end = layout.rows_range.start + row_end * layout.row_bytes;
     &data[start..end]
 }
 
 fn raw_attr_bit(data: &[u8], layout: &RawSketchLayout, cluster_idx: usize) -> bool {
     let bitset = &data[layout.attr_range.clone()];
     bitset[cluster_idx / 8] & (1 << (cluster_idx % 8)) != 0
+}
+
+/// Builds a frozen, structurally valid ZSK1 v3 object for migration coverage.
+fn frozen_v3_sketch(dim: usize, cluster_counts: &[usize]) -> Bytes {
+    let subquantizers = dim;
+    let vector_count: usize = cluster_counts.iter().sum();
+    let mut out = Vec::new();
+    out.extend_from_slice(b"ZSK1");
+    out.extend_from_slice(&3u32.to_le_bytes());
+    out.extend_from_slice(&(dim as u32).to_le_bytes());
+    out.extend_from_slice(&(subquantizers as u32).to_le_bytes());
+    out.extend_from_slice(&(cluster_counts.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(vector_count as u64).to_le_bytes());
+    out.resize(out.len() + dim * 256 * std::mem::size_of::<f32>(), 0);
+    out.resize(out.len() + cluster_counts.len().div_ceil(8), 0);
+    for &count in cluster_counts {
+        out.extend_from_slice(&(count as u32).to_le_bytes());
+    }
+    out.resize(out.len() + vector_count * subquantizers, 0);
+    Bytes::from(out)
+}
+
+/// Replaces only the active segment's sketch/bootstrap metadata with a frozen
+/// v3 sketch while keeping its authoritative centroids and membership intact.
+async fn install_frozen_v3_sketch(store: &ZeppelinStore, ns: &str) -> SketchRef {
+    let segment = active_segment_ref(store, ns).await;
+    let membership_ref = segment
+        .membership
+        .as_ref()
+        .expect("modern fixture must have membership");
+    let (membership, _) = decoded_membership(store, membership_ref).await;
+    let mut cluster_counts = vec![0usize; segment.cluster_count];
+    for (_, cluster_idx) in membership.entries {
+        cluster_counts[cluster_idx as usize] += 1;
+    }
+
+    let bytes = frozen_v3_sketch(DIM, &cluster_counts);
+    let key = format!("{ns}/segments/{}/coarse_sketch_v3_fixture.bin", segment.id);
+    store.put(&key, bytes.clone()).await.unwrap();
+    let sketch_ref = SketchRef {
+        key,
+        version: 3,
+        code_dims: DIM,
+        bytes_per_vector: DIM,
+        size_bytes: bytes.len() as u64,
+        rotation_seed: None,
+    };
+
+    let mut manifest = Manifest::read(store, ns).await.unwrap().unwrap();
+    let active = manifest
+        .segments
+        .iter_mut()
+        .find(|candidate| candidate.id == segment.id)
+        .unwrap();
+    active.sketch = Some(sketch_ref.clone());
+    active.bootstrap = None;
+    manifest.write(store, ns).await.unwrap();
+    sketch_ref
+}
+
+/// Publishes a new immutable copy of the active v4 sketch with an unsupported
+/// bit-width header, then points the active manifest at that corrupt object.
+async fn install_v4_sketch_with_unsupported_width(store: &ZeppelinStore, ns: &str) -> SegmentRef {
+    let segment = active_segment_ref(store, ns).await;
+    let old_sketch_ref = segment
+        .sketch
+        .as_ref()
+        .expect("modern fixture must have a v4 sketch");
+    let old_bytes = store.get(&old_sketch_ref.key).await.unwrap();
+    assert_eq!(read_u32(&old_bytes, 4), 4);
+    assert_eq!(read_u32(&old_bytes, 40), SKETCH_V4_BIT_WIDTH);
+
+    let mut corrupt = old_bytes.to_vec();
+    corrupt[40..44].copy_from_slice(&1u32.to_le_bytes());
+    let corrupt = Bytes::from(corrupt);
+    let key = format!(
+        "{ns}/segments/{}/coarse_sketch_v4_unsupported_width.bin",
+        segment.id
+    );
+    store.put(&key, corrupt.clone()).await.unwrap();
+
+    let mut corrupt_ref = old_sketch_ref.clone();
+    corrupt_ref.key = key;
+    corrupt_ref.size_bytes = corrupt.len() as u64;
+    let mut manifest = Manifest::read(store, ns).await.unwrap().unwrap();
+    let active = manifest
+        .segments
+        .iter_mut()
+        .find(|candidate| candidate.id == segment.id)
+        .unwrap();
+    active.sketch = Some(corrupt_ref);
+    // Avoid a stale embedded v4 copy masking the manifest-selected corrupt
+    // sketch; legacy separate metadata objects remain authoritative here.
+    active.bootstrap = None;
+    manifest.write(store, ns).await.unwrap();
+    segment
+}
+
+/// Makes the manifest's v4 rotation seed disagree with the immutable object.
+async fn install_v4_manifest_seed_mismatch(store: &ZeppelinStore, ns: &str) {
+    let segment = active_segment_ref(store, ns).await;
+    let mut manifest = Manifest::read(store, ns).await.unwrap().unwrap();
+    let active = manifest
+        .segments
+        .iter_mut()
+        .find(|candidate| candidate.id == segment.id)
+        .unwrap();
+    let sketch_ref = active
+        .sketch
+        .as_mut()
+        .expect("modern fixture must have a v4 sketch");
+    sketch_ref.rotation_seed = Some(
+        sketch_ref
+            .rotation_seed
+            .expect("v4 sketch ref must carry a rotation seed")
+            ^ 1,
+    );
+    manifest.write(store, ns).await.unwrap();
 }
 
 fn decode_cluster_vectors(data: &[u8]) -> Vec<(String, Vec<f32>)> {
@@ -408,115 +549,6 @@ async fn persisted_cluster_vectors_and_attrs(
         cluster_attrs.push(attrs);
     }
     (cluster_vecs, cluster_attrs)
-}
-
-fn chunk_range(dim: usize, chunks: usize, chunk: usize) -> (usize, usize) {
-    let start = chunk * dim / chunks;
-    let end = (chunk + 1) * dim / chunks;
-    (start, end)
-}
-
-fn codebook_offset(
-    dim: usize,
-    subquantizers: usize,
-    codebook_size: usize,
-    subq: usize,
-    code: usize,
-) -> usize {
-    let mut offset = 0usize;
-    for prev in 0..subq {
-        let (start, end) = chunk_range(dim, subquantizers, prev);
-        offset += codebook_size * (end - start);
-    }
-    let (start, end) = chunk_range(dim, subquantizers, subq);
-    offset + code * (end - start)
-}
-
-fn sq_l2(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&left, &right)| {
-            let diff = left - right;
-            diff * diff
-        })
-        .sum()
-}
-
-fn encode_with_old_codebook(
-    old_sketch: &[u8],
-    layout: &RawSketchLayout,
-    vector: &[f32],
-) -> Vec<u8> {
-    assert_eq!(vector.len(), layout.dim);
-    let mut packed = vec![0u8; layout.packed_code_bytes];
-    let codebook = &old_sketch[layout.codebook_range.clone()];
-    for (subq, packed_slot) in packed.iter_mut().enumerate().take(layout.subquantizers) {
-        let (start, end) = chunk_range(layout.dim, layout.subquantizers, subq);
-        let mut best_code = 0u8;
-        let mut best_dist = f32::INFINITY;
-        for code in 0..SKETCH_K {
-            let centroid_float_offset =
-                codebook_offset(layout.dim, layout.subquantizers, SKETCH_K, subq, code);
-            let centroid_byte_offset = centroid_float_offset * 4;
-            let mut centroid = Vec::with_capacity(end - start);
-            for dim_idx in 0..(end - start) {
-                centroid.push(read_f32(codebook, centroid_byte_offset + dim_idx * 4));
-            }
-            let dist = sq_l2(&vector[start..end], &centroid);
-            if dist < best_dist {
-                best_dist = dist;
-                best_code = code as u8;
-            }
-        }
-        *packed_slot = best_code;
-    }
-    packed
-}
-
-fn full_encode_oracle_from_old_codebook(
-    old_sketch: &[u8],
-    cluster_vecs: &[Vec<Vec<f32>>],
-    cluster_attrs: &[Vec<Option<HashMap<String, AttributeValue>>>],
-) -> Bytes {
-    let layout = raw_sketch_layout(old_sketch);
-    assert_eq!(cluster_vecs.len(), layout.cluster_count);
-    assert_eq!(cluster_attrs.len(), layout.cluster_count);
-    let vector_count: usize = cluster_vecs.iter().map(Vec::len).sum();
-
-    let mut attr_bits = vec![0u8; layout.cluster_count.div_ceil(8)];
-    for (cluster_idx, attrs) in cluster_attrs.iter().enumerate() {
-        if attrs.iter().any(Option::is_some) {
-            attr_bits[cluster_idx / 8] |= 1 << (cluster_idx % 8);
-        }
-    }
-
-    let mut codes = Vec::with_capacity(vector_count * layout.packed_code_bytes);
-    for cluster in cluster_vecs {
-        for vector in cluster {
-            codes.extend_from_slice(&encode_with_old_codebook(old_sketch, &layout, vector));
-        }
-    }
-
-    let mut out = Vec::with_capacity(
-        SKETCH_HEADER_LEN
-            + layout.codebook_range.len()
-            + attr_bits.len()
-            + layout.cluster_count * 4
-            + codes.len(),
-    );
-    out.extend_from_slice(b"ZSK1");
-    out.extend_from_slice(&3u32.to_le_bytes());
-    out.extend_from_slice(&(layout.dim as u32).to_le_bytes());
-    out.extend_from_slice(&(layout.subquantizers as u32).to_le_bytes());
-    out.extend_from_slice(&(layout.cluster_count as u32).to_le_bytes());
-    out.extend_from_slice(&(vector_count as u64).to_le_bytes());
-    out.extend_from_slice(&old_sketch[layout.codebook_range.clone()]);
-    out.extend_from_slice(&attr_bits);
-    for cluster in cluster_vecs {
-        out.extend_from_slice(&(cluster.len() as u32).to_le_bytes());
-    }
-    out.extend_from_slice(&codes);
-    Bytes::from(out)
 }
 
 /// Build an initial IVF-Flat segment from well-separated clusters and register
@@ -1167,9 +1199,9 @@ async fn test_incremental_compaction_writes_segment_global_membership_artifact()
 }
 
 #[tokio::test]
-async fn test_incremental_stitched_sketch_matches_old_codebook_reencode_oracle() {
+async fn test_incremental_stitched_v4_sketch_preserves_full_carried_rows() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-sketch-stitch-oracle");
+    let ns = harness.key("incr-sketch-v4-full-rows");
     let store = &harness.store;
 
     let (old_seg, seed_vecs) = seed_modern_segment(store, &ns).await;
@@ -1207,6 +1239,7 @@ async fn test_incremental_stitched_sketch_matches_old_codebook_reencode_oracle()
             },
         })
         .collect();
+    let added_ids: Vec<String> = new_vecs.iter().map(|vector| vector.id.clone()).collect();
     WalWriter::new(store.clone())
         .append(&ns, new_vecs, vec![])
         .await
@@ -1237,20 +1270,28 @@ async fn test_incremental_stitched_sketch_matches_old_codebook_reencode_oracle()
 
     let (cluster_vecs, cluster_attrs) =
         persisted_cluster_vectors_and_attrs(store, &ns, new_seg_ref).await;
-    let oracle = full_encode_oracle_from_old_codebook(&old_sketch, &cluster_vecs, &cluster_attrs);
-    assert!(
-        new_sketch == oracle,
-        "stitched sketch must equal a full re-encode of every cluster against \
-         the old codebook: new_len={}, oracle_len={}",
-        new_sketch.len(),
-        oracle.len()
-    );
-
     let new_layout = raw_sketch_layout(&new_sketch);
+    assert_eq!(new_layout.dim, old_layout.dim);
+    assert_eq!(new_layout.cluster_count, new_seg_ref.cluster_count);
     assert_eq!(
-        &new_sketch[new_layout.codebook_range.clone()],
-        &old_sketch[old_layout.codebook_range.clone()],
-        "incremental stitching must reuse old codebook bytes verbatim"
+        new_layout.code_dims, old_layout.code_dims,
+        "incremental stitching must keep the padded rotation dimension"
+    );
+    assert_eq!(
+        new_layout.rotation_seed, old_layout.rotation_seed,
+        "incremental stitching must keep the persisted rotation seed"
+    );
+    assert_eq!(
+        new_layout.rotation_scheme, old_layout.rotation_scheme,
+        "incremental stitching must keep the rotation scheme"
+    );
+    assert_eq!(
+        new_layout.bit_width, old_layout.bit_width,
+        "incremental stitching must keep the two-bit row format"
+    );
+    assert_eq!(
+        new_layout.row_bytes, old_layout.row_bytes,
+        "incremental stitching must keep the full row stride"
     );
     assert_eq!(
         new_layout.vector_count,
@@ -1262,6 +1303,13 @@ async fn test_incremental_stitched_sketch_matches_old_codebook_reencode_oracle()
         cluster_vecs.iter().map(Vec::len).collect::<Vec<_>>(),
         "sketch counts must match the persisted cluster vectors"
     );
+    for (cluster_idx, attrs) in cluster_attrs.iter().enumerate() {
+        assert_eq!(
+            raw_attr_bit(&new_sketch, &new_layout, cluster_idx),
+            attrs.iter().any(Option::is_some),
+            "cluster {cluster_idx} attr bit must match persisted row attributes"
+        );
+    }
 
     let membership_ref = new_seg_ref
         .membership
@@ -1277,16 +1325,20 @@ async fn test_incremental_stitched_sketch_matches_old_codebook_reencode_oracle()
         "sketch counts must match membership cluster_ids"
     );
 
-    let mut carried_with_codes = None;
+    let mut carried_with_rows = None;
+    let mut rewritten_with_more_rows = None;
     for cluster_idx in 0..new_seg_ref.cluster_count {
         let is_carried = new_seg_ref.cluster_owner(cluster_idx) != new_seg;
         if !is_carried {
+            if new_layout.counts[cluster_idx] > old_layout.counts[cluster_idx] {
+                rewritten_with_more_rows = Some(cluster_idx);
+            }
             continue;
         }
         assert_eq!(
-            raw_sketch_code_section(&new_sketch, &new_layout, cluster_idx),
-            raw_sketch_code_section(&old_sketch, &old_layout, cluster_idx),
-            "carried cluster {cluster_idx} must copy old sketch codes byte-for-byte"
+            raw_sketch_row_section(&new_sketch, &new_layout, cluster_idx),
+            raw_sketch_row_section(&old_sketch, &old_layout, cluster_idx),
+            "carried cluster {cluster_idx} must copy both bit planes and both correction factors byte-for-byte"
         );
         assert_eq!(
             new_layout.counts[cluster_idx], old_layout.counts[cluster_idx],
@@ -1298,43 +1350,219 @@ async fn test_incremental_stitched_sketch_matches_old_codebook_reencode_oracle()
             "carried cluster {cluster_idx} must keep its old attr bit"
         );
         if new_layout.counts[cluster_idx] > 0 {
-            carried_with_codes = Some(cluster_idx);
+            carried_with_rows = Some(cluster_idx);
         }
     }
-    let carried_idx = carried_with_codes.expect("fixture must carry a non-empty cluster");
-
-    let carried_row_start: usize = new_layout.counts[..carried_idx].iter().sum();
-    let carried_byte_start =
-        new_layout.codes_range.start + carried_row_start * new_layout.packed_code_bytes;
-    let mut corrupted_codes = new_sketch.to_vec();
-    corrupted_codes[carried_byte_start] ^= 0x01;
-    assert_ne!(
-        Bytes::from(corrupted_codes),
-        oracle,
-        "oracle must detect a one-byte perturbation in a carried code section"
+    carried_with_rows.expect("fixture must carry a non-empty cluster");
+    let rewritten_idx =
+        rewritten_with_more_rows.expect("fixture must append rows to one rewritten cluster");
+    assert_eq!(
+        raw_sketch_row_section(&new_sketch, &new_layout, rewritten_idx).len(),
+        new_layout.counts[rewritten_idx] * new_layout.row_bytes,
+        "rewritten cluster must contain complete two-plane rows with both factors"
     );
 
-    let mut corrupted_codebook = new_sketch.to_vec();
-    corrupted_codebook[new_layout.codebook_range.start] ^= 0x01;
-    assert_ne!(
-        Bytes::from(corrupted_codebook),
-        oracle,
-        "oracle must detect a one-byte perturbation in the reused codebook"
+    let query_ids = strong_query_ids(store, &ns, &anchor, N_CLUSTERS * 25).await;
+    for added_id in added_ids {
+        assert!(
+            query_ids.contains(&added_id),
+            "rewritten v4 rows must keep added vector {added_id} queryable"
+        );
+    }
+
+    harness.cleanup().await;
+}
+
+/// A legacy v3 sketch is readable input, but a new compaction must publish v4.
+#[tokio::test]
+async fn test_incremental_compaction_rebuilds_v3_sketch_as_v4() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("incr-sketch-v3-to-v4");
+    let store = &harness.store;
+
+    let (_old_seg, seed_vecs) = seed_modern_segment(store, &ns).await;
+    let old_sketch_ref = install_frozen_v3_sketch(store, &ns).await;
+    assert_eq!(old_sketch_ref.version, 3);
+    assert_eq!(old_sketch_ref.rotation_seed, None);
+
+    let seed_vector = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_0_vec_0")
+        .unwrap();
+    let anchor = seed_vector.values.clone();
+    let v3_query_ids = strong_query_ids(store, &ns, &anchor, N_CLUSTERS * 25).await;
+    assert!(
+        v3_query_ids.contains(&seed_vector.id),
+        "valid v3 sketch must load and serve a known seed vector before migration"
+    );
+    let added_id = "v3_migration_added".to_string();
+    WalWriter::new(store.clone())
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: added_id.clone(),
+                values: anchor.iter().map(|value| value + 0.001).collect(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    let result = incremental_compactor(store).compact(&ns).await.unwrap();
+    let new_seg = result
+        .segment_id
+        .expect("v3 migration compaction must produce a segment");
+    let new_segment = active_segment_ref(store, &ns).await;
+    assert_eq!(new_segment.id, new_seg);
+    let new_sketch_ref = new_segment
+        .sketch
+        .as_ref()
+        .expect("v3 migration must publish a new sketch");
+    assert_eq!(new_sketch_ref.version, 4);
+    assert!(new_sketch_ref.rotation_seed.is_some());
+    let new_sketch = sketch_bytes(store, &new_segment).await;
+    let new_layout = raw_sketch_layout(&new_sketch);
+    assert_eq!(new_layout.vector_count, new_segment.vector_count);
+
+    let query_ids = strong_query_ids(store, &ns, &anchor, N_CLUSTERS * 25).await;
+    assert!(
+        query_ids.contains(&added_id),
+        "v3-to-v4 rebuild must keep the new vector queryable"
+    );
+
+    harness.cleanup().await;
+}
+
+/// Corrupt active v4 format metadata must fail query load and compaction loud.
+#[tokio::test]
+async fn test_corrupt_v4_width_does_not_scan_or_publish_replacement_segment() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("corrupt-v4-width-fails-loud");
+    let store = &harness.store;
+
+    let (_seed_segment, seed_vecs) = seed_modern_segment(store, &ns).await;
+    let old_active = install_v4_sketch_with_unsupported_width(store, &ns).await;
+    let anchor = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_0_vec_0")
+        .unwrap()
+        .values
+        .clone();
+
+    let reader = WalReader::new(store.clone());
+    let query_result = execute_query(QueryParams {
+        store,
+        wal_reader: &reader,
+        namespace: &ns,
+        query: &anchor,
+        top_k: 10,
+        nprobe: N_CLUSTERS,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        cache: None,
+        manifest_cache: None,
+        include_attributes: false,
+    })
+    .await;
+    let query_error = match query_result {
+        Ok(_) => panic!("corrupt v4 query load must not fall through to scanning"),
+        Err(error) => error,
+    };
+    assert!(
+        query_error.to_string().contains("bit width"),
+        "query must report the corrupt v4 width: {query_error}"
+    );
+
+    WalWriter::new(store.clone())
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "corrupt_v4_incremental_added".to_string(),
+                values: anchor.iter().map(|value| value + 0.001).collect(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+    let compaction_result = incremental_compactor(store).compact(&ns).await;
+    let compaction_error = match compaction_result {
+        Ok(_) => panic!("corrupt active v4 must not be replaced through a rebuild fallback"),
+        Err(error) => error,
+    };
+    assert!(
+        compaction_error.to_string().contains("bit width"),
+        "compaction must report the corrupt v4 width: {compaction_error}"
+    );
+
+    let active_after_failure = active_segment_ref(store, &ns).await;
+    assert_eq!(
+        active_after_failure.id, old_active.id,
+        "failed compaction must not publish a replacement active segment"
+    );
+
+    harness.cleanup().await;
+}
+
+/// A v4 manifest seed that disagrees with its object must stop query loading.
+#[tokio::test]
+async fn test_v4_manifest_seed_mismatch_fails_query_instead_of_scanning() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("v4-seed-ref-mismatch-fails-query");
+    let store = &harness.store;
+
+    let (_seed_segment, seed_vecs) = seed_modern_segment(store, &ns).await;
+    install_v4_manifest_seed_mismatch(store, &ns).await;
+    let anchor = seed_vecs
+        .iter()
+        .find(|vector| vector.id == "cluster_0_vec_0")
+        .unwrap()
+        .values
+        .clone();
+    let reader = WalReader::new(store.clone());
+    let query_result = execute_query(QueryParams {
+        store,
+        wal_reader: &reader,
+        namespace: &ns,
+        query: &anchor,
+        top_k: 10,
+        nprobe: N_CLUSTERS,
+        filter: None,
+        consistency: ConsistencyLevel::Strong,
+        distance_metric: DistanceMetric::Euclidean,
+        oversample_factor: 1,
+        rerank_coalesce_gap_bytes: zeppelin::config::DEFAULT_RERANK_COALESCE_GAP_BYTES,
+        cache: None,
+        manifest_cache: None,
+        include_attributes: false,
+    })
+    .await;
+    let error = match query_result {
+        Ok(_) => panic!("v4 seed/reference mismatch must not fall through to scanning"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("reference mismatch"),
+        "query must report the v4 seed/reference mismatch: {error}"
     );
 
     harness.cleanup().await;
 }
 
 #[tokio::test]
-async fn test_incremental_sketch_fallback_when_old_sketch_missing() {
+async fn test_incremental_compaction_fails_when_referenced_sketch_is_missing() {
     let harness = TestHarness::new().await;
-    let ns = harness.key("incr-sketch-missing-fallback");
+    let ns = harness.key("incr-sketch-missing-fails-loud");
     let store = &harness.store;
 
-    let (old_seg, seed_vecs) = seed_modern_segment(store, &ns).await;
-    let old_seg_ref = active_segment_ref(store, &ns).await;
-    assert_eq!(old_seg_ref.id, old_seg);
-    let old_sketch_ref = old_seg_ref.sketch.as_ref().unwrap().clone();
+    let (old_segment_id, seed_vecs) = seed_modern_segment(store, &ns).await;
+    let old_active = active_segment_ref(store, &ns).await;
+    assert_eq!(old_active.id, old_segment_id);
+    let old_sketch_ref = old_active.sketch.as_ref().unwrap().clone();
     store.delete(&old_sketch_ref.key).await.unwrap();
 
     let anchor = seed_vecs
@@ -1343,50 +1571,43 @@ async fn test_incremental_sketch_fallback_when_old_sketch_missing() {
         .unwrap()
         .values
         .clone();
-    let added: Vec<VectorEntry> = (0..3)
-        .map(|i| VectorEntry {
-            id: format!("fallback_added_{i}"),
-            values: anchor.iter().map(|x| x + 0.001).collect(),
-            attributes: None,
-        })
-        .collect();
     WalWriter::new(store.clone())
-        .append(&ns, added.clone(), vec![])
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "missing_sketch_incremental_added".to_string(),
+                values: anchor.iter().map(|value| value + 0.001).collect(),
+                attributes: None,
+            }],
+            vec![],
+        )
         .await
         .unwrap();
 
-    let counter = zeppelin::metrics::COMPACTION_INCREMENTAL_FALLBACK_TOTAL
-        .with_label_values(&[ns.as_str(), "sketch_stitch_unavailable"]);
-    let before = counter.get();
-    let result = incremental_compactor(store).compact(&ns).await.unwrap();
-    let new_seg = result
-        .segment_id
-        .expect("fallback incremental compaction must produce a segment");
-    assert_eq!(
-        counter.get(),
-        before + 1,
-        "missing old sketch must increment the stitch-unavailable fallback counter"
-    );
-
-    let new_seg_ref = active_segment_ref(store, &ns).await;
-    assert_eq!(new_seg_ref.id, new_seg);
-    assert!(
-        new_seg_ref.sketch.is_some(),
-        "fallback path must still build a full resident sketch"
-    );
-    assert!(
-        new_seg_ref.bootstrap.is_some(),
-        "fallback sketch bytes must still be embedded in bootstrap"
-    );
-
-    let ids = strong_query_ids(store, &ns, &anchor, N_CLUSTERS * 25).await;
-    for vector in added {
-        assert!(
-            ids.contains(&vector.id),
-            "fallback-built sketch segment must keep added vector {} queryable",
-            vector.id
-        );
+    let result = incremental_compactor(store).compact(&ns).await;
+    let error = match result {
+        Ok(_) => panic!("manifest-referenced missing sketch must not trigger a rebuild fallback"),
+        Err(error) => error,
+    };
+    match error {
+        ZeppelinError::CoarseSketch(message) => {
+            assert!(
+                message.contains("referenced resident sketch is missing"),
+                "missing sketch diagnostic must identify the broken reference: {message}"
+            );
+            assert!(
+                message.contains(&old_sketch_ref.key),
+                "missing sketch diagnostic must name the immutable object key: {message}"
+            );
+        }
+        other => panic!("missing referenced sketch must use CoarseSketch semantics, got {other}"),
     }
+
+    let active_after_failure = active_segment_ref(store, &ns).await;
+    assert_eq!(
+        active_after_failure.id, old_active.id,
+        "failed compaction must not publish a replacement active segment"
+    );
 
     harness.cleanup().await;
 }
@@ -1457,9 +1678,9 @@ async fn test_incremental_stitched_sketch_multicycle_carries_sections_stably() {
             }
             carried += 1;
             assert_eq!(
-                raw_sketch_code_section(&new_sketch, &new_layout, cluster_idx),
-                raw_sketch_code_section(&previous_sketch, &old_layout, cluster_idx),
-                "cycle {cycle_no} carried cluster {cluster_idx} must keep sketch codes stable"
+                raw_sketch_row_section(&new_sketch, &new_layout, cluster_idx),
+                raw_sketch_row_section(&previous_sketch, &old_layout, cluster_idx),
+                "cycle {cycle_no} carried cluster {cluster_idx} must keep both bit planes and both correction factors stable"
             );
             assert_eq!(
                 new_layout.counts[cluster_idx], old_layout.counts[cluster_idx],

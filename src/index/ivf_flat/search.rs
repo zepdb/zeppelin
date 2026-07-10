@@ -4083,6 +4083,45 @@ mod tests {
         }
     }
 
+    /// Builds a production-v4 sketch over one deterministic row per cluster.
+    ///
+    /// When `attach_centroids` is false, the returned sketch is decoded from
+    /// its immutable bytes but intentionally not prepared for query scoring.
+    /// That fail-loud state lets bypass tests prove that ADC was never entered.
+    fn make_v4_test_index(cluster_count: usize, attach_centroids: bool) -> IvfFlatIndex {
+        assert!(cluster_count > 0);
+        let centroids: Vec<Vec<f32>> = (0..cluster_count)
+            .map(|cluster_idx| vec![cluster_idx as f32, 0.0])
+            .collect();
+        let cluster_vecs: Vec<Vec<Vec<f32>>> = centroids
+            .iter()
+            .map(|centroid| vec![centroid.clone()])
+            .collect();
+        let cluster_attrs = vec![vec![None]; cluster_count];
+        let (sketch_ref, bytes, attached_sketch) =
+            crate::index::ivf_flat::sketch::build_resident_sketch(
+                "test_ns",
+                "seg_001",
+                2,
+                &centroids,
+                &cluster_vecs,
+                &cluster_attrs,
+            )
+            .unwrap();
+        let resident_sketch = if attach_centroids {
+            attached_sketch
+        } else {
+            crate::index::ivf_flat::sketch::ResidentSketch::from_bytes(&bytes).unwrap()
+        };
+
+        let mut index = make_index();
+        index.centroids = std::sync::Arc::new(centroids);
+        index.num_vectors = cluster_count;
+        index.resident_sketch = Some(std::sync::Arc::new(resident_sketch));
+        index.sketch_ref = Some(sketch_ref);
+        index
+    }
+
     #[test]
     /// Protects the public query-width validation and structured error payload.
     ///
@@ -4152,6 +4191,84 @@ mod tests {
             ))
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    /// A metadata filter preserves the complete centroid probe set for v4.
+    ///
+    /// The fixture deliberately leaves the resident sketch unattached from its
+    /// authoritative centroids. Any attempted sketch scoring would therefore
+    /// fail loudly, so success also proves the filtered path bypasses ADC.
+    fn v4_filtered_query_preserves_every_probe_without_scoring() {
+        let index = make_v4_test_index(16, false);
+        let probe_clusters = vec![15, 3, 7, 0];
+        let filter = Filter::Eq {
+            field: "color".to_string(),
+            value: AttributeValue::String("blue".to_string()),
+        };
+
+        let scan_clusters = select_scan_clusters(
+            &index,
+            &[15.0, 0.0],
+            DistanceMetric::Euclidean,
+            Some(&filter),
+            &probe_clusters,
+            probe_clusters.len(),
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(scan_clusters, probe_clusters);
+    }
+
+    #[test]
+    /// Scale-aware full-retention probe points bypass v4 sketch scoring.
+    ///
+    /// The sketch is valid but unattached, so each successful call proves the
+    /// no-prune decision happens structurally before ADC preparation.
+    fn v4_scale_aware_sentinels_are_structural_noops() {
+        let index = make_v4_test_index(126, false);
+
+        for nprobe in [32usize, 48, 63, 126] {
+            let probe_clusters: Vec<usize> = (0..nprobe).collect();
+            let scan_clusters = select_scan_clusters(
+                &index,
+                &[125.0, 0.0],
+                DistanceMetric::Euclidean,
+                None,
+                &probe_clusters,
+                nprobe,
+                4,
+            )
+            .unwrap();
+
+            assert_eq!(scan_clusters, probe_clusters, "nprobe={nprobe}");
+        }
+    }
+
+    #[test]
+    /// The diagnostic nprobe-16 point still uses v4 adaptive ranking.
+    ///
+    /// One row sits exactly on each centroid. A query on centroid 15 makes the
+    /// four nearest rows an independent expected prefix, while the nprobe-16
+    /// policy's four-cluster floor stops once the remaining mass drops to zero.
+    fn v4_nprobe16_uses_adaptive_budget_and_ranking() {
+        let index = make_v4_test_index(16, true);
+        let probe_clusters: Vec<usize> = (0..16).collect();
+
+        let scan_clusters = select_scan_clusters(
+            &index,
+            &[15.0, 0.0],
+            DistanceMetric::Euclidean,
+            None,
+            &probe_clusters,
+            16,
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(adaptive_sketch_budget(16).max_clusters(), 14);
+        assert_eq!(scan_clusters, vec![15, 14, 13, 12]);
     }
 
     #[test]
