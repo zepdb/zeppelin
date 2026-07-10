@@ -414,6 +414,33 @@ pub fn predict(input: &ModelInput, profile: &Profile) -> Prediction {
     }
 }
 
+/// Convert one Tier 1 serial repeat into the exact Tier 2 model input used by
+/// latency cross-validation.
+#[must_use]
+pub fn model_input_from_repeat(repeat: &RepeatCounters, clients: usize) -> ModelInput {
+    assert!(clients > 0, "prediction clients must be nonzero");
+    let stages = DepthTracker::stages(
+        &repeat.spans,
+        &[SpanKind::Get, SpanKind::Head],
+        Some(repeat.response_cutoff_us),
+    )
+    .into_iter()
+    .map(|stage| ModeledStage {
+        ops: stage.ops as f64,
+        bytes: stage.bytes as f64,
+    })
+    .collect::<Vec<_>>();
+    assert!(
+        !stages.is_empty(),
+        "latency prediction requires at least one measured GET/HEAD stage"
+    );
+    ModelInput {
+        classes: modeled_classes(&repeat.classes),
+        stages,
+        clients,
+    }
+}
+
 fn validate_model(model: &ShapeModel, medium: &ScenarioOutcome) -> ValidationSummary {
     let gt_a = load_gt_a();
     let gt_b = load_gt_b();

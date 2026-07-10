@@ -30,3 +30,9 @@ async fn depth_stability() {
 async fn predict() {
     perf_contract::run_predict_entry().await;
 }
+
+#[tokio::test]
+#[ignore = "requires MinIO for advisory Tier 3 latency validation"]
+async fn latency_validate() {
+    perf_contract::run_latency_validate_entry().await;
+}

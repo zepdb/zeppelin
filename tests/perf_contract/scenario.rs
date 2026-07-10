@@ -1,8 +1,11 @@
 //! Scenario lifecycle and performance-contract entry orchestration.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
+use object_store::path::Path as ObjectPath;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -13,6 +16,7 @@ use zeppelin::index::bitmap::bitmap_key;
 use zeppelin::index::ivf_flat::build::attrs_key;
 use zeppelin::index::ivf_flat::membership::deserialize_membership;
 use zeppelin::index::quantization::QuantizationType;
+use zeppelin::namespace::manager::NamespaceMetadata;
 use zeppelin::wal::manifest::SegmentRef;
 use zeppelin::wal::Manifest;
 
@@ -154,6 +158,8 @@ pub struct RepeatCounters {
     pub op_counts: BTreeMap<String, u64>,
     pub labeled: Vec<LabeledCounters>,
     #[serde(skip)]
+    pub wall_elapsed_us: u64,
+    #[serde(skip)]
     pub response_cutoff_us: u64,
     /// Unfiltered paths are diagnostic inputs for the stability study only.
     #[serde(skip)]
@@ -182,7 +188,7 @@ pub struct LabeledCounters {
 
 struct NamespaceCleanupGuard {
     store: ZeppelinStore,
-    namespace: Arc<str>,
+    namespaces: Vec<Arc<str>>,
     armed: bool,
 }
 
@@ -190,37 +196,47 @@ impl NamespaceCleanupGuard {
     fn new(store: ZeppelinStore, namespace: String) -> Self {
         Self {
             store,
-            namespace: Arc::from(namespace),
+            namespaces: vec![Arc::from(namespace)],
             armed: true,
         }
     }
 
-    async fn cleanup(mut self) {
-        let prefix = format!("{}/", self.namespace);
-        self.store
-            .delete_prefix(&prefix)
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to clean performance namespace {}: {error}",
-                    self.namespace
-                )
-            });
-        let remaining = self
-            .store
-            .list_prefix(&prefix)
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to verify performance namespace cleanup {}: {error}",
-                    self.namespace
-                )
-            });
+    fn add(&mut self, namespace: String) {
         assert!(
-            remaining.is_empty(),
-            "performance namespace cleanup left objects under {}: {remaining:?}",
-            self.namespace
+            self.armed,
+            "cannot add a namespace to a disarmed cleanup guard"
         );
+        assert!(
+            !self
+                .namespaces
+                .iter()
+                .any(|known| known.as_ref() == namespace),
+            "duplicate performance namespace cleanup registration: {namespace}"
+        );
+        self.namespaces.push(Arc::from(namespace));
+    }
+
+    async fn cleanup(mut self) {
+        for namespace in &self.namespaces {
+            let prefix = format!("{namespace}/");
+            self.store
+                .delete_prefix(&prefix)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to clean performance namespace {namespace}: {error}")
+                });
+            let remaining = self
+                .store
+                .list_prefix(&prefix)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to verify performance namespace cleanup {namespace}: {error}")
+                });
+            assert!(
+                remaining.is_empty(),
+                "performance namespace cleanup left objects under {namespace}: {remaining:?}"
+            );
+        }
         self.armed = false;
     }
 }
@@ -231,14 +247,16 @@ impl Drop for NamespaceCleanupGuard {
             return;
         }
         let store = self.store.clone();
-        let namespace = Arc::clone(&self.namespace);
+        let namespaces = self.namespaces.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new()
                 .expect("failed to build panic-cleanup Tokio runtime");
             runtime.block_on(async move {
-                let prefix = format!("{namespace}/");
-                if let Err(error) = store.delete_prefix(&prefix).await {
-                    eprintln!("[perf-contract] panic cleanup failed for {namespace}: {error}");
+                for namespace in namespaces {
+                    let prefix = format!("{namespace}/");
+                    if let Err(error) = store.delete_prefix(&prefix).await {
+                        eprintln!("[perf-contract] panic cleanup failed for {namespace}: {error}");
+                    }
                 }
             });
         });
@@ -250,6 +268,14 @@ impl Drop for NamespaceCleanupGuard {
 pub struct ScenarioOutcome {
     pub per_repeat: Vec<RepeatCounters>,
     pub expected: DatasetExpectations,
+}
+
+/// Advisory closed-loop timing output. Depth is intentionally not asserted
+/// because multiple client requests are in flight at once.
+#[derive(Debug, Clone)]
+pub struct ClosedLoopOutcome {
+    pub request_wall_us: Vec<u64>,
+    pub elapsed_us: u64,
 }
 
 #[derive(Debug, Default)]
@@ -555,6 +581,36 @@ pub(crate) async fn run_scenario(
     spec: &ScenarioSpec,
     injection: Option<Injection>,
 ) -> ScenarioOutcome {
+    run_scenario_inner(spec, injection, None, None, None, false).await
+}
+
+/// Run a serial scenario with a test-only store decorator outside depth and
+/// counting instrumentation. Cold scenarios boot a fresh server per repeat.
+pub(crate) async fn run_scenario_decorated(
+    spec: &ScenarioSpec,
+    decorator: &dyn Fn(&ZeppelinStore) -> ZeppelinStore,
+    before_measure: &dyn Fn(),
+    after_measure: &dyn Fn(),
+) -> ScenarioOutcome {
+    run_scenario_inner(
+        spec,
+        None,
+        Some(decorator),
+        Some(before_measure),
+        Some(after_measure),
+        true,
+    )
+    .await
+}
+
+async fn run_scenario_inner(
+    spec: &ScenarioSpec,
+    injection: Option<Injection>,
+    decorator: Option<&dyn Fn(&ZeppelinStore) -> ZeppelinStore>,
+    before_measure: Option<&dyn Fn()>,
+    after_measure: Option<&dyn Fn()>,
+    repeat_cold: bool,
+) -> ScenarioOutcome {
     assert!(
         spec.repeats > 0,
         "scenario repeats must be greater than zero"
@@ -578,9 +634,13 @@ pub(crate) async fn run_scenario(
     let config = scenario_config(spec);
     let (depth_wrapped, tracker) = depth_store(&harness.store);
     let (instrumented_store, counter) = counting_store(&depth_wrapped);
-    let server_store = injection.map_or_else(
+    let decorated_store = decorator.map_or_else(
         || instrumented_store.clone(),
-        |selected| inject_store(&instrumented_store, selected),
+        |decorate| decorate(&instrumented_store),
+    );
+    let server_store = injection.map_or_else(
+        || decorated_store.clone(),
+        |selected| inject_store(&decorated_store, selected),
     );
     let setup_server = start_test_server_full(
         server_store.clone(),
@@ -591,7 +651,8 @@ pub(crate) async fn run_scenario(
     .await;
     let client = Client::new();
     let namespace = api_ns(&harness, &spec.name);
-    let cleanup_guard = NamespaceCleanupGuard::new(instrumented_store.clone(), namespace.clone());
+    let mut cleanup_guard =
+        NamespaceCleanupGuard::new(instrumented_store.clone(), namespace.clone());
     create_namespace(&client, &setup_server, &namespace, spec).await;
     let mut world = setup_world(&client, &setup_server, &namespace, &generated, spec).await;
 
@@ -606,8 +667,13 @@ pub(crate) async fn run_scenario(
                 "cold scenario setup issued a query before fresh-server boot"
             );
             cold_server = Some(
-                start_test_server_full(server_store, Some(harness.prefix.clone()), config, false)
-                    .await,
+                start_test_server_full(
+                    server_store.clone(),
+                    Some(harness.prefix.clone()),
+                    config.clone(),
+                    false,
+                )
+                .await,
             );
         }
         CacheState::Warm { prime } => {
@@ -639,8 +705,13 @@ pub(crate) async fn run_scenario(
         }
         CacheState::WarmHydrated => {
             cold_server = Some(
-                start_test_server_full(server_store, Some(harness.prefix.clone()), config, false)
-                    .await,
+                start_test_server_full(
+                    server_store.clone(),
+                    Some(harness.prefix.clone()),
+                    config.clone(),
+                    false,
+                )
+                .await,
             );
         }
     }
@@ -653,17 +724,49 @@ pub(crate) async fn run_scenario(
         &mut world,
     )
     .await;
-    let measured_server = cold_server.as_ref().unwrap_or(&setup_server);
 
+    let mut measured_namespaces = vec![namespace.clone()];
+    if repeat_cold && matches!(&spec.cache_state, CacheState::Cold) {
+        let source_manifest = live_manifest(&setup_server, &namespace).await;
+        for repeat in 1..spec.repeats {
+            let target = cold_namespace_name(&namespace, &spec.name, repeat);
+            clone_namespace_for_cold(&setup_server, &namespace, &target, &source_manifest).await;
+            cleanup_guard.add(target.clone());
+            measured_namespaces.push(target);
+        }
+    }
+
+    if let Some(reset) = before_measure {
+        reset();
+    }
     counter.reset();
     tracker.reset();
-    let repeat_count = if matches!(&spec.cache_state, CacheState::Cold) {
+    let repeat_count = if matches!(&spec.cache_state, CacheState::Cold) && !repeat_cold {
         1
     } else {
         spec.repeats
     };
     let mut per_repeat = Vec::with_capacity(repeat_count);
     for repeat in 0..repeat_count {
+        let fresh_server =
+            if repeat_cold && repeat > 0 && matches!(&spec.cache_state, CacheState::Cold) {
+                Some(
+                    start_test_server_full(
+                        server_store.clone(),
+                        Some(harness.prefix.clone()),
+                        config.clone(),
+                        false,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+        let measured_server = fresh_server
+            .as_ref()
+            .or(cold_server.as_ref())
+            .unwrap_or(&setup_server);
+        let measured_namespace = measured_namespaces.get(repeat).unwrap_or(&namespace);
         for key in world
             .eventual_wal_keys
             .iter()
@@ -677,10 +780,11 @@ pub(crate) async fn run_scenario(
                     panic!("failed to invalidate measured cache key {key}: {error}")
                 });
         }
-        let measured = execute_measure_once(
+        let started = Instant::now();
+        let mut measured = execute_measure_once(
             &client,
             measured_server,
-            &namespace,
+            measured_namespace,
             &generated,
             spec,
             &world,
@@ -689,22 +793,205 @@ pub(crate) async fn run_scenario(
             &tracker,
         )
         .await;
+        measured.wall_elapsed_us = started.elapsed().as_micros() as u64;
         per_repeat.push(measured);
         counter.reset();
         tracker.reset();
     }
 
-    if matches!(&spec.measure, MeasureOp::Compact { .. }) {
-        verify_cluster_balance(measured_server, &namespace, &generated.expected, spec).await;
+    if let Some(snapshot) = after_measure {
+        snapshot();
     }
 
-    assert_fragment_window(measured_server, &namespace, spec).await;
+    let final_server = cold_server.as_ref().unwrap_or(&setup_server);
+    if matches!(&spec.measure, MeasureOp::Compact { .. }) {
+        verify_cluster_balance(final_server, &namespace, &generated.expected, spec).await;
+    }
+
+    assert_fragment_window(final_server, &namespace, spec).await;
     cleanup_guard.cleanup().await;
     harness.cleanup().await;
 
     ScenarioOutcome {
         per_repeat,
         expected: generated.expected,
+    }
+}
+
+/// Run query-like traffic through one real server with multiple closed-loop
+/// clients. This path records wall timing only; aggregate depth has no
+/// single-request interpretation while requests overlap.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_closed_loop_scenario(
+    spec: &ScenarioSpec,
+    clients: usize,
+    request_budget: usize,
+    decorator: &dyn Fn(&ZeppelinStore) -> ZeppelinStore,
+    before_measure: &dyn Fn(),
+    after_measure: &dyn Fn(),
+) -> ClosedLoopOutcome {
+    assert!(clients > 0, "closed-loop clients must be nonzero");
+    assert!(
+        request_budget >= clients,
+        "closed-loop request budget must cover every client"
+    );
+    assert!(
+        matches!(
+            &spec.measure,
+            MeasureOp::Query { .. }
+                | MeasureOp::FtsQuery { .. }
+                | MeasureOp::HybridQuery { .. }
+                | MeasureOp::AsOfQuery { .. }
+                | MeasureOp::Fetch { .. }
+        ),
+        "closed-loop validation only supports query-like scenarios"
+    );
+
+    let mut generated = generate(spec.dataset.clone());
+    for probes in &mut generated.expected.probe_clusters {
+        probes.truncate(spec.server_config.nprobe);
+    }
+
+    let harness = TestHarness::new().await;
+    let mut config = scenario_config(spec);
+    // Tier 1 pins this to one request. Tier 3 intentionally admits the
+    // profile's closed-loop clients; the production middleware load-sheds
+    // instead of queueing when this semaphore is exhausted.
+    config.server.max_concurrent_queries = clients;
+    let (depth_wrapped, tracker) = depth_store(&harness.store);
+    let (instrumented_store, counter) = counting_store(&depth_wrapped);
+    let decorated_store = decorator(&instrumented_store);
+    let setup_server = start_test_server_full(
+        decorated_store.clone(),
+        Some(harness.prefix.clone()),
+        config.clone(),
+        false,
+    )
+    .await;
+    let client = Client::new();
+    let namespace = api_ns(&harness, &spec.name);
+    let cleanup_guard = NamespaceCleanupGuard::new(instrumented_store.clone(), namespace.clone());
+    create_namespace(&client, &setup_server, &namespace, spec).await;
+    let mut world = setup_world(&client, &setup_server, &namespace, &generated, spec).await;
+
+    let mut cold_server = None;
+    match &spec.cache_state {
+        CacheState::Cold => {
+            let setup_queries = zeppelin::metrics::QUERIES_TOTAL
+                .with_label_values(&[&namespace])
+                .get();
+            assert_eq!(
+                setup_queries, 0,
+                "cold closed-loop setup issued a query before fresh-server boot"
+            );
+            cold_server = Some(
+                start_test_server_full(
+                    decorated_store.clone(),
+                    Some(harness.prefix.clone()),
+                    config,
+                    false,
+                )
+                .await,
+            );
+        }
+        CacheState::Warm { prime } => {
+            for step in prime {
+                match step {
+                    Step::Measure => {
+                        execute_measure_operation(
+                            &client,
+                            &setup_server,
+                            &namespace,
+                            &generated,
+                            &spec.measure,
+                            &world,
+                            world.measure_offset,
+                            &tracker,
+                        )
+                        .await;
+                        await_tracker_idle(&tracker).await;
+                        assert!(
+                            !measure_mutates(&spec.measure),
+                            "closed-loop prime unexpectedly mutates state"
+                        );
+                    }
+                    Step::Query => {
+                        prime_query(&client, &setup_server, &namespace, &generated).await;
+                        await_tracker_idle(&tracker).await;
+                    }
+                }
+            }
+        }
+        CacheState::WarmHydrated => {
+            panic!("closed-loop latency validation does not support hydration")
+        }
+    }
+    post_prime_setup(
+        &client,
+        &setup_server,
+        &namespace,
+        &generated,
+        spec,
+        &mut world,
+    )
+    .await;
+    let measured_server = cold_server.as_ref().unwrap_or(&setup_server);
+
+    before_measure();
+    counter.reset();
+    tracker.reset();
+    let next = AtomicUsize::new(0);
+    let started = Instant::now();
+    let workers = futures::future::join_all((0..clients).map(|_| {
+        let client = client.clone();
+        let next = &next;
+        let server = measured_server;
+        let namespace = &namespace;
+        let generated = &generated;
+        let measure = &spec.measure;
+        let world = &world;
+        let tracker = &tracker;
+        async move {
+            let mut timings = Vec::new();
+            loop {
+                let request_index = next.fetch_add(1, Ordering::SeqCst);
+                if request_index >= request_budget {
+                    break;
+                }
+                let request_started = Instant::now();
+                let _ = execute_measure_operation(
+                    &client,
+                    server,
+                    namespace,
+                    generated,
+                    measure,
+                    world,
+                    request_index,
+                    tracker,
+                )
+                .await;
+                timings.push(request_started.elapsed().as_micros() as u64);
+            }
+            timings
+        }
+    }))
+    .await;
+    let elapsed_us = started.elapsed().as_micros() as u64;
+    await_tracker_idle(&tracker).await;
+    let request_wall_us = workers.into_iter().flatten().collect::<Vec<_>>();
+    assert_eq!(
+        request_wall_us.len(),
+        request_budget,
+        "closed-loop workers did not exhaust the fixed request budget"
+    );
+    after_measure();
+
+    assert_fragment_window(measured_server, &namespace, spec).await;
+    cleanup_guard.cleanup().await;
+    harness.cleanup().await;
+    ClosedLoopOutcome {
+        request_wall_us,
+        elapsed_us,
     }
 }
 
@@ -872,6 +1159,124 @@ async fn create_namespace(
         Some(namespace),
         "create namespace returned a different name"
     );
+}
+
+async fn clone_namespace_for_cold(
+    server: &FullTestServer,
+    source: &str,
+    target: &str,
+    source_manifest: &Manifest,
+) {
+    let source_meta_key = NamespaceMetadata::s3_key(source);
+    let mut metadata = NamespaceMetadata::from_bytes(
+        &server
+            .store
+            .get(&source_meta_key)
+            .await
+            .unwrap_or_else(|error| panic!("failed to read cold source metadata: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("failed to decode cold source metadata: {error}"));
+    metadata.name = target.to_string();
+    let target_meta_key = NamespaceMetadata::s3_key(target);
+    server
+        .store
+        .put(
+            &target_meta_key,
+            metadata
+                .to_bytes()
+                .unwrap_or_else(|error| panic!("failed to encode cold target metadata: {error}")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("failed to write cold target metadata: {error}"));
+
+    let source_prefix = format!("{source}/");
+    let immutable_prefix = format!("{source}/segments/");
+    let immutable_keys = server
+        .store
+        .list_prefix(&immutable_prefix)
+        .await
+        .unwrap_or_else(|error| panic!("failed to list cold clone artifacts: {error}"));
+    assert!(
+        !immutable_keys.is_empty(),
+        "cold clone source has no immutable segment artifacts"
+    );
+    for from in immutable_keys {
+        let suffix = from.strip_prefix(&source_prefix).unwrap_or_else(|| {
+            panic!("cold clone source key {from:?} escaped prefix {source_prefix:?}")
+        });
+        let to = format!("{target}/{suffix}");
+        let from_path = ObjectPath::parse(&from)
+            .unwrap_or_else(|error| panic!("invalid cold clone source key {from}: {error}"));
+        let to_path = ObjectPath::parse(&to)
+            .unwrap_or_else(|error| panic!("invalid cold clone target key {to}: {error}"));
+        server
+            .store
+            .inner()
+            .copy(&from_path, &to_path)
+            .await
+            .unwrap_or_else(|error| panic!("cold clone copy {from} -> {to} failed: {error}"));
+    }
+
+    let mut manifest = source_manifest.clone();
+    manifest.fencing_token = 0;
+    for key in &mut manifest.pending_deletes {
+        *key = rewrite_cold_key(source, target, key);
+    }
+    for segment in &mut manifest.segments {
+        if let Some(sketch) = &mut segment.sketch {
+            sketch.key = rewrite_cold_key(source, target, &sketch.key);
+        }
+        if let Some(bootstrap) = &mut segment.bootstrap {
+            bootstrap.key = rewrite_cold_key(source, target, &bootstrap.key);
+        }
+        if let Some(membership) = &mut segment.membership {
+            membership.key = rewrite_cold_key(source, target, &membership.key);
+        }
+        for object in &mut segment.cluster_objects {
+            object.key = rewrite_cold_key(source, target, &object.key);
+        }
+    }
+    let mut value = serde_json::to_value(&manifest)
+        .unwrap_or_else(|error| panic!("failed to encode cold clone manifest: {error}"));
+    value["version"] = json!(0);
+    manifest = serde_json::from_value(value)
+        .unwrap_or_else(|error| panic!("failed to reset cold clone generation: {error}"));
+    manifest
+        .write(&server.store, target)
+        .await
+        .unwrap_or_else(|error| panic!("failed to publish cold clone manifest: {error}"));
+    server.manifest_cache.invalidate(target);
+}
+
+fn rewrite_cold_key(source: &str, target: &str, key: &str) -> String {
+    let prefix = format!("{source}/");
+    let suffix = key
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("cold clone embedded key {key:?} escaped prefix {prefix:?}"));
+    format!("{target}/{suffix}")
+}
+
+fn cold_namespace_name(source: &str, scenario: &str, repeat: usize) -> String {
+    assert!(
+        (1..=999).contains(&repeat),
+        "cold namespace repeat must fit three digits"
+    );
+    let suffix = format!("-{scenario}");
+    let prefix = source
+        .strip_suffix(&suffix)
+        .unwrap_or_else(|| panic!("cold namespace {source:?} lacks scenario suffix {suffix:?}"));
+    assert!(
+        prefix.len() >= 3,
+        "cold namespace prefix is too short to encode a repeat"
+    );
+    let split = prefix.len() - 3;
+    let target = format!("{}{:03}{suffix}", &prefix[..split], repeat);
+    assert_eq!(
+        target.len(),
+        source.len(),
+        "cold namespace alias changed serialized key length"
+    );
+    target
 }
 
 async fn upsert_dataset(
@@ -1732,6 +2137,7 @@ fn snapshot_repeat(
         spans,
         op_counts,
         labeled,
+        wall_elapsed_us: 0,
         response_cutoff_us: cutoff_us,
         raw_get_path,
         raw_put_get_path,
@@ -1802,6 +2208,7 @@ fn combine_labeled(labeled: Vec<LabeledCounters>) -> RepeatCounters {
         spans,
         op_counts,
         labeled,
+        wall_elapsed_us: 0,
         response_cutoff_us: cutoff_us,
         raw_get_path,
         raw_put_get_path,

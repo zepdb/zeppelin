@@ -383,6 +383,33 @@ impl RunArtifacts {
         append_report_section(&self.root.join("report.md"), markdown, "Tier 2 what-if");
         path
     }
+
+    /// Write Tier 3 advisory tables plus the deterministic serial injection
+    /// ledger, then append the table to the run report.
+    pub fn write_latency_validation<T: Serialize>(
+        &self,
+        markdown: &str,
+        ledger: &T,
+    ) -> (PathBuf, PathBuf) {
+        assert!(
+            !markdown.trim().is_empty(),
+            "latency-validation report cannot be empty"
+        );
+        let validation_path = self.root.join("latency-validation.md");
+        write_text(
+            &validation_path,
+            markdown,
+            "Tier 3 latency-validation report",
+        );
+        let ledger_path = self.root.join("latency-ledger.json");
+        write_json(ledger_path.clone(), ledger);
+        append_report_section(
+            &self.root.join("report.md"),
+            markdown,
+            "Tier 3 latency validation",
+        );
+        (validation_path, ledger_path)
+    }
 }
 
 fn depth_artifact(repeats: &[RepeatCounters]) -> DepthArtifact {

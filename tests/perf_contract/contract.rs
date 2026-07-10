@@ -1397,6 +1397,7 @@ total = { exact = 0 }
             spans: Vec::new(),
             op_counts: BTreeMap::new(),
             labeled: Vec::new(),
+            wall_elapsed_us: 0,
             response_cutoff_us: 0,
             raw_get_path: path(get_depth),
             raw_put_get_path: path(put_get_depth),
