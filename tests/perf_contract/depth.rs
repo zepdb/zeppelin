@@ -5,6 +5,7 @@
 //! longest chain of non-overlapping storage operations without asserting
 //! wall-clock latency.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -56,6 +57,22 @@ pub struct OpSpan {
 pub struct CriticalPath {
     pub depth: u32,
     pub chain: Vec<OpSpan>,
+}
+
+/// Per-class operation and byte totals assigned to one interval-DAG stage.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct StageClassTotals {
+    pub ops: u64,
+    pub bytes: u64,
+}
+
+/// All selected operations whose longest predecessor chain has this depth.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DepthStage {
+    pub depth: u32,
+    pub ops: u64,
+    pub bytes: u64,
+    pub classes: BTreeMap<String, StageClassTotals>,
 }
 
 #[derive(Debug)]
@@ -319,6 +336,60 @@ impl DepthTracker {
             depth: depths[maximal],
             chain,
         }
+    }
+
+    /// Group selected spans by their interval-DAG depth.
+    ///
+    /// A span's stage is one plus the deepest operation that completed before
+    /// it started. Parallel operations therefore share a stage. Tier 2 uses
+    /// the resulting per-stage op and byte totals as the direct input to its
+    /// transfer-latency equation.
+    #[must_use]
+    pub fn stages(spans: &[OpSpan], kinds: &[SpanKind], cutoff_us: Option<u64>) -> Vec<DepthStage> {
+        let mut ordered = spans
+            .iter()
+            .filter(|span| kinds.contains(&span.kind))
+            .filter(|span| cutoff_us.is_none_or(|cutoff| span.wall_start_us <= cutoff))
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|span| span.end_seq);
+
+        let mut ends = Vec::with_capacity(ordered.len());
+        let mut prefix_max = Vec::<u32>::with_capacity(ordered.len());
+        let mut stages = BTreeMap::<u32, DepthStage>::new();
+        for span in ordered {
+            let eligible = ends.partition_point(|end| *end <= span.start_seq);
+            let predecessor_depth = eligible.checked_sub(1).map_or(0, |index| prefix_max[index]);
+            let depth = predecessor_depth
+                .checked_add(1)
+                .expect("depth stage overflowed u32");
+            ends.push(span.end_seq);
+            prefix_max.push(prefix_max.last().copied().unwrap_or(0).max(depth));
+
+            let stage = stages.entry(depth).or_insert_with(|| DepthStage {
+                depth,
+                ops: 0,
+                bytes: 0,
+                classes: BTreeMap::new(),
+            });
+            stage.ops = stage.ops.checked_add(1).expect("stage op count overflowed");
+            stage.bytes = stage
+                .bytes
+                .checked_add(span.bytes)
+                .expect("stage byte count overflowed");
+            let class = stage
+                .classes
+                .entry(span.class.name().to_string())
+                .or_default();
+            class.ops = class
+                .ops
+                .checked_add(1)
+                .expect("stage class ops overflowed");
+            class.bytes = class
+                .bytes
+                .checked_add(span.bytes)
+                .expect("stage class bytes overflowed");
+        }
+        stages.into_values().collect()
     }
 }
 

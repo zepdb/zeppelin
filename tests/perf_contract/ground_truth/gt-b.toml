@@ -1,0 +1,18 @@
+# Source: ~/Documents/code/zeppelin-bench/vector-db-benchmark/results/
+# zeppelin-default-glove-100-angular-search-0-2026-07-04-07-54-55.json.
+# Companion search-1..3 fixtures cover nprobe 16, 32, and 64. This benchmark
+# did not record bytes/query, so shape-model counters are used: GT-B validates
+# closed-loop/latency machinery while GT-A remains the bytes-to-QPS anchor.
+name = "glove-100-angular-search-0"
+profile = "minio-local-docker"
+dataset = "glove-100-angular"
+vectors = 1183514
+dims = 100
+nlist = 256
+nprobe = 8
+clients = 8
+measured_rps = 83.9417660458749
+mean_latency_s = 0.09422946040313691
+p95_latency_s = 0.1616682250285521
+p99_latency_s = 0.36670039153657896
+mean_precision = 0.8516549999999999

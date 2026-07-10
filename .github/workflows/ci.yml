@@ -112,6 +112,16 @@ jobs:
           mc mb local/stormcrow-test
       - name: Gate object-store performance contracts
         run: cargo test --test perf_contract_tests contracts -- --ignored
+      - name: Generate analytic performance predictions
+        continue-on-error: true
+        run: cargo test --test perf_contract_tests predict -- --ignored --nocapture
+      - name: Upload performance-contract reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-contract-reports
+          path: target/perf-contract
+          if-no-files-found: warn
 
   coverage:
     name: Code Coverage

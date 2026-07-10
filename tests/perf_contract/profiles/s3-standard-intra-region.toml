@@ -1,0 +1,37 @@
+# AWS S3 Standard us-east-1 pricing anchor: GET $0.40/1M, PUT $5.00/1M,
+# intra-region reads have no egress charge. m6i.xlarge is about $0.192/hour.
+# S3-client internal retries are not modeled and may add a few percent cost.
+name = "s3-standard-intra-region"
+
+[storage]
+ttfb_ms = { p50 = 15.0, p99 = 60.0 }
+per_conn_MBps = 80.0
+agg_MBps_per_node = 100000.0
+
+[storage.price]
+get_per_req = 0.0000004
+put_per_req = 0.000005
+egress_per_gb = 0.0
+
+[node]
+count = 1
+vcpus = 4
+mem_gb = 16
+price_hr = 0.192
+cpu_ms_per_query = 8.0
+
+[client]
+closed_loop_clients = 8
+
+[whatif]
+vectors = 32768
+dims = 128
+nlist = 32
+nprobe = [4, 8, 16]
+quantization = ["sq8", "rabitq-1bit", "rabitq-2bit"]
+expected_quantization = ["rabitq-1bit", "rabitq-2bit"]
+
+[whatif.row_bytes]
+sq8 = 128
+rabitq-1bit = 16
+rabitq-2bit = 32

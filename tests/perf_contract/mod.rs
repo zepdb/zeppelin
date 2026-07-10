@@ -3,13 +3,17 @@
 pub mod contract;
 pub mod dataset;
 pub mod depth;
+pub mod ground_truth;
 pub mod injection;
+pub mod predict;
+pub mod profiles;
 pub mod report;
 pub mod scenario;
 pub mod scenarios;
 
 use std::path::PathBuf;
 
+pub use predict::run_predict_entry;
 pub use scenario::{
     run_capture_entry, run_contracts_entry, run_selftest_entry, run_stability_entry,
 };

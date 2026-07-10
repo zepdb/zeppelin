@@ -1,7 +1,7 @@
 //! Run-scoped artifacts and the complete performance-contract report.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::common::counting::ClassStats;
 
 use super::contract::CostViolation;
-use super::depth::{CriticalPath, OpSpan};
+use super::depth::{CriticalPath, DepthStage, DepthTracker, OpSpan, SpanKind};
 use super::scenario::{RepeatCounters, ScenarioOutcome};
 use super::PerfEnv;
 
@@ -100,6 +100,7 @@ struct DepthRepeat {
 struct DepthSummary {
     depth: u32,
     chain: Vec<DepthLink>,
+    stages: Vec<DepthStage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -370,6 +371,18 @@ impl RunArtifacts {
         let path = self.root.join("depth-stability.md");
         write_text(&path, markdown, "depth-stability report");
     }
+
+    /// Write the deterministic Tier 2 table and append it to `report.md`.
+    pub fn write_whatif(&self, markdown: &str) -> PathBuf {
+        assert!(
+            !markdown.trim().is_empty(),
+            "what-if report cannot be empty"
+        );
+        let path = self.root.join("whatif.md");
+        write_text(&path, markdown, "what-if report");
+        append_report_section(&self.root.join("report.md"), markdown, "Tier 2 what-if");
+        path
+    }
 }
 
 fn depth_artifact(repeats: &[RepeatCounters]) -> DepthArtifact {
@@ -381,8 +394,22 @@ fn depth_artifact(repeats: &[RepeatCounters]) -> DepthArtifact {
             .enumerate()
             .map(|(repeat, counters)| DepthRepeat {
                 repeat,
-                get: summarize_depth(&counters.get_path),
-                put_get: summarize_depth(&counters.put_get_path),
+                get: summarize_depth(
+                    &counters.get_path,
+                    DepthTracker::stages(
+                        &counters.spans,
+                        &[SpanKind::Get, SpanKind::Head],
+                        Some(counters.response_cutoff_us),
+                    ),
+                ),
+                put_get: summarize_depth(
+                    &counters.put_get_path,
+                    DepthTracker::stages(
+                        &counters.spans,
+                        &[SpanKind::Get, SpanKind::Head, SpanKind::Put],
+                        Some(counters.response_cutoff_us),
+                    ),
+                ),
                 post_response_ops: post_response_ops(counters).len(),
             })
             .collect(),
@@ -395,8 +422,22 @@ fn report_repeats(repeats: &[RepeatCounters]) -> Vec<ReportRepeat> {
         .map(|counters| ReportRepeat {
             classes: counters.classes.clone(),
             totals: counters.totals,
-            get: summarize_depth(&counters.get_path),
-            put_get: summarize_depth(&counters.put_get_path),
+            get: summarize_depth(
+                &counters.get_path,
+                DepthTracker::stages(
+                    &counters.spans,
+                    &[SpanKind::Get, SpanKind::Head],
+                    Some(counters.response_cutoff_us),
+                ),
+            ),
+            put_get: summarize_depth(
+                &counters.put_get_path,
+                DepthTracker::stages(
+                    &counters.spans,
+                    &[SpanKind::Get, SpanKind::Head, SpanKind::Put],
+                    Some(counters.response_cutoff_us),
+                ),
+            ),
             post_response: post_response_ops(counters),
         })
         .collect()
@@ -415,7 +456,7 @@ fn post_response_ops(counters: &RepeatCounters) -> Vec<PostResponseOp> {
         .collect()
 }
 
-fn summarize_depth(path: &CriticalPath) -> DepthSummary {
+fn summarize_depth(path: &CriticalPath, stages: Vec<DepthStage>) -> DepthSummary {
     DepthSummary {
         depth: path.depth,
         chain: path
@@ -427,6 +468,7 @@ fn summarize_depth(path: &CriticalPath) -> DepthSummary {
                 key: stable_depth_key(&span.key),
             })
             .collect(),
+        stages,
     }
 }
 
@@ -960,6 +1002,36 @@ fn write_text(path: &Path, contents: &str, description: &str) {
     });
     file.flush().unwrap_or_else(|error| {
         panic!("failed to flush {description} {}: {error}", path.display())
+    });
+}
+
+fn append_report_section(path: &Path, contents: &str, description: &str) {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to open {} for {description}: {error}",
+                path.display()
+            )
+        });
+    file.write_all(b"\n\n").unwrap_or_else(|error| {
+        panic!(
+            "failed to separate {description} in {}: {error}",
+            path.display()
+        )
+    });
+    file.write_all(contents.as_bytes()).unwrap_or_else(|error| {
+        panic!(
+            "failed to append {description} to {}: {error}",
+            path.display()
+        )
+    });
+    file.flush().unwrap_or_else(|error| {
+        panic!(
+            "failed to flush {description} in {}: {error}",
+            path.display()
+        )
     });
 }
 

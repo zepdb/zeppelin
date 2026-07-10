@@ -1,0 +1,9 @@
+# Accepted line, 2026-07-05. dbpedia100k, nprobe 16, eight closed-loop
+# workers, MinIO in Docker. tasks/opt-qps-log.md records 70.61 MB/query,
+# 5.638 GETs/query, 5.89 QPS, and the independent raw-boto3 410 MB/s wall.
+name = "dbpedia100k-accepted-line"
+profile = "minio-local-docker"
+bytes_per_query_mb = 70.6
+gets_per_query = 5.64
+clients = 8
+measured_qps = 5.89

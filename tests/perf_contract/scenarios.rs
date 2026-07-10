@@ -5,7 +5,7 @@ use serde_json::json;
 use super::contract::{
     CacheState as ContractCacheState, Consistency, ContractSpec, MeasureSpec, Quantization,
 };
-use super::dataset::FtsShape;
+use super::dataset::{DatasetSpec, FtsShape};
 use super::scenario::{CacheState, MeasureOp, ScenarioSpec, ServerKnobs, SetupPlan, Step};
 
 const DEFAULT_QUERY_NPROBE: usize = 4;
@@ -109,6 +109,33 @@ pub fn build(contract: &ContractSpec, env_repeats: usize) -> ScenarioSpec {
     }
 }
 
+/// Build the warm strong-query lifecycle for a standard shape measurement.
+#[must_use]
+pub fn standard_shape(name: &str, dataset: DatasetSpec) -> ScenarioSpec {
+    assert!(
+        matches!(name, "shape_small" | "shape_medium"),
+        "unknown standard shape scenario {name:?}"
+    );
+    let contract = super::contract::load_contract("warm_query_strong")
+        .unwrap_or_else(|error| panic!("failed to load warm-query template: {error}"));
+    let mut spec = build(&contract, 1);
+    spec.name = name.to_string();
+    spec.dataset = dataset.clone();
+    spec.server_config.nprobe = 4;
+    spec.repeats = 1;
+    let config = spec
+        .ns_config
+        .as_object_mut()
+        .expect("standard-shape namespace config must be an object");
+    config.insert("dimensions".to_string(), json!(dataset.dims));
+    config
+        .get_mut("index_config")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("standard-shape index_config must be an object")
+        .insert("nlist".to_string(), json!(dataset.nlist));
+    spec
+}
+
 fn cache_state(
     contract: &ContractCacheState,
     setup: &SetupPlan,
@@ -120,17 +147,16 @@ fn cache_state(
         ContractCacheState::Warm => {
             let prime = if matches!(measure, MeasureOp::Compact { .. } | MeasureOp::Gc) {
                 Vec::new()
-            } else if bitmap_index
+            } else if (bitmap_index
                 && matches!(
                     measure,
                     MeasureOp::Query {
                         filter: Some(_),
                         ..
                     }
-                )
+                ))
+                || matches!(measure, MeasureOp::FtsQuery { .. })
             {
-                vec![Step::Measure]
-            } else if matches!(measure, MeasureOp::FtsQuery { .. }) {
                 vec![Step::Measure]
             } else if matches!(
                 setup,

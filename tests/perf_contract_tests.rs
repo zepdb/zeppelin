@@ -24,3 +24,9 @@ async fn perf_selftest() {
 async fn depth_stability() {
     perf_contract::run_stability_entry().await;
 }
+
+#[tokio::test]
+#[ignore = "requires MinIO for Tier 2 shape calibration and validation"]
+async fn predict() {
+    perf_contract::run_predict_entry().await;
+}

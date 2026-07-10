@@ -551,7 +551,10 @@ async fn run_stability_worlds(worlds: impl IntoIterator<Item = ScenarioSpec>) ->
     }
 }
 
-async fn run_scenario(spec: &ScenarioSpec, injection: Option<Injection>) -> ScenarioOutcome {
+pub(crate) async fn run_scenario(
+    spec: &ScenarioSpec,
+    injection: Option<Injection>,
+) -> ScenarioOutcome {
     assert!(
         spec.repeats > 0,
         "scenario repeats must be greater than zero"
@@ -1248,6 +1251,7 @@ fn measure_mutates(measure: &MeasureOp) -> bool {
     matches!(measure, MeasureOp::Upsert { .. } | MeasureOp::Delete { .. })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_measure_once(
     client: &Client,
     server: &FullTestServer,
@@ -1490,9 +1494,8 @@ async fn execute_measure_operation(
                 result.segment_id.is_some(),
                 "measured compaction produced no segment"
             );
-            assert_eq!(
-                matches!(world.as_of_generation, Some(_)),
-                false,
+            assert!(
+                world.as_of_generation.is_none(),
                 "compaction world unexpectedly carried an as-of generation"
             );
             if *incremental {

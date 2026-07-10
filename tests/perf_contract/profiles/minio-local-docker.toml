@@ -1,0 +1,23 @@
+# Measured 2026-07-05: raw boto3 reached 377 MB/s with one worker and
+# approximately 410 MB/s at 4-32 workers. Local MinIO has no request cost.
+name = "minio-local-docker"
+
+[storage]
+ttfb_ms = { p50 = 1.0, p99 = 5.0 }
+per_conn_MBps = 377.0
+agg_MBps_per_node = 410.0
+
+[storage.price]
+get_per_req = 0.0
+put_per_req = 0.0
+egress_per_gb = 0.0
+
+[node]
+count = 1
+vcpus = 8
+mem_gb = 16
+price_hr = 0.0
+cpu_ms_per_query = 0.0
+
+[client]
+closed_loop_clients = 8
