@@ -22,6 +22,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets
       - run: cargo clippy --all-targets -- -D warnings
+      - run: bash scripts/perf-contract-selftest.sh
 
   unit-tests:
     name: Unit Tests
