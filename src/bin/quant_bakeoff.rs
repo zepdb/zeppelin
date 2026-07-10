@@ -16,15 +16,15 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::Instant;
 
 use serde::Deserialize;
 use thiserror::Error;
 use uuid::Uuid;
+use zeppelin::config::IndexingConfig;
 use zeppelin::error::ZeppelinError;
 use zeppelin::index::distance::cosine_distance;
-use zeppelin::index::ivf_flat::kmeans::train_kmeans;
+use zeppelin::index::ivf_flat::build::partition_vectors;
 use zeppelin::index::quantization::pq::PqCodebook;
 use zeppelin::index::quantization::sq::SqCalibration;
 use zeppelin::types::DistanceMetric;
@@ -45,17 +45,9 @@ const REQUIRED_FILES: [&str; 6] = [
 
 const TOP_K: usize = 100;
 const QUERY_LIMIT: usize = 1_000;
-const NPROBES: [usize; 3] = [8, 16, 32];
+const BASE_NPROBES: [usize; 3] = [8, 16, 32];
 const MARGINS: [usize; 4] = [2, 3, 4, 5];
 const MAX_CANDIDATES: usize = TOP_K * MARGINS[MARGINS.len() - 1];
-const DBPEDIA_TARGET_ROWS_PER_CLUSTER: usize = 2_500;
-const WIKI_TARGET_ROWS_PER_CLUSTER: usize = 2_500;
-const MIN_ROWS_PER_CLUSTER: f64 = 2_000.0;
-const MAX_ROWS_PER_CLUSTER: f64 = 3_000.0;
-const IVF_TRAIN_ROWS_PER_CLUSTER: usize = 32;
-const IVF_MIN_TRAIN_ROWS: usize = 4_096;
-const IVF_KMEANS_ITERS: usize = 25;
-const KMEANS_EPSILON: f64 = 1e-4;
 const PQ_SUBQUANTIZERS: usize = 64;
 const PQ_TRAIN_ROWS: usize = 4_096;
 const PQ_KMEANS_ITERS: usize = 6;
@@ -63,11 +55,15 @@ const ROTATION_SEED: u64 = 0x5a45_5050_454c_494e;
 const IO_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const UNIT_NORM_SQUARED_TOLERANCE: f64 = 1e-4;
 const ESTIMATOR_ERROR_SAMPLE_MODULUS: u64 = 1_024;
+const ESTIMATOR_ERROR_NPROBE: usize = 32;
 const PQ_ANCHOR_TARGET: f64 = 0.88;
 const PQ_ANCHOR_TOLERANCE: f64 = 0.03;
 const PQ_ANCHOR_NPROBE: usize = 16;
 const PQ_ANCHOR_MARGIN: usize = 3;
 const GATE_RECALL: f64 = 0.96;
+const BINDING_WIKI_CORPUS_ROWS: usize = 2_000_000;
+const BINDING_WIKI_NLIST: usize = 667;
+const BINDING_WIKI_NPROBE: usize = 126;
 const WIKI_DATA_GENERATION: &str = "1778486380300287";
 const WIKI_QUERIES_GENERATION: &str = "1778486223485507";
 
@@ -240,9 +236,11 @@ struct IvfModel {
     clusters: Vec<Vec<u32>>,
     /// Cluster-order code offset, including one terminal offset.
     cluster_offsets: Vec<usize>,
-    training_rows: usize,
+    /// Legacy Phase 1 probe points plus the current production default.
+    probe_counts: Vec<usize>,
+    effective_default_nprobe: usize,
+    partition_rows: usize,
     average_rows_per_cluster: f64,
-    assignment_workers: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -287,8 +285,8 @@ struct DatasetResult {
     dims: usize,
     nlist: usize,
     average_rows_per_cluster: f64,
-    ivf_training_rows: usize,
-    assignment_workers: usize,
+    partition_rows: usize,
+    effective_default_nprobe: usize,
     probe_ceilings: Vec<ProbeCeiling>,
     provenance: DatasetProvenance,
     encoders: Vec<EncoderResult>,
@@ -527,10 +525,10 @@ fn validate_meta(spec: DatasetSpec, meta: &DatasetMeta) -> Result<()> {
                 meta.corpus_n, meta.dims
             )));
         }
-        "wiki_dpr_e5" if !(1_000_000..=2_000_000).contains(&meta.corpus_n) || meta.dims != 768 => {
+        "wiki_dpr_e5" if meta.corpus_n != BINDING_WIKI_CORPUS_ROWS || meta.dims != 768 => {
             return Err(BakeoffError::Dataset(format!(
-                "wiki_dpr_e5 shape is {} x {}, expected 1000000..=2000000 x 768",
-                meta.corpus_n, meta.dims
+                "wiki_dpr_e5 shape is {} x {}, expected {} x 768 for the binding gate",
+                meta.corpus_n, meta.dims, BINDING_WIKI_CORPUS_ROWS
             )));
         }
         _ => {}
@@ -829,153 +827,168 @@ fn validate_unit_rows(
 }
 
 fn train_and_assign_ivf(dataset: &Dataset) -> Result<IvfModel> {
+    let config = IndexingConfig::default();
     let corpus_n = dataset.meta.corpus_n;
-    let target_rows_per_cluster = if dataset.spec.is_gate_dataset {
-        WIKI_TARGET_ROWS_PER_CLUSTER
-    } else {
-        DBPEDIA_TARGET_ROWS_PER_CLUSTER
-    };
-    let nlist = corpus_n.div_ceil(target_rows_per_cluster);
-    if nlist < NPROBES[NPROBES.len() - 1] {
+    let expected_nlist = config.effective_num_centroids(corpus_n);
+    if expected_nlist == 0 {
         return Err(BakeoffError::Integrity(format!(
-            "{} rows produce nlist={nlist}, fewer than max nprobe {}",
-            dataset.spec.report_name,
-            NPROBES[NPROBES.len() - 1]
-        )));
-    }
-    let average_rows_per_cluster = corpus_n as f64 / nlist as f64;
-    if !(MIN_ROWS_PER_CLUSTER..=MAX_ROWS_PER_CLUSTER).contains(&average_rows_per_cluster) {
-        return Err(BakeoffError::Integrity(format!(
-            "{} nlist={nlist} gives {average_rows_per_cluster:.3} rows/cluster, outside [{MIN_ROWS_PER_CLUSTER}, {MAX_ROWS_PER_CLUSTER}]",
+            "{} production IVF policy resolved zero centroids",
             dataset.spec.report_name
         )));
     }
+    let effective_default_nprobe = config.effective_default_nprobe(expected_nlist);
+    if dataset.spec.is_gate_dataset {
+        validate_binding_ivf_policy(corpus_n, expected_nlist, effective_default_nprobe)?;
+    }
 
-    let desired_training_rows = nlist
-        .checked_mul(IVF_TRAIN_ROWS_PER_CLUSTER)
-        .ok_or_else(|| BakeoffError::Integrity("IVF training row count overflowed".into()))?
-        .max(IVF_MIN_TRAIN_ROWS);
-    let training_rows = desired_training_rows.min(corpus_n);
-    let training_indices = evenly_spaced_indices(corpus_n, training_rows)?;
-    let training_refs: Vec<&[f32]> = training_indices
-        .iter()
-        .map(|&row| dataset.corpus_row(row))
-        .collect();
-
-    eprintln!(
-        "training {} IVF centroids from {} deterministic rows for {}",
-        nlist, training_rows, dataset.spec.report_name
-    );
-    let centroids = train_kmeans(
-        &training_refs,
-        dataset.meta.dims,
-        nlist,
-        IVF_KMEANS_ITERS,
-        KMEANS_EPSILON,
-    )?;
-    if centroids.len() != nlist {
+    let corpus_refs: Vec<&[f32]> = dataset.corpus.chunks_exact(dataset.meta.dims).collect();
+    if corpus_refs.len() != corpus_n {
         return Err(BakeoffError::Integrity(format!(
-            "train_kmeans returned {} centroids, expected {nlist}",
-            centroids.len()
+            "{} corpus produced {} vector references, expected {corpus_n}",
+            dataset.spec.report_name,
+            corpus_refs.len()
         )));
     }
-    for (index, centroid) in centroids.iter().enumerate() {
+    eprintln!(
+        "building {} production IVF partition from all {} rows into {} clusters",
+        dataset.spec.report_name, corpus_n, expected_nlist
+    );
+    let partition = partition_vectors(&corpus_refs, dataset.meta.dims, &config)?;
+    drop(corpus_refs);
+
+    if partition.centroids.len() != expected_nlist {
+        return Err(BakeoffError::Integrity(format!(
+            "production partition returned {} centroids, expected {expected_nlist}",
+            partition.centroids.len()
+        )));
+    }
+    if partition.primary.len() != corpus_n {
+        return Err(BakeoffError::Integrity(format!(
+            "production partition returned {} primary assignments, expected {corpus_n}",
+            partition.primary.len()
+        )));
+    }
+    if partition.clusters.len() != expected_nlist {
+        return Err(BakeoffError::Integrity(format!(
+            "production partition returned {} cluster row lists, expected {expected_nlist}",
+            partition.clusters.len()
+        )));
+    }
+    if partition.spilled != 0 {
+        return Err(BakeoffError::Integrity(format!(
+            "production no-spill partition emitted {} duplicate rows",
+            partition.spilled
+        )));
+    }
+    for (index, centroid) in partition.centroids.iter().enumerate() {
         if centroid.len() != dataset.meta.dims || centroid.iter().any(|value| !value.is_finite()) {
             return Err(BakeoffError::Integrity(format!(
-                "IVF centroid {index} is malformed or non-finite"
+                "production IVF centroid {index} is malformed or non-finite"
             )));
         }
     }
 
-    eprintln!(
-        "assigning all {} corpus rows to {} IVF clusters",
-        corpus_n, nlist
-    );
-    let assignment_workers = thread::available_parallelism()
-        .map_err(|error| {
-            BakeoffError::Integrity(format!(
-                "could not determine parallelism for full-corpus IVF assignment: {error}"
-            ))
-        })?
-        .get()
-        .min(corpus_n);
-    let rows_per_worker = corpus_n.div_ceil(assignment_workers);
-    let assignments = thread::scope(|scope| -> Result<Vec<usize>> {
-        let mut handles = Vec::with_capacity(assignment_workers);
-        for worker in 0..assignment_workers {
-            let start = worker * rows_per_worker;
-            let end = (start + rows_per_worker).min(corpus_n);
-            if start == end {
-                continue;
-            }
-            let centroids = &centroids;
-            handles.push(scope.spawn(move || {
-                let mut local = Vec::with_capacity(end - start);
-                for row_index in start..end {
-                    local.push(nearest_l2_centroid(
-                        dataset.corpus_row(row_index),
-                        centroids,
-                    ));
-                }
-                local
-            }));
-        }
-
-        let mut ordered = Vec::with_capacity(corpus_n);
-        for handle in handles {
-            let mut local = handle.join().map_err(|_| {
-                BakeoffError::Integrity(
-                    "a full-corpus IVF assignment worker panicked; no partial assignment is usable"
-                        .into(),
-                )
-            })?;
-            ordered.append(&mut local);
-        }
-        if ordered.len() != corpus_n {
-            return Err(BakeoffError::Integrity(format!(
-                "parallel IVF assignment produced {} rows, expected {corpus_n}",
-                ordered.len()
-            )));
-        }
-        Ok(ordered)
-    })?;
-    let mut counts = vec![0usize; nlist];
-    for &cluster in &assignments {
-        counts[cluster] += 1;
-    }
-
-    let mut clusters: Vec<Vec<u32>> = counts
-        .iter()
-        .map(|&count| Vec::with_capacity(count))
-        .collect();
-    for (row_index, &cluster) in assignments.iter().enumerate() {
-        clusters[cluster].push(row_index as u32);
-    }
-    let mut cluster_offsets = Vec::with_capacity(nlist + 1);
+    let mut seen = vec![false; corpus_n];
+    let mut cluster_offsets = Vec::with_capacity(expected_nlist + 1);
     cluster_offsets.push(0usize);
-    for cluster in &clusters {
+    for (cluster_index, rows) in partition.clusters.iter().enumerate() {
+        let mut previous = None;
+        for &row in rows {
+            let row_index = row as usize;
+            if row_index >= corpus_n {
+                return Err(BakeoffError::Integrity(format!(
+                    "production cluster {cluster_index} contains out-of-range row {row}"
+                )));
+            }
+            if seen[row_index] {
+                return Err(BakeoffError::Integrity(format!(
+                    "production partition stores row {row} more than once"
+                )));
+            }
+            if partition.primary[row_index] as usize != cluster_index {
+                return Err(BakeoffError::Integrity(format!(
+                    "production primary assignment for row {row} is {}, but its cluster list is {cluster_index}",
+                    partition.primary[row_index]
+                )));
+            }
+            if previous.is_some_and(|prior| row <= prior) {
+                return Err(BakeoffError::Integrity(format!(
+                    "production cluster {cluster_index} rows are not strictly ascending"
+                )));
+            }
+            seen[row_index] = true;
+            previous = Some(row);
+        }
         let next = cluster_offsets
             .last()
             .copied()
-            .and_then(|offset| offset.checked_add(cluster.len()))
+            .and_then(|offset| offset.checked_add(rows.len()))
             .ok_or_else(|| BakeoffError::Integrity("cluster offset overflowed usize".into()))?;
         cluster_offsets.push(next);
     }
+    if seen.iter().any(|present| !present) {
+        return Err(BakeoffError::Integrity(
+            "production partition omitted at least one corpus row".into(),
+        ));
+    }
     if cluster_offsets.last().copied() != Some(corpus_n) {
         return Err(BakeoffError::Integrity(format!(
-            "IVF cluster partition covers {} rows, expected {corpus_n}",
+            "production partition covers {} rows, expected {corpus_n}",
             cluster_offsets.last().copied().unwrap_or(0)
         )));
     }
 
+    let probe_counts = production_probe_schedule(&config, expected_nlist)?;
+
+    eprintln!(
+        "{} production IVF partition complete: nlist={}, default nprobe={}",
+        dataset.spec.report_name, expected_nlist, effective_default_nprobe
+    );
     Ok(IvfModel {
-        centroids,
-        clusters,
+        centroids: partition.centroids,
+        clusters: partition.clusters,
         cluster_offsets,
-        training_rows,
-        average_rows_per_cluster,
-        assignment_workers,
+        probe_counts,
+        effective_default_nprobe,
+        partition_rows: corpus_n,
+        average_rows_per_cluster: corpus_n as f64 / expected_nlist as f64,
     })
+}
+
+fn validate_binding_ivf_policy(corpus_n: usize, nlist: usize, nprobe: usize) -> Result<()> {
+    if (corpus_n, nlist, nprobe)
+        != (
+            BINDING_WIKI_CORPUS_ROWS,
+            BINDING_WIKI_NLIST,
+            BINDING_WIKI_NPROBE,
+        )
+    {
+        return Err(BakeoffError::Integrity(format!(
+            "binding wiki gate resolved corpus_n={corpus_n}, nlist={nlist}, nprobe={nprobe}; expected corpus_n={BINDING_WIKI_CORPUS_ROWS}, nlist={BINDING_WIKI_NLIST}, nprobe={BINDING_WIKI_NPROBE}"
+        )));
+    }
+    Ok(())
+}
+
+fn production_probe_schedule(config: &IndexingConfig, cluster_count: usize) -> Result<Vec<usize>> {
+    if cluster_count == 0 {
+        return Err(BakeoffError::Integrity(
+            "cannot build a probe schedule for zero clusters".into(),
+        ));
+    }
+    let mut probe_counts: Vec<usize> = BASE_NPROBES
+        .into_iter()
+        .filter(|&nprobe| nprobe <= cluster_count)
+        .collect();
+    probe_counts.push(config.effective_default_nprobe(cluster_count));
+    probe_counts.sort_unstable();
+    probe_counts.dedup();
+    if probe_counts.is_empty() || probe_counts.last().copied().unwrap_or(0) > cluster_count {
+        return Err(BakeoffError::Integrity(format!(
+            "invalid probe schedule {probe_counts:?} for {cluster_count} clusters"
+        )));
+    }
+    Ok(probe_counts)
 }
 
 fn evaluate_dataset(dataset: &Dataset, ivf: &IvfModel) -> Result<DatasetResult> {
@@ -995,8 +1008,8 @@ fn evaluate_dataset(dataset: &Dataset, ivf: &IvfModel) -> Result<DatasetResult> 
         dims: dataset.meta.dims,
         nlist: ivf.centroids.len(),
         average_rows_per_cluster: ivf.average_rows_per_cluster,
-        ivf_training_rows: ivf.training_rows,
-        assignment_workers: ivf.assignment_workers,
+        partition_rows: ivf.partition_rows,
+        effective_default_nprobe: ivf.effective_default_nprobe,
         probe_ceilings,
         provenance: dataset.provenance.clone(),
         encoders,
@@ -1008,15 +1021,20 @@ fn evaluate_probe_ceilings(dataset: &Dataset, ivf: &IvfModel) -> Result<Vec<Prob
         "computing exact in-probe ceilings for {}",
         dataset.spec.report_name
     );
-    let mut recall_at_10 = [0.0f64; NPROBES.len()];
-    let mut recall_at_100 = [0.0f64; NPROBES.len()];
+    let probe_counts = &ivf.probe_counts;
+    let max_nprobe = probe_counts.last().copied().ok_or_else(|| {
+        BakeoffError::Integrity("exact ceiling received an empty probe schedule".into())
+    })?;
+    let mut recall_at_10 = vec![0.0f64; probe_counts.len()];
+    let mut recall_at_100 = vec![0.0f64; probe_counts.len()];
 
     for query_index in 0..dataset.meta.query_n {
         let query = dataset.query_row(query_index);
         let ground_truth = dataset.ground_truth_row(query_index);
-        let probes = nearest_probe_clusters(query, &ivf.centroids)?;
-        let mut heaps: [BinaryHeap<Candidate>; NPROBES.len()] =
-            std::array::from_fn(|_| BinaryHeap::with_capacity(TOP_K + 1));
+        let probes = nearest_probe_clusters(query, &ivf.centroids, max_nprobe)?;
+        let mut heaps: Vec<BinaryHeap<Candidate>> = (0..probe_counts.len())
+            .map(|_| BinaryHeap::with_capacity(TOP_K + 1))
+            .collect();
 
         for (probe_rank, &cluster_index) in probes.iter().enumerate() {
             for &row in &ivf.clusters[cluster_index] {
@@ -1024,7 +1042,7 @@ fn evaluate_probe_ceilings(dataset: &Dataset, ivf: &IvfModel) -> Result<Vec<Prob
                     score: exact_cosine_in_l2_units(query, dataset.corpus_row(row as usize)),
                     row,
                 };
-                for (nprobe_index, &nprobe) in NPROBES.iter().enumerate() {
+                for (nprobe_index, &nprobe) in probe_counts.iter().enumerate() {
                     if probe_rank < nprobe {
                         retain_best(&mut heaps[nprobe_index], candidate, TOP_K);
                     }
@@ -1036,7 +1054,7 @@ fn evaluate_probe_ceilings(dataset: &Dataset, ivf: &IvfModel) -> Result<Vec<Prob
             if heap.len() < TOP_K {
                 return Err(BakeoffError::Integrity(format!(
                     "exact ceiling query {query_index} at nprobe {} produced only {} rows, fewer than top-k {TOP_K}",
-                    NPROBES[nprobe_index],
+                    probe_counts[nprobe_index],
                     heap.len()
                 )));
             }
@@ -1047,7 +1065,7 @@ fn evaluate_probe_ceilings(dataset: &Dataset, ivf: &IvfModel) -> Result<Vec<Prob
     }
 
     let query_count = dataset.meta.query_n as f64;
-    Ok(NPROBES
+    Ok(probe_counts
         .iter()
         .enumerate()
         .map(|(index, &nprobe)| ProbeCeiling {
@@ -1308,19 +1326,24 @@ fn evaluate_encoder(
     ivf: &IvfModel,
     scorer: &mut dyn ApproximateScorer,
 ) -> Result<EvaluationResult> {
-    let mut recall_10 = vec![0.0f64; NPROBES.len() * MARGINS.len()];
-    let mut recall_100 = vec![0.0f64; NPROBES.len() * MARGINS.len()];
-    let mut raw_recall_10 = vec![0.0f64; NPROBES.len()];
-    let mut raw_recall_100 = vec![0.0f64; NPROBES.len()];
+    let probe_counts = &ivf.probe_counts;
+    let max_nprobe = probe_counts.last().copied().ok_or_else(|| {
+        BakeoffError::Integrity("encoder evaluation received an empty probe schedule".into())
+    })?;
+    let mut recall_10 = vec![0.0f64; probe_counts.len() * MARGINS.len()];
+    let mut recall_100 = vec![0.0f64; probe_counts.len() * MARGINS.len()];
+    let mut raw_recall_10 = vec![0.0f64; probe_counts.len()];
+    let mut raw_recall_100 = vec![0.0f64; probe_counts.len()];
     let mut moments = RunningMoments::default();
 
     for query_index in 0..dataset.meta.query_n {
         let query = dataset.query_row(query_index);
         let ground_truth = dataset.ground_truth_row(query_index);
-        let probes = nearest_probe_clusters(query, &ivf.centroids)?;
+        let probes = nearest_probe_clusters(query, &ivf.centroids, max_nprobe)?;
         scorer.prepare_query(query_index, query)?;
-        let mut heaps: [BinaryHeap<Candidate>; NPROBES.len()] =
-            std::array::from_fn(|_| BinaryHeap::with_capacity(MAX_CANDIDATES + 1));
+        let mut heaps: Vec<BinaryHeap<Candidate>> = (0..probe_counts.len())
+            .map(|_| BinaryHeap::with_capacity(MAX_CANDIDATES + 1))
+            .collect();
 
         for (probe_rank, &cluster_index) in probes.iter().enumerate() {
             scorer.prepare_cluster(query_index, cluster_index, &ivf.centroids[cluster_index])?;
@@ -1334,7 +1357,9 @@ fn evaluate_encoder(
                     )));
                 }
 
-                if estimator_error_sample(query_index, cluster_index, row) {
+                if probe_rank < ESTIMATOR_ERROR_NPROBE
+                    && estimator_error_sample(query_index, cluster_index, row)
+                {
                     let exact = exact_cosine_in_l2_units(query, dataset.corpus_row(row as usize));
                     moments.push((approximate - exact) as f64);
                 }
@@ -1342,7 +1367,7 @@ fn evaluate_encoder(
                     score: approximate,
                     row,
                 };
-                for (nprobe_index, &nprobe) in NPROBES.iter().enumerate() {
+                for (nprobe_index, &nprobe) in probe_counts.iter().enumerate() {
                     if probe_rank < nprobe {
                         retain_best(&mut heaps[nprobe_index], candidate, MAX_CANDIDATES);
                     }
@@ -1354,7 +1379,7 @@ fn evaluate_encoder(
             if heap.len() < MAX_CANDIDATES {
                 return Err(BakeoffError::Integrity(format!(
                     "query {query_index} at nprobe {} produced only {} candidates, fewer than required {MAX_CANDIDATES}",
-                    NPROBES[nprobe_index],
+                    probe_counts[nprobe_index],
                     heap.len()
                 )));
             }
@@ -1388,7 +1413,7 @@ fn evaluate_encoder(
         ));
     }
     let query_count = dataset.meta.query_n as f64;
-    let raw_recall = NPROBES
+    let raw_recall = probe_counts
         .iter()
         .enumerate()
         .map(|(index, &nprobe)| RawRecall {
@@ -1397,8 +1422,8 @@ fn evaluate_encoder(
             recall_at_100: raw_recall_100[index] / query_count,
         })
         .collect();
-    let mut cells = Vec::with_capacity(NPROBES.len() * MARGINS.len());
-    for (nprobe_index, &nprobe) in NPROBES.iter().enumerate() {
+    let mut cells = Vec::with_capacity(probe_counts.len() * MARGINS.len());
+    for (nprobe_index, &nprobe) in probe_counts.iter().enumerate() {
         for (margin_index, &margin) in MARGINS.iter().enumerate() {
             let cell = nprobe_index * MARGINS.len() + margin_index;
             cells.push(MatrixCell {
@@ -1702,22 +1727,16 @@ fn validate_dataset_anchors(result: &DatasetResult) -> Result<()> {
             .find(|entry| entry.nprobe == PQ_ANCHOR_NPROBE)
             .ok_or_else(|| BakeoffError::Integrity("missing PQ nprobe=16 raw anchor".into()))?;
         let anchor = cell(pq, PQ_ANCHOR_NPROBE, PQ_ANCHOR_MARGIN)?;
-        let delta = (anchor.recall_at_100 - PQ_ANCHOR_TARGET).abs();
-        if delta > PQ_ANCHOR_TOLERANCE {
-            let rerank_summary = pq
-                .cells
-                .iter()
-                .filter(|entry| entry.nprobe == PQ_ANCHOR_NPROBE)
-                .map(|entry| format!("{}x={:.6}", entry.margin, entry.recall_at_100))
-                .collect::<Vec<_>>()
-                .join(", ");
+        if anchor.recall_at_10 + f64::EPSILON < raw.recall_at_10
+            || anchor.recall_at_100 + f64::EPSILON < raw.recall_at_100
+        {
             return Err(BakeoffError::Integrity(format!(
-                "current-v3 PQ anchor failed on dbpedia100k: nprobe={} margin={}x exact-rerank recall@100 was {:.6}, outside {:.2} +/- {:.2}; unrescored recall@100 was {:.6}, and exact-rerank recall@100 by margin was [{rerank_summary}]; do not trust the bake-off matrix",
+                "current-v3 PQ rerank anchor failed on dbpedia100k: nprobe={} margin={}x exact-rerank recall@10/@100={:.6}/{:.6}, below unrescored {:.6}/{:.6}",
                 PQ_ANCHOR_NPROBE,
                 PQ_ANCHOR_MARGIN,
+                anchor.recall_at_10,
                 anchor.recall_at_100,
-                PQ_ANCHOR_TARGET,
-                PQ_ANCHOR_TOLERANCE,
+                raw.recall_at_10,
                 raw.recall_at_100,
             )));
         }
@@ -1729,13 +1748,15 @@ fn render_report(
     results: &[DatasetResult],
     rotation_quality: &rabitq::RotationQuality,
 ) -> Result<String> {
+    let indexing = IndexingConfig::default();
     let wiki = results
         .iter()
         .find(|result| result.name == "wiki_dpr_e5")
         .ok_or_else(|| BakeoffError::Integrity("missing wiki_dpr_e5 result".into()))?;
-    let gate_encoder = encoder(wiki, "rabitq-1bit")?;
-    let gate_cell = cell(gate_encoder, 16, 4)?;
-    let gate_ceiling = wiki
+    let one_bit = encoder(wiki, "rabitq-1bit")?;
+    let two_bit = encoder(wiki, "rabitq-2bit")?;
+    let legacy_cell = cell(one_bit, 16, 4)?;
+    let legacy_ceiling = wiki
         .probe_ceilings
         .iter()
         .find(|ceiling| ceiling.nprobe == 16)
@@ -1744,44 +1765,75 @@ fn render_report(
                 "wiki_dpr_e5 exact in-probe ceiling is missing nprobe 16".into(),
             )
         })?;
-    let gate_passed = gate_cell.recall_at_100 >= GATE_RECALL;
-    let gate_interpretation = if gate_passed {
-        "quantizer gate passed"
-    } else if gate_ceiling.recall_at_100 < GATE_RECALL {
-        "coarse-IVF-limited; quantizer go/no-go inconclusive"
+    let default_nprobe = wiki.effective_default_nprobe;
+    let default_one_bit = cell(one_bit, default_nprobe, 4)?;
+    let default_two_bit = cell(two_bit, default_nprobe, 4)?;
+    let default_ceiling = wiki
+        .probe_ceilings
+        .iter()
+        .find(|ceiling| ceiling.nprobe == default_nprobe)
+        .ok_or_else(|| {
+            BakeoffError::Integrity(format!(
+                "wiki_dpr_e5 exact in-probe ceiling is missing production-default nprobe {default_nprobe}"
+            ))
+        })?;
+    let legacy_passed = legacy_cell.recall_at_100 >= GATE_RECALL;
+    let default_one_bit_passed = default_one_bit.recall_at_100 >= GATE_RECALL;
+    let default_two_bit_passed = default_two_bit.recall_at_100 >= GATE_RECALL;
+    let default_interpretation = if default_one_bit_passed && default_two_bit_passed {
+        "both low-bit variants pass at the production default"
+    } else if default_ceiling.recall_at_100 < GATE_RECALL {
+        "the production-default coarse IVF frontier remains below the gate"
+    } else if default_two_bit_passed {
+        "2-bit passes, while 1-bit remains estimator-limited at 4x"
+    } else if default_one_bit_passed {
+        "1-bit passes, while 2-bit remains estimator-limited at 4x"
     } else {
-        "quantizer-limited; evaluate the plan's wider-code decision"
+        "both low-bit variants remain estimator-limited at 4x"
     };
 
     let mut output = String::new();
     output.push_str("# Phase 1 Quantization Bake-off\n\n");
     output.push_str(
-        "Deterministic offline evaluation over the datasets' stored, already-normalized cosine f32 vectors. The driver validates unit norms without rewriting bytes, preserving the exact vectors used to construct ground truth. Zeppelin's public k-means provides deterministic centroids; full-corpus assignment uses the production builder's squared-L2 geometry and query probing uses production cosine geometry. Approximate estimators rank only rows in those IVF probe clusters; each reported margin is then reranked by exact production f32 cosine, multiplied by two only to use squared-L2-equivalent score units. Lower estimator scores are better.\n\n",
+        "Deterministic offline evaluation over the datasets' stored, already-normalized cosine f32 vectors. The driver validates unit norms without rewriting bytes, preserving the exact vectors used to construct ground truth. Production `partition_vectors` provides deterministic centroids and full-corpus squared-L2 assignment; query probing uses production cosine geometry. Approximate estimators rank only rows in those IVF probe clusters; each reported margin is then reranked by exact production f32 cosine, multiplied by two only to use squared-L2-equivalent score units. Lower estimator scores are better.\n\n",
     );
-    output.push_str("## Gate\n\n");
+    output.push_str("## Post-IVF production-default gates\n\n");
     output.push_str(&format!(
-        "> **{}: 1-bit RaBitQ residual at nprobe 16, margin 4x on wiki_dpr_e5 achieved recall@100 = {:.6} (required >= {:.2}).**\n\n",
-        if gate_passed { "PASS" } else { "FAIL" },
-        gate_cell.recall_at_100,
+        "> **{}: 1-bit RaBitQ at production-default nprobe {default_nprobe}, margin 4x achieved recall@100 = {:.6} (required >= {:.2}).**\n\n",
+        if default_one_bit_passed { "PASS" } else { "FAIL" },
+        default_one_bit.recall_at_100,
         GATE_RECALL
     ));
-    output.push_str(&format!("> **Interpretation: {gate_interpretation}.**\n\n"));
-    output.push_str(
-        "A failed gate is a decision result, not permission to select a different dataset or encoder silently.\n\n",
-    );
     output.push_str(&format!(
-        "The exact f32 in-probe recall@100 ceiling at nprobe 16 is {:.6}. {}\n\n",
-        gate_ceiling.recall_at_100,
-        if gate_ceiling.recall_at_100 < GATE_RECALL {
-            "The coarse partition therefore makes the 0.96 end-to-end gate unreachable before quantization; the full encoder matrix remains the required evidence, but it cannot by itself justify selecting a wider code."
-        } else {
-            "The coarse partition clears the target, so the gate cell isolates whether estimator ranking and the 4x exact rerank retain enough candidates."
-        }
+        "> **{}: 2-bit RaBitQ at production-default nprobe {default_nprobe}, margin 4x achieved recall@100 = {:.6} (required >= {:.2}).**\n\n",
+        if default_two_bit_passed { "PASS" } else { "FAIL" },
+        default_two_bit.recall_at_100,
+        GATE_RECALL
     ));
     output.push_str(&format!(
-        "The 1-bit gate cell recovers {:.3}% of that aggregate exact ceiling. This ratio is diagnostic rather than a replacement for the absolute recall gate.\n\n",
-        100.0 * gate_cell.recall_at_100 / gate_ceiling.recall_at_100
+        "> **Interpretation: {default_interpretation}.**\n\n"
     ));
+    output.push_str(&format!(
+        "The production-default exact f32 in-probe recall@100 ceiling is {:.6}. The 1-bit and 2-bit cells recover {:.3}% and {:.3}% of that aggregate ceiling, respectively. These ratios are diagnostic rather than replacements for the absolute recall gate.\n\n",
+        default_ceiling.recall_at_100,
+        100.0 * default_one_bit.recall_at_100 / default_ceiling.recall_at_100,
+        100.0 * default_two_bit.recall_at_100 / default_ceiling.recall_at_100,
+    ));
+    output.push_str("An omitted flat-IVF nprobe now resolves from the active segment's cluster count. Per the rerun decision, this production-default point is the binding gate; the old explicit nprobe-16 point is retained only as a diagnostic below.\n\n");
+
+    output.push_str("## Superseded explicit-nprobe diagnostic\n\n");
+    output.push_str(&format!(
+        "> **{} against the old threshold: 1-bit RaBitQ at explicit nprobe 16, margin 4x achieved recall@100 = {:.6} (required >= {:.2}).**\n\n",
+        if legacy_passed { "PASS" } else { "FAIL" },
+        legacy_cell.recall_at_100,
+        GATE_RECALL
+    ));
+    output.push_str(&format!(
+        "Its exact in-probe recall@100 ceiling is {:.6}, and the 1-bit cell recovers {:.3}% of that aggregate ceiling. Explicit nprobe values retain their exact semantics after the IVF policy change.\n\n",
+        legacy_ceiling.recall_at_100,
+        100.0 * legacy_cell.recall_at_100 / legacy_ceiling.recall_at_100
+    ));
+    output.push_str("A failed gate is a measured result, not permission to substitute a different dataset, probe count, margin, or encoder silently.\n\n");
 
     output.push_str("## Structured rotation quality oracle\n\n");
     output.push_str("The deterministic 768-dimensional oracle compares the production structured rotation with a dense Gaussian/Gram-Schmidt rotation on paired anisotropic sparse inputs. The driver aborts unless the paired MSE delta is within five standard errors; it also inherits the module's requirement that structured rotation materially beat identity.\n\n");
@@ -1802,20 +1854,27 @@ fn render_report(
 
     output.push_str("## Dataset and IVF setup\n\n");
     output.push_str(
-        "| dataset | corpus rows | queries | dims | nlist | rows/cluster | IVF train rows | assignment workers |\n",
+        "| dataset | corpus rows | queries | dims | nlist | rows/cluster | partition input rows | production default nprobe | probe sweep |\n",
     );
-    output.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    output.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n");
     for result in results {
+        let probe_sweep = result
+            .probe_ceilings
+            .iter()
+            .map(|ceiling| ceiling.nprobe.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         output.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {:.3} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {:.3} | {} | {} | {} |\n",
             result.name,
             result.corpus_n,
             result.query_n,
             result.dims,
             result.nlist,
             result.average_rows_per_cluster,
-            result.ivf_training_rows,
-            result.assignment_workers
+            result.partition_rows,
+            result.effective_default_nprobe,
+            probe_sweep,
         ));
     }
     output.push('\n');
@@ -1872,24 +1931,43 @@ fn render_report(
     }
 
     output.push_str(&format!(
-        "IVF centroids use Zeppelin's public `train_kmeans` with {} deterministic evenly spaced training rows per requested centroid (minimum {}, capped by corpus size), {} iterations, and epsilon `{}`. Every corpus row is assigned by minimum squared L2, matching `build.rs`; scoped workers write disjoint row ranges and are joined in range order, preserving deterministic row order and lower-cluster-id tie breaks. Query probes rank the non-unit centroids with production cosine, matching `search.rs`.\n\n",
-        IVF_TRAIN_ROWS_PER_CLUSTER,
-        IVF_MIN_TRAIN_ROWS,
-        IVF_KMEANS_ITERS,
-        KMEANS_EPSILON,
+        "The driver calls production `partition_vectors` on every ordered corpus row. The compiled default policy targets {} rows per cluster with centroid floor {}, centroid cap {}, {} k-means iterations, epsilon `{}`, balance ratio {}, and {} balance-repair rounds. It assigns every row once by production squared L2 and rejects any spill, omission, duplicate, or primary-assignment mismatch. Query probes rank the resulting non-unit centroids with production cosine.\n\n",
+        indexing.target_rows_per_cluster,
+        indexing.default_num_centroids,
+        indexing.max_num_centroids,
+        indexing.kmeans_max_iterations,
+        indexing.kmeans_convergence_epsilon,
+        indexing.balance_max_ratio,
+        indexing.balance_repair_rounds,
     ));
-    output.push_str("Production geometry caveat: `build.rs` assigns with squared L2 while `search.rs` probes non-unit centroids with namespace cosine. The canonical run deliberately mirrors that current behavior rather than silently substituting a new partition. A rejected custom 2M full-corpus spherical run produced only 0.858650 exact nprobe-16 recall@100 and is preserved in `bakeoff-spherical-rejected.md`; it is not the Phase 1 verdict. The canonical exact ceiling below quantifies the current coarse-IVF limit directly.\n\n");
-    output.push_str("Methodology caveat: production passes every segment vector to `train_kmeans`, but k-means++ initialization over two million rows and the requested nlist is prohibitively expensive for this offline run. The driver uses a deterministic `32 * nlist` evenly spaced training sample (with a 4,096-row minimum), then assigns every corpus row. The 25-iteration cap and epsilon match production defaults. The exact in-probe ceiling is a diagnostic upper bound on every encoder's end-to-end recall; a ceiling below 0.96 is reported as part of the gate failure rather than aborting, because the phase plan requires measured curves either way.\n\n");
+    output.push_str(&format!(
+        "For an omitted request, the production probe policy is `ceil({:.6} * nlist)` with floor {} and cap {}. The matrix keeps explicit nprobe 8, 16, and 32 diagnostics and appends each dataset's resolved production default. No runtime override changes the compiled floor in this run.\n\n",
+        indexing.default_probe_fraction,
+        indexing.default_nprobe,
+        indexing.max_nprobe,
+    ));
+    output.push_str("The pre-scale-aware custom-IVF matrix is preserved in `bakeoff-pre-scale-aware-ivf.md`, and the rejected custom spherical diagnostic remains in `bakeoff-spherical-rejected.md`. Neither is used for this rerun's verdict.\n\n");
 
     output.push_str("## Exact in-probe ceilings\n\n");
     output.push_str("These are exact production-cosine scans of every vector in the same centroid-probed clusters, with no quantization or candidate margin. They isolate IVF loss from estimator loss.\n\n");
-    output.push_str("| dataset | nprobe | exact recall@10 ceiling | exact recall@100 ceiling |\n");
-    output.push_str("| --- | ---: | ---: | ---: |\n");
+    output.push_str("| dataset | operating point | nprobe | exact recall@10 ceiling | exact recall@100 ceiling |\n");
+    output.push_str("| --- | --- | ---: | ---: | ---: |\n");
     for result in results {
         for ceiling in &result.probe_ceilings {
             output.push_str(&format!(
-                "| {} | {} | {:.6} | {:.6} |\n",
-                result.name, ceiling.nprobe, ceiling.recall_at_10, ceiling.recall_at_100
+                "| {} | {} | {} | {:.6} | {:.6} |\n",
+                result.name,
+                if result.name == "wiki_dpr_e5" && ceiling.nprobe == result.effective_default_nprobe
+                {
+                    "binding production default"
+                } else if ceiling.nprobe == result.effective_default_nprobe {
+                    "production-default control"
+                } else {
+                    "diagnostic"
+                },
+                ceiling.nprobe,
+                ceiling.recall_at_10,
+                ceiling.recall_at_100
             ));
         }
     }
@@ -1917,8 +1995,10 @@ fn render_report(
 
     output.push_str("## Estimator error\n\n");
     output.push_str(&format!(
-        "Bias and population variance are for `estimated squared-L2-equivalent score - 2 * exact cosine distance` over a deterministic approximately 1/{} sample of rows scored at nprobe 32. A pair is sampled when `splitmix64(rotation_seed XOR mixed(query_index, cluster_index, row_id)) mod {} == 0`; the exact sample count is reported per encoder. Inputs are validated unit-normalized without mutation. PQ uses the current-v3 cosine ADC table. SQ8 uses production asymmetric cosine multiplied by two solely to express its error in comparable squared-L2 units.\n\n",
-        ESTIMATOR_ERROR_SAMPLE_MODULUS, ESTIMATOR_ERROR_SAMPLE_MODULUS
+        "Bias and population variance are for `estimated squared-L2-equivalent score - 2 * exact cosine distance` over a deterministic approximately 1/{} sample of rows scored at explicit nprobe {}. A pair is sampled when `splitmix64(rotation_seed XOR mixed(query_index, cluster_index, row_id)) mod {} == 0`; the exact sample count is reported per encoder. Inputs are validated unit-normalized without mutation. PQ uses the current-v3 cosine ADC table. SQ8 uses production asymmetric cosine multiplied by two solely to express its error in comparable squared-L2 units.\n\n",
+        ESTIMATOR_ERROR_SAMPLE_MODULUS,
+        ESTIMATOR_ERROR_NPROBE,
+        ESTIMATOR_ERROR_SAMPLE_MODULUS
     ));
     output.push_str("| dataset | encoder | samples | bias | variance |\n");
     output.push_str("| --- | --- | ---: | ---: | ---: |\n");
@@ -1937,7 +2017,7 @@ fn render_report(
     output.push('\n');
 
     output.push_str("## Unrescored estimator controls\n\n");
-    output.push_str("These top-100 numbers are before exact reranking. They expose how much each margin recovers but are not the plan's approximately-0.88 PQ anchor, because the historical number included an exact rerank after approximate selection. The pinned anchor is the dbpedia current-v3 PQ nprobe-16, margin-3x matrix cell below. It is still not a literal reproduction of the historical path: Zeppelin's accepted PQ path ranked clusters and used different nlist, bit-width, and selection-budget semantics, while this driver vector-ranks the requested v3 64-subquantizer control with 2,000–3,000-row IVF clusters.\n\n");
+    output.push_str("These top-100 numbers are before exact reranking. They expose how much each margin recovers but are not a literal reproduction of the historical approximately-0.88 PQ path, which ranked clusters and used different nlist, bit-width, and selection-budget semantics. The dbpedia nprobe-16, margin-3x cell remains a loud legacy control while this rerun uses the new scale-aware production partition.\n\n");
     output.push_str("| dataset | encoder | nprobe | raw recall@10 | raw recall@100 |\n");
     output.push_str("| --- | --- | ---: | ---: | ---: |\n");
     for result in results {
@@ -1973,14 +2053,18 @@ fn render_report(
     output.push('\n');
     output.push_str("## Sanity anchors\n\n");
     output.push_str(&format!(
-        "- Current-v3 PQ on dbpedia100k at nprobe {}, margin {}x must have exact-rerank recall@100 within `{:.2} +/- {:.2}`.\n",
+        "- Current-v3 PQ on dbpedia100k at diagnostic nprobe {}, margin {}x is reported against the legacy `{:.2} +/- {:.2}` reference, but that k=40-calibrated range is not fatal under the production k=256 partition. Exact reranking must still meet or exceed its raw PQ recall.\n",
         PQ_ANCHOR_NPROBE, PQ_ANCHOR_MARGIN, PQ_ANCHOR_TARGET, PQ_ANCHOR_TOLERANCE
     ));
+    output.push_str("- Each dataset must be partitioned by production `partition_vectors` over every ordered corpus row with zero spill, complete primary coverage, and matching cluster lists.\n");
     output.push_str("- SQ8 must meet or exceed 1-bit recall@10 and recall@100 in every matching dataset/nprobe/margin cell.\n");
-    output.push_str("- The wiki_dpr_e5 exact nprobe-16 in-probe recall@100 ceiling is reported as the upper bound on the gate cell; falling below 0.96 is a result, not a control failure.\n");
-    output.push_str("- The driver aborts before writing this report if a data-integrity, rotation, PQ, or SQ8 control anchor fails; a Phase 1 gate failure is written explicitly.\n");
+    output.push_str(&format!("- The wiki_dpr_e5 production-default nprobe {} exact ceiling is the upper bound on the binding 1-bit and 2-bit gate cells.\n", wiki.effective_default_nprobe));
+    output.push_str(
+        "- Explicit nprobe 16 remains in the matrix only as the superseded Phase 1 diagnostic.\n",
+    );
+    output.push_str("- The driver aborts before writing this report if a partition, data-integrity, rotation, PQ, or SQ8 control anchor fails; low-bit gate failures are written explicitly.\n");
     output.push_str("\n## Determinism scope\n\n");
-    output.push_str("Codes, cluster assignments, probe sets, sampled quality metrics, recall, and rotation-oracle metrics reproduce exactly on the same build and hardware. Wall-clock encode seconds/vectors-per-second and the detected assignment-worker count inherently vary with runtime load and host availability. The plan's simultaneous wall-clock measurement and every-number-identical requirements cannot both hold for timing values; this report does not claim otherwise.\n");
+    output.push_str("Codes, production partitions, probe sets, sampled quality metrics, recall, and rotation-oracle metrics reproduce exactly on the same build and hardware. Wall-clock encode seconds and vectors-per-second inherently vary with runtime load. The plan's simultaneous wall-clock measurement and every-number-identical requirements cannot both hold for timing values; this report does not claim otherwise.\n");
     Ok(output)
 }
 
@@ -2063,8 +2147,11 @@ fn rotate_centroids(
     Ok(rotated)
 }
 
-fn nearest_probe_clusters(query: &[f32], centroids: &[Vec<f32>]) -> Result<Vec<usize>> {
-    let max_nprobe = NPROBES[NPROBES.len() - 1];
+fn nearest_probe_clusters(
+    query: &[f32],
+    centroids: &[Vec<f32>],
+    max_nprobe: usize,
+) -> Result<Vec<usize>> {
     if centroids.len() < max_nprobe {
         return Err(BakeoffError::Integrity(format!(
             "only {} centroids available for nprobe {max_nprobe}",
@@ -2086,31 +2173,6 @@ fn nearest_probe_clusters(query: &[f32], centroids: &[Vec<f32>]) -> Result<Vec<u
         .take(max_nprobe)
         .map(|(_, cluster)| cluster)
         .collect())
-}
-
-fn nearest_l2_centroid(vector: &[f32], centroids: &[Vec<f32>]) -> usize {
-    let mut best_cluster = 0usize;
-    let mut best_distance = f32::INFINITY;
-    for (cluster, centroid) in centroids.iter().enumerate() {
-        let distance = squared_l2(vector, centroid);
-        if distance < best_distance {
-            best_distance = distance;
-            best_cluster = cluster;
-        }
-    }
-    best_cluster
-}
-
-#[inline]
-fn squared_l2(left: &[f32], right: &[f32]) -> f32 {
-    debug_assert_eq!(left.len(), right.len());
-    left.iter()
-        .zip(right.iter())
-        .map(|(&left, &right)| {
-            let difference = left - right;
-            difference * difference
-        })
-        .sum()
 }
 
 #[inline]
@@ -2282,4 +2344,43 @@ fn io_error(path: &Path, source: io::Error) -> BakeoffError {
 
 fn rabitq_error(error: impl std::fmt::Display) -> BakeoffError {
     BakeoffError::Rabitq(error.to_string())
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::{
+        production_probe_schedule, validate_binding_ivf_policy, IndexingConfig,
+        BINDING_WIKI_CORPUS_ROWS, BINDING_WIKI_NLIST, BINDING_WIKI_NPROBE,
+    };
+
+    #[test]
+    fn production_probe_schedule_keeps_diagnostics_and_scale_aware_default() {
+        let config = IndexingConfig::default();
+
+        assert_eq!(
+            production_probe_schedule(&config, 256).unwrap(),
+            vec![8, 16, 32, 48]
+        );
+        assert_eq!(
+            production_probe_schedule(&config, 667).unwrap(),
+            vec![8, 16, 32, 126]
+        );
+    }
+
+    #[test]
+    fn production_probe_schedule_rejects_zero_clusters() {
+        assert!(production_probe_schedule(&IndexingConfig::default(), 0).is_err());
+    }
+
+    #[test]
+    fn binding_policy_is_pinned_to_the_production_wiki2m_point() {
+        let config = IndexingConfig::default();
+        let nlist = config.effective_num_centroids(BINDING_WIKI_CORPUS_ROWS);
+        let nprobe = config.effective_default_nprobe(nlist);
+
+        assert_eq!(nlist, BINDING_WIKI_NLIST);
+        assert_eq!(nprobe, BINDING_WIKI_NPROBE);
+        validate_binding_ivf_policy(BINDING_WIKI_CORPUS_ROWS, nlist, nprobe).unwrap();
+        assert!(validate_binding_ivf_policy(1_000_000, nlist, nprobe).is_err());
+    }
 }
