@@ -2585,6 +2585,119 @@ pub(crate) fn deserialize_attrs(
 // Build pipeline
 // ---------------------------------------------------------------------------
 
+/// Deterministic CPU-only IVF partition used by production segment builds.
+///
+/// Row indexes refer to the input slice. Each logical row has exactly one
+/// canonical primary cluster; the no-spill policy keeps `spilled` at zero and
+/// stores each row exactly once. The private affinity matrix preserves the
+/// existing second-nearest-centroid signal used to group physical objects.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct IvfPartition {
+    /// Trained centroids in stable training order.
+    pub centroids: Vec<Vec<f32>>,
+    /// Input row indexes stored by logical cluster.
+    pub clusters: Vec<Vec<u32>>,
+    /// Canonical primary cluster for every input row.
+    pub primary: Vec<u32>,
+    /// Number of additional stored row copies. Always zero without spill.
+    pub spilled: usize,
+    /// Symmetric second-nearest affinity used only by the artifact builder.
+    pub(crate) buddy_affinity: Vec<Vec<u32>>,
+}
+
+/// Trains centroids and assigns every row without performing object-store I/O.
+///
+/// This is the production partition seam shared by the immutable segment
+/// builder and the real-dataset recall gate. Keeping training and assignment
+/// here prevents an offline evaluator from drifting away from shipped
+/// behavior.
+///
+/// # Errors
+///
+/// Returns an index error for empty input, zero dimension, or an input too
+/// large for persisted `u32` row indexes. Returns a dimension mismatch when a
+/// row length differs from `dim`, and propagates k-means training failures.
+#[must_use]
+pub fn partition_vectors(
+    vectors: &[&[f32]],
+    dim: usize,
+    config: &IndexingConfig,
+) -> Result<IvfPartition> {
+    if vectors.is_empty() {
+        return Err(ZeppelinError::Index(
+            "cannot build index from empty vector set".into(),
+        ));
+    }
+    if dim == 0 {
+        return Err(ZeppelinError::Index("vector dimension must be > 0".into()));
+    }
+    if vectors.len() > u32::MAX as usize {
+        return Err(ZeppelinError::Index(format!(
+            "IVF partition row count exceeds u32: {}",
+            vectors.len()
+        )));
+    }
+    for vector in vectors {
+        if vector.len() != dim {
+            return Err(ZeppelinError::DimensionMismatch {
+                expected: dim,
+                actual: vector.len(),
+            });
+        }
+    }
+
+    let k = config.default_num_centroids.min(vectors.len());
+    let centroids = train_kmeans(
+        vectors,
+        dim,
+        k,
+        config.kmeans_max_iterations,
+        config.kmeans_convergence_epsilon,
+    )?;
+    let num_clusters = centroids.len();
+    let mut clusters = vec![Vec::new(); num_clusters];
+    let mut primary = Vec::with_capacity(vectors.len());
+    let mut buddy_affinity = vec![vec![0u32; num_clusters]; num_clusters];
+
+    for (row_idx, vector) in vectors.iter().enumerate() {
+        let mut best_dist = f32::MAX;
+        let mut second_dist = f32::MAX;
+        let mut best_cluster = 0usize;
+        let mut second_cluster = 0usize;
+        for (cluster_idx, centroid) in centroids.iter().enumerate() {
+            let candidate = distance::euclidean_distance(vector, centroid);
+            if candidate < best_dist {
+                second_dist = best_dist;
+                second_cluster = best_cluster;
+                best_dist = candidate;
+                best_cluster = cluster_idx;
+            } else if candidate < second_dist {
+                second_dist = candidate;
+                second_cluster = cluster_idx;
+            }
+        }
+        if num_clusters > 1 && second_cluster != best_cluster {
+            buddy_affinity[best_cluster][second_cluster] =
+                buddy_affinity[best_cluster][second_cluster].saturating_add(1);
+            buddy_affinity[second_cluster][best_cluster] =
+                buddy_affinity[second_cluster][best_cluster].saturating_add(1);
+        }
+
+        let row_idx = row_idx as u32;
+        clusters[best_cluster].push(row_idx);
+        primary.push(best_cluster as u32);
+    }
+
+    Ok(IvfPartition {
+        centroids,
+        clusters,
+        primary,
+        spilled: 0,
+        buddy_affinity,
+    })
+}
+
 /// Builds and uploads a complete immutable IVF-Flat segment candidate.
 ///
 /// The operation validates one same-dimensional vector snapshot, trains
@@ -2675,84 +2788,41 @@ pub async fn build_ivf_flat(
     namespace: &str,
     segment_id: &str,
 ) -> Result<IvfFlatIndex> {
-    if vectors.is_empty() {
-        return Err(ZeppelinError::Index(
-            "cannot build index from empty vector set".into(),
-        ));
-    }
-
-    let dim = vectors[0].values.len();
-    if dim == 0 {
-        return Err(ZeppelinError::Index("vector dimension must be > 0".into()));
-    }
-
-    // Validate all dimensions match.
-    for v in vectors.iter() {
-        if v.values.len() != dim {
-            return Err(ZeppelinError::DimensionMismatch {
-                expected: dim,
-                actual: v.values.len(),
-            });
-        }
-    }
-
-    let k = config.default_num_centroids.min(vectors.len());
+    let dim = vectors.first().map_or(0, |vector| vector.values.len());
+    let vec_refs: Vec<&[f32]> = vectors.iter().map(|v| v.values.as_slice()).collect();
+    let partition = partition_vectors(&vec_refs, dim, config)?;
+    let num_clusters = partition.centroids.len();
 
     info!(
         n = vectors.len(),
         dim = dim,
-        k = k,
+        k = num_clusters,
         namespace = namespace,
         segment_id = segment_id,
         "building IVF-Flat index"
     );
 
-    // --- Step 1: Train centroids ---
-    let vec_refs: Vec<&[f32]> = vectors.iter().map(|v| v.values.as_slice()).collect();
-    let centroids = train_kmeans(
-        &vec_refs,
-        dim,
-        k,
-        config.kmeans_max_iterations,
-        config.kmeans_convergence_epsilon,
-    )?;
-
-    let num_clusters = centroids.len();
+    // --- Steps 1-2: Train centroids and assign rows through the shared seam. ---
+    let IvfPartition {
+        centroids,
+        clusters,
+        buddy_affinity,
+        ..
+    } = partition;
     info!(num_clusters = num_clusters, "k-means training complete");
 
-    // --- Step 2: Assign vectors to clusters ---
     let mut cluster_ids: Vec<Vec<String>> = vec![Vec::new(); num_clusters];
     let mut cluster_vecs: Vec<Vec<Vec<f32>>> = vec![Vec::new(); num_clusters];
     let mut cluster_attrs: Vec<Vec<Option<HashMap<String, AttributeValue>>>> =
         vec![Vec::new(); num_clusters];
-    let mut buddy_affinity: Vec<Vec<u32>> = vec![vec![0; num_clusters]; num_clusters];
 
-    for entry in vectors {
-        let mut best_dist = f32::MAX;
-        let mut second_dist = f32::MAX;
-        let mut best_cluster = 0usize;
-        let mut second_cluster = 0usize;
-        for (c, centroid) in centroids.iter().enumerate() {
-            let d = distance::euclidean_distance(&entry.values, centroid);
-            if d < best_dist {
-                second_dist = best_dist;
-                second_cluster = best_cluster;
-                best_dist = d;
-                best_cluster = c;
-            } else if d < second_dist {
-                second_dist = d;
-                second_cluster = c;
-            }
+    for (cluster_idx, rows) in clusters.iter().enumerate() {
+        for &row_idx in rows {
+            let entry = &vectors[row_idx as usize];
+            cluster_ids[cluster_idx].push(entry.id.clone());
+            cluster_vecs[cluster_idx].push(entry.values.clone());
+            cluster_attrs[cluster_idx].push(entry.attributes.clone());
         }
-        if num_clusters > 1 && second_cluster != best_cluster {
-            buddy_affinity[best_cluster][second_cluster] =
-                buddy_affinity[best_cluster][second_cluster].saturating_add(1);
-            buddy_affinity[second_cluster][best_cluster] =
-                buddy_affinity[second_cluster][best_cluster].saturating_add(1);
-        }
-        cluster_ids[best_cluster].push(entry.id.clone());
-        cluster_vecs[best_cluster].push(entry.values.clone());
-        cluster_attrs[best_cluster].push(entry.attributes.clone());
     }
 
     for (i, ids) in cluster_ids.iter().enumerate() {
@@ -3602,6 +3672,31 @@ mod tests {
     //! failed prerequisite stops the test at the exact setup operation.
 
     use super::*;
+
+    /// Pins the extracted partition seam to the pre-refactor assignment shape.
+    ///
+    /// Two duplicate rows on each side of the origin must remain canonical
+    /// single assignments in input order. This fixture also catches centroid
+    /// reordering because `primary` stores the exact deterministic labels.
+    #[test]
+    fn partition_vectors_preserves_pinned_small_assignments() {
+        let values = [
+            vec![-1.0, 0.0],
+            vec![-1.0, 0.0],
+            vec![1.0, 0.0],
+            vec![1.0, 0.0],
+        ];
+        let refs: Vec<&[f32]> = values.iter().map(Vec::as_slice).collect();
+        let mut config = IndexingConfig::default();
+        config.default_num_centroids = 2;
+
+        let partition = partition_vectors(&refs, 2, &config).unwrap();
+
+        assert_eq!(partition.primary, vec![1, 1, 0, 0]);
+        assert_eq!(partition.clusters, vec![vec![2, 3], vec![0, 1]]);
+        assert_eq!(partition.spilled, 0);
+        assert_eq!(partition.buddy_affinity, vec![vec![0, 4], vec![4, 0]]);
+    }
 
     /// Proves current centroid bytes preserve row order, values, and dimension.
     ///
