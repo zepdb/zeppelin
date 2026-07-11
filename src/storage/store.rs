@@ -1199,14 +1199,14 @@ impl ZeppelinStore {
     ///
     /// # Errors
     ///
-    /// An empty prefix returns [`ZeppelinError::Validation`] in release builds.
     /// Invalid prefixes and any paginated listing failure return an error without
     /// exposing a partial key vector.
     ///
     /// # Panics
     ///
-    /// In debug builds, an empty prefix triggers the preceding `debug_assert!`
-    /// to catch accidental root-recursive listing during development.
+    /// An empty prefix panics in every build because unrestricted recursive root
+    /// listing is forbidden. Use [`Self::list_common_prefixes`] for root namespace
+    /// discovery.
     ///
     /// # Side Effects
     ///
@@ -1225,16 +1225,10 @@ impl ZeppelinStore {
     /// [`Self::list_common_prefixes`] for immediate children instead.
     #[instrument(skip(self), fields(prefix = prefix))]
     pub async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        debug_assert!(
+        assert!(
             !prefix.is_empty(),
             "recursive root listing must use list_common_prefixes"
         );
-        if prefix.is_empty() {
-            return Err(ZeppelinError::Validation(
-                "list_prefix requires a non-empty prefix; use list_common_prefixes for namespace discovery"
-                    .to_string(),
-            ));
-        }
 
         let start = std::time::Instant::now();
         use futures::TryStreamExt;
