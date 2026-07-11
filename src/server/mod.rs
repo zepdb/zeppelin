@@ -89,6 +89,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::Router;
 use dashmap::DashMap;
+use futures::StreamExt;
 use tokio::sync::Semaphore;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -546,6 +547,48 @@ pub async fn normalize_error_responses(request: Request<axum::body::Body>, next:
         .map(String::from)
         .or(req_id_hdr);
     handlers::render_status_envelope(status, rid)
+}
+
+/// Rejects a declared oversized request while continuing to drain its body.
+///
+/// [`RequestBodyLimitLayer`] returns immediately when `Content-Length` exceeds
+/// its limit. On HTTP/1, dropping that unread request body can reset the socket
+/// while the client is still uploading, preventing it from observing the 413
+/// response. Retaining and polling the rejected body in a detached task lets
+/// the connection finish the upload or notice that the client stopped after
+/// receiving the response. Bodies without a trustworthy declared length still
+/// flow through the streaming limit layer below this middleware.
+async fn reject_oversized_content_length(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let body_limit = state.config.server.max_request_body_mb * 1024 * 1024;
+    let is_oversized = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > body_limit);
+    if !is_oversized {
+        return next.run(request).await;
+    }
+
+    let body = request.into_body();
+    tokio::spawn(async move {
+        let mut stream = body.into_data_stream();
+        while let Some(frame) = stream.next().await {
+            if let Err(error) = frame {
+                tracing::debug!(
+                    error = %error,
+                    "oversized request body drain stopped before end of stream"
+                );
+                break;
+            }
+        }
+    });
+
+    handlers::render_status_envelope(axum::http::StatusCode::PAYLOAD_TOO_LARGE, None)
 }
 
 /// Admits a query only when an in-flight semaphore permit is immediately free.
@@ -1235,6 +1278,10 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TimeoutLayer::new(timeout))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(RequestBodyLimitLayer::new(body_limit))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            reject_oversized_content_length,
+        ))
         .layer(axum::middleware::from_fn(query_request_id));
 
     // All other routes: full middleware stack with request tracing.
@@ -1301,6 +1348,10 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TimeoutLayer::new(timeout))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(RequestBodyLimitLayer::new(body_limit))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            reject_oversized_content_length,
+        ))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
