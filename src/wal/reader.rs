@@ -21,7 +21,7 @@
 //!                 `-------> fragment bytes
 //!                                |
 //!                                v
-//!                     decode + optional checksum
+//!                     decode + required checksum
 //!                                |
 //!              missing object? --+-- complete ordered results
 //!                     |
@@ -54,8 +54,8 @@
 //!   fragment visible or excuse an authoritative read failure.
 //! - A missing fragment still referenced by a fresh manifest is data loss and
 //!   remains an error. Only an exact ref absent from a fresh manifest is skipped.
-//! - Checked paths validate fragment checksums; unchecked paths are reserved for
-//!   artifacts whose upload path already validated their in-memory contents.
+//! - Every consumed fragment read validates its checksum. Historical method
+//!   names containing `unchecked` remain compatibility aliases only.
 //!
 //! ## Rust concepts used here
 //!
@@ -185,7 +185,7 @@ impl WalReader {
         let data = self
             .read_fragment_bytes(namespace, fragment_id, None)
             .await?;
-        WalFragment::from_bytes(&data)
+        Self::validate_fragment_identity(WalFragment::from_bytes(&data)?, fragment_id)
     }
 
     /// Reads every currently uncompacted fragment in authoritative manifest order.
@@ -296,11 +296,11 @@ impl WalReader {
         Ok(fragments)
     }
 
-    /// Reads and decodes one direct fragment without recomputing its checksum.
+    /// Reads and checksum-validates one directly addressed fragment.
     ///
-    /// This compaction-oriented fast path relies on the fragment having been
-    /// validated before immutable upload. Like [`Self::read_fragment`], it does
-    /// not consult manifest visibility.
+    /// This compatibility alias now validates the checksum because immutable
+    /// upload does not prove that later object-store reads preserved the bytes.
+    /// Like [`Self::read_fragment`], it does not consult manifest visibility.
     ///
     /// # Parameters
     ///
@@ -309,12 +309,11 @@ impl WalReader {
     ///
     /// # Returns
     ///
-    /// The decoded fragment without checksum verification.
+    /// The decoded, checksum-validated fragment.
     ///
     /// # Errors
     ///
-    /// Returns storage and decoding errors, but does not detect byte changes that
-    /// still form a decodable fragment with a stale checksum.
+    /// Returns storage, decoding, and checksum-mismatch errors.
     ///
     /// # Performance
     ///
@@ -323,25 +322,22 @@ impl WalReader {
     ///
     /// # Examples
     ///
-    /// Compaction may use this after selecting a fragment that the write path
-    /// created and validated. An integrity-audit path should use the checked
-    /// method instead.
+    /// Compaction may use this historical entry point after selecting a
+    /// fragment; corruption still fails loud.
     #[instrument(skip(self), fields(namespace = namespace, fragment_id = %fragment_id))]
     pub async fn read_fragment_unchecked(
         &self,
         namespace: &str,
         fragment_id: &Ulid,
     ) -> Result<WalFragment> {
-        let data = self
-            .read_fragment_bytes(namespace, fragment_id, None)
-            .await?;
-        WalFragment::from_bytes_unchecked(&data)
+        self.read_fragment(namespace, fragment_id).await
     }
 
-    /// Reads specific refs in input order without recomputing checksums.
+    /// Reads specific refs in input order with checksum validation.
     ///
     /// Missing-object revalidation, cache behavior, and ordering match
-    /// [`Self::read_fragments_from_refs`]. Only the integrity check differs.
+    /// [`Self::read_fragments_from_refs`]. The historical name remains for API
+    /// compatibility; integrity behavior is now identical.
     ///
     /// # Parameters
     ///
@@ -351,23 +347,23 @@ impl WalReader {
     ///
     /// # Returns
     ///
-    /// Decoded fragments in input order, excluding only verified GC-race misses.
+    /// Checksum-validated fragments in input order, excluding only verified
+    /// GC-race misses.
     ///
     /// # Errors
     ///
-    /// Returns storage, decoding, or still-referenced `NotFound` failures. It
-    /// intentionally does not return checksum mismatches because it does not
-    /// recompute the checksum.
+    /// Returns storage, decoding, checksum, or still-referenced `NotFound`
+    /// failures.
     ///
     /// # Performance
     ///
-    /// Runs cache/S3 reads concurrently and avoids checksum work for every
-    /// fragment. Memory remains proportional to the full batch.
+    /// Runs cache/S3 reads concurrently. Memory remains proportional to the
+    /// full batch.
     ///
     /// # Examples
     ///
-    /// A compaction snapshot can load all selected immutable fragment refs in
-    /// manifest order without paying checksum validation a second time.
+    /// A compaction snapshot loads selected immutable refs in manifest order
+    /// and rejects any payload whose checksum changed after upload.
     #[instrument(skip(self, refs, cache), fields(namespace = namespace, ref_count = refs.len(), cache_enabled = cache.is_some()))]
     pub async fn read_fragments_from_refs_unchecked(
         &self,
@@ -415,8 +411,8 @@ impl WalReader {
     ///
     /// # Errors
     ///
-    /// Propagates unchecked batch-read failures, including a missing fragment
-    /// that remains referenced by a fresh manifest.
+    /// Propagates batch-read failures, including checksum mismatches and a
+    /// missing fragment that remains referenced by a fresh manifest.
     ///
     /// # Side Effects
     ///
@@ -515,10 +511,25 @@ impl WalReader {
         let data = self
             .read_fragment_bytes(namespace, fragment_id, cache)
             .await?;
-        WalFragment::from_bytes(&data)
+        let result = WalFragment::from_bytes(&data)
+            .and_then(|fragment| Self::validate_fragment_identity(fragment, fragment_id));
+        if result.is_err() {
+            if let Some(cache) = cache {
+                let cache_key = Self::fragment_cache_key(fragment_id);
+                if let Err(error) = cache.invalidate(&cache_key).await {
+                    warn!(
+                        namespace,
+                        fragment_id = %fragment_id,
+                        error = %error,
+                        "failed to evict corrupt WAL fragment cache entry"
+                    );
+                }
+            }
+        }
+        result
     }
 
-    /// Reads cached-or-authoritative bytes and decodes them without a checksum pass.
+    /// Reads cached-or-authoritative bytes and validates their checksum.
     ///
     /// # Parameters
     ///
@@ -528,26 +539,37 @@ impl WalReader {
     ///
     /// # Returns
     ///
-    /// A decoded fragment whose stored checksum has not been verified here.
+    /// A decoded, checksum-validated fragment.
     ///
     /// # Errors
     ///
-    /// Propagates authoritative read and decoding failures.
+    /// Propagates authoritative read, decoding, and checksum failures.
     ///
     /// # Examples
     ///
-    /// Compaction uses this wrapper when immutable write-path validation makes a
-    /// second checksum pass unnecessary.
+    /// Compatibility callers use this wrapper, but immutable write-path
+    /// validation never substitutes for validating bytes read back from S3.
     async fn read_fragment_unchecked_with_cache(
         &self,
         namespace: &str,
         fragment_id: &Ulid,
         cache: Option<&Arc<DiskCache>>,
     ) -> Result<WalFragment> {
-        let data = self
-            .read_fragment_bytes(namespace, fragment_id, cache)
-            .await?;
-        WalFragment::from_bytes_unchecked(&data)
+        self.read_fragment_with_cache(namespace, fragment_id, cache)
+            .await
+    }
+
+    fn validate_fragment_identity(
+        fragment: WalFragment,
+        expected_id: &Ulid,
+    ) -> Result<WalFragment> {
+        if fragment.id != *expected_id {
+            return Err(ZeppelinError::Serialization(format!(
+                "WAL fragment id mismatch: key requested {expected_id}, payload contained {}",
+                fragment.id
+            )));
+        }
+        Ok(fragment)
     }
 
     /// Resolves immutable fragment bytes from cache first and S3 after a miss.

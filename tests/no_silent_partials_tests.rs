@@ -5,6 +5,8 @@ mod common;
 use common::server::{cleanup_ns, create_ns_api_with, start_test_server_with_compactor};
 
 use serde_json::{json, Value};
+use std::sync::Arc;
+use zeppelin::cache::DiskCache;
 use zeppelin::config::Config;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::types::{AttributeValue, VectorEntry};
@@ -310,6 +312,166 @@ async fn test_wal_fragment_notfound_still_referenced_is_error_not_skip() {
         gc_race_metric_value(&ns),
         before,
         "an errored (non-tolerated) NotFound must NOT increment the GC-race metric"
+    );
+
+    harness.cleanup().await;
+}
+
+/// A consumed WAL path may keep its historical "unchecked" API name, but it
+/// must still reject structurally valid bytes whose stored checksum no longer
+/// matches the payload. Object-store immutability does not prove integrity.
+#[tokio::test]
+async fn test_consumed_wal_read_rejects_checksum_mismatch() {
+    let harness = common::harness::TestHarness::new().await;
+    let ns = harness.key("wal-checksum-mismatch");
+    Manifest::new().write(&harness.store, &ns).await.unwrap();
+
+    let writer = WalWriter::new(harness.store.clone());
+    writer
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "checksum_target".to_string(),
+                values: vec![1.0, 2.0, 3.0, 4.0],
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    let refs = manifest.uncompacted_fragments().to_vec();
+    assert_eq!(refs.len(), 1);
+    let key = WalFragment::s3_key(&ns, &refs[0].id);
+    let mut corrupted = harness.store.get(&key).await.unwrap().to_vec();
+    let needle = b"checksum_target";
+    let offset = corrupted
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("serialized WAL must contain the vector id");
+    corrupted[offset] = b'd';
+
+    assert!(WalFragment::from_bytes_unchecked(&corrupted).is_ok());
+    assert!(matches!(
+        WalFragment::from_bytes(&corrupted),
+        Err(zeppelin::error::ZeppelinError::ChecksumMismatch { .. })
+    ));
+    harness
+        .store
+        .put(&key, bytes::Bytes::from(corrupted))
+        .await
+        .unwrap();
+
+    let result = WalReader::new(harness.store.clone())
+        .read_fragments_from_refs_unchecked(&ns, &refs, None)
+        .await;
+    assert!(matches!(
+        result,
+        Err(zeppelin::error::ZeppelinError::ChecksumMismatch { .. })
+    ));
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_consumed_wal_read_rejects_payload_id_mismatch() {
+    let harness = common::harness::TestHarness::new().await;
+    let ns = harness.key("wal-payload-id-mismatch");
+    Manifest::new().write(&harness.store, &ns).await.unwrap();
+
+    WalWriter::new(harness.store.clone())
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "identity_target".to_string(),
+                values: vec![1.0, 2.0, 3.0, 4.0],
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    let refs = manifest.uncompacted_fragments().to_vec();
+    let key = WalFragment::s3_key(&ns, &refs[0].id);
+    let bytes = harness.store.get(&key).await.unwrap();
+    let mut fragment = WalFragment::from_bytes(&bytes).unwrap();
+    fragment.id = ulid::Ulid::new();
+    assert!(fragment.validate_checksum().is_ok());
+    harness
+        .store
+        .put(&key, fragment.to_bytes().unwrap())
+        .await
+        .unwrap();
+
+    let result = WalReader::new(harness.store.clone())
+        .read_fragments_from_refs_unchecked(&ns, &refs, None)
+        .await;
+    assert!(matches!(
+        result,
+        Err(zeppelin::error::ZeppelinError::Serialization(message))
+            if message.contains("WAL fragment id mismatch")
+    ));
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_checksum_failure_evicts_poisoned_wal_cache_entry() {
+    let harness = common::harness::TestHarness::new().await;
+    let ns = harness.key("wal-cache-checksum-mismatch");
+    Manifest::new().write(&harness.store, &ns).await.unwrap();
+
+    WalWriter::new(harness.store.clone())
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "cache_target".to_string(),
+                values: vec![1.0, 2.0, 3.0, 4.0],
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    let refs = manifest.uncompacted_fragments().to_vec();
+    let key = WalFragment::s3_key(&ns, &refs[0].id);
+    let correct = harness.store.get(&key).await.unwrap();
+    let mut corrupted = correct.to_vec();
+    let needle = b"cache_target";
+    let offset = corrupted
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("serialized WAL must contain the vector id");
+    corrupted[offset] = b'd';
+    harness
+        .store
+        .put(&key, bytes::Bytes::from(corrupted))
+        .await
+        .unwrap();
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 1024 * 1024).unwrap(),
+    );
+    let reader = WalReader::new(harness.store.clone());
+    let first = reader
+        .read_fragments_from_refs_unchecked(&ns, &refs, Some(&cache))
+        .await;
+    assert!(matches!(
+        first,
+        Err(zeppelin::error::ZeppelinError::ChecksumMismatch { .. })
+    ));
+
+    harness.store.put(&key, correct).await.unwrap();
+    let second = reader
+        .read_fragments_from_refs_unchecked(&ns, &refs, Some(&cache))
+        .await;
+    assert!(
+        second.is_ok(),
+        "a later read must refetch after corrupt cache eviction: {second:?}"
     );
 
     harness.cleanup().await;
