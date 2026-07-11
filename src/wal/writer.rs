@@ -13,7 +13,7 @@
 //! concurrent appends for one namespace
 //!        |            |            |
 //!        v            v            v
-//! upload fragment  upload fragment  upload fragment   (immutable, not visible)
+//! upload + verify  upload + verify  upload + verify   (immutable, not visible)
 //!        |            |            |
 //!        `------------+------------'
 //!                     v
@@ -52,8 +52,9 @@
 //!
 //! ## Invariants
 //!
-//! - Fragment PUT precedes manifest publication. Only a successful manifest CAS
-//!   makes the immutable object visible to readers.
+//! - Fragment PUT and an authoritative exact-byte GET verification precede
+//!   manifest publication. Only a successful manifest CAS makes the verified
+//!   immutable object visible to readers.
 //! - Batched appends share a manifest CAS only when their optional fencing tokens
 //!   are equal; mixing generations would let stale work ride with current work.
 //! - Fencing and CAS are both required. A token check alone has a time-of-check /
@@ -358,9 +359,10 @@ impl WalWriter {
     /// Uploads one immutable fragment and group-commits its manifest reference.
     ///
     /// The upload occurs before local leader election so concurrent fragment PUTs
-    /// can overlap. A successful PUT is durable but not visible. The append then
-    /// queues its ref, participates in same-token group commit, and returns only
-    /// after a manifest CAS references its fragment.
+    /// can overlap. The writer then reads the requested key from authoritative
+    /// storage and requires its bytes to match exactly. Only a verified fragment
+    /// is queued for same-token group commit, and the append returns only after a
+    /// manifest CAS references it.
     ///
     /// With `Some(token)`, publication applies two defenses:
     ///
@@ -391,9 +393,10 @@ impl WalWriter {
     ///
     /// # Errors
     ///
-    /// Returns validation when an ID is both upserted and deleted, serialization
-    /// or fragment PUT failures before queueing, and manifest publication errors
-    /// after upload. A missing manifest becomes
+    /// Returns validation when an ID is both upserted and deleted, serialization,
+    /// fragment PUT, or authoritative post-PUT verification failures before
+    /// queueing, and manifest publication errors after upload. A missing manifest
+    /// becomes
     /// [`ZeppelinError::ManifestNotFound`]; a higher manifest token becomes
     /// [`ZeppelinError::FencingTokenStale`]; exhausted CAS retries become
     /// [`ZeppelinError::ManifestConflict`]. Some other manifest read/write errors
@@ -410,25 +413,28 @@ impl WalWriter {
     /// # Side Effects
     ///
     /// Increments `WAL_APPENDS_TOTAL` before validation, creates one ULID, uploads
-    /// one complete fragment, mutates the process-local group queue, and may lead
-    /// one or more manifest GET/CAS rounds. Success advances manifest sequence
-    /// numbers and can publish other same-token waiters at the same time.
+    /// and authoritatively verifies one complete fragment, mutates the
+    /// process-local group queue, and may lead one or more manifest GET/CAS
+    /// rounds. Success advances manifest sequence numbers and can publish other
+    /// same-token waiters at the same time.
     ///
     /// # Consistency
     ///
-    /// The fragment is invisible between its PUT and successful manifest CAS.
-    /// Grouping never crosses fencing-token options. The returned success is the
-    /// acknowledgment boundary: it proves the fragment is durable and referenced
-    /// by the committed manifest observed by this operation.
+    /// The fragment is invisible between its verified upload and successful
+    /// manifest CAS. Grouping never crosses fencing-token options. The returned
+    /// success is the acknowledgment boundary: it proves the requested key held
+    /// the exact encoded bytes before the fragment was referenced by the committed
+    /// manifest observed by this operation.
     ///
     /// # Performance
     ///
-    /// Serializes and uploads the whole fragment once. Group commit can reduce N
-    /// concurrent same-instance appends from N manifest writes toward one, though
-    /// scheduling may produce multiple batches. CAS conflicts use bounded
-    /// exponential backoff and repeat a full manifest GET and serialization. A
-    /// non-conflict CAS error adds one authoritative GET to resolve whether the
-    /// atomic batch committed before its acknowledgement was lost.
+    /// Serializes and uploads the whole fragment once, then downloads it once for
+    /// exact-byte verification. Group commit can reduce N concurrent same-instance
+    /// appends from N manifest writes toward one, though scheduling may produce
+    /// multiple batches. CAS conflicts use bounded exponential backoff and repeat
+    /// a full manifest GET and serialization. A non-conflict CAS error adds one
+    /// authoritative GET to resolve whether the atomic batch committed before its
+    /// acknowledgement was lost.
     ///
     /// # Examples
     ///
@@ -471,7 +477,39 @@ impl WalWriter {
         let key = WalFragment::s3_key(namespace, &fragment.id);
         let data = fragment.to_bytes()?;
         let size_bytes = data.len() as u64;
-        self.store.put(&key, data).await?;
+        self.store.put(&key, data.clone()).await?;
+
+        // A successful object-store reply alone cannot prove that a faulty or
+        // misconfigured backend wrote the requested immutable key. Read S3 back
+        // before the ref can enter group commit and require the complete wire
+        // bytes to match. Any verification failure is a definite unpublished
+        // outcome, so exact-key cleanup is safe and the append fails loudly.
+        match self.store.get(&key).await {
+            Ok(authoritative) if authoritative == data => {}
+            Ok(authoritative) => {
+                error!(
+                    namespace,
+                    key,
+                    expected_size = data.len(),
+                    actual_size = authoritative.len(),
+                    "authoritative WAL bytes differ after acknowledged PUT"
+                );
+                self.cleanup_orphan_fragment(namespace, &key).await;
+                return Err(ZeppelinError::Index(format!(
+                    "WAL durability verification failed for {key}: authoritative bytes differ"
+                )));
+            }
+            Err(verification_error) => {
+                error!(
+                    namespace,
+                    key,
+                    error = %verification_error,
+                    "authoritative WAL read failed after acknowledged PUT"
+                );
+                self.cleanup_orphan_fragment(namespace, &key).await;
+                return Err(verification_error);
+            }
+        }
 
         debug!(
             fragment_id = %fragment.id,
