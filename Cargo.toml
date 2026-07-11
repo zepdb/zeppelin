@@ -99,6 +99,7 @@ rand = "0.8"
 tempfile = "3"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+tokio-util = "0.7"
 
 [[bench]]
 name = "core_benchmarks"

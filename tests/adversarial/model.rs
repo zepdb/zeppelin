@@ -12,6 +12,7 @@ pub enum AmbiguityReason {
     ConnectionError,
     JsonParse,
     ServerError { status: u16 },
+    ServerCrashed,
 }
 
 impl AmbiguityReason {
@@ -22,6 +23,7 @@ impl AmbiguityReason {
             Self::ConnectionError => "connection_error".to_string(),
             Self::JsonParse => "json_parse".to_string(),
             Self::ServerError { status } => format!("server_error_{status}"),
+            Self::ServerCrashed => "server_crashed".to_string(),
         }
     }
 }
@@ -68,6 +70,7 @@ pub enum OracleMutation {
     PostCommitLostWrite,
     IndetResolutionLie,
     DroppedResponseLostWrite,
+    CrashLostAck,
 }
 
 impl OracleMutation {
@@ -85,6 +88,7 @@ impl OracleMutation {
             "post-commit-lost-write" => Self::PostCommitLostWrite,
             "indet-resolution-lie" => Self::IndetResolutionLie,
             "dropped-response-lost-write" => Self::DroppedResponseLostWrite,
+            "crash-lost-ack" => Self::CrashLostAck,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -103,6 +107,7 @@ impl OracleMutation {
             Self::PostCommitLostWrite => "post-commit-lost-write",
             Self::IndetResolutionLie => "indet-resolution-lie",
             Self::DroppedResponseLostWrite => "dropped-response-lost-write",
+            Self::CrashLostAck => "crash-lost-ack",
         }
     }
 }
@@ -422,7 +427,9 @@ impl Model {
             }
             OpOutcome::NotApplied { .. } => {}
             OpOutcome::Ambiguous { reason, .. } => {
-                if mutation != Some(OracleMutation::PostCommitLostWrite) {
+                if mutation == Some(OracleMutation::CrashLostAck) {
+                    self.apply(op, 200, gen_after, &serde_json::Value::Null, mutation);
+                } else if mutation != Some(OracleMutation::PostCommitLostWrite) {
                     self.record_indeterminate(op, op_index, reason);
                     if mutation == Some(OracleMutation::IndetResolutionLie) {
                         self.corrupt_indeterminate_candidate(op);

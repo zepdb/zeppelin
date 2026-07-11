@@ -15,6 +15,9 @@ use super::{
     StoreFaultAction, TimelineEvent,
 };
 use crate::adversarial::chaos::StoreOp;
+use crate::adversarial::faults::process::{
+    CrashPoint, CrashRequest, ProcessController, TriggerPosition,
+};
 
 #[derive(Debug)]
 pub struct StoreFaultProxy {
@@ -72,6 +75,16 @@ impl StoreFaultProxy {
                 Ok(())
             }
             FaultKind::PostCommitFail { .. } | FaultKind::TruncatedGetStream { .. } => Ok(()),
+            FaultKind::CrashAt {
+                point,
+                position: TriggerPosition::Pre,
+            } => Err(self
+                .trigger_crash(action, key, point, TriggerPosition::Pre)
+                .await),
+            FaultKind::CrashAt {
+                position: TriggerPosition::Post,
+                ..
+            } => Ok(()),
             _ => panic!(
                 "client HTTP fault {:?} reached the object-store proxy",
                 action.kind
@@ -112,6 +125,31 @@ impl StoreFaultProxy {
             Some("inner mutation completed; acknowledgement replaced".to_string()),
         );
         injected_error(error, key)
+    }
+
+    fn process_controller(&self) -> ProcessController {
+        self.scheduler
+            .process_controller()
+            .expect("CrashAt action requires a process controller")
+    }
+
+    async fn trigger_crash(
+        &self,
+        action: &StoreFaultAction,
+        key: &str,
+        point: CrashPoint,
+        position: TriggerPosition,
+    ) -> object_store::Error {
+        let controller = self.process_controller();
+        controller.request_crash(CrashRequest {
+            event_id: action.event_id.clone(),
+            op_index: action.op_index,
+            point,
+            position,
+            key: key.to_string(),
+        });
+        controller.park_token.cancelled().await;
+        injected_error(InjectedErrorKind::Generic, key)
     }
 }
 
@@ -216,6 +254,18 @@ impl ObjectStore for StoreFaultProxy {
                     Err(error) => Err(error),
                 };
             }
+            if let FaultKind::CrashAt {
+                point,
+                position: TriggerPosition::Post,
+            } = action.kind
+            {
+                return match self.inner.put_opts(location, payload, opts).await {
+                    Ok(_) => Err(self
+                        .trigger_crash(&action, &key, point, TriggerPosition::Post)
+                        .await),
+                    Err(error) => Err(error),
+                };
+            }
             self.apply_before(&action, &key).await?;
         }
         self.inner.put_opts(location, payload, opts).await
@@ -243,6 +293,18 @@ impl ObjectStore for StoreFaultProxy {
                 );
                 return Ok(truncated_result(result, after_bytes, key));
             }
+            if let FaultKind::CrashAt {
+                point,
+                position: TriggerPosition::Post,
+            } = action.kind
+            {
+                return match self.inner.get_opts(location, options).await {
+                    Ok(_) => Err(self
+                        .trigger_crash(&action, &key, point, TriggerPosition::Post)
+                        .await),
+                    Err(error) => Err(error),
+                };
+            }
             self.apply_before(&action, &key).await?;
         }
         self.inner.get_opts(location, options).await
@@ -262,6 +324,18 @@ impl ObjectStore for StoreFaultProxy {
             if matches!(action.kind, FaultKind::PostCommitFail { .. }) {
                 return match self.inner.delete(location).await {
                     Ok(()) => Err(self.post_commit_error(&action, &key)),
+                    Err(error) => Err(error),
+                };
+            }
+            if let FaultKind::CrashAt {
+                point,
+                position: TriggerPosition::Post,
+            } = action.kind
+            {
+                return match self.inner.delete(location).await {
+                    Ok(()) => Err(self
+                        .trigger_crash(&action, &key, point, TriggerPosition::Post)
+                        .await),
                     Err(error) => Err(error),
                 };
             }
@@ -341,6 +415,18 @@ impl ObjectStore for StoreFaultProxy {
                     Err(error) => Err(error),
                 };
             }
+            if let FaultKind::CrashAt {
+                point,
+                position: TriggerPosition::Post,
+            } = action.kind
+            {
+                return match self.inner.copy(from, to).await {
+                    Ok(()) => Err(self
+                        .trigger_crash(&action, &key, point, TriggerPosition::Post)
+                        .await),
+                    Err(error) => Err(error),
+                };
+            }
             self.apply_before(&action, &key).await?;
         }
         self.inner.copy(from, to).await
@@ -355,10 +441,169 @@ impl ObjectStore for StoreFaultProxy {
                     Err(error) => Err(error),
                 };
             }
+            if let FaultKind::CrashAt {
+                point,
+                position: TriggerPosition::Post,
+            } = action.kind
+            {
+                return match self.inner.copy_if_not_exists(from, to).await {
+                    Ok(()) => Err(self
+                        .trigger_crash(&action, &key, point, TriggerPosition::Post)
+                        .await),
+                    Err(error) => Err(error),
+                };
+            }
             self.apply_before(&action, &key).await?;
         }
         self.inner.copy_if_not_exists(from, to).await
     }
+}
+
+pub async fn run_crash_matrix() {
+    use bytes::Bytes;
+    use object_store::memory::InMemory;
+
+    let points = [
+        CrashPoint::WalFragmentPut,
+        CrashPoint::ManifestCas,
+        CrashPoint::SegmentPut,
+        CrashPoint::StagingSideObjectPut,
+        CrashPoint::StagingDrop,
+        CrashPoint::CloneCopy { nth: 1 },
+        CrashPoint::NamespaceDeleteBatch { nth: 1 },
+        CrashPoint::SnapshotPut,
+        CrashPoint::HydrationGet,
+    ];
+    for point in points {
+        for position in [TriggerPosition::Pre, TriggerPosition::Post] {
+            let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+            let key = crash_matrix_key(point);
+            let copy_source = "matrix/segments/source.bin";
+            if matches!(
+                point,
+                CrashPoint::StagingDrop
+                    | CrashPoint::NamespaceDeleteBatch { .. }
+                    | CrashPoint::HydrationGet
+            ) {
+                inner
+                    .put(&key, Bytes::from_static(b"before"))
+                    .await
+                    .unwrap();
+            }
+            if matches!(point, CrashPoint::CloneCopy { .. }) {
+                inner
+                    .put(copy_source, Bytes::from_static(b"copy-source"))
+                    .await
+                    .unwrap();
+            }
+            let (store_op, key_substring, _) = point.selector();
+            let scheduler =
+                FaultScheduler::from_schedule(crate::adversarial::faults::FaultSchedule {
+                    profile: crate::adversarial::faults::FaultProfile::Crash,
+                    events: vec![crate::adversarial::faults::FaultEvent {
+                        id: "crash-00".to_string(),
+                        start_op: 0,
+                        end_op: None,
+                        boundary: Boundary::Process,
+                        target: crate::adversarial::faults::TargetSelector {
+                            store_op: Some(store_op),
+                            key_substring: Some(key_substring.to_string()),
+                            ..crate::adversarial::faults::TargetSelector::default()
+                        },
+                        kind: FaultKind::CrashAt { point, position },
+                    }],
+                });
+            let controller = scheduler.process_controller().unwrap();
+            let faulted = store_fault_proxy(&inner, scheduler);
+            let task_key = key.clone();
+            let task = tokio::spawn(async move {
+                match point {
+                    CrashPoint::WalFragmentPut
+                    | CrashPoint::ManifestCas
+                    | CrashPoint::SegmentPut
+                    | CrashPoint::StagingSideObjectPut
+                    | CrashPoint::SnapshotPut => {
+                        faulted.put(&task_key, Bytes::from_static(b"after")).await
+                    }
+                    CrashPoint::StagingDrop | CrashPoint::NamespaceDeleteBatch { .. } => {
+                        faulted.delete(&task_key).await
+                    }
+                    CrashPoint::CloneCopy { .. } => {
+                        faulted
+                            .copy_if_not_exists(copy_source, &task_key, "matrix")
+                            .await
+                    }
+                    CrashPoint::HydrationGet => faulted.get(&task_key).await.map(|_| ()),
+                }
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                controller.crash_requested.notified(),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("crash matrix point {point:?}/{position:?} did not fire"));
+            let request = controller.take_request();
+            assert_eq!(request.point, point);
+            assert_eq!(request.position, position);
+            controller.park_token.cancel();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("crash matrix point {point:?}/{position:?} leaked parked work")
+                })
+                .unwrap();
+            assert!(result.is_err());
+
+            let inner_exists = inner.exists(&key).await.unwrap();
+            match (point, position) {
+                (
+                    CrashPoint::WalFragmentPut
+                    | CrashPoint::ManifestCas
+                    | CrashPoint::SegmentPut
+                    | CrashPoint::StagingSideObjectPut
+                    | CrashPoint::SnapshotPut
+                    | CrashPoint::CloneCopy { .. },
+                    TriggerPosition::Pre,
+                ) => assert!(!inner_exists),
+                (
+                    CrashPoint::WalFragmentPut
+                    | CrashPoint::ManifestCas
+                    | CrashPoint::SegmentPut
+                    | CrashPoint::StagingSideObjectPut
+                    | CrashPoint::SnapshotPut
+                    | CrashPoint::CloneCopy { .. },
+                    TriggerPosition::Post,
+                ) => assert!(inner_exists),
+                (
+                    CrashPoint::StagingDrop | CrashPoint::NamespaceDeleteBatch { .. },
+                    TriggerPosition::Pre,
+                ) => assert!(inner_exists),
+                (
+                    CrashPoint::StagingDrop | CrashPoint::NamespaceDeleteBatch { .. },
+                    TriggerPosition::Post,
+                ) => assert!(!inner_exists),
+                (CrashPoint::HydrationGet, _) => assert!(inner_exists),
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), inner.head(&key))
+                .await
+                .expect("store remained blocked after crash cancellation")
+                .ok();
+        }
+    }
+}
+
+fn crash_matrix_key(point: CrashPoint) -> String {
+    match point {
+        CrashPoint::WalFragmentPut => "matrix/wal/first.wal",
+        CrashPoint::ManifestCas => "matrix/manifest.json",
+        CrashPoint::SegmentPut => "matrix/segments/output.bin",
+        CrashPoint::StagingSideObjectPut | CrashPoint::StagingDrop => "matrix/_staging/1.json",
+        CrashPoint::CloneCopy { .. } => "matrix/segments/copied.bin",
+        CrashPoint::NamespaceDeleteBatch { .. } => "matrix/delete/me.bin",
+        CrashPoint::SnapshotPut => "matrix/snapshots/pin.msgpack",
+        CrashPoint::HydrationGet => "matrix/segments/segment/cluster_0.bin",
+    }
+    .to_string()
 }
 
 #[cfg(test)]

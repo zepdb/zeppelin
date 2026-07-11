@@ -22,6 +22,7 @@ use super::artifacts::{
 };
 use super::chaos::{chaos_store, ChaosHandle, FaultPlan, FiredFault};
 use super::faults::http_proxy::HttpFaultInjector;
+use super::faults::process::{CrashRequest, ProcessController, TriggerPosition};
 use super::faults::store_proxy::store_fault_proxy;
 use super::faults::{
     Boundary, FaultKind, FaultProfile, FaultSchedule, FaultScheduler, FaultSemantics,
@@ -344,7 +345,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     } else {
         None
     };
-    let http_fault_context =
+    let mut http_fault_context =
         scheduler
             .as_ref()
             .zip(injector.as_ref())
@@ -392,6 +393,12 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             replay_lost_ack,
         )
         .await;
+        let pending_crash = step.crash.clone().or_else(|| {
+            scheduler
+                .as_ref()
+                .and_then(FaultScheduler::process_controller)
+                .and_then(|controller| controller.try_take_request())
+        });
         assert_eq!(
             step.post_commit_ack_lost, replay_lost_ack,
             "replay could not reproduce the recorded post-commit acknowledgement loss"
@@ -423,6 +430,36 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             failed = true;
             failure_violations = step.violations;
             break;
+        }
+        if let Some(crash) = pending_crash {
+            let scheduler = scheduler
+                .as_ref()
+                .expect("replayed process crash requires a scheduler");
+            let controller = scheduler
+                .process_controller()
+                .expect("replayed process crash requires a controller");
+            let recovery = restart_after_crash(
+                &mut server,
+                &controller,
+                scheduler,
+                &mut injector,
+                &mut http_fault_context,
+                &store,
+                &harness.store,
+                &prefix,
+                &config,
+                true,
+                &client,
+                &model,
+                source.index,
+                crash,
+            )
+            .await;
+            if !recovery.is_empty() {
+                failed = true;
+                failure_violations = recovery;
+                break;
+            }
         }
     }
 
@@ -611,13 +648,7 @@ async fn start_http_fault_injector(base_url: &str) -> Arc<HttpFaultInjector> {
     )
 }
 
-async fn stop_scheduled_faults(
-    scheduler: Option<&FaultScheduler>,
-    injector: &mut Option<Arc<HttpFaultInjector>>,
-) {
-    if let Some(scheduler) = scheduler {
-        scheduler.quiesce();
-    }
+async fn shutdown_http_fault_injector(injector: &mut Option<Arc<HttpFaultInjector>>) {
     if let Some(injector) = injector.take() {
         injector.disarm();
         Arc::try_unwrap(injector)
@@ -625,6 +656,125 @@ async fn stop_scheduled_faults(
             .shutdown()
             .await;
     }
+}
+
+async fn stop_scheduled_faults(
+    scheduler: Option<&FaultScheduler>,
+    injector: &mut Option<Arc<HttpFaultInjector>>,
+) {
+    if let Some(scheduler) = scheduler {
+        scheduler.quiesce();
+    }
+    shutdown_http_fault_injector(injector).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restart_after_crash(
+    server: &mut FullTestServer,
+    controller: &ProcessController,
+    scheduler: &FaultScheduler,
+    injector: &mut Option<Arc<HttpFaultInjector>>,
+    http_fault_context: &mut Option<HttpFaultContext>,
+    server_store: &ZeppelinStore,
+    bookkeeping_store: &ZeppelinStore,
+    prefix: &str,
+    config: &Config,
+    spawn_compaction_loop: bool,
+    client: &Client,
+    model: &Model,
+    op_index: u64,
+    crash: CrashRequest,
+) -> Vec<Violation> {
+    *http_fault_context = None;
+    server.abort();
+    controller.park_token.cancel();
+    shutdown_http_fault_injector(injector).await;
+
+    *server = start_test_server_full(
+        server_store.clone(),
+        Some(prefix.to_string()),
+        config.clone(),
+        spawn_compaction_loop,
+    )
+    .await;
+    wait_for_health(client, &server.base_url).await;
+    scheduler.record(TimelineEvent {
+        event_id: crash.event_id,
+        op_index: crash.op_index,
+        wall_ms: scheduler.wall_ms(),
+        boundary: Boundary::Process,
+        action: format!("crash@{:?}/{:?}", crash.point, crash.position),
+        key: Some(crash.key),
+        semantics: match crash.position {
+            TriggerPosition::Pre => FaultSemantics::PreCall,
+            TriggerPosition::Post => FaultSemantics::PostCommit,
+        },
+        observed: ObservedResult::Ambiguous,
+        recovery: Some("restart+health-wait".to_string()),
+    });
+    scheduler.reset_process_controller();
+
+    let new_injector = start_http_fault_injector(&server.base_url).await;
+    *http_fault_context = Some(HttpFaultContext {
+        scheduler: scheduler.clone(),
+        injector: Arc::clone(&new_injector),
+        bookkeeping_store: bookkeeping_store.clone(),
+        direct_base_url: server.base_url.clone(),
+        proxy_base_url: new_injector.base_url(),
+    });
+    *injector = Some(new_injector);
+
+    crash_recovery_probe(client, server, model, op_index).await
+}
+
+async fn wait_for_health(client: &Client, base_url: &str) {
+    let url = format!("{base_url}/healthz");
+    for _ in 0..50 {
+        if client
+            .get(&url)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("replacement test server never became healthy at {url}");
+}
+
+async fn crash_recovery_probe(
+    client: &Client,
+    server: &FullTestServer,
+    model: &Model,
+    op_index: u64,
+) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for (namespace, ns_model) in &model.namespaces {
+        let response = client
+            .get(format!("{}/v1/namespaces/{namespace}", server.base_url))
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("crash recovery namespace probe failed for {namespace}: {error}")
+            });
+        let status = response.status().as_u16();
+        let namespace_ambiguous = !ns_model.indeterminate_ns.is_empty();
+        if status == 200 || (namespace_ambiguous && status == 404) {
+            continue;
+        }
+        violations.push(Violation {
+            id: ViolationId::I19CrashRecovery,
+            op_index,
+            namespace: namespace.clone(),
+            detail: "modeled-live namespace was unavailable after restart".to_string(),
+            evidence: json!({
+                "status": status,
+                "namespace_ambiguous": namespace_ambiguous,
+            }),
+        });
+    }
+    violations
 }
 
 async fn stop_chaos_and_background(server: &mut FullTestServer, chaos: Option<&ChaosHandle>) {
@@ -1060,6 +1210,7 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 OracleMutation::PostCommitLostWrite,
                 OracleMutation::IndetResolutionLie,
                 OracleMutation::DroppedResponseLostWrite,
+                OracleMutation::CrashLostAck,
             ]
         },
         |mutation| vec![mutation],
@@ -1126,6 +1277,7 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             OracleMutation::DroppedResponseLostWrite => {
                 fired.contains(&ViolationId::I18IndeterminateResolution)
             }
+            OracleMutation::CrashLostAck => fired.contains(&ViolationId::I16Quiescence),
         };
         assert!(
             accepted,
@@ -1158,11 +1310,16 @@ async fn run_seed(
         mutation.or(selftest_probe),
         Some(OracleMutation::DroppedResponseLostWrite)
     );
+    let crash_lost_ack_selftest = matches!(
+        mutation.or(selftest_probe),
+        Some(OracleMutation::CrashLostAck)
+    );
     let profile = scheduled_profile(env.profile);
     let mode = if profile.is_some()
         || mutation == Some(OracleMutation::ChaosLostWrite)
         || post_commit_selftest
         || dropped_response_selftest
+        || crash_lost_ack_selftest
     {
         RunMode::Chaos
     } else {
@@ -1172,14 +1329,21 @@ async fn run_seed(
     let prefix = harness.prefix.clone();
     let mut generator = AdversarialGenerator::new(seed, &prefix);
     let specs = generator.specs();
-    let scheduler = if dropped_response_selftest {
+    let scheduler = if crash_lost_ack_selftest {
+        Some(FaultScheduler::from_schedule(
+            FaultSchedule::crash_lost_ack_selftest(),
+        ))
+    } else if dropped_response_selftest {
         Some(FaultScheduler::from_schedule(
             FaultSchedule::dropped_response_selftest(),
         ))
     } else {
         profile.map(|profile| FaultScheduler::for_seed(seed, profile))
     };
-    let chaos_plan = if mutation == Some(OracleMutation::DroppedResponseLostWrite) {
+    let chaos_plan = if matches!(
+        mutation,
+        Some(OracleMutation::DroppedResponseLostWrite | OracleMutation::CrashLostAck)
+    ) {
         Some(FaultPlan::lost_write_selftest())
     } else if mode == RunMode::Chaos && scheduler.is_none() {
         Some(if mutation == Some(OracleMutation::ChaosLostWrite) {
@@ -1229,7 +1393,7 @@ async fn run_seed(
     } else {
         None
     };
-    let http_fault_context =
+    let mut http_fault_context =
         scheduler
             .as_ref()
             .zip(injector.as_ref())
@@ -1278,6 +1442,12 @@ async fn run_seed(
             inject_post_commit_ack_loss,
         )
         .await;
+        let pending_crash = step.crash.clone().or_else(|| {
+            scheduler
+                .as_ref()
+                .and_then(FaultScheduler::process_controller)
+                .and_then(|controller| controller.try_take_request())
+        });
         post_commit_ack_loss_fired |= step.post_commit_ack_lost;
         if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
             let ns = op.namespace().to_string();
@@ -1308,6 +1478,36 @@ async fn run_seed(
             failure_violations = step.violations;
             break;
         }
+        if let Some(crash) = pending_crash {
+            let scheduler = scheduler
+                .as_ref()
+                .expect("process crash requires a fault scheduler");
+            let controller = scheduler
+                .process_controller()
+                .expect("process crash requires a process controller");
+            let recovery = restart_after_crash(
+                &mut server,
+                &controller,
+                scheduler,
+                &mut injector,
+                &mut http_fault_context,
+                &store,
+                &harness.store,
+                &prefix,
+                &config,
+                true,
+                &client,
+                &model,
+                op_index,
+                crash,
+            )
+            .await;
+            if !recovery.is_empty() {
+                failed = true;
+                failure_violations = recovery;
+                break;
+            }
+        }
 
         if let Some(probe) = selftest_probe {
             if let Some(probe_op) = selftest_probe_op(probe, &op, &model, &mut generator) {
@@ -1331,12 +1531,48 @@ async fn run_seed(
                     inject_post_commit_ack_loss,
                 )
                 .await;
+                let pending_crash = step.crash.clone().or_else(|| {
+                    scheduler
+                        .as_ref()
+                        .and_then(FaultScheduler::process_controller)
+                        .and_then(|controller| controller.try_take_request())
+                });
                 post_commit_ack_loss_fired |= step.post_commit_ack_lost;
                 op_index += 1;
                 if !step.violations.is_empty() {
                     failed = true;
                     failure_violations = step.violations;
                     break;
+                }
+                if let Some(crash) = pending_crash {
+                    let scheduler = scheduler
+                        .as_ref()
+                        .expect("process crash requires a fault scheduler");
+                    let controller = scheduler
+                        .process_controller()
+                        .expect("process crash requires a process controller");
+                    let recovery = restart_after_crash(
+                        &mut server,
+                        &controller,
+                        scheduler,
+                        &mut injector,
+                        &mut http_fault_context,
+                        &store,
+                        &harness.store,
+                        &prefix,
+                        &config,
+                        true,
+                        &client,
+                        &model,
+                        op_index,
+                        crash,
+                    )
+                    .await;
+                    if !recovery.is_empty() {
+                        failed = true;
+                        failure_violations = recovery;
+                        break;
+                    }
                 }
             }
         }
@@ -1482,6 +1718,7 @@ struct StepOutcome {
     status: u16,
     violations: Vec<Violation>,
     post_commit_ack_lost: bool,
+    crash: Option<CrashRequest>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1502,6 +1739,8 @@ async fn execute_recorded_op(
 ) -> StepOutcome {
     let ambiguity_allowed = mode == RunMode::Chaos;
     let timeline_start = http_fault_context.map(|context| context.scheduler.timeline().len());
+    let process_controller =
+        http_fault_context.and_then(|context| context.scheduler.process_controller());
     let request = REQUEST_AMBIGUITY_ALLOWED.scope(
         ambiguity_allowed,
         REQUEST_IS_MUTATION.scope(
@@ -1509,9 +1748,22 @@ async fn execute_recorded_op(
             execute_op(client, server, op, index, started),
         ),
     );
-    let mut rec = HTTP_FAULT_CONTEXT
-        .scope(http_fault_context.cloned(), request)
-        .await;
+    let request = HTTP_FAULT_CONTEXT.scope(http_fault_context.cloned(), request);
+    tokio::pin!(request);
+    let (mut rec, crash) = if let Some(controller) = &process_controller {
+        tokio::select! {
+            rec = &mut request => (rec, None),
+            _ = controller.crash_requested.notified() => {
+                let crash = controller.take_request();
+                (
+                    crashed_op_record(op, index, started, &crash),
+                    Some(crash),
+                )
+            }
+        }
+    } else {
+        (request.await, None)
+    };
     mark_injected_store_failure(&mut rec, index, http_fault_context, timeline_start);
     let post_commit_ack_lost = inject_post_commit_ack_loss
         && inject_lost_http_acknowledgement_after_commit(&mut rec, ambiguity_allowed);
@@ -1562,6 +1814,7 @@ async fn execute_recorded_op(
             OracleMutation::ChaosLostWrite
                 | OracleMutation::PostCommitLostWrite
                 | OracleMutation::IndetResolutionLie
+                | OracleMutation::CrashLostAck
         )
     ) && mode == RunMode::Chaos
     {
@@ -1598,6 +1851,24 @@ async fn execute_recorded_op(
         status: rec.status,
         violations,
         post_commit_ack_lost,
+        crash,
+    }
+}
+
+fn crashed_op_record(op: &Op, index: u64, started: Instant, crash: &CrashRequest) -> OpRecord {
+    let exchange = ambiguous_exchange(0, AmbiguityReason::ServerCrashed);
+    OpRecord {
+        index,
+        wall_ms: started.elapsed().as_millis() as u64,
+        op: op.clone(),
+        method: "CRASHED".to_string(),
+        path: format!("crash::{:?}::{:?}", crash.point, crash.position),
+        status: exchange.status,
+        response: exchange.response,
+        outcome: String::new(),
+        gen_after: None,
+        duration_ms: 0,
+        violations: Vec::new(),
     }
 }
 

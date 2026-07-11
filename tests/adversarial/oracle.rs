@@ -33,6 +33,7 @@ pub enum ViolationId {
     I16Quiescence,
     I17SketchPublication,
     I18IndeterminateResolution,
+    I19CrashRecovery,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

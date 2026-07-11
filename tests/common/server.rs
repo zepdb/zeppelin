@@ -475,6 +475,33 @@ pub struct FullTestServer {
     pub manifest_cache: Arc<ManifestCache>,
     pub shutdown_compaction: Option<tokio::sync::watch::Sender<bool>>,
     pub compaction_loop_task: Option<JoinHandle<()>>,
+    pub server_task: JoinHandle<()>,
+    pub shutdown_http: tokio::sync::watch::Sender<bool>,
+}
+
+impl FullTestServer {
+    /// Abort the HTTP server and compaction loop without draining in-flight work.
+    pub fn abort(&mut self) {
+        self.server_task.abort();
+        if let Some(task) = &self.compaction_loop_task {
+            task.abort();
+        }
+    }
+
+    /// Gracefully stop the HTTP server and background compaction loop.
+    pub async fn shutdown(mut self) {
+        let _ = self.shutdown_http.send(true);
+        if let Some(shutdown) = self.shutdown_compaction.take() {
+            let _ = shutdown.send(true);
+        }
+        if let Some(task) = self.compaction_loop_task.take() {
+            task.await
+                .unwrap_or_else(|error| panic!("test compaction loop failed: {error}"));
+        }
+        self.server_task
+            .await
+            .unwrap_or_else(|error| panic!("test HTTP server failed: {error}"));
+    }
 }
 
 /// Start a test server on an already-constructed store, returning the full set
@@ -563,11 +590,15 @@ pub async fn start_test_server_full(
     let addr = listener.local_addr().unwrap();
     let base_url = format!("http://{addr}");
 
-    tokio::spawn(async move {
+    let (shutdown_http, mut shutdown_http_rx) = tokio::sync::watch::channel(false);
+    let server_task = tokio::spawn(async move {
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_http_rx.changed().await;
+        })
         .await
         .unwrap();
     });
@@ -582,5 +613,7 @@ pub async fn start_test_server_full(
         manifest_cache,
         shutdown_compaction,
         compaction_loop_task,
+        server_task,
+        shutdown_http,
     }
 }

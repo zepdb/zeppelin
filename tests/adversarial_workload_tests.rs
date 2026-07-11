@@ -211,3 +211,82 @@ async fn overnight() {
         summary.ops_per_sec
     );
 }
+
+#[tokio::test]
+#[ignore]
+async fn crash_matrix() {
+    adversarial::faults::store_proxy::run_crash_matrix().await;
+}
+
+#[tokio::test]
+async fn restartable_server_exposes_hard_abort() {
+    let harness = common::harness::TestHarness::new().await;
+    let prefix = harness.prefix.clone();
+    let namespace = format!("{prefix}-restart");
+    let config = zeppelin::config::Config::load(None).unwrap();
+    let mut server = common::server::start_test_server_full(
+        harness.store.clone(),
+        Some(prefix.clone()),
+        config.clone(),
+        false,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let create = client
+        .post(format!("{}/v1/namespaces", server.base_url))
+        .json(&serde_json::json!({
+            "name": namespace,
+            "dimensions": 2,
+            "distance_metric": "cosine",
+            "index_config": {
+                "nlist": 4,
+                "quantization": "none",
+                "pq_m": 1,
+                "hierarchical": false,
+                "fts_index": false,
+                "bitmap_index": false
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 201);
+    let upsert = client
+        .post(format!(
+            "{}/v1/namespaces/{namespace}/vectors",
+            server.base_url
+        ))
+        .json(&serde_json::json!({
+            "vectors": [{ "id": "survivor", "values": [1.0, 0.0] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(upsert.status().is_success());
+
+    server.abort();
+    drop(server);
+    let mut replacement =
+        common::server::start_test_server_full(harness.store.clone(), Some(prefix), config, false)
+            .await;
+    let fetched = client
+        .post(format!(
+            "{}/v1/namespaces/{namespace}/vectors/get",
+            replacement.base_url
+        ))
+        .json(&serde_json::json!({
+            "ids": ["survivor"],
+            "include_vector": true,
+            "consistency": "strong"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(fetched.status().is_success());
+    let body = fetched.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["results"][0]["id"], "survivor");
+
+    replacement.abort();
+    common::server::cleanup_ns(&harness.store, &namespace).await;
+    harness.cleanup().await;
+}

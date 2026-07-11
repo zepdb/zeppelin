@@ -1,4 +1,5 @@
 pub mod http_proxy;
+pub mod process;
 pub mod store_proxy;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,6 +11,7 @@ use rand::{Rng, SeedableRng};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
+use self::process::{CrashPoint, ProcessController, TriggerPosition};
 use super::chaos::StoreOp;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -24,6 +26,7 @@ pub enum FaultProfile {
     LegacyChaos,
     PostCommit,
     Network,
+    Crash,
 }
 
 impl FaultProfile {
@@ -33,6 +36,7 @@ impl FaultProfile {
             "legacy_chaos" => Self::LegacyChaos,
             "post_commit" => Self::PostCommit,
             "network" => Self::Network,
+            "crash" => Self::Crash,
             other => panic!("invalid ZEPPELIN_ADVERSARIAL_PROFILE: {other}"),
         }
     }
@@ -42,6 +46,7 @@ impl FaultProfile {
             Self::LegacyChaos => "legacy-chaos",
             Self::PostCommit => "post-commit",
             Self::Network => "network",
+            Self::Crash => "crash",
         }
     }
 }
@@ -61,6 +66,7 @@ pub struct FaultEvent {
 pub enum Boundary {
     ObjectStore,
     ClientHttp,
+    Process,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -74,17 +80,36 @@ pub struct TargetSelector {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum FaultKind {
-    PreFail { error: InjectedErrorKind },
-    Latency { base_ms: u64, jitter_ms: u64 },
-    Partition { direction: Direction },
-    PostCommitFail { error: InjectedErrorKind },
-    TruncatedGetStream { after_bytes: usize },
+    PreFail {
+        error: InjectedErrorKind,
+    },
+    Latency {
+        base_ms: u64,
+        jitter_ms: u64,
+    },
+    Partition {
+        direction: Direction,
+    },
+    PostCommitFail {
+        error: InjectedErrorKind,
+    },
+    TruncatedGetStream {
+        after_bytes: usize,
+    },
     DropRequest,
     DropResponse,
-    TruncateResponse { at_bytes: usize },
+    TruncateResponse {
+        at_bytes: usize,
+    },
     ResetAfterRequest,
-    ClientCancel { after_ms: u64 },
+    ClientCancel {
+        after_ms: u64,
+    },
     DuplicateRetry,
+    CrashAt {
+        point: CrashPoint,
+        position: TriggerPosition,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +200,7 @@ pub struct FaultScheduler {
     schedule: Arc<FaultSchedule>,
     runtime: Arc<SchedulerRuntime>,
     rng_salt: u64,
+    process: Option<Arc<Mutex<ProcessController>>>,
 }
 
 impl FaultScheduler {
@@ -194,6 +220,8 @@ impl FaultScheduler {
     }
 
     fn with_salt(schedule: FaultSchedule, rng_salt: u64) -> Self {
+        let process = (schedule.profile == FaultProfile::Crash)
+            .then(|| Arc::new(Mutex::new(ProcessController::new())));
         let events = schedule
             .events
             .iter()
@@ -213,6 +241,7 @@ impl FaultScheduler {
                 started: Instant::now(),
             }),
             rng_salt,
+            process,
         }
     }
 
@@ -233,7 +262,7 @@ impl FaultScheduler {
         let current = self.runtime.logical_op.load(Ordering::SeqCst);
         let call_ordinal = self.runtime.store_calls.fetch_add(1, Ordering::SeqCst) + 1;
         for (index, event) in self.schedule.events.iter().enumerate() {
-            if event.boundary != Boundary::ObjectStore
+            if !matches!(event.boundary, Boundary::ObjectStore | Boundary::Process)
                 || !event_is_active(event, current)
                 || !store_target_matches(event, op, key)
                 || !partition_matches(&event.kind, op)
@@ -290,7 +319,13 @@ impl FaultScheduler {
 
     fn claim(&self, index: usize, event: &FaultEvent) -> bool {
         let runtime = &self.runtime.events[index];
-        runtime.matches.fetch_add(1, Ordering::SeqCst);
+        let match_ordinal = runtime.matches.fetch_add(1, Ordering::SeqCst) + 1;
+        if let FaultKind::CrashAt { point, .. } = event.kind {
+            let (_, _, nth) = point.selector();
+            if match_ordinal != u64::from(nth) {
+                return false;
+            }
+        }
         event.end_op.is_some()
             || runtime
                 .fired
@@ -300,6 +335,25 @@ impl FaultScheduler {
 
     pub fn quiesce(&self) {
         self.runtime.quiesced.store(true, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn process_controller(&self) -> Option<ProcessController> {
+        self.process.as_ref().map(|controller| {
+            controller
+                .lock()
+                .expect("process controller mutex poisoned")
+                .clone()
+        })
+    }
+
+    pub fn reset_process_controller(&self) {
+        let Some(controller) = &self.process else {
+            return;
+        };
+        *controller
+            .lock()
+            .expect("process controller mutex poisoned") = ProcessController::new();
     }
 
     pub fn record(&self, event: TimelineEvent) {
@@ -341,6 +395,30 @@ impl FaultSchedule {
                     ..TargetSelector::default()
                 },
                 kind: FaultKind::DropResponse,
+            }],
+        }
+    }
+
+    #[must_use]
+    pub fn crash_lost_ack_selftest() -> Self {
+        let point = CrashPoint::WalFragmentPut;
+        let (store_op, key_substring, _) = point.selector();
+        Self {
+            profile: FaultProfile::Crash,
+            events: vec![FaultEvent {
+                id: "crash-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::Process,
+                target: TargetSelector {
+                    store_op: Some(store_op),
+                    key_substring: Some(key_substring.to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::CrashAt {
+                    point,
+                    position: TriggerPosition::Post,
+                },
             }],
         }
     }
@@ -542,6 +620,43 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
                 );
             }
         }
+        FaultProfile::Crash => {
+            let points = [
+                CrashPoint::WalFragmentPut,
+                CrashPoint::ManifestCas,
+                CrashPoint::SegmentPut,
+                CrashPoint::StagingSideObjectPut,
+                CrashPoint::StagingDrop,
+                CrashPoint::CloneCopy { nth: 1 },
+                CrashPoint::NamespaceDeleteBatch { nth: 1 },
+                CrashPoint::SnapshotPut,
+                CrashPoint::HydrationGet,
+            ];
+            let count = rng.gen_range(1..=3);
+            for index in 0..count {
+                let point = points[rng.gen_range(0..points.len())];
+                let (store_op, key_substring, _) = point.selector();
+                let start_op = 20 + (index as u64 * 150) + rng.gen_range(0..=30);
+                let position = if rng.gen_bool(0.5) {
+                    TriggerPosition::Pre
+                } else {
+                    TriggerPosition::Post
+                };
+                push_event(
+                    &mut events,
+                    profile,
+                    start_op,
+                    None,
+                    Boundary::Process,
+                    TargetSelector {
+                        store_op: Some(store_op),
+                        key_substring: Some(key_substring.to_string()),
+                        ..TargetSelector::default()
+                    },
+                    FaultKind::CrashAt { point, position },
+                );
+            }
+        }
     }
     FaultSchedule { profile, events }
 }
@@ -572,7 +687,11 @@ mod tests {
 
     #[test]
     fn schedule_is_pure_function_of_seed() {
-        for profile in [FaultProfile::PostCommit, FaultProfile::Network] {
+        for profile in [
+            FaultProfile::PostCommit,
+            FaultProfile::Network,
+            FaultProfile::Crash,
+        ] {
             for seed in 0..20 {
                 let first = FaultScheduler::for_seed(seed, profile);
                 let second = FaultScheduler::for_seed(seed, profile);
