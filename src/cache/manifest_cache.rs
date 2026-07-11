@@ -445,7 +445,7 @@ impl ManifestCache {
         let key = Manifest::s3_key(namespace);
         match store.get_if_none_match(&key, &etag).await? {
             Some((data, next_etag)) => {
-                let manifest = Manifest::from_bytes(&data)?;
+                let manifest = Manifest::from_bytes_for_namespace(&data, namespace)?;
                 let now = Instant::now();
                 self.entries.insert(
                     namespace.to_string(),

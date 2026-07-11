@@ -536,10 +536,19 @@ pub struct Manifest {
     /// Monotonic manifest generation persisted with each manifest commit.
     ///
     /// Legacy manifests decode as `0`; each successful manifest write stores
-    /// the next generation. Keep this field last for MessagePack array
-    /// decode compatibility with older manifests.
+    /// the next generation.
     #[serde(default)]
     version: u64,
+    /// Namespace whose live pointer owns these bytes.
+    ///
+    /// Old manifests predate this binding and decode as `None`. Every new live
+    /// or history write sets it before serialization so a valid manifest
+    /// returned for another namespace fails loud instead of becoming state.
+    ///
+    /// NOTE: this field must stay last because MessagePack encodes structs as
+    /// positional arrays.
+    #[serde(default)]
+    namespace: Option<String>,
 }
 
 /// Location of one immutable, addressable historical manifest generation.
@@ -649,6 +658,7 @@ impl Manifest {
             fencing_token: 0,
             updated_at: now,
             version: 0,
+            namespace: None,
         }
     }
 
@@ -1191,6 +1201,42 @@ impl Manifest {
         }
     }
 
+    /// Decodes manifest bytes and validates any persisted namespace binding.
+    ///
+    /// Legacy manifests without a binding remain readable. Newly written
+    /// manifests must match the namespace whose object key supplied the bytes.
+    pub(crate) fn from_bytes_for_namespace(data: &[u8], namespace: &str) -> Result<Self> {
+        let manifest = Self::from_bytes(data)?;
+        manifest.validate_namespace_binding(namespace)?;
+        Ok(manifest)
+    }
+
+    fn validate_namespace_binding(&self, namespace: &str) -> Result<()> {
+        if let Some(bound) = &self.namespace {
+            if bound != namespace {
+                return Err(ZeppelinError::Serialization(format!(
+                    "manifest namespace binding mismatch: expected {namespace}, got {bound}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn verify_live_write(
+        store: &ZeppelinStore,
+        namespace: &str,
+        expected: &Bytes,
+    ) -> Result<()> {
+        let key = Self::s3_key(namespace);
+        let actual = store.get(&key).await?;
+        if actual != *expected {
+            return Err(ZeppelinError::Serialization(format!(
+                "manifest live write verification mismatch for namespace {namespace}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Reads and decodes the authoritative live manifest from object storage.
     ///
     /// # Parameters
@@ -1224,7 +1270,7 @@ impl Manifest {
     pub async fn read(store: &ZeppelinStore, namespace: &str) -> Result<Option<Self>> {
         let key = Self::s3_key(namespace);
         match store.get(&key).await {
-            Ok(data) => Ok(Some(Self::from_bytes(&data)?)),
+            Ok(data) => Ok(Some(Self::from_bytes_for_namespace(&data, namespace)?)),
             Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         }
@@ -1246,8 +1292,9 @@ impl Manifest {
     ///
     /// # Returns
     ///
-    /// `Ok(())` after both history and live objects are written. Only then is
-    /// `self.version` advanced to the committed generation.
+    /// `Ok(())` after both history and live objects are written and an exact
+    /// live read-back matches the candidate. Only then is `self.version`
+    /// advanced to the committed generation.
     ///
     /// # Errors
     ///
@@ -1257,8 +1304,9 @@ impl Manifest {
     ///
     /// # Side Effects
     ///
-    /// Performs one live-manifest GET, at least one history operation, and one
-    /// unconditional live-manifest PUT on the success path.
+    /// Performs one generation-discovery GET, at least one history operation,
+    /// one unconditional live-manifest PUT, and one verification GET on the
+    /// success path.
     ///
     /// # Consistency
     ///
@@ -1280,6 +1328,7 @@ impl Manifest {
         let base_version = self.version.max(current_version);
         let mut committed = self.clone();
         committed.version = Self::checked_next_version(base_version)?;
+        committed.namespace = Some(namespace.to_string());
         let data = committed.to_bytes()?;
         Self::write_history_snapshot_for_commit(
             store,
@@ -1289,7 +1338,8 @@ impl Manifest {
             ReferencedHistoryConflict::Serialization,
         )
         .await?;
-        store.put(&key, data).await?;
+        store.put(&key, data.clone()).await?;
+        Self::verify_live_write(store, namespace, &data).await?;
         self.version = committed.version;
         Ok(())
     }
@@ -1333,7 +1383,7 @@ impl Manifest {
         let key = Self::s3_key(namespace);
         match store.get_with_meta(&key).await {
             Ok((data, etag)) => {
-                let manifest = Self::from_bytes(&data)?;
+                let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
                 Ok(Some((manifest, ManifestVersion(etag))))
             }
             Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(None),
@@ -1366,8 +1416,8 @@ impl Manifest {
     ///
     /// # Returns
     ///
-    /// `Ok(())` after the live manifest is authoritative; `self.version` then
-    /// advances by exactly one.
+    /// `Ok(())` after an exact read-back proves the live manifest is
+    /// authoritative; `self.version` then advances by exactly one.
     ///
     /// # Errors
     ///
@@ -1379,7 +1429,8 @@ impl Manifest {
     /// # Side Effects
     ///
     /// Creates or reconciles the immutable history object before attempting one
-    /// conditional live PUT (or an unconditional PUT when the ETag is absent).
+    /// conditional live PUT (or an unconditional PUT when the ETag is absent),
+    /// then performs one verification GET.
     ///
     /// # Consistency
     ///
@@ -1410,6 +1461,7 @@ impl Manifest {
         let next_version = self.next_committed_version()?;
         let mut committed = self.clone();
         committed.version = next_version;
+        committed.namespace = Some(namespace.to_string());
         let data = committed.to_bytes()?;
         Self::write_history_snapshot_for_commit(
             store,
@@ -1420,9 +1472,14 @@ impl Manifest {
         )
         .await?;
         match &version.0 {
-            Some(etag) => store.put_if_match(&key, data, etag, namespace).await,
-            None => store.put(&key, data).await,
+            Some(etag) => {
+                store
+                    .put_if_match(&key, data.clone(), etag, namespace)
+                    .await
+            }
+            None => store.put(&key, data.clone()).await,
         }?;
+        Self::verify_live_write(store, namespace, &data).await?;
         self.version = next_version;
         Ok(())
     }
@@ -1509,7 +1566,7 @@ impl Manifest {
         let key = Self::history_key(namespace, version);
         match store.get(&key).await {
             Ok(data) => {
-                let manifest = Self::from_bytes(&data)?;
+                let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
                 if manifest.version() != version {
                     return Err(ZeppelinError::Serialization(format!(
                         "manifest history key {key} contains version {}, expected {version}",

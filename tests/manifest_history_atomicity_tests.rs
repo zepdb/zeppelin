@@ -1,6 +1,6 @@
 mod common;
 
-use common::fault_injection::fail_put_once_matching;
+use common::fault_injection::{fail_put_once_matching, misdirect_put_once_matching};
 use common::harness::TestHarness;
 use ulid::Ulid;
 use zeppelin::error::ZeppelinError;
@@ -166,6 +166,69 @@ async fn conditional_pointer_failure_orphan_history_can_be_overwritten_on_retry(
         .unwrap();
     assert_eq!(history.version(), live.version());
     assert_eq!(history.fragments, live.fragments);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn live_manifest_rejects_bytes_bound_to_another_namespace() {
+    let harness = TestHarness::new().await;
+    let source = harness.key("manifest-binding-source");
+    let target = harness.key("manifest-binding-target");
+    Manifest::new()
+        .write(&harness.store, &source)
+        .await
+        .unwrap();
+    Manifest::new()
+        .write(&harness.store, &target)
+        .await
+        .unwrap();
+
+    let wrong = harness.store.get(&Manifest::s3_key(&source)).await.unwrap();
+    harness
+        .store
+        .put(&Manifest::s3_key(&target), wrong)
+        .await
+        .unwrap();
+
+    let result = Manifest::read(&harness.store, &target).await;
+    assert!(matches!(
+        result,
+        Err(ZeppelinError::Serialization(message))
+            if message.contains("manifest namespace binding mismatch")
+    ));
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn conditional_manifest_write_rejects_misdirected_success() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("manifest-misdirected-pointer");
+    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    let (mut manifest, version) = Manifest::read_versioned(&harness.store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    manifest.add_fragment(fragment(9, 13));
+
+    let live_key = Manifest::s3_key(&ns);
+    let (misdirecting_store, injections) =
+        misdirect_put_once_matching(&harness.store, live_key.clone());
+    let result = manifest
+        .write_conditional(&misdirecting_store, &ns, &version)
+        .await;
+
+    assert!(matches!(result, Err(ZeppelinError::Serialization(_))));
+    assert_eq!(injections.failures_injected(), 1);
+    assert_eq!(manifest.version(), 1);
+    let live = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert!(live.fragments.is_empty());
+    assert!(harness
+        .store
+        .exists(&format!("{live_key}.misdirected"))
+        .await
+        .unwrap());
 
     harness.cleanup().await;
 }
