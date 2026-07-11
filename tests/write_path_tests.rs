@@ -223,7 +223,7 @@ async fn test_concurrent_writers_backoff_absorbs_conflicts() {
 /// into a shared manifest update. Pre-Task-5 code serializes: exactly N CAS
 /// PUTs (one per append, each under the per-namespace mutex).
 ///
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_group_commit_coalesces_manifest_puts() {
     let harness = TestHarness::new().await;
     let ns = harness.key("group-commit");
