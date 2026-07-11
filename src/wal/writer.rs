@@ -36,7 +36,7 @@
 //!                                |
 //!                         terminal failure
 //!                                v
-//!                    best-effort orphan cleanup
+//!                  prove refs absent before cleanup
 //! ```
 //!
 //! ## Reading map
@@ -59,8 +59,9 @@
 //! - Fencing and CAS are both required. A token check alone has a time-of-check /
 //!   time-of-use race; CAS alone does not identify a zombie based on old work.
 //! - A successful append reply includes a manifest that references that append's
-//!   fragment. Manifest/fencing failures handled by the leader attempt
-//!   exact-object cleanup and still return the append error if cleanup fails.
+//!   fragment. Definite manifest/fencing failures handled by the leader attempt
+//!   exact-object cleanup. An ambiguous manifest-write error first re-reads S3;
+//!   possible reachability always suppresses deletion.
 //! - The synchronous pending-queue mutex is never held across `.await`. The Tokio
 //!   commit mutex is held across remote CAS rounds to serialize one namespace,
 //!   while different namespaces retain independent progress.
@@ -83,7 +84,7 @@ use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
-use tracing::{debug, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 
 use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
@@ -388,12 +389,13 @@ impl WalWriter {
     /// [`ZeppelinError::ManifestConflict`]. Some other manifest read/write errors
     /// are delivered to waiters as [`ZeppelinError::Index`] with context.
     ///
-    /// Once upload succeeds, manifest read/write, fencing, and exhausted-CAS
-    /// failures handled by the leader trigger exact-key orphan cleanup. If
-    /// cleanup also fails, the original append error is returned and the
-    /// unreferenced object remains for garbage collection. A closed reply channel
-    /// or impossible no-progress state instead reports an internal `Index` error;
-    /// those defensive invariant paths do not perform their own cleanup.
+    /// Once upload succeeds, manifest reads before publication, fencing, and
+    /// exhausted CAS conflicts trigger exact-key orphan cleanup. A non-conflict
+    /// manifest-write error is ambiguous: the writer re-reads S3, recovers
+    /// success when every batched ref is live, cleans up only when none are live,
+    /// and leaves all objects untouched on missing, unreadable, or partially
+    /// matching state. A closed reply channel or impossible no-progress state
+    /// reports an internal `Index` error without its own cleanup.
     ///
     /// # Side Effects
     ///
@@ -414,7 +416,9 @@ impl WalWriter {
     /// Serializes and uploads the whole fragment once. Group commit can reduce N
     /// concurrent same-instance appends from N manifest writes toward one, though
     /// scheduling may produce multiple batches. CAS conflicts use bounded
-    /// exponential backoff and repeat a full manifest GET and serialization.
+    /// exponential backoff and repeat a full manifest GET and serialization. A
+    /// non-conflict CAS error adds one authoritative GET to resolve whether the
+    /// atomic batch committed before its acknowledgement was lost.
     ///
     /// # Examples
     ///
@@ -562,8 +566,8 @@ impl WalWriter {
     ///
     /// Removes one token group from the local queue, reads and conditionally
     /// writes the authoritative manifest, sleeps after CAS conflicts, clones a
-    /// committed manifest per waiter, and attempts orphan cleanup on terminal
-    /// failure.
+    /// committed manifest per waiter, and attempts orphan cleanup only after
+    /// proving the batch absent from authoritative state.
     ///
     /// # Consistency
     ///
@@ -623,11 +627,11 @@ impl WalWriter {
 
         // CAS retry loop: one manifest update carrying ALL batched refs.
         //
-        // On terminal failure every batched fragment is an orphan — best-effort
-        // delete each one's exact wal/ key (I3), never a prefix or a segment/
-        // cluster object (carried cluster objects live under old segment keys,
-        // Task 2B). Then reply Err to each waiter so no 200 is acked without a
-        // covering manifest (I4).
+        // When authoritative state proves a terminal failure left every batched
+        // fragment orphaned, best-effort delete each exact wal/ key (I3), never
+        // a prefix or segment/cluster object. A non-conflict write error is not
+        // proof: the conditional PUT may have committed before its reply was
+        // lost, so that path re-reads S3 before deciding whether cleanup is safe.
         for attempt in 0..MAX_CAS_RETRIES {
             let (mut manifest, version) =
                 match Manifest::read_versioned(&self.store, namespace).await {
@@ -697,11 +701,86 @@ impl WalWriter {
                     continue;
                 }
                 Err(e) => {
-                    let msg = e.to_string();
-                    self.fail_batch(namespace, batch, |_| {
-                        ZeppelinError::Index(format!("manifest write failed: {msg}"))
-                    })
-                    .await;
+                    let write_error = e.to_string();
+                    match Manifest::read(&self.store, namespace).await {
+                        Ok(Some(authoritative)) => {
+                            let published = batch
+                                .iter()
+                                .filter(|item| {
+                                    authoritative
+                                        .fragments
+                                        .iter()
+                                        .any(|fref| fref.id == item.fref.id)
+                                })
+                                .count();
+
+                            if published == batch.len() {
+                                warn!(
+                                    namespace,
+                                    batched = batch.len(),
+                                    error = %write_error,
+                                    "recovered committed manifest after lost write acknowledgement"
+                                );
+                                for item in batch {
+                                    let _ = item.reply.send(Ok(authoritative.clone()));
+                                }
+                            } else if published == 0 {
+                                self.fail_batch(namespace, batch, |_| {
+                                    ZeppelinError::Index(format!(
+                                        "manifest write failed: {write_error}"
+                                    ))
+                                })
+                                .await;
+                            } else {
+                                error!(
+                                    namespace,
+                                    published,
+                                    batched = batch.len(),
+                                    error = %write_error,
+                                    "manifest write outcome violated atomic batch publication"
+                                );
+                                Self::reply_batch_error(batch, |_| {
+                                    ZeppelinError::Index(format!(
+                                        "manifest write outcome invariant violation for namespace \
+                                         {namespace}: authoritative manifest contains {published} \
+                                         batched refs after write error, expected either 0 or all: \
+                                         {write_error}"
+                                    ))
+                                });
+                            }
+                        }
+                        Ok(None) => {
+                            error!(
+                                namespace,
+                                batched = batch.len(),
+                                error = %write_error,
+                                "manifest disappeared while resolving ambiguous write"
+                            );
+                            Self::reply_batch_error(batch, |_| {
+                                ZeppelinError::Index(format!(
+                                    "manifest write outcome indeterminate for namespace \
+                                     {namespace}: authoritative manifest missing after write \
+                                     error: {write_error}"
+                                ))
+                            });
+                        }
+                        Err(read_error) => {
+                            error!(
+                                namespace,
+                                batched = batch.len(),
+                                error = %write_error,
+                                reread_error = %read_error,
+                                "failed to resolve ambiguous manifest write"
+                            );
+                            Self::reply_batch_error(batch, |_| {
+                                ZeppelinError::Index(format!(
+                                    "manifest write outcome indeterminate for namespace \
+                                     {namespace}: write failed: {write_error}; authoritative \
+                                     reread failed: {read_error}"
+                                ))
+                            });
+                        }
+                    }
                     return true;
                 }
             }
@@ -770,6 +849,19 @@ impl WalWriter {
             let key = WalFragment::s3_key(namespace, &item.fref.id);
             self.cleanup_orphan_fragment(namespace, &key).await;
         }
+        Self::reply_batch_error(batch, make_err);
+    }
+
+    /// Sends one terminal error per waiter without deleting uploaded fragments.
+    ///
+    /// This is the only safe failure path when an authoritative re-read cannot
+    /// prove the entire batch unpublished. Possible orphans are intentionally
+    /// left for reachability GC because exact cleanup could otherwise delete an
+    /// immutable object already referenced by S3 state.
+    fn reply_batch_error(
+        batch: Vec<PendingCommit>,
+        make_err: impl Fn(&PendingCommit) -> ZeppelinError,
+    ) {
         for item in batch {
             let err = make_err(&item);
             let _ = item.reply.send(Err(err));
