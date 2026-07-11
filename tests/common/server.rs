@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,29 @@ use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
 use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
+
+tokio::task_local! {
+    static BACKGROUND_COMPACTION_ORIGIN: bool;
+}
+
+/// Returns whether the current future belongs to a spawned compaction loop.
+///
+/// Operational adversarial observers use this test-only marker to distinguish
+/// background maintenance from foreground HTTP and explicit-compaction work.
+#[must_use]
+pub fn background_compaction_origin_active() -> bool {
+    BACKGROUND_COMPACTION_ORIGIN
+        .try_with(|active| *active)
+        .unwrap_or(false)
+}
+
+/// Marks one spawned production compaction-loop future as background work.
+pub(crate) async fn with_background_compaction_origin<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    BACKGROUND_COMPACTION_ORIGIN.scope(true, future).await
+}
 
 fn configure_test_server_limits(config: &mut Config) {
     // Integration tests share one loopback IP and often issue bursty setup or
@@ -345,7 +369,7 @@ pub async fn start_test_server_with_compaction(
         let lease_manager = lease_manager.clone();
         let cache = cache.clone();
         let namespace_prefix = Some(harness.prefix.clone());
-        tokio::spawn(async move {
+        tokio::spawn(with_background_compaction_origin(async move {
             compaction_loop(
                 compactor,
                 namespace_manager,
@@ -359,7 +383,7 @@ pub async fn start_test_server_with_compaction(
                 },
             )
             .await;
-        });
+        }));
     }
 
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
@@ -526,9 +550,33 @@ impl FullTestServer {
 pub async fn start_test_server_full(
     store: ZeppelinStore,
     namespace_name_prefix: Option<String>,
+    config: Config,
+    spawn_compaction_loop: bool,
+    clock: Option<Clock>,
+) -> FullTestServer {
+    start_test_server_full_with_disk_cache_max_bytes(
+        store,
+        namespace_name_prefix,
+        config,
+        spawn_compaction_loop,
+        clock,
+        100 * 1024 * 1024,
+    )
+    .await
+}
+
+/// Starts the full test server with an explicit local disk-cache budget.
+///
+/// Operational adversarial profiles use this additive seam to exercise tiny
+/// caches while existing callers retain the historical 100 MiB default.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_test_server_full_with_disk_cache_max_bytes(
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
     mut config: Config,
     spawn_compaction_loop: bool,
     clock: Option<Clock>,
+    disk_cache_max_bytes: u64,
 ) -> FullTestServer {
     zeppelin::metrics::init();
     configure_test_server_limits(&mut config);
@@ -536,7 +584,8 @@ pub async fn start_test_server_full(
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
-        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), disk_cache_max_bytes)
+            .unwrap(),
     );
 
     let namespace_manager = namespace_manager(&config, &store, &clock);
@@ -557,21 +606,23 @@ pub async fn start_test_server_full(
             let lease_manager = lease_manager.clone();
             let cache = cache.clone();
             let namespace_prefix = namespace_name_prefix.clone();
-            compaction_loop_task = Some(tokio::spawn(async move {
-                compaction_loop(
-                    compactor,
-                    namespace_manager,
-                    shutdown_rx,
-                    manifest_cache,
-                    lease_manager,
-                    cache,
-                    CompactionLoopOptions {
-                        gc_config,
-                        namespace_prefix,
-                    },
-                )
-                .await;
-            }));
+            compaction_loop_task = Some(tokio::spawn(with_background_compaction_origin(
+                async move {
+                    compaction_loop(
+                        compactor,
+                        namespace_manager,
+                        shutdown_rx,
+                        manifest_cache,
+                        lease_manager,
+                        cache,
+                        CompactionLoopOptions {
+                            gc_config,
+                            namespace_prefix,
+                        },
+                    )
+                    .await;
+                },
+            )));
         }
         Some(shutdown_tx)
     } else {

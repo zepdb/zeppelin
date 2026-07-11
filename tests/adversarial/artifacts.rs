@@ -30,6 +30,8 @@ pub struct SeedArtifacts {
     pub dir: PathBuf,
     ops: BufWriter<File>,
     op_count: u64,
+    next_op_index: u64,
+    pending_ops: BTreeMap<u64, OpRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,6 +177,8 @@ impl RunArtifacts {
             dir,
             ops: BufWriter::new(ops_file),
             op_count: 0,
+            next_op_index: 0,
+            pending_ops: BTreeMap::new(),
         }
     }
 
@@ -200,12 +204,29 @@ impl RunArtifacts {
 
 impl SeedArtifacts {
     pub fn write_op(&mut self, rec: &OpRecord) {
-        let encoded = serde_json::to_string(rec).expect("OpRecord must serialize");
-        let _: OpRecord =
-            serde_json::from_str(&encoded).expect("OpRecord JSONL line must deserialize");
-        writeln!(self.ops, "{encoded}").expect("failed to write ops.jsonl line");
-        self.ops.flush().expect("failed to flush ops.jsonl line");
+        assert!(
+            rec.index >= self.next_op_index,
+            "op {} completed after it was already flushed",
+            rec.index
+        );
+        assert!(
+            self.pending_ops.insert(rec.index, rec.clone()).is_none(),
+            "op {} completed more than once",
+            rec.index
+        );
         self.op_count += 1;
+        let mut flushed = false;
+        while let Some(rec) = self.pending_ops.remove(&self.next_op_index) {
+            let encoded = serde_json::to_string(&rec).expect("OpRecord must serialize");
+            let _: OpRecord =
+                serde_json::from_str(&encoded).expect("OpRecord JSONL line must deserialize");
+            writeln!(self.ops, "{encoded}").expect("failed to write ops.jsonl line");
+            self.next_op_index += 1;
+            flushed = true;
+        }
+        if flushed {
+            self.ops.flush().expect("failed to flush ops.jsonl line");
+        }
     }
 
     #[must_use]
@@ -576,6 +597,209 @@ mod tests {
     };
 
     use super::*;
+    use crate::adversarial::faults::{Boundary, FaultSemantics, ObservedResult};
+    use crate::adversarial::ops::{ExecutionMetadata, Op};
+    use crate::adversarial::PreserveMode;
+
+    fn record(index: u64) -> OpRecord {
+        OpRecord {
+            index,
+            wall_ms: index,
+            op: Op::GetNamespace {
+                ns: "ordered".to_string(),
+            },
+            method: "GET".to_string(),
+            path: "/v1/namespaces/ordered".to_string(),
+            status: 200,
+            response: serde_json::json!({}),
+            outcome: "applied".to_string(),
+            target_node: 0,
+            execution: ExecutionMetadata::workload(),
+            gen_after: None,
+            duration_ms: 0,
+            violations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn seed_artifacts_flush_out_of_order_completions_by_op_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("ops.jsonl");
+        let mut artifacts = SeedArtifacts {
+            dir: dir.path().to_path_buf(),
+            ops: BufWriter::new(File::create(&path).unwrap()),
+            op_count: 0,
+            next_op_index: 0,
+            pending_ops: BTreeMap::new(),
+        };
+
+        artifacts.write_op(&record(1));
+        artifacts.write_op(&record(0));
+
+        let indexes = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<OpRecord>(line).unwrap().index)
+            .collect::<Vec<_>>();
+        assert_eq!(indexes, vec![0, 1]);
+        assert_eq!(artifacts.op_count(), 2);
+    }
+
+    #[test]
+    fn report_surfaces_routing_delete_contention_and_exhaustion_proofs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let seed_dir = dir.path().join("seed-7");
+        fs::create_dir_all(&seed_dir).unwrap();
+        let mut node_0 = record(0);
+        node_0.target_node = 0;
+        let mut node_1 = record(1);
+        node_1.target_node = 1;
+        fs::write(
+            seed_dir.join("ops.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&node_0).unwrap(),
+                serde_json::to_string(&node_1).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            seed_dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({ "fault_schedule": null })).unwrap(),
+        )
+        .unwrap();
+        let timeline = [
+            TimelineEvent {
+                event_id: "ops-second-node".to_string(),
+                op_index: 60,
+                wall_ms: 1,
+                boundary: Boundary::Runner,
+                action: "stop second node".to_string(),
+                key: None,
+                semantics: FaultSemantics::WindowEnd,
+                observed: ObservedResult::DefiniteApplied,
+                recovery: Some(
+                    "namespace=ordered; lease_attempt_nodes=[0,1]; \
+                     lease_publication=true; fenced_manifest=true; \
+                     background_activity=true"
+                        .to_string(),
+                ),
+            },
+            TimelineEvent {
+                event_id: "ops-second-node-incomplete".to_string(),
+                op_index: 61,
+                wall_ms: 2,
+                boundary: Boundary::Runner,
+                action: "stop second node".to_string(),
+                key: None,
+                semantics: FaultSemantics::WindowEnd,
+                observed: ObservedResult::DefiniteApplied,
+                recovery: Some(
+                    "namespace=ordered; lease_attempt_nodes=[0,1]; \
+                     lease_publication=true; background_activity=true"
+                        .to_string(),
+                ),
+            },
+            TimelineEvent {
+                event_id: "ops-second-node-wrong-action".to_string(),
+                op_index: 62,
+                wall_ms: 3,
+                boundary: Boundary::Runner,
+                action: "unrelated runner event".to_string(),
+                key: None,
+                semantics: FaultSemantics::WindowEnd,
+                observed: ObservedResult::DefiniteApplied,
+                recovery: Some(
+                    "namespace=ordered; lease_attempt_nodes=[0,1]; \
+                     lease_publication=true; fenced_manifest=true; \
+                     background_activity=true"
+                        .to_string(),
+                ),
+            },
+            TimelineEvent {
+                event_id: "ops-delete-race".to_string(),
+                op_index: 420,
+                wall_ms: 4,
+                boundary: Boundary::Runner,
+                action: "delete namespace with in-flight upsert upsert_node=0 delete_node=1"
+                    .to_string(),
+                key: None,
+                semantics: FaultSemantics::WindowEnd,
+                observed: ObservedResult::DefiniteApplied,
+                recovery: Some(
+                    "barrier=wal_put_entered; delete_joined=true; barrier_released=true; \
+                     upsert_joined=true; upsert_status=404; delete_status=202"
+                        .to_string(),
+                ),
+            },
+            TimelineEvent {
+                event_id: "ops-resource-limits".to_string(),
+                op_index: 8,
+                wall_ms: 5,
+                boundary: Boundary::Runner,
+                action: "resource limits queries=1 disk_cache_bytes=2097152".to_string(),
+                key: None,
+                semantics: FaultSemantics::PreCall,
+                observed: ObservedResult::DefiniteApplied,
+                recovery: None,
+            },
+            TimelineEvent {
+                event_id: "ops-exhaustion-burst".to_string(),
+                op_index: 9,
+                wall_ms: 6,
+                boundary: Boundary::Runner,
+                action: "fill disk cache with eight concurrent queries".to_string(),
+                key: None,
+                semantics: FaultSemantics::WindowEnd,
+                observed: ObservedResult::DefiniteApplied,
+                recovery: Some("completed=8 successful=4 load_shed=4 nodes={0, 1}".to_string()),
+            },
+        ];
+        fs::write(
+            seed_dir.join("timeline.jsonl"),
+            timeline
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: vec![7],
+            max_ops: Some(2),
+            artifacts: dir.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Deterministic,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let report = build_report(
+            dir.path(),
+            &env,
+            &[SeedReport {
+                seed: 7,
+                mode: RunMode::Deterministic,
+                dir: seed_dir,
+                failed: false,
+                ops: 2,
+                compactions: 0,
+                background_compactions: 1,
+                violations: Vec::new(),
+                wall_secs: 1.0,
+                object_store: BTreeMap::new(),
+                fired_faults: Vec::new(),
+            }],
+            &Coverage::default(),
+        );
+
+        assert!(report.contains("## Operational Proofs"));
+        assert!(report.contains("| 7 | 1 | 1 | 1 | 1 | 1 | 1 |"));
+        assert!(report.contains(
+            "Counts come from persisted operation targets and causal runner-timeline evidence."
+        ));
+    }
 
     #[tokio::test]
     async fn capture_s3_metadata_records_missing_listed_key() {
@@ -587,6 +811,8 @@ mod tests {
             dir: temp_dir.path().to_path_buf(),
             ops,
             op_count: 0,
+            next_op_index: 0,
+            pending_ops: BTreeMap::new(),
         };
         let ns = "ns";
         let key = format!("{ns}/manifest.json");
@@ -790,6 +1016,28 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
         background_compactions,
         ops as f64 / wall
     ));
+
+    out.push_str("## Operational Proofs\n\n");
+    out.push_str(
+        "| seed | node 0 ops | node 1 ops | two-node contention | delete joins | resource limits | exhaustion bursts |\n",
+    );
+    out.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for seed in seeds {
+        let proof = operational_report_proof(&seed.dir);
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            seed.seed,
+            proof.node_0_ops,
+            proof.node_1_ops,
+            proof.two_node_contention,
+            proof.delete_joins,
+            proof.resource_limits,
+            proof.exhaustion_bursts,
+        ));
+    }
+    out.push_str(
+        "\nCounts come from persisted operation targets and causal runner-timeline evidence.\n\n",
+    );
 
     out.push_str("## Violations\n\n");
     let mut any_violation = false;
@@ -1002,6 +1250,67 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
         ));
     }
     out
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OperationalReportProof {
+    node_0_ops: u64,
+    node_1_ops: u64,
+    two_node_contention: u64,
+    delete_joins: u64,
+    resource_limits: u64,
+    exhaustion_bursts: u64,
+}
+
+fn operational_report_proof(seed_dir: &Path) -> OperationalReportProof {
+    let mut proof = OperationalReportProof::default();
+    for record in read_ops(seed_dir) {
+        match record.target_node {
+            0 => proof.node_0_ops += 1,
+            1 => proof.node_1_ops += 1,
+            invalid => panic!("persisted operation target node must be 0 or 1, got {invalid}"),
+        }
+    }
+    for event in read_timeline(seed_dir) {
+        let recovery = event.recovery.as_deref().unwrap_or_default();
+        if event.action == "stop second node"
+            && event.semantics == super::faults::FaultSemantics::WindowEnd
+            && full_two_node_contention_proof(recovery)
+        {
+            proof.two_node_contention += 1;
+        }
+        if event
+            .action
+            .starts_with("delete namespace with in-flight upsert")
+            && recovery.contains("delete_joined=true")
+            && recovery.contains("barrier_released=true")
+            && recovery.contains("upsert_joined=true")
+        {
+            proof.delete_joins += 1;
+        }
+        if event.action.starts_with("resource limits queries=") {
+            proof.resource_limits += 1;
+        }
+        if event.action == "fill disk cache with eight concurrent queries"
+            && recovery.contains("completed=8")
+        {
+            proof.exhaustion_bursts += 1;
+        }
+    }
+    proof
+}
+
+fn full_two_node_contention_proof(recovery: &str) -> bool {
+    let Some(recovery) = recovery.strip_prefix("namespace=") else {
+        return false;
+    };
+    let Some((namespace, evidence)) = recovery.split_once("; ") else {
+        return false;
+    };
+    !namespace.is_empty()
+        && evidence
+            == "lease_attempt_nodes=[0,1]; lease_publication=true; fenced_manifest=true; \
+                background_activity=true"
 }
 
 const REQUIRED_OP_KINDS: &[&str] = &[

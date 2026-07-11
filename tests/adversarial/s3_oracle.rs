@@ -20,11 +20,13 @@ const SKETCH_V4_BIT_WIDTH: u32 = 2;
 #[derive(Debug, Default)]
 pub struct S3Tracker {
     history_hashes: BTreeMap<(String, u64), u64>,
+    live_heads: BTreeMap<String, (u64, u64)>,
 }
 
 impl S3Tracker {
     pub fn forget_namespace(&mut self, namespace: &str) {
         self.history_hashes.retain(|(ns, _), _| ns != namespace);
+        self.live_heads.remove(namespace);
     }
 
     pub async fn check_namespace(
@@ -109,10 +111,59 @@ impl S3Tracker {
         };
 
         let mut violations = Vec::new();
+        if !fault_window_active {
+            let live_hash = match manifest.to_bytes() {
+                Ok(bytes) => xxh3_64(&bytes),
+                Err(error) => {
+                    violations.push(violation(
+                        ViolationId::I15ManifestLineage,
+                        op_index,
+                        namespace,
+                        "live manifest hash encoding failed",
+                        json!({ "error": error.to_string() }),
+                    ));
+                    return violations;
+                }
+            };
+            match self.live_heads.get(namespace).copied() {
+                Some((previous_generation, _)) if manifest.version() < previous_generation => {
+                    violations.push(violation(
+                        ViolationId::I21FencingViolation,
+                        op_index,
+                        namespace,
+                        "live manifest generation regressed across oracle sweeps",
+                        json!({
+                            "previous_generation": previous_generation,
+                            "current_generation": manifest.version(),
+                        }),
+                    ));
+                }
+                Some((previous_generation, previous_hash))
+                    if manifest.version() == previous_generation && live_hash != previous_hash =>
+                {
+                    violations.push(violation(
+                        ViolationId::I21FencingViolation,
+                        op_index,
+                        namespace,
+                        "same-generation live manifest fork observed",
+                        json!({
+                            "generation": manifest.version(),
+                            "previous_hash": previous_hash,
+                            "current_hash": live_hash,
+                        }),
+                    ));
+                }
+                Some((previous_generation, _)) if manifest.version() == previous_generation => {}
+                _ => {
+                    self.live_heads
+                        .insert(namespace.to_string(), (manifest.version(), live_hash));
+                }
+            }
+        }
         let status_generation = compact_status
             .get("manifest_generation")
             .and_then(serde_json::Value::as_u64);
-        if status_generation != Some(manifest.version()) {
+        if !fault_window_active && status_generation != Some(manifest.version()) {
             violations.push(violation(
                 ViolationId::I15ManifestLineage,
                 op_index,
@@ -238,10 +289,10 @@ impl S3Tracker {
                         );
                     } else {
                         violations.push(violation(
-                            ViolationId::I15ManifestLineage,
+                            ViolationId::I21FencingViolation,
                             op_index,
                             namespace,
-                            "manifest history bytes changed for an immutable generation",
+                            "same-generation manifest history fork observed",
                             json!({
                                 "generation": entry.version,
                                 "key": entry.key,
@@ -382,6 +433,43 @@ pub async fn check_quiescent_namespace(
     compact_status: &serde_json::Value,
     op_index: u64,
 ) -> Vec<Violation> {
+    check_quiescent_namespace_with_count_policy(
+        store,
+        namespace,
+        expected_live,
+        compact_status,
+        op_index,
+        false,
+    )
+    .await
+}
+
+pub async fn check_quiescent_namespace_after_second_node(
+    store: &ZeppelinStore,
+    namespace: &str,
+    expected_live: usize,
+    compact_status: &serde_json::Value,
+    op_index: u64,
+) -> Vec<Violation> {
+    check_quiescent_namespace_with_count_policy(
+        store,
+        namespace,
+        expected_live,
+        compact_status,
+        op_index,
+        true,
+    )
+    .await
+}
+
+async fn check_quiescent_namespace_with_count_policy(
+    store: &ZeppelinStore,
+    namespace: &str,
+    expected_live: usize,
+    compact_status: &serde_json::Value,
+    op_index: u64,
+    exact_vector_count: bool,
+) -> Vec<Violation> {
     let manifest = match read_manifest_for_oracle(store, namespace).await {
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
@@ -420,12 +508,21 @@ pub async fn check_quiescent_namespace(
             json!({ "compact_status": compact_status }),
         ));
     }
-    if manifest.vector_count() < expected_live as u64 {
+    let vector_count_mismatch = if exact_vector_count {
+        manifest.vector_count() != expected_live as u64
+    } else {
+        manifest.vector_count() < expected_live as u64
+    };
+    if vector_count_mismatch {
         violations.push(violation(
             ViolationId::I16Quiescence,
             op_index,
             namespace,
-            "manifest vector_count undercounted model live count at quiescence",
+            if exact_vector_count {
+                "manifest vector_count differed from model live count after second-node activity"
+            } else {
+                "manifest vector_count undercounted model live count at quiescence"
+            },
             json!({
                 "manifest_vector_count": manifest.vector_count(),
                 "expected_live": expected_live,
@@ -882,6 +979,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_generation_live_manifest_fork_is_i21() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        Manifest::new().write(&store, "ns").await.unwrap();
+        let status = json!({ "manifest_generation": 1 });
+        let mut tracker = S3Tracker::default();
+        assert!(tracker
+            .check_namespace(&store, "ns", 1, &status, false)
+            .await
+            .is_empty());
+
+        let mut fork = Manifest::read(&store, "ns")
+            .await
+            .unwrap()
+            .expect("live manifest must exist");
+        fork.fencing_token = 99;
+        store
+            .put("ns/manifest.json", fork.to_bytes().unwrap())
+            .await
+            .unwrap();
+
+        let violations = tracker
+            .check_namespace(&store, "ns", 2, &status, false)
+            .await;
+
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I21FencingViolation);
+        assert!(violations[0].detail.contains("fork"));
+        assert_eq!(violations[0].evidence["generation"], 1);
+        assert_ne!(
+            violations[0].evidence["previous_hash"],
+            violations[0].evidence["current_hash"]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_manifest_generation_regression_is_i21() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        Manifest::new().write(&store, "ns").await.unwrap();
+        let (mut generation_two, version) = Manifest::read_versioned(&store, "ns")
+            .await
+            .unwrap()
+            .expect("generation one must exist");
+        generation_two
+            .write_conditional(&store, "ns", &version)
+            .await
+            .unwrap();
+        assert_eq!(generation_two.version(), 2);
+
+        let mut tracker = S3Tracker::default();
+        assert!(tracker
+            .check_namespace(&store, "ns", 1, &json!({ "manifest_generation": 2 }), false,)
+            .await
+            .is_empty());
+
+        let generation_one = store.get(&Manifest::history_key("ns", 1)).await.unwrap();
+        store.put("ns/manifest.json", generation_one).await.unwrap();
+        let violations = tracker
+            .check_namespace(&store, "ns", 2, &json!({ "manifest_generation": 1 }), false)
+            .await;
+
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I21FencingViolation);
+        assert!(violations[0].detail.contains("regressed"));
+        assert_eq!(violations[0].evidence["previous_generation"], 2);
+        assert_eq!(violations[0].evidence["current_generation"], 1);
+    }
+
+    #[tokio::test]
+    async fn injected_stale_live_head_does_not_regress_or_replace_clean_baseline() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Semantic,
+            events: vec![FaultEvent {
+                id: "semantic-stale-live-head-regression".to_string(),
+                start_op: 10,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("manifest.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::StaleRead,
+            }],
+        });
+        let store = store_fault_proxy(&inner, scheduler.clone());
+        Manifest::new().write(&store, "ns").await.unwrap();
+        let (mut generation_two, version) = Manifest::read_versioned(&store, "ns")
+            .await
+            .unwrap()
+            .expect("generation one must exist");
+        generation_two
+            .write_conditional(&store, "ns", &version)
+            .await
+            .unwrap();
+
+        let mut tracker = S3Tracker::default();
+        assert!(tracker
+            .check_namespace(&store, "ns", 1, &json!({ "manifest_generation": 2 }), false)
+            .await
+            .is_empty());
+        assert_eq!(tracker.live_heads["ns"].0, 2);
+
+        scheduler.advance_to(10);
+        let prospective_fault_window = scheduler.fault_window_active(10, "ns");
+        assert!(
+            prospective_fault_window,
+            "active unfired manifest StaleRead must be predicted before its GET fires"
+        );
+        let fault_window = tracker
+            .check_namespace_with_fault_window(
+                &store,
+                "ns",
+                10,
+                &json!({ "manifest_generation": 2 }),
+                false,
+                prospective_fault_window,
+            )
+            .await;
+        assert!(
+            fault_window.is_empty(),
+            "injected stale live head must be a zero-false-positive observation: {fault_window:#?}"
+        );
+        assert_eq!(tracker.live_heads["ns"].0, 2);
+        assert_eq!(scheduler.timeline().len(), 1);
+        assert!(
+            !scheduler.fault_window_active(10, "ns"),
+            "one-shot StaleRead prediction must become strict immediately after firing"
+        );
+
+        scheduler.advance_to(11);
+        let clean = tracker
+            .check_namespace(
+                &store,
+                "ns",
+                11,
+                &json!({ "manifest_generation": 2 }),
+                false,
+            )
+            .await;
+        assert!(
+            clean.is_empty(),
+            "strict clean observation must resume: {clean:#?}"
+        );
+        assert_eq!(tracker.live_heads["ns"].0, 2);
+    }
+
+    #[tokio::test]
+    async fn live_head_hash_and_generation_are_observed_atomically() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Semantic,
+            events: vec![FaultEvent {
+                id: "semantic-stale-live-head".to_string(),
+                start_op: 10,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("manifest.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::StaleRead,
+            }],
+        });
+        let store = store_fault_proxy(&inner, scheduler.clone());
+        Manifest::new().write(&store, "ns").await.unwrap();
+
+        let mut tracker = S3Tracker::default();
+        assert!(tracker
+            .check_namespace(&store, "ns", 1, &json!({ "manifest_generation": 1 }), false,)
+            .await
+            .is_empty());
+
+        let (mut generation_two, version) = Manifest::read_versioned(&store, "ns")
+            .await
+            .unwrap()
+            .expect("generation one must exist");
+        generation_two
+            .write_conditional(&store, "ns", &version)
+            .await
+            .unwrap();
+        scheduler.advance_to(10);
+
+        let violations = tracker
+            .check_namespace(&store, "ns", 2, &json!({ "manifest_generation": 1 }), false)
+            .await;
+
+        assert!(
+            violations
+                .iter()
+                .all(|violation| violation.id != ViolationId::I21FencingViolation),
+            "a generation advance between two GETs is not a live-head fork: {violations:#?}"
+        );
+        assert_eq!(scheduler.timeline().len(), 1);
+    }
+
+    #[tokio::test]
     async fn manifest_read_failure_returns_violation_instead_of_panicking() {
         let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
         Manifest::new().write(&inner, "ns").await.unwrap();
@@ -991,6 +1286,72 @@ mod tests {
         assert_eq!(violations.len(), 1, "{violations:#?}");
         assert_eq!(violations[0].id, ViolationId::I16Quiescence);
         assert!(violations[0].detail.contains("reachability read-failed"));
+    }
+
+    #[tokio::test]
+    async fn quiescent_manifest_vector_count_overcount_is_allowed_for_single_writer() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let fragment_id = Ulid::from(2_u128);
+        let fragment_key = format!("ns/wal/{fragment_id}.wal");
+        store
+            .put(&fragment_key, bytes::Bytes::from_static(b"wal"))
+            .await
+            .unwrap();
+        let mut manifest = Manifest::new();
+        manifest.add_fragment(FragmentRef {
+            id: fragment_id,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 3,
+        });
+        manifest.write(&store, "ns").await.unwrap();
+
+        let violations = check_quiescent_namespace(
+            &store,
+            "ns",
+            0,
+            &json!({ "ready": true, "uncompacted_fragments": 0 }),
+            17,
+        )
+        .await;
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[tokio::test]
+    async fn quiescent_manifest_vector_count_overcount_is_i16_after_second_node() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let fragment_id = Ulid::from(3_u128);
+        let fragment_key = format!("ns/wal/{fragment_id}.wal");
+        store
+            .put(&fragment_key, bytes::Bytes::from_static(b"wal"))
+            .await
+            .unwrap();
+        let mut manifest = Manifest::new();
+        manifest.add_fragment(FragmentRef {
+            id: fragment_id,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 3,
+        });
+        manifest.write(&store, "ns").await.unwrap();
+
+        let violations = check_quiescent_namespace_after_second_node(
+            &store,
+            "ns",
+            0,
+            &json!({ "ready": true, "uncompacted_fragments": 0 }),
+            18,
+        )
+        .await;
+
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I16Quiescence);
+        assert!(violations[0].detail.contains("vector_count"));
+        assert_eq!(violations[0].evidence["manifest_vector_count"], 1);
+        assert_eq!(violations[0].evidence["expected_live"], 0);
     }
 
     #[tokio::test]

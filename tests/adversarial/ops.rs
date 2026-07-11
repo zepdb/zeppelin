@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter};
@@ -169,6 +169,55 @@ pub enum MaintenanceKind {
     Hydrate,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    #[default]
+    Legacy,
+    Workload,
+    DeferredDrain,
+    Quiescence,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldReleaseCause {
+    #[default]
+    Legacy,
+    LogicalOp,
+    Quiesce,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HeldExecutionMetadata {
+    pub event_id: String,
+    pub window_op: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_release_op: Option<u64>,
+    #[serde(alias = "release_op")]
+    pub actual_join_op: u64,
+    #[serde(default)]
+    pub release_cause: HoldReleaseCause,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionMetadata {
+    #[serde(default)]
+    pub phase: ExecutionPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<HeldExecutionMetadata>,
+}
+
+impl ExecutionMetadata {
+    #[must_use]
+    pub fn workload() -> Self {
+        Self {
+            phase: ExecutionPhase::Workload,
+            hold: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpRecord {
     pub index: u64,
@@ -180,9 +229,27 @@ pub struct OpRecord {
     pub response: serde_json::Value,
     #[serde(default)]
     pub outcome: String,
+    #[serde(default, deserialize_with = "deserialize_target_node")]
+    pub target_node: u8,
+    #[serde(default)]
+    pub execution: ExecutionMetadata,
     pub gen_after: Option<u64>,
     pub duration_ms: u64,
     pub violations: Vec<ViolationId>,
+}
+
+fn deserialize_target_node<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let target_node = u8::deserialize(deserializer)?;
+    if target_node <= 1 {
+        Ok(target_node)
+    } else {
+        Err(D::Error::custom(format!(
+            "target_node must be 0 or 1, got {target_node}"
+        )))
+    }
 }
 
 impl Op {
@@ -492,5 +559,108 @@ impl fmt::Display for AsOfTarget {
             AsOfTarget::Timestamp(timestamp) => write!(f, "{timestamp}"),
             AsOfTarget::Snapshot(name) => write!(f, "snapshot:{name}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn op_record_serializes_execution_and_defaults_legacy_metadata() {
+        let record = OpRecord {
+            index: 3,
+            wall_ms: 0,
+            op: Op::GetNamespace {
+                ns: "ns".to_string(),
+            },
+            method: "GET".to_string(),
+            path: "/v1/namespaces/ns".to_string(),
+            status: 200,
+            response: serde_json::json!({}),
+            outcome: "applied".to_string(),
+            target_node: 0,
+            execution: ExecutionMetadata {
+                phase: ExecutionPhase::Workload,
+                hold: Some(HeldExecutionMetadata {
+                    event_id: "sched-manifest-hold".to_string(),
+                    window_op: 3,
+                    scheduled_release_op: Some(7),
+                    actual_join_op: 7,
+                    release_cause: HoldReleaseCause::LogicalOp,
+                }),
+            },
+            gen_after: None,
+            duration_ms: 1,
+            violations: Vec::new(),
+        };
+        let mut encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(encoded["target_node"], 0);
+        assert_eq!(encoded["execution"]["phase"], "workload");
+        assert_eq!(
+            encoded["execution"]["hold"],
+            serde_json::json!({
+                "event_id": "sched-manifest-hold",
+                "window_op": 3,
+                "scheduled_release_op": 7,
+                "actual_join_op": 7,
+                "release_cause": "logical_op",
+            })
+        );
+
+        encoded.as_object_mut().unwrap().remove("execution");
+        encoded.as_object_mut().unwrap().remove("target_node");
+        let legacy: OpRecord = serde_json::from_value(encoded).unwrap();
+        assert_eq!(legacy.target_node, 0);
+        assert_eq!(legacy.execution, ExecutionMetadata::default());
+        assert_eq!(legacy.execution.phase, ExecutionPhase::Legacy);
+        assert_eq!(legacy.execution.hold, None);
+    }
+
+    #[test]
+    fn op_record_rejects_target_node_outside_two_node_domain() {
+        let record = OpRecord {
+            index: 3,
+            wall_ms: 0,
+            op: Op::GetNamespace {
+                ns: "ns".to_string(),
+            },
+            method: "GET".to_string(),
+            path: "/v1/namespaces/ns".to_string(),
+            status: 200,
+            response: serde_json::json!({}),
+            outcome: "applied".to_string(),
+            target_node: 0,
+            execution: ExecutionMetadata::workload(),
+            gen_after: None,
+            duration_ms: 1,
+            violations: Vec::new(),
+        };
+        let mut encoded = serde_json::to_value(record).unwrap();
+        encoded["target_node"] = serde_json::json!(2);
+
+        let error = serde_json::from_value::<OpRecord>(encoded).unwrap_err();
+        assert!(error.to_string().contains("target_node"), "{error}");
+        assert!(error.to_string().contains("0 or 1"), "{error}");
+    }
+
+    #[test]
+    fn execution_metadata_separates_scheduled_release_from_quiesced_join() {
+        let execution = ExecutionMetadata {
+            phase: ExecutionPhase::DeferredDrain,
+            hold: Some(HeldExecutionMetadata {
+                event_id: "sched-boundary-hold".to_string(),
+                window_op: 3,
+                scheduled_release_op: Some(7),
+                actual_join_op: 5,
+                release_cause: HoldReleaseCause::Quiesce,
+            }),
+        };
+
+        let encoded = serde_json::to_value(&execution).unwrap();
+        assert_eq!(encoded["phase"], "deferred_drain");
+        assert_eq!(encoded["hold"]["scheduled_release_op"], 7);
+        assert_eq!(encoded["hold"]["actual_join_op"], 5);
+        assert_eq!(encoded["hold"]["release_cause"], "quiesce");
     }
 }

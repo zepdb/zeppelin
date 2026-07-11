@@ -35,6 +35,7 @@ pub enum ViolationId {
     I18IndeterminateResolution,
     I19CrashRecovery,
     I20CorruptionSurfaced,
+    I21FencingViolation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2355,6 +2356,8 @@ mod tests {
                 "missing": []
             }),
             outcome: "applied".to_string(),
+            target_node: 0,
+            execution: Default::default(),
             gen_after: Some(1),
             duration_ms: 1,
             violations: Vec::new(),
@@ -2397,6 +2400,8 @@ mod tests {
             status: 200,
             response,
             outcome: "applied".to_string(),
+            target_node: 0,
+            execution: Default::default(),
             gen_after: Some(1),
             duration_ms: 1,
             violations: Vec::new(),
@@ -2432,6 +2437,8 @@ mod tests {
             status: 200,
             response,
             outcome: "applied".to_string(),
+            target_node: 0,
+            execution: Default::default(),
             gen_after: Some(1),
             duration_ms: 1,
             violations: Vec::new(),
@@ -2568,6 +2575,8 @@ mod tests {
             status: 200,
             response,
             outcome: "applied".to_string(),
+            target_node: 0,
+            execution: Default::default(),
             gen_after: Some(1),
             duration_ms: 1,
             violations: Vec::new(),

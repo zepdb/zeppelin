@@ -13,6 +13,7 @@ pub enum AmbiguityReason {
     JsonParse,
     ServerError { status: u16 },
     ServerCrashed,
+    HeldInFlight,
 }
 
 impl AmbiguityReason {
@@ -24,6 +25,7 @@ impl AmbiguityReason {
             Self::JsonParse => "json_parse".to_string(),
             Self::ServerError { status } => format!("server_error_{status}"),
             Self::ServerCrashed => "server_crashed".to_string(),
+            Self::HeldInFlight => "held_in_flight".to_string(),
         }
     }
 }
@@ -74,6 +76,8 @@ pub enum OracleMutation {
     ClockGcEatsLive,
     SwallowCorruption,
     MisdirectedWriteReachability,
+    /// Admit one stale-token writer result so lineage must report I21.
+    DualWriterFencing,
 }
 
 impl OracleMutation {
@@ -95,6 +99,7 @@ impl OracleMutation {
             "clock-gc-eats-live" => Self::ClockGcEatsLive,
             "swallow-corruption" => Self::SwallowCorruption,
             "misdirected-write-reachability" => Self::MisdirectedWriteReachability,
+            "dual-writer-fencing" => Self::DualWriterFencing,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -117,6 +122,7 @@ impl OracleMutation {
             Self::ClockGcEatsLive => "clock-gc-eats-live",
             Self::SwallowCorruption => "swallow-corruption",
             Self::MisdirectedWriteReachability => "misdirected-write-reachability",
+            Self::DualWriterFencing => "dual-writer-fencing",
         }
     }
 }
@@ -236,6 +242,18 @@ impl Model {
         response: &serde_json::Value,
         mutation: Option<OracleMutation>,
     ) {
+        self.apply_with_generation_checkpoints(op, status, gen_after, response, mutation, true);
+    }
+
+    fn apply_with_generation_checkpoints(
+        &mut self,
+        op: &Op,
+        status: u16,
+        gen_after: Option<u64>,
+        response: &serde_json::Value,
+        mutation: Option<OracleMutation>,
+        generation_checkpoints: bool,
+    ) {
         if !(200..300).contains(&status) {
             return;
         }
@@ -279,7 +297,7 @@ impl Model {
                 if mutation == Some(OracleMutation::PhantomId) {
                     model.insert_phantom_once();
                 }
-                model.checkpoint(gen_after);
+                model.checkpoint_if_enabled(gen_after, generation_checkpoints);
                 if mutation == Some(OracleMutation::StaleCheckpoint) {
                     model.corrupt_latest_checkpoint();
                 }
@@ -298,7 +316,7 @@ impl Model {
                         model.deleted_ever.insert(id.clone());
                     }
                 }
-                model.checkpoint(gen_after);
+                model.checkpoint_if_enabled(gen_after, generation_checkpoints);
                 if mutation == Some(OracleMutation::StaleCheckpoint) {
                     model.corrupt_latest_checkpoint();
                 }
@@ -312,7 +330,7 @@ impl Model {
                 model
                     .indeterminate_ns
                     .retain(|entry| !matches!(entry, NsIndeterminate::MaybeCompacted));
-                model.checkpoint(gen_after);
+                model.checkpoint_if_enabled(gen_after, generation_checkpoints);
                 if mutation == Some(OracleMutation::StaleCheckpoint) {
                     model.corrupt_latest_checkpoint();
                 }
@@ -330,7 +348,7 @@ impl Model {
                 model
                     .indeterminate_ns
                     .retain(|entry| !matches!(entry, NsIndeterminate::MaybeCompacted));
-                model.checkpoint(gen_after);
+                model.checkpoint_if_enabled(gen_after, generation_checkpoints);
                 if mutation == Some(OracleMutation::StaleCheckpoint) {
                     model.corrupt_latest_checkpoint();
                 }
@@ -339,7 +357,7 @@ impl Model {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     panic!("maintenance acked for unknown namespace {ns}");
                 };
-                model.checkpoint(gen_after);
+                model.checkpoint_if_enabled(gen_after, generation_checkpoints);
                 if mutation == Some(OracleMutation::StaleCheckpoint) {
                     model.corrupt_latest_checkpoint();
                 }
@@ -430,14 +448,42 @@ impl Model {
         mutation: Option<OracleMutation>,
         op_index: u64,
     ) {
+        self.apply_outcome_with_generation_checkpoints(
+            op, outcome, gen_after, mutation, op_index, true,
+        );
+    }
+
+    pub fn apply_outcome_with_generation_checkpoints(
+        &mut self,
+        op: &Op,
+        outcome: &OpOutcome,
+        gen_after: Option<u64>,
+        mutation: Option<OracleMutation>,
+        op_index: u64,
+        generation_checkpoints: bool,
+    ) {
         match outcome {
             OpOutcome::Applied { status, response } => {
-                self.apply(op, *status, gen_after, response, mutation);
+                self.apply_with_generation_checkpoints(
+                    op,
+                    *status,
+                    gen_after,
+                    response,
+                    mutation,
+                    generation_checkpoints,
+                );
             }
             OpOutcome::NotApplied { .. } => {}
             OpOutcome::Ambiguous { reason, .. } => {
                 if mutation == Some(OracleMutation::CrashLostAck) {
-                    self.apply(op, 200, gen_after, &serde_json::Value::Null, mutation);
+                    self.apply_with_generation_checkpoints(
+                        op,
+                        200,
+                        gen_after,
+                        &serde_json::Value::Null,
+                        mutation,
+                        generation_checkpoints,
+                    );
                 } else if mutation != Some(OracleMutation::PostCommitLostWrite) {
                     self.record_indeterminate(op, op_index, reason);
                     if mutation == Some(OracleMutation::IndetResolutionLie) {
@@ -445,6 +491,109 @@ impl Model {
                     }
                 }
             }
+        }
+    }
+
+    /// Replaces a provisional held-operation ambiguity with its joined result.
+    pub fn apply_joined_outcome(
+        &mut self,
+        op: &Op,
+        outcome: &OpOutcome,
+        gen_after: Option<u64>,
+        mutation: Option<OracleMutation>,
+        op_index: u64,
+    ) {
+        self.apply_joined_outcome_with_generation_checkpoints(
+            op, outcome, gen_after, mutation, op_index, true,
+        );
+    }
+
+    pub fn apply_joined_outcome_with_generation_checkpoints(
+        &mut self,
+        op: &Op,
+        outcome: &OpOutcome,
+        gen_after: Option<u64>,
+        mutation: Option<OracleMutation>,
+        op_index: u64,
+        generation_checkpoints: bool,
+    ) {
+        self.clear_held_vector_effects(op, op_index);
+        self.apply_outcome_with_generation_checkpoints(
+            op,
+            outcome,
+            gen_after,
+            mutation,
+            op_index,
+            generation_checkpoints,
+        );
+    }
+
+    fn clear_held_vector_effects(&mut self, op: &Op, op_index: u64) {
+        self.clear_held_namespace_effect(op);
+        let (ns, ids): (&str, Vec<&str>) = match op {
+            Op::Upsert { ns, vectors } => (
+                ns,
+                vectors.iter().map(|vector| vector.id.as_str()).collect(),
+            ),
+            Op::DeleteVectors { ns, ids } => (ns, ids.iter().map(String::as_str).collect()),
+            _ => return,
+        };
+        let Some(model) = self.namespaces.get_mut(ns) else {
+            return;
+        };
+        for id in ids {
+            let held = model.indeterminate.get(id).is_some_and(|pending| {
+                pending.op_index == op_index && pending.reason == "held_in_flight"
+            });
+            if held {
+                model.indeterminate.remove(id);
+            }
+        }
+    }
+
+    fn clear_held_namespace_effect(&mut self, op: &Op) {
+        let (namespace, matches_effect): (&str, fn(&NsIndeterminate) -> bool) = match op {
+            Op::CreateSnapshot { ns, name } => {
+                let name = name.clone();
+                if let Some(model) = self.namespaces.get_mut(ns) {
+                    model.indeterminate_ns.retain(|effect| {
+                        !matches!(effect, NsIndeterminate::MaybeSnapshot { name: pending } if pending == &name)
+                    });
+                }
+                return;
+            }
+            Op::DeleteSnapshot { ns, name } => {
+                let name = name.clone();
+                if let Some(model) = self.namespaces.get_mut(ns) {
+                    model.indeterminate_ns.retain(|effect| {
+                        !matches!(effect, NsIndeterminate::MaybeSnapshotDeleted { name: pending } if pending == &name)
+                    });
+                }
+                return;
+            }
+            Op::CloneNamespace { source, target, .. } => {
+                let target = target.clone();
+                if let Some(model) = self.namespaces.get_mut(source) {
+                    model.indeterminate_ns.retain(|effect| {
+                        !matches!(effect, NsIndeterminate::MaybeCloned { target: pending, .. } if pending == &target)
+                    });
+                }
+                return;
+            }
+            Op::DeleteNamespace { ns } => (ns, |effect| {
+                matches!(effect, NsIndeterminate::MaybeDeletedNs)
+            }),
+            Op::CompactInline { ns }
+            | Op::CompactEndpoint { ns }
+            | Op::ProbeSandwich { ns, .. } => (ns, |effect| {
+                matches!(effect, NsIndeterminate::MaybeCompacted)
+            }),
+            _ => return,
+        };
+        if let Some(model) = self.namespaces.get_mut(namespace) {
+            model
+                .indeterminate_ns
+                .retain(|effect| !matches_effect(effect));
         }
     }
 
@@ -650,6 +799,12 @@ impl NsModel {
         self.checkpoints.insert(generation, self.live.clone());
     }
 
+    fn checkpoint_if_enabled(&mut self, gen_after: Option<u64>, enabled: bool) {
+        if enabled {
+            self.checkpoint(gen_after);
+        }
+    }
+
     fn insert_phantom_once(&mut self) {
         let id = "__phantom_id".to_string();
         if self.live.contains_key(&id) {
@@ -748,7 +903,86 @@ mod tests {
 
     use crate::adversarial::ops::{AsOfTarget, GenVector, NamespaceSpec, Op};
 
-    use super::{model_distance, AmbiguityReason, Model, ModelRecord, NsModel, OpOutcome};
+    use super::{
+        model_distance, AmbiguityReason, Model, ModelRecord, NsModel, OpOutcome, OracleMutation,
+    };
+
+    #[test]
+    fn held_in_flight_ambiguity_has_stable_label_and_wire_key() {
+        let reason = AmbiguityReason::HeldInFlight;
+
+        assert_eq!(reason.label(), "held_in_flight");
+        assert_eq!(
+            serde_json::to_value(&reason).unwrap(),
+            json!("held_in_flight")
+        );
+        assert_eq!(
+            serde_json::from_value::<AmbiguityReason>(json!("held_in_flight")).unwrap(),
+            reason
+        );
+    }
+
+    #[test]
+    fn dual_writer_fencing_mutation_key_round_trips() {
+        let mutation = OracleMutation::from_key("dual-writer-fencing");
+
+        assert_eq!(mutation, OracleMutation::DualWriterFencing);
+        assert_eq!(mutation.key(), "dual-writer-fencing");
+    }
+
+    #[test]
+    fn generation_checkpoints_pause_only_during_second_node_window() {
+        let (mut model, ns) = model_with_old_record();
+        let active_window_upsert = Op::Upsert {
+            ns: ns.clone(),
+            vectors: vec![GenVector {
+                id: "during-window".to_string(),
+                values: vec![0.0, 1.0],
+                attributes: None,
+            }],
+        };
+        model.apply_outcome_with_generation_checkpoints(
+            &active_window_upsert,
+            &OpOutcome::Applied {
+                status: 200,
+                response: json!({}),
+            },
+            Some(2),
+            None,
+            10,
+            false,
+        );
+
+        let during = &model.namespaces[&ns];
+        assert!(during.live.contains_key("during-window"));
+        assert_eq!(during.live_generation, 1);
+        assert!(!during.checkpoints.contains_key(&2));
+
+        let after_window_upsert = Op::Upsert {
+            ns: ns.clone(),
+            vectors: vec![GenVector {
+                id: "after-window".to_string(),
+                values: vec![1.0, 1.0],
+                attributes: None,
+            }],
+        };
+        model.apply_outcome_with_generation_checkpoints(
+            &after_window_upsert,
+            &OpOutcome::Applied {
+                status: 200,
+                response: json!({}),
+            },
+            Some(3),
+            None,
+            11,
+            true,
+        );
+
+        let after = &model.namespaces[&ns];
+        assert_eq!(after.live_generation, 3);
+        assert!(after.checkpoints[&3].contains_key("during-window"));
+        assert!(after.checkpoints[&3].contains_key("after-window"));
+    }
 
     #[test]
     fn ambiguous_delete_defers_tombstone_until_resolution() {
@@ -949,6 +1183,47 @@ mod tests {
 
         assert_eq!(model.namespaces[&ns].live["id-1"].values, definite.values);
         assert!(model.namespaces[&ns].indeterminate.is_empty());
+    }
+
+    #[test]
+    fn joined_rejection_clears_held_upsert_without_changing_state() {
+        let (mut model, ns) = model_with_old_record();
+        let op = Op::Upsert {
+            ns: ns.clone(),
+            vectors: vec![GenVector {
+                id: "id-1".to_string(),
+                values: vec![0.0, 1.0],
+                attributes: None,
+            }],
+        };
+        model.apply_outcome(
+            &op,
+            &OpOutcome::Ambiguous {
+                reason: AmbiguityReason::HeldInFlight,
+                status: None,
+            },
+            None,
+            None,
+            12,
+        );
+        assert_eq!(
+            model.namespaces[&ns].indeterminate["id-1"].reason,
+            "held_in_flight"
+        );
+
+        model.apply_joined_outcome(
+            &op,
+            &OpOutcome::NotApplied {
+                status: 409,
+                response: json!({ "code": "CONFLICT_RETRY" }),
+            },
+            None,
+            None,
+            12,
+        );
+
+        assert!(model.namespaces[&ns].indeterminate.is_empty());
+        assert_eq!(model.namespaces[&ns].live["id-1"].values, vec![1.0, 0.0]);
     }
 
     #[test]

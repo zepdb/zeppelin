@@ -33,6 +33,8 @@ pub enum FaultProfile {
     Clock,
     Content,
     Semantic,
+    Sched,
+    Ops,
 }
 
 impl FaultProfile {
@@ -46,6 +48,8 @@ impl FaultProfile {
             "clock" => Self::Clock,
             "content" => Self::Content,
             "semantic" => Self::Semantic,
+            "sched" => Self::Sched,
+            "ops" => Self::Ops,
             other => panic!("invalid ZEPPELIN_ADVERSARIAL_PROFILE: {other}"),
         }
     }
@@ -59,6 +63,8 @@ impl FaultProfile {
             Self::Clock => "clock",
             Self::Content => "content",
             Self::Semantic => "semantic",
+            Self::Sched => "sched",
+            Self::Ops => "ops",
         }
     }
 }
@@ -91,6 +97,7 @@ pub enum Boundary {
     ClientHttp,
     Process,
     Clock,
+    Runner,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -142,6 +149,10 @@ pub enum FaultKind {
     },
     Content(ContentFault),
     CasConflict,
+    /// Test-only fault that admits one stale conditional manifest publication.
+    /// Regular seeded schedules never construct this variant; callers must also
+    /// opt into the dedicated store-proxy constructor.
+    AdmitStaleManifestCas,
     ListOmit {
         nth: u32,
     },
@@ -155,6 +166,19 @@ pub enum FaultKind {
         fail_every: u32,
     },
     CopySourceVanish,
+    HoldCall {
+        for_ops: u64,
+    },
+    StartSecondNode {
+        for_ops: u64,
+    },
+    PatchConfigDuringTraffic,
+    DeleteNamespaceInFlight,
+    FillDiskCache,
+    ResourceExhaustion {
+        max_concurrent_queries: usize,
+        disk_cache_max_bytes: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -232,18 +256,47 @@ pub enum ClockCommand {
     Thaw { event_id: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerCommand {
+    Clock(ClockCommand),
+    StartSecondNode {
+        event_id: String,
+        for_ops: u64,
+    },
+    StopSecondNode {
+        event_id: String,
+    },
+    PatchConfigDuringTraffic {
+        event_id: String,
+    },
+    DeleteNamespaceInFlight {
+        event_id: String,
+    },
+    FillDiskCache {
+        event_id: String,
+    },
+    ResourceExhaustion {
+        event_id: String,
+        max_concurrent_queries: usize,
+        disk_cache_max_bytes: u64,
+    },
+}
+
 #[derive(Debug)]
 struct EventRuntime {
     fired: AtomicBool,
     ended: AtomicBool,
     matches: AtomicU64,
+    claimed_op: AtomicU64,
 }
 
 #[derive(Debug)]
 struct SchedulerRuntime {
     logical_op: AtomicU64,
+    logical_op_tx: tokio::sync::watch::Sender<u64>,
     quiesced: AtomicBool,
     timeline: Mutex<Vec<TimelineEvent>>,
+    timeline_revision_tx: tokio::sync::watch::Sender<u64>,
     events: Vec<EventRuntime>,
     store_calls: AtomicU64,
     started: Instant,
@@ -255,6 +308,13 @@ pub struct FaultScheduler {
     runtime: Arc<SchedulerRuntime>,
     rng_salt: u64,
     process: Option<Arc<Mutex<ProcessController>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForegroundHold {
+    pub event_id: String,
+    pub window_op: u64,
+    pub release_op: u64,
 }
 
 impl FaultScheduler {
@@ -283,14 +343,19 @@ impl FaultScheduler {
                 fired: AtomicBool::new(false),
                 ended: AtomicBool::new(false),
                 matches: AtomicU64::new(0),
+                claimed_op: AtomicU64::new(u64::MAX),
             })
             .collect();
+        let (logical_op_tx, _) = tokio::sync::watch::channel(0);
+        let (timeline_revision_tx, _) = tokio::sync::watch::channel(0);
         Self {
             schedule: Arc::new(schedule),
             runtime: Arc::new(SchedulerRuntime {
                 logical_op: AtomicU64::new(0),
+                logical_op_tx,
                 quiesced: AtomicBool::new(false),
                 timeline: Mutex::new(Vec::new()),
+                timeline_revision_tx,
                 events,
                 store_calls: AtomicU64::new(0),
                 started: Instant::now(),
@@ -305,18 +370,97 @@ impl FaultScheduler {
         &self.schedule
     }
 
-    pub fn advance_to(&self, op_index: u64) -> Vec<ClockCommand> {
+    pub fn advance_to(&self, op_index: u64) -> Vec<SchedulerCommand> {
         self.runtime.logical_op.store(op_index, Ordering::SeqCst);
+        self.runtime.logical_op_tx.send_replace(op_index);
         if self.runtime.quiesced.load(Ordering::SeqCst) {
             return Vec::new();
         }
 
         let mut commands = Vec::new();
         for (index, event) in self.schedule.events.iter().enumerate() {
+            let runtime = &self.runtime.events[index];
+            if event.boundary == Boundary::Runner {
+                match event.kind {
+                    FaultKind::StartSecondNode { for_ops } => {
+                        if op_index == event.start_op
+                            && runtime
+                                .fired
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                        {
+                            commands.push(SchedulerCommand::StartSecondNode {
+                                event_id: event.id.clone(),
+                                for_ops,
+                            });
+                        }
+                        if op_index == event.start_op.saturating_add(for_ops)
+                            && runtime
+                                .ended
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                        {
+                            commands.push(SchedulerCommand::StopSecondNode {
+                                event_id: event.id.clone(),
+                            });
+                        }
+                    }
+                    FaultKind::PatchConfigDuringTraffic if op_index == event.start_op => {
+                        if runtime
+                            .fired
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            commands.push(SchedulerCommand::PatchConfigDuringTraffic {
+                                event_id: event.id.clone(),
+                            });
+                        }
+                    }
+                    FaultKind::DeleteNamespaceInFlight if op_index == event.start_op => {
+                        if runtime
+                            .fired
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            commands.push(SchedulerCommand::DeleteNamespaceInFlight {
+                                event_id: event.id.clone(),
+                            });
+                        }
+                    }
+                    FaultKind::FillDiskCache if op_index == event.start_op => {
+                        if runtime
+                            .fired
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            commands.push(SchedulerCommand::FillDiskCache {
+                                event_id: event.id.clone(),
+                            });
+                        }
+                    }
+                    FaultKind::ResourceExhaustion {
+                        max_concurrent_queries,
+                        disk_cache_max_bytes,
+                    } if op_index == event.start_op => {
+                        if runtime
+                            .fired
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            commands.push(SchedulerCommand::ResourceExhaustion {
+                                event_id: event.id.clone(),
+                                max_concurrent_queries,
+                                disk_cache_max_bytes,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             if event.boundary != Boundary::Clock {
                 continue;
             }
-            let runtime = &self.runtime.events[index];
             match event.kind {
                 FaultKind::ClockJump { delta_ms } if op_index == event.start_op => {
                     if runtime
@@ -324,10 +468,10 @@ impl FaultScheduler {
                         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                     {
-                        commands.push(ClockCommand::Jump {
+                        commands.push(SchedulerCommand::Clock(ClockCommand::Jump {
                             event_id: event.id.clone(),
                             delta_ms,
-                        });
+                        }));
                     }
                 }
                 FaultKind::ClockFreeze { for_ops } => {
@@ -337,10 +481,10 @@ impl FaultScheduler {
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                             .is_ok()
                     {
-                        commands.push(ClockCommand::Freeze {
+                        commands.push(SchedulerCommand::Clock(ClockCommand::Freeze {
                             event_id: event.id.clone(),
                             for_ops,
-                        });
+                        }));
                     }
                     if op_index == event.start_op.saturating_add(for_ops)
                         && runtime
@@ -348,15 +492,83 @@ impl FaultScheduler {
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                             .is_ok()
                     {
-                        commands.push(ClockCommand::Thaw {
+                        commands.push(SchedulerCommand::Clock(ClockCommand::Thaw {
                             event_id: event.id.clone(),
-                        });
+                        }));
                     }
                 }
                 _ => {}
             }
         }
         commands
+    }
+
+    /// Predicts whether one of the supplied object-store calls must
+    /// participate in an active foreground hold, without consuming that
+    /// scheduled event. A hold already claimed at this logical op remains
+    /// visible until its exact release boundary.
+    #[must_use]
+    pub fn foreground_hold_release_for_calls(
+        &self,
+        op_index: u64,
+        calls: &[(StoreOp, String)],
+    ) -> Option<u64> {
+        self.foreground_hold_for_calls(op_index, calls)
+            .map(|hold| hold.release_op)
+    }
+
+    /// Returns the exact scheduled hold a foreground call footprint can claim.
+    #[must_use]
+    pub fn foreground_hold_for_calls(
+        &self,
+        op_index: u64,
+        calls: &[(StoreOp, String)],
+    ) -> Option<ForegroundHold> {
+        self.foreground_hold_for_calls_excluding(op_index, calls, None)
+    }
+
+    /// Returns the first matching scheduled hold other than an optionally
+    /// excluded event that is already tracked by the foreground runner.
+    #[must_use]
+    pub fn foreground_hold_for_calls_excluding(
+        &self,
+        op_index: u64,
+        calls: &[(StoreOp, String)],
+        excluded_event_id: Option<&str>,
+    ) -> Option<ForegroundHold> {
+        if self.runtime.quiesced.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.schedule
+            .events
+            .iter()
+            .zip(&self.runtime.events)
+            .find_map(|(event, runtime)| {
+                if excluded_event_id == Some(event.id.as_str()) {
+                    return None;
+                }
+                let FaultKind::HoldCall { for_ops } = event.kind else {
+                    return None;
+                };
+                let claimed_op = runtime.claimed_op.load(Ordering::SeqCst);
+                let window_op = if claimed_op == u64::MAX {
+                    op_index
+                } else {
+                    claimed_op
+                };
+                let release_op = window_op.saturating_add(for_ops);
+                (event.boundary == Boundary::ObjectStore
+                    && event_is_active(event, op_index)
+                    && (!runtime.fired.load(Ordering::SeqCst) || op_index < release_op)
+                    && calls
+                        .iter()
+                        .any(|(op, key)| store_target_matches(event, *op, key)))
+                .then(|| ForegroundHold {
+                    event_id: event.id.clone(),
+                    window_op,
+                    release_op,
+                })
+            })
     }
 
     #[must_use]
@@ -371,7 +583,7 @@ impl FaultScheduler {
                 || !event_is_active(event, current)
                 || !store_target_matches(event, op, key)
                 || !partition_matches(&event.kind, op)
-                || !self.claim(index, event)
+                || !self.claim(index, event, current)
             {
                 continue;
             }
@@ -408,7 +620,7 @@ impl FaultScheduler {
             if event.boundary != Boundary::ClientHttp
                 || !event_is_active(event, current)
                 || !http_target_matches(event, method, path)
-                || !self.claim(index, event)
+                || !self.claim(index, event, current)
             {
                 continue;
             }
@@ -422,7 +634,7 @@ impl FaultScheduler {
         None
     }
 
-    fn claim(&self, index: usize, event: &FaultEvent) -> bool {
+    fn claim(&self, index: usize, event: &FaultEvent, current: u64) -> bool {
         let runtime = &self.runtime.events[index];
         let match_ordinal = runtime.matches.fetch_add(1, Ordering::SeqCst) + 1;
         if let FaultKind::CrashAt { point, .. } = event.kind {
@@ -430,6 +642,16 @@ impl FaultScheduler {
             if match_ordinal != u64::from(nth) {
                 return false;
             }
+        }
+        if matches!(event.kind, FaultKind::HoldCall { .. }) {
+            let claimed = runtime
+                .claimed_op
+                .compare_exchange(u64::MAX, current, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            if claimed {
+                runtime.fired.store(true, Ordering::SeqCst);
+            }
+            return claimed;
         }
         event.end_op.is_some()
             || runtime
@@ -440,6 +662,25 @@ impl FaultScheduler {
 
     pub fn quiesce(&self) {
         self.runtime.quiesced.store(true, Ordering::SeqCst);
+        let current = self.runtime.logical_op.load(Ordering::SeqCst);
+        self.runtime.logical_op_tx.send_replace(current);
+    }
+
+    pub async fn wait_for_hold_release(&self, action: &StoreFaultAction) {
+        let FaultKind::HoldCall { for_ops } = action.kind else {
+            panic!("wait_for_hold_release requires HoldCall");
+        };
+        let release_op = action.op_index.saturating_add(for_ops);
+        let mut logical_op = self.runtime.logical_op_tx.subscribe();
+        loop {
+            if self.runtime.quiesced.load(Ordering::SeqCst) || *logical_op.borrow() >= release_op {
+                return;
+            }
+            logical_op
+                .changed()
+                .await
+                .expect("fault scheduler logical-op sender dropped");
+        }
     }
 
     #[must_use]
@@ -467,6 +708,48 @@ impl FaultScheduler {
             .lock()
             .expect("fault timeline mutex poisoned")
             .push(event);
+        self.runtime
+            .timeline_revision_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+
+    pub async fn wait_for_hold_window_active(
+        &self,
+        event_id: &str,
+        op_index: u64,
+    ) -> TimelineEvent {
+        assert!(
+            self.schedule.events.iter().any(|event| {
+                event.id == event_id
+                    && event.boundary == Boundary::ObjectStore
+                    && matches!(event.kind, FaultKind::HoldCall { .. })
+            }),
+            "hold-window waiter requires a scheduled object-store HoldCall event: {event_id}"
+        );
+
+        let mut timeline_revision = self.runtime.timeline_revision_tx.subscribe();
+        loop {
+            if let Some(event) = self
+                .runtime
+                .timeline
+                .lock()
+                .expect("fault timeline mutex poisoned")
+                .iter()
+                .find(|event| {
+                    event.event_id == event_id
+                        && event.op_index == op_index
+                        && event.boundary == Boundary::ObjectStore
+                        && event.semantics == FaultSemantics::WindowActive
+                })
+                .cloned()
+            {
+                return event;
+            }
+            timeline_revision
+                .changed()
+                .await
+                .expect("fault scheduler timeline sender dropped");
+        }
     }
 
     #[must_use]
@@ -494,6 +777,24 @@ impl FaultScheduler {
             return false;
         }
 
+        let manifest_key = format!("{namespace}/manifest.json");
+        let prospective_one_shot =
+            self.schedule
+                .events
+                .iter()
+                .zip(&self.runtime.events)
+                .any(|(event, runtime)| {
+                    event.boundary == Boundary::ObjectStore
+                        && event_is_active(event, op_index)
+                        && matches!(event.kind, FaultKind::StaleRead)
+                        && !runtime.fired.load(Ordering::SeqCst)
+                        && store_target_matches(event, StoreOp::Get, &manifest_key)
+                        && partition_matches(&event.kind, StoreOp::Get)
+                });
+        if prospective_one_shot {
+            return true;
+        }
+
         let scheduled_window = self.schedule.events.iter().any(|event| {
             event.boundary == Boundary::ObjectStore
                 && event.end_op.is_some_and(|end| {
@@ -507,6 +808,7 @@ impl FaultScheduler {
 
         self.timeline().into_iter().any(|event| {
             event.boundary == Boundary::ObjectStore
+                && !event.action.starts_with("StaleRead")
                 && op_index >= event.op_index
                 && op_index <= event.op_index.saturating_add(FAULT_WINDOW_TRAILING_OPS)
                 && event
@@ -623,6 +925,65 @@ impl FaultSchedule {
                     ..TargetSelector::default()
                 },
                 kind: FaultKind::Content(ContentFault::MisdirectedWrite),
+            }],
+        }
+    }
+
+    /// Pins the dual-writer fencing self-test to one deterministic interleaving.
+    ///
+    /// Node B starts before traffic at logical op 0 and remains active for 20
+    /// ops. During that same window, the first lease PUT observed from either
+    /// node is held for eight logical ops. The runner's mutation may admit one
+    /// stale-token result, but the S3 lineage oracle must still report I21.
+    #[must_use]
+    pub fn dual_writer_fencing_selftest() -> Self {
+        Self {
+            profile: FaultProfile::Ops,
+            events: vec![
+                FaultEvent {
+                    id: "ops-dual-writer-second-node".to_string(),
+                    start_op: 0,
+                    end_op: Some(20),
+                    boundary: Boundary::Runner,
+                    target: TargetSelector::default(),
+                    kind: FaultKind::StartSecondNode { for_ops: 20 },
+                },
+                FaultEvent {
+                    id: "ops-dual-writer-lease-hold".to_string(),
+                    start_op: 0,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Put),
+                        key_substring: Some("lease.json".to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::HoldCall { for_ops: 8 },
+                },
+            ],
+        }
+    }
+
+    /// Builds the isolated proxy schedule used to admit one stale manifest CAS.
+    ///
+    /// This mutation is deliberately absent from seeded Ops schedules. The
+    /// store proxy additionally requires its dedicated self-test constructor,
+    /// so loading this event through a normal campaign fails loudly.
+    #[must_use]
+    pub fn stale_manifest_cas_selftest() -> Self {
+        Self {
+            profile: FaultProfile::Ops,
+            events: vec![FaultEvent {
+                id: "dual-writer-stale-cas-selftest".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Put),
+                    key_substring: Some("manifest.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::AdmitStaleManifestCas,
             }],
         }
     }
@@ -1056,6 +1417,87 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
                 );
             }
         }
+        FaultProfile::Sched => {
+            let targets = [
+                (StoreOp::Get, "manifest.json"),
+                (StoreOp::Put, "lease.json"),
+                (StoreOp::Get, "cluster_"),
+                (StoreOp::List, ""),
+            ];
+            for _ in 0..rng.gen_range(1..=3) {
+                let (store_op, key_substring) = targets[rng.gen_range(0..targets.len())];
+                push_event(
+                    &mut events,
+                    profile,
+                    rng.gen_range(10..=450),
+                    None,
+                    Boundary::ObjectStore,
+                    TargetSelector {
+                        store_op: Some(store_op),
+                        key_substring: Some(key_substring.to_string()),
+                        ..TargetSelector::default()
+                    },
+                    FaultKind::HoldCall {
+                        for_ops: rng.gen_range(2..=8),
+                    },
+                );
+            }
+        }
+        FaultProfile::Ops => {
+            let second_node_start = rng.gen_range(40..=120);
+            push_event(
+                &mut events,
+                profile,
+                second_node_start,
+                Some(second_node_start + 20),
+                Boundary::Runner,
+                TargetSelector::default(),
+                FaultKind::StartSecondNode { for_ops: 20 },
+            );
+            push_event(
+                &mut events,
+                profile,
+                rng.gen_range(140..=220),
+                None,
+                Boundary::Runner,
+                TargetSelector::default(),
+                FaultKind::FillDiskCache,
+            );
+            push_event(
+                &mut events,
+                profile,
+                rng.gen_range(230..=310),
+                None,
+                Boundary::Runner,
+                TargetSelector::default(),
+                FaultKind::PatchConfigDuringTraffic,
+            );
+            push_event(
+                &mut events,
+                profile,
+                rng.gen_range(400..=460),
+                None,
+                Boundary::Runner,
+                TargetSelector::default(),
+                FaultKind::DeleteNamespaceInFlight,
+            );
+            push_event(
+                &mut events,
+                profile,
+                0,
+                None,
+                Boundary::Runner,
+                TargetSelector::default(),
+                FaultKind::ResourceExhaustion {
+                    max_concurrent_queries: 1,
+                    disk_cache_max_bytes: if seed % 2 == 0 {
+                        2 * 1024 * 1024
+                    } else {
+                        4 * 1024 * 1024
+                    },
+                },
+            );
+        }
     }
     FaultSchedule { profile, events }
 }
@@ -1084,6 +1526,244 @@ fn push_event(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn hold_window_wait_observes_existing_and_future_timeline_updates() {
+        let scheduler = || {
+            FaultScheduler::from_schedule(FaultSchedule {
+                profile: FaultProfile::Sched,
+                events: vec![FaultEvent {
+                    id: "sched-held-manifest-get".to_string(),
+                    start_op: 5,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Get),
+                        key_substring: Some("manifest.json".to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::HoldCall { for_ops: 3 },
+                }],
+            })
+        };
+        let hold_active = || TimelineEvent {
+            event_id: "sched-held-manifest-get".to_string(),
+            op_index: 5,
+            wall_ms: 0,
+            boundary: Boundary::ObjectStore,
+            action: "HoldCall { for_ops: 3 } call=1".to_string(),
+            key: Some("ns/manifest.json".to_string()),
+            semantics: FaultSemantics::WindowActive,
+            observed: ObservedResult::DefiniteNotApplied,
+            recovery: Some("parked until logical op +3".to_string()),
+        };
+
+        let already_recorded = scheduler();
+        already_recorded.record(hold_active());
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            already_recorded.wait_for_hold_window_active("sched-held-manifest-get", 5),
+        )
+        .await
+        .expect("an already-recorded hold must not lose its wakeup");
+        assert_eq!(observed.event_id, "sched-held-manifest-get");
+        assert_eq!(observed.op_index, 5);
+        assert_eq!(observed.semantics, FaultSemantics::WindowActive);
+
+        let recorded_later = scheduler();
+        let waiter = tokio::spawn({
+            let scheduler = recorded_later.clone();
+            async move {
+                scheduler
+                    .wait_for_hold_window_active("sched-held-manifest-get", 5)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        recorded_later.record(TimelineEvent {
+            event_id: "unrelated-window".to_string(),
+            ..hold_active()
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "an unrelated timeline update must not satisfy the hold waiter"
+        );
+        recorded_later.record(hold_active());
+        let observed = tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+            .await
+            .expect("recording the matching hold must notify the waiter")
+            .expect("hold waiter task must not panic");
+        assert_eq!(observed.event_id, "sched-held-manifest-get");
+        assert_eq!(recorded_later.timeline().len(), 2);
+    }
+
+    #[test]
+    fn foreground_hold_prediction_is_non_consuming_and_returns_exact_release() {
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Sched,
+            events: vec![FaultEvent {
+                id: "sched-foreground-manifest-get".to_string(),
+                start_op: 5,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("manifest.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::HoldCall { for_ops: 3 },
+            }],
+        });
+        let calls = [(StoreOp::Get, "ns/manifest.json".to_string())];
+
+        scheduler.advance_to(4);
+        assert_eq!(scheduler.foreground_hold_release_for_calls(4, &calls), None);
+        scheduler.advance_to(5);
+        assert_eq!(
+            scheduler.foreground_hold_release_for_calls(5, &calls),
+            Some(8)
+        );
+        assert_eq!(
+            scheduler.foreground_hold_release_for_calls(
+                5,
+                &[(StoreOp::Put, "ns/manifest.json".to_string())]
+            ),
+            None
+        );
+
+        let action = scheduler
+            .store_decision(StoreOp::Get, "ns/manifest.json")
+            .expect("prediction must not consume the hold event");
+        assert!(matches!(action.kind, FaultKind::HoldCall { for_ops: 3 }));
+        assert_eq!(
+            scheduler.foreground_hold_release_for_calls(5, &calls),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn foreground_hold_prediction_tracks_a_background_claim_until_exact_release() {
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Sched,
+            events: vec![FaultEvent {
+                id: "sched-background-manifest-get".to_string(),
+                start_op: 5,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("manifest.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::HoldCall { for_ops: 3 },
+            }],
+        });
+        let calls = [(StoreOp::Get, "ns/manifest.json".to_string())];
+
+        scheduler.advance_to(5);
+        let action = scheduler
+            .store_decision(StoreOp::Get, "ns/manifest.json")
+            .expect("background store call must claim the scheduled hold");
+        assert_eq!(action.op_index, 5);
+        assert_eq!(
+            scheduler.foreground_hold_release_for_calls(5, &calls),
+            Some(8),
+            "the foreground runner must join an already claimed hold window"
+        );
+
+        scheduler.advance_to(7);
+        assert_eq!(
+            scheduler.foreground_hold_release_for_calls(7, &calls),
+            Some(8)
+        );
+        scheduler.advance_to(8);
+        assert_eq!(scheduler.foreground_hold_release_for_calls(8, &calls), None);
+    }
+
+    #[test]
+    fn foreground_hold_preserves_background_window_op_across_logical_ops() {
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Sched,
+            events: vec![FaultEvent {
+                id: "sched-cross-boundary-manifest-get".to_string(),
+                start_op: 5,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("manifest.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::HoldCall { for_ops: 3 },
+            }],
+        });
+        let calls = [(StoreOp::Get, "ns/manifest.json".to_string())];
+
+        scheduler.advance_to(5);
+        scheduler
+            .store_decision(StoreOp::Get, "ns/manifest.json")
+            .expect("background store call must claim the scheduled hold");
+        scheduler.advance_to(6);
+
+        let hold = scheduler
+            .foreground_hold_for_calls(6, &calls)
+            .expect("claimed hold must remain visible before release");
+        assert_eq!(hold.event_id, "sched-cross-boundary-manifest-get");
+        assert_eq!(hold.window_op, 5);
+        assert_eq!(hold.release_op, 8);
+    }
+
+    #[test]
+    fn foreground_hold_exclusion_finds_overlapping_matching_event() {
+        let manifest_get = TargetSelector {
+            store_op: Some(StoreOp::Get),
+            key_substring: Some("manifest.json".to_string()),
+            ..TargetSelector::default()
+        };
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Sched,
+            events: vec![
+                FaultEvent {
+                    id: "sched-first".to_string(),
+                    start_op: 5,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: manifest_get.clone(),
+                    kind: FaultKind::HoldCall { for_ops: 3 },
+                },
+                FaultEvent {
+                    id: "sched-second".to_string(),
+                    start_op: 5,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: manifest_get,
+                    kind: FaultKind::HoldCall { for_ops: 4 },
+                },
+            ],
+        });
+        let calls = [(StoreOp::Get, "ns/manifest.json".to_string())];
+
+        scheduler.advance_to(5);
+        let claimed = scheduler
+            .store_decision(StoreOp::Get, "ns/manifest.json")
+            .expect("first scheduled hold must be claimed");
+        assert_eq!(claimed.event_id, "sched-first");
+        assert_eq!(
+            scheduler
+                .foreground_hold_for_calls(5, &calls)
+                .expect("default prediction keeps the claimed event first")
+                .event_id,
+            "sched-first"
+        );
+
+        let second = scheduler
+            .foreground_hold_for_calls_excluding(5, &calls, Some("sched-first"))
+            .expect("excluding the pending event must reveal the overlapping hold");
+        assert_eq!(second.event_id, "sched-second");
+        assert_eq!(second.window_op, 5);
+        assert_eq!(second.release_op, 9);
+    }
+
     #[test]
     fn schedule_is_pure_function_of_seed() {
         for profile in [
@@ -1093,6 +1773,8 @@ mod tests {
             FaultProfile::Clock,
             FaultProfile::Content,
             FaultProfile::Semantic,
+            FaultProfile::Sched,
+            FaultProfile::Ops,
         ] {
             for seed in 0..20 {
                 let first = FaultScheduler::for_seed(seed, profile);
@@ -1106,6 +1788,59 @@ mod tests {
                 }));
             }
         }
+    }
+
+    #[test]
+    fn dual_writer_fencing_selftest_pins_node_window_and_lease_hold() {
+        let schedule = FaultSchedule::dual_writer_fencing_selftest();
+        assert_eq!(schedule.profile, FaultProfile::Ops);
+        assert_eq!(schedule.events.len(), 2, "{schedule:#?}");
+
+        let second_node = &schedule.events[0];
+        assert_eq!(second_node.id, "ops-dual-writer-second-node");
+        assert_eq!(second_node.start_op, 0);
+        assert_eq!(second_node.end_op, Some(20));
+        assert_eq!(second_node.boundary, Boundary::Runner);
+        assert_eq!(second_node.target, TargetSelector::default());
+        assert!(matches!(
+            second_node.kind,
+            FaultKind::StartSecondNode { for_ops: 20 }
+        ));
+
+        let lease_hold = &schedule.events[1];
+        assert_eq!(lease_hold.id, "ops-dual-writer-lease-hold");
+        assert_eq!(lease_hold.start_op, 0);
+        assert_eq!(lease_hold.end_op, None);
+        assert_eq!(lease_hold.boundary, Boundary::ObjectStore);
+        assert_eq!(lease_hold.target.store_op, Some(StoreOp::Put));
+        assert_eq!(
+            lease_hold.target.key_substring.as_deref(),
+            Some("lease.json")
+        );
+        assert!(matches!(
+            lease_hold.kind,
+            FaultKind::HoldCall { for_ops: 8 }
+        ));
+
+        let scheduler = FaultScheduler::from_schedule(schedule);
+        assert_eq!(
+            scheduler.advance_to(0),
+            vec![SchedulerCommand::StartSecondNode {
+                event_id: "ops-dual-writer-second-node".to_string(),
+                for_ops: 20,
+            }]
+        );
+        let action = scheduler
+            .store_decision(StoreOp::Put, "ns/lease.json")
+            .expect("pinned schedule must hold the first lease PUT");
+        assert_eq!(action.event_id, "ops-dual-writer-lease-hold");
+        assert!(matches!(action.kind, FaultKind::HoldCall { for_ops: 8 }));
+        assert_eq!(
+            scheduler.advance_to(20),
+            vec![SchedulerCommand::StopSecondNode {
+                event_id: "ops-dual-writer-second-node".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -1203,6 +1938,71 @@ mod tests {
                         | FaultKind::CopySourceVanish
                 )
             }));
+        }
+    }
+
+    #[test]
+    fn sched_schedule_has_one_to_three_bounded_toctou_holds() {
+        let targets = [
+            (StoreOp::Get, "manifest.json"),
+            (StoreOp::Put, "lease.json"),
+            (StoreOp::Get, "cluster_"),
+            (StoreOp::List, ""),
+        ];
+        for seed in 0..100 {
+            let scheduler = FaultScheduler::for_seed(seed, FaultProfile::Sched);
+            let events = &scheduler.schedule().events;
+            assert!((1..=3).contains(&events.len()), "seed {seed}: {events:#?}");
+            assert!(events.iter().all(|event| {
+                let FaultKind::HoldCall { for_ops } = event.kind else {
+                    return false;
+                };
+                (2..=8).contains(&for_ops)
+                    && event.boundary == Boundary::ObjectStore
+                    && targets.iter().any(|(op, key)| {
+                        event.target.store_op == Some(*op)
+                            && event.target.key_substring.as_deref() == Some(*key)
+                    })
+            }));
+        }
+    }
+
+    #[test]
+    fn ops_schedule_emits_a_twenty_op_node_window_and_all_events() {
+        for seed in 0..100 {
+            let scheduler = FaultScheduler::for_seed(seed, FaultProfile::Ops);
+            let events = &scheduler.schedule().events;
+            assert_eq!(events.len(), 5, "seed {seed}: {events:#?}");
+            let start = events
+                .iter()
+                .find_map(|event| match event.kind {
+                    FaultKind::StartSecondNode { for_ops: 20 } => Some(event.start_op),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("seed {seed} omitted second-node window"));
+            assert!(events
+                .iter()
+                .any(|event| matches!(event.kind, FaultKind::PatchConfigDuringTraffic)));
+            assert!(events
+                .iter()
+                .any(|event| matches!(event.kind, FaultKind::DeleteNamespaceInFlight)));
+            assert!(events
+                .iter()
+                .any(|event| matches!(event.kind, FaultKind::FillDiskCache)));
+            assert!(events
+                .iter()
+                .any(|event| matches!(event.kind, FaultKind::ResourceExhaustion { .. })));
+
+            assert!(scheduler.advance_to(start).iter().any(|command| {
+                matches!(
+                    command,
+                    SchedulerCommand::StartSecondNode { for_ops: 20, .. }
+                )
+            }));
+            assert!(scheduler
+                .advance_to(start + 20)
+                .iter()
+                .any(|command| matches!(command, SchedulerCommand::StopSecondNode { .. })));
         }
     }
 
