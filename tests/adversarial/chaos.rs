@@ -145,13 +145,15 @@ impl FaultPlan {
     }
 }
 
-fn fault_catalog() -> [(&'static str, StoreOp, &'static str); 8] {
+fn fault_catalog() -> [(&'static str, StoreOp, &'static str); 10] {
     [
         ("put-manifest", StoreOp::Put, "manifest.json"),
         ("put-wal", StoreOp::Put, ".wal"),
         ("put-segment", StoreOp::Put, "segments/"),
         ("get-cluster", StoreOp::Get, "cluster_"),
         ("get-centroids", StoreOp::Get, "centroids"),
+        ("get-bootstrap", StoreOp::Get, "bootstrap.bin"),
+        ("get-sketch", StoreOp::Get, "coarse_sketch.bin"),
         ("copy-clone", StoreOp::Copy, "segments/"),
         ("delete-gc", StoreOp::Delete, "segments/"),
         ("list-gc", StoreOp::List, "/"),
@@ -370,5 +372,17 @@ impl ObjectStore for ChaosStore {
             let _ = apply_action(action, &key).await?;
         }
         self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fault_catalog_covers_bootstrap_and_standalone_sketch_gets() {
+        let catalog = fault_catalog();
+        assert!(catalog.contains(&("get-bootstrap", StoreOp::Get, "bootstrap.bin")));
+        assert!(catalog.contains(&("get-sketch", StoreOp::Get, "coarse_sketch.bin")));
     }
 }

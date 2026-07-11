@@ -21,6 +21,7 @@ const FILTER_TAG: &str = "filter";
 const FTS_TAG: &str = "fts";
 const PAGINATION_TAG: &str = "pagination";
 const BATCH_TAG: &str = "batch";
+const SKETCH_ADC_TAG: &str = "sketch-adc-v4";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Coverage {
@@ -124,6 +125,28 @@ impl AdversarialGenerator {
             });
         }
 
+        let sketch_spec = NamespaceSpec {
+            dims: 8,
+            metric: DistanceMetric::Euclidean,
+            quantization: QuantizationType::None,
+            num_centroids: 16,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let sketch_name = format!("{namespace_prefix}-adv-{seed}-sketch");
+        pending.push_back(Op::CreateNamespace {
+            ns: sketch_name.clone(),
+            spec: sketch_spec.clone(),
+        });
+        pending.push_back(Op::GetNamespace {
+            ns: sketch_name.clone(),
+        });
+        namespaces.push(GenNamespace {
+            name: sketch_name,
+            spec: sketch_spec,
+            next_id: 0,
+        });
+
         let mut generator = Self {
             rng,
             namespaces,
@@ -137,7 +160,7 @@ impl AdversarialGenerator {
             .position(|namespace| namespace.spec.is_exact())
             .unwrap();
         let mut exact_vectors = Vec::new();
-        for index in 0..generator.namespaces.len() {
+        for index in 0..namespace_count {
             let ns = generator.namespaces[index].name.clone();
             let count = if index == exact_ns { 8 } else { 12 };
             let vectors = generator.make_vectors(index, count);
@@ -153,7 +176,71 @@ impl AdversarialGenerator {
             }
         }
         generator.enqueue_phase2_script(exact_ns, &exact_vectors);
+        generator.enqueue_sketch_adc_script(namespace_count);
         generator
+    }
+
+    fn enqueue_sketch_adc_script(&mut self, namespace_index: usize) {
+        let namespace = self.namespaces[namespace_index].clone();
+        let initial = self.sketch_blob_vectors(&namespace, "initial", 0..16, 8);
+        let query_vector = initial[0].values.clone();
+
+        self.pending.push_back(Op::Upsert {
+            ns: namespace.name.clone(),
+            vectors: initial,
+        });
+        self.pending.push_back(Op::CompactInline {
+            ns: namespace.name.clone(),
+        });
+        self.pending.push_back(Op::Query {
+            ns: namespace.name.clone(),
+            q: Self::fixed_membership_query(
+                &namespace,
+                query_vector.clone(),
+                10,
+                128,
+                &[SKETCH_ADC_TAG],
+            ),
+            as_of: None,
+        });
+
+        let incremental = self.sketch_blob_vectors(&namespace, "incremental", 0..4, 4);
+        self.pending.push_back(Op::Upsert {
+            ns: namespace.name.clone(),
+            vectors: incremental,
+        });
+        self.pending.push_back(Op::CompactInline {
+            ns: namespace.name.clone(),
+        });
+        self.pending.push_back(Op::Query {
+            ns: namespace.name.clone(),
+            q: Self::fixed_membership_query(&namespace, query_vector, 10, 144, &[SKETCH_ADC_TAG]),
+            as_of: None,
+        });
+    }
+
+    fn sketch_blob_vectors(
+        &mut self,
+        namespace: &GenNamespace,
+        batch: &str,
+        blobs: std::ops::Range<usize>,
+        rows_per_blob: usize,
+    ) -> Vec<GenVector> {
+        let mut vectors = Vec::with_capacity(blobs.len() * rows_per_blob);
+        for blob in blobs {
+            for row in 0..rows_per_blob {
+                let mut values = (0..namespace.spec.dims)
+                    .map(|_| self.rng.gen_range(-0.01f32..=0.01f32))
+                    .collect::<Vec<_>>();
+                values[0] += blob as f32 * 1_000.0;
+                vectors.push(GenVector {
+                    id: format!("{}-{batch}-b{blob:02}-r{row:02}", namespace.name),
+                    values,
+                    attributes: None,
+                });
+            }
+        }
+        vectors
     }
 
     fn enqueue_phase2_script(&mut self, exact_index: usize, exact_vectors: &[GenVector]) {
@@ -881,6 +968,7 @@ impl AdversarialGenerator {
             tags.push(FILTER_TAG.to_string());
         }
         let class = if namespace.spec.is_exact()
+            && !namespace.name.ends_with("-sketch")
             && exact_allowed
             && consistency == ConsistencyLevel::Strong
         {
@@ -947,6 +1035,33 @@ impl AdversarialGenerator {
                 QueryOracleClass::Membership { consistency }
             },
             pattern_tags,
+        }
+    }
+
+    fn fixed_membership_query(
+        namespace: &GenNamespace,
+        vector: Vec<f32>,
+        top_k: usize,
+        candidate_count: usize,
+        tags: &[&str],
+    ) -> GeneratedQuery {
+        GeneratedQuery {
+            body: json!({
+                "sources": [{
+                    "type": "ann",
+                    "vector": vector,
+                    "nprobe": namespace.spec.num_centroids
+                }],
+                "fusion": { "type": "none" },
+                "top_k": top_k,
+                "candidate_k": candidate_count.max(1),
+                "consistency": ConsistencyLevel::Strong,
+                "include_attributes": true
+            }),
+            class: QueryOracleClass::Membership {
+                consistency: ConsistencyLevel::Strong,
+            },
+            pattern_tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
         }
     }
 
@@ -1256,5 +1371,58 @@ impl AdversarialGenerator {
             })
             .map(|namespace| namespace.name.clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_queue_covers_v4_sketch_adc_and_incremental_compaction() {
+        let generator = AdversarialGenerator::new(7, "test");
+        let sketch = generator
+            .namespaces
+            .iter()
+            .find(|namespace| namespace.name.ends_with("-sketch"))
+            .expect("generator must include the fixed sketch namespace");
+
+        assert_eq!(sketch.spec.dims, 8);
+        assert_eq!(sketch.spec.metric, DistanceMetric::Euclidean);
+        assert_eq!(sketch.spec.quantization, QuantizationType::None);
+        assert_eq!(sketch.spec.num_centroids, 16);
+        assert!(sketch.spec.fts_fields.is_empty());
+        assert!(!sketch.spec.bitmap);
+
+        let ops = generator
+            .pending
+            .iter()
+            .filter(|op| op.namespace() == sketch.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, Op::CompactInline { .. }))
+                .count(),
+            2
+        );
+        let tagged_queries = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Query { q, .. } if q.pattern_tags.iter().any(|tag| tag == "sketch-adc-v4") => {
+                    Some(q)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tagged_queries.len(), 2);
+        for query in tagged_queries {
+            assert_eq!(query.body["sources"][0]["nprobe"], 16);
+            assert!(matches!(
+                query.class,
+                QueryOracleClass::Membership {
+                    consistency: ConsistencyLevel::Strong
+                }
+            ));
+        }
     }
 }

@@ -897,6 +897,7 @@ const REQUIRED_TAGS: &[&str] = &[
     "gc-cycle",
     "sandwich",
     "delete-recreate",
+    "sketch-adc-v4",
 ];
 
 fn object_store_totals(seeds: &[SeedReport]) -> BTreeMap<String, ClassStats> {

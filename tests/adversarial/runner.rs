@@ -836,6 +836,23 @@ async fn print_namespace_inspection(store: &zeppelin::storage::ZeppelinStore, ns
             segment.bitmap_fields,
             segment.has_global_fts
         );
+        if let Some(sketch) = &segment.sketch {
+            println!(
+                "    sketch_key={} sketch_version={} code_dims={} bytes_per_vector={} size_bytes={} rotation_seed={:?}",
+                sketch.key,
+                sketch.version,
+                sketch.code_dims,
+                sketch.bytes_per_vector,
+                sketch.size_bytes,
+                sketch.rotation_seed
+            );
+        }
+        if let Some(bootstrap) = &segment.bootstrap {
+            println!(
+                "    bootstrap_key={} bootstrap_size_bytes={}",
+                bootstrap.key, bootstrap.size_bytes
+            );
+        }
     }
 
     let snapshots = zeppelin::wal::manifest::NamedSnapshot::list(store, ns)
@@ -2166,6 +2183,8 @@ async fn quiesce_and_verify(
             *op_index,
         )
         .await;
+        violations
+            .extend(s3_oracle::check_v4_sketch_publication(&server.store, ns, *op_index).await);
         violations.extend(
             if model
                 .namespaces
@@ -2250,7 +2269,10 @@ fn exhaustive_query_from_model(model: &Model, ns: &str) -> GeneratedQuery {
         "consistency": ConsistencyLevel::Strong,
         "include_attributes": true
     });
-    let class = if ns_model.spec.is_exact() && ns_model.wal_tombstones.is_empty() {
+    let class = if ns_model.spec.is_exact()
+        && !ns.ends_with("-sketch")
+        && ns_model.wal_tombstones.is_empty()
+    {
         QueryOracleClass::ExactAnn {
             top_k,
             consistency: ConsistencyLevel::Strong,

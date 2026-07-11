@@ -29,6 +29,7 @@ pub enum ViolationId {
     I14S3Reachability,
     I15ManifestLineage,
     I16Quiescence,
+    I17SketchPublication,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

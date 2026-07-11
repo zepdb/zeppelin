@@ -80,12 +80,23 @@ async fn smoke() {
         "gc-cycle",
         "sandwich",
         "delete-recreate",
+        "sketch-adc-v4",
     ] {
         assert!(
             summary.coverage.tag_counts.get(tag).copied().unwrap_or(0) > 0,
             "scenario tag {tag} was not covered"
         );
     }
+    assert!(
+        summary
+            .coverage
+            .tag_counts
+            .get("sketch-adc-v4")
+            .copied()
+            .unwrap_or(0)
+            >= summary.seeds_run * 2,
+        "sketch-adc-v4 scenario tag must run twice per seed"
+    );
 
     println!(
         "adversarial smoke: seeds={} ops={} compactions={} background_compactions={} failed={} ops/sec={:.2}",
