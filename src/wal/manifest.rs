@@ -1391,6 +1391,29 @@ impl Manifest {
         }
     }
 
+    /// Reads a published live manifest that must exist.
+    ///
+    /// Active namespace paths use this form after metadata has established that
+    /// a live manifest must exist. A missing object is therefore an integrity
+    /// failure rather than empty namespace state. Published legacy manifests
+    /// that predate generation tracking remain valid at generation zero.
+    pub(crate) async fn read_versioned_required(
+        store: &ZeppelinStore,
+        namespace: &str,
+    ) -> Result<(Self, ManifestVersion)> {
+        let key = Self::s3_key(namespace);
+        let (data, etag) = store.get_with_meta(&key).await?;
+        let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
+        Ok((manifest, ManifestVersion(etag)))
+    }
+
+    /// Reads a required published manifest without exposing its object ETag.
+    pub(crate) async fn read_required(store: &ZeppelinStore, namespace: &str) -> Result<Self> {
+        Self::read_versioned_required(store, namespace)
+            .await
+            .map(|(manifest, _)| manifest)
+    }
+
     /// Publishes the next generation using ETag compare-and-swap when available.
     ///
     /// ```text

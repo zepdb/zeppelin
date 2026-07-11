@@ -150,7 +150,7 @@ use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
 use crate::namespace::manager::{
-    CreateNamespaceOutcome, NamespaceIndexConfig, NamespaceMetadata,
+    CreateNamespaceOutcome, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
     COMPACTION_DEGRADED_FAILURE_THRESHOLD,
 };
 use crate::server::AppState;
@@ -715,7 +715,7 @@ pub async fn put_snapshot(
         .map_err(ApiError::from)?;
     let manifest = state
         .manifest_cache
-        .get_strong(&state.store, &ns)
+        .get_strong_required(&state.store, &ns)
         .await
         .map_err(ApiError::from)?;
     let snapshot = NamedSnapshot::create_at(
@@ -1120,8 +1120,8 @@ pub async fn create_namespace(
 ///
 /// Creates a temporary source snapshot, creates target metadata and an initial
 /// empty manifest, performs bounded-concurrency server-side object copies,
-/// publishes the rewritten target manifest, invalidates the target manifest
-/// cache, and deletes the temporary pin. Failed attempts may have copied some
+/// publishes the rewritten target manifest, writes it through to the target
+/// manifest cache, and deletes the temporary pin. Failed attempts may copy some
 /// target objects before cleanup begins.
 ///
 /// # Consistency
@@ -1232,7 +1232,7 @@ pub async fn clone_namespace(
     }
     state
         .manifest_cache
-        .invalidate_at(&target, state.clock.now());
+        .insert(&target, target_manifest.clone());
     release_internal_clone_pin(&state, &source, &clone_pin_name).await;
 
     info!(
@@ -1817,11 +1817,16 @@ pub async fn get_namespace(
     // Stats are manifest aggregates. This strong read is the same manifest
     // freshness path used by read handlers; the response below does not list,
     // HEAD, or fetch WAL/segment objects.
-    let manifest = state
-        .manifest_cache
-        .get_strong(&state.store, &ns)
-        .await
-        .map_err(ApiError::from)?;
+    let manifest = match meta.state {
+        NamespaceState::Active => {
+            state
+                .manifest_cache
+                .get_strong_required(&state.store, &ns)
+                .await
+        }
+        NamespaceState::Deleting => state.manifest_cache.get_strong(&state.store, &ns).await,
+    }
+    .map_err(ApiError::from)?;
 
     Ok(Json(NamespaceResponse::from_manifest(
         meta,
@@ -1878,7 +1883,7 @@ pub async fn get_compaction_status(
         .map_err(ApiError::from)?;
     let manifest = state
         .manifest_cache
-        .get_strong(&state.store, &ns)
+        .get_strong_required(&state.store, &ns)
         .await
         .map_err(ApiError::from)?;
 
@@ -1975,7 +1980,7 @@ pub async fn compact_namespace(
         .map_err(ApiError::from)?;
     let before = state
         .manifest_cache
-        .get_strong(&state.store, &ns)
+        .get_strong_required(&state.store, &ns)
         .await
         .map_err(ApiError::from)?;
 
@@ -2331,7 +2336,7 @@ pub async fn trigger_hydration(
         .map_err(ApiError::from)?;
     let manifest = state
         .manifest_cache
-        .get_strong(&state.store, &ns)
+        .get_strong_required(&state.store, &ns)
         .await
         .map_err(ApiError::from)?;
     let segment = active_segment_snapshot(&manifest).ok_or_else(|| {

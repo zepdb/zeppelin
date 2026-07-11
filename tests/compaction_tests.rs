@@ -719,6 +719,68 @@ async fn test_compact_trigger_by_fragment_count() {
     harness.cleanup().await;
 }
 
+#[tokio::test]
+async fn test_should_compact_rejects_missing_manifest_for_active_namespace() {
+    let harness = TestHarness::new().await;
+    let ns = format!("{}-missing-trigger-manifest", harness.prefix);
+    let store = &harness.store;
+    let namespace_manager = zeppelin::namespace::NamespaceManager::new(store.clone());
+    namespace_manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    store.delete(&Manifest::s3_key(&ns)).await.unwrap();
+
+    let error = test_compactor(store)
+        .should_compact(&ns)
+        .await
+        .expect_err("an active namespace without its manifest must fail loudly");
+    assert!(
+        matches!(
+            error,
+            zeppelin::error::ZeppelinError::ManifestNotFound { ref namespace }
+                if namespace == &ns
+        ),
+        "missing active manifest must return ManifestNotFound, got {error:?}"
+    );
+
+    store.delete_prefix(&format!("{ns}/")).await.unwrap();
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_compact_rejects_missing_manifest_for_active_namespace() {
+    let harness = TestHarness::new().await;
+    let ns = format!("{}-missing-transaction-manifest", harness.prefix);
+    let store = &harness.store;
+    let namespace_manager = zeppelin::namespace::NamespaceManager::new(store.clone());
+    namespace_manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    store.delete(&Manifest::s3_key(&ns)).await.unwrap();
+
+    let error = test_compactor(store)
+        .compact(&ns)
+        .await
+        .expect_err("compaction must not treat a missing active manifest as empty");
+    assert!(
+        matches!(
+            error,
+            zeppelin::error::ZeppelinError::ManifestNotFound { ref namespace }
+                if namespace == &ns
+        ),
+        "missing active manifest must return ManifestNotFound, got {error:?}"
+    );
+    assert!(
+        !store.exists(&Manifest::s3_key(&ns)).await.unwrap(),
+        "failed compaction must not recreate the missing manifest"
+    );
+
+    store.delete_prefix(&format!("{ns}/")).await.unwrap();
+    harness.cleanup().await;
+}
+
 /// I1: a quiet namespace with a small number of uncompacted fragments must
 /// converge to a compacted state within a bounded time window via the
 /// age-based trigger — regardless of the fragment-count threshold.
@@ -1375,6 +1437,181 @@ async fn test_compaction_warms_new_segment_centroids() {
     );
 
     let _ = store.delete_prefix(&format!("{ns}/")).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_background_compaction_records_missing_active_manifest_failure() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let ns = format!("{}-missing-background-manifest", harness.prefix);
+    let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
+    namespace_manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    store.delete(&Manifest::s3_key(&ns)).await.unwrap();
+
+    let compaction_config = CompactionConfig {
+        interval_secs: 1,
+        ..Default::default()
+    };
+    let compactor = Arc::new(Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        compaction_config.clone(),
+        IndexingConfig::default(),
+        common::default_gc_upload_window(),
+    ));
+    let manifest_cache = Arc::new(zeppelin::cache::manifest_cache::ManifestCache::new(
+        Duration::from_millis(10),
+    ));
+    let lease_manager = Arc::new(zeppelin::wal::LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(compaction_config.lease_duration_secs),
+    ));
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+    let failures =
+        zeppelin::metrics::COMPACTIONS_TOTAL.with_label_values(&[ns.as_str(), "failure"]);
+    assert_eq!(failures.get(), 0);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let loop_handle = {
+        let compactor = compactor.clone();
+        let namespace_manager = namespace_manager.clone();
+        let namespace_prefix = Some(harness.prefix.clone());
+        tokio::spawn(async move {
+            zeppelin::compaction::background::compaction_loop(
+                compactor,
+                namespace_manager,
+                shutdown_rx,
+                manifest_cache,
+                lease_manager,
+                cache,
+                CompactionLoopOptions {
+                    gc_config: zeppelin::config::GcConfig::default(),
+                    namespace_prefix,
+                },
+            )
+            .await;
+        })
+    };
+
+    let health = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let meta = namespace_manager.get(&ns).await.unwrap();
+            if meta.compaction_health.consecutive_failures > 0 {
+                break meta.compaction_health;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background compaction must persist a missing-manifest failure");
+    shutdown_tx.send(true).unwrap();
+    loop_handle.await.unwrap();
+
+    assert_eq!(failures.get(), 1);
+    assert_eq!(
+        health.last_compaction_status,
+        zeppelin::namespace::manager::CompactionStatus::Failure
+    );
+    assert_eq!(health.consecutive_failures, 1);
+    assert_eq!(
+        health.last_compaction_error.as_deref(),
+        Some(format!("manifest not found for namespace: {ns}").as_str())
+    );
+    assert!(
+        !store.exists(&Manifest::s3_key(&ns)).await.unwrap(),
+        "background failure handling must not recreate the manifest"
+    );
+
+    store.delete_prefix(&format!("{ns}/")).await.unwrap();
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_background_compaction_accepts_missing_manifest_while_deleting() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let ns = format!("{}-deleting-without-manifest", harness.prefix);
+    let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
+    namespace_manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    namespace_manager.start_delete(&ns).await.unwrap();
+    assert!(!store.exists(&Manifest::s3_key(&ns)).await.unwrap());
+
+    let compaction_config = CompactionConfig {
+        interval_secs: 1,
+        ..Default::default()
+    };
+    let compactor = Arc::new(Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        compaction_config.clone(),
+        IndexingConfig::default(),
+        common::default_gc_upload_window(),
+    ));
+    let manifest_cache = Arc::new(zeppelin::cache::manifest_cache::ManifestCache::new(
+        Duration::from_millis(10),
+    ));
+    let lease_manager = Arc::new(zeppelin::wal::LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(compaction_config.lease_duration_secs),
+    ));
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+    let failures =
+        zeppelin::metrics::COMPACTIONS_TOTAL.with_label_values(&[ns.as_str(), "failure"]);
+    assert_eq!(failures.get(), 0);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let loop_handle = tokio::spawn({
+        let namespace_manager = namespace_manager.clone();
+        let namespace_prefix = Some(harness.prefix.clone());
+        async move {
+            zeppelin::compaction::background::compaction_loop(
+                compactor,
+                namespace_manager,
+                shutdown_rx,
+                manifest_cache,
+                lease_manager,
+                cache,
+                CompactionLoopOptions {
+                    gc_config: zeppelin::config::GcConfig::default(),
+                    namespace_prefix,
+                },
+            )
+            .await;
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let metadata_key = zeppelin::namespace::manager::NamespaceMetadata::s3_key(&ns);
+        while store.exists(&metadata_key).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background lifecycle handling must finish the deletion tombstone");
+    shutdown_tx.send(true).unwrap();
+    loop_handle.await.unwrap();
+
+    assert_eq!(
+        failures.get(),
+        0,
+        "a deleting namespace must bypass active compaction failure accounting"
+    );
+
     harness.cleanup().await;
 }
 

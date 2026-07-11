@@ -74,7 +74,8 @@
 //!              v
 //!        should_compact?
 //!              |
-//!              +-- false/error --> next namespace
+//!              +-- false --> next namespace
+//!              +-- error --> metric + health failure --> next namespace
 //!              v
 //! acquire lease --> heartbeat renews concurrently --> build immutable segment
 //!              |                                      |
@@ -870,10 +871,11 @@ pub fn start_compaction_thread(
 /// health metadata, invalidates manifest cache entries, and spawns best-effort
 /// routing-metadata warms.
 ///
-/// `COMPACTIONS_TOTAL` counts only attempts that acquired a lease and returned
-/// from the compactor. `LeaseHeld` is a quiet skip. A successful result records
-/// health and invalidates the manifest cache even when a race turned the run
-/// into a no-op; only a result containing a segment ID spawns a warm.
+/// `COMPACTIONS_TOTAL` counts trigger-evaluation failures and attempts that
+/// acquired a lease and returned from the compactor. `LeaseHeld` is a quiet
+/// skip. A successful result records health and invalidates the manifest cache
+/// even when a race turned the run into a no-op; only a result containing a
+/// segment ID spawns a warm.
 ///
 /// # Consistency
 ///
@@ -885,9 +887,10 @@ pub fn start_compaction_thread(
 /// publication and cannot make an unpublished segment visible.
 ///
 /// A GC failure is logged but does not authorize a weaker cleanup or prevent an
-/// independent compaction attempt. Compaction failure increments failure metrics
-/// and attempts a CAS-protected namespace health update; failure of that health
-/// write is logged without hiding the original compaction failure.
+/// independent compaction attempt. Trigger-evaluation and compaction failures
+/// increment failure metrics and attempt a CAS-protected namespace health
+/// update; failure of that health write is logged without hiding the original
+/// maintenance failure.
 ///
 /// # Cancellation
 ///
@@ -1134,6 +1137,19 @@ pub async fn compaction_loop(
                     debug!(namespace = %ns.name, "compaction not needed");
                 }
                 Err(e) => {
+                    crate::metrics::COMPACTIONS_TOTAL
+                        .with_label_values(&[ns.name.as_str(), "failure"])
+                        .inc();
+                    if let Err(health_error) = namespace_manager
+                        .record_compaction_failure(&ns.name, &e)
+                        .await
+                    {
+                        warn!(
+                            namespace = %ns.name,
+                            error = %health_error,
+                            "failed to record compaction trigger failure health"
+                        );
+                    }
                     warn!(namespace = %ns.name, error = %e, "failed to check compaction status");
                 }
             }

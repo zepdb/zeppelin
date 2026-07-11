@@ -286,12 +286,10 @@ async fn test_tla_namespace_delete_compaction_zombie() {
     store.delete(&manifest_key).await.unwrap();
     store.delete(&meta_key).await.unwrap();
 
-    // Compactor runs against the deleted namespace. Its initial manifest
-    // read yields None → unwrap_or_default() sees no fragments → no-op.
-    // The dangerous window is the CAS loop after building a segment, which
-    // is covered by the empty-vectors and main CAS paths both returning
-    // ManifestNotFound now; a no-op result is also acceptable. What is NOT
-    // acceptable is manifest.json existing afterwards.
+    // Compactor runs against the deleted namespace. Its initial authoritative
+    // manifest read must reject the missing object instead of treating it as
+    // an empty manifest. This also prevents either publication CAS path from
+    // recreating manifest.json.
     let compactor = Compactor::new(
         store.clone(),
         WalReader::new(store.clone()),
@@ -303,7 +301,12 @@ async fn test_tla_namespace_delete_compaction_zombie() {
         },
         common::default_gc_upload_window(),
     );
-    let _ = compactor.compact(ns).await;
+    let result = compactor.compact(ns).await;
+
+    assert!(
+        matches!(result, Err(ZeppelinError::ManifestNotFound { .. })),
+        "compaction against a deleted manifest must fail loudly, got {result:?}"
+    );
 
     assert!(
         !store.exists(&manifest_key).await.unwrap(),

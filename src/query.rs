@@ -728,10 +728,10 @@ pub(crate) async fn read_manifest_for_query(
 ) -> Result<Manifest> {
     match manifest_cache {
         Some(mc) => match consistency {
-            ConsistencyLevel::Strong => mc.get_strong(store, namespace).await,
-            ConsistencyLevel::Eventual => mc.get(store, namespace).await,
+            ConsistencyLevel::Strong => mc.get_strong_required(store, namespace).await,
+            ConsistencyLevel::Eventual => mc.get_required(store, namespace).await,
         },
-        None => Ok(Manifest::read(store, namespace).await?.unwrap_or_default()),
+        None => Manifest::read_required(store, namespace).await,
     }
 }
 

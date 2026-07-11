@@ -727,8 +727,9 @@ impl Compactor {
     ///
     /// # Errors
     ///
-    /// Propagates manifest read/decoding errors, metadata/config errors, and a
-    /// clock error if the injected wall time is before the Unix epoch.
+    /// Returns [`ZeppelinError::ManifestNotFound`] when an active namespace has
+    /// lost its authoritative manifest. Also propagates manifest decoding,
+    /// metadata/config, storage, and pre-Unix-epoch clock errors.
     ///
     /// # Consistency
     ///
@@ -760,7 +761,9 @@ impl Compactor {
     pub async fn should_compact(&self, namespace: &str) -> Result<bool> {
         let manifest = Manifest::read(&self.store, namespace)
             .await?
-            .unwrap_or_default();
+            .ok_or_else(|| ZeppelinError::ManifestNotFound {
+                namespace: namespace.to_string(),
+            })?;
         let fragments = manifest.uncompacted_fragments();
 
         // Idle namespace: nothing to compact, never trigger (no busy work,
@@ -997,12 +1000,14 @@ impl Compactor {
     ///
     /// # Errors
     ///
-    /// Fails on namespace metadata or manifest errors, WAL corruption, missing
-    /// required segment artifacts, dimension mismatch, index/FTS serialization,
-    /// any required object-store operation, lease loss, stale fencing, upload
-    /// window expiry, or exhausted CAS retries. The function intentionally does
-    /// not roll back immutable PUTs; failure after upload can leave orphaned
-    /// objects, and fenced staging may remain for GC to expire.
+    /// Returns [`ZeppelinError::ManifestNotFound`] when the namespace's
+    /// authoritative manifest is missing. Also fails on namespace metadata or
+    /// manifest decoding errors, WAL corruption, missing required segment
+    /// artifacts, dimension mismatch, index/FTS serialization, any required
+    /// object-store operation, lease loss, stale fencing, upload window expiry,
+    /// or exhausted CAS retries. The function intentionally does not roll back
+    /// immutable PUTs; failure after upload can leave orphaned objects, and
+    /// fenced staging may remain for GC to expire.
     ///
     /// Incremental build errors are logged and metered before a full rebuild is
     /// attempted. That is a correctness-preserving cost fallback, not silent
@@ -1080,7 +1085,9 @@ impl Compactor {
         // 1. Read manifest to get fragment list (snapshot for segment building)
         let manifest = Manifest::read(&self.store, namespace)
             .await?
-            .unwrap_or_default();
+            .ok_or_else(|| ZeppelinError::ManifestNotFound {
+                namespace: namespace.to_string(),
+            })?;
         let indexing_config = self.effective_indexing_config(namespace).await?;
         let rewrite_for_index_config = manifest_needs_index_rewrite(&manifest, &indexing_config);
 

@@ -277,7 +277,7 @@ async fn resolve_history_at_or_before_timestamp(
 ///
 /// # Returns
 ///
-/// The live manifest's generation, or zero when no live manifest exists.
+/// The live manifest's generation. Published legacy manifests can report zero.
 ///
 /// # Errors
 ///
@@ -290,15 +290,14 @@ async fn resolve_history_at_or_before_timestamp(
 ///
 /// # Examples
 ///
-/// A new namespace with no manifest returns zero, making every positive PITR
-/// target unretained. A live generation 12 returns 12.
+/// A published legacy manifest returns zero, making every positive PITR target
+/// unretained. A missing live object fails as an integrity error. A live
+/// generation 12 returns 12.
 async fn live_manifest_version(
     store: &ZeppelinStore,
     namespace: &str,
 ) -> Result<u64, ZeppelinError> {
-    Ok(Manifest::read(store, namespace)
-        .await?
-        .map_or(0, |manifest| manifest.version()))
+    Ok(Manifest::read_required(store, namespace).await?.version())
 }
 
 /// Builds the stable domain error for an unavailable point-in-time target.
