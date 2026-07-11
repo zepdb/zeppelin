@@ -59,7 +59,11 @@ fn tag_coverage_required(mode: adversarial::RunMode, tag: &str) -> bool {
 #[ignore]
 async fn smoke() {
     let env = adversarial::RunnerEnv::from_env();
-    let mode = env.mode;
+    let mode = if env.profile.is_some() {
+        adversarial::RunMode::Chaos
+    } else {
+        env.mode
+    };
     let summary = adversarial::runner::run_smoke(env).await;
 
     assert!(

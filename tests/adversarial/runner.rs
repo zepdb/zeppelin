@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::{Client, Method, StatusCode};
 use serde_json::json;
 use zeppelin::compaction::gc;
 use zeppelin::config::{Config, GcConfig};
+use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::ConsistencyLevel;
 use zeppelin::wal::Manifest;
 
@@ -18,6 +21,12 @@ use super::artifacts::{
     read_ops, read_seed_config, FailureManifest, RunArtifacts, SeedArtifacts, SeedReport,
 };
 use super::chaos::{chaos_store, ChaosHandle, FaultPlan, FiredFault};
+use super::faults::http_proxy::HttpFaultInjector;
+use super::faults::store_proxy::store_fault_proxy;
+use super::faults::{
+    Boundary, FaultKind, FaultProfile, FaultSchedule, FaultScheduler, FaultSemantics,
+    HttpFaultAction, ObservedResult, TimelineEvent,
+};
 use super::generator::{AdversarialGenerator, Coverage};
 use super::model::{
     AmbiguityReason, IndetEffect, Model, ModelRecord, NsIndeterminate, OpOutcome, OracleMutation,
@@ -28,10 +37,21 @@ use super::s3_oracle::{self, S3Tracker};
 use super::{PreserveMode, RunMode, RunnerEnv};
 
 const AMBIGUITY_MARKER: &str = "_adversarial_ambiguity";
+const STORE_FAULT_MARKER: &str = "_adversarial_store_fault";
 
 tokio::task_local! {
     static REQUEST_AMBIGUITY_ALLOWED: bool;
     static REQUEST_IS_MUTATION: bool;
+    static HTTP_FAULT_CONTEXT: Option<HttpFaultContext>;
+}
+
+#[derive(Clone)]
+struct HttpFaultContext {
+    scheduler: FaultScheduler,
+    injector: Arc<HttpFaultInjector>,
+    bookkeeping_store: ZeppelinStore,
+    direct_base_url: String,
+    proxy_base_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -260,8 +280,18 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         seed_config.selftest_probe,
         Some(OracleMutation::PostCommitLostWrite | OracleMutation::IndetResolutionLie)
     );
-    let mode = effective_seed_mode(seed_config.mode, seed_config.seed);
-    let chaos_plan = if mode == RunMode::Chaos {
+    let scheduler = seed_config
+        .fault_schedule
+        .clone()
+        .map(FaultScheduler::from_schedule);
+    let mode = if scheduler.is_some() {
+        RunMode::Chaos
+    } else {
+        effective_seed_mode(seed_config.mode, seed_config.seed)
+    };
+    let chaos_plan = if seed_config.chaos_plan.is_some() {
+        seed_config.chaos_plan.clone()
+    } else if mode == RunMode::Chaos && scheduler.is_none() {
         Some(
             seed_config
                 .chaos_plan
@@ -277,7 +307,13 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let old_prefix = recorded_namespace_prefix(seed_config.seed, &seed_config.namespace_specs);
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
-    let (instrumented_store, chaos_handle) = wrap_chaos_store(&harness.store, chaos_plan.clone());
+    let (legacy_instrumented_store, chaos_handle) =
+        wrap_chaos_store(&harness.store, chaos_plan.clone());
+    let instrumented_store = scheduler
+        .as_ref()
+        .map_or(legacy_instrumented_store.clone(), |scheduler| {
+            store_fault_proxy(&legacy_instrumented_store, scheduler.clone())
+        });
     let (store, counter) = counting_store(&instrumented_store);
     let config = seed_config.config.clone();
     let specs = seed_config
@@ -294,6 +330,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         replay_mutation.map(OracleMutation::key),
         seed_config.selftest_probe.map(OracleMutation::key),
         chaos_plan_json.as_ref(),
+        scheduler.as_ref().map(FaultScheduler::schedule),
     );
     let mut server = start_test_server_full(
         store.clone(),
@@ -302,6 +339,22 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         mode == RunMode::Chaos,
     )
     .await;
+    let mut injector = if scheduler.is_some() {
+        Some(start_http_fault_injector(&server.base_url).await)
+    } else {
+        None
+    };
+    let http_fault_context =
+        scheduler
+            .as_ref()
+            .zip(injector.as_ref())
+            .map(|(scheduler, injector)| HttpFaultContext {
+                scheduler: scheduler.clone(),
+                injector: Arc::clone(injector),
+                bookkeeping_store: harness.store.clone(),
+                direct_base_url: server.base_url.clone(),
+                proxy_base_url: injector.base_url(),
+            });
     let client = adversarial_client();
     let mut model = Model::default();
     let mut coverage = Coverage::default();
@@ -316,6 +369,9 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
 
     let records = read_ops(replay);
     for source in records.into_iter().take(max_ops as usize) {
+        if let Some(scheduler) = &scheduler {
+            scheduler.advance_to(source.index);
+        }
         let replay_lost_ack = replay_post_commit_selftest
             && source.status == 0
             && source.outcome == "ambiguous:connection_error";
@@ -332,6 +388,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             started,
             replay_mutation,
             mode,
+            http_fault_context.as_ref(),
             replay_lost_ack,
         )
         .await;
@@ -370,6 +427,8 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     }
 
     let mut op_count = artifacts.op_count();
+    drop(http_fault_context);
+    stop_scheduled_faults(scheduler.as_ref(), &mut injector).await;
     stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
     if !failed {
         let quiescence = quiesce_and_verify(
@@ -401,6 +460,9 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         .map(ChaosHandle::fired)
         .unwrap_or_default();
     artifacts.write_faults(&fired_faults);
+    if let Some(scheduler) = &scheduler {
+        artifacts.write_timeline(&scheduler.timeline());
+    }
     let object_store = object_store_breakdown(&counter);
     let background_compactions = background_compactions_since(&background_compaction_starts);
     if should_cleanup(env.preserve, failed) {
@@ -437,6 +499,8 @@ struct ReplaySeedConfig {
     selftest_probe: Option<OracleMutation>,
     #[serde(default)]
     chaos_plan: Option<FaultPlan>,
+    #[serde(default)]
+    fault_schedule: Option<FaultSchedule>,
     config: Config,
     namespace_specs: BTreeMap<String, NamespaceSpec>,
 }
@@ -523,11 +587,44 @@ fn wrap_chaos_store(
     }
 }
 
+fn scheduled_profile(profile: Option<FaultProfile>) -> Option<FaultProfile> {
+    profile.filter(|profile| *profile != FaultProfile::LegacyChaos)
+}
+
 fn adversarial_client() -> Client {
     Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .expect("failed to build adversarial reqwest client")
+}
+
+async fn start_http_fault_injector(base_url: &str) -> Arc<HttpFaultInjector> {
+    let upstream = base_url
+        .strip_prefix("http://")
+        .unwrap_or_else(|| panic!("test server URL is not HTTP: {base_url}"))
+        .parse::<SocketAddr>()
+        .unwrap_or_else(|error| panic!("test server URL has invalid socket address: {error}"));
+    Arc::new(
+        HttpFaultInjector::start(upstream)
+            .await
+            .unwrap_or_else(|error| panic!("failed to start HTTP fault injector: {error}")),
+    )
+}
+
+async fn stop_scheduled_faults(
+    scheduler: Option<&FaultScheduler>,
+    injector: &mut Option<Arc<HttpFaultInjector>>,
+) {
+    if let Some(scheduler) = scheduler {
+        scheduler.quiesce();
+    }
+    if let Some(injector) = injector.take() {
+        injector.disarm();
+        Arc::try_unwrap(injector)
+            .unwrap_or_else(|_| panic!("HTTP fault injector still has live request contexts"))
+            .shutdown()
+            .await;
+    }
 }
 
 async fn stop_chaos_and_background(server: &mut FullTestServer, chaos: Option<&ChaosHandle>) {
@@ -962,6 +1059,7 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 OracleMutation::ChaosLostWrite,
                 OracleMutation::PostCommitLostWrite,
                 OracleMutation::IndetResolutionLie,
+                OracleMutation::DroppedResponseLostWrite,
             ]
         },
         |mutation| vec![mutation],
@@ -1025,6 +1123,9 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             OracleMutation::IndetResolutionLie => {
                 fired.contains(&ViolationId::I18IndeterminateResolution)
             }
+            OracleMutation::DroppedResponseLostWrite => {
+                fired.contains(&ViolationId::I18IndeterminateResolution)
+            }
         };
         assert!(
             accepted,
@@ -1053,7 +1154,16 @@ async fn run_seed(
         mutation.or(selftest_probe),
         Some(OracleMutation::PostCommitLostWrite | OracleMutation::IndetResolutionLie)
     );
-    let mode = if mutation == Some(OracleMutation::ChaosLostWrite) || post_commit_selftest {
+    let dropped_response_selftest = matches!(
+        mutation.or(selftest_probe),
+        Some(OracleMutation::DroppedResponseLostWrite)
+    );
+    let profile = scheduled_profile(env.profile);
+    let mode = if profile.is_some()
+        || mutation == Some(OracleMutation::ChaosLostWrite)
+        || post_commit_selftest
+        || dropped_response_selftest
+    {
         RunMode::Chaos
     } else {
         effective_seed_mode(env.mode, seed)
@@ -1062,7 +1172,16 @@ async fn run_seed(
     let prefix = harness.prefix.clone();
     let mut generator = AdversarialGenerator::new(seed, &prefix);
     let specs = generator.specs();
-    let chaos_plan = if mode == RunMode::Chaos {
+    let scheduler = if dropped_response_selftest {
+        Some(FaultScheduler::from_schedule(
+            FaultSchedule::dropped_response_selftest(),
+        ))
+    } else {
+        profile.map(|profile| FaultScheduler::for_seed(seed, profile))
+    };
+    let chaos_plan = if mutation == Some(OracleMutation::DroppedResponseLostWrite) {
+        Some(FaultPlan::lost_write_selftest())
+    } else if mode == RunMode::Chaos && scheduler.is_none() {
         Some(if mutation == Some(OracleMutation::ChaosLostWrite) {
             FaultPlan::lost_write_selftest()
         } else if post_commit_selftest {
@@ -1078,7 +1197,13 @@ async fn run_seed(
     let chaos_plan_json = chaos_plan
         .as_ref()
         .map(|plan| serde_json::to_value(plan).expect("FaultPlan must serialize"));
-    let (instrumented_store, chaos_handle) = wrap_chaos_store(&harness.store, chaos_plan.clone());
+    let (legacy_instrumented_store, chaos_handle) =
+        wrap_chaos_store(&harness.store, chaos_plan.clone());
+    let instrumented_store = scheduler
+        .as_ref()
+        .map_or(legacy_instrumented_store.clone(), |scheduler| {
+            store_fault_proxy(&legacy_instrumented_store, scheduler.clone())
+        });
     let (store, counter) = counting_store(&instrumented_store);
     let config = config_for_mode(mode, seed);
     let recorded_ops = recorded_seed_ops_if_requested(env, seed, &prefix);
@@ -1090,6 +1215,7 @@ async fn run_seed(
         mutation.map(OracleMutation::key),
         selftest_probe.map(OracleMutation::key),
         chaos_plan_json.as_ref(),
+        scheduler.as_ref().map(FaultScheduler::schedule),
     );
     let mut server = start_test_server_full(
         store.clone(),
@@ -1098,6 +1224,22 @@ async fn run_seed(
         mode == RunMode::Chaos,
     )
     .await;
+    let mut injector = if scheduler.is_some() {
+        Some(start_http_fault_injector(&server.base_url).await)
+    } else {
+        None
+    };
+    let http_fault_context =
+        scheduler
+            .as_ref()
+            .zip(injector.as_ref())
+            .map(|(scheduler, injector)| HttpFaultContext {
+                scheduler: scheduler.clone(),
+                injector: Arc::clone(injector),
+                bookkeeping_store: harness.store.clone(),
+                direct_base_url: server.base_url.clone(),
+                proxy_base_url: injector.base_url(),
+            });
     let client = adversarial_client();
     let mut model = Model::default();
     let mut coverage = Coverage::default();
@@ -1113,6 +1255,9 @@ async fn run_seed(
     let max_ops = env.max_ops.unwrap_or(500);
 
     while op_index < max_ops && (Instant::now() < deadline || op_index == 0) {
+        if let Some(scheduler) = &scheduler {
+            scheduler.advance_to(op_index);
+        }
         let op = sanitize_op_for_mode(generator.next(&model), mode);
         assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &op);
         let inject_post_commit_ack_loss =
@@ -1129,6 +1274,7 @@ async fn run_seed(
             started,
             mutation,
             mode,
+            http_fault_context.as_ref(),
             inject_post_commit_ack_loss,
         )
         .await;
@@ -1181,6 +1327,7 @@ async fn run_seed(
                     started,
                     mutation,
                     mode,
+                    http_fault_context.as_ref(),
                     inject_post_commit_ack_loss,
                 )
                 .await;
@@ -1195,6 +1342,8 @@ async fn run_seed(
         }
     }
 
+    drop(http_fault_context);
+    stop_scheduled_faults(scheduler.as_ref(), &mut injector).await;
     stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
 
     if post_commit_selftest {
@@ -1243,6 +1392,9 @@ async fn run_seed(
         .map(ChaosHandle::fired)
         .unwrap_or_default();
     artifacts.write_faults(&fired_faults);
+    if let Some(scheduler) = &scheduler {
+        artifacts.write_timeline(&scheduler.timeline());
+    }
     let object_store = object_store_breakdown(&counter);
     let background_compactions = background_compactions_since(&background_compaction_starts);
 
@@ -1345,18 +1497,22 @@ async fn execute_recorded_op(
     started: Instant,
     mutation: Option<OracleMutation>,
     mode: RunMode,
+    http_fault_context: Option<&HttpFaultContext>,
     inject_post_commit_ack_loss: bool,
 ) -> StepOutcome {
     let ambiguity_allowed = mode == RunMode::Chaos;
-    let mut rec = REQUEST_AMBIGUITY_ALLOWED
-        .scope(
-            ambiguity_allowed,
-            REQUEST_IS_MUTATION.scope(
-                op.is_mutating(),
-                execute_op(client, server, op, index, started),
-            ),
-        )
+    let timeline_start = http_fault_context.map(|context| context.scheduler.timeline().len());
+    let request = REQUEST_AMBIGUITY_ALLOWED.scope(
+        ambiguity_allowed,
+        REQUEST_IS_MUTATION.scope(
+            op.is_mutating(),
+            execute_op(client, server, op, index, started),
+        ),
+    );
+    let mut rec = HTTP_FAULT_CONTEXT
+        .scope(http_fault_context.cloned(), request)
         .await;
+    mark_injected_store_failure(&mut rec, index, http_fault_context, timeline_start);
     let post_commit_ack_lost = inject_post_commit_ack_loss
         && inject_lost_http_acknowledgement_after_commit(&mut rec, ambiguity_allowed);
     let outcome = classify_record_outcome(&rec, ambiguity_allowed);
@@ -1371,8 +1527,22 @@ async fn execute_recorded_op(
             }
             Op::DeleteNamespace { .. } | Op::PatchIndexConfig { .. } => {}
             _ if op.is_mutating() => {
-                rec.gen_after =
-                    Some(compact_generation(client, &server.base_url, op.namespace()).await);
+                rec.gen_after = if let Some(context) = http_fault_context {
+                    if op_records_manifest_generation(op) {
+                        Some(
+                            authoritative_generation(
+                                &context.bookkeeping_store,
+                                op.namespace(),
+                                op.kind(),
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(compact_generation(client, &server.base_url, op.namespace()).await)
+                };
             }
             _ => {}
         }
@@ -1428,6 +1598,46 @@ async fn execute_recorded_op(
         status: rec.status,
         violations,
         post_commit_ack_lost,
+    }
+}
+
+fn op_records_manifest_generation(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::CreateNamespace { .. }
+            | Op::Upsert { .. }
+            | Op::DeleteVectors { .. }
+            | Op::CompactEndpoint { .. }
+            | Op::ProbeSandwich { .. }
+            | Op::CompactInline { .. }
+    )
+}
+
+fn mark_injected_store_failure(
+    rec: &mut OpRecord,
+    op_index: u64,
+    context: Option<&HttpFaultContext>,
+    timeline_start: Option<usize>,
+) {
+    if rec.status < 500
+        || rec.response.get("code").and_then(serde_json::Value::as_str) != Some("STORAGE_ERROR")
+    {
+        return;
+    }
+    let Some((context, timeline_start)) = context.zip(timeline_start) else {
+        return;
+    };
+    let fault_fired = context
+        .scheduler
+        .timeline()
+        .into_iter()
+        .skip(timeline_start)
+        .any(|event| event.op_index == op_index && event.boundary == Boundary::ObjectStore);
+    if fault_fired {
+        rec.response
+            .as_object_mut()
+            .expect("storage error response must be an object")
+            .insert(STORE_FAULT_MARKER.to_string(), json!(true));
     }
 }
 
@@ -1647,14 +1857,14 @@ async fn execute_op(
         }
         Op::InvalidProbe { ns, probe } => {
             let status_before = if probe.is_write_shaped() {
-                Some(compact_status(client, &server.base_url, ns).await)
+                Some(bookkeeping_compact_status(client, server, ns).await)
             } else {
                 None
             };
             let (method, path, status, mut response) =
                 execute_invalid_probe(client, server, ns, *probe).await;
             if let Some(before) = status_before {
-                let after = compact_status(client, &server.base_url, ns).await;
+                let after = bookkeeping_compact_status(client, server, ns).await;
                 let response_object = response
                     .as_object_mut()
                     .expect("invalid probe error response is object");
@@ -2117,9 +2327,186 @@ async fn request_exchange(
     let request_is_mutation = REQUEST_IS_MUTATION
         .try_with(|is_mutation| *is_mutation)
         .unwrap_or_else(|_| http_request_is_mutating(&method, url));
+    let context = HTTP_FAULT_CONTEXT.try_with(Clone::clone).ok().flatten();
+    let (target_url, path, action) = if let Some(context) = &context {
+        let suffix = url
+            .strip_prefix(&context.direct_base_url)
+            .unwrap_or_else(|| {
+                panic!(
+                    "faulted workload URL {url} did not use direct server base {}",
+                    context.direct_base_url
+                )
+            });
+        let path = suffix.to_string();
+        let action = request_is_mutation
+            .then(|| context.scheduler.http_decision(&method, &path))
+            .flatten();
+        (
+            format!("{}{}", context.proxy_base_url, suffix),
+            path,
+            action,
+        )
+    } else {
+        (url.to_string(), url.to_string(), None)
+    };
+
+    let Some(action) = action else {
+        return send_exchange(
+            client,
+            method,
+            &target_url,
+            body.as_ref(),
+            ambiguity_allowed,
+            request_is_mutation,
+            context.is_some(),
+            None,
+        )
+        .await;
+    };
+
+    let context = context.expect("HTTP fault action requires a fault context");
+    match action.kind.clone() {
+        FaultKind::DropRequest => {
+            let response = json!({
+                "code": "RATE_LIMITED",
+                "error": "request dropped before send by adversarial injector",
+                "status": 429,
+                "retryable": true,
+                "request_id": "adversarial-drop-request"
+            });
+            record_http_action(
+                &context,
+                &action,
+                &path,
+                FaultSemantics::PreCall,
+                ObservedResult::DefiniteNotApplied,
+                None,
+            );
+            RequestExchange {
+                status: 429,
+                response: response.clone(),
+                outcome: OpOutcome::NotApplied {
+                    status: 429,
+                    response,
+                },
+            }
+        }
+        FaultKind::DropResponse
+        | FaultKind::TruncateResponse { .. }
+        | FaultKind::ResetAfterRequest => {
+            context.injector.arm(action.clone());
+            let exchange = send_exchange(
+                client,
+                method,
+                &target_url,
+                body.as_ref(),
+                ambiguity_allowed,
+                request_is_mutation,
+                true,
+                Some(Duration::from_millis(300)),
+            )
+            .await;
+            context.injector.disarm();
+            record_http_action(
+                &context,
+                &action,
+                &path,
+                FaultSemantics::PostCommit,
+                ObservedResult::Ambiguous,
+                Some(exchange.outcome.label()),
+            );
+            exchange
+        }
+        FaultKind::ClientCancel { after_ms } => {
+            let send = send_exchange(
+                client,
+                method,
+                &target_url,
+                body.as_ref(),
+                ambiguity_allowed,
+                request_is_mutation,
+                true,
+                Some(Duration::from_millis(300)),
+            );
+            let exchange = match tokio::time::timeout(Duration::from_millis(after_ms), send).await {
+                Ok(exchange) => exchange,
+                Err(_) => ambiguous_exchange(0, AmbiguityReason::HttpTimeout),
+            };
+            record_http_action(
+                &context,
+                &action,
+                &path,
+                FaultSemantics::PostCommit,
+                ObservedResult::Ambiguous,
+                Some(exchange.outcome.label()),
+            );
+            exchange
+        }
+        FaultKind::DuplicateRetry => {
+            let first = send_exchange(
+                client,
+                method.clone(),
+                &target_url,
+                body.as_ref(),
+                ambiguity_allowed,
+                request_is_mutation,
+                true,
+                Some(Duration::from_millis(300)),
+            )
+            .await;
+            let second = send_exchange(
+                client,
+                method,
+                &target_url,
+                body.as_ref(),
+                ambiguity_allowed,
+                request_is_mutation,
+                true,
+                Some(Duration::from_millis(300)),
+            )
+            .await;
+            let observed = observed_result(&second.outcome);
+            record_http_action(
+                &context,
+                &action,
+                &path,
+                FaultSemantics::PostCommit,
+                observed,
+                Some(format!(
+                    "first={}; second={}",
+                    first.outcome.label(),
+                    second.outcome.label()
+                )),
+            );
+            second
+        }
+        _ => panic!(
+            "object-store fault {:?} reached the HTTP injector",
+            action.kind
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_exchange(
+    client: &Client,
+    method: Method,
+    url: &str,
+    body: Option<&serde_json::Value>,
+    ambiguity_allowed: bool,
+    request_is_mutation: bool,
+    force_close: bool,
+    timeout: Option<Duration>,
+) -> RequestExchange {
     let mut request = client.request(method, url);
     if let Some(body) = body {
-        request = request.json(&body);
+        request = request.json(body);
+    }
+    if force_close {
+        request = request.header(reqwest::header::CONNECTION, "close");
+    }
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
     }
     let response = match request.send().await {
         Ok(response) => response,
@@ -2179,6 +2566,39 @@ async fn request_exchange(
         response,
         outcome,
     }
+}
+
+fn observed_result(outcome: &OpOutcome) -> ObservedResult {
+    match outcome {
+        OpOutcome::Applied { .. } => ObservedResult::DefiniteApplied,
+        OpOutcome::NotApplied { .. } => ObservedResult::DefiniteNotApplied,
+        OpOutcome::Ambiguous { .. } => ObservedResult::Ambiguous,
+    }
+}
+
+fn record_http_action(
+    context: &HttpFaultContext,
+    action: &HttpFaultAction,
+    path: &str,
+    semantics: FaultSemantics,
+    observed: ObservedResult,
+    recovery: Option<String>,
+) {
+    context.scheduler.record(TimelineEvent {
+        event_id: action.event_id.clone(),
+        op_index: action.op_index,
+        wall_ms: context.scheduler.wall_ms(),
+        boundary: Boundary::ClientHttp,
+        action: format!("{:?}", action.kind),
+        key: Some(path.to_string()),
+        semantics: if action.window {
+            FaultSemantics::WindowActive
+        } else {
+            semantics
+        },
+        observed,
+        recovery,
+    });
 }
 
 fn http_request_is_mutating(method: &Method, url: &str) -> bool {
@@ -2256,6 +2676,47 @@ async fn compact_generation(client: &Client, base_url: &str, ns: &str) -> u64 {
     compact_status(client, base_url, ns).await["manifest_generation"]
         .as_u64()
         .unwrap_or_else(|| panic!("compact/status missing manifest_generation for {ns}"))
+}
+
+async fn authoritative_generation(store: &ZeppelinStore, ns: &str, op_kind: &str) -> u64 {
+    read_authoritative_manifest(store, ns, op_kind)
+        .await
+        .unwrap_or_else(|| panic!("authoritative manifest missing for {ns} during {op_kind}"))
+        .version()
+}
+
+async fn read_authoritative_manifest(
+    store: &ZeppelinStore,
+    ns: &str,
+    context: &str,
+) -> Option<Manifest> {
+    Manifest::read(store, ns).await.unwrap_or_else(|error| {
+        panic!("authoritative manifest read failed for {ns} during {context}: {error}")
+    })
+}
+
+async fn bookkeeping_compact_status(
+    client: &Client,
+    server: &FullTestServer,
+    ns: &str,
+) -> serde_json::Value {
+    let context = HTTP_FAULT_CONTEXT.try_with(Clone::clone).ok().flatten();
+    if let Some(context) = context {
+        match read_authoritative_manifest(&context.bookkeeping_store, ns, "invalid_probe").await {
+            Some(manifest) => json!({
+                "manifest_present": true,
+                "manifest_generation": manifest.version(),
+                "uncompacted_fragments": manifest.uncompacted_fragments().len(),
+            }),
+            None => json!({
+                "manifest_present": false,
+                "manifest_generation": null,
+                "uncompacted_fragments": null,
+            }),
+        }
+    } else {
+        compact_status(client, &server.base_url, ns).await
+    }
 }
 
 async fn compact_status(client: &Client, base_url: &str, ns: &str) -> serde_json::Value {
@@ -2399,7 +2860,7 @@ async fn quiesce_and_verify(
         let compact = Op::CompactInline { ns: ns.clone() };
         let step = execute_recorded_op(
             client, server, artifacts, model, coverage, s3_tracker, &compact, *op_index, started,
-            mutation, mode, false,
+            mutation, mode, None, false,
         )
         .await;
         *op_index += 1;
@@ -2424,7 +2885,7 @@ async fn quiesce_and_verify(
             };
             let step = execute_recorded_op(
                 client, server, artifacts, model, coverage, s3_tracker, &gc, *op_index, started,
-                mutation, mode, false,
+                mutation, mode, None, false,
             )
             .await;
             *op_index += 1;
@@ -2483,7 +2944,7 @@ async fn quiesce_and_verify(
         };
         let step = execute_recorded_op(
             client, server, artifacts, model, coverage, s3_tracker, &fetch, *op_index, started,
-            mutation, mode, false,
+            mutation, mode, None, false,
         )
         .await;
         *op_index += 1;
@@ -2499,7 +2960,7 @@ async fn quiesce_and_verify(
         };
         let step = execute_recorded_op(
             client, server, artifacts, model, coverage, s3_tracker, &query, *op_index, started,
-            mutation, mode, false,
+            mutation, mode, None, false,
         )
         .await;
         *op_index += 1;
@@ -2749,7 +3210,11 @@ async fn resolve_indeterminates(
             };
             let pending = model.namespaces[&ns].indeterminate[&id].clone();
             let resolved = match &pending.effect {
-                IndetEffect::MaybeUpserted(candidate) if observed.as_ref() == Some(candidate) => {
+                IndetEffect::MaybeUpserted(candidate)
+                    if observed
+                        .as_ref()
+                        .is_some_and(|observed| observed.semantically_eq(candidate)) =>
+                {
                     "applied"
                 }
                 IndetEffect::MaybeDeleted if observed.is_none() => "applied",
@@ -2967,8 +3432,11 @@ mod outcome_tests {
     use axum::http::{HeaderMap, HeaderValue};
     use axum::routing::post;
     use axum::{Json, Router};
+    use zeppelin::index::quantization::QuantizationType;
+    use zeppelin::types::DistanceMetric;
 
     use super::*;
+    use crate::adversarial::faults::{FaultEvent, TargetSelector};
 
     #[tokio::test]
     async fn mutating_server_error_is_ambiguous_when_faults_are_active() {
@@ -3013,5 +3481,109 @@ mod outcome_tests {
                 status: Some(500),
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_retry_is_idempotent() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let ns = format!("{prefix}-duplicate-retry");
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let mut server = start_test_server_full(
+            harness.store.clone(),
+            Some(prefix),
+            deterministic_config(),
+            false,
+        )
+        .await;
+        let client = adversarial_client();
+        let create = client
+            .post(format!("{}/v1/namespaces", server.base_url))
+            .json(&spec.create_body(&ns))
+            .send()
+            .await
+            .unwrap();
+        assert!(create.status().is_success());
+
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Network,
+            events: vec![FaultEvent {
+                id: "network-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ClientHttp,
+                target: TargetSelector {
+                    path_substring: Some("/vectors".to_string()),
+                    methods: Some(vec!["POST".to_string()]),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::DuplicateRetry,
+            }],
+        });
+        scheduler.advance_to(0);
+        let injector = start_http_fault_injector(&server.base_url).await;
+        let context = HttpFaultContext {
+            scheduler: scheduler.clone(),
+            injector: Arc::clone(&injector),
+            bookkeeping_store: harness.store.clone(),
+            direct_base_url: server.base_url.clone(),
+            proxy_base_url: injector.base_url(),
+        };
+        let outcome = HTTP_FAULT_CONTEXT
+            .scope(
+                Some(context),
+                REQUEST_AMBIGUITY_ALLOWED.scope(
+                    true,
+                    REQUEST_IS_MUTATION.scope(
+                        true,
+                        request_outcome(
+                            &client,
+                            Method::POST,
+                            &format!("{}/v1/namespaces/{ns}/vectors", server.base_url),
+                            Some(json!({
+                                "vectors": [{
+                                    "id": "one",
+                                    "values": [1.0, 0.0]
+                                }]
+                            })),
+                            true,
+                        ),
+                    ),
+                ),
+            )
+            .await;
+        assert!(matches!(outcome, OpOutcome::Applied { .. }));
+
+        let response = client
+            .post(format!(
+                "{}/v1/namespaces/{ns}/vectors/get",
+                server.base_url
+            ))
+            .json(&json!({
+                "ids": ["one"],
+                "include_vector": true,
+                "consistency": "strong"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["results"].as_array().unwrap().len(), 1);
+        assert_eq!(body["results"][0]["id"], "one");
+        assert_eq!(scheduler.timeline().len(), 1);
+        assert!(scheduler.timeline()[0].action.contains("DuplicateRetry"));
+
+        Arc::try_unwrap(injector).unwrap().shutdown().await;
+        stop_chaos_and_background(&mut server, None).await;
+        cleanup_ns(&harness.store, &ns).await;
+        harness.cleanup().await;
     }
 }

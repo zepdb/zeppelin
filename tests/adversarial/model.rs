@@ -67,6 +67,7 @@ pub enum OracleMutation {
     ChaosLostWrite,
     PostCommitLostWrite,
     IndetResolutionLie,
+    DroppedResponseLostWrite,
 }
 
 impl OracleMutation {
@@ -83,6 +84,7 @@ impl OracleMutation {
             "chaos-lost-write" => Self::ChaosLostWrite,
             "post-commit-lost-write" => Self::PostCommitLostWrite,
             "indet-resolution-lie" => Self::IndetResolutionLie,
+            "dropped-response-lost-write" => Self::DroppedResponseLostWrite,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -100,6 +102,7 @@ impl OracleMutation {
             Self::ChaosLostWrite => "chaos-lost-write",
             Self::PostCommitLostWrite => "post-commit-lost-write",
             Self::IndetResolutionLie => "indet-resolution-lie",
+            Self::DroppedResponseLostWrite => "dropped-response-lost-write",
         }
     }
 }
@@ -113,6 +116,49 @@ pub struct Model {
 pub struct ModelRecord {
     pub values: Vec<f32>,
     pub attributes: Option<HashMap<String, AttributeValue>>,
+}
+
+impl ModelRecord {
+    #[must_use]
+    pub fn semantically_eq(&self, other: &Self) -> bool {
+        self.values == other.values && model_attributes_equal(&self.attributes, &other.attributes)
+    }
+}
+
+fn model_attributes_equal(
+    left: &Option<HashMap<String, AttributeValue>>,
+    right: &Option<HashMap<String, AttributeValue>>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) if left.len() == right.len() => {
+            left.iter().all(|(key, left_value)| {
+                right.get(key).is_some_and(|right_value| {
+                    model_attribute_values_equal(left_value, right_value)
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
+fn model_attribute_values_equal(left: &AttributeValue, right: &AttributeValue) -> bool {
+    match (left, right) {
+        (AttributeValue::String(left), AttributeValue::String(right)) => left == right,
+        (AttributeValue::Integer(left), AttributeValue::Integer(right)) => left == right,
+        (AttributeValue::Float(left), AttributeValue::Float(right)) => (left - right).abs() <= 1e-9,
+        (AttributeValue::Bool(left), AttributeValue::Bool(right)) => left == right,
+        (AttributeValue::StringList(left), AttributeValue::StringList(right)) => left == right,
+        (AttributeValue::IntegerList(left), AttributeValue::IntegerList(right)) => left == right,
+        (AttributeValue::FloatList(left), AttributeValue::FloatList(right))
+            if left.len() == right.len() =>
+        {
+            left.iter()
+                .zip(right.iter())
+                .all(|(left, right)| (left - right).abs() <= 1e-9)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +228,19 @@ impl Model {
 
         match op {
             Op::CreateNamespace { ns, spec } => {
+                if status == 201 {
+                    // A fresh named create proves that an earlier ambiguous
+                    // clone did not leave this target visible. An idempotent
+                    // create returns 200 and must preserve the clone candidate.
+                    for model in self.namespaces.values_mut() {
+                        model.indeterminate_ns.retain(|entry| {
+                            !matches!(
+                                entry,
+                                NsIndeterminate::MaybeCloned { target, .. } if target == ns
+                            )
+                        });
+                    }
+                }
                 let generation = gen_after.unwrap_or(0);
                 self.namespaces
                     .entry(ns.clone())
@@ -501,11 +560,14 @@ impl Model {
         let old = model.live.get(id).cloned();
         match pending.effect {
             IndetEffect::MaybeUpserted(candidate) => {
-                if observed.as_ref() == Some(&candidate) {
+                if observed
+                    .as_ref()
+                    .is_some_and(|observed| observed.semantically_eq(&candidate))
+                {
                     model.live.insert(id.to_string(), candidate);
                     model.deleted_ever.remove(id);
                     Ok(())
-                } else if observed == old {
+                } else if records_semantically_equal(observed.as_ref(), old.as_ref()) {
                     Ok(())
                 } else {
                     Err(format!(
@@ -519,7 +581,7 @@ impl Model {
                     model.wal_tombstones.insert(id.to_string());
                     model.deleted_ever.insert(id.to_string());
                     Ok(())
-                } else if observed == old {
+                } else if records_semantically_equal(observed.as_ref(), old.as_ref()) {
                     Ok(())
                 } else {
                     Err(format!(
@@ -528,6 +590,14 @@ impl Model {
                 }
             }
         }
+    }
+}
+
+fn records_semantically_equal(left: Option<&ModelRecord>, right: Option<&ModelRecord>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.semantically_eq(right),
+        _ => false,
     }
 }
 
@@ -655,12 +725,12 @@ mod tests {
     use serde_json::json;
     use zeppelin::config::Config;
     use zeppelin::index::quantization::QuantizationType;
-    use zeppelin::types::DistanceMetric;
+    use zeppelin::types::{AttributeValue, DistanceMetric};
 
     use crate::adversarial::oracle::{score_close, SCORE_ABS_EPS, SCORE_REL_EPS};
     use crate::common::server::{cleanup_ns, start_test_server_with_compactor};
 
-    use crate::adversarial::ops::{GenVector, NamespaceSpec, Op};
+    use crate::adversarial::ops::{AsOfTarget, GenVector, NamespaceSpec, Op};
 
     use super::{model_distance, AmbiguityReason, Model, ModelRecord, NsModel, OpOutcome};
 
@@ -713,6 +783,56 @@ mod tests {
         let ns_model = &model.namespaces[&ns];
         assert!(!ns_model.live.contains_key("id-1"));
         assert!(ns_model.deleted_ever.contains("id-1"));
+    }
+
+    #[test]
+    fn indeterminate_resolution_tolerates_attribute_transport_roundoff() {
+        let (mut model, ns) = model_with_old_record();
+        model
+            .namespaces
+            .get_mut(&ns)
+            .unwrap()
+            .live
+            .get_mut("id-1")
+            .unwrap()
+            .attributes = Some(
+            [(
+                "score".to_string(),
+                AttributeValue::Float(99.547_459_052_870_35),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        model.apply_outcome(
+            &Op::DeleteVectors {
+                ns: ns.clone(),
+                ids: vec!["id-1".to_string()],
+            },
+            &ambiguous_500(),
+            None,
+            None,
+            8,
+        );
+
+        model
+            .resolve_indeterminate_record(
+                &ns,
+                "id-1",
+                Some(ModelRecord {
+                    values: vec![1.0, 0.0],
+                    attributes: Some(
+                        [(
+                            "score".to_string(),
+                            AttributeValue::Float(99.547_459_052_870_37),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                }),
+            )
+            .expect("transport-level float drift must still match the old record");
+        assert!(model.namespaces[&ns].indeterminate.is_empty());
+        assert!(model.namespaces[&ns].live.contains_key("id-1"));
     }
 
     #[test]
@@ -813,6 +933,41 @@ mod tests {
 
         assert_eq!(model.namespaces[&ns].live["id-1"].values, definite.values);
         assert!(model.namespaces[&ns].indeterminate.is_empty());
+    }
+
+    #[test]
+    fn fresh_create_discards_stale_ambiguous_clone_for_target() {
+        let (mut model, source) = model_with_old_record();
+        let target = "fresh-after-ambiguous-clone".to_string();
+        let spec = model.namespaces[&source].spec.clone();
+        model.apply_outcome(
+            &Op::CloneNamespace {
+                source: source.clone(),
+                target: target.clone(),
+                as_of: AsOfTarget::Generation(1),
+            },
+            &ambiguous_500(),
+            None,
+            None,
+            11,
+        );
+
+        model.apply_outcome(
+            &Op::CreateNamespace {
+                ns: target.clone(),
+                spec,
+            },
+            &OpOutcome::Applied {
+                status: 201,
+                response: json!({}),
+            },
+            Some(1),
+            None,
+            12,
+        );
+
+        assert!(model.namespaces[&source].indeterminate_ns.is_empty());
+        assert!(model.namespaces[&target].live.is_empty());
     }
 
     fn model_with_old_record() -> (Model, String) {

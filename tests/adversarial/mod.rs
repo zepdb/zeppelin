@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod chaos;
+pub mod faults;
 pub mod generator;
 pub mod model;
 pub mod ops;
@@ -15,6 +16,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use self::faults::FaultProfile;
 use self::model::OracleMutation;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +44,7 @@ pub struct RunnerEnv {
     pub preserve: PreserveMode,
     pub selftest: Option<OracleMutation>,
     pub mode: RunMode,
+    pub profile: Option<FaultProfile>,
     pub env_echo: BTreeMap<String, String>,
 }
 
@@ -74,6 +77,8 @@ impl RunnerEnv {
         let selftest = std::env::var("ZEPPELIN_ADVERSARIAL_SELFTEST")
             .ok()
             .map(|value| OracleMutation::from_key(&value));
+        let raw_profile = std::env::var("ZEPPELIN_ADVERSARIAL_PROFILE").ok();
+        let profile = raw_profile.as_deref().map(FaultProfile::from_env);
 
         let mut env_echo = BTreeMap::new();
         env_echo.insert(
@@ -108,6 +113,10 @@ impl RunnerEnv {
         );
         env_echo.insert("ZEPPELIN_ADVERSARIAL_MODE".to_string(), raw_mode);
         env_echo.insert(
+            "ZEPPELIN_ADVERSARIAL_PROFILE".to_string(),
+            raw_profile.unwrap_or_else(|| "unset".to_string()),
+        );
+        env_echo.insert(
             "ZEPPELIN_ADVERSARIAL_SELFTEST".to_string(),
             selftest
                 .map(|mutation| mutation.key().to_string())
@@ -122,6 +131,7 @@ impl RunnerEnv {
             preserve,
             selftest,
             mode,
+            profile,
             env_echo,
         }
     }

@@ -13,6 +13,7 @@ use zeppelin::storage::ZeppelinStore;
 use crate::common::counting::ClassStats;
 
 use super::chaos::FiredFault;
+use super::faults::{FaultSchedule, TimelineEvent};
 use super::generator::Coverage;
 use super::model::Model;
 use super::ops::{NamespaceSpec, OpRecord};
@@ -107,11 +108,15 @@ impl RunArtifacts {
             .seeds
             .iter()
             .map(|seed| {
-                let mode = match env.mode {
-                    RunMode::Deterministic => RunMode::Deterministic,
-                    RunMode::Chaos => RunMode::Chaos,
-                    RunMode::Mixed if seed % 3 == 1 => RunMode::Chaos,
-                    RunMode::Mixed => RunMode::Deterministic,
+                let mode = if env.profile.is_some() {
+                    RunMode::Chaos
+                } else {
+                    match env.mode {
+                        RunMode::Deterministic => RunMode::Deterministic,
+                        RunMode::Chaos => RunMode::Chaos,
+                        RunMode::Mixed if seed % 3 == 1 => RunMode::Chaos,
+                        RunMode::Mixed => RunMode::Deterministic,
+                    }
                 };
                 (seed.to_string(), mode)
             })
@@ -123,6 +128,7 @@ impl RunArtifacts {
             "env": env.env_echo,
             "seeds": env.seeds,
             "mode": env.mode,
+            "profile": env.profile,
             "mode_assignment": mode_assignment,
         });
         write_json(root.join("run.json"), &run_json);
@@ -144,6 +150,7 @@ impl RunArtifacts {
         fault_plan: Option<&str>,
         selftest_probe: Option<&str>,
         chaos_plan: Option<&serde_json::Value>,
+        fault_schedule: Option<&FaultSchedule>,
     ) -> SeedArtifacts {
         let dir = self.root.join(format!("seed-{seed}"));
         fs::create_dir_all(&dir)
@@ -156,6 +163,7 @@ impl RunArtifacts {
                 "fault_plan": fault_plan,
                 "selftest_probe": selftest_probe,
                 "chaos_plan": chaos_plan,
+                "fault_schedule": fault_schedule,
                 "config": config,
                 "namespace_specs": specs,
             }),
@@ -246,6 +254,21 @@ impl SeedArtifacts {
         let mut writer = BufWriter::new(file);
         for fault in faults {
             let encoded = serde_json::to_string(fault).expect("FiredFault must serialize");
+            writeln!(writer, "{encoded}")
+                .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+        }
+        writer
+            .flush()
+            .unwrap_or_else(|error| panic!("failed to flush {}: {error}", path.display()));
+    }
+
+    pub fn write_timeline(&self, timeline: &[TimelineEvent]) {
+        let path = self.dir.join("timeline.jsonl");
+        let file = File::create(&path)
+            .unwrap_or_else(|error| panic!("failed to create {}: {error}", path.display()));
+        let mut writer = BufWriter::new(file);
+        for event in timeline {
+            let encoded = serde_json::to_string(event).expect("TimelineEvent must serialize");
             writeln!(writer, "{encoded}")
                 .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
         }
@@ -479,6 +502,28 @@ pub fn read_ops(path: &Path) -> Vec<OpRecord> {
                     "failed to parse ops.jsonl line {} in {}: {error}",
                     idx + 1,
                     path.display()
+                )
+            })
+        })
+        .collect()
+}
+
+fn read_timeline(path: &Path) -> Vec<TimelineEvent> {
+    let path = path.join("timeline.jsonl");
+    if !path.exists() {
+        return Vec::new();
+    }
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!(
+                    "failed to parse {} line {}: {error}",
+                    path.display(),
+                    index + 1
                 )
             })
         })
@@ -726,7 +771,7 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
             seed.ops,
             seed.compactions,
             seed.background_compactions,
-            seed.fired_faults.len(),
+            seed.fired_faults.len() + read_timeline(&seed.dir).len(),
             seed.wall_secs,
             seed.ops as f64 / seed.wall_secs.max(0.001)
         ));
@@ -800,6 +845,65 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
         out.push_str("No chaos faults fired.\n");
     }
     out.push('\n');
+
+    let has_timeline = seeds
+        .iter()
+        .any(|seed| seed.dir.join("timeline.jsonl").exists());
+    if has_timeline {
+        out.push_str("## Fault Timeline\n\n");
+        for seed in seeds {
+            let timeline = read_timeline(&seed.dir);
+            if timeline.is_empty() {
+                continue;
+            }
+            let config = read_seed_config(&seed.dir);
+            let schedule = config
+                .get("fault_schedule")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    serde_json::from_value::<FaultSchedule>(value.clone()).unwrap_or_else(|error| {
+                        panic!(
+                            "failed to parse fault schedule in {}: {error}",
+                            seed.dir.display()
+                        )
+                    })
+                });
+            let windows = schedule
+                .map(|schedule| {
+                    schedule
+                        .events
+                        .into_iter()
+                        .map(|event| {
+                            let window = event.end_op.map_or_else(
+                                || format!("{}+", event.start_op),
+                                |end| format!("{}..{}", event.start_op, end),
+                            );
+                            (event.id, window)
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            out.push_str(&format!("- seed {}:\n", seed.seed));
+            for event in timeline {
+                let window = windows
+                    .get(&event.event_id)
+                    .map(String::as_str)
+                    .unwrap_or("recorded-only");
+                let recovery = event.recovery.as_deref().unwrap_or("none");
+                out.push_str(&format!(
+                    "  - `{}` window=`{}` op={} boundary=`{:?}` action=`{}` observed=`{:?}` recovery=`{}`\n",
+                    event.event_id,
+                    window,
+                    event.op_index,
+                    event.boundary,
+                    event.action,
+                    event.observed,
+                    recovery
+                ));
+            }
+        }
+        out.push('\n');
+    }
 
     out.push_str("## Indeterminate Resolutions\n\n");
     let mut any_resolution = false;

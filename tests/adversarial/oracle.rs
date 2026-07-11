@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use zeppelin::index::filter::evaluate_filter;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, Filter};
 
-use super::model::{model_distance, IndetEffect, Model, ModelRecord, NsModel, OracleMutation};
+use super::model::{
+    model_distance, IndetEffect, Model, ModelRecord, NsIndeterminate, NsModel, OracleMutation,
+};
 use super::ops::{AsOfTarget, GeneratedQuery, MaintenanceKind, Op, OpRecord, QueryOracleClass};
 use super::RunMode;
 
@@ -56,7 +58,7 @@ pub fn check_op(
 ) -> Vec<Violation> {
     let mut violations = Vec::new();
     violations.extend(check_i11_error_envelope(rec));
-    violations.extend(check_expected_error(rec));
+    violations.extend(check_expected_error(model, rec, mode));
     if mode == RunMode::Deterministic {
         violations.extend(check_i10_failed_validation_no_wal(rec));
     }
@@ -909,7 +911,7 @@ fn check_error_envelope_body(
     None
 }
 
-fn check_expected_error(rec: &OpRecord) -> Vec<Violation> {
+fn check_expected_error(model: &Model, rec: &OpRecord, mode: RunMode) -> Vec<Violation> {
     let expected = match &rec.op {
         Op::Query { ns, q, .. } => {
             let QueryOracleClass::ExpectError { status, code } = &q.class else {
@@ -923,6 +925,30 @@ fn check_expected_error(rec: &OpRecord) -> Vec<Violation> {
         _ => return Vec::new(),
     };
     let actual_code = rec.response.get("code").and_then(serde_json::Value::as_str);
+    if mode == RunMode::Chaos
+        && rec.status >= 500
+        && actual_code == Some("STORAGE_ERROR")
+        && rec.response.get("_adversarial_store_fault") == Some(&serde_json::Value::Bool(true))
+    {
+        return Vec::new();
+    }
+    if mode == RunMode::Chaos
+        && rec.status == 404
+        && actual_code == Some("NAMESPACE_NOT_FOUND")
+        && model
+            .namespaces
+            .get(rec.op.namespace())
+            .is_some_and(|ns_model| {
+                ns_model.indeterminate_ns.iter().any(|pending| {
+                    matches!(
+                        pending,
+                        NsIndeterminate::MaybeCreatedNs | NsIndeterminate::MaybeDeletedNs
+                    )
+                })
+            })
+    {
+        return Vec::new();
+    }
     if rec.status == expected.1 && actual_code == Some(expected.2) {
         return Vec::new();
     }
@@ -1895,19 +1921,43 @@ fn responses_equivalent(left: &serde_json::Value, right: &serde_json::Value) -> 
 }
 
 fn facet_totals(ns_model: &NsModel) -> BTreeMap<String, BTreeMap<String, u64>> {
-    let mut totals = BTreeMap::new();
-    for record in ns_model.live.values() {
-        let Some(attributes) = record.attributes.as_ref() else {
-            continue;
-        };
-        for (field, value) in attributes {
-            let field_counts = totals.entry(field.clone()).or_insert_with(BTreeMap::new);
-            for key in facet_keys(value) {
-                *field_counts.entry(key).or_default() += 1;
-            }
+    let mut possible_ids = BTreeMap::<String, BTreeMap<String, BTreeSet<String>>>::new();
+    for (id, record) in &ns_model.live {
+        add_possible_facet_values(&mut possible_ids, id, record);
+    }
+    for (id, pending) in &ns_model.indeterminate {
+        if let IndetEffect::MaybeUpserted(candidate) = &pending.effect {
+            add_possible_facet_values(&mut possible_ids, id, candidate);
         }
     }
-    totals
+    possible_ids
+        .into_iter()
+        .map(|(field, values)| {
+            (
+                field,
+                values
+                    .into_iter()
+                    .map(|(value, ids)| (value, ids.len() as u64))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn add_possible_facet_values(
+    possible_ids: &mut BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    id: &str,
+    record: &ModelRecord,
+) {
+    let Some(attributes) = record.attributes.as_ref() else {
+        return;
+    };
+    for (field, value) in attributes {
+        let field_values = possible_ids.entry(field.clone()).or_default();
+        for key in facet_keys(value) {
+            field_values.entry(key).or_default().insert(id.to_string());
+        }
+    }
 }
 
 fn facet_keys(value: &AttributeValue) -> Vec<String> {
