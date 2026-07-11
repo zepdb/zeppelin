@@ -19,6 +19,7 @@ use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
+use zeppelin::time::Clock;
 use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
 
 fn configure_test_server_limits(config: &mut Config) {
@@ -38,28 +39,35 @@ fn runtime_query_state(config: &Config) -> (Arc<RuntimeQueryConfig>, QueryKnobBo
     )
 }
 
-fn namespace_manager(config: &Config, store: &ZeppelinStore) -> Arc<NamespaceManager> {
-    Arc::new(NamespaceManager::new_with_registry_ttl(
+fn namespace_manager(
+    config: &Config,
+    store: &ZeppelinStore,
+    clock: &Clock,
+) -> Arc<NamespaceManager> {
+    Arc::new(NamespaceManager::with_clock(
         store.clone(),
         Duration::from_millis(config.cache.namespace_registry_ttl_ms),
+        clock.clone(),
     ))
 }
 
-fn compactor(config: &Config, store: &ZeppelinStore) -> Arc<Compactor> {
-    Arc::new(Compactor::new(
+fn compactor(config: &Config, store: &ZeppelinStore, clock: &Clock) -> Arc<Compactor> {
+    Arc::new(Compactor::with_clock(
         store.clone(),
         WalReader::new(store.clone()),
         config.compaction.clone(),
         config.indexing.clone(),
         Duration::from_secs(config.gc.compaction_upload_window_secs),
+        clock.clone(),
     ))
 }
 
-fn lease_manager(config: &Config, store: &ZeppelinStore) -> Arc<LeaseManager> {
-    Arc::new(LeaseManager::new(
+fn lease_manager(config: &Config, store: &ZeppelinStore, clock: &Clock) -> Arc<LeaseManager> {
+    Arc::new(LeaseManager::with_clock(
         store.clone(),
         format!("test-{}", uuid::Uuid::new_v4()),
         Duration::from_secs(config.compaction.lease_duration_secs),
+        clock.clone(),
     ))
 }
 
@@ -108,6 +116,7 @@ async fn start_test_server_with_config_inner(
     if override_rate_limits {
         configure_test_server_limits(&mut config);
     }
+    let clock = Clock::system();
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -119,14 +128,15 @@ async fn start_test_server_with_config_inner(
     ));
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
-    let compactor = compactor(&config, &harness.store);
-    let lease_manager = lease_manager(&config, &harness.store);
+    let compactor = compactor(&config, &harness.store, &clock);
+    let lease_manager = lease_manager(&config, &harness.store, &clock);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: harness.store.clone(),
-        namespace_manager: namespace_manager(&config, &harness.store),
+        clock: clock.clone(),
+        namespace_manager: namespace_manager(&config, &harness.store, &clock),
         namespace_name_prefix: None,
-        wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
+        wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor,
         lease_manager,
@@ -171,6 +181,7 @@ pub async fn start_test_server_on_store(
 
     let mut config = Config::load(None).unwrap();
     configure_test_server_limits(&mut config);
+    let clock = Clock::system();
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -182,14 +193,15 @@ pub async fn start_test_server_on_store(
     ));
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let hydrator = maybe_hydrator(&config, &store, &cache);
-    let compactor = compactor(&config, &store);
-    let lease_manager = lease_manager(&config, &store);
+    let compactor = compactor(&config, &store, &clock);
+    let lease_manager = lease_manager(&config, &store, &clock);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: store.clone(),
-        namespace_manager: namespace_manager(&config, &store),
+        clock: clock.clone(),
+        namespace_manager: namespace_manager(&config, &store, &clock),
         namespace_name_prefix,
-        wal_writer: Arc::new(WalWriter::new(store.clone())),
+        wal_writer: Arc::new(WalWriter::with_clock(store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor,
         lease_manager,
@@ -238,14 +250,15 @@ pub async fn start_test_server_with_compactor(
     let harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
     configure_test_server_limits(&mut config);
+    let clock = Clock::system();
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
     );
 
-    let compactor = compactor(&config, &harness.store);
-    let lease_manager = lease_manager(&config, &harness.store);
+    let compactor = compactor(&config, &harness.store, &clock);
+    let lease_manager = lease_manager(&config, &harness.store, &clock);
     let manifest_cache = Arc::new(ManifestCache::new(Duration::ZERO));
 
     let query_semaphore = Arc::new(tokio::sync::Semaphore::new(
@@ -256,9 +269,10 @@ pub async fn start_test_server_with_compactor(
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: harness.store.clone(),
-        namespace_manager: namespace_manager(&config, &harness.store),
+        clock: clock.clone(),
+        namespace_manager: namespace_manager(&config, &harness.store, &clock),
         namespace_name_prefix: None,
-        wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
+        wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor: compactor.clone(),
         lease_manager,
@@ -308,19 +322,20 @@ pub async fn start_test_server_with_compaction(
     let harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
     configure_test_server_limits(&mut config);
+    let clock = Clock::system();
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
     );
 
-    let namespace_manager = namespace_manager(&config, &harness.store);
+    let namespace_manager = namespace_manager(&config, &harness.store, &clock);
 
-    let compactor = compactor(&config, &harness.store);
+    let compactor = compactor(&config, &harness.store, &clock);
 
     // Spawn background compaction loop (mirrors main.rs)
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(500)));
-    let lease_manager = lease_manager(&config, &harness.store);
+    let lease_manager = lease_manager(&config, &harness.store, &clock);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let gc_config = config.gc.clone();
     {
@@ -355,9 +370,10 @@ pub async fn start_test_server_with_compaction(
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: harness.store.clone(),
+        clock: clock.clone(),
         namespace_manager,
         namespace_name_prefix: Some(harness.prefix.clone()),
-        wal_writer: Arc::new(WalWriter::new(harness.store.clone())),
+        wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor,
         lease_manager,
@@ -468,6 +484,7 @@ pub async fn cleanup_ns(store: &ZeppelinStore, ns: &str) {
 pub struct FullTestServer {
     pub base_url: String,
     pub store: ZeppelinStore,
+    pub clock: Clock,
     pub cache: Arc<DiskCache>,
     pub cache_dir: tempfile::TempDir,
     pub compactor: Arc<Compactor>,
@@ -511,18 +528,20 @@ pub async fn start_test_server_full(
     namespace_name_prefix: Option<String>,
     mut config: Config,
     spawn_compaction_loop: bool,
+    clock: Option<Clock>,
 ) -> FullTestServer {
     zeppelin::metrics::init();
     configure_test_server_limits(&mut config);
+    let clock = clock.unwrap_or_else(Clock::system);
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
     );
 
-    let namespace_manager = namespace_manager(&config, &store);
-    let compactor = compactor(&config, &store);
-    let lease_manager = lease_manager(&config, &store);
+    let namespace_manager = namespace_manager(&config, &store, &clock);
+    let compactor = compactor(&config, &store, &clock);
+    let lease_manager = lease_manager(&config, &store, &clock);
     let manifest_cache = Arc::new(ManifestCache::new(Duration::from_millis(
         config.cache.manifest_cache_ttl_ms,
     )));
@@ -567,9 +586,10 @@ pub async fn start_test_server_full(
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: store.clone(),
+        clock: clock.clone(),
         namespace_manager,
         namespace_name_prefix,
-        wal_writer: Arc::new(WalWriter::new(store.clone())),
+        wal_writer: Arc::new(WalWriter::with_clock(store.clone(), clock.clone())),
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),
         lease_manager: lease_manager.clone(),
@@ -606,6 +626,7 @@ pub async fn start_test_server_full(
     FullTestServer {
         base_url,
         store,
+        clock,
         cache,
         cache_dir,
         compactor,

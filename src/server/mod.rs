@@ -107,6 +107,7 @@ use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL};
 use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::storage::ZeppelinStore;
+use crate::time::Clock;
 use crate::wal::{LeaseManager, WalReader, WalWriter};
 
 use self::handlers::{config as config_handler, namespace, query, vectors, ApiError};
@@ -262,6 +263,8 @@ pub struct RateLimitBucket {
 pub struct AppState {
     /// Storage abstraction through which handlers reach authoritative S3/MinIO.
     pub store: ZeppelinStore,
+    /// Shared wall clock for all correctness-sensitive request paths.
+    pub clock: Clock,
     /// Domain service for namespace CRUD and authoritative metadata changes.
     pub namespace_manager: Arc<NamespaceManager>,
     /// Optional prefix for server-generated namespace names.

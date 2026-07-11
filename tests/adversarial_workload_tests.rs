@@ -229,6 +229,7 @@ async fn restartable_server_exposes_hard_abort() {
         Some(prefix.clone()),
         config.clone(),
         false,
+        None,
     )
     .await;
     let client = reqwest::Client::new();
@@ -266,9 +267,14 @@ async fn restartable_server_exposes_hard_abort() {
 
     server.abort();
     drop(server);
-    let mut replacement =
-        common::server::start_test_server_full(harness.store.clone(), Some(prefix), config, false)
-            .await;
+    let mut replacement = common::server::start_test_server_full(
+        harness.store.clone(),
+        Some(prefix),
+        config,
+        false,
+        None,
+    )
+    .await;
     let fetched = client
         .post(format!(
             "{}/v1/namespaces/{namespace}/vectors/get",
@@ -287,6 +293,56 @@ async fn restartable_server_exposes_hard_abort() {
     assert_eq!(body["results"][0]["id"], "survivor");
 
     replacement.abort();
+    common::server::cleanup_ns(&harness.store, &namespace).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn wall_clock_jump_does_not_expire_compaction_upload_window() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use zeppelin::time::{Clock, TimeSource};
+
+    let harness = common::harness::TestHarness::new().await;
+    let namespace = harness.key("clock-upload-window");
+    let test_clock = Arc::new(adversarial::faults::clock::TestClock::default());
+    let source: Arc<dyn TimeSource> = test_clock.clone();
+    let clock = Clock::from_source(source);
+    let mut manifest = zeppelin::wal::Manifest::new_at(clock.now());
+    manifest.write(&harness.store, &namespace).await.unwrap();
+    let writer = zeppelin::wal::WalWriter::with_clock(harness.store.clone(), clock.clone());
+    writer
+        .append(
+            &namespace,
+            common::vectors::random_vectors(8, 4),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let mut config = zeppelin::config::Config::load(None).unwrap();
+    config.indexing.default_num_centroids = 4;
+    config.indexing.default_nprobe = 4;
+    let mut compactor = zeppelin::compaction::Compactor::with_clock(
+        harness.store.clone(),
+        zeppelin::wal::WalReader::new(harness.store.clone()),
+        config.compaction,
+        config.indexing,
+        Duration::from_secs(2),
+        clock,
+    );
+    compactor.set_test_pre_cas_delay(Duration::from_millis(100));
+    let compactor = Arc::new(compactor);
+    let ns = namespace.clone();
+    let task = tokio::spawn(async move { compactor.compact(&ns).await });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!task.is_finished(), "compaction finished before clock jump");
+    test_clock.jump(60 * 60 * 1_000);
+    let result = task.await.unwrap().unwrap();
+    assert_eq!(result.vectors_compacted, 8);
+
     common::server::cleanup_ns(&harness.store, &namespace).await;
     harness.cleanup().await;
 }

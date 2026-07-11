@@ -137,7 +137,6 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use chrono::Utc;
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -719,9 +718,15 @@ pub async fn put_snapshot(
         .get_strong(&state.store, &ns)
         .await
         .map_err(ApiError::from)?;
-    let snapshot = NamedSnapshot::create(&state.store, &ns, &name, manifest.version())
-        .await
-        .map_err(ApiError::from)?;
+    let snapshot = NamedSnapshot::create_at(
+        &state.store,
+        &ns,
+        &name,
+        manifest.version(),
+        state.clock.now(),
+    )
+    .await
+    .map_err(ApiError::from)?;
     Ok((
         StatusCode::CREATED,
         Json(SnapshotResponse::from_ref(snapshot)),
@@ -1040,7 +1045,7 @@ pub async fn create_namespace(
             Json(CreateNamespaceResponse {
                 namespace: NamespaceResponse::from_manifest(
                     meta,
-                    &Manifest::new(),
+                    &Manifest::new_at(state.clock.now()),
                     &state.config.indexing,
                 ),
                 warning:
@@ -1070,7 +1075,7 @@ pub async fn create_namespace(
         Json(CreateNamespaceResponse {
             namespace: NamespaceResponse::from_manifest(
                 meta,
-                &Manifest::new(),
+                &Manifest::new_at(state.clock.now()),
                 &state.config.indexing,
             ),
             warning: "Save this namespace name. It cannot be recovered if lost.".to_string(),
@@ -1178,9 +1183,15 @@ pub async fn clone_namespace(
         .map_err(ApiError::from)?;
     let source_generation = source_manifest.version();
     let clone_pin_name = internal_clone_pin_name();
-    NamedSnapshot::create(&state.store, &source, &clone_pin_name, source_generation)
-        .await
-        .map_err(ApiError::from)?;
+    NamedSnapshot::create_at(
+        &state.store,
+        &source,
+        &clone_pin_name,
+        source_generation,
+        state.clock.now(),
+    )
+    .await
+    .map_err(ApiError::from)?;
 
     let index_config = source_meta
         .index_config
@@ -1219,7 +1230,9 @@ pub async fn clone_namespace(
         release_internal_clone_pin(&state, &source, &clone_pin_name).await;
         return Err(ApiError::from(e));
     }
-    state.manifest_cache.invalidate(&target);
+    state
+        .manifest_cache
+        .invalidate_at(&target, state.clock.now());
     release_internal_clone_pin(&state, &source, &clone_pin_name).await;
 
     info!(
@@ -1327,7 +1340,9 @@ async fn release_internal_clone_pin(state: &AppState, source: &str, name: &str) 
 /// If the seventh object copy fails, this helper removes target metadata and
 /// the first six copied objects so a later clone request can reuse the name.
 async fn cleanup_failed_clone_target(state: &AppState, target: &str) {
-    state.manifest_cache.invalidate(target);
+    state
+        .manifest_cache
+        .invalidate_at(target, state.clock.now());
     match state.namespace_manager.delete(target).await {
         Ok(()) | Err(ZeppelinError::NamespaceNotFound { .. }) => {}
         Err(e) => warn!(
@@ -1551,7 +1566,7 @@ async fn materialize_clone_manifest(
     let copies = clone_copy_map(source, target, &manifest)?;
     rewrite_manifest_stored_keys(source, target, &mut manifest)?;
     manifest.fencing_token = 0;
-    manifest.updated_at = Utc::now();
+    manifest.updated_at = state.clock.now();
     manifest.reset_version_for_clone();
 
     futures::stream::iter(copies.into_iter().map(|(from, to)| {
@@ -1732,7 +1747,7 @@ pub async fn list_namespaces(
         .map_err(ApiError::from)?;
 
     info!(count = namespaces.len(), "listed namespaces");
-    let empty_manifest = Manifest::new();
+    let empty_manifest = Manifest::new_at(state.clock.now());
     let responses: Vec<NamespaceResponse> = namespaces
         .into_iter()
         .map(|meta| NamespaceResponse::from_manifest(meta, &empty_manifest, &state.config.indexing))
@@ -1988,6 +2003,7 @@ pub async fn compact_namespace(
     let compactor = state.compactor.clone();
     let lease_manager = state.lease_manager.clone();
     let manifest_cache = state.manifest_cache.clone();
+    let clock = state.clock.clone();
     let ns_for_task = ns.clone();
     let fts_configs = meta.full_text_search.clone();
     tokio::spawn(async move {
@@ -2001,7 +2017,7 @@ pub async fn compact_namespace(
         .await
         {
             Ok(result) => {
-                manifest_cache.invalidate(&ns_for_task);
+                manifest_cache.invalidate_at(&ns_for_task, clock.now());
                 info!(
                     namespace = %ns_for_task,
                     vectors_compacted = result.vectors_compacted,
@@ -2010,7 +2026,7 @@ pub async fn compact_namespace(
                 );
             }
             Err(e) => {
-                manifest_cache.invalidate(&ns_for_task);
+                manifest_cache.invalidate_at(&ns_for_task, clock.now());
                 tracing::error!(
                     namespace = %ns_for_task,
                     error = %e,
@@ -2207,7 +2223,7 @@ pub async fn delete_namespace(
     // The durable tombstone and manifest removal happened first. Only now is it
     // safe to discard disposable process state that could retain the namespace.
     state.wal_writer.remove_lock(&ns);
-    state.manifest_cache.invalidate(&ns);
+    state.manifest_cache.invalidate_at(&ns, state.clock.now());
 
     let namespace_manager = state.namespace_manager.clone();
     let ns_for_task = ns.clone();

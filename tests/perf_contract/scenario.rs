@@ -648,6 +648,7 @@ async fn run_scenario_inner(
         Some(harness.prefix.clone()),
         config.clone(),
         false,
+        None,
     )
     .await;
     let client = Client::new();
@@ -673,6 +674,7 @@ async fn run_scenario_inner(
                     Some(harness.prefix.clone()),
                     config.clone(),
                     false,
+                    None,
                 )
                 .await,
             );
@@ -711,6 +713,7 @@ async fn run_scenario_inner(
                     Some(harness.prefix.clone()),
                     config.clone(),
                     false,
+                    None,
                 )
                 .await,
             );
@@ -757,6 +760,7 @@ async fn run_scenario_inner(
                         Some(harness.prefix.clone()),
                         config.clone(),
                         false,
+                        None,
                     )
                     .await,
                 )
@@ -867,6 +871,7 @@ pub(crate) async fn run_closed_loop_scenario(
         Some(harness.prefix.clone()),
         config.clone(),
         false,
+        None,
     )
     .await;
     let client = Client::new();
@@ -891,6 +896,7 @@ pub(crate) async fn run_closed_loop_scenario(
                     Some(harness.prefix.clone()),
                     config,
                     false,
+                    None,
                 )
                 .await,
             );

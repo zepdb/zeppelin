@@ -224,6 +224,7 @@ use crate::index::ivf_flat::membership::{
 };
 use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
 use crate::storage::ZeppelinStore;
+use crate::time::Clock;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
@@ -427,6 +428,8 @@ pub struct Compactor {
     /// This is derived from GC configuration so in-flight objects cannot age
     /// past the horizon that staging is intended to protect.
     upload_window: Duration,
+    /// Explicit wall clock used for manifest stamps and GC orchestration.
+    clock: Clock,
     /// Test-only hook: artificial delay injected after index build and
     /// before the final manifest CAS loop, simulating a compaction whose
     /// build phase outlasts the lease duration. Always `None` in production
@@ -526,12 +529,33 @@ impl Compactor {
         indexing_config: IndexingConfig,
         upload_window: Duration,
     ) -> Self {
+        Self::with_clock(
+            store,
+            wal_reader,
+            config,
+            indexing_config,
+            upload_window,
+            Clock::system(),
+        )
+    }
+
+    /// Creates a compactor with an explicitly selected wall-clock source.
+    #[must_use]
+    pub fn with_clock(
+        store: ZeppelinStore,
+        wal_reader: WalReader,
+        config: CompactionConfig,
+        indexing_config: IndexingConfig,
+        upload_window: Duration,
+        clock: Clock,
+    ) -> Self {
         Self {
             store,
             wal_reader,
             config,
             indexing_config,
             upload_window,
+            clock,
             test_pre_cas_delay: None,
         }
     }
@@ -608,6 +632,12 @@ impl Compactor {
     /// compactor.
     pub fn store(&self) -> &ZeppelinStore {
         &self.store
+    }
+
+    /// Borrows the wall clock shared with compaction and GC paths.
+    #[must_use]
+    pub fn clock(&self) -> &Clock {
+        &self.clock
     }
 
     /// Resolves process defaults with the namespace's current indexing overlay.
@@ -698,7 +728,7 @@ impl Compactor {
     /// # Errors
     ///
     /// Propagates manifest read/decoding errors, metadata/config errors, and a
-    /// system-clock error if wall time is before the Unix epoch.
+    /// clock error if the injected wall time is before the Unix epoch.
     ///
     /// # Consistency
     ///
@@ -747,10 +777,10 @@ impl Compactor {
 
         let count = fragments.len();
         let total_bytes: u64 = fragments.iter().map(|f| f.size_bytes).sum();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| ZeppelinError::Index(format!("system clock before Unix epoch: {e}")))?
-            .as_millis() as u64;
+        let now = self.clock.now();
+        let now_ms = u64::try_from(now.timestamp_millis()).map_err(|_| {
+            ZeppelinError::Index(format!("compactor clock before Unix epoch: {now}"))
+        })?;
         let oldest_age_secs = fragments
             .iter()
             .map(|f| fragment_age_secs(&f.id, now_ms))
@@ -1295,10 +1325,11 @@ impl Compactor {
                     fresh_manifest.fencing_token = token;
                 }
 
+                let manifest_stamp = self.clock.now();
                 if let Some(seg_id) = old_segment_id.as_deref() {
-                    fresh_manifest.remove_segment(seg_id);
+                    fresh_manifest.remove_segment_at(seg_id, manifest_stamp);
                 }
-                fresh_manifest.remove_compacted_fragments(&compacted_ids);
+                fresh_manifest.remove_compacted_fragments_at(&compacted_ids, manifest_stamp);
                 merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
                 // Layer 2: CAS.
@@ -1833,7 +1864,8 @@ impl Compactor {
                 fresh_manifest.fencing_token = token;
             }
 
-            fresh_manifest.add_segment_with_limits(
+            let manifest_stamp = self.clock.now();
+            fresh_manifest.add_segment_with_limits_at(
                 SegmentRef {
                     id: segment_id.clone(),
                     vector_count: vectors_compacted,
@@ -1856,8 +1888,9 @@ impl Compactor {
                 },
                 self.config.max_pending_deletes,
                 self.config.max_old_segments,
+                manifest_stamp,
             );
-            fresh_manifest.remove_compacted_fragments(&compacted_ids);
+            fresh_manifest.remove_compacted_fragments_at(&compacted_ids, manifest_stamp);
             merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
             // Layer 2: CAS.
@@ -4022,9 +4055,40 @@ mod tests {
     //! 4. `test_merge_pending_deletes_keeps_concurrent_keys` protects a CAS
     //!    retry from dropping deletion work added by another writer.
 
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    use chrono::{DateTime, Utc};
+
     use super::*;
     use crate::config::{Config, GcConfig};
+    use crate::time::TimeSource;
     use crate::wal::manifest::FragmentRef;
+
+    #[derive(Debug)]
+    struct AdjustableTimeSource {
+        now_ms: AtomicI64,
+    }
+
+    impl AdjustableTimeSource {
+        fn new(now: DateTime<Utc>) -> Self {
+            Self {
+                now_ms: AtomicI64::new(now.timestamp_millis()),
+            }
+        }
+
+        fn jump(&self, delta: chrono::Duration) {
+            self.now_ms
+                .fetch_add(delta.num_milliseconds(), Ordering::SeqCst);
+        }
+    }
+
+    impl TimeSource for AdjustableTimeSource {
+        fn now(&self) -> DateTime<Utc> {
+            DateTime::from_timestamp_millis(self.now_ms.load(Ordering::SeqCst))
+                .expect("adjustable compactor-test timestamp must be representable")
+        }
+    }
 
     /// Creates an isolated in-memory compactor with the default GC upload window.
     ///
@@ -4045,6 +4109,21 @@ mod tests {
             config,
             IndexingConfig::default(),
             Duration::from_secs(GcConfig::default().compaction_upload_window_secs),
+        )
+    }
+
+    /// Creates an isolated compactor driven by an explicitly injected clock.
+    fn mem_compactor_with_clock(config: CompactionConfig, clock: Clock) -> Compactor {
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let store = ZeppelinStore::new(mem);
+        let wal_reader = WalReader::new(store.clone());
+        Compactor::with_clock(
+            store,
+            wal_reader,
+            config,
+            IndexingConfig::default(),
+            Duration::from_secs(GcConfig::default().compaction_upload_window_secs),
+            clock,
         )
     }
 
@@ -4194,6 +4273,75 @@ mod tests {
         assert!(
             compactor.should_compact("ns-age").await.unwrap(),
             "1 fragment older than max_wal_age_before_compact_secs must trigger compaction"
+        );
+    }
+
+    /// Advancing only the injected clock must make a fresh fragment age into
+    /// compaction eligibility without changing count or byte thresholds.
+    #[tokio::test]
+    async fn test_should_compact_age_uses_injected_clock() {
+        let source = Arc::new(AdjustableTimeSource::new(Utc::now()));
+        let compactor = mem_compactor_with_clock(
+            CompactionConfig {
+                max_wal_fragments_before_compact: 1000,
+                max_wal_age_before_compact_secs: 300,
+                max_wal_bytes_before_compact: u64::MAX,
+                ..Default::default()
+            },
+            Clock::from_source(source.clone()),
+        );
+        let fragment_timestamp = u64::try_from(source.now().timestamp_millis())
+            .expect("compactor-test clock must be after the Unix epoch");
+        let fragment_id = Ulid::from_parts(fragment_timestamp, 42);
+        write_manifest(
+            &compactor,
+            "ns-injected-age",
+            vec![fragment_ref(fragment_id, 100)],
+        )
+        .await;
+
+        assert!(
+            !compactor.should_compact("ns-injected-age").await.unwrap(),
+            "fragment at the injected current time must remain below all thresholds"
+        );
+
+        source.jump(chrono::Duration::seconds(301));
+
+        assert!(
+            compactor.should_compact("ns-injected-age").await.unwrap(),
+            "advancing the injected clock past the age threshold must trigger compaction"
+        );
+    }
+
+    /// A pre-epoch injected clock is invalid configuration, not a young
+    /// fragment; reject it instead of saturating or consulting host time.
+    #[tokio::test]
+    async fn test_should_compact_rejects_pre_epoch_injected_clock() {
+        let before_epoch = DateTime::from_timestamp_millis(-1)
+            .expect("one millisecond before the Unix epoch must be representable");
+        let compactor = mem_compactor_with_clock(
+            CompactionConfig {
+                max_wal_fragments_before_compact: 1000,
+                max_wal_age_before_compact_secs: 300,
+                max_wal_bytes_before_compact: u64::MAX,
+                ..Default::default()
+            },
+            Clock::from_source(Arc::new(AdjustableTimeSource::new(before_epoch))),
+        );
+        write_manifest(
+            &compactor,
+            "ns-pre-epoch-age",
+            vec![fragment_ref(Ulid::from_parts(0, 42), 100)],
+        )
+        .await;
+
+        let error = compactor
+            .should_compact("ns-pre-epoch-age")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ZeppelinError::Index(ref message) if message.contains("compactor clock before Unix epoch")),
+            "pre-epoch injected time must fail loudly: {error:?}"
         );
     }
 

@@ -135,7 +135,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
 use crate::cache::manifest_cache::ManifestCache;
@@ -346,7 +345,7 @@ impl LeaseHeartbeat {
                         // A failed renewal does not prove loss before the last
                         // confirmed expiry. After it, fail closed rather than
                         // letting an unproven holder reach manifest CAS.
-                        if current.expires_at <= Utc::now() {
+                        if current.expires_at <= lease_manager.clock().now() {
                             crate::metrics::COMPACTION_LEASE_LOST_TOTAL
                                 .with_label_values(&[namespace.as_str()])
                                 .inc();
@@ -991,7 +990,7 @@ pub async fn compaction_loop(
                     .await
                 {
                     Ok(outcome) if outcome.complete => {
-                        manifest_cache.invalidate(&ns.name);
+                        manifest_cache.invalidate_at(&ns.name, compactor.clock().now());
                         info!(
                             namespace = %ns.name,
                             objects_deleted = outcome.deleted,
@@ -1022,7 +1021,14 @@ pub async fn compaction_loop(
                 continue;
             }
 
-            match super::gc::run_gc_cycle(compactor.store(), &ns.name, &gc_config).await {
+            match super::gc::run_gc_cycle_at(
+                compactor.store(),
+                &ns.name,
+                &gc_config,
+                compactor.clock().now(),
+            )
+            .await
+            {
                 Ok(report) => {
                     if report.objects_deleted > 0
                         || report.candidates_marked > 0
@@ -1085,7 +1091,7 @@ pub async fn compaction_loop(
                                 );
                             }
                             // Invalidate manifest cache so queries see new segment.
-                            manifest_cache.invalidate(&ns.name);
+                            manifest_cache.invalidate_at(&ns.name, compactor.clock().now());
                             info!(
                                 namespace = %ns.name,
                                 vectors_compacted = result.vectors_compacted,

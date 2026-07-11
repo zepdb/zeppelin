@@ -10,6 +10,7 @@ use serde_json::json;
 use zeppelin::compaction::gc;
 use zeppelin::config::{Config, GcConfig};
 use zeppelin::storage::ZeppelinStore;
+use zeppelin::time::Clock;
 use zeppelin::types::ConsistencyLevel;
 use zeppelin::wal::Manifest;
 
@@ -21,11 +22,12 @@ use super::artifacts::{
     read_ops, read_seed_config, FailureManifest, RunArtifacts, SeedArtifacts, SeedReport,
 };
 use super::chaos::{chaos_store, ChaosHandle, FaultPlan, FiredFault};
+use super::faults::clock::TestClock;
 use super::faults::http_proxy::HttpFaultInjector;
 use super::faults::process::{CrashRequest, ProcessController, TriggerPosition};
 use super::faults::store_proxy::store_fault_proxy;
 use super::faults::{
-    Boundary, FaultKind, FaultProfile, FaultSchedule, FaultScheduler, FaultSemantics,
+    Boundary, ClockCommand, FaultKind, FaultProfile, FaultSchedule, FaultScheduler, FaultSemantics,
     HttpFaultAction, ObservedResult, TimelineEvent,
 };
 use super::generator::{AdversarialGenerator, Coverage};
@@ -252,7 +254,8 @@ pub async fn inspect_from_env() {
         !namespaces.is_empty(),
         "inspect target {target:?} did not resolve to any namespaces"
     );
-    let server = start_test_server_full(store.clone(), None, deterministic_config(), false).await;
+    let server =
+        start_test_server_full(store.clone(), None, deterministic_config(), false, None).await;
     println!("inspect server: {}", server.base_url);
     for ns in &namespaces {
         print_namespace_inspection(&store, ns).await;
@@ -285,6 +288,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         .fault_schedule
         .clone()
         .map(FaultScheduler::from_schedule);
+    let test_clock = test_clock_for_scheduler(scheduler.as_ref());
     let mode = if scheduler.is_some() {
         RunMode::Chaos
     } else {
@@ -338,6 +342,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         Some(prefix.clone()),
         config.clone(),
         mode == RunMode::Chaos,
+        injected_clock(test_clock.as_ref()),
     )
     .await;
     let mut injector = if scheduler.is_some() {
@@ -370,9 +375,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
 
     let records = read_ops(replay);
     for source in records.into_iter().take(max_ops as usize) {
-        if let Some(scheduler) = &scheduler {
-            scheduler.advance_to(source.index);
-        }
+        advance_scheduled_faults(scheduler.as_ref(), test_clock.as_ref(), source.index);
         let replay_lost_ack = replay_post_commit_selftest
             && source.status == 0
             && source.outcome == "ambiguous:connection_error";
@@ -465,7 +468,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
 
     let mut op_count = artifacts.op_count();
     drop(http_fault_context);
-    stop_scheduled_faults(scheduler.as_ref(), &mut injector).await;
+    stop_scheduled_faults(scheduler.as_ref(), test_clock.as_ref(), &mut injector).await;
     stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
     if !failed {
         let quiescence = quiesce_and_verify(
@@ -602,12 +605,19 @@ fn effective_seed_mode(mode: RunMode, seed: u64) -> RunMode {
     }
 }
 
-fn config_for_mode(mode: RunMode, seed: u64) -> Config {
+fn config_for_mode(mode: RunMode, seed: u64, profile: Option<FaultProfile>) -> Config {
     let mut config = deterministic_config();
     if mode == RunMode::Chaos {
         config.cache.manifest_cache_ttl_ms = 500;
         config.compaction.interval_secs = 2 + (seed % 4);
         config.gc.compaction_upload_window_secs = 2;
+    }
+    if profile == Some(FaultProfile::Clock) {
+        config.cache.namespace_registry_ttl_ms = 500;
+        config.compaction.interval_secs = 2;
+        config.compaction.lease_duration_secs = 10;
+        config.gc.horizon_secs = 30;
+        config.gc.allow_unsafe_short_horizon = true;
     }
     config
 }
@@ -626,6 +636,63 @@ fn wrap_chaos_store(
 
 fn scheduled_profile(profile: Option<FaultProfile>) -> Option<FaultProfile> {
     profile.filter(|profile| *profile != FaultProfile::LegacyChaos)
+}
+
+fn test_clock_for_scheduler(scheduler: Option<&FaultScheduler>) -> Option<Arc<TestClock>> {
+    scheduler
+        .is_some_and(|scheduler| scheduler.schedule().profile == FaultProfile::Clock)
+        .then(|| Arc::new(TestClock::default()))
+}
+
+fn injected_clock(test_clock: Option<&Arc<TestClock>>) -> Option<Clock> {
+    test_clock.map(|clock| Clock::from_source(clock.clone()))
+}
+
+fn advance_scheduled_faults(
+    scheduler: Option<&FaultScheduler>,
+    test_clock: Option<&Arc<TestClock>>,
+    op_index: u64,
+) {
+    let Some(scheduler) = scheduler else {
+        return;
+    };
+    for command in scheduler.advance_to(op_index) {
+        let clock = test_clock.expect("clock command requires a shared TestClock");
+        let (event_id, action, semantics) = match command {
+            ClockCommand::Jump { event_id, delta_ms } => {
+                clock.jump(delta_ms);
+                let action = if delta_ms % 1_000 == 0 {
+                    format!("jump {:+}s", delta_ms / 1_000)
+                } else {
+                    format!("jump {delta_ms:+}ms")
+                };
+                (event_id, action, FaultSemantics::PreCall)
+            }
+            ClockCommand::Freeze { event_id, for_ops } => {
+                clock.freeze();
+                (
+                    event_id,
+                    format!("freeze({for_ops} ops)"),
+                    FaultSemantics::PreCall,
+                )
+            }
+            ClockCommand::Thaw { event_id } => {
+                clock.thaw();
+                (event_id, "thaw".to_string(), FaultSemantics::WindowEnd)
+            }
+        };
+        scheduler.record(TimelineEvent {
+            event_id,
+            op_index,
+            wall_ms: scheduler.wall_ms(),
+            boundary: Boundary::Clock,
+            action,
+            key: None,
+            semantics,
+            observed: ObservedResult::DefiniteApplied,
+            recovery: None,
+        });
+    }
 }
 
 fn adversarial_client() -> Client {
@@ -660,10 +727,14 @@ async fn shutdown_http_fault_injector(injector: &mut Option<Arc<HttpFaultInjecto
 
 async fn stop_scheduled_faults(
     scheduler: Option<&FaultScheduler>,
+    test_clock: Option<&Arc<TestClock>>,
     injector: &mut Option<Arc<HttpFaultInjector>>,
 ) {
     if let Some(scheduler) = scheduler {
         scheduler.quiesce();
+    }
+    if let Some(clock) = test_clock {
+        clock.thaw();
     }
     shutdown_http_fault_injector(injector).await;
 }
@@ -686,6 +757,7 @@ async fn restart_after_crash(
     crash: CrashRequest,
 ) -> Vec<Violation> {
     *http_fault_context = None;
+    let clock = server.clock.clone();
     server.abort();
     controller.park_token.cancel();
     shutdown_http_fault_injector(injector).await;
@@ -695,6 +767,7 @@ async fn restart_after_crash(
         Some(prefix.to_string()),
         config.clone(),
         spawn_compaction_loop,
+        Some(clock),
     )
     .await;
     wait_for_health(client, &server.base_url).await;
@@ -1211,6 +1284,7 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 OracleMutation::IndetResolutionLie,
                 OracleMutation::DroppedResponseLostWrite,
                 OracleMutation::CrashLostAck,
+                OracleMutation::ClockGcEatsLive,
             ]
         },
         |mutation| vec![mutation],
@@ -1278,6 +1352,7 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 fired.contains(&ViolationId::I18IndeterminateResolution)
             }
             OracleMutation::CrashLostAck => fired.contains(&ViolationId::I16Quiescence),
+            OracleMutation::ClockGcEatsLive => fired.contains(&ViolationId::I14S3Reachability),
         };
         assert!(
             accepted,
@@ -1314,12 +1389,17 @@ async fn run_seed(
         mutation.or(selftest_probe),
         Some(OracleMutation::CrashLostAck)
     );
+    let clock_gc_eats_live_selftest = matches!(
+        mutation.or(selftest_probe),
+        Some(OracleMutation::ClockGcEatsLive)
+    );
     let profile = scheduled_profile(env.profile);
     let mode = if profile.is_some()
         || mutation == Some(OracleMutation::ChaosLostWrite)
         || post_commit_selftest
         || dropped_response_selftest
         || crash_lost_ack_selftest
+        || clock_gc_eats_live_selftest
     {
         RunMode::Chaos
     } else {
@@ -1329,7 +1409,11 @@ async fn run_seed(
     let prefix = harness.prefix.clone();
     let mut generator = AdversarialGenerator::new(seed, &prefix);
     let specs = generator.specs();
-    let scheduler = if crash_lost_ack_selftest {
+    let scheduler = if clock_gc_eats_live_selftest {
+        Some(FaultScheduler::from_schedule(
+            FaultSchedule::clock_gc_eats_live_selftest(),
+        ))
+    } else if crash_lost_ack_selftest {
         Some(FaultScheduler::from_schedule(
             FaultSchedule::crash_lost_ack_selftest(),
         ))
@@ -1340,6 +1424,7 @@ async fn run_seed(
     } else {
         profile.map(|profile| FaultScheduler::for_seed(seed, profile))
     };
+    let test_clock = test_clock_for_scheduler(scheduler.as_ref());
     let chaos_plan = if matches!(
         mutation,
         Some(OracleMutation::DroppedResponseLostWrite | OracleMutation::CrashLostAck)
@@ -1369,7 +1454,13 @@ async fn run_seed(
             store_fault_proxy(&legacy_instrumented_store, scheduler.clone())
         });
     let (store, counter) = counting_store(&instrumented_store);
-    let config = config_for_mode(mode, seed);
+    let config = config_for_mode(
+        mode,
+        seed,
+        scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.schedule().profile),
+    );
     let recorded_ops = recorded_seed_ops_if_requested(env, seed, &prefix);
     let mut artifacts = artifacts.seed(
         seed,
@@ -1386,6 +1477,7 @@ async fn run_seed(
         Some(prefix.clone()),
         config.clone(),
         mode == RunMode::Chaos,
+        injected_clock(test_clock.as_ref()),
     )
     .await;
     let mut injector = if scheduler.is_some() {
@@ -1419,9 +1511,7 @@ async fn run_seed(
     let max_ops = env.max_ops.unwrap_or(500);
 
     while op_index < max_ops && (Instant::now() < deadline || op_index == 0) {
-        if let Some(scheduler) = &scheduler {
-            scheduler.advance_to(op_index);
-        }
+        advance_scheduled_faults(scheduler.as_ref(), test_clock.as_ref(), op_index);
         let op = sanitize_op_for_mode(generator.next(&model), mode);
         assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &op);
         let inject_post_commit_ack_loss =
@@ -1511,6 +1601,7 @@ async fn run_seed(
 
         if let Some(probe) = selftest_probe {
             if let Some(probe_op) = selftest_probe_op(probe, &op, &model, &mut generator) {
+                advance_scheduled_faults(scheduler.as_ref(), test_clock.as_ref(), op_index);
                 assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &probe_op);
                 let inject_post_commit_ack_loss = post_commit_selftest
                     && !post_commit_ack_loss_fired
@@ -1579,7 +1670,7 @@ async fn run_seed(
     }
 
     drop(http_fault_context);
-    stop_scheduled_faults(scheduler.as_ref(), &mut injector).await;
+    stop_scheduled_faults(scheduler.as_ref(), test_clock.as_ref(), &mut injector).await;
     stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
 
     if post_commit_selftest {
@@ -1841,7 +1932,10 @@ async fn execute_recorded_op(
                         ns,
                         rec.index,
                         &status,
-                        mutation == Some(OracleMutation::GcEatsLiveKey),
+                        matches!(
+                            mutation,
+                            Some(OracleMutation::GcEatsLiveKey | OracleMutation::ClockGcEatsLive)
+                        ),
                     )
                     .await,
             );
@@ -2173,10 +2267,10 @@ async fn execute_op(
         Op::GcCycle { ns, keep_count } => {
             let path = format!("gc::run_gc_cycle({ns})");
             let config = gc_config(*keep_count);
-            let report = gc::run_gc_cycle(&server.store, ns, &config)
+            let report = gc::run_gc_cycle_at(&server.store, ns, &config, server.clock.now())
                 .await
                 .unwrap_or_else(|error| panic!("gc cycle failed for {ns}: {error}"));
-            server.manifest_cache.invalidate(ns);
+            server.manifest_cache.invalidate_at(ns, server.clock.now());
             let retained_generations = Manifest::list_history(&server.store, ns)
                 .await
                 .unwrap_or_else(|error| panic!("history list after gc failed for {ns}: {error}"))
@@ -2317,7 +2411,7 @@ async fn execute_op(
         }
         Op::CompactInline { ns } => match server.compactor.compact(ns).await {
             Ok(result) => {
-                server.manifest_cache.invalidate(ns);
+                server.manifest_cache.invalidate_at(ns, server.clock.now());
                 (
                     "IN_PROCESS".to_string(),
                     format!("compactor.compact({ns})"),
@@ -2331,7 +2425,7 @@ async fn execute_op(
                 )
             }
             Err(error) => {
-                server.manifest_cache.invalidate(ns);
+                server.manifest_cache.invalidate_at(ns, server.clock.now());
                 (
                     "IN_PROCESS".to_string(),
                     format!("compactor.compact({ns})"),
@@ -3049,7 +3143,7 @@ async fn execute_sandwich_maintenance(
                 .compact(ns)
                 .await
                 .unwrap_or_else(|error| panic!("sandwich compaction failed for {ns}: {error}"));
-            server.manifest_cache.invalidate(ns);
+            server.manifest_cache.invalidate_at(ns, server.clock.now());
             json!({
                 "kind": "compact_inline",
                 "segment_id": result.segment_id,
@@ -3073,10 +3167,10 @@ async fn execute_sandwich_maintenance(
         }
         super::ops::MaintenanceKind::GcCycle => {
             let config = gc_config(4);
-            let report = gc::run_gc_cycle(&server.store, ns, &config)
+            let report = gc::run_gc_cycle_at(&server.store, ns, &config, server.clock.now())
                 .await
                 .unwrap_or_else(|error| panic!("sandwich gc failed for {ns}: {error}"));
-            server.manifest_cache.invalidate(ns);
+            server.manifest_cache.invalidate_at(ns, server.clock.now());
             json!({
                 "kind": "gc_cycle",
                 "candidates_marked": report.candidates_marked,
@@ -3192,7 +3286,10 @@ async fn quiesce_and_verify(
                         ns,
                         *op_index,
                         &status,
-                        mutation == Some(OracleMutation::GcEatsLiveKey),
+                        matches!(
+                            mutation,
+                            Some(OracleMutation::GcEatsLiveKey | OracleMutation::ClockGcEatsLive)
+                        ),
                     )
                     .await
             } else {
@@ -3772,6 +3869,7 @@ mod outcome_tests {
             Some(prefix),
             deterministic_config(),
             false,
+            None,
         )
         .await;
         let client = adversarial_client();
@@ -3798,7 +3896,7 @@ mod outcome_tests {
                 kind: FaultKind::DuplicateRetry,
             }],
         });
-        scheduler.advance_to(0);
+        let _ = scheduler.advance_to(0);
         let injector = start_http_fault_injector(&server.base_url).await;
         let context = HttpFaultContext {
             scheduler: scheduler.clone(),

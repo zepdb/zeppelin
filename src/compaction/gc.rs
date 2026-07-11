@@ -847,8 +847,18 @@ pub async fn drain_pending_deletes(
     namespace: &str,
     gc: &GcConfig,
 ) -> Result<PendingDeleteDrainReport> {
+    drain_pending_deletes_at(store, namespace, gc, Utc::now()).await
+}
+
+/// Drains pending deletes using an explicit cycle timestamp.
+pub async fn drain_pending_deletes_at(
+    store: &ZeppelinStore,
+    namespace: &str,
+    gc: &GcConfig,
+    now: DateTime<Utc>,
+) -> Result<PendingDeleteDrainReport> {
     let history_reachable = retained_manifest_history_reachable_keys(store, namespace).await?;
-    drain_pending_deletes_with_retained_history(store, namespace, gc, &history_reachable).await
+    drain_pending_deletes_with_retained_history(store, namespace, gc, &history_reachable, now).await
 }
 
 /// Drains pending deletes using a retained-history union already loaded by the caller.
@@ -884,8 +894,8 @@ async fn drain_pending_deletes_with_retained_history(
     namespace: &str,
     gc: &GcConfig,
     retained_history: &BTreeSet<String>,
+    now: DateTime<Utc>,
 ) -> Result<PendingDeleteDrainReport> {
-    let now = Utc::now();
     let mut deleted_keys = BTreeSet::new();
 
     for attempt in 0..GC_MANIFEST_CAS_RETRIES {
@@ -959,7 +969,7 @@ async fn drain_pending_deletes_with_retained_history(
         manifest
             .pending_deletes
             .retain(|key| !confirmed_absent.contains(key));
-        manifest.updated_at = Utc::now();
+        manifest.updated_at = now;
 
         match manifest.write_conditional(store, namespace, &version).await {
             Ok(()) => {
@@ -1287,8 +1297,17 @@ pub async fn run_gc_cycle(
     namespace: &str,
     gc: &GcConfig,
 ) -> Result<GcCycleReport> {
-    let now = Utc::now();
-    let history_prune = match Manifest::prune_history_with_retention(
+    run_gc_cycle_at(store, namespace, gc, Utc::now()).await
+}
+
+/// Runs one complete garbage-collection cycle at an explicit wall time.
+pub async fn run_gc_cycle_at(
+    store: &ZeppelinStore,
+    namespace: &str,
+    gc: &GcConfig,
+    now: DateTime<Utc>,
+) -> Result<GcCycleReport> {
+    let history_prune = match Manifest::prune_history_with_retention_at(
         store,
         namespace,
         ManifestHistoryRetention {
@@ -1296,6 +1315,7 @@ pub async fn run_gc_cycle(
             pitr_retention_secs: gc.pitr_retention_secs,
             skew_slop_secs: gc.skew_slop_secs,
         },
+        now,
     )
     .await
     {
@@ -1321,20 +1341,25 @@ pub async fn run_gc_cycle(
             return Ok(GcCycleReport::default());
         }
     };
-    let pending_report =
-        match drain_pending_deletes_with_retained_history(store, namespace, gc, &retained_history)
-            .await
-        {
-            Ok(report) => report,
-            Err(e) => {
-                warn!(
-                    namespace,
-                    error = %e,
-                    "gc pending-delete drain failed; aborting cycle"
-                );
-                return Ok(GcCycleReport::default());
-            }
-        };
+    let pending_report = match drain_pending_deletes_with_retained_history(
+        store,
+        namespace,
+        gc,
+        &retained_history,
+        now,
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(e) => {
+            warn!(
+                namespace,
+                error = %e,
+                "gc pending-delete drain failed; aborting cycle"
+            );
+            return Ok(GcCycleReport::default());
+        }
+    };
     let base_report = GcCycleReport {
         objects_deleted: pending_report.objects_deleted,
         pending_deletes_deleted: pending_report.objects_deleted,
@@ -1371,7 +1396,7 @@ pub async fn run_gc_cycle(
             return Ok(base_report);
         }
     };
-    let mark_staging = match active_staged_keys(store, namespace).await {
+    let mark_staging = match active_staged_keys_at(store, namespace, now).await {
         Ok(staging) => staging,
         Err(e) => {
             warn!(namespace, error = %e, "gc active staging read failed; aborting cycle");
@@ -1440,7 +1465,7 @@ pub async fn run_gc_cycle(
             return Ok(report);
         }
     };
-    let sweep_staging = match active_staged_keys(store, namespace).await {
+    let sweep_staging = match active_staged_keys_at(store, namespace, now).await {
         Ok(staging) => staging,
         Err(e) => {
             warn!(namespace, error = %e, "gc active staging re-read failed; skipping sweep");
@@ -2132,13 +2157,22 @@ pub async fn active_staged_keys(
     store: &ZeppelinStore,
     namespace: &str,
 ) -> Result<BTreeSet<String>> {
+    active_staged_keys_at(store, namespace, Utc::now()).await
+}
+
+/// Reads active compaction staging roots at an explicit wall time.
+pub async fn active_staged_keys_at(
+    store: &ZeppelinStore,
+    namespace: &str,
+    now: DateTime<Utc>,
+) -> Result<BTreeSet<String>> {
     let lease_data = match store.get(&format!("{namespace}/lease.json")).await {
         Ok(data) => data,
         Err(crate::error::ZeppelinError::NotFound { .. }) => return Ok(BTreeSet::new()),
         Err(e) => return Err(e),
     };
     let lease: Lease = serde_json::from_slice(&lease_data)?;
-    if lease.expires_at <= Utc::now() {
+    if lease.expires_at <= now {
         return Ok(BTreeSet::new());
     }
 
@@ -3077,6 +3111,39 @@ mod tests {
             load_gc_candidates(&store, NS).await.unwrap(),
             vec![candidate]
         );
+    }
+
+    #[tokio::test]
+    async fn gc_horizon_honors_injected_now() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let now = Utc::now();
+        let mut manifest = Manifest::new_at(now);
+        manifest.write(&store, NS).await.unwrap();
+        let old_ms =
+            u64::try_from((now - chrono::Duration::seconds(60)).timestamp_millis()).unwrap();
+        let orphan = WalFragment::s3_key(NS, &Ulid::from_parts(old_ms, 101));
+        store
+            .put(&orphan, Bytes::from_static(b"orphan"))
+            .await
+            .unwrap();
+        let gc = GcConfig {
+            horizon_secs: 30,
+            compaction_upload_window_secs: 2,
+            skew_slop_secs: 0,
+            allow_unsafe_short_horizon: true,
+            manifest_history_keep_count: 1,
+            pitr_retention_secs: 0,
+        };
+
+        let first = run_gc_cycle_at(&store, NS, &gc, now).await.unwrap();
+        assert_eq!(first.candidates_marked, 1);
+        assert!(store.exists(&orphan).await.unwrap());
+
+        let second = run_gc_cycle_at(&store, NS, &gc, now + chrono::Duration::seconds(31))
+            .await
+            .unwrap();
+        assert_eq!(second.objects_deleted, 1);
+        assert!(!store.exists(&orphan).await.unwrap());
     }
 
     /// Ensures marking drops resurrected entries but preserves old marks for dead keys.

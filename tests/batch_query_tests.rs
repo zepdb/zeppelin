@@ -63,6 +63,7 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
 
     let app = build_router(AppState {
         store: store.clone(),
+        clock: zeppelin::time::Clock::system(),
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(store.clone())),

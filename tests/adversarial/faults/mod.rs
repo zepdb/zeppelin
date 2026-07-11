@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod http_proxy;
 pub mod process;
 pub mod store_proxy;
@@ -27,6 +28,7 @@ pub enum FaultProfile {
     PostCommit,
     Network,
     Crash,
+    Clock,
 }
 
 impl FaultProfile {
@@ -37,6 +39,7 @@ impl FaultProfile {
             "post_commit" => Self::PostCommit,
             "network" => Self::Network,
             "crash" => Self::Crash,
+            "clock" => Self::Clock,
             other => panic!("invalid ZEPPELIN_ADVERSARIAL_PROFILE: {other}"),
         }
     }
@@ -47,6 +50,7 @@ impl FaultProfile {
             Self::PostCommit => "post-commit",
             Self::Network => "network",
             Self::Crash => "crash",
+            Self::Clock => "clock",
         }
     }
 }
@@ -67,6 +71,7 @@ pub enum Boundary {
     ObjectStore,
     ClientHttp,
     Process,
+    Clock,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -109,6 +114,12 @@ pub enum FaultKind {
     CrashAt {
         point: CrashPoint,
         position: TriggerPosition,
+    },
+    ClockJump {
+        delta_ms: i64,
+    },
+    ClockFreeze {
+        for_ops: u64,
     },
 }
 
@@ -179,9 +190,17 @@ pub struct HttpFaultAction {
     pub window: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClockCommand {
+    Jump { event_id: String, delta_ms: i64 },
+    Freeze { event_id: String, for_ops: u64 },
+    Thaw { event_id: String },
+}
+
 #[derive(Debug)]
 struct EventRuntime {
     fired: AtomicBool,
+    ended: AtomicBool,
     matches: AtomicU64,
 }
 
@@ -227,6 +246,7 @@ impl FaultScheduler {
             .iter()
             .map(|_| EventRuntime {
                 fired: AtomicBool::new(false),
+                ended: AtomicBool::new(false),
                 matches: AtomicU64::new(0),
             })
             .collect();
@@ -250,8 +270,58 @@ impl FaultScheduler {
         &self.schedule
     }
 
-    pub fn advance_to(&self, op_index: u64) {
+    pub fn advance_to(&self, op_index: u64) -> Vec<ClockCommand> {
         self.runtime.logical_op.store(op_index, Ordering::SeqCst);
+        if self.runtime.quiesced.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+
+        let mut commands = Vec::new();
+        for (index, event) in self.schedule.events.iter().enumerate() {
+            if event.boundary != Boundary::Clock {
+                continue;
+            }
+            let runtime = &self.runtime.events[index];
+            match event.kind {
+                FaultKind::ClockJump { delta_ms } if op_index == event.start_op => {
+                    if runtime
+                        .fired
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        commands.push(ClockCommand::Jump {
+                            event_id: event.id.clone(),
+                            delta_ms,
+                        });
+                    }
+                }
+                FaultKind::ClockFreeze { for_ops } => {
+                    if op_index == event.start_op
+                        && runtime
+                            .fired
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        commands.push(ClockCommand::Freeze {
+                            event_id: event.id.clone(),
+                            for_ops,
+                        });
+                    }
+                    if op_index == event.start_op.saturating_add(for_ops)
+                        && runtime
+                            .ended
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        commands.push(ClockCommand::Thaw {
+                            event_id: event.id.clone(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        commands
     }
 
     #[must_use]
@@ -419,6 +489,21 @@ impl FaultSchedule {
                     point,
                     position: TriggerPosition::Post,
                 },
+            }],
+        }
+    }
+
+    #[must_use]
+    pub fn clock_gc_eats_live_selftest() -> Self {
+        Self {
+            profile: FaultProfile::Clock,
+            events: vec![FaultEvent {
+                id: "clock-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::Clock,
+                target: TargetSelector::default(),
+                kind: FaultKind::ClockJump { delta_ms: 120_000 },
             }],
         }
     }
@@ -657,6 +742,55 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
                 );
             }
         }
+        FaultProfile::Clock => {
+            push_event(
+                &mut events,
+                profile,
+                rng.gen_range(25..=75),
+                None,
+                Boundary::Clock,
+                TargetSelector::default(),
+                FaultKind::ClockJump {
+                    delta_ms: rng.gen_range(1..=120) * 1_000,
+                },
+            );
+            push_event(
+                &mut events,
+                profile,
+                rng.gen_range(100..=150),
+                None,
+                Boundary::Clock,
+                TargetSelector::default(),
+                FaultKind::ClockJump {
+                    delta_ms: -rng.gen_range(1..=30) * 1_000,
+                },
+            );
+            let freeze_start = rng.gen_range(175..=240);
+            let for_ops = rng.gen_range(5..=20);
+            push_event(
+                &mut events,
+                profile,
+                freeze_start,
+                Some(freeze_start + for_ops),
+                Boundary::Clock,
+                TargetSelector::default(),
+                FaultKind::ClockFreeze { for_ops },
+            );
+            let (start_op, delta_ms) = if seed % 2 == 0 {
+                (rng.gen_range(300..=360), rng.gen_range(15..=120) * 1_000)
+            } else {
+                (rng.gen_range(470..=485), rng.gen_range(31..=120) * 1_000)
+            };
+            push_event(
+                &mut events,
+                profile,
+                start_op,
+                None,
+                Boundary::Clock,
+                TargetSelector::default(),
+                FaultKind::ClockJump { delta_ms },
+            );
+        }
     }
     FaultSchedule { profile, events }
 }
@@ -691,6 +825,7 @@ mod tests {
             FaultProfile::PostCommit,
             FaultProfile::Network,
             FaultProfile::Crash,
+            FaultProfile::Clock,
         ] {
             for seed in 0..20 {
                 let first = FaultScheduler::for_seed(seed, profile);
@@ -756,18 +891,18 @@ mod tests {
             ],
         };
         let scheduler = FaultScheduler::from_schedule(schedule);
-        scheduler.advance_to(2);
+        let _ = scheduler.advance_to(2);
         assert!(scheduler.store_decision(StoreOp::Get, "key").is_none());
-        scheduler.advance_to(3);
+        let _ = scheduler.advance_to(3);
         assert!(scheduler.store_decision(StoreOp::Get, "key").is_some());
-        scheduler.advance_to(4);
+        let _ = scheduler.advance_to(4);
         assert!(scheduler.store_decision(StoreOp::Put, "key").is_some());
         assert!(scheduler.http_decision(&Method::POST, "/path").is_some());
         assert!(scheduler.http_decision(&Method::POST, "/path").is_none());
-        scheduler.advance_to(5);
+        let _ = scheduler.advance_to(5);
         assert!(scheduler.store_decision(StoreOp::Get, "key").is_none());
         scheduler.quiesce();
-        scheduler.advance_to(4);
+        let _ = scheduler.advance_to(4);
         assert!(scheduler.store_decision(StoreOp::Get, "key").is_none());
     }
 }

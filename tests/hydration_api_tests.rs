@@ -110,6 +110,7 @@ async fn start_api_server(config: Config) -> ApiServer {
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let state = AppState {
         store: store.clone(),
+        clock: zeppelin::time::Clock::system(),
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(store.clone())),

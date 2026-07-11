@@ -261,6 +261,12 @@ pub mod startup;
 /// ranged reads, immutable writes, conditional updates, listing, and bounded
 /// cleanup. Code above this layer does not call `object_store` directly.
 pub mod storage;
+/// Explicit wall-clock source used by correctness-sensitive components.
+///
+/// [`time::Clock`] defaults to the system wall clock in production and accepts
+/// an injected [`time::TimeSource`] during construction for deterministic fault
+/// testing. Monotonic elapsed-time paths continue to use `std::time::Instant`.
+pub mod time;
 /// Shared vectors, attributes, filters, score metrics, consistency, and index choices.
 ///
 /// Read [`types::VectorEntry`], [`types::Filter`],

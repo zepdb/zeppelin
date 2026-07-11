@@ -531,7 +531,7 @@ impl ManifestCache {
         );
     }
 
-    /// Removes one namespace snapshot and fences older write-throughs.
+    /// Removes one namespace snapshot using the system-clock fence time.
     ///
     /// # Parameters
     ///
@@ -544,7 +544,7 @@ impl ManifestCache {
     ///
     /// # Side Effects
     ///
-    /// Records the current UTC time and removes `entries[namespace]`. It does
+    /// Delegates to [`Self::invalidate_at`] with the current UTC time. It does
     /// not remove the namespace's singleflight mutex or cancel an active read.
     ///
     /// # Consistency
@@ -559,8 +559,37 @@ impl ManifestCache {
     /// the next query to discover that manifest instead of serving the old TTL
     /// entry. Invalidating an already-cold namespace is harmless.
     pub fn invalidate(&self, namespace: &str) {
+        self.invalidate_at(namespace, Utc::now());
+    }
+
+    /// Removes one namespace snapshot and fences older write-throughs.
+    ///
+    /// # Parameters
+    ///
+    /// - `namespace`: Namespace whose resident snapshot must no longer satisfy
+    ///   a bounded read.
+    /// - `invalidated_at`: Wall-clock timestamp supplied by the caller's shared
+    ///   correctness clock.
+    ///
+    /// # Side Effects
+    ///
+    /// Advances the namespace's invalidation fence and removes its resident
+    /// entry. A backward wall-clock jump cannot lower an existing fence.
+    ///
+    /// # Consistency
+    ///
+    /// Callers that stamp manifests with an injected clock must pass that same
+    /// clock here. Otherwise a future-stamped delayed write-through could appear
+    /// newer than a host-clock invalidation and repopulate stale cache state.
+    pub fn invalidate_at(&self, namespace: &str, invalidated_at: DateTime<Utc>) {
         self.last_invalidated
-            .insert(namespace.to_string(), Utc::now());
+            .entry(namespace.to_string())
+            .and_modify(|current| {
+                if invalidated_at > *current {
+                    *current = invalidated_at;
+                }
+            })
+            .or_insert(invalidated_at);
         self.entries.remove(namespace);
     }
 }
@@ -682,6 +711,22 @@ mod tests {
         stale.next_sequence = 4;
         stale.updated_at = chrono::Utc::now() - chrono::Duration::seconds(10);
         cache.insert("ns", stale);
+
+        assert!(cache.entries.get("ns").is_none());
+    }
+
+    /// Uses the injected invalidation stamp to reject a delayed write-through.
+    #[test]
+    fn test_insert_rejects_manifest_older_than_injected_invalidation() {
+        let cache = ManifestCache::new(Duration::from_millis(500));
+        let host_now = Utc::now();
+        let invalidated_at = host_now + chrono::Duration::hours(2);
+        cache.invalidate_at("ns", invalidated_at);
+
+        let mut delayed = Manifest::default();
+        delayed.next_sequence = 1;
+        delayed.updated_at = host_now + chrono::Duration::hours(1);
+        cache.insert("ns", delayed);
 
         assert!(cache.entries.get("ns").is_none());
     }

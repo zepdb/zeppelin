@@ -73,6 +73,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
+use crate::time::Clock;
 
 /// A process's snapshot of the time-bounded write lease for one namespace.
 ///
@@ -131,6 +132,8 @@ pub struct LeaseManager {
     holder_id: String,
     /// Amount of wall-clock time granted by each acquisition or renewal.
     lease_duration: Duration,
+    /// Explicit wall-clock source shared with the process's other components.
+    clock: Clock,
 }
 
 /// Builds the object-store key for a namespace's authoritative lease record.
@@ -174,10 +177,22 @@ impl LeaseManager {
     /// A compactor can construct one manager for `node-a` with a 30-second
     /// duration, then use that manager for different namespace keys.
     pub fn new(store: ZeppelinStore, holder_id: String, lease_duration: Duration) -> Self {
+        Self::with_clock(store, holder_id, lease_duration, Clock::system())
+    }
+
+    /// Creates a manager with an explicitly selected wall-clock source.
+    #[must_use]
+    pub fn with_clock(
+        store: ZeppelinStore,
+        holder_id: String,
+        lease_duration: Duration,
+        clock: Clock,
+    ) -> Self {
         Self {
             store,
             holder_id,
             lease_duration,
+            clock,
         }
     }
 
@@ -197,6 +212,12 @@ impl LeaseManager {
     #[must_use]
     pub fn lease_duration(&self) -> Duration {
         self.lease_duration
+    }
+
+    /// Borrows the wall clock used for lease timestamps and expiry checks.
+    #[must_use]
+    pub fn clock(&self) -> &Clock {
+        &self.clock
     }
 
     /// Acquires a namespace lease or takes over its expired record.
@@ -272,7 +293,7 @@ impl LeaseManager {
             Ok((data, etag)) => {
                 let existing: Lease = serde_json::from_slice(&data)?;
 
-                if existing.expires_at > Utc::now() {
+                if existing.expires_at > self.clock.now() {
                     // Lease is still valid — reject.
                     return Err(ZeppelinError::LeaseHeld {
                         namespace: namespace.to_string(),
@@ -456,7 +477,7 @@ impl LeaseManager {
                 // We still hold it — mark as expired (preserves fencing token
                 // so the next acquire increments from it, not from 1).
                 let mut released = current;
-                released.expires_at = Utc::now() - chrono::Duration::seconds(1);
+                released.expires_at = self.clock.now() - chrono::Duration::seconds(1);
                 let release_data = Bytes::from(serde_json::to_vec_pretty(&released)?);
                 match self.store.put(&key, release_data).await {
                     Ok(()) => {
@@ -506,7 +527,7 @@ impl LeaseManager {
     /// `node-a`. The same snapshot fails for `node-b`, and it fails for both
     /// after its wall-clock expiry.
     pub fn validate(&self, lease: &Lease) -> bool {
-        lease.expires_at > Utc::now() && lease.holder_id == self.holder_id
+        lease.expires_at > self.clock.now() && lease.holder_id == self.holder_id
     }
 
     /// Builds an unpersisted lease record with current wall-clock timestamps.
@@ -540,7 +561,7 @@ impl LeaseManager {
     /// its UTF-8 bytes. The `expect` is an explicit invariant assertion after a
     /// checked standard-to-Chrono duration conversion.
     fn build_lease(&self, fencing_token: u64) -> Lease {
-        let now = Utc::now();
+        let now = self.clock.now();
         #[allow(clippy::expect_used)]
         let expires_at = now
             + chrono::Duration::from_std(self.lease_duration)
@@ -552,5 +573,70 @@ impl LeaseManager {
             expires_at,
             etag: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::time::TimeSource;
+
+    #[derive(Debug)]
+    struct AdjustableTimeSource {
+        now_ms: AtomicI64,
+    }
+
+    impl AdjustableTimeSource {
+        fn new(now: DateTime<Utc>) -> Self {
+            Self {
+                now_ms: AtomicI64::new(now.timestamp_millis()),
+            }
+        }
+
+        fn jump(&self, delta: chrono::Duration) {
+            self.now_ms
+                .fetch_add(delta.num_milliseconds(), Ordering::SeqCst);
+        }
+    }
+
+    impl TimeSource for AdjustableTimeSource {
+        fn now(&self) -> DateTime<Utc> {
+            DateTime::from_timestamp_millis(self.now_ms.load(Ordering::SeqCst))
+                .expect("adjustable lease-test timestamp must be representable")
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_safety_under_backward_jump() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let source = Arc::new(AdjustableTimeSource::new(Utc::now()));
+        let clock = Clock::from_source(source.clone());
+        let holder_a = LeaseManager::with_clock(
+            store.clone(),
+            "holder-a".to_string(),
+            Duration::from_secs(10),
+            clock.clone(),
+        );
+        let holder_b = LeaseManager::with_clock(
+            store,
+            "holder-b".to_string(),
+            Duration::from_secs(10),
+            clock,
+        );
+
+        let first = holder_a.acquire("clock-lease").await.unwrap();
+        source.jump(chrono::Duration::seconds(-30));
+        let blocked = holder_b.acquire("clock-lease").await.unwrap_err();
+        assert!(matches!(blocked, ZeppelinError::LeaseHeld { .. }));
+
+        source.jump(chrono::Duration::seconds(45));
+        let takeover = holder_b.acquire("clock-lease").await.unwrap();
+        assert_eq!(takeover.fencing_token, first.fencing_token + 1);
     }
 }

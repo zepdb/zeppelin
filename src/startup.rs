@@ -122,6 +122,7 @@ use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::server::build_router;
 use crate::server::AppState;
 use crate::storage::ZeppelinStore;
+use crate::time::Clock;
 use crate::wal::{LeaseManager, WalReader, WalWriter};
 
 /// Maximum duration for each endpoint, LIST, or namespace-scan startup probe.
@@ -358,10 +359,13 @@ pub async fn build_app(
         }
     }
 
+    let clock = Clock::system();
+
     // Initialize namespace manager and scan existing namespaces
-    let namespace_manager = Arc::new(NamespaceManager::new_with_registry_ttl(
+    let namespace_manager = Arc::new(NamespaceManager::with_clock(
         store.clone(),
         Duration::from_millis(config.cache.namespace_registry_ttl_ms),
+        clock.clone(),
     ));
     if storage_available {
         match tokio::time::timeout(
@@ -413,7 +417,7 @@ pub async fn build_app(
     }
 
     // Initialize WAL writer and reader
-    let wal_writer = Arc::new(WalWriter::new(store.clone()));
+    let wal_writer = Arc::new(WalWriter::with_clock(store.clone(), clock.clone()));
     let wal_reader = Arc::new(WalReader::new(store.clone()));
 
     // Initialize disk cache
@@ -439,21 +443,23 @@ pub async fn build_app(
     )));
 
     // Initialize compactor
-    let compactor = Arc::new(Compactor::new(
+    let compactor = Arc::new(Compactor::with_clock(
         store.clone(),
         WalReader::new(store.clone()),
         config.compaction.clone(),
         config.indexing.clone(),
         Duration::from_secs(config.gc.compaction_upload_window_secs),
+        clock.clone(),
     ));
 
     // Per-namespace compaction lease: only one node compacts a namespace at
     // a time. The holder ID is unique per process; the fencing token from the
     // lease is threaded into every compaction commit.
-    let lease_manager = Arc::new(LeaseManager::new(
+    let lease_manager = Arc::new(LeaseManager::with_clock(
         store.clone(),
         format!("zeppelin-{}", uuid::Uuid::new_v4()),
         Duration::from_secs(config.compaction.lease_duration_secs),
+        clock.clone(),
     ));
 
     // Spawn background compaction on a dedicated runtime (CPU isolation from queries)
@@ -501,6 +507,7 @@ pub async fn build_app(
     )?);
     let state = AppState {
         store,
+        clock,
         namespace_manager,
         namespace_name_prefix: None,
         wal_writer,

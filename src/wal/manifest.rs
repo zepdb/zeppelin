@@ -633,6 +633,12 @@ impl Manifest {
     /// Namespace creation starts with this value, writes generation 1, and only
     /// then exposes the namespace to write and query paths.
     pub fn new() -> Self {
+        Self::new_at(Utc::now())
+    }
+
+    /// Creates an unpublished empty manifest stamped at an explicit time.
+    #[must_use]
+    pub fn new_at(now: DateTime<Utc>) -> Self {
         Self {
             fragments: Vec::new(),
             segments: Vec::new(),
@@ -641,7 +647,7 @@ impl Manifest {
             next_sequence: 0,
             pending_deletes: Vec::new(),
             fencing_token: 0,
-            updated_at: Utc::now(),
+            updated_at: now,
             version: 0,
         }
     }
@@ -778,11 +784,16 @@ impl Manifest {
     /// binding unusable after the call unless it explicitly cloned the value.
     /// The method therefore gains unique ownership without allocating another
     /// `FragmentRef`.
-    pub fn add_fragment(&mut self, mut fref: FragmentRef) {
+    pub fn add_fragment(&mut self, fref: FragmentRef) {
+        self.add_fragment_at(fref, Utc::now());
+    }
+
+    /// Appends a fragment descriptor using an explicit manifest stamp.
+    pub fn add_fragment_at(&mut self, mut fref: FragmentRef, now: DateTime<Utc>) {
         fref.sequence_number = self.next_sequence;
         self.next_sequence += 1;
         self.fragments.push(fref);
-        self.updated_at = Utc::now();
+        self.updated_at = now;
     }
 
     /// Remove exactly the fragments that were compacted (by ID).
@@ -826,6 +837,15 @@ impl Manifest {
     /// vector, a separation the borrow checker verifies without a garbage
     /// collector or manual alias analysis.
     pub fn remove_compacted_fragments(&mut self, compacted_ids: &HashSet<Ulid>) {
+        self.remove_compacted_fragments_at(compacted_ids, Utc::now());
+    }
+
+    /// Removes exact compacted fragments using an explicit manifest stamp.
+    pub fn remove_compacted_fragments_at(
+        &mut self,
+        compacted_ids: &HashSet<Ulid>,
+        now: DateTime<Utc>,
+    ) {
         self.fragments.retain(|f| !compacted_ids.contains(&f.id));
         if let Some(max_id) = compacted_ids.iter().max() {
             let watermark = match self.compaction_watermark {
@@ -834,7 +854,7 @@ impl Manifest {
             };
             self.compaction_watermark = Some(watermark);
         }
-        self.updated_at = Utc::now();
+        self.updated_at = now;
     }
 
     /// Add a segment reference and prune old segments using the provided limit.
@@ -865,9 +885,20 @@ impl Manifest {
         max_pending_deletes: usize,
         max_old_segments: usize,
     ) {
+        self.add_segment_with_limits_at(sref, max_pending_deletes, max_old_segments, Utc::now());
+    }
+
+    /// Adds a segment with retention limits and an explicit manifest stamp.
+    pub fn add_segment_with_limits_at(
+        &mut self,
+        sref: SegmentRef,
+        max_pending_deletes: usize,
+        max_old_segments: usize,
+        now: DateTime<Utc>,
+    ) {
         self.active_segment = Some(sref.id.clone());
         self.segments.push(sref);
-        self.updated_at = Utc::now();
+        self.updated_at = now;
         self.prune(max_pending_deletes, max_old_segments);
     }
 
@@ -908,11 +939,16 @@ impl Manifest {
     /// `active_segment` to `None`, so callers cannot accidentally keep routing
     /// through the removed descriptor.
     pub fn remove_segment(&mut self, segment_id: &str) {
+        self.remove_segment_at(segment_id, Utc::now());
+    }
+
+    /// Removes a segment descriptor using an explicit manifest stamp.
+    pub fn remove_segment_at(&mut self, segment_id: &str, now: DateTime<Utc>) {
         if self.active_segment.as_deref() == Some(segment_id) {
             self.active_segment = None;
         }
         self.segments.retain(|segment| segment.id != segment_id);
-        self.updated_at = Utc::now();
+        self.updated_at = now;
     }
 
     /// Prune the manifest to prevent unbounded growth at 1M+ scale.
@@ -1586,6 +1622,16 @@ impl Manifest {
         namespace: &str,
         retention: ManifestHistoryRetention,
     ) -> Result<ManifestHistoryPruneResult> {
+        Self::prune_history_with_retention_at(store, namespace, retention, Utc::now()).await
+    }
+
+    /// Prunes manifest history using one explicit wall-clock timestamp.
+    pub async fn prune_history_with_retention_at(
+        store: &ZeppelinStore,
+        namespace: &str,
+        retention: ManifestHistoryRetention,
+        now: DateTime<Utc>,
+    ) -> Result<ManifestHistoryPruneResult> {
         if retention.keep_count == 0 {
             return Err(ZeppelinError::Config(
                 "gc.manifest_history_keep_count must be greater than zero".to_string(),
@@ -1594,8 +1640,6 @@ impl Manifest {
         let history = Self::list_history(store, namespace).await?;
         let keep_from = history.len().saturating_sub(retention.keep_count);
         let pinned_generations = NamedSnapshot::pinned_generations(store, namespace).await?;
-        let now = Utc::now();
-
         let mut retained_manifests = Vec::new();
         let mut pruned = 0usize;
         for (index, entry) in history.iter().enumerate() {
@@ -1982,6 +2026,17 @@ impl NamedSnapshot {
         name: &str,
         generation: u64,
     ) -> Result<NamedSnapshotRef> {
+        Self::create_at(store, namespace, name, generation, Utc::now()).await
+    }
+
+    /// Creates a named snapshot pin with an explicit creation timestamp.
+    pub async fn create_at(
+        store: &ZeppelinStore,
+        namespace: &str,
+        name: &str,
+        generation: u64,
+        now: DateTime<Utc>,
+    ) -> Result<NamedSnapshotRef> {
         if generation == 0 {
             return Err(ZeppelinError::Validation(
                 "snapshot generation must be a committed nonzero manifest generation".into(),
@@ -1998,7 +2053,7 @@ impl NamedSnapshot {
         }
         let snapshot = Self {
             generation,
-            created_at: Utc::now(),
+            created_at: now,
         };
         match store
             .put_if_not_exists(&key, snapshot.to_bytes()?, namespace)

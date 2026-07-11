@@ -66,7 +66,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{info, instrument};
 
 use crate::config::IndexingConfig;
@@ -74,6 +74,7 @@ use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
 use crate::storage::ZeppelinStore;
+use crate::time::Clock;
 use crate::types::{DistanceMetric, IndexType};
 
 /// Default lifetime of a process-local namespace registry entry.
@@ -416,8 +417,8 @@ impl NamespaceMetadata {
 struct RegistryEntry {
     /// Owned metadata snapshot safe to return after releasing the map guard.
     meta: NamespaceMetadata,
-    /// Local monotonic time when S3 last supplied or confirmed this snapshot.
-    fetched_at: Instant,
+    /// Injected wall time when S3 last supplied or confirmed this snapshot.
+    fetched_at: DateTime<Utc>,
 }
 
 /// Result of an idempotent namespace create request.
@@ -451,6 +452,8 @@ pub struct NamespaceManager {
     registry: DashMap<String, RegistryEntry>,
     /// Maximum age at which a read-only lookup may reuse a registry entry.
     registry_ttl: Duration,
+    /// Explicit wall clock used for metadata stamps and registry expiry.
+    clock: Clock,
 }
 
 impl NamespaceManager {
@@ -470,7 +473,7 @@ impl NamespaceManager {
     /// A newly started node constructs a manager, then startup scans S3 to seed
     /// its disposable registry.
     pub fn new(store: ZeppelinStore) -> Self {
-        Self::new_with_registry_ttl(store, DEFAULT_NAMESPACE_REGISTRY_TTL)
+        Self::with_clock(store, DEFAULT_NAMESPACE_REGISTRY_TTL, Clock::system())
     }
 
     /// Creates a manager with an explicit metadata-cache TTL.
@@ -491,10 +494,17 @@ impl NamespaceManager {
     /// second manager without waiting five seconds.
     #[must_use]
     pub fn new_with_registry_ttl(store: ZeppelinStore, registry_ttl: Duration) -> Self {
+        Self::with_clock(store, registry_ttl, Clock::system())
+    }
+
+    /// Creates a manager with explicit registry lifetime and wall clock.
+    #[must_use]
+    pub fn with_clock(store: ZeppelinStore, registry_ttl: Duration, clock: Clock) -> Self {
         Self {
             store,
             registry: DashMap::new(),
             registry_ttl,
+            clock,
         }
     }
 
@@ -690,7 +700,7 @@ impl NamespaceManager {
         // overwrite each other's configuration.
         let key = NamespaceMetadata::s3_key(name);
 
-        let now = Utc::now();
+        let now = self.clock.now();
         let meta = NamespaceMetadata {
             name: name.to_string(),
             dimensions,
@@ -728,7 +738,7 @@ impl NamespaceManager {
         }
 
         // Also initialize an empty manifest
-        let mut manifest = crate::wal::Manifest::new();
+        let mut manifest = crate::wal::Manifest::new_at(self.clock.now());
         manifest.write(&self.store, name).await?;
 
         // Add to registry
@@ -1053,7 +1063,12 @@ impl NamespaceManager {
     /// map entry and lock guard.
     fn fresh_registry_meta(&self, name: &str) -> Option<NamespaceMetadata> {
         self.registry.get(name).and_then(|entry| {
-            if entry.fetched_at.elapsed() < self.registry_ttl {
+            let age = self.clock.now().signed_duration_since(entry.fetched_at);
+            if age < chrono::Duration::zero()
+                || age
+                    .to_std()
+                    .is_ok_and(|elapsed| elapsed < self.registry_ttl)
+            {
                 Some(entry.meta.clone())
             } else {
                 None
@@ -1079,7 +1094,7 @@ impl NamespaceManager {
             meta.name.clone(),
             RegistryEntry {
                 meta,
-                fetched_at: Instant::now(),
+                fetched_at: self.clock.now(),
             },
         );
     }
@@ -1446,7 +1461,7 @@ impl NamespaceManager {
             index_config.validate(meta.dimensions)?;
 
             meta.index_config = Some(index_config.clone());
-            meta.updated_at = Utc::now();
+            meta.updated_at = self.clock.now();
             let etag = etag.unwrap_or_default();
             match self
                 .store
@@ -1489,8 +1504,9 @@ impl NamespaceManager {
     /// the degraded Prometheus gauge.
     #[instrument(skip(self), fields(namespace = name))]
     pub async fn record_compaction_success(&self, name: &str) -> Result<NamespaceMetadata> {
+        let now = self.clock.now();
         self.update_compaction_health(name, |health| {
-            health.last_compaction_at = Some(Utc::now());
+            health.last_compaction_at = Some(now);
             health.last_compaction_status = CompactionStatus::Success;
             health.last_compaction_error = None;
             health.consecutive_failures = 0;
@@ -1528,8 +1544,9 @@ impl NamespaceManager {
         error: &ZeppelinError,
     ) -> Result<NamespaceMetadata> {
         let message = error.to_string();
+        let now = self.clock.now();
         self.update_compaction_health(name, |health| {
-            health.last_compaction_at = Some(Utc::now());
+            health.last_compaction_at = Some(now);
             health.last_compaction_status = CompactionStatus::Failure;
             health.last_compaction_error = Some(message.clone());
             health.consecutive_failures = health.consecutive_failures.saturating_add(1);
@@ -1587,7 +1604,7 @@ impl NamespaceManager {
             self.ensure_active(meta.clone())?;
 
             update(&mut meta.compaction_health);
-            meta.updated_at = Utc::now();
+            meta.updated_at = self.clock.now();
             let degraded = meta.compaction_health.consecutive_failures
                 >= COMPACTION_DEGRADED_FAILURE_THRESHOLD;
             let etag = etag.unwrap_or_default();
@@ -1642,7 +1659,7 @@ impl NamespaceManager {
             }
 
             meta.state = NamespaceState::Deleting;
-            meta.updated_at = Utc::now();
+            meta.updated_at = self.clock.now();
             let etag = etag.unwrap_or_default();
             match self
                 .store

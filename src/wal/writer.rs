@@ -88,6 +88,7 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
+use crate::time::Clock;
 use crate::types::{VectorEntry, VectorId};
 
 use super::fragment::WalFragment;
@@ -186,6 +187,8 @@ pub struct WalWriter {
     /// Entries are created lazily and removed when namespace deletion has
     /// quiesced local writes.
     groups: DashMap<String, Arc<GroupCommitState>>,
+    /// Explicit wall clock used to stamp manifest mutations.
+    clock: Clock,
 }
 
 impl WalWriter {
@@ -205,9 +208,16 @@ impl WalWriter {
     /// Server startup can create one writer and share it through application
     /// state; the first append to `catalog` creates that namespace's local group.
     pub fn new(store: ZeppelinStore) -> Self {
+        Self::with_clock(store, Clock::system())
+    }
+
+    /// Creates a writer with an explicitly selected wall-clock source.
+    #[must_use]
+    pub fn with_clock(store: ZeppelinStore, clock: Clock) -> Self {
         Self {
             store,
             groups: DashMap::new(),
+            clock,
         }
     }
 
@@ -669,8 +679,9 @@ impl WalWriter {
             }
 
             // Fold every batched fragment ref into this one manifest.
+            let manifest_stamp = self.clock.now();
             for item in &batch {
-                manifest.add_fragment(item.fref.clone());
+                manifest.add_fragment_at(item.fref.clone(), manifest_stamp);
             }
 
             // Layer 2: CAS — catches TOCTOU between fencing check and write.

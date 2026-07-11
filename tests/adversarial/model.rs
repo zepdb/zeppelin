@@ -71,6 +71,7 @@ pub enum OracleMutation {
     IndetResolutionLie,
     DroppedResponseLostWrite,
     CrashLostAck,
+    ClockGcEatsLive,
 }
 
 impl OracleMutation {
@@ -89,6 +90,7 @@ impl OracleMutation {
             "indet-resolution-lie" => Self::IndetResolutionLie,
             "dropped-response-lost-write" => Self::DroppedResponseLostWrite,
             "crash-lost-ack" => Self::CrashLostAck,
+            "clock-gc-eats-live" => Self::ClockGcEatsLive,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -108,6 +110,7 @@ impl OracleMutation {
             Self::IndetResolutionLie => "indet-resolution-lie",
             Self::DroppedResponseLostWrite => "dropped-response-lost-write",
             Self::CrashLostAck => "crash-lost-ack",
+            Self::ClockGcEatsLive => "clock-gc-eats-live",
         }
     }
 }
