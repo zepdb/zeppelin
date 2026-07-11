@@ -3936,6 +3936,19 @@ async fn reachable_keys_for_taint(
     .map_err(|error| error.to_string())
 }
 
+fn unresolved_create_allows_missing_manifest_bookkeeping(model: &Model, op: &Op) -> bool {
+    let Op::InvalidProbe { ns, probe } = op else {
+        return false;
+    };
+    probe.is_write_shaped()
+        && model.namespaces.get(ns).is_some_and(|namespace| {
+            namespace
+                .indeterminate_ns
+                .iter()
+                .any(|effect| matches!(effect, NsIndeterminate::MaybeCreatedNs))
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_recorded_op(
     client: &Client,
@@ -3956,6 +3969,8 @@ async fn execute_recorded_op(
     http_fault_context: Option<&HttpFaultContext>,
     inject_post_commit_ack_loss: bool,
 ) -> StepOutcome {
+    let allow_missing_manifest_bookkeeping =
+        unresolved_create_allows_missing_manifest_bookkeeping(model, op);
     let mut raw = execute_raw_recorded_op(
         client.clone(),
         OpExecutionTarget::from(server),
@@ -3966,6 +3981,7 @@ async fn execute_recorded_op(
         generation_checkpoints_enabled,
         target_node,
         http_fault_context.cloned(),
+        allow_missing_manifest_bookkeeping,
         inject_post_commit_ack_loss,
     )
     .await;
@@ -4006,6 +4022,7 @@ async fn execute_raw_recorded_op(
     generation_checkpoints_enabled: bool,
     target_node: u8,
     http_fault_context: Option<HttpFaultContext>,
+    allow_missing_manifest_bookkeeping: bool,
     inject_post_commit_ack_loss: bool,
 ) -> RawRecordedOp {
     let ambiguity_allowed = mode == RunMode::Chaos;
@@ -4020,7 +4037,14 @@ async fn execute_raw_recorded_op(
         ambiguity_allowed,
         REQUEST_IS_MUTATION.scope(
             op.is_mutating(),
-            execute_op(&client, &request_target, &op, index, started),
+            execute_op(
+                &client,
+                &request_target,
+                &op,
+                index,
+                started,
+                allow_missing_manifest_bookkeeping,
+            ),
         ),
     );
     let request = HTTP_FAULT_CONTEXT.scope(http_fault_context.clone(), request);
@@ -4109,6 +4133,8 @@ async fn execute_hold_candidate(
     model: &mut Model,
 ) -> HoldCandidateOutcome {
     let provisional_op = op.clone();
+    let allow_missing_manifest_bookkeeping =
+        unresolved_create_allows_missing_manifest_bookkeeping(model, &provisional_op);
     let event_id = hold.event_id.clone();
     let namespace = op.namespace().to_string();
     let mut task = tokio::spawn(execute_raw_recorded_op(
@@ -4121,6 +4147,7 @@ async fn execute_hold_candidate(
         generation_checkpoints_enabled,
         target_node,
         http_fault_context,
+        allow_missing_manifest_bookkeeping,
         inject_post_commit_ack_loss,
     ));
     tokio::select! {
@@ -4559,6 +4586,7 @@ async fn execute_op(
     op: &Op,
     index: u64,
     started: Instant,
+    allow_missing_manifest_bookkeeping: bool,
 ) -> OpRecord {
     let before = Instant::now();
     let (method, path, status, response) = match op {
@@ -4745,14 +4773,28 @@ async fn execute_op(
         }
         Op::InvalidProbe { ns, probe } => {
             let status_before = if probe.is_write_shaped() {
-                Some(bookkeeping_compact_status(client, target, ns).await)
+                Some(
+                    bookkeeping_compact_status(
+                        client,
+                        target,
+                        ns,
+                        allow_missing_manifest_bookkeeping,
+                    )
+                    .await,
+                )
             } else {
                 None
             };
             let (method, path, status, mut response) =
                 execute_invalid_probe(client, target, ns, *probe).await;
             if let Some(before) = status_before {
-                let after = bookkeeping_compact_status(client, target, ns).await;
+                let after = bookkeeping_compact_status(
+                    client,
+                    target,
+                    ns,
+                    allow_missing_manifest_bookkeeping,
+                )
+                .await;
                 let response_object = response
                     .as_object_mut()
                     .expect("invalid probe error response is object");
@@ -5589,6 +5631,7 @@ async fn bookkeeping_compact_status(
     client: &Client,
     target: &OpExecutionTarget,
     ns: &str,
+    allow_missing_manifest: bool,
 ) -> serde_json::Value {
     let context = HTTP_FAULT_CONTEXT.try_with(Clone::clone).ok().flatten();
     if let Some(context) = context {
@@ -5604,9 +5647,64 @@ async fn bookkeeping_compact_status(
                 "uncompacted_fragments": null,
             }),
         }
+    } else if allow_missing_manifest {
+        compact_status_for_indeterminate_create(client, &target.base_url, ns).await
     } else {
         compact_status(client, &target.base_url, ns).await
     }
+}
+
+async fn compact_status_for_indeterminate_create(
+    client: &Client,
+    base_url: &str,
+    ns: &str,
+) -> serde_json::Value {
+    let url = format!("{base_url}/v1/namespaces/{ns}/compact/status");
+    let (status, response) = request_json(client, Method::GET, &url, None).await;
+    if status == StatusCode::OK.as_u16() {
+        return response;
+    }
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+        "indeterminate create compact/status returned an unexpected status for {ns}"
+    );
+    assert_eq!(
+        response.get("code").and_then(serde_json::Value::as_str),
+        Some("INTERNAL_DATA_MISSING"),
+        "indeterminate create compact/status returned an unexpected error for {ns}"
+    );
+    assert_eq!(
+        response.get("status").and_then(serde_json::Value::as_u64),
+        Some(u64::from(StatusCode::INTERNAL_SERVER_ERROR.as_u16())),
+        "indeterminate create compact/status returned a mismatched status body for {ns}"
+    );
+    assert_eq!(
+        response
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "indeterminate create compact/status must fail non-retryably for {ns}"
+    );
+    assert!(
+        response
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|error| !error.is_empty()),
+        "indeterminate create compact/status omitted its error message for {ns}"
+    );
+    assert!(
+        response
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|request_id| !request_id.is_empty()),
+        "indeterminate create compact/status omitted its request id for {ns}"
+    );
+    json!({
+        "manifest_present": false,
+        "manifest_generation": null,
+        "uncompacted_fragments": null,
+    })
 }
 
 async fn compact_status(client: &Client, base_url: &str, ns: &str) -> serde_json::Value {
@@ -7633,6 +7731,62 @@ mod outcome_tests {
         );
         assert!(seed_dir.join("timeline.jsonl").exists());
         assert!(!seed_dir.join("faults.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn legacy_chaos_resolves_failed_initial_manifest_before_quiescence() {
+        let root = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 30,
+            seeds: vec![49],
+            max_ops: Some(30),
+            artifacts: root.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Chaos,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let artifacts = RunArtifacts::create(&env);
+        let seed_dir = artifacts.root().join("seed-49");
+        let outcome = run_seed(
+            &env,
+            &artifacts,
+            49,
+            Instant::now() + Duration::from_secs(30),
+            None,
+            None,
+        )
+        .await;
+        assert!(!outcome.failed, "{:?}", outcome.violations);
+
+        let records = read_ops(&seed_dir);
+        let probe = records
+            .iter()
+            .find(|record| record.index == 29)
+            .expect("seed 49 must reach the write-shaped invalid probe");
+        assert!(matches!(
+            probe.op,
+            Op::InvalidProbe {
+                probe: InvalidProbe::WrongDims,
+                ..
+            }
+        ));
+        assert_eq!(probe.status, StatusCode::BAD_REQUEST.as_u16());
+        let missing = json!({
+            "manifest_present": false,
+            "manifest_generation": null,
+            "uncompacted_fragments": null,
+        });
+        assert_eq!(probe.response["compact_status_before"], missing);
+        assert_eq!(probe.response["compact_status_after"], missing);
+
+        let resolutions = fs::read_to_string(seed_dir.join("resolutions.json")).unwrap();
+        let resolutions: Vec<serde_json::Value> = serde_json::from_str(&resolutions).unwrap();
+        assert!(resolutions.iter().any(|resolution| {
+            resolution["effect"] == "maybe_created_namespace"
+                && resolution["resolved"] == "not_applied"
+        }));
     }
 
     #[tokio::test]
