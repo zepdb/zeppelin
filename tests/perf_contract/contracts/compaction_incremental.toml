@@ -28,10 +28,10 @@ fragments = 4
 incremental = true
 
 [baseline]
-git_rev = "ff182073ebe01ece19e771f5e4fc6b7b433153b3"
-captured = "2026-07-10T05:01:45.704263+00:00"
+git_rev = "a8f8bea0e74802fcfaace44a48ce272fad8b9fd8"
+captured = "2026-07-11T03:25:40.350315+00:00"
 approved_by = "anup"
-reason = "Initial Phase 2 freeze after audited MinIO capture: resident-state reads, four WAL reads, bounded rewrites, history, and manifest CAS form exact depth thirteen."
+reason = "ZSK1 v4 two-bit re-baseline at a8f8bea: sketch/bootstrap shrink, SketchRef rotation_seed adds 11 manifest bytes; ops and depth unchanged."
 
 [assert.depth.put_get]
 mode = "exact"
@@ -85,19 +85,19 @@ exact = 362608
 exact = 0
 
 [assert.get_bytes.manifest]
-exact = 8502
+exact = 8535
 
 [assert.get_bytes.other]
 exact = 78497
 
 [assert.get_bytes.sketch]
-exact = 327741
+exact = 294989
 
 [assert.get_bytes.sq]
 exact = 0
 
 [assert.get_bytes.total]
-exact = 784005
+exact = 751286
 
 [assert.get_bytes.wal]
 exact = 1512
@@ -109,7 +109,7 @@ exact = 2561
 exact = 0
 
 [assert.put_bytes.bootstrap]
-exact = 330365
+exact = 297613
 
 [assert.put_bytes.centroids]
 exact = 2584
@@ -121,19 +121,19 @@ exact = 181308
 exact = 0
 
 [assert.put_bytes.manifest]
-exact = 5074
+exact = 5096
 
 [assert.put_bytes.other]
-exact = 82918
+exact = 82940
 
 [assert.put_bytes.sketch]
-exact = 327741
+exact = 294989
 
 [assert.put_bytes.sq]
 exact = 0
 
 [assert.put_bytes.total]
-exact = 932551
+exact = 867091
 
 [assert.put_bytes.wal]
 exact = 0

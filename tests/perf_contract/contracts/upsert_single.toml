@@ -23,10 +23,10 @@ op = "upsert"
 batch = 1
 
 [baseline]
-git_rev = "75271612523250f04cdb466a683137fcbc709ba7"
-captured = "2026-07-10T01:40:20.713597+00:00"
+git_rev = "04a538b85b8b452518cbb631e3f1fdbeb304a11d"
+captured = "2026-07-11T03:32:18.268416+00:00"
 approved_by = "anup"
-reason = "initial freeze"
+reason = "ZSK1 v4 manifest re-baseline after 04a538b: SketchRef rotation_seed shifts compacted setup manifest and history bands by 7 bytes per serialization; ops and depth unchanged."
 
 [assert.depth.put_get]
 mode = "exact"
@@ -80,8 +80,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.manifest]
-min = 977
-max = 1215
+min = 984
+max = 1222
 why = "manifest GET bytes grow across the eight measured repeats"
 
 [assert.get_bytes.other]
@@ -94,8 +94,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-min = 977
-max = 1215
+min = 984
+max = 1222
 why = "manifest GET bytes grow across the eight measured repeats"
 
 [assert.get_bytes.wal]
@@ -120,13 +120,13 @@ exact = 0
 exact = 0
 
 [assert.put_bytes.manifest]
-min = 1011
-max = 1249
+min = 1018
+max = 1256
 why = "manifest CAS bytes grow across the eight measured repeats"
 
 [assert.put_bytes.other]
-min = 1011
-max = 1249
+min = 1018
+max = 1256
 why = "history PUT bytes grow across the eight measured repeats"
 
 [assert.put_bytes.sketch]
@@ -136,8 +136,8 @@ exact = 0
 exact = 0
 
 [assert.put_bytes.total]
-min = 2408
-max = 2884
+min = 2422
+max = 2898
 why = "manifest and history bytes grow while WAL bytes remain fixed"
 
 [assert.put_bytes.wal]

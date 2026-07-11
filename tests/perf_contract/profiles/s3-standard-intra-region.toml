@@ -1,6 +1,9 @@
 # AWS S3 Standard us-east-1 pricing anchor: GET $0.40/1M, PUT $5.00/1M,
 # intra-region reads have no egress charge. m6i.xlarge is about $0.192/hour.
 # S3-client internal retries are not modeled and may add a few percent cost.
+# Phase-4 on-storage cluster-quantization projection. Production today (Phase 2)
+# quantizes only the resident sketch; 1-bit has no production path. RaBitQ row
+# bytes include two f32 factors and dimensions padded to 256-d blocks.
 name = "s3-standard-intra-region"
 
 [storage]
@@ -27,11 +30,12 @@ closed_loop_clients = 8
 vectors = 32768
 dims = 128
 nlist = 32
-nprobe = [4, 8, 16]
+# 32 is the scale-aware production default; smaller values stay as diagnostics.
+nprobe = [4, 8, 16, 32]
 quantization = ["sq8", "rabitq-1bit", "rabitq-2bit"]
 expected_quantization = ["rabitq-1bit", "rabitq-2bit"]
 
 [whatif.row_bytes]
 sq8 = 128
-rabitq-1bit = 16
-rabitq-2bit = 32
+rabitq-1bit = 40
+rabitq-2bit = 72

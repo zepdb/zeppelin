@@ -42,7 +42,7 @@ pub const PHASE2_SCENARIOS: [&str; 14] = [
 ];
 
 /// Complete Tier-1 catalog run by default and in gating CI.
-pub const ALL_SCENARIOS: [&str; 17] = [
+pub const ALL_SCENARIOS: [&str; 18] = [
     "warm_query_strong",
     "cold_query_strong",
     "upsert_single",
@@ -60,6 +60,7 @@ pub const ALL_SCENARIOS: [&str; 17] = [
     "compaction_incremental",
     "gc_cycle",
     "hydration",
+    "cold_query_sketch_adc",
 ];
 
 /// Process-level runner configuration parsed from `ZEPPELIN_PERF_*`.
@@ -196,7 +197,10 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), ALL_SCENARIOS.len());
         assert_eq!(&ALL_SCENARIOS[..PHASE1_SCENARIOS.len()], &PHASE1_SCENARIOS);
-        assert_eq!(&ALL_SCENARIOS[PHASE1_SCENARIOS.len()..], &PHASE2_SCENARIOS);
+        let phase2_start = PHASE1_SCENARIOS.len();
+        let phase2_end = phase2_start + PHASE2_SCENARIOS.len();
+        assert_eq!(&ALL_SCENARIOS[phase2_start..phase2_end], &PHASE2_SCENARIOS);
+        assert_eq!(&ALL_SCENARIOS[phase2_end..], &["cold_query_sketch_adc"]);
     }
 
     #[test]

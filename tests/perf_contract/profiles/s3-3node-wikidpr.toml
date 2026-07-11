@@ -1,7 +1,7 @@
 # AWS S3 Standard us-east-1 pricing and three m6i.xlarge-equivalent nodes.
-# The RaBitQ row sizes are EXPECTED pending the July10Quant campaign:
-# sq8=dims, 1-bit=dims/8, 2-bit=dims/4. That plan targets roughly 10x fewer
-# bytes/query for wiki_dpr_e5 and requires later measured re-validation.
+# Phase-4 on-storage cluster-quantization projection. Production today (Phase 2)
+# quantizes only the resident sketch; 1-bit has no production path. RaBitQ row
+# bytes include two f32 factors and dimensions padded to 256-d blocks.
 name = "s3-3node-wikidpr"
 
 [storage]
@@ -28,11 +28,12 @@ closed_loop_clients = 8
 vectors = 21000000
 dims = 768
 nlist = 4096
-nprobe = [8, 16, 32]
+# 256 is the scale-aware production default; smaller values stay as diagnostics.
+nprobe = [8, 16, 32, 256]
 quantization = ["sq8", "rabitq-1bit", "rabitq-2bit"]
 expected_quantization = ["rabitq-1bit", "rabitq-2bit"]
 
 [whatif.row_bytes]
 sq8 = 768
-rabitq-1bit = 96
-rabitq-2bit = 192
+rabitq-1bit = 104
+rabitq-2bit = 200
