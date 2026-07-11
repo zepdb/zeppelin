@@ -20,6 +20,7 @@ use zeppelin::storage::ZeppelinStore;
 pub enum StoreOp {
     Put,
     Get,
+    Head,
     Delete,
     List,
     Copy,
@@ -32,6 +33,7 @@ pub enum FaultMode {
     FailFirstK { k: u32 },
     Latency { ms: u64 },
     SilentDrop,
+    PostCommitError { n: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +100,14 @@ enum FaultAction {
     Fail,
     Latency(u64),
     SilentDrop,
+    PostCommit(PostCommitAction),
+}
+
+#[derive(Debug, Clone)]
+struct PostCommitAction {
+    site_id: String,
+    call: u64,
+    mode: FaultMode,
 }
 
 impl FaultPlan {
@@ -108,13 +118,21 @@ impl FaultPlan {
             .into_iter()
             .map(|(id, op, key_substring)| {
                 let enabled = rng.gen_bool(0.25);
-                let mode = match rng.gen_range(0..3) {
+                let mode = match rng.gen_range(0..4) {
                     0 => FaultMode::FailNthMatch {
                         n: rng.gen_range(1..=3),
                     },
                     1 => FaultMode::FailFirstK {
                         k: rng.gen_range(1..=2),
                     },
+                    2 => FaultMode::Latency {
+                        ms: rng.gen_range(10..=75),
+                    },
+                    _ if matches!(op, StoreOp::Put | StoreOp::Delete | StoreOp::Copy) => {
+                        FaultMode::PostCommitError {
+                            n: rng.gen_range(1..=2),
+                        }
+                    }
                     _ => FaultMode::Latency {
                         ms: rng.gen_range(10..=75),
                     },
@@ -139,6 +157,19 @@ impl FaultPlan {
                 op: StoreOp::Put,
                 key_substring: ".wal".to_string(),
                 mode: FaultMode::SilentDrop,
+                enabled: true,
+            }],
+        }
+    }
+
+    #[must_use]
+    pub fn post_commit_selftest(manifest_call: u32) -> Self {
+        Self {
+            sites: vec![FaultSite {
+                id: "post-commit-lost-write".to_string(),
+                op: StoreOp::Put,
+                key_substring: "manifest.json".to_string(),
+                mode: FaultMode::PostCommitError { n: manifest_call },
                 enabled: true,
             }],
         }
@@ -232,9 +263,29 @@ impl ChaosStore {
                         None
                     }
                 }
+                FaultMode::PostCommitError { n } => {
+                    if !matches!(op, StoreOp::Put | StoreOp::Delete | StoreOp::Copy) {
+                        None
+                    } else if call == u64::from(n)
+                        && runtime
+                            .fired
+                            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        Some(FaultAction::PostCommit(PostCommitAction {
+                            site_id: site.id.clone(),
+                            call,
+                            mode: site.mode.clone(),
+                        }))
+                    } else {
+                        None
+                    }
+                }
             };
             if let Some(action) = action {
-                self.record(site, key, call);
+                if !matches!(action, FaultAction::PostCommit(_)) {
+                    self.record(site, key, call);
+                }
                 return Some(action);
             }
         }
@@ -242,15 +293,23 @@ impl ChaosStore {
     }
 
     fn record(&self, site: &FaultSite, key: &str, call: u64) {
+        self.record_parts(&site.id, &site.mode, key, call);
+    }
+
+    fn record_post_commit(&self, action: &PostCommitAction, key: &str) {
+        self.record_parts(&action.site_id, &action.mode, key, action.call);
+    }
+
+    fn record_parts(&self, site_id: &str, mode: &FaultMode, key: &str, call: u64) {
         self.fired
             .lock()
             .expect("chaos fired-fault mutex poisoned")
             .push(FiredFault {
-                site_id: site.id.clone(),
+                site_id: site_id.to_string(),
                 key: key.to_string(),
                 call_ordinal: call,
                 wall_ms: self.started.elapsed().as_millis() as u64,
-                mode: site.mode.clone(),
+                mode: mode.clone(),
             });
     }
 }
@@ -275,6 +334,9 @@ async fn apply_action(action: FaultAction, key: &str) -> OsResult<Option<PutResu
             e_tag: Some("chaos-silent-drop".to_string()),
             version: None,
         })),
+        FaultAction::PostCommit(_) => {
+            panic!("post-commit actions must be applied after the inner mutation")
+        }
     }
 }
 
@@ -294,6 +356,16 @@ impl ObjectStore for ChaosStore {
     ) -> OsResult<PutResult> {
         let key = location.to_string();
         if let Some(action) = self.action(StoreOp::Put, &key) {
+            if let FaultAction::PostCommit(post_commit) = action {
+                let result = self.inner.put_opts(location, payload, opts).await;
+                return match result {
+                    Ok(_) => {
+                        self.record_post_commit(&post_commit, &key);
+                        Err(injected_error(&key))
+                    }
+                    Err(error) => Err(error),
+                };
+            }
             if let Some(result) = apply_action(action, &key).await? {
                 return Ok(result);
             }
@@ -318,12 +390,28 @@ impl ObjectStore for ChaosStore {
     }
 
     async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        let key = location.to_string();
+        if let Some(action) = self.action(StoreOp::Head, &key) {
+            if !matches!(action, FaultAction::SilentDrop | FaultAction::PostCommit(_)) {
+                let _ = apply_action(action, &key).await?;
+            }
+        }
         self.inner.head(location).await
     }
 
     async fn delete(&self, location: &Path) -> OsResult<()> {
         let key = location.to_string();
         if let Some(action) = self.action(StoreOp::Delete, &key) {
+            if let FaultAction::PostCommit(post_commit) = action {
+                let result = self.inner.delete(location).await;
+                return match result {
+                    Ok(()) => {
+                        self.record_post_commit(&post_commit, &key);
+                        Err(injected_error(&key))
+                    }
+                    Err(error) => Err(error),
+                };
+            }
             let _ = apply_action(action, &key).await?;
         }
         self.inner.delete(location).await
@@ -345,6 +433,7 @@ impl ObjectStore for ChaosStore {
                     .boxed();
                 }
                 FaultAction::SilentDrop => {}
+                FaultAction::PostCommit(_) => {}
             }
         }
         self.inner.list(prefix)
@@ -361,6 +450,16 @@ impl ObjectStore for ChaosStore {
     async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
         let key = format!("{from}->{to}");
         if let Some(action) = self.action(StoreOp::Copy, &key) {
+            if let FaultAction::PostCommit(post_commit) = action {
+                let result = self.inner.copy(from, to).await;
+                return match result {
+                    Ok(()) => {
+                        self.record_post_commit(&post_commit, &key);
+                        Err(injected_error(&key))
+                    }
+                    Err(error) => Err(error),
+                };
+            }
             let _ = apply_action(action, &key).await?;
         }
         self.inner.copy(from, to).await
@@ -369,6 +468,16 @@ impl ObjectStore for ChaosStore {
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
         let key = format!("{from}->{to}");
         if let Some(action) = self.action(StoreOp::Copy, &key) {
+            if let FaultAction::PostCommit(post_commit) = action {
+                let result = self.inner.copy_if_not_exists(from, to).await;
+                return match result {
+                    Ok(()) => {
+                        self.record_post_commit(&post_commit, &key);
+                        Err(injected_error(&key))
+                    }
+                    Err(error) => Err(error),
+                };
+            }
             let _ = apply_action(action, &key).await?;
         }
         self.inner.copy_if_not_exists(from, to).await
@@ -377,6 +486,9 @@ impl ObjectStore for ChaosStore {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use object_store::memory::InMemory;
+
     use super::*;
 
     #[test]
@@ -384,5 +496,39 @@ mod tests {
         let catalog = fault_catalog();
         assert!(catalog.contains(&("get-bootstrap", StoreOp::Get, "bootstrap.bin")));
         assert!(catalog.contains(&("get-sketch", StoreOp::Get, "coarse_sketch.bin")));
+    }
+
+    #[tokio::test]
+    async fn post_commit_error_persists_put_and_fires_once() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let plan = FaultPlan {
+            sites: vec![FaultSite {
+                id: "post-commit-put".to_string(),
+                op: StoreOp::Put,
+                key_substring: ".wal".to_string(),
+                mode: FaultMode::PostCommitError { n: 1 },
+                enabled: true,
+            }],
+        };
+        let (faulted, handle) = chaos_store(&inner, plan);
+
+        let first = faulted
+            .put("ns/first.wal", Bytes::from_static(b"durable"))
+            .await;
+        assert!(
+            first.is_err(),
+            "caller must lose the successful acknowledgement"
+        );
+        assert_eq!(
+            inner.get("ns/first.wal").await.unwrap(),
+            Bytes::from_static(b"durable"),
+            "post-commit failure must happen after the inner write"
+        );
+
+        faulted
+            .put("ns/second.wal", Bytes::from_static(b"acked"))
+            .await
+            .expect("latched fault must not fire twice");
+        assert_eq!(handle.fired().len(), 1);
     }
 }

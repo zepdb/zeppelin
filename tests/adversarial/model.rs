@@ -3,7 +3,56 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use zeppelin::types::{AttributeValue, DistanceMetric};
 
-use super::ops::{GenVector, GeneratedQuery, MaintenanceKind, NamespaceSpec, Op};
+use super::ops::{AsOfTarget, GenVector, GeneratedQuery, MaintenanceKind, NamespaceSpec, Op};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AmbiguityReason {
+    HttpTimeout,
+    ConnectionError,
+    JsonParse,
+    ServerError { status: u16 },
+}
+
+impl AmbiguityReason {
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::HttpTimeout => "http_timeout".to_string(),
+            Self::ConnectionError => "connection_error".to_string(),
+            Self::JsonParse => "json_parse".to_string(),
+            Self::ServerError { status } => format!("server_error_{status}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpOutcome {
+    Applied {
+        status: u16,
+        response: serde_json::Value,
+    },
+    NotApplied {
+        status: u16,
+        response: serde_json::Value,
+    },
+    Ambiguous {
+        reason: AmbiguityReason,
+        status: Option<u16>,
+    },
+}
+
+impl OpOutcome {
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Applied { .. } => "applied".to_string(),
+            Self::NotApplied { .. } => "not_applied".to_string(),
+            Self::Ambiguous { reason, .. } => format!("ambiguous:{}", reason.label()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -16,6 +65,8 @@ pub enum OracleMutation {
     GcEatsLiveKey,
     StaleCheckpoint,
     ChaosLostWrite,
+    PostCommitLostWrite,
+    IndetResolutionLie,
 }
 
 impl OracleMutation {
@@ -30,6 +81,8 @@ impl OracleMutation {
             "gc-eats-live-key" => Self::GcEatsLiveKey,
             "stale-checkpoint" => Self::StaleCheckpoint,
             "chaos-lost-write" => Self::ChaosLostWrite,
+            "post-commit-lost-write" => Self::PostCommitLostWrite,
+            "indet-resolution-lie" => Self::IndetResolutionLie,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -45,6 +98,8 @@ impl OracleMutation {
             Self::GcEatsLiveKey => "gc-eats-live-key",
             Self::StaleCheckpoint => "stale-checkpoint",
             Self::ChaosLostWrite => "chaos-lost-write",
+            Self::PostCommitLostWrite => "post-commit-lost-write",
+            Self::IndetResolutionLie => "indet-resolution-lie",
         }
     }
 }
@@ -54,7 +109,7 @@ pub struct Model {
     pub namespaces: BTreeMap<String, NsModel>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelRecord {
     pub values: Vec<f32>,
     pub attributes: Option<HashMap<String, AttributeValue>>,
@@ -72,6 +127,7 @@ pub struct NsModel {
     pub retained_generations: BTreeSet<u64>,
     pub live_generation: u64,
     pub indeterminate: BTreeMap<String, IndeterminateWrite>,
+    pub indeterminate_ns: Vec<NsIndeterminate>,
     pub canonical_queries: Vec<GeneratedQuery>,
     pub deleted_ever: BTreeSet<String>,
 }
@@ -84,7 +140,26 @@ pub enum NsOracleClass {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndeterminateWrite {
+    pub op_index: u64,
     pub reason: String,
+    pub effect: IndetEffect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IndetEffect {
+    MaybeUpserted(ModelRecord),
+    MaybeDeleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::enum_variant_names)]
+pub enum NsIndeterminate {
+    MaybeCreatedNs,
+    MaybeSnapshot { name: String },
+    MaybeSnapshotDeleted { name: String },
+    MaybeCloned { target: String, as_of: AsOfTarget },
+    MaybeDeletedNs,
+    MaybeCompacted,
 }
 
 impl Model {
@@ -111,12 +186,18 @@ impl Model {
                 self.namespaces
                     .entry(ns.clone())
                     .or_insert_with(|| NsModel::new(spec.clone(), generation));
+                if let Some(model) = self.namespaces.get_mut(ns) {
+                    model
+                        .indeterminate_ns
+                        .retain(|entry| !matches!(entry, NsIndeterminate::MaybeCreatedNs));
+                }
             }
             Op::Upsert { ns, vectors } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     panic!("upsert acked for unknown namespace {ns}");
                 };
                 for vector in vectors {
+                    model.indeterminate.remove(&vector.id);
                     model
                         .live
                         .insert(vector.id.clone(), ModelRecord::from(vector));
@@ -136,6 +217,7 @@ impl Model {
                 };
                 if mutation != Some(OracleMutation::DropDelete) {
                     for (idx, id) in ids.iter().enumerate() {
+                        model.indeterminate.remove(id);
                         model.live.remove(id);
                         if mutation != Some(OracleMutation::LeakTombstone) || idx > 0 {
                             model.wal_tombstones.insert(id.clone());
@@ -154,6 +236,9 @@ impl Model {
                 };
                 model.compacted_live = model.live.clone();
                 model.wal_tombstones.clear();
+                model
+                    .indeterminate_ns
+                    .retain(|entry| !matches!(entry, NsIndeterminate::MaybeCompacted));
                 model.checkpoint(gen_after);
                 if mutation == Some(OracleMutation::StaleCheckpoint) {
                     model.corrupt_latest_checkpoint();
@@ -169,6 +254,9 @@ impl Model {
                 };
                 model.compacted_live = model.live.clone();
                 model.wal_tombstones.clear();
+                model
+                    .indeterminate_ns
+                    .retain(|entry| !matches!(entry, NsIndeterminate::MaybeCompacted));
                 model.checkpoint(gen_after);
                 if mutation == Some(OracleMutation::StaleCheckpoint) {
                     model.corrupt_latest_checkpoint();
@@ -194,10 +282,16 @@ impl Model {
                         panic!("snapshot ack missing generation for namespace {ns}")
                     });
                 model.snapshots.insert(name.clone(), generation);
+                model.indeterminate_ns.retain(|entry| {
+                    !matches!(entry, NsIndeterminate::MaybeSnapshot { name: pending } if pending == name)
+                });
             }
             Op::DeleteSnapshot { ns, name } => {
                 if let Some(model) = self.namespaces.get_mut(ns) {
                     model.snapshots.remove(name);
+                    model.indeterminate_ns.retain(|entry| {
+                        !matches!(entry, NsIndeterminate::MaybeSnapshotDeleted { name: pending } if pending == name)
+                    });
                 }
             }
             Op::GcCycle { ns, .. } => {
@@ -233,6 +327,11 @@ impl Model {
                 target_model.checkpoints.insert(1, live);
                 target_model.live_generation = 1;
                 self.namespaces.insert(target.clone(), target_model);
+                if let Some(source_model) = self.namespaces.get_mut(source) {
+                    source_model.indeterminate_ns.retain(|entry| {
+                        !matches!(entry, NsIndeterminate::MaybeCloned { target: pending, .. } if pending == target)
+                    });
+                }
             }
             Op::DeleteNamespace { ns } => {
                 self.namespaces.remove(ns);
@@ -247,6 +346,187 @@ impl Model {
             | Op::ListSnapshots { .. }
             | Op::PatchIndexConfig { .. }
             | Op::Hydrate { .. } => {}
+        }
+    }
+
+    pub fn apply_outcome(
+        &mut self,
+        op: &Op,
+        outcome: &OpOutcome,
+        gen_after: Option<u64>,
+        mutation: Option<OracleMutation>,
+        op_index: u64,
+    ) {
+        match outcome {
+            OpOutcome::Applied { status, response } => {
+                self.apply(op, *status, gen_after, response, mutation);
+            }
+            OpOutcome::NotApplied { .. } => {}
+            OpOutcome::Ambiguous { reason, .. } => {
+                if mutation != Some(OracleMutation::PostCommitLostWrite) {
+                    self.record_indeterminate(op, op_index, reason);
+                    if mutation == Some(OracleMutation::IndetResolutionLie) {
+                        self.corrupt_indeterminate_candidate(op);
+                    }
+                }
+            }
+        }
+    }
+
+    fn corrupt_indeterminate_candidate(&mut self, op: &Op) {
+        let Op::Upsert { ns, vectors } = op else {
+            return;
+        };
+        let Some(model) = self.namespaces.get_mut(ns) else {
+            return;
+        };
+        for vector in vectors {
+            let Some(IndeterminateWrite {
+                effect: IndetEffect::MaybeUpserted(candidate),
+                ..
+            }) = model.indeterminate.get_mut(&vector.id)
+            else {
+                continue;
+            };
+            if let Some(value) = candidate.values.first_mut() {
+                *value += 10_000.0;
+            }
+        }
+    }
+
+    fn record_indeterminate(&mut self, op: &Op, op_index: u64, reason: &AmbiguityReason) {
+        let reason = reason.label();
+        match op {
+            Op::CreateNamespace { ns, spec } => {
+                let model = self
+                    .namespaces
+                    .entry(ns.clone())
+                    .or_insert_with(|| NsModel::new(spec.clone(), 0));
+                model.indeterminate_ns.push(NsIndeterminate::MaybeCreatedNs);
+            }
+            Op::Upsert { ns, vectors } => {
+                let Some(model) = self.namespaces.get_mut(ns) else {
+                    return;
+                };
+                for vector in vectors {
+                    model.indeterminate.insert(
+                        vector.id.clone(),
+                        IndeterminateWrite {
+                            op_index,
+                            reason: reason.clone(),
+                            effect: IndetEffect::MaybeUpserted(ModelRecord::from(vector)),
+                        },
+                    );
+                }
+            }
+            Op::DeleteVectors { ns, ids } => {
+                let Some(model) = self.namespaces.get_mut(ns) else {
+                    return;
+                };
+                for id in ids {
+                    model.indeterminate.insert(
+                        id.clone(),
+                        IndeterminateWrite {
+                            op_index,
+                            reason: reason.clone(),
+                            effect: IndetEffect::MaybeDeleted,
+                        },
+                    );
+                }
+            }
+            Op::CreateSnapshot { ns, name } => {
+                if let Some(model) = self.namespaces.get_mut(ns) {
+                    model
+                        .indeterminate_ns
+                        .push(NsIndeterminate::MaybeSnapshot { name: name.clone() });
+                }
+            }
+            Op::DeleteSnapshot { ns, name } => {
+                if let Some(model) = self.namespaces.get_mut(ns) {
+                    model
+                        .indeterminate_ns
+                        .push(NsIndeterminate::MaybeSnapshotDeleted { name: name.clone() });
+                }
+            }
+            Op::CloneNamespace {
+                source,
+                target,
+                as_of,
+            } => {
+                if let Some(model) = self.namespaces.get_mut(source) {
+                    model.indeterminate_ns.push(NsIndeterminate::MaybeCloned {
+                        target: target.clone(),
+                        as_of: as_of.clone(),
+                    });
+                }
+            }
+            Op::DeleteNamespace { ns } => {
+                if let Some(model) = self.namespaces.get_mut(ns) {
+                    model.indeterminate_ns.push(NsIndeterminate::MaybeDeletedNs);
+                }
+            }
+            Op::CompactInline { ns }
+            | Op::CompactEndpoint { ns }
+            | Op::GcCycle { ns, .. }
+            | Op::ProbeSandwich { ns, .. } => {
+                if let Some(model) = self.namespaces.get_mut(ns) {
+                    model.indeterminate_ns.push(NsIndeterminate::MaybeCompacted);
+                }
+            }
+            Op::GetNamespace { .. }
+            | Op::FetchVectors { .. }
+            | Op::Query { .. }
+            | Op::BatchQuery { .. }
+            | Op::PaginateAll { .. }
+            | Op::InvalidProbe { .. }
+            | Op::GetSnapshot { .. }
+            | Op::ListSnapshots { .. }
+            | Op::PatchIndexConfig { .. }
+            | Op::Hydrate { .. } => {}
+        }
+    }
+
+    pub fn resolve_indeterminate_record(
+        &mut self,
+        ns: &str,
+        id: &str,
+        observed: Option<ModelRecord>,
+    ) -> Result<(), String> {
+        let Some(model) = self.namespaces.get_mut(ns) else {
+            return Err(format!("indeterminate namespace disappeared: {ns}"));
+        };
+        let Some(pending) = model.indeterminate.remove(id) else {
+            return Ok(());
+        };
+        let old = model.live.get(id).cloned();
+        match pending.effect {
+            IndetEffect::MaybeUpserted(candidate) => {
+                if observed.as_ref() == Some(&candidate) {
+                    model.live.insert(id.to_string(), candidate);
+                    model.deleted_ever.remove(id);
+                    Ok(())
+                } else if observed == old {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "observed state matched neither old nor new for {ns}/{id}"
+                    ))
+                }
+            }
+            IndetEffect::MaybeDeleted => {
+                if observed.is_none() {
+                    model.live.remove(id);
+                    model.wal_tombstones.insert(id.to_string());
+                    model.deleted_ever.insert(id.to_string());
+                    Ok(())
+                } else if observed == old {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "observed state matched neither old nor deleted for {ns}/{id}"
+                    ))
+                }
+            }
         }
     }
 }
@@ -272,6 +552,7 @@ impl NsModel {
             retained_generations: BTreeSet::new(),
             live_generation: generation,
             indeterminate: BTreeMap::new(),
+            indeterminate_ns: Vec::new(),
             canonical_queries: Vec::new(),
             deleted_ever: BTreeSet::new(),
         }
@@ -379,7 +660,192 @@ mod tests {
     use crate::adversarial::oracle::{score_close, SCORE_ABS_EPS, SCORE_REL_EPS};
     use crate::common::server::{cleanup_ns, start_test_server_with_compactor};
 
-    use super::model_distance;
+    use crate::adversarial::ops::{GenVector, NamespaceSpec, Op};
+
+    use super::{model_distance, AmbiguityReason, Model, ModelRecord, NsModel, OpOutcome};
+
+    #[test]
+    fn ambiguous_delete_defers_tombstone_until_resolution() {
+        let ns = "model-indeterminate".to_string();
+        let mut model = Model::default();
+        let mut ns_model = NsModel::new(
+            NamespaceSpec {
+                dims: 2,
+                metric: DistanceMetric::Cosine,
+                quantization: QuantizationType::None,
+                num_centroids: 1,
+                fts_fields: Vec::new(),
+                bitmap: false,
+            },
+            1,
+        );
+        ns_model.live.insert(
+            "id-1".to_string(),
+            ModelRecord {
+                values: vec![1.0, 0.0],
+                attributes: None,
+            },
+        );
+        model.namespaces.insert(ns.clone(), ns_model);
+
+        model.apply_outcome(
+            &Op::DeleteVectors {
+                ns: ns.clone(),
+                ids: vec!["id-1".to_string()],
+            },
+            &OpOutcome::Ambiguous {
+                reason: AmbiguityReason::ServerError { status: 500 },
+                status: Some(500),
+            },
+            None,
+            None,
+            7,
+        );
+
+        let ns_model = &model.namespaces[&ns];
+        assert!(ns_model.live.contains_key("id-1"));
+        assert!(ns_model.indeterminate.contains_key("id-1"));
+        assert!(!ns_model.deleted_ever.contains("id-1"));
+
+        model
+            .resolve_indeterminate_record(&ns, "id-1", None)
+            .expect("absence must resolve an ambiguous delete as applied");
+        let ns_model = &model.namespaces[&ns];
+        assert!(!ns_model.live.contains_key("id-1"));
+        assert!(ns_model.deleted_ever.contains("id-1"));
+    }
+
+    #[test]
+    fn ambiguous_upsert_promotes_observed_candidate() {
+        let (mut model, ns) = model_with_old_record();
+        let candidate = GenVector {
+            id: "id-1".to_string(),
+            values: vec![0.0, 1.0],
+            attributes: None,
+        };
+        model.apply_outcome(
+            &Op::Upsert {
+                ns: ns.clone(),
+                vectors: vec![candidate.clone()],
+            },
+            &ambiguous_500(),
+            None,
+            None,
+            9,
+        );
+
+        model
+            .resolve_indeterminate_record(&ns, "id-1", Some(ModelRecord::from(&candidate)))
+            .unwrap();
+        assert_eq!(model.namespaces[&ns].live["id-1"].values, vec![0.0, 1.0]);
+        assert!(model.namespaces[&ns].indeterminate.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_upsert_reverts_when_old_value_is_observed() {
+        let (mut model, ns) = model_with_old_record();
+        let candidate = GenVector {
+            id: "id-1".to_string(),
+            values: vec![0.0, 1.0],
+            attributes: None,
+        };
+        model.apply_outcome(
+            &Op::Upsert {
+                ns: ns.clone(),
+                vectors: vec![candidate],
+            },
+            &ambiguous_500(),
+            None,
+            None,
+            10,
+        );
+
+        model
+            .resolve_indeterminate_record(
+                &ns,
+                "id-1",
+                Some(ModelRecord {
+                    values: vec![1.0, 0.0],
+                    attributes: None,
+                }),
+            )
+            .unwrap();
+        assert_eq!(model.namespaces[&ns].live["id-1"].values, vec![1.0, 0.0]);
+        assert!(model.namespaces[&ns].indeterminate.is_empty());
+    }
+
+    #[test]
+    fn later_definite_upsert_implicitly_resolves_ambiguity() {
+        let (mut model, ns) = model_with_old_record();
+        let ambiguous = GenVector {
+            id: "id-1".to_string(),
+            values: vec![0.0, 1.0],
+            attributes: None,
+        };
+        let definite = GenVector {
+            id: "id-1".to_string(),
+            values: vec![-1.0, 0.0],
+            attributes: None,
+        };
+        model.apply_outcome(
+            &Op::Upsert {
+                ns: ns.clone(),
+                vectors: vec![ambiguous],
+            },
+            &ambiguous_500(),
+            None,
+            None,
+            11,
+        );
+        model.apply_outcome(
+            &Op::Upsert {
+                ns: ns.clone(),
+                vectors: vec![definite.clone()],
+            },
+            &OpOutcome::Applied {
+                status: 200,
+                response: serde_json::json!({ "upserted": 1 }),
+            },
+            Some(3),
+            None,
+            12,
+        );
+
+        assert_eq!(model.namespaces[&ns].live["id-1"].values, definite.values);
+        assert!(model.namespaces[&ns].indeterminate.is_empty());
+    }
+
+    fn model_with_old_record() -> (Model, String) {
+        let ns = "model-indeterminate-upsert".to_string();
+        let mut model = Model::default();
+        let mut ns_model = NsModel::new(
+            NamespaceSpec {
+                dims: 2,
+                metric: DistanceMetric::Cosine,
+                quantization: QuantizationType::None,
+                num_centroids: 1,
+                fts_fields: Vec::new(),
+                bitmap: false,
+            },
+            1,
+        );
+        ns_model.live.insert(
+            "id-1".to_string(),
+            ModelRecord {
+                values: vec![1.0, 0.0],
+                attributes: None,
+            },
+        );
+        model.namespaces.insert(ns.clone(), ns_model);
+        (model, ns)
+    }
+
+    fn ambiguous_500() -> OpOutcome {
+        OpOutcome::Ambiguous {
+            reason: AmbiguityReason::ServerError { status: 500 },
+            status: Some(500),
+        }
+    }
 
     #[tokio::test]
     #[ignore]

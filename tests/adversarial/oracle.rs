@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use zeppelin::index::filter::evaluate_filter;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, Filter};
 
-use super::model::{model_distance, Model, ModelRecord, NsModel, OracleMutation};
+use super::model::{model_distance, IndetEffect, Model, ModelRecord, NsModel, OracleMutation};
 use super::ops::{AsOfTarget, GeneratedQuery, MaintenanceKind, Op, OpRecord, QueryOracleClass};
 use super::RunMode;
 
@@ -30,6 +30,7 @@ pub enum ViolationId {
     I15ManifestLineage,
     I16Quiescence,
     I17SketchPublication,
+    I18IndeterminateResolution,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,7 +116,7 @@ fn check_i1_strong_exact(
         )];
     };
     let query = query_vector(q);
-    let Ok(results) = query_results(&rec.response) else {
+    let Ok(mut results) = query_results(&rec.response) else {
         return vec![violation(
             violation_id,
             rec,
@@ -124,11 +125,13 @@ fn check_i1_strong_exact(
             rec.response.clone(),
         )];
     };
+    results.retain(|result| !ns_model.indeterminate.contains_key(&result.id));
 
     let first_visible = first_visible_id(ns_model, *consistency);
     let mut expected: Vec<(String, f32, &ModelRecord)> = ns_model
         .visible_records(*consistency)
         .into_iter()
+        .filter(|(id, _)| !ns_model.indeterminate.contains_key(*id))
         .filter(|(id, record)| {
             record_matches_filter(mutation, id, first_visible, record, filter.as_ref())
         })
@@ -318,7 +321,7 @@ fn check_i2_deleted_never_returned(model: &Model, rec: &OpRecord) -> Vec<Violati
         return Vec::new();
     };
     ids.into_iter()
-        .filter(|id| ns_model.deleted_ever.contains(id))
+        .filter(|id| ns_model.deleted_ever.contains(id) && !ns_model.indeterminate.contains_key(id))
         .map(|id| {
             violation(
                 ViolationId::I2DeletedNeverReturned,
@@ -357,6 +360,9 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
             rec.response.clone(),
         )];
     };
+    if !ns_model.indeterminate.is_empty() {
+        return check_indeterminate_fetch(rec, ns, ids, *consistency, ns_model, &actual);
+    }
 
     let mut expected_results = Vec::new();
     let mut expected_missing = Vec::new();
@@ -440,6 +446,105 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
     }
 
     violations
+}
+
+fn check_indeterminate_fetch(
+    rec: &OpRecord,
+    ns: &str,
+    ids: &[String],
+    consistency: ConsistencyLevel,
+    ns_model: &NsModel,
+    actual: &WireFetchResponse,
+) -> Vec<Violation> {
+    let violation_id = fetch_violation_id(consistency);
+    let actual_by_id = actual
+        .results
+        .iter()
+        .map(|record| (record.id.as_str(), record))
+        .collect::<BTreeMap<_, _>>();
+    let missing = actual
+        .missing
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let requested = ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut violations = Vec::new();
+
+    for record in &actual.results {
+        if !requested.contains(record.id.as_str()) {
+            violations.push(violation(
+                violation_id,
+                rec,
+                ns,
+                "fetch returned an id that was not requested",
+                serde_json::json!({ "id": record.id }),
+            ));
+        }
+    }
+
+    for id in ids {
+        if let Some(pending) = ns_model.indeterminate.get(id) {
+            let old = ns_model.visible_get(id, consistency);
+            let actual_record = actual_by_id.get(id.as_str()).copied();
+            let accepted = match (&pending.effect, actual_record) {
+                (IndetEffect::MaybeUpserted(candidate), Some(actual_record)) => {
+                    wire_record_matches(actual_record, candidate)
+                        || old.is_some_and(|old| wire_record_matches(actual_record, old))
+                }
+                (IndetEffect::MaybeUpserted(_), None) => {
+                    old.is_none() && missing.contains(id.as_str())
+                }
+                (IndetEffect::MaybeDeleted, Some(actual_record)) => {
+                    old.is_some_and(|old| wire_record_matches(actual_record, old))
+                }
+                (IndetEffect::MaybeDeleted, None) => missing.contains(id.as_str()),
+            };
+            if !accepted {
+                violations.push(violation(
+                    violation_id,
+                    rec,
+                    ns,
+                    "indeterminate fetch matched neither old nor new state",
+                    serde_json::json!({
+                        "id": id,
+                        "pending": pending,
+                        "actual": actual_record,
+                        "missing": missing.contains(id.as_str()),
+                    }),
+                ));
+            }
+            continue;
+        }
+
+        match (
+            ns_model.visible_get(id, consistency),
+            actual_by_id.get(id.as_str()),
+        ) {
+            (Some(expected), Some(actual_record))
+                if wire_record_matches(actual_record, expected) => {}
+            (Some(expected), actual_record) => violations.push(violation(
+                violation_id,
+                rec,
+                ns,
+                "determinate fetch value diverged while another id was indeterminate",
+                serde_json::json!({ "id": id, "expected": expected, "actual": actual_record }),
+            )),
+            (None, None) if missing.contains(id.as_str()) => {}
+            (None, actual_record) => violations.push(violation(
+                violation_id,
+                rec,
+                ns,
+                "determinate missing id diverged while another id was indeterminate",
+                serde_json::json!({ "id": id, "actual": actual_record }),
+            )),
+        }
+    }
+    violations
+}
+
+fn wire_record_matches(actual: &WireFetchRecord, expected: &ModelRecord) -> bool {
+    actual.values.as_ref() == Some(&expected.values)
+        && attributes_equal(&actual.attributes, &expected.attributes)
 }
 
 /// I8 — Point-in-time query exactness
@@ -681,6 +786,12 @@ fn check_i11_error_envelope(rec: &OpRecord) -> Vec<Violation> {
         return Vec::new();
     }
     let nested = nested_error_envelopes(rec);
+    if rec.outcome.starts_with("ambiguous:")
+        && nested.is_empty()
+        && rec.response.get("code").is_none()
+    {
+        return Vec::new();
+    }
     if nested.is_empty() {
         return check_error_envelope_body(rec, "$", rec.status, &rec.response)
             .into_iter()
@@ -1182,6 +1293,7 @@ fn check_i3_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
         .collect::<BTreeSet<_>>();
     response_ids(&rec.response)
         .into_iter()
+        .filter(|id| !ns_model.indeterminate.contains_key(id))
         .filter(|id| !visible.contains(id))
         .map(|id| {
             violation(
@@ -1496,6 +1608,9 @@ fn check_i7_fts_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
     };
     let mut violations = Vec::new();
     for id in response_ids(&rec.response) {
+        if ns_model.indeterminate.contains_key(&id) {
+            continue;
+        }
         let Some(record) =
             ns_model.visible_get(&id, q.consistency().unwrap_or(ConsistencyLevel::Strong))
         else {
@@ -2121,6 +2236,7 @@ mod tests {
             path: format!("/v1/namespaces/{NS}/query"),
             status: 200,
             response,
+            outcome: "applied".to_string(),
             gen_after: Some(1),
             duration_ms: 1,
             violations: Vec::new(),
@@ -2155,6 +2271,7 @@ mod tests {
             path: format!("/v1/namespaces/{NS}/query/batch"),
             status: 200,
             response,
+            outcome: "applied".to_string(),
             gen_after: Some(1),
             duration_ms: 1,
             violations: Vec::new(),
@@ -2227,6 +2344,7 @@ mod tests {
             path: format!("/v1/namespaces/{NS}/query"),
             status: 200,
             response,
+            outcome: "applied".to_string(),
             gen_after: Some(1),
             duration_ms: 1,
             violations: Vec::new(),

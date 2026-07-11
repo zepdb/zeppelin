@@ -254,6 +254,10 @@ impl SeedArtifacts {
             .unwrap_or_else(|error| panic!("failed to flush {}: {error}", path.display()));
     }
 
+    pub fn write_resolutions(&self, resolutions: &[serde_json::Value]) {
+        write_json(self.dir.join("resolutions.json"), resolutions);
+    }
+
     pub async fn capture_s3_metadata(
         &self,
         store: &ZeppelinStore,
@@ -481,7 +485,7 @@ pub fn read_ops(path: &Path) -> Vec<OpRecord> {
         .collect()
 }
 
-fn write_json(path: impl AsRef<Path>, value: &impl Serialize) {
+fn write_json<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &T) {
     let bytes = serde_json::to_vec_pretty(value).expect("artifact JSON must serialize");
     fs::write(path.as_ref(), bytes).unwrap_or_else(|error| {
         panic!(
@@ -491,7 +495,7 @@ fn write_json(path: impl AsRef<Path>, value: &impl Serialize) {
     });
 }
 
-fn try_write_json(path: impl AsRef<Path>, value: &impl Serialize) -> std::io::Result<()> {
+fn try_write_json<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(value).expect("artifact JSON must serialize");
     fs::write(path.as_ref(), bytes)
 }
@@ -794,6 +798,44 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
     }
     if !any_fault {
         out.push_str("No chaos faults fired.\n");
+    }
+    out.push('\n');
+
+    out.push_str("## Indeterminate Resolutions\n\n");
+    let mut any_resolution = false;
+    for seed in seeds {
+        let path = seed.dir.join("resolutions.json");
+        if !path.exists() {
+            continue;
+        }
+        let bytes = fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+        if entries.is_empty() {
+            continue;
+        }
+        any_resolution = true;
+        let mut counts = BTreeMap::<String, u64>::new();
+        for entry in &entries {
+            let resolved = entry
+                .get("resolved")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            *counts.entry(resolved.to_string()).or_default() += 1;
+        }
+        out.push_str(&format!(
+            "- seed {}: `{}` ({} entries)\n",
+            seed.seed,
+            path.display(),
+            entries.len()
+        ));
+        for (resolved, count) in counts {
+            out.push_str(&format!("  - `{resolved}`: {count}\n"));
+        }
+    }
+    if !any_resolution {
+        out.push_str("No indeterminate writes required resolution.\n");
     }
     out.push('\n');
 

@@ -19,11 +19,20 @@ use super::artifacts::{
 };
 use super::chaos::{chaos_store, ChaosHandle, FaultPlan, FiredFault};
 use super::generator::{AdversarialGenerator, Coverage};
-use super::model::{Model, OracleMutation};
+use super::model::{
+    AmbiguityReason, IndetEffect, Model, ModelRecord, NsIndeterminate, OpOutcome, OracleMutation,
+};
 use super::ops::{GeneratedQuery, InvalidProbe, NamespaceSpec, Op, OpRecord, QueryOracleClass};
 use super::oracle::{self, Violation, ViolationId};
 use super::s3_oracle::{self, S3Tracker};
 use super::{PreserveMode, RunMode, RunnerEnv};
+
+const AMBIGUITY_MARKER: &str = "_adversarial_ambiguity";
+
+tokio::task_local! {
+    static REQUEST_AMBIGUITY_ALLOWED: bool;
+    static REQUEST_IS_MUTATION: bool;
+}
 
 #[derive(Debug, Clone)]
 pub struct RunSummary {
@@ -247,6 +256,10 @@ pub async fn inspect_from_env() {
 async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let seed_config = replay_seed_config(replay);
     let replay_mutation = env.selftest.or(seed_config.fault_plan);
+    let replay_post_commit_selftest = matches!(
+        seed_config.selftest_probe,
+        Some(OracleMutation::PostCommitLostWrite | OracleMutation::IndetResolutionLie)
+    );
     let mode = effective_seed_mode(seed_config.mode, seed_config.seed);
     let chaos_plan = if mode == RunMode::Chaos {
         Some(
@@ -303,6 +316,9 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
 
     let records = read_ops(replay);
     for source in records.into_iter().take(max_ops as usize) {
+        let replay_lost_ack = replay_post_commit_selftest
+            && source.status == 0
+            && source.outcome == "ambiguous:connection_error";
         let op = source.op.rewrite_namespace_prefix(&old_prefix, &prefix);
         let step = execute_recorded_op(
             &client,
@@ -316,8 +332,13 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             started,
             replay_mutation,
             mode,
+            replay_lost_ack,
         )
         .await;
+        assert_eq!(
+            step.post_commit_ack_lost, replay_lost_ack,
+            "replay could not reproduce the recorded post-commit acknowledgement loss"
+        );
         if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
             let ns = op.namespace().to_string();
             note_background_compaction_namespace(&mut background_compaction_starts, &ns);
@@ -939,6 +960,8 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 OracleMutation::GcEatsLiveKey,
                 OracleMutation::StaleCheckpoint,
                 OracleMutation::ChaosLostWrite,
+                OracleMutation::PostCommitLostWrite,
+                OracleMutation::IndetResolutionLie,
             ]
         },
         |mutation| vec![mutation],
@@ -995,6 +1018,13 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             OracleMutation::GcEatsLiveKey => fired.contains(&ViolationId::I14S3Reachability),
             OracleMutation::StaleCheckpoint => fired.contains(&ViolationId::I8AsOfExact),
             OracleMutation::ChaosLostWrite => fired.contains(&ViolationId::I16Quiescence),
+            OracleMutation::PostCommitLostWrite => {
+                fired.contains(&ViolationId::I16Quiescence)
+                    || fired.contains(&ViolationId::I1StrongExact)
+            }
+            OracleMutation::IndetResolutionLie => {
+                fired.contains(&ViolationId::I18IndeterminateResolution)
+            }
         };
         assert!(
             accepted,
@@ -1019,14 +1049,26 @@ async fn run_seed(
     mutation: Option<OracleMutation>,
     selftest_probe: Option<OracleMutation>,
 ) -> SeedOutcome {
-    let mode = if mutation == Some(OracleMutation::ChaosLostWrite) {
+    let post_commit_selftest = matches!(
+        mutation.or(selftest_probe),
+        Some(OracleMutation::PostCommitLostWrite | OracleMutation::IndetResolutionLie)
+    );
+    let mode = if mutation == Some(OracleMutation::ChaosLostWrite) || post_commit_selftest {
         RunMode::Chaos
     } else {
         effective_seed_mode(env.mode, seed)
     };
+    let harness = TestHarness::new().await;
+    let prefix = harness.prefix.clone();
+    let mut generator = AdversarialGenerator::new(seed, &prefix);
+    let specs = generator.specs();
     let chaos_plan = if mode == RunMode::Chaos {
         Some(if mutation == Some(OracleMutation::ChaosLostWrite) {
             FaultPlan::lost_write_selftest()
+        } else if post_commit_selftest {
+            let first_upsert_manifest_call =
+                u32::try_from(specs.len() + 1).expect("selftest namespace count must fit in u32");
+            FaultPlan::post_commit_selftest(first_upsert_manifest_call)
         } else {
             FaultPlan::for_seed(seed)
         })
@@ -1036,13 +1078,9 @@ async fn run_seed(
     let chaos_plan_json = chaos_plan
         .as_ref()
         .map(|plan| serde_json::to_value(plan).expect("FaultPlan must serialize"));
-    let harness = TestHarness::new().await;
-    let prefix = harness.prefix.clone();
     let (instrumented_store, chaos_handle) = wrap_chaos_store(&harness.store, chaos_plan.clone());
     let (store, counter) = counting_store(&instrumented_store);
     let config = config_for_mode(mode, seed);
-    let mut generator = AdversarialGenerator::new(seed, &prefix);
-    let specs = generator.specs();
     let recorded_ops = recorded_seed_ops_if_requested(env, seed, &prefix);
     let mut artifacts = artifacts.seed(
         seed,
@@ -1070,12 +1108,15 @@ async fn run_seed(
     let mut failed = false;
     let mut failure_violations = Vec::new();
     let mut compactions = 0u64;
+    let mut post_commit_ack_loss_fired = false;
     let started = Instant::now();
     let max_ops = env.max_ops.unwrap_or(500);
 
     while op_index < max_ops && (Instant::now() < deadline || op_index == 0) {
         let op = sanitize_op_for_mode(generator.next(&model), mode);
         assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &op);
+        let inject_post_commit_ack_loss =
+            post_commit_selftest && !post_commit_ack_loss_fired && matches!(op, Op::Upsert { .. });
         let step = execute_recorded_op(
             &client,
             &server,
@@ -1088,8 +1129,10 @@ async fn run_seed(
             started,
             mutation,
             mode,
+            inject_post_commit_ack_loss,
         )
         .await;
+        post_commit_ack_loss_fired |= step.post_commit_ack_lost;
         if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
             let ns = op.namespace().to_string();
             note_background_compaction_namespace(&mut background_compaction_starts, &ns);
@@ -1123,6 +1166,9 @@ async fn run_seed(
         if let Some(probe) = selftest_probe {
             if let Some(probe_op) = selftest_probe_op(probe, &op, &model, &mut generator) {
                 assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &probe_op);
+                let inject_post_commit_ack_loss = post_commit_selftest
+                    && !post_commit_ack_loss_fired
+                    && matches!(probe_op, Op::Upsert { .. });
                 let step = execute_recorded_op(
                     &client,
                     &server,
@@ -1135,8 +1181,10 @@ async fn run_seed(
                     started,
                     mutation,
                     mode,
+                    inject_post_commit_ack_loss,
                 )
                 .await;
+                post_commit_ack_loss_fired |= step.post_commit_ack_lost;
                 op_index += 1;
                 if !step.violations.is_empty() {
                     failed = true;
@@ -1148,6 +1196,22 @@ async fn run_seed(
     }
 
     stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
+
+    if post_commit_selftest {
+        assert!(
+            post_commit_ack_loss_fired,
+            "post-commit selftest never lost an applied HTTP acknowledgement"
+        );
+        assert!(
+            chaos_handle.as_ref().is_some_and(|handle| {
+                handle
+                    .fired()
+                    .iter()
+                    .any(|fault| fault.site_id == "post-commit-lost-write")
+            }),
+            "post-commit selftest never exercised manifest acknowledgement recovery"
+        );
+    }
 
     if !failed {
         let quiescence = quiesce_and_verify(
@@ -1265,6 +1329,7 @@ async fn run_seed(
 struct StepOutcome {
     status: u16,
     violations: Vec<Violation>,
+    post_commit_ack_lost: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1280,8 +1345,22 @@ async fn execute_recorded_op(
     started: Instant,
     mutation: Option<OracleMutation>,
     mode: RunMode,
+    inject_post_commit_ack_loss: bool,
 ) -> StepOutcome {
-    let mut rec = execute_op(client, server, op, index, started).await;
+    let ambiguity_allowed = mode == RunMode::Chaos;
+    let mut rec = REQUEST_AMBIGUITY_ALLOWED
+        .scope(
+            ambiguity_allowed,
+            REQUEST_IS_MUTATION.scope(
+                op.is_mutating(),
+                execute_op(client, server, op, index, started),
+            ),
+        )
+        .await;
+    let post_commit_ack_lost = inject_post_commit_ack_loss
+        && inject_lost_http_acknowledgement_after_commit(&mut rec, ambiguity_allowed);
+    let outcome = classify_record_outcome(&rec, ambiguity_allowed);
+    rec.outcome = outcome.label();
     if (200..300).contains(&rec.status) {
         match op {
             Op::CloneNamespace { .. } => {
@@ -1300,14 +1379,22 @@ async fn execute_recorded_op(
     }
     coverage.record(op);
     artifacts.write_op(&rec);
-    model.apply(op, rec.status, rec.gen_after, &rec.response, mutation);
+    model.apply_outcome(op, &outcome, rec.gen_after, mutation, rec.index);
     if (200..300).contains(&rec.status) {
         if let Op::DeleteNamespace { ns } = op {
             s3_tracker.forget_namespace(ns);
         }
     }
     let mut violations = oracle::check_op(model, &rec, mode, mutation);
-    if mutation == Some(OracleMutation::ChaosLostWrite) && mode == RunMode::Chaos {
+    if matches!(
+        mutation,
+        Some(
+            OracleMutation::ChaosLostWrite
+                | OracleMutation::PostCommitLostWrite
+                | OracleMutation::IndetResolutionLie
+        )
+    ) && mode == RunMode::Chaos
+    {
         violations.clear();
     }
     if (200..300).contains(&rec.status) {
@@ -1340,7 +1427,32 @@ async fn execute_recorded_op(
     StepOutcome {
         status: rec.status,
         violations,
+        post_commit_ack_lost,
     }
+}
+
+fn inject_lost_http_acknowledgement_after_commit(
+    rec: &mut OpRecord,
+    ambiguity_allowed: bool,
+) -> bool {
+    if !(200..300).contains(&rec.status) {
+        return false;
+    }
+    assert!(
+        ambiguity_allowed,
+        "post-commit acknowledgement loss is only valid in chaos mode"
+    );
+
+    // A post-commit error on the WAL object itself only leaves an orphan: the
+    // manifest never references it, so no logical write was committed. A lost
+    // manifest acknowledgement is now recovered authoritatively by WalWriter.
+    // The deterministic oracle self-test therefore models the remaining sound
+    // boundary: the HTTP mutation committed, then its 2xx acknowledgement was
+    // lost before the client observed it.
+    let ambiguous = ambiguous_exchange(0, AmbiguityReason::ConnectionError);
+    rec.status = ambiguous.status;
+    rec.response = ambiguous.response;
+    true
 }
 
 async fn execute_op(
@@ -1763,6 +1875,7 @@ async fn execute_op(
         path,
         status,
         response,
+        outcome: String::new(),
         gen_after: None,
         duration_ms: before.elapsed().as_millis() as u64,
         violations: Vec::new(),
@@ -1969,14 +2082,57 @@ async fn request_json(
     url: &str,
     body: Option<serde_json::Value>,
 ) -> (u16, serde_json::Value) {
+    let ambiguity_allowed = REQUEST_AMBIGUITY_ALLOWED
+        .try_with(|allowed| *allowed)
+        .unwrap_or(false);
+    let exchange = request_exchange(client, method, url, body, ambiguity_allowed).await;
+    (exchange.status, exchange.response)
+}
+
+struct RequestExchange {
+    status: u16,
+    response: serde_json::Value,
+    outcome: OpOutcome,
+}
+
+async fn request_outcome(
+    client: &Client,
+    method: Method,
+    url: &str,
+    body: Option<serde_json::Value>,
+    ambiguity_allowed: bool,
+) -> OpOutcome {
+    request_exchange(client, method, url, body, ambiguity_allowed)
+        .await
+        .outcome
+}
+
+async fn request_exchange(
+    client: &Client,
+    method: Method,
+    url: &str,
+    body: Option<serde_json::Value>,
+    ambiguity_allowed: bool,
+) -> RequestExchange {
+    let request_is_mutation = REQUEST_IS_MUTATION
+        .try_with(|is_mutation| *is_mutation)
+        .unwrap_or_else(|_| http_request_is_mutating(&method, url));
     let mut request = client.request(method, url);
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let response = request
-        .send()
-        .await
-        .unwrap_or_else(|error| panic!("HTTP request failed for {url}: {error}"));
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) if ambiguity_allowed => {
+            let reason = if error.is_timeout() {
+                AmbiguityReason::HttpTimeout
+            } else {
+                AmbiguityReason::ConnectionError
+            };
+            return ambiguous_exchange(0, reason);
+        }
+        Err(error) => panic!("HTTP request failed for {url}: {error}"),
+    };
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         assert!(
@@ -1985,13 +2141,115 @@ async fn request_json(
         );
     }
     if status == StatusCode::NO_CONTENT.as_u16() {
-        return (status, serde_json::Value::Null);
+        return RequestExchange {
+            status,
+            response: serde_json::Value::Null,
+            outcome: OpOutcome::Applied {
+                status,
+                response: serde_json::Value::Null,
+            },
+        };
     }
-    let body = response
-        .json::<serde_json::Value>()
-        .await
-        .unwrap_or_else(|error| panic!("HTTP response JSON parse failed for {url}: {error}"));
-    (status, body)
+    let response = match response.json::<serde_json::Value>().await {
+        Ok(response) => response,
+        Err(_) if ambiguity_allowed => {
+            return ambiguous_exchange(status, AmbiguityReason::JsonParse);
+        }
+        Err(error) => panic!("HTTP response JSON parse failed for {url}: {error}"),
+    };
+    let outcome = if (200..300).contains(&status) {
+        OpOutcome::Applied {
+            status,
+            response: response.clone(),
+        }
+    } else if status >= 500 && ambiguity_allowed && request_is_mutation {
+        return ambiguous_exchange_with_response(
+            status,
+            AmbiguityReason::ServerError { status },
+            response,
+        );
+    } else {
+        OpOutcome::NotApplied {
+            status,
+            response: response.clone(),
+        }
+    };
+    RequestExchange {
+        status,
+        response,
+        outcome,
+    }
+}
+
+fn http_request_is_mutating(method: &Method, url: &str) -> bool {
+    match *method {
+        Method::PUT | Method::PATCH | Method::DELETE => true,
+        Method::POST => {
+            !url.contains("/query") && !url.ends_with("/vectors/get") && !url.ends_with("/hydrate")
+        }
+        _ => false,
+    }
+}
+
+fn ambiguous_exchange(status: u16, reason: AmbiguityReason) -> RequestExchange {
+    ambiguous_exchange_with_response(status, reason, serde_json::Value::Null)
+}
+
+fn ambiguous_exchange_with_response(
+    status: u16,
+    reason: AmbiguityReason,
+    response: serde_json::Value,
+) -> RequestExchange {
+    let mut response = match response {
+        serde_json::Value::Object(object) => serde_json::Value::Object(object),
+        other => json!({ "response": other }),
+    };
+    response
+        .as_object_mut()
+        .expect("ambiguity response must be an object")
+        .insert(
+            AMBIGUITY_MARKER.to_string(),
+            serde_json::to_value(&reason).expect("AmbiguityReason must serialize"),
+        );
+    RequestExchange {
+        status,
+        response,
+        outcome: OpOutcome::Ambiguous {
+            reason,
+            status: (status != 0).then_some(status),
+        },
+    }
+}
+
+fn classify_record_outcome(rec: &OpRecord, ambiguity_allowed: bool) -> OpOutcome {
+    if let Some(encoded) = rec.response.get(AMBIGUITY_MARKER) {
+        let reason = serde_json::from_value(encoded.clone())
+            .expect("recorded ambiguity reason must deserialize");
+        return OpOutcome::Ambiguous {
+            reason,
+            status: (rec.status != 0).then_some(rec.status),
+        };
+    }
+    if (200..300).contains(&rec.status) {
+        OpOutcome::Applied {
+            status: rec.status,
+            response: rec.response.clone(),
+        }
+    } else if rec.status >= 500
+        && ambiguity_allowed
+        && rec.op.is_mutating()
+        && rec.method != "IN_PROCESS"
+    {
+        OpOutcome::Ambiguous {
+            reason: AmbiguityReason::ServerError { status: rec.status },
+            status: Some(rec.status),
+        }
+    } else {
+        OpOutcome::NotApplied {
+            status: rec.status,
+            response: rec.response.clone(),
+        }
+    }
 }
 
 async fn compact_generation(client: &Client, base_url: &str, ns: &str) -> u64 {
@@ -2125,18 +2383,23 @@ async fn quiesce_and_verify(
     model: &mut Model,
     coverage: &mut Coverage,
     s3_tracker: &mut S3Tracker,
-    namespaces: &[String],
+    _namespaces: &[String],
     op_index: &mut u64,
     compactions: &mut u64,
     started: Instant,
     mutation: Option<OracleMutation>,
     mode: RunMode,
 ) -> Vec<Violation> {
-    for ns in namespaces {
+    let resolutions = resolve_indeterminates(client, server, model, artifacts, *op_index).await;
+    if !resolutions.is_empty() {
+        return resolutions;
+    }
+    let namespaces = model.namespace_names();
+    for ns in &namespaces {
         let compact = Op::CompactInline { ns: ns.clone() };
         let step = execute_recorded_op(
             client, server, artifacts, model, coverage, s3_tracker, &compact, *op_index, started,
-            mutation, mode,
+            mutation, mode, false,
         )
         .await;
         *op_index += 1;
@@ -2161,7 +2424,7 @@ async fn quiesce_and_verify(
             };
             let step = execute_recorded_op(
                 client, server, artifacts, model, coverage, s3_tracker, &gc, *op_index, started,
-                mutation, mode,
+                mutation, mode, false,
             )
             .await;
             *op_index += 1;
@@ -2220,7 +2483,7 @@ async fn quiesce_and_verify(
         };
         let step = execute_recorded_op(
             client, server, artifacts, model, coverage, s3_tracker, &fetch, *op_index, started,
-            mutation, mode,
+            mutation, mode, false,
         )
         .await;
         *op_index += 1;
@@ -2236,7 +2499,7 @@ async fn quiesce_and_verify(
         };
         let step = execute_recorded_op(
             client, server, artifacts, model, coverage, s3_tracker, &query, *op_index, started,
-            mutation, mode,
+            mutation, mode, false,
         )
         .await;
         *op_index += 1;
@@ -2245,6 +2508,354 @@ async fn quiesce_and_verify(
         }
     }
     Vec::new()
+}
+
+async fn resolve_indeterminates(
+    client: &Client,
+    server: &FullTestServer,
+    model: &mut Model,
+    artifacts: &SeedArtifacts,
+    op_index: u64,
+) -> Vec<Violation> {
+    let mut resolutions = Vec::new();
+    let mut violations = Vec::new();
+
+    for ns in model.namespace_names() {
+        let entries = model
+            .namespaces
+            .get_mut(&ns)
+            .map(|ns_model| std::mem::take(&mut ns_model.indeterminate_ns))
+            .unwrap_or_default();
+        for entry in entries {
+            match entry {
+                NsIndeterminate::MaybeCreatedNs => {
+                    let exists = server
+                        .store
+                        .exists(&format!("{ns}/manifest.json"))
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("manifest existence probe failed for {ns}: {error}")
+                        });
+                    if exists {
+                        resolutions.push(json!({
+                            "namespace": ns,
+                            "effect": "maybe_created_namespace",
+                            "resolved": "applied"
+                        }));
+                    } else {
+                        model.namespaces.remove(&ns);
+                        resolutions.push(json!({
+                            "namespace": ns,
+                            "effect": "maybe_created_namespace",
+                            "resolved": "not_applied"
+                        }));
+                        break;
+                    }
+                }
+                NsIndeterminate::MaybeDeletedNs => {
+                    let exists = server
+                        .store
+                        .exists(&format!("{ns}/manifest.json"))
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("manifest existence probe failed for {ns}: {error}")
+                        });
+                    if exists {
+                        resolutions.push(json!({
+                            "namespace": ns,
+                            "effect": "maybe_deleted_namespace",
+                            "resolved": "not_applied"
+                        }));
+                    } else {
+                        model.namespaces.remove(&ns);
+                        resolutions.push(json!({
+                            "namespace": ns,
+                            "effect": "maybe_deleted_namespace",
+                            "resolved": "applied"
+                        }));
+                        break;
+                    }
+                }
+                NsIndeterminate::MaybeSnapshot { name } => {
+                    let path = format!("/v1/namespaces/{ns}/snapshots/{name}");
+                    let (status, response) = request_json(
+                        client,
+                        Method::GET,
+                        &format!("{}{}", server.base_url, path),
+                        None,
+                    )
+                    .await;
+                    if (200..300).contains(&status) {
+                        let generation = response["generation"]
+                            .as_u64()
+                            .or_else(|| {
+                                model.namespaces.get(&ns).map(|model| model.live_generation)
+                            })
+                            .unwrap_or(0);
+                        if let Some(ns_model) = model.namespaces.get_mut(&ns) {
+                            ns_model.snapshots.insert(name.clone(), generation);
+                        }
+                        resolutions.push(json!({
+                            "namespace": ns,
+                            "effect": "maybe_snapshot",
+                            "name": name,
+                            "resolved": "applied"
+                        }));
+                    } else if matches!(status, 404 | 410) {
+                        resolutions.push(json!({
+                            "namespace": ns,
+                            "effect": "maybe_snapshot",
+                            "name": name,
+                            "resolved": "not_applied"
+                        }));
+                    } else {
+                        violations.push(indeterminate_violation(
+                            op_index,
+                            &ns,
+                            "snapshot creation resolution returned an unexpected status",
+                            json!({ "name": name, "status": status, "response": response }),
+                        ));
+                    }
+                }
+                NsIndeterminate::MaybeSnapshotDeleted { name } => {
+                    let path = format!("/v1/namespaces/{ns}/snapshots/{name}");
+                    let (status, response) = request_json(
+                        client,
+                        Method::GET,
+                        &format!("{}{}", server.base_url, path),
+                        None,
+                    )
+                    .await;
+                    if matches!(status, 404 | 410) {
+                        if let Some(ns_model) = model.namespaces.get_mut(&ns) {
+                            ns_model.snapshots.remove(&name);
+                        }
+                        resolutions.push(json!({
+                            "namespace": ns,
+                            "effect": "maybe_snapshot_deleted",
+                            "name": name,
+                            "resolved": "applied"
+                        }));
+                    } else if (200..300).contains(&status) {
+                        resolutions.push(json!({
+                            "namespace": ns,
+                            "effect": "maybe_snapshot_deleted",
+                            "name": name,
+                            "resolved": "not_applied"
+                        }));
+                    } else {
+                        violations.push(indeterminate_violation(
+                            op_index,
+                            &ns,
+                            "snapshot deletion resolution returned an unexpected status",
+                            json!({ "name": name, "status": status, "response": response }),
+                        ));
+                    }
+                }
+                NsIndeterminate::MaybeCloned { target, as_of } => {
+                    let exists = server
+                        .store
+                        .exists(&format!("{target}/manifest.json"))
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("clone manifest existence probe failed for {target}: {error}")
+                        });
+                    if exists {
+                        let generation = clone_source_generation(model, &ns, &as_of);
+                        model.apply(
+                            &Op::CloneNamespace {
+                                source: ns.clone(),
+                                target: target.clone(),
+                                as_of,
+                            },
+                            200,
+                            None,
+                            &json!({ "generation": generation }),
+                            None,
+                        );
+                        resolutions.push(json!({
+                            "namespace": ns,
+                            "target": target,
+                            "effect": "maybe_cloned",
+                            "resolved": "applied"
+                        }));
+                    } else {
+                        resolutions.push(json!({
+                            "namespace": ns,
+                            "target": target,
+                            "effect": "maybe_cloned",
+                            "resolved": "not_applied"
+                        }));
+                    }
+                }
+                NsIndeterminate::MaybeCompacted => resolutions.push(json!({
+                    "namespace": ns,
+                    "effect": "maybe_compacted",
+                    "resolved": "deferred_to_forced_compaction"
+                })),
+            }
+        }
+    }
+
+    for ns in model.namespace_names() {
+        let ids = model
+            .namespaces
+            .get(&ns)
+            .map(|ns_model| ns_model.indeterminate.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if ids.is_empty() {
+            continue;
+        }
+        let path = format!("/v1/namespaces/{ns}/vectors/get");
+        let (status, response) = request_json(
+            client,
+            Method::POST,
+            &format!("{}{}", server.base_url, path),
+            Some(json!({
+                "ids": ids,
+                "include_vector": true,
+                "include_attributes": true,
+                "consistency": ConsistencyLevel::Strong,
+            })),
+        )
+        .await;
+        if !(200..300).contains(&status) {
+            violations.push(indeterminate_violation(
+                op_index,
+                &ns,
+                "strong fetch failed while resolving indeterminate vectors",
+                json!({ "status": status, "response": response }),
+            ));
+            continue;
+        }
+
+        let pending_ids = model
+            .namespaces
+            .get(&ns)
+            .map(|ns_model| ns_model.indeterminate.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for id in pending_ids {
+            let observed = match observed_fetch_record(&response, &id) {
+                Ok(observed) => observed,
+                Err(detail) => {
+                    violations.push(indeterminate_violation(
+                        op_index,
+                        &ns,
+                        &detail,
+                        json!({ "id": id, "response": response }),
+                    ));
+                    continue;
+                }
+            };
+            let pending = model.namespaces[&ns].indeterminate[&id].clone();
+            let resolved = match &pending.effect {
+                IndetEffect::MaybeUpserted(candidate) if observed.as_ref() == Some(candidate) => {
+                    "applied"
+                }
+                IndetEffect::MaybeDeleted if observed.is_none() => "applied",
+                _ => "not_applied",
+            };
+            match model.resolve_indeterminate_record(&ns, &id, observed.clone()) {
+                Ok(()) => resolutions.push(json!({
+                    "namespace": ns,
+                    "id": id,
+                    "op_index": pending.op_index,
+                    "reason": pending.reason,
+                    "resolved": resolved,
+                    "observed": observed,
+                })),
+                Err(detail) => violations.push(indeterminate_violation(
+                    op_index,
+                    &ns,
+                    &detail,
+                    json!({
+                        "id": id,
+                        "pending": pending,
+                        "observed": observed,
+                    }),
+                )),
+            }
+        }
+    }
+
+    artifacts.write_resolutions(&resolutions);
+    violations
+}
+
+fn clone_source_generation(model: &Model, source: &str, as_of: &super::ops::AsOfTarget) -> u64 {
+    let source = model
+        .namespaces
+        .get(source)
+        .unwrap_or_else(|| panic!("missing clone source model during resolution: {source}"));
+    match as_of {
+        super::ops::AsOfTarget::Generation(generation) => *generation,
+        super::ops::AsOfTarget::Snapshot(name) => source
+            .snapshots
+            .get(name)
+            .copied()
+            .unwrap_or(source.live_generation),
+        super::ops::AsOfTarget::Timestamp(_) => source.live_generation,
+    }
+}
+
+fn observed_fetch_record(
+    response: &serde_json::Value,
+    id: &str,
+) -> Result<Option<ModelRecord>, String> {
+    if response["missing"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|value| value.as_str() == Some(id))
+    {
+        return Ok(None);
+    }
+    let Some(record) = response["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|record| record["id"].as_str() == Some(id))
+    else {
+        return Err(format!(
+            "fetch resolution omitted {id} from both results and missing"
+        ));
+    };
+    let values = record["values"]
+        .as_array()
+        .ok_or_else(|| format!("fetch resolution omitted values for {id}"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|value| value as f32)
+                .ok_or_else(|| format!("fetch resolution returned non-numeric values for {id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let attributes = record
+        .get("attributes")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|error| {
+                format!("fetch resolution returned invalid attributes for {id}: {error}")
+            })
+        })
+        .transpose()?;
+    Ok(Some(ModelRecord { values, attributes }))
+}
+
+fn indeterminate_violation(
+    op_index: u64,
+    namespace: &str,
+    detail: &str,
+    evidence: serde_json::Value,
+) -> Violation {
+    Violation {
+        id: ViolationId::I18IndeterminateResolution,
+        op_index,
+        namespace: namespace.to_string(),
+        detail: detail.to_string(),
+        evidence,
+    }
 }
 
 fn exhaustive_query_from_model(model: &Model, ns: &str) -> GeneratedQuery {
@@ -2348,5 +2959,59 @@ fn should_cleanup(preserve: PreserveMode, failed: bool) -> bool {
         PreserveMode::Always => false,
         PreserveMode::OnFailure => !failed,
         PreserveMode::Never => true,
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use axum::http::{HeaderMap, HeaderValue};
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn mutating_server_error_is_ambiguous_when_faults_are_active() {
+        let app = Router::new().route(
+            "/v1/namespaces/test/vectors",
+            post(|| async {
+                let mut headers = HeaderMap::new();
+                headers.insert("x-request-id", HeaderValue::from_static("test-request"));
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    Json(json!({
+                        "code": "STORAGE_ERROR",
+                        "error": "injected",
+                        "status": 500,
+                        "retryable": true,
+                        "request_id": "test-request"
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let outcome = request_outcome(
+            &adversarial_client(),
+            Method::POST,
+            &format!("http://{address}/v1/namespaces/test/vectors"),
+            Some(json!({ "vectors": [] })),
+            true,
+        )
+        .await;
+        server.abort();
+
+        assert!(matches!(
+            outcome,
+            OpOutcome::Ambiguous {
+                reason: AmbiguityReason::ServerError { status: 500 },
+                status: Some(500),
+            }
+        ));
     }
 }

@@ -178,6 +178,8 @@ pub struct OpRecord {
     pub path: String,
     pub status: u16,
     pub response: serde_json::Value,
+    #[serde(default)]
+    pub outcome: String,
     pub gen_after: Option<u64>,
     pub duration_ms: u64,
     pub violations: Vec<ViolationId>,
