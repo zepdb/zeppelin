@@ -494,7 +494,15 @@ impl Model {
             }
             OpOutcome::NotApplied { .. } => {}
             OpOutcome::Ambiguous { reason, .. } => {
-                if mutation == Some(OracleMutation::CrashLostAck) {
+                let chaos_lost_write_selftest = mutation == Some(OracleMutation::ChaosLostWrite)
+                    && matches!(op, Op::Upsert { .. })
+                    && matches!(reason, AmbiguityReason::ServerError { status: 500 });
+                if mutation == Some(OracleMutation::CrashLostAck) || chaos_lost_write_selftest {
+                    // WAL read-back verification now turns the legacy
+                    // SilentDrop fixture into a loud 500. Keep this oracle
+                    // mutation useful by deliberately promoting only that
+                    // failed upsert in the model; quiescence must reject the
+                    // resulting claimed-but-absent write as I16.
                     self.apply_with_generation_checkpoints(
                         op,
                         200,
@@ -1173,6 +1181,45 @@ mod tests {
             .unwrap();
         assert_eq!(model.namespaces[&ns].live["id-1"].values, vec![1.0, 0.0]);
         assert!(model.namespaces[&ns].indeterminate.is_empty());
+    }
+
+    #[test]
+    fn chaos_lost_write_selftest_promotes_only_its_failed_upsert() {
+        let (mut model, ns) = model_with_old_record();
+        let candidate = GenVector {
+            id: "id-1".to_string(),
+            values: vec![0.0, 1.0],
+            attributes: None,
+        };
+        model.apply_outcome(
+            &Op::Upsert {
+                ns: ns.clone(),
+                vectors: vec![candidate.clone()],
+            },
+            &ambiguous_500(),
+            None,
+            Some(OracleMutation::ChaosLostWrite),
+            11,
+        );
+
+        assert_eq!(
+            model.namespaces[&ns].live["id-1"],
+            ModelRecord::from(&candidate)
+        );
+        assert!(model.namespaces[&ns].indeterminate.is_empty());
+
+        model.apply_outcome(
+            &Op::DeleteVectors {
+                ns: ns.clone(),
+                ids: vec!["id-1".to_string()],
+            },
+            &ambiguous_500(),
+            None,
+            Some(OracleMutation::ChaosLostWrite),
+            12,
+        );
+        assert!(model.namespaces[&ns].live.contains_key("id-1"));
+        assert!(model.namespaces[&ns].indeterminate.contains_key("id-1"));
     }
 
     #[test]

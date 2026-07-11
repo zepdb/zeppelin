@@ -3302,6 +3302,18 @@ async fn run_seed(
         );
     }
 
+    if mutation == Some(OracleMutation::ChaosLostWrite) {
+        assert!(
+            chaos_handle.as_ref().is_some_and(|handle| {
+                handle
+                    .fired()
+                    .iter()
+                    .any(|fault| fault.site_id == "chaos-lost-write")
+            }),
+            "chaos lost-write selftest never exercised its pinned WAL SilentDrop"
+        );
+    }
+
     if post_commit_selftest {
         assert!(
             post_commit_ack_loss_fired,
@@ -6364,7 +6376,8 @@ async fn run_quiescent_checks(
     quiet_timeline: &mut Vec<TimelineEvent>,
     scheduler: Option<&FaultScheduler>,
 ) -> Vec<Violation> {
-    let mut violations = resolve_indeterminates(client, server, model, artifacts, *op_index).await;
+    let mut violations =
+        resolve_indeterminates(client, server, model, artifacts, mutation, *op_index).await;
     push_quiet_event(
         quiet_timeline,
         scheduler,
@@ -6769,6 +6782,7 @@ async fn resolve_indeterminates(
     server: &FullTestServer,
     model: &mut Model,
     artifacts: &SeedArtifacts,
+    mutation: Option<OracleMutation>,
     op_index: u64,
 ) -> Vec<Violation> {
     let mut resolutions = Vec::new();
@@ -7002,6 +7016,22 @@ async fn resolve_indeterminates(
                 }
             };
             let pending = model.namespaces[&ns].indeterminate[&id].clone();
+            if mutation == Some(OracleMutation::DroppedResponseLostWrite) {
+                // Deliberately claim the ambiguous upsert was applied. The
+                // ordinary resolver must reject that claim when the strong
+                // fetch proves the WAL write was lost.
+                let IndetEffect::MaybeUpserted(candidate) = &pending.effect else {
+                    panic!(
+                        "dropped-response lost-write mutation reached a non-upsert effect for {ns}/{id}"
+                    );
+                };
+                model
+                    .namespaces
+                    .get_mut(&ns)
+                    .expect("indeterminate namespace disappeared before selftest mutation")
+                    .live
+                    .insert(id.clone(), candidate.clone());
+            }
             let resolved = match &pending.effect {
                 IndetEffect::MaybeUpserted(candidate)
                     if observed
