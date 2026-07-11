@@ -34,6 +34,7 @@ pub enum ViolationId {
     I17SketchPublication,
     I18IndeterminateResolution,
     I19CrashRecovery,
+    I20CorruptionSurfaced,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +79,83 @@ pub fn check_op(
         violations.extend(check_i7_fts_membership(model, rec));
     }
     violations
+}
+
+pub struct CorruptionContext<'a> {
+    pub tainted_keys: &'a BTreeSet<String>,
+    pub fault_window_active: bool,
+}
+
+#[must_use]
+pub fn check_op_with_faults(
+    model: &Model,
+    rec: &OpRecord,
+    mode: RunMode,
+    mutation: Option<OracleMutation>,
+    corruption: Option<&CorruptionContext<'_>>,
+) -> Vec<Violation> {
+    let mut violations = check_op(model, rec, mode, mutation);
+    if let Some(corruption) = corruption {
+        violations.extend(check_i20_corruption_surfaced(
+            model, rec, mutation, corruption,
+        ));
+    }
+    violations
+}
+
+fn check_i20_corruption_surfaced(
+    model: &Model,
+    rec: &OpRecord,
+    mutation: Option<OracleMutation>,
+    corruption: &CorruptionContext<'_>,
+) -> Vec<Violation> {
+    if !(200..300).contains(&rec.status) || corruption.tainted_keys.is_empty() {
+        return Vec::new();
+    }
+    let namespace = rec.op.namespace();
+    let Some(ns_model) = model.namespaces.get(namespace) else {
+        return Vec::new();
+    };
+    if !ns_model.spec.is_exact()
+        || !ns_model.indeterminate.is_empty()
+        || !ns_model.indeterminate_ns.is_empty()
+    {
+        // TODO tighten once per-record read sets can exclude ambiguous state.
+        return Vec::new();
+    }
+
+    let divergences = match &rec.op {
+        Op::FetchVectors { .. } => check_i4_fetch_exact(model, rec, RunMode::Deterministic),
+        Op::Query { q, as_of: None, .. }
+            if matches!(q.class, QueryOracleClass::ExactAnn { .. }) =>
+        {
+            check_i1_strong_exact(model, rec, RunMode::Deterministic, mutation)
+        }
+        Op::Query {
+            q, as_of: Some(_), ..
+        } if matches!(q.class, QueryOracleClass::ExactAnn { .. }) => {
+            check_i8_as_of_exact(model, rec, RunMode::Deterministic, mutation)
+        }
+        _ => {
+            // TODO tighten for composite operations once their read sets are exact.
+            Vec::new()
+        }
+    };
+    if divergences.is_empty() {
+        return Vec::new();
+    }
+
+    vec![violation(
+        ViolationId::I20CorruptionSurfaced,
+        rec,
+        namespace,
+        "successful response diverged while corrupted storage was plausibly consulted",
+        serde_json::json!({
+            "tainted_keys": corruption.tainted_keys,
+            "fault_window_active": corruption.fault_window_active,
+            "exact_divergences": divergences,
+        }),
+    )]
 }
 
 /// I1/I3 — Exact top-k
@@ -2101,7 +2179,11 @@ fn oracle_distance(
     values: &[f32],
 ) -> f32 {
     let base = model_distance(metric, query, values);
-    if mutation == Some(OracleMutation::SkewScore) && first_id.is_some_and(|first| first == id) {
+    if matches!(
+        mutation,
+        Some(OracleMutation::SkewScore | OracleMutation::SwallowCorruption)
+    ) && first_id.is_some_and(|first| first == id)
+    {
         base + (SCORE_ABS_EPS * 10.0)
     } else {
         base
@@ -2252,6 +2334,33 @@ mod tests {
         }
     }
 
+    fn fetch_record(values: [f32; 2]) -> OpRecord {
+        OpRecord {
+            index: 17,
+            wall_ms: 0,
+            op: Op::FetchVectors {
+                ns: NS.to_string(),
+                ids: vec!["row".to_string()],
+                consistency: ConsistencyLevel::Strong,
+            },
+            method: "POST".to_string(),
+            path: format!("/v1/namespaces/{NS}/vectors/fetch"),
+            status: 200,
+            response: json!({
+                "results": [{
+                    "id": "row",
+                    "values": values,
+                    "attributes": null
+                }],
+                "missing": []
+            }),
+            outcome: "applied".to_string(),
+            gen_after: Some(1),
+            duration_ms: 1,
+            violations: Vec::new(),
+        }
+    }
+
     fn query_record(body: serde_json::Value) -> OpRecord {
         query_record_with_response(
             body,
@@ -2366,6 +2475,69 @@ mod tests {
             "results": flat_results,
             "groups": groups
         })
+    }
+
+    #[test]
+    fn i20_rejects_divergent_success_when_namespace_has_tainted_storage() {
+        let model = model_with_record("row", None);
+        let rec = fetch_record([9.0, 9.0]);
+        let tainted_keys = BTreeSet::from(["ns/segments/cluster_0.bin".to_string()]);
+        let corruption = CorruptionContext {
+            tainted_keys: &tainted_keys,
+            fault_window_active: true,
+        };
+
+        let violations =
+            check_op_with_faults(&model, &rec, RunMode::Chaos, None, Some(&corruption));
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.id == ViolationId::I20CorruptionSurfaced),
+            "{violations:#?}"
+        );
+    }
+
+    #[test]
+    fn i20_accepts_model_consistent_success_with_tainted_storage() {
+        let model = model_with_record("row", None);
+        let rec = fetch_record([0.0, 0.0]);
+        let tainted_keys = BTreeSet::from(["ns/segments/cluster_0.bin".to_string()]);
+        let corruption = CorruptionContext {
+            tainted_keys: &tainted_keys,
+            fault_window_active: true,
+        };
+
+        let violations =
+            check_op_with_faults(&model, &rec, RunMode::Chaos, None, Some(&corruption));
+
+        assert!(
+            violations
+                .iter()
+                .all(|violation| violation.id != ViolationId::I20CorruptionSurfaced),
+            "{violations:#?}"
+        );
+    }
+
+    #[test]
+    fn i20_does_not_attribute_divergence_without_tainted_storage() {
+        let model = model_with_record("row", None);
+        let rec = fetch_record([9.0, 9.0]);
+        let tainted_keys = BTreeSet::new();
+        let corruption = CorruptionContext {
+            tainted_keys: &tainted_keys,
+            fault_window_active: false,
+        };
+
+        let violations =
+            check_op_with_faults(&model, &rec, RunMode::Chaos, None, Some(&corruption));
+
+        assert!(
+            violations
+                .iter()
+                .all(|violation| violation.id != ViolationId::I20CorruptionSurfaced),
+            "{violations:#?}"
+        );
     }
 
     fn paginate_record(class: QueryOracleClass, response: serde_json::Value) -> OpRecord {

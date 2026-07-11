@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use self::process::{CrashPoint, ProcessController, TriggerPosition};
 use super::chaos::StoreOp;
 
+const FAULT_WINDOW_TRAILING_OPS: u64 = 8;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FaultSchedule {
     pub profile: FaultProfile,
@@ -29,6 +31,8 @@ pub enum FaultProfile {
     Network,
     Crash,
     Clock,
+    Content,
+    Semantic,
 }
 
 impl FaultProfile {
@@ -40,6 +44,8 @@ impl FaultProfile {
             "network" => Self::Network,
             "crash" => Self::Crash,
             "clock" => Self::Clock,
+            "content" => Self::Content,
+            "semantic" => Self::Semantic,
             other => panic!("invalid ZEPPELIN_ADVERSARIAL_PROFILE: {other}"),
         }
     }
@@ -51,8 +57,21 @@ impl FaultProfile {
             Self::Network => "network",
             Self::Crash => "crash",
             Self::Clock => "clock",
+            Self::Content => "content",
+            Self::Semantic => "semantic",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentFault {
+    TruncateBody { keep_bytes: usize },
+    BitFlip { offset_hint: u64 },
+    WrongObject,
+    TornWrite { keep_bytes: usize },
+    MisdirectedWrite,
+    SilentDeleteFailure,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -121,6 +140,21 @@ pub enum FaultKind {
     ClockFreeze {
         for_ops: u64,
     },
+    Content(ContentFault),
+    CasConflict,
+    ListOmit {
+        nth: u32,
+    },
+    ListDuplicate {
+        nth: u32,
+    },
+    ListReorder,
+    StaleRead,
+    HeadGetDiverge,
+    BatchDeletePartial {
+        fail_every: u32,
+    },
+    CopySourceVanish,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +191,7 @@ pub enum ObservedResult {
     DefiniteNotApplied,
     DefiniteApplied,
     Ambiguous,
+    Corrupted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,6 +482,52 @@ impl FaultScheduler {
     pub fn wall_ms(&self) -> u64 {
         self.runtime.started.elapsed().as_millis() as u64
     }
+
+    #[must_use]
+    pub fn fault_window_active(&self, op_index: u64, namespace: &str) -> bool {
+        if self.runtime.quiesced.load(Ordering::SeqCst)
+            || !matches!(
+                self.schedule.profile,
+                FaultProfile::Content | FaultProfile::Semantic
+            )
+        {
+            return false;
+        }
+
+        let scheduled_window = self.schedule.events.iter().any(|event| {
+            event.boundary == Boundary::ObjectStore
+                && event.end_op.is_some_and(|end| {
+                    op_index >= event.start_op
+                        && op_index <= end.saturating_add(FAULT_WINDOW_TRAILING_OPS)
+                })
+        });
+        if scheduled_window {
+            return true;
+        }
+
+        self.timeline().into_iter().any(|event| {
+            event.boundary == Boundary::ObjectStore
+                && op_index >= event.op_index
+                && op_index <= event.op_index.saturating_add(FAULT_WINDOW_TRAILING_OPS)
+                && event
+                    .key
+                    .as_deref()
+                    .is_some_and(|key| key_is_in_namespace(key, namespace))
+        })
+    }
+}
+
+fn key_is_in_namespace(key: &str, namespace: &str) -> bool {
+    key == namespace
+        || key
+            .strip_prefix(namespace)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || key.split("->").any(|part| {
+            part == namespace
+                || part
+                    .strip_prefix(namespace)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
 }
 
 impl FaultSchedule {
@@ -504,6 +585,44 @@ impl FaultSchedule {
                 boundary: Boundary::Clock,
                 target: TargetSelector::default(),
                 kind: FaultKind::ClockJump { delta_ms: 120_000 },
+            }],
+        }
+    }
+
+    #[must_use]
+    pub fn swallow_corruption_selftest() -> Self {
+        Self {
+            profile: FaultProfile::Content,
+            events: vec![FaultEvent {
+                id: "content-swallow-corruption".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("cluster_".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(ContentFault::BitFlip { offset_hint: 3 }),
+            }],
+        }
+    }
+
+    #[must_use]
+    pub fn misdirected_write_reachability_selftest() -> Self {
+        Self {
+            profile: FaultProfile::Content,
+            events: vec![FaultEvent {
+                id: "content-misdirected-write".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Put),
+                    key_substring: Some("segments/".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(ContentFault::MisdirectedWrite),
             }],
         }
     }
@@ -791,6 +910,152 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
                 FaultKind::ClockJump { delta_ms },
             );
         }
+        FaultProfile::Content => {
+            let put_targets = ["manifest.json", ".wal", "segments/"];
+            let put_target = put_targets[rng.gen_range(0..put_targets.len())];
+            let durable = if rng.gen_bool(0.5) {
+                FaultKind::Content(ContentFault::TornWrite {
+                    keep_bytes: rng.gen_range(1..=64),
+                })
+            } else {
+                FaultKind::Content(ContentFault::MisdirectedWrite)
+            };
+            push_event(
+                &mut events,
+                profile,
+                rng.gen_range(10..=320),
+                None,
+                Boundary::ObjectStore,
+                TargetSelector {
+                    store_op: Some(StoreOp::Put),
+                    key_substring: Some(put_target.to_string()),
+                    ..TargetSelector::default()
+                },
+                durable,
+            );
+
+            let get_targets = [
+                "manifest.json",
+                ".wal",
+                "segments/",
+                "centroids",
+                "bootstrap.bin",
+                "coarse_sketch.bin",
+                "cluster_",
+            ];
+            for _ in 0..rng.gen_range(1..=3) {
+                let target = get_targets[rng.gen_range(0..get_targets.len())];
+                let kind = match rng.gen_range(0..3) {
+                    0 => FaultKind::Content(ContentFault::TruncateBody {
+                        keep_bytes: rng.gen_range(1..=128),
+                    }),
+                    1 => FaultKind::Content(ContentFault::BitFlip {
+                        offset_hint: rng.gen(),
+                    }),
+                    _ => FaultKind::Content(ContentFault::WrongObject),
+                };
+                push_event(
+                    &mut events,
+                    profile,
+                    rng.gen_range(10..=450),
+                    None,
+                    Boundary::ObjectStore,
+                    TargetSelector {
+                        store_op: Some(StoreOp::Get),
+                        key_substring: Some(target.to_string()),
+                        ..TargetSelector::default()
+                    },
+                    kind,
+                );
+            }
+
+            if rng.gen_bool(0.5) {
+                let delete_targets = [".wal", "segments/"];
+                let target = delete_targets[rng.gen_range(0..delete_targets.len())];
+                push_event(
+                    &mut events,
+                    profile,
+                    rng.gen_range(250..=480),
+                    None,
+                    Boundary::ObjectStore,
+                    TargetSelector {
+                        store_op: Some(StoreOp::Delete),
+                        key_substring: Some(target.to_string()),
+                        ..TargetSelector::default()
+                    },
+                    FaultKind::Content(ContentFault::SilentDeleteFailure),
+                );
+            }
+        }
+        FaultProfile::Semantic => {
+            for _ in 0..rng.gen_range(2..=5) {
+                let (store_op, key_substring, end_op, kind) = match rng.gen_range(0..8) {
+                    0 => (
+                        StoreOp::Put,
+                        Some("manifest.json"),
+                        None,
+                        FaultKind::CasConflict,
+                    ),
+                    1 => (
+                        StoreOp::List,
+                        None,
+                        None,
+                        FaultKind::ListOmit {
+                            nth: rng.gen_range(1..=3),
+                        },
+                    ),
+                    2 => (
+                        StoreOp::List,
+                        None,
+                        None,
+                        FaultKind::ListDuplicate {
+                            nth: rng.gen_range(1..=3),
+                        },
+                    ),
+                    3 => (StoreOp::List, None, None, FaultKind::ListReorder),
+                    4 => (
+                        StoreOp::Get,
+                        Some("manifest.json"),
+                        None,
+                        FaultKind::StaleRead,
+                    ),
+                    5 => (
+                        StoreOp::Get,
+                        Some("manifest.json"),
+                        None,
+                        FaultKind::HeadGetDiverge,
+                    ),
+                    6 => (
+                        StoreOp::Delete,
+                        None,
+                        Some(40),
+                        FaultKind::BatchDeletePartial {
+                            fail_every: rng.gen_range(2..=4),
+                        },
+                    ),
+                    _ => (
+                        StoreOp::Copy,
+                        Some("segments/"),
+                        None,
+                        FaultKind::CopySourceVanish,
+                    ),
+                };
+                let start = rng.gen_range(10..=440);
+                push_event(
+                    &mut events,
+                    profile,
+                    start,
+                    end_op.map(|length| (start + length).min(500)),
+                    Boundary::ObjectStore,
+                    TargetSelector {
+                        store_op: Some(store_op),
+                        key_substring: key_substring.map(str::to_string),
+                        ..TargetSelector::default()
+                    },
+                    kind,
+                );
+            }
+        }
     }
     FaultSchedule { profile, events }
 }
@@ -826,6 +1091,8 @@ mod tests {
             FaultProfile::Network,
             FaultProfile::Crash,
             FaultProfile::Clock,
+            FaultProfile::Content,
+            FaultProfile::Semantic,
         ] {
             for seed in 0..20 {
                 let first = FaultScheduler::for_seed(seed, profile);
@@ -863,6 +1130,80 @@ mod tests {
             duplicate_retries > 0,
             "seed sweep generated no duplicate retries"
         );
+    }
+
+    #[test]
+    fn content_schedule_bounds_durable_corruption_and_targets_catalog_keys() {
+        let catalog = [
+            "manifest.json",
+            ".wal",
+            "segments/",
+            "centroids",
+            "bootstrap.bin",
+            "coarse_sketch.bin",
+            "cluster_",
+        ];
+        for seed in 0..100 {
+            let scheduler = FaultScheduler::for_seed(seed, FaultProfile::Content);
+            let events = &scheduler.schedule().events;
+            let durable = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        FaultKind::Content(
+                            ContentFault::TornWrite { .. } | ContentFault::MisdirectedWrite
+                        )
+                    )
+                })
+                .count();
+            let gets = events
+                .iter()
+                .filter(|event| event.target.store_op == Some(StoreOp::Get))
+                .count();
+            let silent_deletes = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        FaultKind::Content(ContentFault::SilentDeleteFailure)
+                    )
+                })
+                .count();
+
+            assert_eq!(durable, 1, "seed {seed}: {events:#?}");
+            assert!((1..=3).contains(&gets), "seed {seed}: {events:#?}");
+            assert!(silent_deletes <= 1, "seed {seed}: {events:#?}");
+            assert!(events.iter().all(|event| {
+                event
+                    .target
+                    .key_substring
+                    .as_deref()
+                    .is_some_and(|key| catalog.contains(&key))
+            }));
+        }
+    }
+
+    #[test]
+    fn semantic_schedule_has_two_to_five_declared_events() {
+        for seed in 0..100 {
+            let scheduler = FaultScheduler::for_seed(seed, FaultProfile::Semantic);
+            let events = &scheduler.schedule().events;
+            assert!((2..=5).contains(&events.len()), "seed {seed}: {events:#?}");
+            assert!(events.iter().all(|event| {
+                matches!(
+                    event.kind,
+                    FaultKind::CasConflict
+                        | FaultKind::ListOmit { .. }
+                        | FaultKind::ListDuplicate { .. }
+                        | FaultKind::ListReorder
+                        | FaultKind::StaleRead
+                        | FaultKind::HeadGetDiverge
+                        | FaultKind::BatchDeletePartial { .. }
+                        | FaultKind::CopySourceVanish
+                )
+            }));
+        }
     }
 
     #[test]
@@ -904,5 +1245,30 @@ mod tests {
         scheduler.quiesce();
         let _ = scheduler.advance_to(4);
         assert!(scheduler.store_decision(StoreOp::Get, "key").is_none());
+    }
+
+    #[test]
+    fn corruption_fault_window_is_namespace_scoped_with_trailing_slop() {
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Content,
+            events: Vec::new(),
+        });
+        scheduler.record(TimelineEvent {
+            event_id: "content-00".to_string(),
+            op_index: 3,
+            wall_ms: 0,
+            boundary: Boundary::ObjectStore,
+            action: "Content(BitFlip)".to_string(),
+            key: Some("ns/segments/cluster_0.bin".to_string()),
+            semantics: FaultSemantics::PostCommit,
+            observed: ObservedResult::Corrupted,
+            recovery: None,
+        });
+
+        assert!(!scheduler.fault_window_active(2, "ns"));
+        assert!(scheduler.fault_window_active(3, "ns"));
+        assert!(scheduler.fault_window_active(11, "ns"));
+        assert!(!scheduler.fault_window_active(12, "ns"));
+        assert!(!scheduler.fault_window_active(4, "other"));
     }
 }

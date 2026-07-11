@@ -72,6 +72,8 @@ pub enum OracleMutation {
     DroppedResponseLostWrite,
     CrashLostAck,
     ClockGcEatsLive,
+    SwallowCorruption,
+    MisdirectedWriteReachability,
 }
 
 impl OracleMutation {
@@ -91,6 +93,8 @@ impl OracleMutation {
             "dropped-response-lost-write" => Self::DroppedResponseLostWrite,
             "crash-lost-ack" => Self::CrashLostAck,
             "clock-gc-eats-live" => Self::ClockGcEatsLive,
+            "swallow-corruption" => Self::SwallowCorruption,
+            "misdirected-write-reachability" => Self::MisdirectedWriteReachability,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -111,6 +115,8 @@ impl OracleMutation {
             Self::DroppedResponseLostWrite => "dropped-response-lost-write",
             Self::CrashLostAck => "crash-lost-ack",
             Self::ClockGcEatsLive => "clock-gc-eats-live",
+            Self::SwallowCorruption => "swallow-corruption",
+            Self::MisdirectedWriteReachability => "misdirected-write-reachability",
         }
     }
 }

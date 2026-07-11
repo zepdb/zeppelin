@@ -27,6 +27,7 @@ impl HttpFaultInjector {
         let armed_for_task = Arc::clone(&armed);
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
+            let mut connections = Vec::new();
             loop {
                 tokio::select! {
                     changed = shutdown_rx.changed() => {
@@ -41,15 +42,17 @@ impl HttpFaultInjector {
                             .lock()
                             .expect("HTTP fault proxy armed mutex poisoned")
                             .take();
-                        tokio::spawn(async move {
-                            handle_connection(downstream, upstream, action)
-                                .await
-                                .unwrap_or_else(|error| {
-                                    panic!("HTTP fault proxy connection failed: {error}")
-                                });
-                        });
+                        connections.push(tokio::spawn(async move {
+                            handle_connection(downstream, upstream, action).await
+                        }));
                     }
                 }
+            }
+            for connection in connections {
+                connection
+                    .await
+                    .unwrap_or_else(|error| panic!("HTTP fault proxy task failed: {error}"))
+                    .unwrap_or_else(|error| panic!("HTTP fault proxy connection failed: {error}"));
             }
         });
         Ok(Self {
@@ -268,6 +271,61 @@ mod tests {
         );
 
         proxy.shutdown().await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_accepted_connections() {
+        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                upstream,
+                Router::new().route("/drop", post(|| async { Json(json!({ "ok": true })) })),
+            )
+            .await
+            .unwrap();
+        });
+        let proxy = HttpFaultInjector::start(upstream_addr).await.unwrap();
+        proxy.arm(HttpFaultAction {
+            event_id: "network-shutdown".to_string(),
+            op_index: 0,
+            kind: FaultKind::DropResponse,
+            window: false,
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let url = format!("{}/drop", proxy.base_url());
+        let request = tokio::spawn(async move {
+            client
+                .post(url)
+                .header(reqwest::header::CONNECTION, "close")
+                .send()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while proxy
+                .armed
+                .lock()
+                .expect("HTTP fault proxy armed mutex poisoned")
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("proxy never accepted the armed connection");
+
+        proxy.shutdown().await;
+
+        let response = tokio::time::timeout(Duration::from_millis(100), request)
+            .await
+            .expect("proxy shutdown returned with a live connection task")
+            .unwrap();
+        assert!(response.is_err());
         server.abort();
         let _ = server.await;
     }

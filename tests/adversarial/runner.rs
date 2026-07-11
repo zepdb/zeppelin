@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -365,6 +365,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let mut model = Model::default();
     let mut coverage = Coverage::default();
     let mut s3_tracker = S3Tracker::default();
+    let mut corruption_tracker = CorruptionTracker::default();
     let mut created_namespaces = Vec::new();
     let mut background_compaction_starts = BTreeMap::new();
     let mut failed = false;
@@ -387,6 +388,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             &mut model,
             &mut coverage,
             &mut s3_tracker,
+            &mut corruption_tracker,
             &op,
             source.index,
             started,
@@ -478,6 +480,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             &mut model,
             &mut coverage,
             &mut s3_tracker,
+            &mut corruption_tracker,
             &created_namespaces,
             &mut op_count,
             &mut compactions,
@@ -513,7 +516,8 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     } else {
         println!("preserved replay prefix {prefix}");
     }
-    stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
+    drop(client);
+    server.shutdown().await;
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     SeedOutcome {
         mode,
@@ -1285,6 +1289,8 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 OracleMutation::DroppedResponseLostWrite,
                 OracleMutation::CrashLostAck,
                 OracleMutation::ClockGcEatsLive,
+                OracleMutation::SwallowCorruption,
+                OracleMutation::MisdirectedWriteReachability,
             ]
         },
         |mutation| vec![mutation],
@@ -1353,6 +1359,12 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             }
             OracleMutation::CrashLostAck => fired.contains(&ViolationId::I16Quiescence),
             OracleMutation::ClockGcEatsLive => fired.contains(&ViolationId::I14S3Reachability),
+            OracleMutation::SwallowCorruption => {
+                fired.contains(&ViolationId::I20CorruptionSurfaced)
+            }
+            OracleMutation::MisdirectedWriteReachability => {
+                fired.contains(&ViolationId::I14S3Reachability)
+            }
         };
         assert!(
             accepted,
@@ -1393,6 +1405,8 @@ async fn run_seed(
         mutation.or(selftest_probe),
         Some(OracleMutation::ClockGcEatsLive)
     );
+    let swallow_corruption_selftest = mutation == Some(OracleMutation::SwallowCorruption);
+    let misdirected_write_selftest = mutation == Some(OracleMutation::MisdirectedWriteReachability);
     let profile = scheduled_profile(env.profile);
     let mode = if profile.is_some()
         || mutation == Some(OracleMutation::ChaosLostWrite)
@@ -1400,6 +1414,8 @@ async fn run_seed(
         || dropped_response_selftest
         || crash_lost_ack_selftest
         || clock_gc_eats_live_selftest
+        || swallow_corruption_selftest
+        || misdirected_write_selftest
     {
         RunMode::Chaos
     } else {
@@ -1409,7 +1425,15 @@ async fn run_seed(
     let prefix = harness.prefix.clone();
     let mut generator = AdversarialGenerator::new(seed, &prefix);
     let specs = generator.specs();
-    let scheduler = if clock_gc_eats_live_selftest {
+    let scheduler = if swallow_corruption_selftest {
+        Some(FaultScheduler::from_schedule(
+            FaultSchedule::swallow_corruption_selftest(),
+        ))
+    } else if misdirected_write_selftest {
+        Some(FaultScheduler::from_schedule(
+            FaultSchedule::misdirected_write_reachability_selftest(),
+        ))
+    } else if clock_gc_eats_live_selftest {
         Some(FaultScheduler::from_schedule(
             FaultSchedule::clock_gc_eats_live_selftest(),
         ))
@@ -1502,6 +1526,7 @@ async fn run_seed(
     let mut created_namespaces = Vec::new();
     let mut background_compaction_starts = BTreeMap::new();
     let mut s3_tracker = S3Tracker::default();
+    let mut corruption_tracker = CorruptionTracker::default();
     let mut op_index = 0u64;
     let mut failed = false;
     let mut failure_violations = Vec::new();
@@ -1523,6 +1548,7 @@ async fn run_seed(
             &mut model,
             &mut coverage,
             &mut s3_tracker,
+            &mut corruption_tracker,
             &op,
             op_index,
             started,
@@ -1613,6 +1639,7 @@ async fn run_seed(
                     &mut model,
                     &mut coverage,
                     &mut s3_tracker,
+                    &mut corruption_tracker,
                     &probe_op,
                     op_index,
                     started,
@@ -1697,6 +1724,7 @@ async fn run_seed(
             &mut model,
             &mut coverage,
             &mut s3_tracker,
+            &mut corruption_tracker,
             &created_namespaces,
             &mut op_index,
             &mut compactions,
@@ -1778,7 +1806,8 @@ async fn run_seed(
         println!("preserved adversarial prefix {prefix}");
     }
 
-    stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
+    drop(client);
+    server.shutdown().await;
 
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     println!(
@@ -1812,6 +1841,87 @@ struct StepOutcome {
     crash: Option<CrashRequest>,
 }
 
+#[derive(Debug, Default)]
+struct CorruptionTracker {
+    seen_timeline_events: usize,
+    tainted: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl CorruptionTracker {
+    fn observe(&mut self, timeline: &[TimelineEvent], namespaces: &[String]) {
+        if timeline.len() < self.seen_timeline_events {
+            self.seen_timeline_events = 0;
+        }
+        for event in timeline.iter().skip(self.seen_timeline_events) {
+            if event.observed != ObservedResult::Corrupted {
+                continue;
+            }
+            let Some(key) = event.key.as_ref() else {
+                continue;
+            };
+            let namespace = namespaces
+                .iter()
+                .filter(|namespace| timeline_key_matches_namespace(key, namespace))
+                .max_by_key(|namespace| namespace.len());
+            if let Some(namespace) = namespace {
+                self.tainted
+                    .entry(namespace.clone())
+                    .or_default()
+                    .insert(key.clone());
+            }
+        }
+        self.seen_timeline_events = timeline.len();
+    }
+
+    fn tainted_keys(&self, namespace: &str) -> Option<&BTreeSet<String>> {
+        self.tainted.get(namespace).filter(|keys| !keys.is_empty())
+    }
+
+    fn retain_reachable(&mut self, namespace: &str, reachable: &BTreeSet<String>) {
+        let Some(keys) = self.tainted.get_mut(namespace) else {
+            return;
+        };
+        keys.retain(|key| reachable.contains(key));
+        if keys.is_empty() {
+            self.tainted.remove(namespace);
+        }
+    }
+
+    fn forget_namespace(&mut self, namespace: &str) {
+        self.tainted.remove(namespace);
+    }
+}
+
+fn timeline_key_matches_namespace(key: &str, namespace: &str) -> bool {
+    key.split("->").any(|part| {
+        part == namespace
+            || part
+                .strip_prefix(namespace)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+async fn reachable_keys_for_taint(
+    store: &ZeppelinStore,
+    namespace: &str,
+) -> Result<Option<BTreeSet<String>>, String> {
+    let manifest = Manifest::read(store, namespace)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    gc::reachable_keys_with_retained_history_and_staging(
+        store,
+        namespace,
+        &manifest,
+        &BTreeSet::new(),
+    )
+    .await
+    .map(Some)
+    .map_err(|error| error.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_recorded_op(
     client: &Client,
@@ -1820,6 +1930,7 @@ async fn execute_recorded_op(
     model: &mut Model,
     coverage: &mut Coverage,
     s3_tracker: &mut S3Tracker,
+    corruption_tracker: &mut CorruptionTracker,
     op: &Op,
     index: u64,
     started: Instant,
@@ -1893,12 +2004,51 @@ async fn execute_recorded_op(
     coverage.record(op);
     artifacts.write_op(&rec);
     model.apply_outcome(op, &outcome, rec.gen_after, mutation, rec.index);
+    if (200..300).contains(&rec.status)
+        && mutation != Some(OracleMutation::MisdirectedWriteReachability)
+        && matches!(
+            op,
+            Op::CompactInline { .. }
+                | Op::CompactEndpoint { .. }
+                | Op::ProbeSandwich { .. }
+                | Op::GcCycle { .. }
+        )
+    {
+        let reachability_store = http_fault_context
+            .map(|context| &context.bookkeeping_store)
+            .unwrap_or(&server.store);
+        match reachable_keys_for_taint(reachability_store, op.namespace()).await {
+            Ok(Some(reachable)) => {
+                corruption_tracker.retain_reachable(op.namespace(), &reachable);
+            }
+            Ok(None) => corruption_tracker.forget_namespace(op.namespace()),
+            Err(error) => eprintln!(
+                "taint reachability refresh failed for {}: {error}",
+                op.namespace()
+            ),
+        }
+    }
+    if let Some(context) = http_fault_context {
+        corruption_tracker.observe(&context.scheduler.timeline(), &model.namespace_names());
+    }
     if (200..300).contains(&rec.status) {
         if let Op::DeleteNamespace { ns } = op {
             s3_tracker.forget_namespace(ns);
+            corruption_tracker.forget_namespace(ns);
         }
     }
-    let mut violations = oracle::check_op(model, &rec, mode, mutation);
+    let corruption = corruption_tracker
+        .tainted_keys(op.namespace())
+        .map(|tainted_keys| oracle::CorruptionContext {
+            tainted_keys,
+            fault_window_active: http_fault_context.is_some_and(|context| {
+                context
+                    .scheduler
+                    .fault_window_active(rec.index, op.namespace())
+            }),
+        });
+    let mut violations =
+        oracle::check_op_with_faults(model, &rec, mode, mutation, corruption.as_ref());
     if matches!(
         mutation,
         Some(
@@ -1919,15 +2069,42 @@ async fn execute_recorded_op(
             );
         }
     }
-    if mode == RunMode::Deterministic && rec.index % 25 == 0 {
+    let scheduled_content_or_semantic = http_fault_context.is_some_and(|context| {
+        matches!(
+            context.scheduler.schedule().profile,
+            FaultProfile::Content | FaultProfile::Semantic
+        )
+    });
+    if (mode == RunMode::Deterministic || scheduled_content_or_semantic) && rec.index % 25 == 0 {
         for (ns, ns_model) in &model.namespaces {
             if !ns_model.spec.is_exact() {
                 continue;
             }
-            let status = compact_status(client, &server.base_url, ns).await;
+            let status = if let Some(context) = http_fault_context {
+                match read_authoritative_manifest(
+                    &context.bookkeeping_store,
+                    ns,
+                    "periodic S3 oracle",
+                )
+                .await
+                {
+                    Some(manifest) => json!({
+                        "manifest_generation": manifest.version(),
+                    }),
+                    None => json!({ "manifest_generation": null }),
+                }
+            } else {
+                compact_status(client, &server.base_url, ns).await
+            };
+            let fault_window_active = http_fault_context
+                .is_some_and(|context| context.scheduler.fault_window_active(rec.index, ns));
+            let known_tainted_keys = corruption_tracker
+                .tainted_keys(ns)
+                .cloned()
+                .unwrap_or_default();
             violations.extend(
                 s3_tracker
-                    .check_namespace(
+                    .check_namespace_with_fault_context(
                         &server.store,
                         ns,
                         rec.index,
@@ -1936,6 +2113,8 @@ async fn execute_recorded_op(
                             mutation,
                             Some(OracleMutation::GcEatsLiveKey | OracleMutation::ClockGcEatsLive)
                         ),
+                        fault_window_active,
+                        &known_tainted_keys,
                     )
                     .await,
             );
@@ -2706,11 +2885,11 @@ async fn request_exchange(
         let action = request_is_mutation
             .then(|| context.scheduler.http_decision(&method, &path))
             .flatten();
-        (
-            format!("{}{}", context.proxy_base_url, suffix),
-            path,
-            action,
-        )
+        let target_url = action.as_ref().map_or_else(
+            || url.to_string(),
+            |_| format!("{}{}", context.proxy_base_url, suffix),
+        );
+        (target_url, path, action)
     } else {
         (url.to_string(), url.to_string(), None)
     };
@@ -2723,7 +2902,7 @@ async fn request_exchange(
             body.as_ref(),
             ambiguity_allowed,
             request_is_mutation,
-            context.is_some(),
+            false,
             None,
         )
         .await;
@@ -3201,6 +3380,16 @@ fn gc_config(keep_count: u64) -> GcConfig {
     }
 }
 
+fn accept_loud_tainted_quiescence(
+    status: u16,
+    violations: &[Violation],
+    tainted_keys: Option<&BTreeSet<String>>,
+) -> bool {
+    (500..600).contains(&status)
+        && violations.is_empty()
+        && tainted_keys.is_some_and(|keys| !keys.is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn quiesce_and_verify(
     client: &Client,
@@ -3209,6 +3398,7 @@ async fn quiesce_and_verify(
     model: &mut Model,
     coverage: &mut Coverage,
     s3_tracker: &mut S3Tracker,
+    corruption_tracker: &mut CorruptionTracker,
     _namespaces: &[String],
     op_index: &mut u64,
     compactions: &mut u64,
@@ -3221,16 +3411,74 @@ async fn quiesce_and_verify(
         return resolutions;
     }
     let namespaces = model.namespace_names();
+    if mutation == Some(OracleMutation::MisdirectedWriteReachability) {
+        for ns in &namespaces {
+            let Some(ns_model) = model.namespaces.get(ns) else {
+                continue;
+            };
+            if !ns_model.spec.is_exact() {
+                continue;
+            }
+            let status = match Manifest::read(&server.store, ns).await {
+                Ok(Some(manifest)) => json!({
+                    "manifest_generation": manifest.version(),
+                }),
+                Ok(None) => json!({ "manifest_generation": null }),
+                Err(error) => {
+                    return vec![Violation {
+                        id: ViolationId::I15ManifestLineage,
+                        op_index: *op_index,
+                        namespace: ns.clone(),
+                        detail: "selftest manifest read-failed at quiescence".to_string(),
+                        evidence: json!({ "error": error.to_string() }),
+                    }];
+                }
+            };
+            let violations = s3_tracker
+                .check_namespace(&server.store, ns, *op_index, &status, false)
+                .await;
+            if !violations.is_empty() {
+                return violations;
+            }
+        }
+    }
     for ns in &namespaces {
         let compact = Op::CompactInline { ns: ns.clone() };
         let step = execute_recorded_op(
-            client, server, artifacts, model, coverage, s3_tracker, &compact, *op_index, started,
-            mutation, mode, None, false,
+            client,
+            server,
+            artifacts,
+            model,
+            coverage,
+            s3_tracker,
+            corruption_tracker,
+            &compact,
+            *op_index,
+            started,
+            mutation,
+            mode,
+            None,
+            false,
         )
         .await;
         *op_index += 1;
         *compactions += u64::from((200..300).contains(&step.status));
         if !(200..300).contains(&step.status) {
+            if accept_loud_tainted_quiescence(
+                step.status,
+                &step.violations,
+                corruption_tracker.tainted_keys(ns),
+            ) {
+                eprintln!(
+                    "accepted loud quiescence failure for known-tainted namespace {ns}: \
+                     status={}",
+                    step.status
+                );
+                continue;
+            }
+            if !step.violations.is_empty() {
+                return step.violations;
+            }
             return vec![Violation {
                 id: ViolationId::I16Quiescence,
                 op_index: *op_index,
@@ -3249,8 +3497,20 @@ async fn quiesce_and_verify(
                 keep_count: 1,
             };
             let step = execute_recorded_op(
-                client, server, artifacts, model, coverage, s3_tracker, &gc, *op_index, started,
-                mutation, mode, None, false,
+                client,
+                server,
+                artifacts,
+                model,
+                coverage,
+                s3_tracker,
+                corruption_tracker,
+                &gc,
+                *op_index,
+                started,
+                mutation,
+                mode,
+                None,
+                false,
             )
             .await;
             *op_index += 1;
@@ -3311,8 +3571,20 @@ async fn quiesce_and_verify(
             consistency: ConsistencyLevel::Strong,
         };
         let step = execute_recorded_op(
-            client, server, artifacts, model, coverage, s3_tracker, &fetch, *op_index, started,
-            mutation, mode, None, false,
+            client,
+            server,
+            artifacts,
+            model,
+            coverage,
+            s3_tracker,
+            corruption_tracker,
+            &fetch,
+            *op_index,
+            started,
+            mutation,
+            mode,
+            None,
+            false,
         )
         .await;
         *op_index += 1;
@@ -3327,8 +3599,20 @@ async fn quiesce_and_verify(
             as_of: None,
         };
         let step = execute_recorded_op(
-            client, server, artifacts, model, coverage, s3_tracker, &query, *op_index, started,
-            mutation, mode, None, false,
+            client,
+            server,
+            artifacts,
+            model,
+            coverage,
+            s3_tracker,
+            corruption_tracker,
+            &query,
+            *op_index,
+            started,
+            mutation,
+            mode,
+            None,
+            false,
         )
         .await;
         *op_index += 1;
@@ -3762,6 +4046,22 @@ fn selftest_probe_op(
                 None
             }
         }
+        (OracleMutation::SwallowCorruption, Op::Upsert { ns, .. }) => {
+            let ns_model = model.namespaces.get(ns)?;
+            if ns_model.compacted_live.is_empty() {
+                Some(Op::CompactInline { ns: ns.clone() })
+            } else {
+                let q = generator.exhaustive_query(model, ns, None);
+                matches!(&q.class, QueryOracleClass::ExactAnn { .. }).then(|| Op::Query {
+                    ns: ns.clone(),
+                    q,
+                    as_of: None,
+                })
+            }
+        }
+        (OracleMutation::MisdirectedWriteReachability, Op::Upsert { ns, .. }) => {
+            Some(Op::CompactInline { ns: ns.clone() })
+        }
         _ => None,
     }
 }
@@ -3800,11 +4100,81 @@ mod outcome_tests {
     use axum::http::{HeaderMap, HeaderValue};
     use axum::routing::post;
     use axum::{Json, Router};
+    use object_store::memory::InMemory;
     use zeppelin::index::quantization::QuantizationType;
     use zeppelin::types::DistanceMetric;
 
     use super::*;
     use crate::adversarial::faults::{FaultEvent, TargetSelector};
+
+    #[test]
+    fn corruption_tracker_records_new_timeline_taint_per_namespace_once() {
+        let event = TimelineEvent {
+            event_id: "content-00".to_string(),
+            op_index: 7,
+            wall_ms: 0,
+            boundary: Boundary::ObjectStore,
+            action: "Content(BitFlip)".to_string(),
+            key: Some("ns-a/segments/cluster_0.bin".to_string()),
+            semantics: FaultSemantics::PostCommit,
+            observed: ObservedResult::Corrupted,
+            recovery: None,
+        };
+        let mut tracker = CorruptionTracker::default();
+        let namespaces = vec!["ns-a".to_string(), "ns-b".to_string()];
+
+        tracker.observe(std::slice::from_ref(&event), &namespaces);
+        tracker.observe(std::slice::from_ref(&event), &namespaces);
+
+        assert_eq!(
+            tracker.tainted_keys("ns-a"),
+            Some(&BTreeSet::from(["ns-a/segments/cluster_0.bin".to_string()]))
+        );
+        assert!(tracker.tainted_keys("ns-b").is_none());
+        assert_eq!(tracker.seen_timeline_events, 1);
+    }
+
+    #[test]
+    fn corruption_tracker_clears_taint_after_artifact_is_rewritten() {
+        let mut tracker = CorruptionTracker {
+            seen_timeline_events: 0,
+            tainted: BTreeMap::from([(
+                "ns".to_string(),
+                BTreeSet::from([
+                    "ns/segments/old.bin".to_string(),
+                    "ns/segments/live.bin".to_string(),
+                ]),
+            )]),
+        };
+
+        tracker.retain_reachable("ns", &BTreeSet::from(["ns/segments/live.bin".to_string()]));
+
+        assert_eq!(
+            tracker.tainted_keys("ns"),
+            Some(&BTreeSet::from(["ns/segments/live.bin".to_string()]))
+        );
+    }
+
+    #[test]
+    fn quiescence_accepts_only_clean_loud_failure_for_known_taint() {
+        let tainted = BTreeSet::from(["ns/wal/missing.wal".to_string()]);
+        let malformed_error = vec![Violation {
+            id: ViolationId::I11ErrorEnvelope,
+            op_index: 7,
+            namespace: "ns".to_string(),
+            detail: "malformed error".to_string(),
+            evidence: json!({}),
+        }];
+
+        assert!(accept_loud_tainted_quiescence(500, &[], Some(&tainted)));
+        assert!(!accept_loud_tainted_quiescence(500, &[], None));
+        assert!(!accept_loud_tainted_quiescence(
+            500,
+            &malformed_error,
+            Some(&tainted)
+        ));
+        assert!(!accept_loud_tainted_quiescence(200, &[], Some(&tainted)));
+    }
 
     #[tokio::test]
     async fn mutating_server_error_is_ambiguous_when_faults_are_active() {
@@ -3849,6 +4219,52 @@ mod outcome_tests {
                 status: Some(500),
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn unmatched_http_requests_bypass_fault_proxy() {
+        let app = Router::new().route(
+            "/pass",
+            post(|| async { Json(json!({ "relayed": "direct" })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let direct_base_url = format!("http://{address}");
+        let injector = start_http_fault_injector(&direct_base_url).await;
+        let context = HttpFaultContext {
+            scheduler: FaultScheduler::from_schedule(FaultSchedule {
+                profile: FaultProfile::Network,
+                events: Vec::new(),
+            }),
+            injector: Arc::clone(&injector),
+            bookkeeping_store: ZeppelinStore::new(Arc::new(InMemory::new())),
+            direct_base_url: direct_base_url.clone(),
+            proxy_base_url: "http://127.0.0.1:1".to_string(),
+        };
+
+        let outcome = HTTP_FAULT_CONTEXT
+            .scope(
+                Some(context),
+                REQUEST_IS_MUTATION.scope(
+                    false,
+                    request_outcome(
+                        &adversarial_client(),
+                        Method::POST,
+                        &format!("{direct_base_url}/pass"),
+                        None,
+                        true,
+                    ),
+                ),
+            )
+            .await;
+
+        assert!(matches!(outcome, OpOutcome::Applied { status: 200, .. }));
+        Arc::try_unwrap(injector).unwrap().shutdown().await;
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -3953,6 +4369,144 @@ mod outcome_tests {
         Arc::try_unwrap(injector).unwrap().shutdown().await;
         stop_chaos_and_background(&mut server, None).await;
         cleanup_ns(&harness.store, &ns).await;
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn copy_source_vanish_clone_fails_loudly_and_preserves_source_at_quiescence() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let source = format!("{prefix}-copy-vanish-source");
+        let target = format!("{prefix}-copy-vanish-target");
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let client = adversarial_client();
+        let setup_server = start_test_server_full(
+            harness.store.clone(),
+            Some(prefix.clone()),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+        let create = client
+            .post(format!("{}/v1/namespaces", setup_server.base_url))
+            .json(&spec.create_body(&source))
+            .send()
+            .await
+            .unwrap();
+        assert!(create.status().is_success());
+        let upsert = client
+            .post(format!(
+                "{}/v1/namespaces/{source}/vectors",
+                setup_server.base_url
+            ))
+            .json(&json!({
+                "vectors": [{ "id": "one", "values": [1.0, 0.0] }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(upsert.status().is_success());
+        setup_server.compactor.compact(&source).await.unwrap();
+        let generation = Manifest::read(&harness.store, &source)
+            .await
+            .unwrap()
+            .expect("source manifest must exist")
+            .version();
+        setup_server.shutdown().await;
+
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Semantic,
+            events: vec![FaultEvent {
+                id: "semantic-copy-source-vanish".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(super::super::chaos::StoreOp::Copy),
+                    key_substring: Some("segments/".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::CopySourceVanish,
+            }],
+        });
+        let faulted_store = store_fault_proxy(&harness.store, scheduler.clone());
+        let server = start_test_server_full(
+            faulted_store,
+            Some(prefix),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+
+        let clone = client
+            .post(format!("{}/v1/namespaces/{source}/clone", server.base_url))
+            .json(&json!({
+                "target": target,
+                "as_of": generation.to_string(),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(clone.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let clone_body = clone.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(clone_body["code"], "STORAGE_ERROR");
+        assert_eq!(clone_body["status"], 500);
+        assert!(clone_body["request_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert_eq!(scheduler.timeline().len(), 1);
+        assert_eq!(scheduler.timeline()[0].observed, ObservedResult::Corrupted);
+
+        server.compactor.compact(&source).await.unwrap();
+        let source_manifest = Manifest::read(&harness.store, &source)
+            .await
+            .unwrap()
+            .expect("source manifest must survive failed clone");
+        let quiescent = s3_oracle::check_quiescent_namespace(
+            &harness.store,
+            &source,
+            1,
+            &json!({ "ready": true, "uncompacted_fragments": 0 }),
+            1,
+        )
+        .await;
+        assert!(quiescent.is_empty(), "{quiescent:#?}");
+        assert_eq!(source_manifest.vector_count(), 1);
+        assert!(!harness
+            .store
+            .exists(&format!("{target}/manifest.json"))
+            .await
+            .unwrap());
+
+        let fetch = client
+            .post(format!(
+                "{}/v1/namespaces/{source}/vectors/get",
+                server.base_url
+            ))
+            .json(&json!({
+                "ids": ["one"],
+                "include_vector": true,
+                "consistency": "strong"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(fetch.status().is_success());
+        let fetch_body = fetch.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(fetch_body["results"][0]["id"], "one");
+
+        server.shutdown().await;
+        cleanup_ns(&harness.store, &source).await;
+        cleanup_ns(&harness.store, &target).await;
         harness.cleanup().await;
     }
 }
