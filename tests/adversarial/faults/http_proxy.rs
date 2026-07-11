@@ -18,6 +18,12 @@ pub struct HttpFaultInjector {
     task: JoinHandle<()>,
 }
 
+#[derive(Clone, Debug)]
+pub struct HttpFaultRequestHandle {
+    addr: SocketAddr,
+    armed: Arc<Mutex<Option<HttpFaultAction>>>,
+}
+
 impl HttpFaultInjector {
     pub async fn start(upstream: SocketAddr) -> io::Result<Self> {
         let listener =
@@ -68,6 +74,36 @@ impl HttpFaultInjector {
         format!("http://{}", self.addr)
     }
 
+    #[must_use]
+    pub fn request_handle(&self) -> HttpFaultRequestHandle {
+        HttpFaultRequestHandle {
+            addr: self.addr,
+            armed: Arc::clone(&self.armed),
+        }
+    }
+
+    pub fn arm(&self, action: HttpFaultAction) {
+        self.request_handle().arm(action);
+    }
+
+    pub fn disarm(&self) {
+        self.request_handle().disarm();
+    }
+
+    pub async fn shutdown(self) {
+        let _ = self.shutdown.send(true);
+        self.task
+            .await
+            .unwrap_or_else(|error| panic!("HTTP fault proxy task failed: {error}"));
+    }
+}
+
+impl HttpFaultRequestHandle {
+    #[must_use]
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
     pub fn arm(&self, action: HttpFaultAction) {
         assert!(
             matches!(
@@ -95,13 +131,6 @@ impl HttpFaultInjector {
             .lock()
             .expect("HTTP fault proxy armed mutex poisoned")
             .take();
-    }
-
-    pub async fn shutdown(self) {
-        let _ = self.shutdown.send(true);
-        self.task
-            .await
-            .unwrap_or_else(|error| panic!("HTTP fault proxy task failed: {error}"));
     }
 }
 
@@ -324,6 +353,69 @@ mod tests {
         let response = tokio::time::timeout(Duration::from_millis(100), request)
             .await
             .expect("proxy shutdown returned with a live connection task")
+            .unwrap();
+        assert!(response.is_err());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_accepted_connections_while_request_handle_is_live() {
+        let upstream = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_received = Arc::new(tokio::sync::Notify::new());
+        let handler_received = Arc::clone(&upstream_received);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                upstream,
+                Router::new().route(
+                    "/drop",
+                    post(move || {
+                        let handler_received = Arc::clone(&handler_received);
+                        async move {
+                            handler_received.notify_one();
+                            Json(json!({ "ok": true }))
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let proxy = Arc::new(HttpFaultInjector::start(upstream_addr).await.unwrap());
+        let request_handle = proxy.request_handle();
+        request_handle.arm(HttpFaultAction {
+            event_id: "network-shutdown-handle".to_string(),
+            op_index: 0,
+            kind: FaultKind::DropResponse,
+            window: false,
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let url = format!("{}/drop", request_handle.base_url());
+        let request = tokio::spawn(async move {
+            client
+                .post(url)
+                .header(reqwest::header::CONNECTION, "close")
+                .send()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), upstream_received.notified())
+            .await
+            .expect("proxy never forwarded the accepted request owned by the live handle");
+
+        let proxy = Arc::try_unwrap(proxy)
+            .expect("a live request handle must not retain the injector lifecycle owner");
+        tokio::time::timeout(Duration::from_secs(1), proxy.shutdown())
+            .await
+            .expect("proxy shutdown did not drain its accepted request boundedly");
+
+        assert!(request_handle.base_url().starts_with("http://"));
+        let response = tokio::time::timeout(Duration::from_millis(100), request)
+            .await
+            .expect("proxy shutdown returned with a live accepted request")
             .unwrap();
         assert!(response.is_err());
         server.abort();

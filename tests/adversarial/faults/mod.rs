@@ -35,6 +35,7 @@ pub enum FaultProfile {
     Semantic,
     Sched,
     Ops,
+    Full,
 }
 
 impl FaultProfile {
@@ -50,7 +51,24 @@ impl FaultProfile {
             "semantic" => Self::Semantic,
             "sched" => Self::Sched,
             "ops" => Self::Ops,
+            "full" => Self::Full,
             other => panic!("invalid ZEPPELIN_ADVERSARIAL_PROFILE: {other}"),
+        }
+    }
+
+    #[must_use]
+    pub fn as_env(self) -> &'static str {
+        match self {
+            Self::LegacyChaos => "legacy_chaos",
+            Self::PostCommit => "post_commit",
+            Self::Network => "network",
+            Self::Crash => "crash",
+            Self::Clock => "clock",
+            Self::Content => "content",
+            Self::Semantic => "semantic",
+            Self::Sched => "sched",
+            Self::Ops => "ops",
+            Self::Full => "full",
         }
     }
 
@@ -65,6 +83,7 @@ impl FaultProfile {
             Self::Semantic => "semantic",
             Self::Sched => "sched",
             Self::Ops => "ops",
+            Self::Full => "full",
         }
     }
 }
@@ -295,6 +314,7 @@ struct SchedulerRuntime {
     logical_op: AtomicU64,
     logical_op_tx: tokio::sync::watch::Sender<u64>,
     quiesced: AtomicBool,
+    release_held_calls: AtomicBool,
     timeline: Mutex<Vec<TimelineEvent>>,
     timeline_revision_tx: tokio::sync::watch::Sender<u64>,
     events: Vec<EventRuntime>,
@@ -334,7 +354,10 @@ impl FaultScheduler {
     }
 
     fn with_salt(schedule: FaultSchedule, rng_salt: u64) -> Self {
-        let process = (schedule.profile == FaultProfile::Crash)
+        let process = schedule
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, FaultKind::CrashAt { .. }))
             .then(|| Arc::new(Mutex::new(ProcessController::new())));
         let events = schedule
             .events
@@ -354,6 +377,7 @@ impl FaultScheduler {
                 logical_op: AtomicU64::new(0),
                 logical_op_tx,
                 quiesced: AtomicBool::new(false),
+                release_held_calls: AtomicBool::new(false),
                 timeline: Mutex::new(Vec::new()),
                 timeline_revision_tx,
                 events,
@@ -666,6 +690,30 @@ impl FaultScheduler {
         self.runtime.logical_op_tx.send_replace(current);
     }
 
+    pub fn begin_quiet_period(&self, event: TimelineEvent) {
+        let mut timeline = self
+            .runtime
+            .timeline
+            .lock()
+            .expect("fault timeline mutex poisoned");
+        self.runtime.quiesced.store(true, Ordering::SeqCst);
+        timeline.push(event);
+        let current = self.runtime.logical_op.load(Ordering::SeqCst);
+        self.runtime.logical_op_tx.send_replace(current);
+        drop(timeline);
+        self.runtime
+            .timeline_revision_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+
+    pub fn release_held_calls(&self) {
+        self.runtime
+            .release_held_calls
+            .store(true, Ordering::SeqCst);
+        let current = self.runtime.logical_op.load(Ordering::SeqCst);
+        self.runtime.logical_op_tx.send_replace(current);
+    }
+
     pub async fn wait_for_hold_release(&self, action: &StoreFaultAction) {
         let FaultKind::HoldCall { for_ops } = action.kind else {
             panic!("wait_for_hold_release requires HoldCall");
@@ -673,7 +721,9 @@ impl FaultScheduler {
         let release_op = action.op_index.saturating_add(for_ops);
         let mut logical_op = self.runtime.logical_op_tx.subscribe();
         loop {
-            if self.runtime.quiesced.load(Ordering::SeqCst) || *logical_op.borrow() >= release_op {
+            if self.runtime.release_held_calls.load(Ordering::SeqCst)
+                || *logical_op.borrow() >= release_op
+            {
                 return;
             }
             logical_op
@@ -771,7 +821,7 @@ impl FaultScheduler {
         if self.runtime.quiesced.load(Ordering::SeqCst)
             || !matches!(
                 self.schedule.profile,
-                FaultProfile::Content | FaultProfile::Semantic
+                FaultProfile::Content | FaultProfile::Semantic | FaultProfile::Full
             )
         {
             return false;
@@ -1498,6 +1548,31 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
                 },
             );
         }
+        FaultProfile::Full => {
+            let sources = [
+                FaultProfile::PostCommit,
+                FaultProfile::Network,
+                FaultProfile::Crash,
+                FaultProfile::Clock,
+                FaultProfile::Content,
+                FaultProfile::Semantic,
+                FaultProfile::Sched,
+                FaultProfile::Ops,
+            ];
+            for (index, source) in sources.into_iter().enumerate() {
+                let source_seed = seed
+                    ^ (u64::try_from(index + 1)
+                        .expect("full profile source index must fit u64")
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                let mut event = schedule_for_seed(source_seed, source)
+                    .events
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| panic!("{source:?} generated no Full-profile event"));
+                event.id = format!("full-{}-{index:02}", source.id_prefix());
+                events.push(event);
+            }
+        }
     }
     FaultSchedule { profile, events }
 }
@@ -1775,6 +1850,7 @@ mod tests {
             FaultProfile::Semantic,
             FaultProfile::Sched,
             FaultProfile::Ops,
+            FaultProfile::Full,
         ] {
             for seed in 0..20 {
                 let first = FaultScheduler::for_seed(seed, profile);
@@ -1788,6 +1864,36 @@ mod tests {
                 }));
             }
         }
+    }
+
+    #[test]
+    fn full_profile_draws_one_deterministic_event_from_each_family() {
+        let scheduler = FaultScheduler::for_seed(11, FaultProfile::Full);
+        let schedule = scheduler.schedule();
+        assert_eq!(schedule.profile, FaultProfile::Full);
+        assert_eq!(schedule.events.len(), 8, "{schedule:#?}");
+        assert_eq!(
+            schedule
+                .events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "full-post-commit-00",
+                "full-network-01",
+                "full-crash-02",
+                "full-clock-03",
+                "full-content-04",
+                "full-semantic-05",
+                "full-sched-06",
+                "full-ops-07",
+            ]
+        );
+        assert!(scheduler.process_controller().is_some());
+        assert_eq!(
+            schedule,
+            FaultScheduler::for_seed(11, FaultProfile::Full).schedule()
+        );
     }
 
     #[test]
@@ -2070,5 +2176,42 @@ mod tests {
         assert!(scheduler.fault_window_active(11, "ns"));
         assert!(!scheduler.fault_window_active(12, "ns"));
         assert!(!scheduler.fault_window_active(4, "other"));
+    }
+
+    #[test]
+    fn full_profile_inherits_semantic_fault_window_attribution() {
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Full,
+            events: vec![FaultEvent {
+                id: "full-semantic-05".to_string(),
+                start_op: 55,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("manifest.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::HeadGetDiverge,
+            }],
+        });
+        let _ = scheduler.advance_to(55);
+        let action = scheduler
+            .store_decision(StoreOp::Get, "ns/manifest.json")
+            .expect("pinned semantic event must fire");
+        scheduler.record(TimelineEvent {
+            event_id: action.event_id,
+            op_index: 55,
+            wall_ms: 0,
+            boundary: Boundary::ObjectStore,
+            action: "HeadGetDiverge".to_string(),
+            key: Some("ns/manifest.json".to_string()),
+            semantics: FaultSemantics::PostCommit,
+            observed: ObservedResult::Corrupted,
+            recovery: Some("HEAD succeeded before injected GET NotFound".to_string()),
+        });
+
+        assert!(scheduler.fault_window_active(56, "ns"));
+        assert!(!scheduler.fault_window_active(56, "other"));
     }
 }

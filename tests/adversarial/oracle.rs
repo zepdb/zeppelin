@@ -941,7 +941,7 @@ fn push_nested_error<'a>(
     nested.push(NestedErrorEnvelope {
         path: path.to_string(),
         status,
-        body: &wrapper["body"],
+        body: wrapper.get("body").unwrap_or(wrapper),
     });
 }
 
@@ -2828,6 +2828,35 @@ mod tests {
             }),
         );
         rec.status = 500;
+
+        let violations = check_i11_error_envelope(&rec);
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn i11_accepts_batch_level_concurrency_limit_envelope() {
+        let concurrency_limit = json!({
+            "code": "CONCURRENCY_LIMIT",
+            "error": "query concurrency limit reached, try again later",
+            "request_id": "req",
+            "retryable": true,
+            "status": 503
+        });
+        let mut rec = batch_record(json!({
+            "batch": concurrency_limit,
+            "individual": [{
+                "status": 503,
+                "body": {
+                    "code": "CONCURRENCY_LIMIT",
+                    "error": "query concurrency limit reached, try again later",
+                    "request_id": "req-individual",
+                    "retryable": true,
+                    "status": 503
+                }
+            }]
+        }));
+        rec.status = 503;
 
         let violations = check_i11_error_envelope(&rec);
 

@@ -568,7 +568,9 @@ impl StoreFaultProxy {
     fn tracks_bodies(&self) -> bool {
         matches!(
             self.scheduler.schedule().profile,
-            super::FaultProfile::Content | super::FaultProfile::Semantic
+            super::FaultProfile::Content
+                | super::FaultProfile::Semantic
+                | super::FaultProfile::Full
         )
     }
 

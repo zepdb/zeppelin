@@ -30,15 +30,16 @@ use super::artifacts::{
 };
 use super::chaos::{chaos_store, ChaosHandle, FaultPlan, FiredFault, StoreOp};
 use super::faults::clock::TestClock;
-use super::faults::http_proxy::HttpFaultInjector;
+use super::faults::http_proxy::{HttpFaultInjector, HttpFaultRequestHandle};
 use super::faults::process::{CrashRequest, ProcessController, TriggerPosition};
 use super::faults::store_proxy::{
     operational_store_proxy, stale_manifest_cas_selftest_proxy, store_fault_proxy,
     OperationalStoreObserver,
 };
 use super::faults::{
-    Boundary, ClockCommand, FaultKind, FaultProfile, FaultSchedule, FaultScheduler, FaultSemantics,
-    ForegroundHold, HttpFaultAction, ObservedResult, SchedulerCommand, TimelineEvent,
+    Boundary, ClockCommand, ContentFault, FaultKind, FaultProfile, FaultSchedule, FaultScheduler,
+    FaultSemantics, ForegroundHold, HttpFaultAction, ObservedResult, SchedulerCommand,
+    TimelineEvent,
 };
 use super::generator::{AdversarialGenerator, Coverage};
 use super::model::{
@@ -50,7 +51,7 @@ use super::ops::{
 };
 use super::oracle::{self, Violation, ViolationId};
 use super::s3_oracle::{self, S3Tracker};
-use super::{PreserveMode, RunMode, RunnerEnv};
+use super::{effective_seed_assignment, PreserveMode, RunMode, RunnerEnv};
 
 const AMBIGUITY_MARKER: &str = "_adversarial_ambiguity";
 const STORE_FAULT_MARKER: &str = "_adversarial_store_fault";
@@ -65,7 +66,7 @@ tokio::task_local! {
 #[derive(Clone)]
 struct HttpFaultContext {
     scheduler: FaultScheduler,
-    injector: Arc<HttpFaultInjector>,
+    injector: HttpFaultRequestHandle,
     bookkeeping_store: ZeppelinStore,
     direct_base_url: String,
     proxy_base_url: String,
@@ -666,16 +667,34 @@ fn requires_two_node_compaction_evidence(scheduler: Option<&FaultScheduler>) -> 
 
 fn requires_two_node_compaction_evidence_for_schedule(schedule: Option<&FaultSchedule>) -> bool {
     schedule.is_some_and(|schedule| {
-        schedule.profile == FaultProfile::Ops
+        let has_second_node = schedule
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, FaultKind::StartSecondNode { .. }));
+        let bounded_ops_campaign = schedule.profile == FaultProfile::Ops
             && schedule
                 .events
                 .iter()
-                .any(|event| matches!(event.kind, FaultKind::ResourceExhaustion { .. }))
+                .any(|event| matches!(event.kind, FaultKind::ResourceExhaustion { .. }));
+        // The publication rendezvous is an Ops campaign proof. Full profiles
+        // deliberately overlap families that may block either worker.
+        has_second_node && bounded_ops_campaign
     })
 }
 
 fn requires_operational_store_observer(scheduler: Option<&FaultScheduler>) -> bool {
-    scheduler.is_some_and(|scheduler| scheduler.schedule().profile == FaultProfile::Ops)
+    scheduler.is_some_and(|scheduler| {
+        scheduler.schedule().events.iter().any(|event| {
+            matches!(
+                event.kind,
+                FaultKind::StartSecondNode { .. }
+                    | FaultKind::PatchConfigDuringTraffic
+                    | FaultKind::DeleteNamespaceInFlight
+                    | FaultKind::FillDiskCache
+                    | FaultKind::ResourceExhaustion { .. }
+            )
+        })
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -692,6 +711,7 @@ pub struct RunSummary {
 #[derive(Debug)]
 struct SeedOutcome {
     mode: RunMode,
+    profile: Option<FaultProfile>,
     failed: bool,
     ops: u64,
     compactions: u64,
@@ -738,6 +758,7 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
         seed_reports.push(SeedReport {
             seed: *seed,
             mode: outcome.mode,
+            profile: outcome.profile,
             dir: artifact_root.join(format!("seed-{seed}")),
             failed: outcome.failed,
             ops: outcome.ops,
@@ -752,6 +773,41 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
     summary.ops_per_sec = summary.ops_total as f64 / started.elapsed().as_secs_f64().max(0.001);
     artifacts.write_report(&env, &seed_reports, &summary.coverage, false);
     summary
+}
+
+/// Returns the seed at `seed_index` in the deterministic overnight stream.
+///
+/// The configured prefix is emitted verbatim for artifact compatibility. The
+/// remainder enumerates the smallest seeds not present in that prefix, which
+/// keeps every emitted seed unique and advances through every Mixed-mode slot.
+#[must_use]
+fn overnight_seed(configured_seeds: &[u64], seed_index: usize) -> u64 {
+    assert!(
+        !configured_seeds.is_empty(),
+        "overnight requires at least one configured seed"
+    );
+    let configured = configured_seeds.iter().copied().collect::<BTreeSet<_>>();
+    assert_eq!(
+        configured.len(),
+        configured_seeds.len(),
+        "overnight configured seeds must be unique"
+    );
+
+    if seed_index < configured_seeds.len() {
+        return configured_seeds[seed_index];
+    }
+
+    let mut candidate = u64::try_from(seed_index - configured_seeds.len())
+        .expect("overnight seed index does not fit in u64");
+    for configured_seed in configured {
+        if configured_seed > candidate {
+            break;
+        }
+        candidate = candidate
+            .checked_add(1)
+            .expect("overnight seed space exhausted");
+    }
+    candidate
 }
 
 pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
@@ -772,9 +828,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
     let mut seed_index = 0usize;
 
     while Instant::now() < deadline || summary.seeds_run == 0 {
-        let base_seed = env.seeds[seed_index % env.seeds.len()];
-        let round = (seed_index / env.seeds.len()) as u64;
-        let seed = base_seed.wrapping_add(round << 32);
+        let seed = overnight_seed(&env.seeds, seed_index);
         let outcome = run_seed(&env, &artifacts, seed, deadline, env.selftest, env.selftest).await;
         summary.seeds_run += 1;
         summary.failed_seeds += u64::from(outcome.failed);
@@ -785,6 +839,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
         seed_reports.push(SeedReport {
             seed,
             mode: outcome.mode,
+            profile: outcome.profile,
             dir: artifact_root.join(format!("seed-{seed}")),
             failed: outcome.failed,
             ops: outcome.ops,
@@ -930,6 +985,10 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let chaos_plan_json = chaos_plan
         .as_ref()
         .map(|plan| serde_json::to_value(plan).expect("FaultPlan must serialize"));
+    let active_profile = scheduler
+        .as_ref()
+        .map(|scheduler| scheduler.schedule().profile)
+        .or_else(|| chaos_plan.as_ref().map(|_| FaultProfile::LegacyChaos));
     let old_prefix = recorded_namespace_prefix(seed_config.seed, &seed_config.namespace_specs);
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
@@ -987,7 +1046,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             .zip(injector.as_ref())
             .map(|(scheduler, injector)| HttpFaultContext {
                 scheduler: scheduler.clone(),
-                injector: Arc::clone(injector),
+                injector: injector.request_handle(),
                 bookkeeping_store: harness.store.clone(),
                 direct_base_url: server.base_url.clone(),
                 proxy_base_url: injector.base_url(),
@@ -1003,11 +1062,13 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let mut failure_violations = Vec::new();
     let mut compactions = 0u64;
     let mut pending_held_op = None;
-    let mut scheduler_quiesced = false;
     let started = Instant::now();
     let max_ops = env.max_ops.unwrap_or(u64::MAX);
 
     let source_records = read_ops(replay);
+    let source_failure = read_failure_manifest(replay);
+    let source_failure_before_quiet =
+        source_failure_precedes_unrecorded_quiet_period(&source_records, source_failure.as_ref());
     let (exact_execution_trace, workload_records) = replay_workload_records(&source_records);
     let workload_record_count = workload_records.len();
     let records = workload_records
@@ -1017,9 +1078,52 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let replayed_full_workload = records.len() == workload_record_count;
     let replayed_workload_count =
         u64::try_from(records.len()).expect("replayed workload count must fit in u64");
-    for source in records {
+    let mut replay_op_index = 0u64;
+    let mut quiet_drain_ops = VecDeque::new();
+    for (record_position, source) in records.iter().cloned().enumerate() {
         let commands =
             advance_scheduled_faults(scheduler.as_ref(), test_clock.as_ref(), source.index);
+        let enters_quiet_period =
+            pending_held_op
+                .as_ref()
+                .is_some_and(|pending: &PendingHeldOp| {
+                    pending.release_op <= source.index
+                        && exact_execution_trace
+                        && replayed_hold_releases_before_nominal(
+                            scheduler
+                                .as_ref()
+                                .expect("recorded foreground hold requires a fault scheduler"),
+                            pending,
+                        )
+                });
+        if enters_quiet_period {
+            assert_eq!(
+                source.index, replay_op_index,
+                "quiet-period replay drain changed its operation boundary"
+            );
+            for source in records.iter().skip(record_position).cloned() {
+                assert_eq!(
+                    source.execution.phase,
+                    ExecutionPhase::DeferredDrain,
+                    "records after a quiesced hold release must remain deferred drain"
+                );
+                assert!(
+                    source.execution.hold.is_none(),
+                    "deferred-drain replay record {} starts another hold",
+                    source.index
+                );
+                let inject_post_commit_ack_loss = replay_post_commit_selftest
+                    && source.status == 0
+                    && source.outcome == "ambiguous:connection_error";
+                let op = rewrite_replayed_op(&source.op, &old_prefix, &prefix);
+                quiet_drain_ops.push_back(QuietDrainOp::Replay {
+                    source: Box::new(source),
+                    op,
+                    inject_post_commit_ack_loss,
+                });
+            }
+            break;
+        }
         if pending_held_op
             .as_ref()
             .is_some_and(|pending: &PendingHeldOp| pending.release_op <= source.index)
@@ -1027,20 +1131,6 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             let pending = pending_held_op
                 .take()
                 .expect("release-ready replayed held op disappeared");
-            if exact_execution_trace
-                && replayed_hold_releases_before_nominal(
-                    scheduler
-                        .as_ref()
-                        .expect("recorded foreground hold requires a fault scheduler"),
-                    &pending,
-                )
-            {
-                scheduler
-                    .as_ref()
-                    .expect("recorded foreground hold requires a fault scheduler")
-                    .quiesce();
-                scheduler_quiesced = true;
-            }
             let step = finish_pending_held_op(
                 pending,
                 &client,
@@ -1246,6 +1336,10 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             )
             .await
         };
+        replay_op_index = source
+            .index
+            .checked_add(1)
+            .expect("replayed operation cursor overflowed");
         let step = match execution {
             RecordedExecutionOutcome::Completed(step) => *step,
             RecordedExecutionOutcome::Held(pending) => {
@@ -1330,86 +1424,88 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         }
     }
 
-    if !scheduler_quiesced {
-        if let Some(scheduler) = &scheduler {
-            scheduler.quiesce();
-        }
+    let mut op_count = replay_op_index;
+    let exact_quiescent_vector_count = operational_state.quiescent_vector_count_must_be_exact();
+    let mut no_dual_writer_lease_hold = None;
+    let quiet = QuietPeriod {
+        client: &client,
+        server: &mut server,
+        scheduler: scheduler.as_ref(),
+        test_clock: test_clock.as_ref(),
+        injector: &mut injector,
+        http_fault_context: &mut http_fault_context,
+        chaos: chaos_handle.as_ref(),
+        operational_state: &mut operational_state,
+        operational_observer: operational_observer.as_ref(),
+        pending_held_op: &mut pending_held_op,
+        dual_writer_lease_hold: &mut no_dual_writer_lease_hold,
+        initial_dual_writer_stale_fencing_token: None,
+        artifacts: &mut artifacts,
+        model: &mut model,
+        coverage: &mut coverage,
+        s3_tracker: &mut s3_tracker,
+        corruption_tracker: &mut corruption_tracker,
+        created_namespaces: &mut created_namespaces,
+        background_compaction_starts: &mut background_compaction_starts,
+        op_index: &mut op_count,
+        compactions: &mut compactions,
+        started,
+        mutation: replay_mutation,
+        mode,
+        exact_vector_count: exact_quiescent_vector_count,
+        verify: !failed && !source_failure_before_quiet,
+        preserve_recorded_holds: true,
+        prefix: &prefix,
+        config: &config,
+        disk_cache_max_bytes,
+        drain_ops: &mut quiet_drain_ops,
     }
-    if let Some(pending) = pending_held_op.take() {
-        let step = finish_pending_held_op(
-            pending,
-            &client,
-            &mut artifacts,
-            &mut model,
-            &mut coverage,
-            &mut s3_tracker,
-            &mut corruption_tracker,
-            replay_mutation,
-            mode,
-        )
-        .await;
-        apply_step_bookkeeping(
-            &step,
-            &mut created_namespaces,
-            &mut background_compaction_starts,
-            &mut compactions,
-        );
-        assert!(
-            !step.post_commit_ack_lost,
-            "replayed held foreground op unexpectedly lost its acknowledgement"
-        );
-        assert!(
-            step.crash.is_none(),
-            "a quiesced foreground HoldCall cannot complete through a process crash"
-        );
-        if !step.violations.is_empty() {
-            failed = true;
-            failure_violations.extend(step.violations);
-        }
-    }
+    .run()
+    .await;
+    replay_op_index = replay_op_index
+        .checked_add(quiet.drained_ops)
+        .expect("replayed workload cursor overflowed after deferred drain");
+    let replayed_all_selected_records = replay_op_index == replayed_workload_count;
     if !failed {
+        assert!(
+            replayed_all_selected_records,
+            "replay must advance through every selected workload record exactly once: \
+             advanced={replay_op_index} selected={replayed_workload_count}"
+        );
+    }
+    assert!(
+        !quiet.post_commit_ack_lost,
+        "replayed held foreground op unexpectedly lost its acknowledgement"
+    );
+    assert!(
+        quiet.dual_writer_stale_fencing_token.is_none(),
+        "ordinary replay unexpectedly produced a dual-writer fencing token"
+    );
+    if !quiet.violations.is_empty() {
+        if !failed {
+            failure_violations = quiet.violations;
+        } else {
+            failure_violations.extend(quiet.violations);
+        }
+        failed = true;
+    }
+
+    if replayed_all_selected_records {
+        let replayed_records = read_ops(&artifacts.dir);
+        let (_, replayed_workload) = replay_workload_records(&replayed_records);
         assert_eq!(
-            artifacts.op_count(),
+            u64::try_from(replayed_workload.len())
+                .expect("replayed workload record count must fit in u64"),
             replayed_workload_count,
             "replay must execute every selected workload record exactly once"
         );
-        let replayed_records = read_ops(&artifacts.dir);
         assert_contiguous_record_indices(
-            &replayed_records,
+            &replayed_workload,
             replayed_workload_count,
             "replayed workload trace",
         );
-    }
-    let mut op_count = artifacts.op_count();
-    let exact_quiescent_vector_count = operational_state.quiescent_vector_count_must_be_exact();
-    operational_state
-        .stop_second_node(operational_observer.as_ref())
-        .await;
-    drop(http_fault_context);
-    stop_scheduled_faults(scheduler.as_ref(), test_clock.as_ref(), &mut injector).await;
-    stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
-    if !failed {
-        let quiescence = quiesce_and_verify(
-            &client,
-            &server,
-            &mut artifacts,
-            &mut model,
-            &mut coverage,
-            &mut s3_tracker,
-            &mut corruption_tracker,
-            &created_namespaces,
-            &mut op_count,
-            &mut compactions,
-            started,
-            None,
-            replay_mutation,
-            RunMode::Deterministic,
-            exact_quiescent_vector_count,
-        )
-        .await;
-        if !quiescence.is_empty() {
-            failed = true;
-            failure_violations = quiescence;
+        if exact_execution_trace {
+            assert_normalized_replay_structure(&records, &old_prefix, &replayed_workload, &prefix);
         }
     }
 
@@ -1420,13 +1516,27 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         .as_ref()
         .map(ChaosHandle::fired)
         .unwrap_or_default();
-    artifacts.write_faults(&fired_faults);
-    if let Some(scheduler) = &scheduler {
-        artifacts.write_timeline(&scheduler.timeline());
+    if active_profile == Some(FaultProfile::LegacyChaos) {
+        artifacts.write_faults(&fired_faults);
     }
-    if exact_execution_trace && replayed_full_workload {
+    let mut timeline = scheduler
+        .as_ref()
+        .map(FaultScheduler::timeline)
+        .unwrap_or_default();
+    timeline.extend(quiet.timeline);
+    artifacts.write_timeline(&timeline);
+    if exact_execution_trace
+        && replayed_full_workload
+        && source_records.len() > workload_record_count
+    {
         let replay_records = read_ops(&artifacts.dir);
-        assert_normalized_replay_structure(&source_records, &old_prefix, &replay_records, &prefix);
+        assert_normalized_full_replay_structure(
+            &source_records,
+            &old_prefix,
+            &replay_records,
+            &prefix,
+            source_failure.as_ref(),
+        );
     }
     let object_store = object_store_breakdown(&counter);
     let background_compactions = background_compactions_since(&background_compaction_starts);
@@ -1443,6 +1553,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
     SeedOutcome {
         mode,
+        profile: active_profile,
         failed,
         ops: op_count,
         compactions,
@@ -1623,6 +1734,95 @@ fn assert_normalized_replay_structure(
     );
 }
 
+fn source_ends_at_quiet_failure(source: &[OpRecord], failure: Option<&FailureManifest>) -> bool {
+    let Some(failure) = failure else {
+        return false;
+    };
+    let Some(first_quiet) = source
+        .iter()
+        .find(|record| record.execution.phase == ExecutionPhase::Quiescence)
+    else {
+        return false;
+    };
+    let Some(last) = source.last() else {
+        return false;
+    };
+    let after_last = last
+        .index
+        .checked_add(1)
+        .expect("source replay trace index overflowed");
+
+    !failure.violations.is_empty()
+        && failure.op_index >= first_quiet.index
+        && matches!(failure.op_index, boundary if boundary == last.index || boundary == after_last)
+}
+
+fn source_failure_precedes_unrecorded_quiet_period(
+    source: &[OpRecord],
+    failure: Option<&FailureManifest>,
+) -> bool {
+    let Some(failure) = failure else {
+        return false;
+    };
+    let Some(last) = source.last() else {
+        return false;
+    };
+    if source.iter().any(|record| {
+        !matches!(
+            record.execution.phase,
+            ExecutionPhase::Workload | ExecutionPhase::DeferredDrain
+        )
+    }) {
+        return false;
+    }
+    let after_last = last
+        .index
+        .checked_add(1)
+        .expect("source replay trace index overflowed");
+
+    !failure.violations.is_empty()
+        && matches!(failure.op_index, boundary if boundary == last.index || boundary == after_last)
+}
+
+fn assert_normalized_full_replay_structure(
+    source: &[OpRecord],
+    source_prefix: &str,
+    replay: &[OpRecord],
+    replay_prefix: &str,
+    source_failure: Option<&FailureManifest>,
+) {
+    if !source_ends_at_quiet_failure(source, source_failure) {
+        assert_normalized_replay_structure(source, source_prefix, replay, replay_prefix);
+        return;
+    }
+
+    assert_contiguous_record_indices(
+        source,
+        u64::try_from(source.len()).expect("source trace length must fit in u64"),
+        "quiet-failure replay source",
+    );
+    assert_contiguous_record_indices(
+        replay,
+        u64::try_from(replay.len()).expect("replay trace length must fit in u64"),
+        "repaired quiet-failure replay",
+    );
+    assert!(
+        replay.len() >= source.len(),
+        "repaired quiet-failure replay stopped before its source failure boundary"
+    );
+    assert_eq!(
+        normalized_op_execution_structure(&replay[..source.len()], replay_prefix),
+        normalized_op_execution_structure(source, source_prefix),
+        "repaired quiet-failure replay changed its source trace prefix"
+    );
+    assert!(
+        replay[source.len()..].iter().all(|record| {
+            record.execution.phase == ExecutionPhase::Quiescence && record.execution.hold.is_none()
+        }),
+        "repaired quiet-failure replay appended non-quiescence work"
+    );
+}
+
 fn rewrite_prefix(value: &str, old_prefix: &str, new_prefix: &str) -> String {
     value.strip_prefix(old_prefix).map_or_else(
         || value.to_string(),
@@ -1631,17 +1831,28 @@ fn rewrite_prefix(value: &str, old_prefix: &str, new_prefix: &str) -> String {
 }
 
 fn effective_seed_mode(mode: RunMode, seed: u64) -> RunMode {
-    match mode {
-        RunMode::Deterministic => RunMode::Deterministic,
-        RunMode::Chaos => RunMode::Chaos,
-        RunMode::Mixed => {
-            if seed % 3 == 1 {
-                RunMode::Chaos
-            } else {
-                RunMode::Deterministic
-            }
-        }
+    effective_seed_assignment(mode, None, seed).mode
+}
+
+fn reproduction_environment(
+    backend: &str,
+    mutation: Option<OracleMutation>,
+    profile: Option<FaultProfile>,
+) -> String {
+    let mut environment = format!("TEST_BACKEND={backend}");
+    if let Some(mutation) = mutation {
+        environment.push_str(&format!(
+            " ZEPPELIN_ADVERSARIAL_SELFTEST={}",
+            mutation.key()
+        ));
     }
+    if let Some(profile) = profile {
+        environment.push_str(&format!(
+            " ZEPPELIN_ADVERSARIAL_PROFILE={}",
+            profile.as_env()
+        ));
+    }
+    environment
 }
 
 fn config_for_mode(mode: RunMode, seed: u64, schedule: Option<&FaultSchedule>) -> Config {
@@ -1652,14 +1863,14 @@ fn config_for_mode(mode: RunMode, seed: u64, schedule: Option<&FaultSchedule>) -
         config.compaction.interval_secs = 2 + (seed % 4);
         config.gc.compaction_upload_window_secs = 2;
     }
-    if profile == Some(FaultProfile::Clock) {
+    if matches!(profile, Some(FaultProfile::Clock | FaultProfile::Full)) {
         config.cache.namespace_registry_ttl_ms = 500;
         config.compaction.interval_secs = 2;
         config.compaction.lease_duration_secs = 10;
         config.gc.horizon_secs = 30;
         config.gc.allow_unsafe_short_horizon = true;
     }
-    if profile == Some(FaultProfile::Ops) {
+    if matches!(profile, Some(FaultProfile::Ops | FaultProfile::Full)) {
         config.server.max_concurrent_queries = 1;
         config.cache.memory_cache_max_mb = 1;
     }
@@ -1694,12 +1905,12 @@ fn scheduled_profile(profile: Option<FaultProfile>) -> Option<FaultProfile> {
 fn test_clock_for_scheduler(scheduler: Option<&FaultScheduler>) -> Option<Arc<TestClock>> {
     scheduler
         .is_some_and(|scheduler| {
-            scheduler.schedule().profile == FaultProfile::Clock
-                || scheduler
-                    .schedule()
-                    .events
-                    .iter()
-                    .any(|event| event.id == DUAL_WRITER_LEASE_HOLD_EVENT_ID)
+            scheduler.schedule().events.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    FaultKind::ClockJump { .. } | FaultKind::ClockFreeze { .. }
+                ) || event.id == DUAL_WRITER_LEASE_HOLD_EVENT_ID
+            })
         })
         .then(|| Arc::new(TestClock::default()))
 }
@@ -1791,20 +2002,6 @@ async fn shutdown_http_fault_injector(injector: &mut Option<Arc<HttpFaultInjecto
     }
 }
 
-async fn stop_scheduled_faults(
-    scheduler: Option<&FaultScheduler>,
-    test_clock: Option<&Arc<TestClock>>,
-    injector: &mut Option<Arc<HttpFaultInjector>>,
-) {
-    if let Some(scheduler) = scheduler {
-        scheduler.quiesce();
-    }
-    if let Some(clock) = test_clock {
-        clock.thaw();
-    }
-    shutdown_http_fault_injector(injector).await;
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn restart_after_crash(
     server: &mut FullTestServer,
@@ -1856,7 +2053,7 @@ async fn restart_after_crash(
     let new_injector = start_http_fault_injector(&server.base_url).await;
     *http_fault_context = Some(HttpFaultContext {
         scheduler: scheduler.clone(),
-        injector: Arc::clone(&new_injector),
+        injector: new_injector.request_handle(),
         bookkeeping_store: bookkeeping_store.clone(),
         direct_base_url: server.base_url.clone(),
         proxy_base_url: new_injector.base_url(),
@@ -1914,19 +2111,6 @@ async fn crash_recovery_probe(
         });
     }
     violations
-}
-
-async fn stop_chaos_and_background(server: &mut FullTestServer, chaos: Option<&ChaosHandle>) {
-    if let Some(chaos) = chaos {
-        chaos.disable();
-    }
-    if let Some(shutdown) = server.shutdown_compaction.take() {
-        let _ = shutdown.send(true);
-    }
-    if let Some(task) = server.compaction_loop_task.take() {
-        task.await
-            .unwrap_or_else(|error| panic!("background compaction task failed: {error}"));
-    }
 }
 
 fn sanitize_op_for_mode(op: Op, mode: RunMode) -> Op {
@@ -2335,29 +2519,9 @@ async fn print_namespace_inspection(store: &zeppelin::storage::ZeppelinStore, ns
 }
 
 pub async fn run_oracle_selftest(env: RunnerEnv) {
-    let mutations = env.selftest.map_or_else(
-        || {
-            vec![
-                OracleMutation::DropDelete,
-                OracleMutation::SkewScore,
-                OracleMutation::PhantomId,
-                OracleMutation::LeakTombstone,
-                OracleMutation::FilterSkew,
-                OracleMutation::GcEatsLiveKey,
-                OracleMutation::StaleCheckpoint,
-                OracleMutation::ChaosLostWrite,
-                OracleMutation::PostCommitLostWrite,
-                OracleMutation::IndetResolutionLie,
-                OracleMutation::DroppedResponseLostWrite,
-                OracleMutation::CrashLostAck,
-                OracleMutation::ClockGcEatsLive,
-                OracleMutation::SwallowCorruption,
-                OracleMutation::MisdirectedWriteReachability,
-                OracleMutation::DualWriterFencing,
-            ]
-        },
-        |mutation| vec![mutation],
-    );
+    let mutations = env
+        .selftest
+        .map_or_else(|| OracleMutation::ALL.to_vec(), |mutation| vec![mutation]);
 
     for mutation in mutations {
         let seed = 7;
@@ -2475,7 +2639,8 @@ async fn run_seed(
     );
     let swallow_corruption_selftest = mutation == Some(OracleMutation::SwallowCorruption);
     let misdirected_write_selftest = mutation == Some(OracleMutation::MisdirectedWriteReachability);
-    let profile = scheduled_profile(env.profile);
+    let assignment = effective_seed_assignment(env.mode, env.profile, seed);
+    let profile = scheduled_profile(assignment.profile);
     let mode = if profile.is_some()
         || mutation == Some(OracleMutation::ChaosLostWrite)
         || post_commit_selftest
@@ -2488,7 +2653,7 @@ async fn run_seed(
     {
         RunMode::Chaos
     } else {
-        effective_seed_mode(env.mode, seed)
+        assignment.mode
     };
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
@@ -2543,6 +2708,10 @@ async fn run_seed(
     let chaos_plan_json = chaos_plan
         .as_ref()
         .map(|plan| serde_json::to_value(plan).expect("FaultPlan must serialize"));
+    let active_profile = scheduler
+        .as_ref()
+        .map(|scheduler| scheduler.schedule().profile)
+        .or_else(|| chaos_plan.as_ref().map(|_| FaultProfile::LegacyChaos));
     let (legacy_instrumented_store, chaos_handle) =
         wrap_chaos_store(&harness.store, chaos_plan.clone());
     let instrumented_store = scheduler
@@ -2592,7 +2761,7 @@ async fn run_seed(
             .zip(injector.as_ref())
             .map(|(scheduler, injector)| HttpFaultContext {
                 scheduler: scheduler.clone(),
-                injector: Arc::clone(injector),
+                injector: injector.request_handle(),
                 bookkeeping_store: harness.store.clone(),
                 direct_base_url: server.base_url.clone(),
                 proxy_base_url: injector.base_url(),
@@ -2611,8 +2780,7 @@ async fn run_seed(
     let mut post_commit_ack_loss_fired = false;
     let mut pending_held_op = None;
     let mut deferred_ops = VecDeque::new();
-    let mut deferred_drain_phase = false;
-    let mut scheduler_quiesced = false;
+    let mut quiet_drain_ops = VecDeque::new();
     let mut dual_writer_lease_hold = None;
     let mut dual_writer_lease_hold_activated = false;
     let mut dual_writer_stale_fencing_token = None;
@@ -2737,19 +2905,30 @@ async fn run_seed(
             },
         ) else {
             if let Some(pending) = pending_held_op.as_mut() {
-                let scheduler = scheduler
-                    .as_ref()
-                    .expect("a pending foreground hold requires a fault scheduler");
-                scheduler.quiesce();
-                scheduler_quiesced = true;
                 assert!(
                     op_index <= pending.release_op,
                     "boundary release moved a foreground hold past its scheduled release"
                 );
                 pending.release_op = op_index;
                 pending.release_cause = HoldReleaseCause::Quiesce;
-                deferred_drain_phase = true;
-                continue;
+                let mut ack_loss_reserved = post_commit_ack_loss_fired;
+                for (offset, op) in deferred_ops.drain(..).enumerate() {
+                    let index = op_index
+                        .checked_add(
+                            u64::try_from(offset).expect("deferred drain offset must fit in u64"),
+                        )
+                        .expect("deferred drain operation index overflowed");
+                    assert_recorded_op_matches(recorded_ops.as_deref(), seed, index, &op);
+                    let inject_post_commit_ack_loss = post_commit_selftest
+                        && !ack_loss_reserved
+                        && matches!(op, Op::Upsert { .. });
+                    ack_loss_reserved |= inject_post_commit_ack_loss;
+                    quiet_drain_ops.push_back(QuietDrainOp::Generated {
+                        op,
+                        inject_post_commit_ack_loss,
+                    });
+                }
+                break;
             }
             break;
         };
@@ -2759,11 +2938,7 @@ async fn run_seed(
         let op_http_fault_context = http_fault_context
             .as_ref()
             .map(|context| context.for_node(target_server));
-        let execution_phase = if deferred_drain_phase {
-            ExecutionPhase::DeferredDrain
-        } else {
-            ExecutionPhase::Workload
-        };
+        let execution_phase = ExecutionPhase::Workload;
         let inject_post_commit_ack_loss =
             post_commit_selftest && !post_commit_ack_loss_fired && matches!(op, Op::Upsert { .. });
         let execution = if pending_held_op.is_some() {
@@ -2782,29 +2957,6 @@ async fn run_seed(
                     mutation,
                     mode,
                     execution_phase,
-                    operational_state.generation_checkpoints_enabled(),
-                    target_node,
-                    op_http_fault_context.as_ref(),
-                    inject_post_commit_ack_loss,
-                )
-                .await,
-            ))
-        } else if deferred_drain_phase {
-            RecordedExecutionOutcome::Completed(Box::new(
-                execute_recorded_op(
-                    &client,
-                    target_server,
-                    &mut artifacts,
-                    &mut model,
-                    &mut coverage,
-                    &mut s3_tracker,
-                    &mut corruption_tracker,
-                    &op,
-                    op_index,
-                    started,
-                    mutation,
-                    mode,
-                    ExecutionPhase::DeferredDrain,
                     operational_state.generation_checkpoints_enabled(),
                     target_node,
                     op_http_fault_context.as_ref(),
@@ -3051,6 +3203,11 @@ async fn run_seed(
         }
     }
 
+    let deferred_drain_count =
+        u64::try_from(quiet_drain_ops.len()).expect("deferred drain count must fit in u64");
+    let expected_workload_count = op_index
+        .checked_add(deferred_drain_count)
+        .expect("expected workload count overflowed");
     if !failed {
         assert!(
             deferred_ops.is_empty(),
@@ -3059,75 +3216,79 @@ async fn run_seed(
         );
         if generation_cap_reached {
             assert_eq!(
-                op_index, max_ops,
+                expected_workload_count, max_ops,
                 "max_ops must remain the executed workload record count"
             );
         }
-        assert_eq!(
-            artifacts.op_count(),
-            op_index,
-            "every selected workload operation must complete exactly once"
-        );
-        let workload_records = read_ops(&artifacts.dir);
-        assert_contiguous_record_indices(&workload_records, op_index, "generated workload trace");
+        if quiet_drain_ops.is_empty() {
+            assert_eq!(
+                artifacts.op_count(),
+                op_index,
+                "every selected workload operation must complete exactly once"
+            );
+            let workload_records = read_ops(&artifacts.dir);
+            assert_contiguous_record_indices(
+                &workload_records,
+                op_index,
+                "generated workload trace",
+            );
+        }
     }
 
-    if !scheduler_quiesced {
-        if let Some(scheduler) = &scheduler {
-            scheduler.quiesce();
-        }
-    }
-    if let Some(activation) = dual_writer_lease_hold.take() {
-        let stale_fencing_token = finish_dual_writer_lease_hold(
-            scheduler
-                .as_ref()
-                .expect("dual-writer lease hold requires a scheduler"),
-            activation,
-        )
-        .await;
-        assert!(
-            dual_writer_stale_fencing_token
-                .replace(stale_fencing_token)
-                .is_none(),
-            "dual-writer selftest completed its renewal race more than once"
-        );
-    }
-    if let Some(pending) = pending_held_op.take() {
-        let step = finish_pending_held_op(
-            pending,
-            &client,
-            &mut artifacts,
-            &mut model,
-            &mut coverage,
-            &mut s3_tracker,
-            &mut corruption_tracker,
-            mutation,
-            mode,
-        )
-        .await;
-        apply_step_bookkeeping(
-            &step,
-            &mut created_namespaces,
-            &mut background_compaction_starts,
-            &mut compactions,
-        );
-        post_commit_ack_loss_fired |= step.post_commit_ack_lost;
-        assert!(
-            step.crash.is_none(),
-            "a quiesced foreground HoldCall cannot complete through a process crash"
-        );
-        if !step.violations.is_empty() {
-            failed = true;
-            failure_violations.extend(step.violations);
-        }
-    }
     let exact_quiescent_vector_count = operational_state.quiescent_vector_count_must_be_exact();
-    operational_state
-        .stop_second_node(operational_observer.as_ref())
-        .await;
-    drop(http_fault_context);
-    stop_scheduled_faults(scheduler.as_ref(), test_clock.as_ref(), &mut injector).await;
-    stop_chaos_and_background(&mut server, chaos_handle.as_ref()).await;
+    let quiet = QuietPeriod {
+        client: &client,
+        server: &mut server,
+        scheduler: scheduler.as_ref(),
+        test_clock: test_clock.as_ref(),
+        injector: &mut injector,
+        http_fault_context: &mut http_fault_context,
+        chaos: chaos_handle.as_ref(),
+        operational_state: &mut operational_state,
+        operational_observer: operational_observer.as_ref(),
+        pending_held_op: &mut pending_held_op,
+        dual_writer_lease_hold: &mut dual_writer_lease_hold,
+        initial_dual_writer_stale_fencing_token: dual_writer_stale_fencing_token,
+        artifacts: &mut artifacts,
+        model: &mut model,
+        coverage: &mut coverage,
+        s3_tracker: &mut s3_tracker,
+        corruption_tracker: &mut corruption_tracker,
+        created_namespaces: &mut created_namespaces,
+        background_compaction_starts: &mut background_compaction_starts,
+        op_index: &mut op_index,
+        compactions: &mut compactions,
+        started,
+        mutation,
+        mode,
+        exact_vector_count: exact_quiescent_vector_count,
+        verify: !failed,
+        preserve_recorded_holds: false,
+        prefix: &prefix,
+        config: &config,
+        disk_cache_max_bytes,
+        drain_ops: &mut quiet_drain_ops,
+    }
+    .run()
+    .await;
+    post_commit_ack_loss_fired |= quiet.post_commit_ack_lost;
+    if deferred_drain_count > 0 && quiet_drain_ops.is_empty() {
+        let records = read_ops(&artifacts.dir);
+        let (_, workload_records) = replay_workload_records(&records);
+        assert_contiguous_record_indices(
+            &workload_records,
+            expected_workload_count,
+            "generated deferred-drain workload trace",
+        );
+    }
+    if !quiet.violations.is_empty() {
+        if !failed {
+            failure_violations = quiet.violations;
+        } else {
+            failure_violations.extend(quiet.violations);
+        }
+        failed = true;
+    }
 
     if dual_writer_fencing_selftest {
         assert!(
@@ -3157,31 +3318,6 @@ async fn run_seed(
         );
     }
 
-    if !failed {
-        let quiescence = quiesce_and_verify(
-            &client,
-            &server,
-            &mut artifacts,
-            &mut model,
-            &mut coverage,
-            &mut s3_tracker,
-            &mut corruption_tracker,
-            &created_namespaces,
-            &mut op_index,
-            &mut compactions,
-            started,
-            dual_writer_stale_fencing_token,
-            mutation,
-            RunMode::Deterministic,
-            exact_quiescent_vector_count,
-        )
-        .await;
-        if !quiescence.is_empty() {
-            failed = true;
-            failure_violations = quiescence;
-        }
-    }
-
     artifacts.write_model_final(&model);
     artifacts.write_s3_final(&store, &created_namespaces).await;
     artifacts.write_coverage(&coverage);
@@ -3189,10 +3325,15 @@ async fn run_seed(
         .as_ref()
         .map(ChaosHandle::fired)
         .unwrap_or_default();
-    artifacts.write_faults(&fired_faults);
-    if let Some(scheduler) = &scheduler {
-        artifacts.write_timeline(&scheduler.timeline());
+    if active_profile == Some(FaultProfile::LegacyChaos) {
+        artifacts.write_faults(&fired_faults);
     }
+    let mut timeline = scheduler
+        .as_ref()
+        .map(FaultScheduler::timeline)
+        .unwrap_or_default();
+    timeline.extend(quiet.timeline);
+    artifacts.write_timeline(&timeline);
     let object_store = object_store_breakdown(&counter);
     let background_compactions = background_compactions_since(&background_compaction_starts);
 
@@ -3213,13 +3354,7 @@ async fn run_seed(
             .get("TEST_BACKEND")
             .map(String::as_str)
             .unwrap_or("memory");
-        let mut repro_env = format!("TEST_BACKEND={backend}");
-        if let Some(mutation) = mutation {
-            repro_env.push_str(&format!(
-                " ZEPPELIN_ADVERSARIAL_SELFTEST={}",
-                mutation.key()
-            ));
-        }
+        let repro_env = reproduction_environment(backend, mutation, active_profile);
         artifacts.write_failure(&FailureManifest {
             seed,
             mode,
@@ -3265,6 +3400,7 @@ async fn run_seed(
 
     SeedOutcome {
         mode,
+        profile: active_profile,
         failed,
         ops: op_index,
         compactions,
@@ -3295,6 +3431,18 @@ struct PendingHeldOp {
     op_index: u64,
     namespace: String,
     task: JoinHandle<RawRecordedOp>,
+}
+
+enum QuietDrainOp {
+    Generated {
+        op: Op,
+        inject_post_commit_ack_loss: bool,
+    },
+    Replay {
+        source: Box<OpRecord>,
+        op: Op,
+        inject_post_commit_ack_loss: bool,
+    },
 }
 
 fn replayed_hold_releases_before_nominal(
@@ -5686,8 +5834,519 @@ async fn inject_dual_writer_fencing_mutation(
     violations
 }
 
+struct QuietPeriod<'a> {
+    client: &'a Client,
+    server: &'a mut FullTestServer,
+    scheduler: Option<&'a FaultScheduler>,
+    test_clock: Option<&'a Arc<TestClock>>,
+    injector: &'a mut Option<Arc<HttpFaultInjector>>,
+    http_fault_context: &'a mut Option<HttpFaultContext>,
+    chaos: Option<&'a ChaosHandle>,
+    operational_state: &'a mut OperationalState,
+    operational_observer: Option<&'a OperationalStoreObserver>,
+    pending_held_op: &'a mut Option<PendingHeldOp>,
+    dual_writer_lease_hold: &'a mut Option<DualWriterLeaseHoldActivation>,
+    initial_dual_writer_stale_fencing_token: Option<u64>,
+    artifacts: &'a mut SeedArtifacts,
+    model: &'a mut Model,
+    coverage: &'a mut Coverage,
+    s3_tracker: &'a mut S3Tracker,
+    corruption_tracker: &'a mut CorruptionTracker,
+    created_namespaces: &'a mut Vec<String>,
+    background_compaction_starts: &'a mut BTreeMap<String, u64>,
+    op_index: &'a mut u64,
+    compactions: &'a mut u64,
+    started: Instant,
+    mutation: Option<OracleMutation>,
+    mode: RunMode,
+    exact_vector_count: bool,
+    verify: bool,
+    preserve_recorded_holds: bool,
+    prefix: &'a str,
+    config: &'a Config,
+    disk_cache_max_bytes: u64,
+    drain_ops: &'a mut VecDeque<QuietDrainOp>,
+}
+
+struct QuietPeriodOutcome {
+    violations: Vec<Violation>,
+    post_commit_ack_lost: bool,
+    dual_writer_stale_fencing_token: Option<u64>,
+    drained_ops: u64,
+    timeline: Vec<TimelineEvent>,
+}
+
+impl QuietPeriod<'_> {
+    async fn run(self) -> QuietPeriodOutcome {
+        let mut timeline = Vec::new();
+        let mut violations = Vec::new();
+        let mut post_commit_ack_lost = false;
+        let mut dual_writer_stale_fencing_token = self.initial_dual_writer_stale_fencing_token;
+        let mut drained_ops = 0u64;
+
+        let quiet_start = quiet_event(
+            self.scheduler,
+            self.started,
+            *self.op_index,
+            1,
+            Boundary::Runner,
+            "scheduler-quiesce",
+            ObservedResult::DefiniteApplied,
+            Some("new fault admission disabled".to_string()),
+        );
+        if let Some(scheduler) = self.scheduler {
+            scheduler.begin_quiet_period(quiet_start);
+        } else {
+            timeline.push(quiet_start);
+        }
+
+        if let Some(clock) = self.test_clock {
+            clock.thaw();
+        }
+        *self.http_fault_context = None;
+        if let Some(chaos) = self.chaos {
+            chaos.disable();
+        }
+        shutdown_http_fault_injector(self.injector).await;
+        push_quiet_event(
+            &mut timeline,
+            self.scheduler,
+            self.started,
+            *self.op_index,
+            2,
+            Boundary::ClientHttp,
+            "restore-network",
+            ObservedResult::DefiniteApplied,
+            Some("injectors disabled; test clock thawed".to_string()),
+        );
+
+        if let Some(scheduler) = self.scheduler {
+            scheduler.release_held_calls();
+        }
+        if let Some(activation) = self.dual_writer_lease_hold.take() {
+            dual_writer_stale_fencing_token = Some(
+                finish_dual_writer_lease_hold(
+                    self.scheduler
+                        .expect("dual-writer lease hold requires a fault scheduler"),
+                    activation,
+                )
+                .await,
+            );
+        }
+        if let Some(mut pending) = self.pending_held_op.take() {
+            if !self.preserve_recorded_holds && pending.release_op > *self.op_index {
+                pending.release_op = *self.op_index;
+                pending.release_cause = HoldReleaseCause::Quiesce;
+            }
+            let step = finish_pending_held_op(
+                pending,
+                self.client,
+                self.artifacts,
+                self.model,
+                self.coverage,
+                self.s3_tracker,
+                self.corruption_tracker,
+                self.mutation,
+                self.mode,
+            )
+            .await;
+            apply_step_bookkeeping(
+                &step,
+                self.created_namespaces,
+                self.background_compaction_starts,
+                self.compactions,
+            );
+            post_commit_ack_lost |= step.post_commit_ack_lost;
+            assert!(
+                step.crash.is_none(),
+                "a quiesced foreground HoldCall cannot complete through a process crash"
+            );
+            violations.extend(step.violations);
+        }
+        let deferred_drain_count = self.drain_ops.len();
+        while violations.is_empty() {
+            let Some(drain) = self.drain_ops.pop_front() else {
+                break;
+            };
+            let (op, target_node, phase, inject_post_commit_ack_loss) = match drain {
+                QuietDrainOp::Generated {
+                    op,
+                    inject_post_commit_ack_loss,
+                } => (
+                    op,
+                    self.operational_state.choose_target_node(),
+                    ExecutionPhase::DeferredDrain,
+                    inject_post_commit_ack_loss,
+                ),
+                QuietDrainOp::Replay {
+                    source,
+                    op,
+                    inject_post_commit_ack_loss,
+                } => {
+                    let source = *source;
+                    assert_eq!(
+                        source.index, *self.op_index,
+                        "replayed deferred drain changed its operation index"
+                    );
+                    assert_eq!(
+                        source.execution.phase,
+                        ExecutionPhase::DeferredDrain,
+                        "replayed quiet-period continuation changed phase"
+                    );
+                    assert!(
+                        source.execution.hold.is_none(),
+                        "replayed quiet-period continuation cannot start a hold"
+                    );
+                    (
+                        op,
+                        source.target_node,
+                        source.execution.phase,
+                        inject_post_commit_ack_loss,
+                    )
+                }
+            };
+            let generation_checkpoints = self.operational_state.generation_checkpoints_enabled();
+            let target_server = self.operational_state.target(self.server, target_node);
+            let step = execute_recorded_op(
+                self.client,
+                target_server,
+                self.artifacts,
+                self.model,
+                self.coverage,
+                self.s3_tracker,
+                self.corruption_tracker,
+                &op,
+                *self.op_index,
+                self.started,
+                self.mutation,
+                self.mode,
+                phase,
+                generation_checkpoints,
+                target_node,
+                None,
+                inject_post_commit_ack_loss,
+            )
+            .await;
+            *self.op_index = self
+                .op_index
+                .checked_add(1)
+                .expect("quiet-period deferred drain index overflowed");
+            drained_ops = drained_ops
+                .checked_add(1)
+                .expect("quiet-period deferred drain count overflowed");
+            apply_step_bookkeeping(
+                &step,
+                self.created_namespaces,
+                self.background_compaction_starts,
+                self.compactions,
+            );
+            assert!(
+                step.crash.is_none(),
+                "a quiesced deferred operation cannot complete through a process crash"
+            );
+            assert_eq!(
+                step.post_commit_ack_lost, inject_post_commit_ack_loss,
+                "quiet-period deferred drain changed acknowledgement-loss replay"
+            );
+            post_commit_ack_lost |= step.post_commit_ack_lost;
+            violations.extend(step.violations);
+        }
+        push_quiet_event(
+            &mut timeline,
+            self.scheduler,
+            self.started,
+            *self.op_index,
+            3,
+            Boundary::ObjectStore,
+            "release-held",
+            quiet_observed(&violations),
+            Some(format!(
+                "held calls released and joined; deferred_ops={deferred_drain_count}"
+            )),
+        );
+
+        self.operational_state
+            .stop_second_node(self.operational_observer)
+            .await;
+        push_quiet_event(
+            &mut timeline,
+            self.scheduler,
+            self.started,
+            *self.op_index,
+            4,
+            Boundary::Runner,
+            "stop-second-node",
+            ObservedResult::DefiniteApplied,
+            Some("secondary server stopped".to_string()),
+        );
+
+        let restarted = if self.server.server_task.is_finished() {
+            let store = self.server.store.clone();
+            let clock = self.server.clock.clone();
+            let spawn_compaction_loop = self.server.shutdown_compaction.is_some();
+            self.server.abort();
+            *self.server = start_test_server_full_with_disk_cache_max_bytes(
+                store,
+                Some(self.prefix.to_string()),
+                self.config.clone(),
+                spawn_compaction_loop,
+                Some(clock),
+                self.disk_cache_max_bytes,
+            )
+            .await;
+            true
+        } else {
+            false
+        };
+        wait_for_health(self.client, &self.server.base_url).await;
+        push_quiet_event(
+            &mut timeline,
+            self.scheduler,
+            self.started,
+            *self.op_index,
+            5,
+            Boundary::Process,
+            "primary-health",
+            ObservedResult::DefiniteApplied,
+            Some(if restarted {
+                "primary restarted and healthy".to_string()
+            } else {
+                "primary already healthy".to_string()
+            }),
+        );
+
+        stop_background_compaction(self.server).await;
+        let misdirected_recovery =
+            restore_misdirected_write_artifacts(&self.server.store, self.scheduler, self.mutation)
+                .await;
+        push_quiet_event(
+            &mut timeline,
+            self.scheduler,
+            self.started,
+            *self.op_index,
+            6,
+            Boundary::Runner,
+            "stop-background",
+            ObservedResult::DefiniteApplied,
+            Some(format!(
+                "background compaction joined; {misdirected_recovery}"
+            )),
+        );
+
+        let verify = self.verify && violations.is_empty();
+        if verify {
+            violations.extend(
+                run_quiescent_checks(
+                    self.client,
+                    self.server,
+                    self.artifacts,
+                    self.model,
+                    self.coverage,
+                    self.s3_tracker,
+                    self.corruption_tracker,
+                    self.op_index,
+                    self.compactions,
+                    self.started,
+                    dual_writer_stale_fencing_token,
+                    self.mutation,
+                    RunMode::Deterministic,
+                    self.exact_vector_count,
+                    &mut timeline,
+                    self.scheduler,
+                )
+                .await,
+            );
+        } else {
+            for (step, boundary, action) in [
+                (7, Boundary::Runner, "resolve-indeterminates"),
+                (8, Boundary::Runner, "force-compaction"),
+                (9, Boundary::Runner, "gc-twice"),
+                (10, Boundary::ObjectStore, "s3-oracles"),
+                (11, Boundary::ClientHttp, "exhaustive-sweep"),
+            ] {
+                push_quiet_event(
+                    &mut timeline,
+                    self.scheduler,
+                    self.started,
+                    *self.op_index,
+                    step,
+                    boundary,
+                    action,
+                    ObservedResult::DefiniteNotApplied,
+                    Some("skipped after an earlier violation".to_string()),
+                );
+            }
+        }
+
+        QuietPeriodOutcome {
+            violations,
+            post_commit_ack_lost,
+            dual_writer_stale_fencing_token,
+            drained_ops,
+            timeline,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn quiesce_and_verify(
+fn push_quiet_event(
+    timeline: &mut Vec<TimelineEvent>,
+    scheduler: Option<&FaultScheduler>,
+    started: Instant,
+    op_index: u64,
+    step: u8,
+    boundary: Boundary,
+    action: &str,
+    observed: ObservedResult,
+    recovery: Option<String>,
+) {
+    let event = quiet_event(
+        scheduler, started, op_index, step, boundary, action, observed, recovery,
+    );
+    if let Some(scheduler) = scheduler {
+        scheduler.record(event);
+    } else {
+        timeline.push(event);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quiet_event(
+    scheduler: Option<&FaultScheduler>,
+    started: Instant,
+    op_index: u64,
+    step: u8,
+    boundary: Boundary,
+    action: &str,
+    observed: ObservedResult,
+    recovery: Option<String>,
+) -> TimelineEvent {
+    TimelineEvent {
+        event_id: format!("quiet-{step:02}"),
+        op_index,
+        wall_ms: scheduler.map_or_else(
+            || {
+                u64::try_from(started.elapsed().as_millis())
+                    .expect("quiet-period wall time must fit u64")
+            },
+            FaultScheduler::wall_ms,
+        ),
+        boundary,
+        action: format!("quiet:{action}"),
+        key: None,
+        semantics: FaultSemantics::WindowEnd,
+        observed,
+        recovery,
+    }
+}
+
+fn quiet_observed(violations: &[Violation]) -> ObservedResult {
+    if violations.is_empty() {
+        ObservedResult::DefiniteApplied
+    } else {
+        ObservedResult::Corrupted
+    }
+}
+
+async fn restore_misdirected_write_artifacts(
+    store: &ZeppelinStore,
+    scheduler: Option<&FaultScheduler>,
+    mutation: Option<OracleMutation>,
+) -> String {
+    let mut proven_keys = BTreeSet::new();
+    if let Some(scheduler) = scheduler {
+        let schedule = scheduler.schedule();
+        for event in scheduler.timeline() {
+            let is_scheduled_misdirected_write = schedule.events.iter().any(|scheduled| {
+                scheduled.id == event.event_id
+                    && scheduled.boundary == Boundary::ObjectStore
+                    && matches!(
+                        scheduled.kind,
+                        FaultKind::Content(ContentFault::MisdirectedWrite)
+                    )
+            });
+            if !is_scheduled_misdirected_write {
+                continue;
+            }
+            assert_eq!(event.boundary, Boundary::ObjectStore);
+            assert_eq!(event.semantics, FaultSemantics::PostCommit);
+            assert_eq!(event.observed, ObservedResult::Corrupted);
+            assert!(
+                event.action.starts_with("Content(MisdirectedWrite) call="),
+                "misdirected-write timeline action lost its exact fault identity: {}",
+                event.action
+            );
+            let original = event
+                .key
+                .as_deref()
+                .expect("misdirected-write timeline evidence omitted the original key");
+            let persisted = event
+                .recovery
+                .as_deref()
+                .and_then(|recovery| recovery.strip_prefix("payload persisted at "))
+                .expect("misdirected-write timeline evidence omitted the persisted key");
+            assert_eq!(
+                persisted,
+                format!("{original}.misdirected"),
+                "misdirected-write timeline evidence named an unexpected artifact"
+            );
+            proven_keys.insert(persisted.to_string());
+        }
+    }
+
+    let key_list = proven_keys.iter().cloned().collect::<Vec<_>>().join(",");
+    if mutation == Some(OracleMutation::MisdirectedWriteReachability) {
+        return format!(
+            "misdirected_artifacts_proven={}; cleanup_deferred_for_selftest=true; keys=[{}]",
+            proven_keys.len(),
+            key_list
+        );
+    }
+
+    let mut deleted = 0usize;
+    let mut already_absent = 0usize;
+    for key in &proven_keys {
+        if store
+            .exists(key)
+            .await
+            .unwrap_or_else(|error| panic!("misdirected artifact existence check failed: {error}"))
+        {
+            store
+                .delete(key)
+                .await
+                .unwrap_or_else(|error| panic!("misdirected artifact cleanup failed: {error}"));
+            deleted += 1;
+        } else {
+            already_absent += 1;
+        }
+        assert!(
+            !store.exists(key).await.unwrap_or_else(|error| panic!(
+                "misdirected artifact cleanup verification failed: {error}"
+            )),
+            "misdirected artifact remained after canonical quiet restoration: {key}"
+        );
+    }
+
+    format!(
+        "misdirected_artifacts_proven={}; deleted={deleted}; already_absent={already_absent}; \
+         verified_absent={}; keys=[{key_list}]",
+        proven_keys.len(),
+        proven_keys.len()
+    )
+}
+
+async fn stop_background_compaction(server: &mut FullTestServer) {
+    if let Some(shutdown) = server.shutdown_compaction.take() {
+        let _ = shutdown.send(true);
+    }
+    if let Some(task) = server.compaction_loop_task.take() {
+        task.await
+            .unwrap_or_else(|error| panic!("background compaction task failed: {error}"));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_quiescent_checks(
     client: &Client,
     server: &FullTestServer,
     artifacts: &mut SeedArtifacts,
@@ -5695,7 +6354,6 @@ async fn quiesce_and_verify(
     coverage: &mut Coverage,
     s3_tracker: &mut S3Tracker,
     corruption_tracker: &mut CorruptionTracker,
-    _namespaces: &[String],
     op_index: &mut u64,
     compactions: &mut u64,
     started: Instant,
@@ -5703,67 +6361,32 @@ async fn quiesce_and_verify(
     mutation: Option<OracleMutation>,
     mode: RunMode,
     exact_vector_count: bool,
+    quiet_timeline: &mut Vec<TimelineEvent>,
+    scheduler: Option<&FaultScheduler>,
 ) -> Vec<Violation> {
-    let resolutions = resolve_indeterminates(client, server, model, artifacts, *op_index).await;
-    if !resolutions.is_empty() {
-        return resolutions;
+    let mut violations = resolve_indeterminates(client, server, model, artifacts, *op_index).await;
+    push_quiet_event(
+        quiet_timeline,
+        scheduler,
+        started,
+        *op_index,
+        7,
+        Boundary::Runner,
+        "resolve-indeterminates",
+        quiet_observed(&violations),
+        Some(if violations.is_empty() {
+            "ambiguity drained".to_string()
+        } else {
+            format!("violations={}", violations.len())
+        }),
+    );
+    if !violations.is_empty() {
+        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 8);
+        return violations;
     }
+
     let namespaces = model.namespace_names();
-    if mutation == Some(OracleMutation::DualWriterFencing) {
-        let namespace = namespaces
-            .iter()
-            .find(|namespace| {
-                model
-                    .namespaces
-                    .get(*namespace)
-                    .is_some_and(|ns_model| ns_model.spec.is_exact())
-            })
-            .unwrap_or_else(|| {
-                panic!("dual-writer fencing mutation requires a live exact namespace")
-            });
-        return inject_dual_writer_fencing_mutation(
-            &server.store,
-            s3_tracker,
-            namespace,
-            *op_index,
-            dual_writer_stale_fencing_token.unwrap_or_else(|| {
-                panic!("dual-writer fencing mutation requires node A's stale fencing token")
-            }),
-        )
-        .await;
-    }
-    if mutation == Some(OracleMutation::MisdirectedWriteReachability) {
-        for ns in &namespaces {
-            let Some(ns_model) = model.namespaces.get(ns) else {
-                continue;
-            };
-            if !ns_model.spec.is_exact() {
-                continue;
-            }
-            let status = match Manifest::read(&server.store, ns).await {
-                Ok(Some(manifest)) => json!({
-                    "manifest_generation": manifest.version(),
-                }),
-                Ok(None) => json!({ "manifest_generation": null }),
-                Err(error) => {
-                    return vec![Violation {
-                        id: ViolationId::I15ManifestLineage,
-                        op_index: *op_index,
-                        namespace: ns.clone(),
-                        detail: "selftest manifest read-failed at quiescence".to_string(),
-                        evidence: json!({ "error": error.to_string() }),
-                    }];
-                }
-            };
-            let violations = s3_tracker
-                .check_namespace(&server.store, ns, *op_index, &status, false)
-                .await;
-            if !violations.is_empty() {
-                return violations;
-            }
-        }
-    }
-    for ns in &namespaces {
+    'compactions: for ns in &namespaces {
         let compact = Op::CompactInline { ns: ns.clone() };
         let step = execute_recorded_op(
             client,
@@ -5801,20 +6424,44 @@ async fn quiesce_and_verify(
                 continue;
             }
             if !step.violations.is_empty() {
-                return step.violations;
+                violations = step.violations;
+                break 'compactions;
             }
-            return vec![Violation {
+            violations = vec![Violation {
                 id: ViolationId::I16Quiescence,
                 op_index: *op_index,
                 namespace: ns.clone(),
                 detail: "quiescence compaction failed".to_string(),
                 evidence: serde_json::json!({ "status": step.status }),
             }];
+            break 'compactions;
         }
         if !step.violations.is_empty() {
-            return step.violations;
+            violations = step.violations;
+            break 'compactions;
         }
+    }
+    push_quiet_event(
+        quiet_timeline,
+        scheduler,
+        started,
+        *op_index,
+        8,
+        Boundary::Runner,
+        "force-compaction",
+        quiet_observed(&violations),
+        Some(format!(
+            "namespaces={}; violations={}",
+            namespaces.len(),
+            violations.len()
+        )),
+    );
+    if !violations.is_empty() {
+        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 9);
+        return violations;
+    }
 
+    'gc: for ns in &namespaces {
         for _ in 0..2 {
             let gc = Op::GcCycle {
                 ns: ns.clone(),
@@ -5842,16 +6489,97 @@ async fn quiesce_and_verify(
             .await;
             *op_index += 1;
             if !step.violations.is_empty() {
-                return step.violations;
+                violations = step.violations;
+                break 'gc;
             }
         }
+    }
+    push_quiet_event(
+        quiet_timeline,
+        scheduler,
+        started,
+        *op_index,
+        9,
+        Boundary::Runner,
+        "gc-twice",
+        quiet_observed(&violations),
+        Some(format!(
+            "namespaces={}; cycles={}; violations={}",
+            namespaces.len(),
+            namespaces.len().saturating_mul(2),
+            violations.len()
+        )),
+    );
+    if !violations.is_empty() {
+        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 10);
+        return violations;
+    }
 
+    if mutation == Some(OracleMutation::DualWriterFencing) {
+        let namespace = namespaces
+            .iter()
+            .find(|namespace| {
+                model
+                    .namespaces
+                    .get(*namespace)
+                    .is_some_and(|ns_model| ns_model.spec.is_exact())
+            })
+            .unwrap_or_else(|| {
+                panic!("dual-writer fencing mutation requires a live exact namespace")
+            });
+        violations = inject_dual_writer_fencing_mutation(
+            &server.store,
+            s3_tracker,
+            namespace,
+            *op_index,
+            dual_writer_stale_fencing_token.unwrap_or_else(|| {
+                panic!("dual-writer fencing mutation requires node A's stale fencing token")
+            }),
+        )
+        .await;
+    }
+    if violations.is_empty() && mutation == Some(OracleMutation::MisdirectedWriteReachability) {
+        'misdirected: for ns in &namespaces {
+            let Some(ns_model) = model.namespaces.get(ns) else {
+                continue;
+            };
+            if !ns_model.spec.is_exact() {
+                continue;
+            }
+            let status = match Manifest::read(&server.store, ns).await {
+                Ok(Some(manifest)) => json!({
+                    "manifest_generation": manifest.version(),
+                }),
+                Ok(None) => json!({ "manifest_generation": null }),
+                Err(error) => {
+                    violations.push(Violation {
+                        id: ViolationId::I15ManifestLineage,
+                        op_index: *op_index,
+                        namespace: ns.clone(),
+                        detail: "selftest manifest read-failed at quiescence".to_string(),
+                        evidence: json!({ "error": error.to_string() }),
+                    });
+                    break 'misdirected;
+                }
+            };
+            violations = s3_tracker
+                .check_namespace(&server.store, ns, *op_index, &status, false)
+                .await;
+            if !violations.is_empty() {
+                break 'misdirected;
+            }
+        }
+    }
+    'oracles: for ns in &namespaces {
+        if !violations.is_empty() {
+            break;
+        }
         let status = compact_status(client, &server.base_url, ns).await;
         let expected_live = model
             .namespaces
             .get(ns)
             .map_or(0, |ns_model| ns_model.live.len());
-        let mut violations = if exact_vector_count {
+        let mut oracle_violations = if exact_vector_count {
             s3_oracle::check_quiescent_namespace_after_second_node(
                 &server.store,
                 ns,
@@ -5870,9 +6598,9 @@ async fn quiesce_and_verify(
             )
             .await
         };
-        violations
+        oracle_violations
             .extend(s3_oracle::check_v4_sketch_publication(&server.store, ns, *op_index).await);
-        violations.extend(
+        oracle_violations.extend(
             if model
                 .namespaces
                 .get(ns)
@@ -5894,10 +6622,32 @@ async fn quiesce_and_verify(
                 Vec::new()
             },
         );
+        violations.extend(oracle_violations);
         if !violations.is_empty() {
-            return violations;
+            break 'oracles;
         }
+    }
+    push_quiet_event(
+        quiet_timeline,
+        scheduler,
+        started,
+        *op_index,
+        10,
+        Boundary::ObjectStore,
+        "s3-oracles",
+        quiet_observed(&violations),
+        Some(format!(
+            "namespaces={}; violations={}",
+            namespaces.len(),
+            violations.len()
+        )),
+    );
+    if !violations.is_empty() {
+        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 11);
+        return violations;
+    }
 
+    'sweep: for ns in &namespaces {
         let ids = model
             .namespaces
             .get(ns)
@@ -5930,7 +6680,8 @@ async fn quiesce_and_verify(
         .await;
         *op_index += 1;
         if !step.violations.is_empty() {
-            return step.violations;
+            violations = step.violations;
+            break 'sweep;
         }
 
         let q = exhaustive_query_from_model(model, ns);
@@ -5961,10 +6712,56 @@ async fn quiesce_and_verify(
         .await;
         *op_index += 1;
         if !step.violations.is_empty() {
-            return step.violations;
+            violations = step.violations;
+            break 'sweep;
         }
     }
-    Vec::new()
+    push_quiet_event(
+        quiet_timeline,
+        scheduler,
+        started,
+        *op_index,
+        11,
+        Boundary::ClientHttp,
+        "exhaustive-sweep",
+        quiet_observed(&violations),
+        Some(format!(
+            "namespaces={}; violations={}",
+            namespaces.len(),
+            violations.len()
+        )),
+    );
+    violations
+}
+
+fn push_skipped_quiet_steps(
+    timeline: &mut Vec<TimelineEvent>,
+    scheduler: Option<&FaultScheduler>,
+    started: Instant,
+    op_index: u64,
+    first_step: u8,
+) {
+    for (step, boundary, action) in [
+        (8, Boundary::Runner, "force-compaction"),
+        (9, Boundary::Runner, "gc-twice"),
+        (10, Boundary::ObjectStore, "s3-oracles"),
+        (11, Boundary::ClientHttp, "exhaustive-sweep"),
+    ]
+    .into_iter()
+    .filter(|(step, _, _)| *step >= first_step)
+    {
+        push_quiet_event(
+            timeline,
+            scheduler,
+            started,
+            op_index,
+            step,
+            boundary,
+            action,
+            ObservedResult::DefiniteNotApplied,
+            Some("skipped after an earlier quiet-period violation".to_string()),
+        );
+    }
 }
 
 async fn resolve_indeterminates(
@@ -6449,7 +7246,436 @@ mod outcome_tests {
     use zeppelin::types::DistanceMetric;
 
     use super::*;
-    use crate::adversarial::faults::{FaultEvent, TargetSelector};
+    use crate::adversarial::faults::{Direction, FaultEvent, TargetSelector};
+
+    #[test]
+    fn mixed_mode_reserves_only_legacy_seed_zero_and_two_as_deterministic() {
+        let expected = [
+            (RunMode::Deterministic, None),
+            (RunMode::Chaos, Some(FaultProfile::LegacyChaos)),
+            (RunMode::Deterministic, None),
+            (RunMode::Chaos, Some(FaultProfile::PostCommit)),
+            (RunMode::Chaos, Some(FaultProfile::Network)),
+            (RunMode::Chaos, Some(FaultProfile::Crash)),
+            (RunMode::Chaos, Some(FaultProfile::Clock)),
+            (RunMode::Chaos, Some(FaultProfile::Content)),
+            (RunMode::Chaos, Some(FaultProfile::Semantic)),
+            (RunMode::Chaos, Some(FaultProfile::Sched)),
+            (RunMode::Chaos, Some(FaultProfile::Ops)),
+            (RunMode::Chaos, Some(FaultProfile::Full)),
+        ];
+        for (seed, (mode, profile)) in expected.into_iter().enumerate() {
+            let seed = u64::try_from(seed).unwrap();
+            let assignment = effective_seed_assignment(RunMode::Mixed, None, seed);
+            assert_eq!(assignment.mode, mode, "mixed residue {seed}");
+            assert_eq!(assignment.profile, profile, "mixed residue {seed}");
+            assert_eq!(effective_seed_mode(RunMode::Mixed, seed), mode);
+        }
+        assert_eq!(
+            effective_seed_assignment(RunMode::Mixed, Some(FaultProfile::Content), 0).profile,
+            Some(FaultProfile::Content)
+        );
+    }
+
+    #[test]
+    fn overnight_seed_rotation_preserves_history_and_reaches_every_mixed_slot() {
+        let configured = [0, 1, 2];
+        let emitted = (0..12)
+            .map(|index| overnight_seed(&configured, index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(&emitted[..3], &configured);
+        assert_eq!(emitted.iter().copied().collect::<BTreeSet<_>>().len(), 12);
+        assert_eq!(
+            emitted.iter().map(|seed| seed % 12).collect::<Vec<_>>(),
+            (0..12).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|seed| effective_seed_assignment(RunMode::Mixed, None, *seed).profile)
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some(FaultProfile::LegacyChaos),
+                None,
+                Some(FaultProfile::PostCommit),
+                Some(FaultProfile::Network),
+                Some(FaultProfile::Crash),
+                Some(FaultProfile::Clock),
+                Some(FaultProfile::Content),
+                Some(FaultProfile::Semantic),
+                Some(FaultProfile::Sched),
+                Some(FaultProfile::Ops),
+                Some(FaultProfile::Full),
+            ]
+        );
+    }
+
+    fn replay_trace_record(index: u64, phase: ExecutionPhase, op: Op) -> OpRecord {
+        OpRecord {
+            index,
+            wall_ms: index,
+            op,
+            method: "GET".to_string(),
+            path: "/fixture".to_string(),
+            status: StatusCode::OK.as_u16(),
+            response: json!({}),
+            outcome: "applied".to_string(),
+            target_node: 0,
+            execution: ExecutionMetadata { phase, hold: None },
+            gen_after: None,
+            duration_ms: 0,
+            violations: Vec::new(),
+        }
+    }
+
+    fn quiet_failure_manifest(op_index: u64) -> FailureManifest {
+        FailureManifest {
+            seed: 7,
+            mode: RunMode::Chaos,
+            op_index,
+            violations: vec![Violation {
+                id: ViolationId::I16Quiescence,
+                op_index,
+                namespace: "source-prefix-ns".to_string(),
+                detail: "quiet fixture failure".to_string(),
+                evidence: json!({}),
+            }],
+            preserved_prefix: "source-prefix".to_string(),
+            fault_plan: None,
+            repro_cmd: "fixture replay".to_string(),
+            inspect_cmd: "fixture inspect".to_string(),
+        }
+    }
+
+    fn replay_trace_fixture(prefix: &str, include_sweep: bool) -> Vec<OpRecord> {
+        let ns = format!("{prefix}-ns");
+        let mut records = vec![
+            replay_trace_record(
+                0,
+                ExecutionPhase::Workload,
+                Op::GetNamespace { ns: ns.clone() },
+            ),
+            replay_trace_record(
+                1,
+                ExecutionPhase::Quiescence,
+                Op::CompactInline { ns: ns.clone() },
+            ),
+            replay_trace_record(
+                2,
+                ExecutionPhase::Quiescence,
+                Op::GcCycle {
+                    ns: ns.clone(),
+                    keep_count: 1,
+                },
+            ),
+        ];
+        if include_sweep {
+            records.push(replay_trace_record(
+                3,
+                ExecutionPhase::Quiescence,
+                Op::FetchVectors {
+                    ns,
+                    ids: vec![format!("{prefix}-v0")],
+                    consistency: ConsistencyLevel::Strong,
+                },
+            ));
+        }
+        records
+    }
+
+    #[test]
+    fn clean_replay_requires_an_exact_completed_quiet_trace() {
+        let source = replay_trace_fixture("source-prefix", true);
+        let replay = replay_trace_fixture("replay-prefix", true);
+
+        assert_normalized_full_replay_structure(
+            &source,
+            "source-prefix",
+            &replay,
+            "replay-prefix",
+            None,
+        );
+
+        let mut extended = replay;
+        extended.push(replay_trace_record(
+            4,
+            ExecutionPhase::Quiescence,
+            Op::Query {
+                ns: "replay-prefix-ns".to_string(),
+                q: GeneratedQuery {
+                    body: json!({}),
+                    class: QueryOracleClass::Membership {
+                        consistency: ConsistencyLevel::Strong,
+                    },
+                    pattern_tags: Vec::new(),
+                },
+                as_of: None,
+            },
+        ));
+        assert!(std::panic::catch_unwind(|| {
+            assert_normalized_full_replay_structure(
+                &source,
+                "source-prefix",
+                &extended,
+                "replay-prefix",
+                None,
+            );
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn repaired_quiet_failure_replay_accepts_only_a_longer_exact_prefix() {
+        let source = replay_trace_fixture("source-prefix", false);
+        let replay = replay_trace_fixture("replay-prefix", true);
+        let failure = quiet_failure_manifest(3);
+
+        assert_normalized_full_replay_structure(
+            &source,
+            "source-prefix",
+            &replay,
+            "replay-prefix",
+            Some(&failure),
+        );
+    }
+
+    #[test]
+    fn terminal_workload_failure_does_not_add_unrecorded_quiet_verification() {
+        let source = vec![
+            replay_trace_record(
+                0,
+                ExecutionPhase::Workload,
+                Op::GetNamespace {
+                    ns: "source-prefix-ns".to_string(),
+                },
+            ),
+            replay_trace_record(
+                1,
+                ExecutionPhase::Workload,
+                Op::GetNamespace {
+                    ns: "source-prefix-ns".to_string(),
+                },
+            ),
+        ];
+        let failure = quiet_failure_manifest(1);
+
+        assert!(source_failure_precedes_unrecorded_quiet_period(
+            &source,
+            Some(&failure),
+        ));
+        assert!(!source_failure_precedes_unrecorded_quiet_period(
+            &source, None,
+        ));
+
+        let quiet_source = replay_trace_fixture("source-prefix", false);
+        let quiet_failure = quiet_failure_manifest(3);
+        assert!(!source_failure_precedes_unrecorded_quiet_period(
+            &quiet_source,
+            Some(&quiet_failure),
+        ));
+    }
+
+    #[test]
+    fn overnight_seed_rotation_skips_arbitrary_configured_seeds_without_collisions() {
+        let configured = [u64::MAX, 17, 0, 12, 5];
+        let emitted = (0..64)
+            .map(|index| overnight_seed(&configured, index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(&emitted[..configured.len()], &configured);
+        assert_eq!(
+            emitted.iter().copied().collect::<BTreeSet<_>>().len(),
+            emitted.len()
+        );
+        assert!(emitted[configured.len()..]
+            .iter()
+            .all(|seed| !configured.contains(seed)));
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|seed| seed % 12)
+                .collect::<BTreeSet<_>>(),
+            (0..12).collect()
+        );
+    }
+
+    #[test]
+    fn overnight_emitted_seed_is_the_artifact_and_replay_identity() {
+        let root = tempfile::TempDir::new().unwrap();
+        let configured = [0, 1, 2];
+        let emitted_seed = overnight_seed(&configured, 11);
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: configured.to_vec(),
+            max_ops: Some(1),
+            artifacts: root.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Mixed,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let run_artifacts = RunArtifacts::create(&env);
+        let seed_artifacts = run_artifacts.seed(
+            emitted_seed,
+            &deterministic_config(),
+            &BTreeMap::new(),
+            RunMode::Chaos,
+            None,
+            None,
+            None,
+            None,
+        );
+        drop(seed_artifacts);
+
+        let seed_dir = run_artifacts.root().join(format!("seed-{emitted_seed}"));
+        assert!(seed_dir.exists());
+        assert_eq!(replay_seed_config(&seed_dir).seed, emitted_seed);
+    }
+
+    #[test]
+    fn reproduction_environment_includes_the_active_profile() {
+        assert_eq!(
+            reproduction_environment("memory", None, Some(FaultProfile::Semantic)),
+            "TEST_BACKEND=memory ZEPPELIN_ADVERSARIAL_PROFILE=semantic"
+        );
+        assert_eq!(
+            reproduction_environment(
+                "minio",
+                Some(OracleMutation::DualWriterFencing),
+                Some(FaultProfile::Ops),
+            ),
+            "TEST_BACKEND=minio ZEPPELIN_ADVERSARIAL_SELFTEST=dual-writer-fencing \
+             ZEPPELIN_ADVERSARIAL_PROFILE=ops"
+        );
+    }
+
+    #[tokio::test]
+    async fn deterministic_seed_uses_the_canonical_quiet_period_order() {
+        let root = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 30,
+            seeds: vec![0],
+            max_ops: Some(4),
+            artifacts: root.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Deterministic,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let artifacts = RunArtifacts::create(&env);
+        let seed_dir = artifacts.root().join("seed-0");
+        let outcome = run_seed(
+            &env,
+            &artifacts,
+            0,
+            Instant::now() + Duration::from_secs(30),
+            None,
+            None,
+        )
+        .await;
+        assert!(!outcome.failed, "{:?}", outcome.violations);
+
+        let timeline = fs::read_to_string(seed_dir.join("timeline.jsonl")).unwrap();
+        let actions = timeline
+            .lines()
+            .map(|line| serde_json::from_str::<TimelineEvent>(line).unwrap().action)
+            .filter(|action| action.starts_with("quiet:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            [
+                "quiet:scheduler-quiesce",
+                "quiet:restore-network",
+                "quiet:release-held",
+                "quiet:stop-second-node",
+                "quiet:primary-health",
+                "quiet:stop-background",
+                "quiet:resolve-indeterminates",
+                "quiet:force-compaction",
+                "quiet:gc-twice",
+                "quiet:s3-oracles",
+                "quiet:exhaustive-sweep",
+            ]
+        );
+        assert!(seed_dir.join("timeline.jsonl").exists());
+        assert!(!seed_dir.join("faults.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn quiet_restore_deletes_only_a_fired_misdirected_write_artifact() {
+        let harness = TestHarness::new().await;
+        let original = harness.key("ns/wal/fired.wal");
+        let redirected = format!("{original}.misdirected");
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Content,
+            events: vec![FaultEvent {
+                id: "content-fired-misdirected".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Put),
+                    key_substring: Some(original.clone()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(super::super::faults::ContentFault::MisdirectedWrite),
+            }],
+        });
+        let faulted = store_fault_proxy(&harness.store, scheduler.clone());
+
+        faulted
+            .put(&original, bytes::Bytes::from_static(b"wal"))
+            .await
+            .unwrap();
+        assert!(!harness.store.exists(&original).await.unwrap());
+        assert!(harness.store.exists(&redirected).await.unwrap());
+        scheduler.quiesce();
+
+        let recovery =
+            restore_misdirected_write_artifacts(&harness.store, Some(&scheduler), None).await;
+
+        assert!(!harness.store.exists(&original).await.unwrap());
+        assert!(!harness.store.exists(&redirected).await.unwrap());
+        assert_eq!(
+            recovery,
+            format!(
+                "misdirected_artifacts_proven=1; deleted=1; already_absent=0; \
+                 verified_absent=1; keys=[{redirected}]"
+            )
+        );
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn quiet_restore_preserves_an_unproven_misdirected_suffix_object() {
+        let harness = TestHarness::new().await;
+        let arbitrary = harness.key("ns/wal/arbitrary.wal.misdirected");
+        harness
+            .store
+            .put(&arbitrary, bytes::Bytes::from_static(b"stray"))
+            .await
+            .unwrap();
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Content,
+            events: Vec::new(),
+        });
+        scheduler.quiesce();
+
+        let recovery =
+            restore_misdirected_write_artifacts(&harness.store, Some(&scheduler), None).await;
+
+        assert!(harness.store.exists(&arbitrary).await.unwrap());
+        assert_eq!(
+            recovery,
+            "misdirected_artifacts_proven=0; deleted=0; already_absent=0; \
+             verified_absent=0; keys=[]"
+        );
+        harness.cleanup().await;
+    }
 
     #[test]
     fn replay_op_rewrite_updates_all_prefix_bearing_strings() {
@@ -7079,7 +8305,7 @@ mod outcome_tests {
                 profile: FaultProfile::Network,
                 events: Vec::new(),
             }),
-            injector: Arc::clone(&injector),
+            injector: injector.request_handle(),
             bookkeeping_store: ZeppelinStore::new(Arc::new(InMemory::new())),
             direct_base_url: direct_base_url.clone(),
             proxy_base_url: "http://127.0.0.1:1".to_string(),
@@ -7161,6 +8387,41 @@ mod outcome_tests {
         assert_eq!(config.server.max_concurrent_queries, 1);
         assert_eq!(config.compaction.interval_secs, 5);
         assert_eq!(config.compaction.max_wal_fragments_before_compact, 2);
+    }
+
+    #[test]
+    fn standalone_ops_requires_strict_compaction_proof_but_full_overlap_does_not() {
+        let standalone_ops = FaultScheduler::for_seed(7, FaultProfile::Ops);
+        assert!(requires_two_node_compaction_evidence_for_schedule(Some(
+            standalone_ops.schedule()
+        )));
+
+        let full_overlap = FaultSchedule {
+            profile: FaultProfile::Full,
+            events: vec![
+                FaultEvent {
+                    id: "full-network-00".to_string(),
+                    start_op: 40,
+                    end_op: Some(80),
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector::default(),
+                    kind: FaultKind::Partition {
+                        direction: Direction::All,
+                    },
+                },
+                FaultEvent {
+                    id: "full-ops-01".to_string(),
+                    start_op: 50,
+                    end_op: Some(70),
+                    boundary: Boundary::Runner,
+                    target: TargetSelector::default(),
+                    kind: FaultKind::StartSecondNode { for_ops: 20 },
+                },
+            ],
+        };
+        assert!(!requires_two_node_compaction_evidence_for_schedule(Some(
+            &full_overlap
+        )));
     }
 
     #[tokio::test]
@@ -7680,7 +8941,7 @@ mod outcome_tests {
         let injector = start_http_fault_injector(&server.base_url).await;
         let context = HttpFaultContext {
             scheduler,
-            injector: Arc::clone(&injector),
+            injector: injector.request_handle(),
             bookkeeping_store: harness.store.clone(),
             direct_base_url: server.base_url.clone(),
             proxy_base_url: injector.base_url(),
@@ -7762,7 +9023,7 @@ mod outcome_tests {
     }
 
     #[tokio::test]
-    async fn manifest_get_hold_spans_foreground_ops_and_joins_without_violations() {
+    async fn quiet_period_releases_terminal_hold_and_drains_reserved_ops() {
         let harness = TestHarness::new().await;
         let prefix = harness.prefix.clone();
         let held_ns = format!("{prefix}-held");
@@ -7787,13 +9048,13 @@ mod outcome_tests {
                     key_substring: Some(format!("{held_ns}/manifest.json")),
                     ..TargetSelector::default()
                 },
-                kind: FaultKind::HoldCall { for_ops: 3 },
+                kind: FaultKind::HoldCall { for_ops: 5 },
             }],
         });
         let config = deterministic_config();
         let mut server = start_test_server_full(
             store_fault_proxy(&harness.store, scheduler.clone()),
-            Some(prefix),
+            Some(prefix.clone()),
             config.clone(),
             false,
             None,
@@ -7873,7 +9134,7 @@ mod outcome_tests {
         scheduler.advance_to(2);
         let hold = foreground_hold_for_op(Some(&scheduler), &held_op, 2)
             .expect("pinned manifest GET must nominate the held upsert");
-        assert_eq!(hold.release_op, 5);
+        assert_eq!(hold.release_op, 7);
         let pending = match execute_hold_candidate(
             &scheduler,
             hold,
@@ -7939,31 +9200,78 @@ mod outcome_tests {
             assert!(step.violations.is_empty(), "{:?}", step.violations);
         }
 
-        scheduler.advance_to(5);
-        let joined = finish_pending_held_op(
-            pending,
-            &client,
-            &mut artifacts,
-            &mut model,
-            &mut coverage,
-            &mut s3_tracker,
-            &mut corruption_tracker,
-            None,
-            RunMode::Chaos,
-        )
+        let mut pending = Some(pending);
+        let mut drain_ops = VecDeque::from([QuietDrainOp::Generated {
+            op: Op::Upsert {
+                ns: held_ns.clone(),
+                vectors: vec![GenVector {
+                    id: "deferred-vector".to_string(),
+                    values: vec![0.5, 0.5],
+                    attributes: None,
+                }],
+            },
+            inject_post_commit_ack_loss: false,
+        }]);
+        let mut operational_state = OperationalState::default();
+        let mut injector = None;
+        let mut http_fault_context = None;
+        let mut dual_writer_lease_hold = None;
+        let mut created_namespaces = vec![held_ns.clone(), other_ns.clone()];
+        let mut background_compaction_starts = BTreeMap::new();
+        let mut op_index = 5;
+        let mut compactions = 0;
+        let quiet = QuietPeriod {
+            client: &client,
+            server: &mut server,
+            scheduler: Some(&scheduler),
+            test_clock: None,
+            injector: &mut injector,
+            http_fault_context: &mut http_fault_context,
+            chaos: None,
+            operational_state: &mut operational_state,
+            operational_observer: None,
+            pending_held_op: &mut pending,
+            dual_writer_lease_hold: &mut dual_writer_lease_hold,
+            initial_dual_writer_stale_fencing_token: None,
+            artifacts: &mut artifacts,
+            model: &mut model,
+            coverage: &mut coverage,
+            s3_tracker: &mut s3_tracker,
+            corruption_tracker: &mut corruption_tracker,
+            created_namespaces: &mut created_namespaces,
+            background_compaction_starts: &mut background_compaction_starts,
+            op_index: &mut op_index,
+            compactions: &mut compactions,
+            started,
+            mutation: None,
+            mode: RunMode::Chaos,
+            exact_vector_count: false,
+            verify: false,
+            preserve_recorded_holds: false,
+            prefix: &prefix,
+            config: &config,
+            disk_cache_max_bytes: 100 * 1024 * 1024,
+            drain_ops: &mut drain_ops,
+        }
+        .run()
         .await;
-        assert!((200..300).contains(&joined.status), "{joined:?}");
-        assert!(joined.violations.is_empty(), "{:?}", joined.violations);
+        assert!(quiet.violations.is_empty(), "{:?}", quiet.violations);
+        assert_eq!(quiet.drained_ops, 1);
+        assert!(pending.is_none());
+        assert!(drain_ops.is_empty());
         assert!(model.namespaces[&held_ns].indeterminate.is_empty());
         assert!(model.namespaces[&held_ns].live.contains_key("held-vector"));
-        assert_eq!(artifacts.op_count(), 5);
+        assert!(model.namespaces[&held_ns]
+            .live
+            .contains_key("deferred-vector"));
+        assert_eq!(artifacts.op_count(), 6);
         let recorded = read_ops(&artifacts.dir);
         assert_eq!(
             recorded
                 .iter()
                 .map(|record| record.index)
                 .collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
+            vec![0, 1, 2, 3, 4, 5]
         );
         assert_eq!(
             recorded[2].execution,
@@ -7972,15 +9280,22 @@ mod outcome_tests {
                 hold: Some(HeldExecutionMetadata {
                     event_id: "sched-held-manifest-get".to_string(),
                     window_op: 2,
-                    scheduled_release_op: Some(5),
+                    scheduled_release_op: Some(7),
                     actual_join_op: 5,
-                    release_cause: HoldReleaseCause::LogicalOp,
+                    release_cause: HoldReleaseCause::Quiesce,
                 }),
             }
         );
-        let hold_timeline = scheduler
-            .timeline()
-            .into_iter()
+        assert_eq!(
+            recorded[5].execution,
+            ExecutionMetadata {
+                phase: ExecutionPhase::DeferredDrain,
+                hold: None,
+            }
+        );
+        let timeline = scheduler.timeline();
+        let hold_timeline = timeline
+            .iter()
             .filter(|event| event.event_id == "sched-held-manifest-get")
             .collect::<Vec<_>>();
         assert_eq!(hold_timeline.len(), 2, "{hold_timeline:#?}");
@@ -7988,12 +9303,281 @@ mod outcome_tests {
         assert_eq!(hold_timeline[0].semantics, FaultSemantics::WindowActive);
         assert_eq!(hold_timeline[1].op_index, 2);
         assert_eq!(hold_timeline[1].semantics, FaultSemantics::WindowEnd);
+        let quiet_start = timeline
+            .iter()
+            .position(|event| event.event_id == "quiet-01")
+            .unwrap();
+        let environment_restored = timeline
+            .iter()
+            .position(|event| event.event_id == "quiet-02")
+            .unwrap();
+        let held_release = timeline
+            .iter()
+            .position(|event| {
+                event.event_id == "sched-held-manifest-get"
+                    && event.semantics == FaultSemantics::WindowEnd
+            })
+            .unwrap();
+        let release_complete = timeline
+            .iter()
+            .position(|event| event.event_id == "quiet-03")
+            .unwrap();
+        assert!(quiet_start < environment_restored, "{timeline:#?}");
+        assert!(environment_restored < held_release, "{timeline:#?}");
+        assert!(held_release < release_complete, "{timeline:#?}");
 
-        scheduler.quiesce();
-        stop_chaos_and_background(&mut server, None).await;
         cleanup_ns(&harness.store, &held_ns).await;
         cleanup_ns(&harness.store, &other_ns).await;
         harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn replay_joins_terminal_hold_after_following_workload_record() {
+        let source_root = tempfile::TempDir::new().unwrap();
+        let source_env = RunnerEnv {
+            seconds: 30,
+            seeds: vec![61],
+            max_ops: Some(4),
+            artifacts: source_root.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Chaos,
+            profile: Some(FaultProfile::Sched),
+            env_echo: BTreeMap::new(),
+        };
+        let source_artifacts = RunArtifacts::create(&source_env);
+        let held_ns = "source-prefix-adv-61-held".to_string();
+        let other_ns = "source-prefix-adv-61-other".to_string();
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let config = deterministic_config();
+        let schedule = FaultSchedule {
+            profile: FaultProfile::Sched,
+            events: vec![FaultEvent {
+                id: "sched-terminal-hold".to_string(),
+                start_op: 2,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("manifest.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::HoldCall { for_ops: 4 },
+            }],
+        };
+        let specs = BTreeMap::from([
+            (held_ns.clone(), spec.clone()),
+            (other_ns.clone(), spec.clone()),
+        ]);
+        let mut source_seed = source_artifacts.seed(
+            61,
+            &config,
+            &specs,
+            RunMode::Chaos,
+            None,
+            None,
+            None,
+            Some(&schedule),
+        );
+        let held_query = GeneratedQuery {
+            body: json!({
+                "sources": [{
+                    "type": "ann",
+                    "vector": [0.0, 0.0],
+                    "nprobe": 4
+                }],
+                "fusion": { "type": "none" },
+                "top_k": 1,
+                "candidate_k": 1,
+                "consistency": ConsistencyLevel::Strong
+            }),
+            class: QueryOracleClass::Membership {
+                consistency: ConsistencyLevel::Strong,
+            },
+            pattern_tags: Vec::new(),
+        };
+        let source_records = vec![
+            OpRecord {
+                index: 0,
+                wall_ms: 0,
+                op: Op::CreateNamespace {
+                    ns: held_ns.clone(),
+                    spec: spec.clone(),
+                },
+                method: "POST".to_string(),
+                path: "/v1/namespaces".to_string(),
+                status: StatusCode::CREATED.as_u16(),
+                response: json!({}),
+                outcome: "applied".to_string(),
+                target_node: 0,
+                execution: ExecutionMetadata::workload(),
+                gen_after: Some(1),
+                duration_ms: 0,
+                violations: Vec::new(),
+            },
+            OpRecord {
+                index: 1,
+                wall_ms: 1,
+                op: Op::CreateNamespace {
+                    ns: other_ns.clone(),
+                    spec,
+                },
+                method: "POST".to_string(),
+                path: "/v1/namespaces".to_string(),
+                status: StatusCode::CREATED.as_u16(),
+                response: json!({}),
+                outcome: "applied".to_string(),
+                target_node: 0,
+                execution: ExecutionMetadata::workload(),
+                gen_after: Some(1),
+                duration_ms: 0,
+                violations: Vec::new(),
+            },
+            OpRecord {
+                index: 2,
+                wall_ms: 2,
+                op: Op::Query {
+                    ns: held_ns,
+                    q: held_query,
+                    as_of: None,
+                },
+                method: "POST".to_string(),
+                path: "/query".to_string(),
+                status: StatusCode::OK.as_u16(),
+                response: json!({}),
+                outcome: "applied".to_string(),
+                target_node: 0,
+                execution: ExecutionMetadata {
+                    phase: ExecutionPhase::Workload,
+                    hold: Some(HeldExecutionMetadata {
+                        event_id: "sched-terminal-hold".to_string(),
+                        window_op: 2,
+                        scheduled_release_op: Some(6),
+                        actual_join_op: 4,
+                        release_cause: HoldReleaseCause::Quiesce,
+                    }),
+                },
+                gen_after: None,
+                duration_ms: 0,
+                violations: Vec::new(),
+            },
+            OpRecord {
+                index: 3,
+                wall_ms: 3,
+                op: Op::GetNamespace {
+                    ns: other_ns.clone(),
+                },
+                method: "GET".to_string(),
+                path: "/v1/namespaces/other".to_string(),
+                status: StatusCode::OK.as_u16(),
+                response: json!({}),
+                outcome: "applied".to_string(),
+                target_node: 0,
+                execution: ExecutionMetadata::workload(),
+                gen_after: None,
+                duration_ms: 0,
+                violations: Vec::new(),
+            },
+            OpRecord {
+                index: 4,
+                wall_ms: 4,
+                op: Op::GetNamespace { ns: other_ns },
+                method: "GET".to_string(),
+                path: "/v1/namespaces/other".to_string(),
+                status: StatusCode::OK.as_u16(),
+                response: json!({}),
+                outcome: "applied".to_string(),
+                target_node: 0,
+                execution: ExecutionMetadata {
+                    phase: ExecutionPhase::DeferredDrain,
+                    hold: None,
+                },
+                gen_after: None,
+                duration_ms: 0,
+                violations: Vec::new(),
+            },
+        ];
+        for record in &source_records {
+            source_seed.write_op(record);
+        }
+        let source_dir = source_seed.dir.clone();
+        drop(source_seed);
+
+        let replay_root = tempfile::TempDir::new().unwrap();
+        let replay_env = RunnerEnv {
+            artifacts: replay_root.path().to_path_buf(),
+            max_ops: None,
+            profile: None,
+            ..source_env
+        };
+        let outcome = run_replay(&replay_env, &source_dir).await;
+        assert!(!outcome.failed, "{:?}", outcome.violations);
+
+        let replay_dir = fs::read_dir(replay_root.path())
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path().join("seed-61");
+                path.join("timeline.jsonl").exists().then_some(path)
+            })
+            .expect("terminal-hold replay did not write artifacts");
+        let replay_records = read_ops(&replay_dir);
+        let (_, replay_workload) = replay_workload_records(&replay_records);
+        assert_eq!(replay_workload.len(), 5);
+        assert_eq!(
+            normalized_op_execution_structure(
+                &replay_workload,
+                &recorded_namespace_prefix(61, &replay_seed_config(&replay_dir).namespace_specs,)
+            ),
+            normalized_op_execution_structure(&source_records, "source-prefix")
+        );
+        assert_eq!(
+            replay_workload[2].execution.hold,
+            source_records[2].execution.hold
+        );
+        assert!(replay_records.len() > 5);
+        assert!(replay_records[5..]
+            .iter()
+            .all(|record| record.execution.phase == ExecutionPhase::Quiescence));
+
+        let timeline = fs::read_to_string(replay_dir.join("timeline.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<TimelineEvent>(line).unwrap())
+            .collect::<Vec<_>>();
+        let first_quiet = timeline
+            .iter()
+            .find(|event| event.event_id == "quiet-01")
+            .expect("terminal-hold replay omitted canonical quiet period");
+        assert_eq!(first_quiet.op_index, 4);
+        let quiet_start = timeline
+            .iter()
+            .position(|event| event.event_id == "quiet-01")
+            .unwrap();
+        let environment_restored = timeline
+            .iter()
+            .position(|event| event.event_id == "quiet-02")
+            .unwrap();
+        let held_release = timeline
+            .iter()
+            .position(|event| {
+                event.event_id == "sched-terminal-hold"
+                    && event.semantics == FaultSemantics::WindowEnd
+            })
+            .expect("terminal hold omitted its release timeline event");
+        let release_complete = timeline
+            .iter()
+            .position(|event| event.event_id == "quiet-03")
+            .unwrap();
+        assert!(quiet_start < environment_restored, "{timeline:#?}");
+        assert!(environment_restored < held_release, "{timeline:#?}");
+        assert!(held_release < release_complete, "{timeline:#?}");
     }
 
     #[tokio::test]
@@ -8219,7 +9803,7 @@ mod outcome_tests {
         let injector = start_http_fault_injector(&server.base_url).await;
         let context = HttpFaultContext {
             scheduler: scheduler.clone(),
-            injector: Arc::clone(&injector),
+            injector: injector.request_handle(),
             bookkeeping_store: harness.store.clone(),
             direct_base_url: server.base_url.clone(),
             proxy_base_url: injector.base_url(),
@@ -8270,7 +9854,7 @@ mod outcome_tests {
         assert!(scheduler.timeline()[0].action.contains("DuplicateRetry"));
 
         Arc::try_unwrap(injector).unwrap().shutdown().await;
-        stop_chaos_and_background(&mut server, None).await;
+        stop_background_compaction(&mut server).await;
         cleanup_ns(&harness.store, &ns).await;
         harness.cleanup().await;
     }

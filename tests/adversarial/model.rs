@@ -81,6 +81,25 @@ pub enum OracleMutation {
 }
 
 impl OracleMutation {
+    pub const ALL: [Self; 16] = [
+        Self::DropDelete,
+        Self::SkewScore,
+        Self::PhantomId,
+        Self::LeakTombstone,
+        Self::FilterSkew,
+        Self::GcEatsLiveKey,
+        Self::StaleCheckpoint,
+        Self::ChaosLostWrite,
+        Self::PostCommitLostWrite,
+        Self::IndetResolutionLie,
+        Self::DroppedResponseLostWrite,
+        Self::CrashLostAck,
+        Self::ClockGcEatsLive,
+        Self::SwallowCorruption,
+        Self::MisdirectedWriteReachability,
+        Self::DualWriterFencing,
+    ];
+
     #[must_use]
     pub fn from_key(key: &str) -> Self {
         match key {
@@ -928,6 +947,18 @@ mod tests {
 
         assert_eq!(mutation, OracleMutation::DualWriterFencing);
         assert_eq!(mutation.key(), "dual-writer-fencing");
+    }
+
+    #[test]
+    fn consolidated_oracle_matrix_has_unique_round_tripping_keys() {
+        let keys = OracleMutation::ALL
+            .into_iter()
+            .map(OracleMutation::key)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys.len(), OracleMutation::ALL.len());
+        for mutation in OracleMutation::ALL {
+            assert_eq!(OracleMutation::from_key(mutation.key()), mutation);
+        }
     }
 
     #[test]

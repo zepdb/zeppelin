@@ -1,5 +1,11 @@
-use std::collections::BTreeMap;
-use std::fs::{self, File};
+//! Durable adversarial-run artifacts and Markdown reporting.
+//!
+//! `faults.jsonl` belongs only to the legacy chaos injector. Scheduled fault
+//! profiles use `timeline.jsonl`; all profiles also record canonical
+//! `quiet:<step>` recovery events there.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,16 +19,31 @@ use zeppelin::storage::ZeppelinStore;
 use crate::common::counting::ClassStats;
 
 use super::chaos::FiredFault;
-use super::faults::{FaultSchedule, TimelineEvent};
+use super::faults::{FaultKind, FaultProfile, FaultSchedule, ObservedResult, TimelineEvent};
 use super::generator::Coverage;
 use super::model::Model;
 use super::ops::{NamespaceSpec, OpRecord};
 use super::oracle::Violation;
-use super::{RunMode, RunnerEnv};
+use super::{effective_seed_assignment, RunMode, RunnerEnv, SeedAssignment};
 
 #[derive(Debug)]
 pub struct RunArtifacts {
     root: PathBuf,
+    start_manifest: RunManifest,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RunManifest {
+    git_rev: String,
+    dirty_tree: bool,
+    backend: Option<String>,
+    env: BTreeMap<String, String>,
+    configured_seeds: Vec<u64>,
+    seeds: Vec<u64>,
+    mode: RunMode,
+    profile: Option<FaultProfile>,
+    mode_assignment: BTreeMap<String, SeedAssignment>,
+    seconds: u64,
 }
 
 #[derive(Debug)]
@@ -56,6 +77,7 @@ struct S3CaptureMetadata {
 pub struct SeedReport {
     pub seed: u64,
     pub mode: RunMode,
+    pub profile: Option<FaultProfile>,
     pub dir: PathBuf,
     pub failed: bool,
     pub ops: u64,
@@ -106,35 +128,17 @@ impl RunArtifacts {
                 root.display()
             )
         });
-        let mode_assignment = env
-            .seeds
-            .iter()
-            .map(|seed| {
-                let mode = if env.profile.is_some() {
-                    RunMode::Chaos
-                } else {
-                    match env.mode {
-                        RunMode::Deterministic => RunMode::Deterministic,
-                        RunMode::Chaos => RunMode::Chaos,
-                        RunMode::Mixed if seed % 3 == 1 => RunMode::Chaos,
-                        RunMode::Mixed => RunMode::Deterministic,
-                    }
-                };
-                (seed.to_string(), mode)
-            })
-            .collect::<BTreeMap<_, _>>();
-        let run_json = serde_json::json!({
-            "git_rev": git_rev(),
-            "dirty_tree": git_dirty(),
-            "backend": env.env_echo.get("TEST_BACKEND"),
-            "env": env.env_echo,
-            "seeds": env.seeds,
-            "mode": env.mode,
-            "profile": env.profile,
-            "mode_assignment": mode_assignment,
-        });
-        write_json(root.join("run.json"), &run_json);
-        Self { root }
+        let start_manifest = RunManifest::at_start(env);
+        let artifacts = Self {
+            root,
+            start_manifest,
+        };
+        artifacts.write_run_manifest(&artifacts.start_manifest);
+        artifacts
+    }
+
+    fn write_run_manifest(&self, manifest: &RunManifest) {
+        write_json_atomically(self.root.join("run.json"), manifest);
     }
 
     #[must_use]
@@ -184,12 +188,14 @@ impl RunArtifacts {
 
     pub fn write_report(
         &self,
-        env: &RunnerEnv,
+        _env: &RunnerEnv,
         seeds: &[SeedReport],
         coverage: &Coverage,
         update_latest: bool,
     ) {
-        let report = build_report(&self.root, env, seeds, coverage);
+        let completed_manifest = self.start_manifest.at_completion(seeds);
+        self.write_run_manifest(&completed_manifest);
+        let report = build_report(&self.root, &self.start_manifest, seeds, coverage);
         let report_path = self.root.join("report.md");
         fs::write(&report_path, &report).unwrap_or_else(|error| {
             panic!("failed to write report {}: {error}", report_path.display())
@@ -199,6 +205,61 @@ impl RunArtifacts {
             fs::write("tasks/overnight-adversarial-report.md", report)
                 .expect("failed to update tasks/overnight-adversarial-report.md");
         }
+    }
+}
+
+impl RunManifest {
+    fn at_start(env: &RunnerEnv) -> Self {
+        let mode_assignment = env
+            .seeds
+            .iter()
+            .map(|seed| {
+                (
+                    seed.to_string(),
+                    effective_seed_assignment(env.mode, env.profile, *seed),
+                )
+            })
+            .collect();
+        Self {
+            git_rev: git_rev(),
+            dirty_tree: git_dirty(),
+            backend: env.env_echo.get("TEST_BACKEND").cloned(),
+            env: env.env_echo.clone(),
+            configured_seeds: env.seeds.clone(),
+            seeds: env.seeds.clone(),
+            mode: env.mode,
+            profile: env.profile,
+            mode_assignment,
+            seconds: env.seconds,
+        }
+    }
+
+    fn at_completion(&self, reports: &[SeedReport]) -> Self {
+        let mut completed = self.clone();
+        completed.seeds.clear();
+        let mut seen = BTreeSet::new();
+        for report in reports {
+            assert!(
+                seen.insert(report.seed),
+                "run completion contained duplicate seed report {}",
+                report.seed
+            );
+            completed.seeds.push(report.seed);
+            let key = report.seed.to_string();
+            let assignment = SeedAssignment {
+                mode: report.mode,
+                profile: report.profile,
+            };
+            if let Some(configured) = self.mode_assignment.get(&key) {
+                assert_eq!(
+                    assignment, *configured,
+                    "configured assignment for seed {} changed during the run",
+                    report.seed
+                );
+            }
+            completed.mode_assignment.insert(key, assignment);
+        }
+        completed
     }
 }
 
@@ -561,6 +622,55 @@ fn write_json<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &T) {
     });
 }
 
+fn write_json_atomically<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &T) {
+    let path = path.as_ref();
+    let bytes = serde_json::to_vec_pretty(value).expect("artifact JSON must serialize");
+    let parent = path.parent().unwrap_or_else(|| {
+        panic!(
+            "atomic artifact path {} has no parent directory",
+            path.display()
+        )
+    });
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| panic!("atomic artifact path {} has no file name", path.display()));
+    let temp_path = parent.join(format!(
+        "{}.{}.tmp",
+        file_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut temp = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to create atomic artifact temp {}: {error}",
+                temp_path.display()
+            )
+        });
+    temp.write_all(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "failed to write atomic artifact temp {}: {error}",
+            temp_path.display()
+        )
+    });
+    temp.sync_all().unwrap_or_else(|error| {
+        panic!(
+            "failed to sync atomic artifact temp {}: {error}",
+            temp_path.display()
+        )
+    });
+    drop(temp);
+    fs::rename(&temp_path, path).unwrap_or_else(|error| {
+        panic!(
+            "failed to atomically replace artifact {} with {}: {error}",
+            path.display(),
+            temp_path.display()
+        )
+    });
+}
+
 fn try_write_json<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(value).expect("artifact JSON must serialize");
     fs::write(path.as_ref(), bytes)
@@ -597,7 +707,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::adversarial::faults::{Boundary, FaultSemantics, ObservedResult};
+    use crate::adversarial::faults::{
+        Boundary, FaultEvent, FaultSemantics, ObservedResult, TargetSelector,
+    };
     use crate::adversarial::ops::{ExecutionMetadata, Op};
     use crate::adversarial::PreserveMode;
 
@@ -646,6 +758,339 @@ mod tests {
     }
 
     #[test]
+    fn run_json_records_the_twelve_slot_mode_and_profile_assignment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: (0..12).collect(),
+            max_ops: Some(1),
+            artifacts: dir.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Mixed,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let artifacts = RunArtifacts::create(&env);
+        let run: serde_json::Value =
+            serde_json::from_slice(&fs::read(artifacts.root().join("run.json")).unwrap()).unwrap();
+        let assignments = &run["mode_assignment"];
+        assert_eq!(assignments["0"]["mode"], "deterministic");
+        assert!(assignments["0"]["profile"].is_null());
+        assert_eq!(assignments["1"]["profile"], "legacy_chaos");
+        assert_eq!(assignments["3"]["profile"], "post_commit");
+        assert_eq!(assignments["10"]["profile"], "ops");
+        assert_eq!(assignments["11"]["profile"], "full");
+    }
+
+    #[test]
+    fn completed_run_json_records_emitted_overnight_seeds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: vec![0, 1, 2],
+            max_ops: Some(1),
+            artifacts: dir.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Mixed,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let artifacts = RunArtifacts::create(&env);
+        let reports = (0..12)
+            .map(|seed| {
+                let seed_dir = artifacts.root().join(format!("seed-{seed}"));
+                fs::create_dir_all(&seed_dir).unwrap();
+                File::create(seed_dir.join("ops.jsonl")).unwrap();
+                let assignment = effective_seed_assignment(env.mode, env.profile, seed);
+                SeedReport {
+                    seed,
+                    mode: assignment.mode,
+                    profile: assignment.profile,
+                    dir: seed_dir,
+                    failed: false,
+                    ops: 0,
+                    compactions: 0,
+                    background_compactions: 0,
+                    violations: Vec::new(),
+                    wall_secs: 0.0,
+                    object_store: BTreeMap::new(),
+                    fired_faults: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        artifacts.write_report(&env, &reports, &Coverage::default(), false);
+
+        let run: serde_json::Value =
+            serde_json::from_slice(&fs::read(artifacts.root().join("run.json")).unwrap()).unwrap();
+        assert_eq!(run["configured_seeds"], serde_json::json!([0, 1, 2]));
+        assert_eq!(
+            run["seeds"],
+            serde_json::json!([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+        );
+        assert_eq!(run["mode_assignment"]["3"]["profile"], "post_commit");
+        assert_eq!(run["mode_assignment"]["7"]["profile"], "content");
+        assert_eq!(run["mode_assignment"]["11"]["profile"], "full");
+    }
+
+    #[test]
+    fn completion_preserves_start_provenance_and_atomically_replaces_run_json() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut env_echo = BTreeMap::new();
+        env_echo.insert("TEST_BACKEND".to_string(), "start-backend".to_string());
+        env_echo.insert("ZEPPELIN_ADVERSARIAL_SECONDS".to_string(), "17".to_string());
+        env_echo.insert("START_ONLY".to_string(), "preserve-me".to_string());
+        let env = RunnerEnv {
+            seconds: 17,
+            seeds: vec![0, 1, 2],
+            max_ops: Some(1),
+            artifacts: dir.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Mixed,
+            profile: None,
+            env_echo,
+        };
+        let artifacts = RunArtifacts::create(&env);
+        let run_path = artifacts.root().join("run.json");
+        let start_bytes = fs::read(&run_path).unwrap();
+        let start: serde_json::Value = serde_json::from_slice(&start_bytes).unwrap();
+        let start_witness = artifacts.root().join("run-start-witness.json");
+        fs::hard_link(&run_path, &start_witness).unwrap();
+
+        let mut completion_env = env.clone();
+        completion_env.seeds = vec![99];
+        completion_env.mode = RunMode::Deterministic;
+        completion_env.profile = Some(FaultProfile::Crash);
+        completion_env
+            .env_echo
+            .insert("TEST_BACKEND".to_string(), "mutated-backend".to_string());
+        completion_env.env_echo.clear();
+
+        let seed_dir = artifacts.root().join("seed-3");
+        fs::create_dir_all(&seed_dir).unwrap();
+        File::create(seed_dir.join("ops.jsonl")).unwrap();
+        let reports = [SeedReport {
+            seed: 3,
+            mode: RunMode::Chaos,
+            profile: Some(FaultProfile::PostCommit),
+            dir: seed_dir,
+            failed: false,
+            ops: 0,
+            compactions: 0,
+            background_compactions: 0,
+            violations: Vec::new(),
+            wall_secs: 0.0,
+            object_store: BTreeMap::new(),
+            fired_faults: Vec::new(),
+        }];
+        artifacts.write_report(&completion_env, &reports, &Coverage::default(), false);
+
+        let completed_bytes = fs::read(&run_path).unwrap();
+        let completed: serde_json::Value = serde_json::from_slice(&completed_bytes).unwrap();
+        for key in [
+            "git_rev",
+            "dirty_tree",
+            "backend",
+            "env",
+            "configured_seeds",
+            "mode",
+            "profile",
+        ] {
+            assert_eq!(completed[key], start[key], "start field {key} drifted");
+        }
+        for seed in ["0", "1", "2"] {
+            assert_eq!(
+                completed["mode_assignment"][seed], start["mode_assignment"][seed],
+                "configured assignment for seed {seed} drifted"
+            );
+        }
+        assert_eq!(completed["seeds"], serde_json::json!([3]));
+        assert_eq!(
+            completed["mode_assignment"]["3"],
+            serde_json::json!({"mode": "chaos", "profile": "post_commit"})
+        );
+        let report = fs::read_to_string(artifacts.root().join("report.md")).unwrap();
+        assert!(report.contains(&format!(
+            "- git rev: `{}`",
+            start["git_rev"].as_str().unwrap()
+        )));
+        assert!(report.contains("- backend: `start-backend`"));
+        assert!(report.contains("- mode: `Mixed`"));
+        assert!(report.contains("- budget_s: `17`"));
+        assert!(!report.contains("mutated-backend"));
+        assert_eq!(
+            fs::read(&start_witness).unwrap(),
+            start_bytes,
+            "run.json completion must atomically replace, not truncate, its inode"
+        );
+        assert!(
+            fs::read_dir(artifacts.root()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
+            "atomic run.json update left a temporary file behind"
+        );
+    }
+
+    #[test]
+    fn timeline_summary_does_not_count_unresolved_ambiguity_as_applied() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let seed_dir = dir.path().join("seed-3");
+        fs::create_dir_all(&seed_dir).unwrap();
+        File::create(seed_dir.join("ops.jsonl")).unwrap();
+        let recoveries = [
+            "applied",
+            "not_applied",
+            "violation:I14",
+            "restart+health-wait",
+            "ambiguous:http_timeout",
+            "stream errors after 128 bytes",
+        ];
+        let schedule = FaultSchedule {
+            profile: FaultProfile::PostCommit,
+            events: recoveries
+                .iter()
+                .enumerate()
+                .map(|(index, _)| FaultEvent {
+                    id: format!("ambiguous-{index}"),
+                    start_op: u64::try_from(index).unwrap(),
+                    end_op: None,
+                    boundary: Boundary::ClientHttp,
+                    target: TargetSelector::default(),
+                    kind: FaultKind::DropResponse,
+                })
+                .collect(),
+        };
+        write_json(
+            seed_dir.join("config.json"),
+            &serde_json::json!({ "fault_schedule": schedule }),
+        );
+        let timeline = recoveries
+            .iter()
+            .enumerate()
+            .map(|(index, recovery)| TimelineEvent {
+                event_id: format!("ambiguous-{index}"),
+                op_index: u64::try_from(index).unwrap(),
+                wall_ms: u64::try_from(index).unwrap(),
+                boundary: Boundary::ClientHttp,
+                action: "DropResponse".to_string(),
+                key: None,
+                semantics: FaultSemantics::PostCommit,
+                observed: ObservedResult::Ambiguous,
+                recovery: Some((*recovery).to_string()),
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            seed_dir.join("timeline.jsonl"),
+            timeline
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: vec![3],
+            max_ops: Some(1),
+            artifacts: dir.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Mixed,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let manifest = RunManifest::at_start(&env);
+        let report = build_report(
+            dir.path(),
+            &manifest,
+            &[SeedReport {
+                seed: 3,
+                mode: RunMode::Chaos,
+                profile: Some(FaultProfile::PostCommit),
+                dir: seed_dir,
+                failed: false,
+                ops: 0,
+                compactions: 0,
+                background_compactions: 0,
+                violations: Vec::new(),
+                wall_secs: 0.0,
+                object_store: BTreeMap::new(),
+                fired_faults: Vec::new(),
+            }],
+            &Coverage::default(),
+        );
+
+        assert!(report.contains(
+            "| boundary | kind | events | applied | not applied | violation | unresolved |"
+        ));
+        assert!(report.contains("| `ClientHttp` | `DropResponse` | 6 | 1 | 1 | 1 | 3 |"));
+    }
+
+    #[test]
+    #[should_panic(expected = "missing persisted fault-schedule context")]
+    fn timeline_report_rejects_unscheduled_non_quiet_events() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let seed_dir = dir.path().join("seed-3");
+        fs::create_dir_all(&seed_dir).unwrap();
+        File::create(seed_dir.join("ops.jsonl")).unwrap();
+        write_json(
+            seed_dir.join("config.json"),
+            &serde_json::json!({ "fault_schedule": null }),
+        );
+        fs::write(
+            seed_dir.join("timeline.jsonl"),
+            serde_json::to_string(&TimelineEvent {
+                event_id: "lost-schedule-event".to_string(),
+                op_index: 3,
+                wall_ms: 0,
+                boundary: Boundary::ClientHttp,
+                action: "DropResponse".to_string(),
+                key: None,
+                semantics: FaultSemantics::PostCommit,
+                observed: ObservedResult::Ambiguous,
+                recovery: Some("ambiguous:http_timeout".to_string()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: vec![3],
+            max_ops: Some(1),
+            artifacts: dir.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Mixed,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let manifest = RunManifest::at_start(&env);
+        let _ = build_report(
+            dir.path(),
+            &manifest,
+            &[SeedReport {
+                seed: 3,
+                mode: RunMode::Chaos,
+                profile: Some(FaultProfile::PostCommit),
+                dir: seed_dir,
+                failed: false,
+                ops: 0,
+                compactions: 0,
+                background_compactions: 0,
+                violations: Vec::new(),
+                wall_secs: 0.0,
+                object_store: BTreeMap::new(),
+                fired_faults: Vec::new(),
+            }],
+            &Coverage::default(),
+        );
+    }
+
+    #[test]
     fn report_surfaces_routing_delete_contention_and_exhaustion_proofs() {
         let dir = tempfile::TempDir::new().unwrap();
         let seed_dir = dir.path().join("seed-7");
@@ -661,11 +1106,6 @@ mod tests {
                 serde_json::to_string(&node_0).unwrap(),
                 serde_json::to_string(&node_1).unwrap()
             ),
-        )
-        .unwrap();
-        fs::write(
-            seed_dir.join("config.json"),
-            serde_json::to_vec(&serde_json::json!({ "fault_schedule": null })).unwrap(),
         )
         .unwrap();
         let timeline = [
@@ -755,6 +1195,37 @@ mod tests {
                 recovery: Some("completed=8 successful=4 load_shed=4 nodes={0, 1}".to_string()),
             },
         ];
+        let schedule = FaultSchedule {
+            profile: FaultProfile::Ops,
+            events: timeline
+                .iter()
+                .map(|event| FaultEvent {
+                    id: event.event_id.clone(),
+                    start_op: event.op_index,
+                    end_op: None,
+                    boundary: event.boundary,
+                    target: TargetSelector::default(),
+                    kind: match event.event_id.as_str() {
+                        "ops-second-node"
+                        | "ops-second-node-incomplete"
+                        | "ops-second-node-wrong-action" => {
+                            FaultKind::StartSecondNode { for_ops: 1 }
+                        }
+                        "ops-delete-race" => FaultKind::DeleteNamespaceInFlight,
+                        "ops-resource-limits" => FaultKind::ResourceExhaustion {
+                            max_concurrent_queries: 1,
+                            disk_cache_max_bytes: 2_097_152,
+                        },
+                        "ops-exhaustion-burst" => FaultKind::FillDiskCache,
+                        other => panic!("unexpected operational test event {other}"),
+                    },
+                })
+                .collect(),
+        };
+        write_json(
+            seed_dir.join("config.json"),
+            &serde_json::json!({ "fault_schedule": schedule }),
+        );
         fs::write(
             seed_dir.join("timeline.jsonl"),
             timeline
@@ -775,12 +1246,14 @@ mod tests {
             profile: None,
             env_echo: BTreeMap::new(),
         };
+        let manifest = RunManifest::at_start(&env);
         let report = build_report(
             dir.path(),
-            &env,
+            &manifest,
             &[SeedReport {
                 seed: 7,
                 mode: RunMode::Deterministic,
+                profile: None,
                 dir: seed_dir,
                 failed: false,
                 ops: 2,
@@ -799,6 +1272,9 @@ mod tests {
         assert!(report.contains(
             "Counts come from persisted operation targets and causal runner-timeline evidence."
         ));
+        assert!(report.contains("## Fault Timeline Summary"));
+        assert!(report
+            .contains("| event id | op window | boundary | kind | action | observed | recovery |"));
     }
 
     #[tokio::test]
@@ -936,7 +1412,12 @@ mod tests {
     }
 }
 
-fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &Coverage) -> String {
+fn build_report(
+    root: &Path,
+    manifest: &RunManifest,
+    seeds: &[SeedReport],
+    coverage: &Coverage,
+) -> String {
     let mut error_codes = BTreeMap::<String, u64>::new();
     let mut latencies = BTreeMap::<String, Vec<u64>>::new();
     for seed in seeds {
@@ -966,33 +1447,34 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
         .max(0.001);
     let mut out = String::new();
     out.push_str("# Adversarial Runner Report\n\n");
-    out.push_str(&format!("- git rev: `{}`\n", git_rev()));
+    out.push_str(&format!("- git rev: `{}`\n", manifest.git_rev));
     out.push_str(&format!(
         "- dirty tree: `{}`\n",
-        if git_dirty() { "true" } else { "false" }
+        if manifest.dirty_tree { "true" } else { "false" }
     ));
     out.push_str(&format!("- date_unix_s: `{}`\n", now_unix_secs()));
     out.push_str(&format!(
         "- backend: `{}`\n",
-        env.env_echo
-            .get("TEST_BACKEND")
-            .map(String::as_str)
-            .unwrap_or("memory")
+        manifest.backend.as_deref().unwrap_or("memory")
     ));
-    out.push_str(&format!("- mode: `{:?}`\n", env.mode));
-    out.push_str(&format!("- budget_s: `{}`\n", env.seconds));
+    out.push_str(&format!("- mode: `{:?}`\n", manifest.mode));
+    out.push_str(&format!("- budget_s: `{}`\n", manifest.seconds));
     out.push_str(&format!("- run dir: `{}`\n\n", root.display()));
 
     out.push_str("## Seeds\n\n");
     out.push_str(
-        "| seed | mode | status | ops | explicit compactions | bg compactions | faults | wall_s | ops/sec |\n",
+        "| seed | mode | profile | status | ops | explicit compactions | bg compactions | faults | wall_s | ops/sec |\n",
     );
-    out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    out.push_str("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for seed in seeds {
+        let profile = seed
+            .profile
+            .map_or_else(|| "none".to_string(), |profile| format!("{:?}", profile));
         out.push_str(&format!(
-            "| {} | `{:?}` | {} | {} | {} | {} | {} | {:.2} | {:.2} |\n",
+            "| {} | `{:?}` | `{}` | {} | {} | {} | {} | {} | {:.2} | {:.2} |\n",
             seed.seed,
             seed.mode,
+            profile,
             if seed.failed { "failed" } else { "passed" },
             seed.ops,
             seed.compactions,
@@ -1069,7 +1551,10 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
 
     out.push_str("## Fired Faults\n\n");
     let mut any_fault = false;
-    for seed in seeds {
+    for seed in seeds
+        .iter()
+        .filter(|seed| seed.profile == Some(FaultProfile::LegacyChaos))
+    {
         if seed.fired_faults.is_empty() {
             continue;
         }
@@ -1090,7 +1575,7 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
         }
     }
     if !any_fault {
-        out.push_str("No chaos faults fired.\n");
+        out.push_str("No LegacyChaos faults fired.\n");
     }
     out.push('\n');
 
@@ -1099,6 +1584,7 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
         .any(|seed| seed.dir.join("timeline.jsonl").exists());
     if has_timeline {
         out.push_str("## Fault Timeline\n\n");
+        let mut summary = BTreeMap::<(String, String), TimelineSummary>::new();
         for seed in seeds {
             let timeline = read_timeline(&seed.dir);
             if timeline.is_empty() {
@@ -1116,39 +1602,74 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
                         )
                     })
                 });
-            let windows = schedule
-                .map(|schedule| {
-                    schedule
-                        .events
-                        .into_iter()
-                        .map(|event| {
-                            let window = event.end_op.map_or_else(
-                                || format!("{}+", event.start_op),
-                                |end| format!("{}..{}", event.start_op, end),
-                            );
-                            (event.id, window)
-                        })
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .unwrap_or_default();
-            out.push_str(&format!("- seed {}:\n", seed.seed));
+            let contexts = schedule.map_or_else(BTreeMap::new, |schedule| {
+                schedule
+                    .events
+                    .into_iter()
+                    .map(|event| {
+                        let window = event.end_op.map_or_else(
+                            || format!("{}+", event.start_op),
+                            |end| format!("{}..{}", event.start_op, end),
+                        );
+                        let kind = fault_kind_name(&event.kind);
+                        (event.id, (window, kind))
+                    })
+                    .collect()
+            });
+            out.push_str(&format!("### Seed {}\n\n", seed.seed));
+            out.push_str(
+                "| event id | op window | boundary | kind | action | observed | recovery |\n",
+            );
+            out.push_str("| --- | --- | --- | --- | --- | --- | --- |\n");
             for event in timeline {
-                let window = windows
-                    .get(&event.event_id)
-                    .map(String::as_str)
-                    .unwrap_or("recorded-only");
+                let (window, kind) = match contexts.get(&event.event_id) {
+                    Some((window, kind)) => (window.as_str(), kind.as_str()),
+                    None if event.event_id.starts_with("quiet-")
+                        && event.action.starts_with("quiet:") =>
+                    {
+                        ("recorded-only", "QuietPeriod")
+                    }
+                    None => panic!(
+                        "timeline event {} in {} is missing persisted fault-schedule context",
+                        event.event_id,
+                        seed.dir.display()
+                    ),
+                };
                 let recovery = event.recovery.as_deref().unwrap_or("none");
+                let boundary = format!("{:?}", event.boundary);
+                let counts = summary
+                    .entry((boundary.clone(), kind.to_string()))
+                    .or_default();
+                counts.observe(&event);
                 out.push_str(&format!(
-                    "  - `{}` window=`{}` op={} boundary=`{:?}` action=`{}` observed=`{:?}` recovery=`{}`\n",
-                    event.event_id,
-                    window,
-                    event.op_index,
-                    event.boundary,
-                    event.action,
+                    "| `{}` | `{}` | `{}` | `{}` | `{}` | `{:?}` | `{}` |\n",
+                    markdown_cell(&event.event_id),
+                    markdown_cell(window),
+                    boundary,
+                    markdown_cell(kind),
+                    markdown_cell(&event.action),
                     event.observed,
-                    recovery
+                    markdown_cell(recovery),
                 ));
             }
+            out.push('\n');
+        }
+        out.push_str("## Fault Timeline Summary\n\n");
+        out.push_str(
+            "| boundary | kind | events | applied | not applied | violation | unresolved |\n",
+        );
+        out.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: |\n");
+        for ((boundary, kind), counts) in summary {
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} | {} | {} | {} | {} |\n",
+                markdown_cell(&boundary),
+                markdown_cell(&kind),
+                counts.events,
+                counts.applied,
+                counts.not_applied,
+                counts.violation,
+                counts.unresolved,
+            ));
         }
         out.push('\n');
     }
@@ -1250,6 +1771,71 @@ fn build_report(root: &Path, env: &RunnerEnv, seeds: &[SeedReport], coverage: &C
         ));
     }
     out
+}
+
+#[derive(Debug, Default)]
+struct TimelineSummary {
+    events: u64,
+    applied: u64,
+    not_applied: u64,
+    violation: u64,
+    unresolved: u64,
+}
+
+impl TimelineSummary {
+    fn observe(&mut self, event: &TimelineEvent) {
+        self.events += 1;
+        match event.observed {
+            ObservedResult::DefiniteApplied => self.applied += 1,
+            ObservedResult::DefiniteNotApplied => self.not_applied += 1,
+            ObservedResult::Corrupted => self.violation += 1,
+            ObservedResult::Ambiguous => match terminal_ambiguity_resolution(event) {
+                Some(TerminalResolution::Applied) => self.applied += 1,
+                Some(TerminalResolution::NotApplied) => self.not_applied += 1,
+                Some(TerminalResolution::Violation) => self.violation += 1,
+                None => self.unresolved += 1,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalResolution {
+    Applied,
+    NotApplied,
+    Violation,
+}
+
+fn terminal_ambiguity_resolution(event: &TimelineEvent) -> Option<TerminalResolution> {
+    match event.recovery.as_deref().map(str::trim) {
+        Some("applied" | "inner mutation completed; acknowledgement replaced") => {
+            Some(TerminalResolution::Applied)
+        }
+        Some("not_applied") => Some(TerminalResolution::NotApplied),
+        Some(recovery) if recovery.starts_with("violation:") => Some(TerminalResolution::Violation),
+        Some(recovery)
+            if recovery
+                .strip_prefix("violations=")
+                .and_then(|count| count.parse::<u64>().ok())
+                .is_some_and(|count| count > 0) =>
+        {
+            Some(TerminalResolution::Violation)
+        }
+        Some(_) | None => None,
+    }
+}
+
+fn fault_kind_name(kind: &FaultKind) -> String {
+    let debug = format!("{kind:?}");
+    debug
+        .split([' ', '{', '('])
+        .next()
+        .expect("FaultKind debug output must start with its variant")
+        .to_string()
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace(['\r', '\n'], " ")
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]

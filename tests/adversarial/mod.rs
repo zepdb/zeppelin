@@ -28,6 +28,67 @@ pub enum RunMode {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SeedAssignment {
+    pub mode: RunMode,
+    pub profile: Option<FaultProfile>,
+}
+
+/// Resolves the stable per-seed execution slot used by smoke and overnight
+/// runs. An explicit profile always wins; otherwise Mixed mode preserves the
+/// historical meanings of seeds 0, 1, and 2 before rotating new profiles.
+#[must_use]
+pub fn effective_seed_assignment(
+    mode: RunMode,
+    forced_profile: Option<FaultProfile>,
+    seed: u64,
+) -> SeedAssignment {
+    if let Some(profile) = forced_profile {
+        return SeedAssignment {
+            mode: RunMode::Chaos,
+            profile: Some(profile),
+        };
+    }
+
+    match mode {
+        RunMode::Deterministic => SeedAssignment {
+            mode: RunMode::Deterministic,
+            profile: None,
+        },
+        RunMode::Chaos => SeedAssignment {
+            mode: RunMode::Chaos,
+            profile: Some(FaultProfile::LegacyChaos),
+        },
+        RunMode::Mixed => match seed % 12 {
+            0 | 2 => SeedAssignment {
+                mode: RunMode::Deterministic,
+                profile: None,
+            },
+            1 => SeedAssignment {
+                mode: RunMode::Chaos,
+                profile: Some(FaultProfile::LegacyChaos),
+            },
+            3 => scheduled(FaultProfile::PostCommit),
+            4 => scheduled(FaultProfile::Network),
+            5 => scheduled(FaultProfile::Crash),
+            6 => scheduled(FaultProfile::Clock),
+            7 => scheduled(FaultProfile::Content),
+            8 => scheduled(FaultProfile::Semantic),
+            9 => scheduled(FaultProfile::Sched),
+            10 => scheduled(FaultProfile::Ops),
+            11 => scheduled(FaultProfile::Full),
+            residue => unreachable!("seed modulo 12 produced residue {residue}"),
+        },
+    }
+}
+
+fn scheduled(profile: FaultProfile) -> SeedAssignment {
+    SeedAssignment {
+        mode: RunMode::Chaos,
+        profile: Some(profile),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PreserveMode {
     Always,
