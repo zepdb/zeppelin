@@ -3845,6 +3845,7 @@ where
 struct CorruptionTracker {
     seen_timeline_events: usize,
     tainted: BTreeMap<String, BTreeSet<String>>,
+    durably_tainted: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl CorruptionTracker {
@@ -3868,6 +3869,12 @@ impl CorruptionTracker {
                     .entry(namespace.clone())
                     .or_default()
                     .insert(key.clone());
+                if durable_content_corruption(event) {
+                    self.durably_tainted
+                        .entry(namespace.clone())
+                        .or_default()
+                        .insert(key.clone());
+                }
             }
         }
         self.seen_timeline_events = timeline.len();
@@ -3875,6 +3882,12 @@ impl CorruptionTracker {
 
     fn tainted_keys(&self, namespace: &str) -> Option<&BTreeSet<String>> {
         self.tainted.get(namespace).filter(|keys| !keys.is_empty())
+    }
+
+    fn durably_tainted_keys(&self, namespace: &str) -> Option<&BTreeSet<String>> {
+        self.durably_tainted
+            .get(namespace)
+            .filter(|keys| !keys.is_empty())
     }
 
     fn retain_reachable(&mut self, namespace: &str, reachable: &BTreeSet<String>) {
@@ -3885,11 +3898,25 @@ impl CorruptionTracker {
         if keys.is_empty() {
             self.tainted.remove(namespace);
         }
+        let Some(keys) = self.durably_tainted.get_mut(namespace) else {
+            return;
+        };
+        keys.retain(|key| reachable.contains(key));
+        if keys.is_empty() {
+            self.durably_tainted.remove(namespace);
+        }
     }
 
     fn forget_namespace(&mut self, namespace: &str) {
         self.tainted.remove(namespace);
+        self.durably_tainted.remove(namespace);
     }
+}
+
+fn durable_content_corruption(event: &TimelineEvent) -> bool {
+    event.semantics == FaultSemantics::PostCommit
+        && (event.action.starts_with("Content(TornWrite")
+            || event.action.starts_with("Content(MisdirectedWrite)"))
 }
 
 fn timeline_key_matches_namespace(key: &str, namespace: &str) -> bool {
@@ -4449,28 +4476,24 @@ async fn finish_recorded_op(
             if !ns_model.spec.is_exact() {
                 continue;
             }
+            let known_tainted_keys = corruption_tracker
+                .durably_tainted_keys(ns)
+                .cloned()
+                .unwrap_or_default();
             let status = if let Some(context) = http_fault_context {
-                match read_authoritative_manifest(
-                    &context.bookkeeping_store,
+                periodic_s3_oracle_status(&context.bookkeeping_store, ns).await
+            } else {
+                periodic_server_lineage_status(
+                    client,
+                    &target.store,
+                    &target.base_url,
                     ns,
-                    "periodic S3 oracle",
+                    &known_tainted_keys,
                 )
                 .await
-                {
-                    Some(manifest) => json!({
-                        "manifest_generation": manifest.version(),
-                    }),
-                    None => json!({ "manifest_generation": null }),
-                }
-            } else {
-                compact_status(client, &target.base_url, ns).await
             };
             let fault_window_active = http_fault_context
                 .is_some_and(|context| context.scheduler.fault_window_active(rec.index, ns));
-            let known_tainted_keys = corruption_tracker
-                .tainted_keys(ns)
-                .cloned()
-                .unwrap_or_default();
             violations.extend(
                 s3_tracker
                     .check_namespace_with_fault_context(
@@ -5644,6 +5667,62 @@ async fn read_authoritative_manifest(
     })
 }
 
+async fn periodic_s3_oracle_status(store: &ZeppelinStore, ns: &str) -> serde_json::Value {
+    match Manifest::read(store, ns).await {
+        Ok(Some(manifest)) => json!({
+            "manifest_generation": manifest.version(),
+        }),
+        Ok(None) => json!({ "manifest_generation": null }),
+        Err(error) => {
+            eprintln!(
+                "periodic S3 oracle authoritative read failed for {ns}; deferring to the S3 \
+                 oracle classifier: {error}"
+            );
+            json!({
+                "manifest_generation": null,
+                "manifest_read_error": error.to_string(),
+            })
+        }
+    }
+}
+
+async fn periodic_server_lineage_status(
+    client: &Client,
+    store: &ZeppelinStore,
+    base_url: &str,
+    ns: &str,
+    durably_tainted_keys: &BTreeSet<String>,
+) -> serde_json::Value {
+    let manifest_key = Manifest::s3_key(ns);
+    if !durably_tainted_keys.contains(&manifest_key) {
+        return compact_status(client, base_url, ns).await;
+    }
+
+    let status = periodic_s3_oracle_status(store, ns).await;
+    if status.get("manifest_read_error").is_none() {
+        return compact_status(client, base_url, ns).await;
+    }
+
+    let url = format!("{base_url}/v1/namespaces/{ns}/compact/status");
+    let (http_status, response) = request_json(client, Method::GET, &url, None).await;
+    assert!(
+        accept_loud_durable_manifest_resolution(
+            http_status,
+            &response,
+            ns,
+            Some(durably_tainted_keys),
+        ),
+        "periodic lineage authoritative manifest read failed without exact durable manifest \
+         taint and a valid loud compact/status response for {ns}: status={http_status}; \
+         response={response}"
+    );
+    eprintln!(
+        "accepted loud periodic-lineage compact/status failure for exact durable manifest taint \
+         in {ns}: status={http_status}"
+    );
+    status
+}
+
 async fn bookkeeping_compact_status(
     client: &Client,
     target: &OpExecutionTarget,
@@ -5740,6 +5819,31 @@ async fn compact_status(client: &Client, base_url: &str, ns: &str) -> serde_json
         .json::<serde_json::Value>()
         .await
         .unwrap_or_else(|error| panic!("compact/status JSON parse failed for {ns}: {error}"))
+}
+
+async fn quiescent_s3_oracle_status(
+    client: &Client,
+    base_url: &str,
+    ns: &str,
+    durably_tainted_keys: Option<&BTreeSet<String>>,
+) -> Option<serde_json::Value> {
+    let url = format!("{base_url}/v1/namespaces/{ns}/compact/status");
+    let (status, response) = request_json(client, Method::GET, &url, None).await;
+    if status == StatusCode::OK.as_u16() {
+        return Some(response);
+    }
+    let exact_durable_failure =
+        accept_loud_durable_manifest_resolution(status, &response, ns, durably_tainted_keys);
+    assert!(
+        exact_durable_failure,
+        "quiet S3 compact/status failed without exact durable manifest taint for {ns}: \
+         status={status}; response={response}"
+    );
+    eprintln!(
+        "accepted loud quiet-S3 compact/status failure for exact durable manifest taint in \
+         {ns}: status={status}"
+    );
+    None
 }
 
 async fn wait_compaction_ready(client: &Client, base_url: &str, ns: &str) -> serde_json::Value {
@@ -5849,6 +5953,42 @@ fn accept_loud_tainted_quiescence(
     (500..600).contains(&status)
         && violations.is_empty()
         && tainted_keys.is_some_and(|keys| !keys.is_empty())
+}
+
+fn accept_loud_durable_manifest_resolution(
+    status: u16,
+    response: &serde_json::Value,
+    namespace: &str,
+    durably_tainted_keys: Option<&BTreeSet<String>>,
+) -> bool {
+    let manifest_key = Manifest::s3_key(namespace);
+    if !durably_tainted_keys.is_some_and(|keys| keys.contains(&manifest_key)) {
+        return false;
+    }
+    let record = OpRecord {
+        index: 0,
+        wall_ms: 0,
+        op: Op::FetchVectors {
+            ns: namespace.to_string(),
+            ids: Vec::new(),
+            consistency: ConsistencyLevel::Strong,
+        },
+        method: "POST".to_string(),
+        path: format!("/v1/namespaces/{namespace}/vectors/get"),
+        status,
+        response: response.clone(),
+        outcome: "not_applied".to_string(),
+        target_node: 0,
+        execution: ExecutionMetadata {
+            phase: ExecutionPhase::Quiescence,
+            hold: None,
+        },
+        gen_after: None,
+        duration_ms: 0,
+        violations: Vec::new(),
+    };
+    let envelope_violations = oracle::check_op(&Model::default(), &record, RunMode::Chaos, None);
+    accept_loud_tainted_quiescence(status, &envelope_violations, durably_tainted_keys)
 }
 
 async fn inject_dual_writer_fencing_mutation(
@@ -6491,8 +6631,16 @@ async fn run_quiescent_checks(
     quiet_timeline: &mut Vec<TimelineEvent>,
     scheduler: Option<&FaultScheduler>,
 ) -> Vec<Violation> {
-    let mut violations =
-        resolve_indeterminates(client, server, model, artifacts, mutation, *op_index).await;
+    let mut violations = resolve_indeterminates(
+        client,
+        server,
+        model,
+        artifacts,
+        corruption_tracker,
+        mutation,
+        *op_index,
+    )
+    .await;
     push_quiet_event(
         quiet_timeline,
         scheduler,
@@ -6702,7 +6850,16 @@ async fn run_quiescent_checks(
         if !violations.is_empty() {
             break;
         }
-        let status = compact_status(client, &server.base_url, ns).await;
+        let Some(status) = quiescent_s3_oracle_status(
+            client,
+            &server.base_url,
+            ns,
+            corruption_tracker.durably_tainted_keys(ns),
+        )
+        .await
+        else {
+            continue;
+        };
         let expected_live = model
             .namespaces
             .get(ns)
@@ -6897,6 +7054,7 @@ async fn resolve_indeterminates(
     server: &FullTestServer,
     model: &mut Model,
     artifacts: &SeedArtifacts,
+    corruption_tracker: &CorruptionTracker,
     mutation: Option<OracleMutation>,
     op_index: u64,
 ) -> Vec<Violation> {
@@ -7103,6 +7261,25 @@ async fn resolve_indeterminates(
         )
         .await;
         if !(200..300).contains(&status) {
+            if accept_loud_durable_manifest_resolution(
+                status,
+                &response,
+                &ns,
+                corruption_tracker.durably_tainted_keys(&ns),
+            ) {
+                eprintln!(
+                    "accepted loud indeterminate-resolution failure for exact durable manifest \
+                     taint in {ns}: status={status}"
+                );
+                resolutions.push(json!({
+                    "namespace": ns,
+                    "ids": ids,
+                    "effect": "indeterminate_vectors",
+                    "resolved": "deferred_due_to_durable_manifest_taint",
+                    "status": status,
+                }));
+                continue;
+            }
             violations.push(indeterminate_violation(
                 op_index,
                 &ns,
@@ -7384,7 +7561,7 @@ fn should_cleanup(preserve: PreserveMode, failed: bool) -> bool {
 #[cfg(test)]
 mod outcome_tests {
     use axum::http::{HeaderMap, HeaderValue};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use object_store::memory::InMemory;
     use zeppelin::index::quantization::QuantizationType;
@@ -7530,6 +7707,205 @@ mod outcome_tests {
                 .iter()
                 .any(|violation| violation.id == ViolationId::I11ErrorEnvelope)
         );
+    }
+
+    #[tokio::test]
+    async fn periodic_s3_oracle_classifies_corrupt_manifest_without_panicking() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let manifest_key = Manifest::s3_key("ns");
+        store
+            .put(&manifest_key, bytes::Bytes::from_static(b"truncated"))
+            .await
+            .unwrap();
+
+        let status = periodic_s3_oracle_status(&store, "ns").await;
+        assert_eq!(status["manifest_generation"], serde_json::Value::Null);
+        assert!(status["manifest_read_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("manifest msgpack deserialize")));
+
+        let unrelated_taint = BTreeSet::from(["ns/wal/tainted.wal".to_string()]);
+        let outside_window = S3Tracker::default()
+            .check_namespace_with_fault_context(
+                &store,
+                "ns",
+                225,
+                &status,
+                false,
+                false,
+                &unrelated_taint,
+            )
+            .await;
+        assert_eq!(outside_window.len(), 1, "{outside_window:#?}");
+        assert_eq!(outside_window[0].id, ViolationId::I15ManifestLineage);
+        assert!(outside_window[0].detail.contains("read-failed"));
+
+        let inside_window = S3Tracker::default()
+            .check_namespace_with_fault_context(
+                &store,
+                "ns",
+                208,
+                &status,
+                false,
+                true,
+                &BTreeSet::new(),
+            )
+            .await;
+        assert!(inside_window.is_empty(), "{inside_window:#?}");
+
+        let mut corruption_tracker = CorruptionTracker::default();
+        corruption_tracker.observe(
+            &[TimelineEvent {
+                event_id: "content-00".to_string(),
+                op_index: 208,
+                wall_ms: 0,
+                boundary: Boundary::ObjectStore,
+                action: "Content(TornWrite { keep_bytes: 30 }) call=1".to_string(),
+                key: Some(manifest_key),
+                semantics: FaultSemantics::PostCommit,
+                observed: ObservedResult::Corrupted,
+                recovery: None,
+            }],
+            &["ns".to_string()],
+        );
+        let durable_manifest_taint = corruption_tracker
+            .durably_tainted_keys("ns")
+            .expect("torn manifest write must remain durably tainted");
+        let explained_durable_corruption = S3Tracker::default()
+            .check_namespace_with_fault_context(
+                &store,
+                "ns",
+                225,
+                &status,
+                false,
+                false,
+                durable_manifest_taint,
+            )
+            .await;
+        assert!(
+            explained_durable_corruption.is_empty(),
+            "{explained_durable_corruption:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_lineage_without_http_context_absorbs_exact_durable_manifest_taint() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let namespace = format!("{prefix}-periodic-lineage");
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let config = deterministic_config();
+        let server = start_test_server_full(
+            harness.store.clone(),
+            Some(prefix),
+            config.clone(),
+            false,
+            None,
+        )
+        .await;
+        let client = adversarial_client();
+        let (create_status, _) = request_json(
+            &client,
+            Method::POST,
+            &format!("{}/v1/namespaces", server.base_url),
+            Some(spec.create_body(&namespace)),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CREATED.as_u16());
+
+        let artifact_root = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: vec![0],
+            max_ops: Some(1),
+            artifacts: artifact_root.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Deterministic,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let run_artifacts = RunArtifacts::create(&env);
+        let mut artifacts = run_artifacts.seed(
+            0,
+            &config,
+            &BTreeMap::from([(namespace.clone(), spec.clone())]),
+            RunMode::Deterministic,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut model = Model::default();
+        model.apply(
+            &Op::CreateNamespace {
+                ns: namespace.clone(),
+                spec,
+            },
+            StatusCode::CREATED.as_u16(),
+            Some(1),
+            &json!({}),
+            None,
+        );
+        let manifest_key = Manifest::s3_key(&namespace);
+        server
+            .store
+            .put(&manifest_key, bytes::Bytes::from_static(b"truncated"))
+            .await
+            .unwrap();
+        server.manifest_cache.invalidate(&namespace);
+        let mut corruption_tracker = CorruptionTracker::default();
+        corruption_tracker.observe(
+            &[TimelineEvent {
+                event_id: "content-00".to_string(),
+                op_index: 24,
+                wall_ms: 0,
+                boundary: Boundary::ObjectStore,
+                action: "Content(TornWrite { keep_bytes: 30 }) call=1".to_string(),
+                key: Some(manifest_key),
+                semantics: FaultSemantics::PostCommit,
+                observed: ObservedResult::Corrupted,
+                recovery: None,
+            }],
+            std::slice::from_ref(&namespace),
+        );
+
+        let step = execute_recorded_op(
+            &client,
+            &server,
+            &mut artifacts,
+            &mut model,
+            &mut Coverage::default(),
+            &mut S3Tracker::default(),
+            &mut corruption_tracker,
+            &Op::FetchVectors {
+                ns: namespace.clone(),
+                ids: vec!["missing".to_string()],
+                consistency: ConsistencyLevel::Strong,
+            },
+            25,
+            Instant::now(),
+            None,
+            RunMode::Deterministic,
+            ExecutionPhase::Quiescence,
+            true,
+            0,
+            None,
+            false,
+        )
+        .await;
+
+        assert_eq!(step.status, StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+        assert!(step.violations.is_empty(), "{:?}", step.violations);
+        server.shutdown().await;
+        harness.cleanup().await;
     }
 
     fn replay_trace_record(index: u64, phase: ExecutionPhase, op: Op) -> OpRecord {
@@ -8261,6 +8637,7 @@ mod outcome_tests {
             tracker.tainted_keys("ns-a"),
             Some(&BTreeSet::from(["ns-a/segments/cluster_0.bin".to_string()]))
         );
+        assert!(tracker.durably_tainted_keys("ns-a").is_none());
         assert!(tracker.tainted_keys("ns-b").is_none());
         assert_eq!(tracker.seen_timeline_events, 1);
     }
@@ -8276,12 +8653,23 @@ mod outcome_tests {
                     "ns/segments/live.bin".to_string(),
                 ]),
             )]),
+            durably_tainted: BTreeMap::from([(
+                "ns".to_string(),
+                BTreeSet::from([
+                    "ns/segments/old.bin".to_string(),
+                    "ns/segments/live.bin".to_string(),
+                ]),
+            )]),
         };
 
         tracker.retain_reachable("ns", &BTreeSet::from(["ns/segments/live.bin".to_string()]));
 
         assert_eq!(
             tracker.tainted_keys("ns"),
+            Some(&BTreeSet::from(["ns/segments/live.bin".to_string()]))
+        );
+        assert_eq!(
+            tracker.durably_tainted_keys("ns"),
             Some(&BTreeSet::from(["ns/segments/live.bin".to_string()]))
         );
     }
@@ -8305,6 +8693,131 @@ mod outcome_tests {
             Some(&tainted)
         ));
         assert!(!accept_loud_tainted_quiescence(200, &[], Some(&tainted)));
+    }
+
+    #[test]
+    fn indeterminate_resolution_accepts_only_exact_durable_manifest_taint() {
+        let namespace = "ns";
+        let clean_loud = json!({
+            "code": "INTERNAL_ERROR",
+            "error": "an internal error occurred",
+            "request_id": "request-id",
+            "retryable": false,
+            "status": 500,
+        });
+        let exact_manifest = BTreeSet::from([Manifest::s3_key(namespace)]);
+        let unrelated_key = BTreeSet::from([format!("{namespace}/wal/tainted.wal")]);
+        let other_manifest = BTreeSet::from([Manifest::s3_key("other")]);
+
+        assert!(accept_loud_durable_manifest_resolution(
+            500,
+            &clean_loud,
+            namespace,
+            Some(&exact_manifest),
+        ));
+        assert!(!accept_loud_durable_manifest_resolution(
+            500,
+            &clean_loud,
+            namespace,
+            Some(&unrelated_key),
+        ));
+        assert!(!accept_loud_durable_manifest_resolution(
+            500,
+            &clean_loud,
+            namespace,
+            Some(&other_manifest),
+        ));
+        assert!(!accept_loud_durable_manifest_resolution(
+            500,
+            &json!({ "status": 500 }),
+            namespace,
+            Some(&exact_manifest),
+        ));
+        assert!(!accept_loud_durable_manifest_resolution(
+            200,
+            &json!({}),
+            namespace,
+            Some(&exact_manifest),
+        ));
+    }
+
+    #[tokio::test]
+    async fn quiet_s3_status_absorbs_exact_durable_manifest_failure() {
+        let app = Router::new().route(
+            "/v1/namespaces/ns/compact/status",
+            get(|| async {
+                let mut headers = HeaderMap::new();
+                headers.insert("x-request-id", HeaderValue::from_static("request-id"));
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    Json(json!({
+                        "code": "INTERNAL_ERROR",
+                        "error": "an internal error occurred",
+                        "request_id": "request-id",
+                        "retryable": false,
+                        "status": 500,
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let exact_manifest = BTreeSet::from([Manifest::s3_key("ns")]);
+
+        let status = quiescent_s3_oracle_status(
+            &adversarial_client(),
+            &format!("http://{address}"),
+            "ns",
+            Some(&exact_manifest),
+        )
+        .await;
+
+        assert!(status.is_none(), "{status:#?}");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn periodic_lineage_keeps_strict_http_status_without_exact_taint() {
+        let app = Router::new().route(
+            "/v1/namespaces/ns/compact/status",
+            get(|| async {
+                let mut headers = HeaderMap::new();
+                headers.insert("x-request-id", HeaderValue::from_static("request-id"));
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    Json(json!({
+                        "code": "INTERNAL_ERROR",
+                        "error": "an internal error occurred",
+                        "request_id": "request-id",
+                        "retryable": false,
+                        "status": 500,
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        Manifest::new().write(&store, "ns").await.unwrap();
+        let client = adversarial_client();
+        let base_url = format!("http://{address}");
+        let strict = tokio::spawn(async move {
+            periodic_server_lineage_status(&client, &store, &base_url, "ns", &BTreeSet::new()).await
+        })
+        .await;
+
+        assert!(strict.is_err_and(|error| error.is_panic()));
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]

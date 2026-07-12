@@ -93,6 +93,14 @@ impl S3Tracker {
                 )];
             }
             Err(error) => {
+                let manifest_key = Manifest::s3_key(namespace);
+                if known_tainted_keys.contains(&manifest_key) {
+                    eprintln!(
+                        "accepted manifest read failure for exact durable taint \
+                         {manifest_key}: {error}"
+                    );
+                    return Vec::new();
+                }
                 if fault_window_active {
                     eprintln!(
                         "tolerated manifest read failure in active fault window for \
