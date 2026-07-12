@@ -1273,6 +1273,9 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                     source.target_node,
                     op_http_fault_context.clone(),
                     replay_lost_ack,
+                    corruption_tracker
+                        .durably_tainted_keys(op.namespace())
+                        .cloned(),
                     &mut model,
                 )
                 .await
@@ -3998,6 +4001,9 @@ async fn execute_recorded_op(
 ) -> StepOutcome {
     let allow_missing_manifest_bookkeeping =
         unresolved_create_allows_missing_manifest_bookkeeping(model, op);
+    let durably_tainted_keys = corruption_tracker
+        .durably_tainted_keys(op.namespace())
+        .cloned();
     let mut raw = execute_raw_recorded_op(
         client.clone(),
         OpExecutionTarget::from(server),
@@ -4009,6 +4015,7 @@ async fn execute_recorded_op(
         target_node,
         http_fault_context.cloned(),
         allow_missing_manifest_bookkeeping,
+        durably_tainted_keys,
         inject_post_commit_ack_loss,
     )
     .await;
@@ -4050,6 +4057,7 @@ async fn execute_raw_recorded_op(
     target_node: u8,
     http_fault_context: Option<HttpFaultContext>,
     allow_missing_manifest_bookkeeping: bool,
+    durably_tainted_keys: Option<BTreeSet<String>>,
     inject_post_commit_ack_loss: bool,
 ) -> RawRecordedOp {
     let ambiguity_allowed = mode == RunMode::Chaos;
@@ -4071,6 +4079,7 @@ async fn execute_raw_recorded_op(
                 index,
                 started,
                 allow_missing_manifest_bookkeeping,
+                durably_tainted_keys.as_ref(),
             ),
         ),
     );
@@ -4164,6 +4173,7 @@ async fn execute_hold_candidate(
     target_node: u8,
     http_fault_context: Option<HttpFaultContext>,
     inject_post_commit_ack_loss: bool,
+    durably_tainted_keys: Option<BTreeSet<String>>,
     model: &mut Model,
 ) -> HoldCandidateOutcome {
     let provisional_op = op.clone();
@@ -4182,6 +4192,7 @@ async fn execute_hold_candidate(
         target_node,
         http_fault_context,
         allow_missing_manifest_bookkeeping,
+        durably_tainted_keys,
         inject_post_commit_ack_loss,
     ));
     tokio::select! {
@@ -4328,6 +4339,9 @@ async fn execute_recorded_op_or_hold(
         target_node,
         http_fault_context.cloned(),
         inject_post_commit_ack_loss,
+        corruption_tracker
+            .durably_tainted_keys(op.namespace())
+            .cloned(),
         model,
     )
     .await
@@ -4627,6 +4641,7 @@ async fn execute_op(
     index: u64,
     started: Instant,
     allow_missing_manifest_bookkeeping: bool,
+    durably_tainted_keys: Option<&BTreeSet<String>>,
 ) -> OpRecord {
     let before = Instant::now();
     let (method, path, status, response) = match op {
@@ -4819,6 +4834,7 @@ async fn execute_op(
                         target,
                         ns,
                         allow_missing_manifest_bookkeeping,
+                        durably_tainted_keys,
                     )
                     .await,
                 )
@@ -4833,6 +4849,7 @@ async fn execute_op(
                     target,
                     ns,
                     allow_missing_manifest_bookkeeping,
+                    durably_tainted_keys,
                 )
                 .await;
                 let response_object = response
@@ -5728,20 +5745,53 @@ async fn bookkeeping_compact_status(
     target: &OpExecutionTarget,
     ns: &str,
     allow_missing_manifest: bool,
+    durably_tainted_keys: Option<&BTreeSet<String>>,
 ) -> serde_json::Value {
     let context = HTTP_FAULT_CONTEXT.try_with(Clone::clone).ok().flatten();
     if let Some(context) = context {
-        match read_authoritative_manifest(&context.bookkeeping_store, ns, "invalid_probe").await {
-            Some(manifest) => json!({
+        match Manifest::read(&context.bookkeeping_store, ns).await {
+            Ok(Some(manifest)) => json!({
                 "manifest_present": true,
                 "manifest_generation": manifest.version(),
                 "uncompacted_fragments": manifest.uncompacted_fragments().len(),
             }),
-            None => json!({
+            Ok(None) => json!({
                 "manifest_present": false,
                 "manifest_generation": null,
                 "uncompacted_fragments": null,
             }),
+            Err(error) => {
+                let url = format!(
+                    "{}/v1/namespaces/{ns}/compact/status",
+                    context.direct_base_url
+                );
+                let (status, response) = request_json(client, Method::GET, &url, None).await;
+                assert!(
+                    accept_loud_durable_manifest_resolution(
+                        status,
+                        &response,
+                        ns,
+                        durably_tainted_keys,
+                    ),
+                    "invalid-probe authoritative manifest read failed without exact durable \
+                     manifest taint and a valid loud compact/status response for {ns}: \
+                     error={error}; status={status}; response={response}"
+                );
+                eprintln!(
+                    "accepted loud invalid-probe bookkeeping failure for exact durable manifest \
+                     taint in {ns}: status={status}"
+                );
+                json!({
+                    "manifest_present": null,
+                    "manifest_generation": null,
+                    "uncompacted_fragments": null,
+                    "manifest_read_error": error.to_string(),
+                    "loud_failure": {
+                        "status": status,
+                        "response": response,
+                    },
+                })
+            }
         }
     } else if allow_missing_manifest {
         compact_status_for_indeterminate_create(client, &target.base_url, ns).await
@@ -8258,6 +8308,65 @@ mod outcome_tests {
     }
 
     #[tokio::test]
+    async fn content_seed_127_classifies_late_invalid_probe_bookkeeping_loudly() {
+        let root = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 30,
+            seeds: vec![127],
+            max_ops: Some(520),
+            artifacts: root.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Mixed,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let artifacts = RunArtifacts::create(&env);
+        let seed_dir = artifacts.root().join("seed-127");
+        let outcome = run_seed(
+            &env,
+            &artifacts,
+            127,
+            Instant::now() + Duration::from_secs(30),
+            None,
+            None,
+        )
+        .await;
+        assert!(!outcome.failed, "{:?}", outcome.violations);
+        assert!(
+            outcome.ops >= 520,
+            "seed 127 stopped at {} ops",
+            outcome.ops
+        );
+
+        let records = read_ops(&seed_dir);
+        let probe = records
+            .iter()
+            .find(|record| {
+                record.index >= 431
+                    && matches!(
+                        record.op,
+                        Op::InvalidProbe { probe, .. } if probe.is_write_shaped()
+                    )
+            })
+            .expect("seed 127 must reach its late write-shaped invalid probe");
+        assert_eq!(probe.index, 431);
+        assert_eq!(probe.status, StatusCode::BAD_REQUEST.as_u16());
+        for status in [
+            &probe.response["compact_status_before"],
+            &probe.response["compact_status_after"],
+        ] {
+            assert_eq!(status["manifest_present"], json!(null));
+            assert_eq!(status["manifest_generation"], json!(null));
+            assert_eq!(status["uncompacted_fragments"], json!(null));
+            assert!(status["manifest_read_error"].as_str().is_some());
+            assert_eq!(status["loud_failure"]["status"], 500);
+            assert_eq!(status["loud_failure"]["response"]["status"], 500);
+            assert_eq!(status["loud_failure"]["response"]["code"], "INTERNAL_ERROR");
+        }
+    }
+
+    #[tokio::test]
     async fn quiet_restore_deletes_only_a_fired_misdirected_write_artifact() {
         let harness = TestHarness::new().await;
         let original = harness.key("ns/wal/fired.wal");
@@ -9938,6 +10047,7 @@ mod outcome_tests {
             0,
             None,
             false,
+            None,
             &mut model,
         )
         .await
