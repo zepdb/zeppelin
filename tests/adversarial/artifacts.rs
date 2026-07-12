@@ -16,7 +16,7 @@ use zeppelin::config::Config;
 use zeppelin::error::ZeppelinError;
 use zeppelin::storage::ZeppelinStore;
 
-use crate::common::counting::ClassStats;
+use crate::common::counting::{ArtifactClass, ClassStats};
 
 use super::chaos::{FaultPlan, FiredFault};
 use super::faults::{
@@ -89,8 +89,16 @@ pub struct SeedReport {
     pub background_compactions: u64,
     pub violations: Vec<Violation>,
     pub wall_secs: f64,
-    pub object_store: BTreeMap<String, ClassStats>,
+    pub object_store: ObjectStorePhaseCensus,
     pub fired_faults: Vec<FiredFault>,
+}
+
+pub type ObjectStoreCensus = BTreeMap<ArtifactClass, ClassStats>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ObjectStorePhaseCensus {
+    pub in_run: ObjectStoreCensus,
+    pub quiet_period: ObjectStoreCensus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -902,7 +910,7 @@ mod tests {
                 background_compactions: 0,
                 violations: Vec::new(),
                 wall_secs: 0.0,
-                object_store: BTreeMap::new(),
+                object_store: ObjectStorePhaseCensus::default(),
                 fired_faults: Vec::new(),
             }],
             &Coverage::default(),
@@ -912,6 +920,93 @@ mod tests {
         assert!(report.contains("not a v1 product bug"));
         assert!(report.contains("research-finding"));
         assert!(report.contains("failed=0, research_findings=1"));
+    }
+
+    #[test]
+    fn report_separates_in_run_and_quiet_period_object_store_censuses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: vec![7],
+            max_ops: Some(1),
+            artifacts: dir.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Deterministic,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let run = RunArtifacts::create(&env);
+        let seed = run.seed(
+            7,
+            &Config::default(),
+            &BTreeMap::new(),
+            RunMode::Deterministic,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let report = build_report(
+            run.root(),
+            &RunManifest::at_start(&env),
+            &[SeedReport {
+                seed: 7,
+                mode: RunMode::Deterministic,
+                profile: None,
+                dir: seed.dir,
+                failed: false,
+                ops: 0,
+                compactions: 0,
+                background_compactions: 0,
+                violations: Vec::new(),
+                wall_secs: 1.0,
+                object_store: ObjectStorePhaseCensus {
+                    in_run: BTreeMap::from([(
+                        ArtifactClass::Manifest,
+                        ClassStats {
+                            get_ops: 3,
+                            get_bytes: 30,
+                            put_ops: 1,
+                            put_bytes: 10,
+                        },
+                    )]),
+                    quiet_period: BTreeMap::from([(
+                        ArtifactClass::Manifest,
+                        ClassStats {
+                            get_ops: 5,
+                            get_bytes: 50,
+                            put_ops: 2,
+                            put_bytes: 20,
+                        },
+                    )]),
+                },
+                fired_faults: Vec::new(),
+            }],
+            &Coverage::default(),
+        );
+
+        let in_run = report
+            .split("## Object-Store In-Run Totals\n")
+            .nth(1)
+            .expect("report omitted in-run object-store totals")
+            .split("## Object-Store Quiet-Period Totals\n")
+            .next()
+            .unwrap();
+        assert!(in_run.contains("| `manifest` | 3 | 30 | 1 | 10 |"));
+
+        let quiet_period = report
+            .split("## Object-Store Quiet-Period Totals\n")
+            .nth(1)
+            .expect("report omitted quiet-period object-store totals");
+        assert!(quiet_period.contains("| `manifest` | 5 | 50 | 2 | 20 |"));
+
+        let combined = report
+            .split("## Object-Store Totals\n")
+            .nth(1)
+            .expect("report omitted combined object-store totals");
+        assert!(combined.contains("| `manifest` | 8 | 80 | 3 | 30 |"));
     }
 
     #[test]
@@ -968,7 +1063,7 @@ mod tests {
                 background_compactions: 0,
                 violations: Vec::new(),
                 wall_secs: 0.0,
-                object_store: BTreeMap::new(),
+                object_store: ObjectStorePhaseCensus::default(),
                 fired_faults: Vec::new(),
             }],
             &Coverage::default(),
@@ -1034,7 +1129,7 @@ mod tests {
                     background_compactions: 0,
                     violations: Vec::new(),
                     wall_secs: 0.0,
-                    object_store: BTreeMap::new(),
+                    object_store: ObjectStorePhaseCensus::default(),
                     fired_faults: Vec::new(),
                 }
             })
@@ -1098,7 +1193,7 @@ mod tests {
             background_compactions: 0,
             violations: Vec::new(),
             wall_secs: 0.0,
-            object_store: BTreeMap::new(),
+            object_store: ObjectStorePhaseCensus::default(),
             fired_faults: Vec::new(),
         }];
         artifacts.write_report(&completion_env, &reports, &Coverage::default(), false);
@@ -1234,7 +1329,7 @@ mod tests {
                 background_compactions: 0,
                 violations: Vec::new(),
                 wall_secs: 0.0,
-                object_store: BTreeMap::new(),
+                object_store: ObjectStorePhaseCensus::default(),
                 fired_faults: Vec::new(),
             }],
             &Coverage::default(),
@@ -1299,7 +1394,7 @@ mod tests {
                 background_compactions: 0,
                 violations: Vec::new(),
                 wall_secs: 0.0,
-                object_store: BTreeMap::new(),
+                object_store: ObjectStorePhaseCensus::default(),
                 fired_faults: Vec::new(),
             }],
             &Coverage::default(),
@@ -1477,7 +1572,7 @@ mod tests {
                 background_compactions: 1,
                 violations: Vec::new(),
                 wall_secs: 1.0,
-                object_store: BTreeMap::new(),
+                object_store: ObjectStorePhaseCensus::default(),
                 fired_faults: Vec::new(),
             }],
             &Coverage::default(),
@@ -2064,15 +2159,25 @@ fn build_report(
     }
     out.push('\n');
 
-    out.push_str("## Object-Store Totals\n\n");
-    out.push_str("| class | get_ops | get_bytes | put_ops | put_bytes |\n");
-    out.push_str("| --- | ---: | ---: | ---: | ---: |\n");
-    for (class, stats) in object_store_totals(seeds) {
-        out.push_str(&format!(
-            "| `{class}` | {} | {} | {} | {} |\n",
-            stats.get_ops, stats.get_bytes, stats.put_ops, stats.put_bytes
-        ));
-    }
+    render_object_store_totals(
+        &mut out,
+        "Object-Store In-Run Totals",
+        object_store_totals(seeds.iter().map(|seed| &seed.object_store.in_run)),
+    );
+    render_object_store_totals(
+        &mut out,
+        "Object-Store Quiet-Period Totals",
+        object_store_totals(seeds.iter().map(|seed| &seed.object_store.quiet_period)),
+    );
+    render_object_store_totals(
+        &mut out,
+        "Object-Store Totals",
+        object_store_totals(
+            seeds
+                .iter()
+                .flat_map(|seed| [&seed.object_store.in_run, &seed.object_store.quiet_period]),
+        ),
+    );
     out
 }
 
@@ -2345,11 +2450,13 @@ const REQUIRED_TAGS: &[&str] = &[
     "sketch-adc-v4",
 ];
 
-fn object_store_totals(seeds: &[SeedReport]) -> BTreeMap<String, ClassStats> {
-    let mut totals = BTreeMap::<String, ClassStats>::new();
-    for seed in seeds {
-        for (class, stats) in &seed.object_store {
-            let total = totals.entry(class.clone()).or_default();
+fn object_store_totals<'a>(
+    censuses: impl IntoIterator<Item = &'a ObjectStoreCensus>,
+) -> ObjectStoreCensus {
+    let mut totals = ObjectStoreCensus::new();
+    for census in censuses {
+        for (class, stats) in census {
+            let total = totals.entry(*class).or_default();
             total.get_ops += stats.get_ops;
             total.get_bytes += stats.get_bytes;
             total.put_ops += stats.put_ops;
@@ -2357,6 +2464,25 @@ fn object_store_totals(seeds: &[SeedReport]) -> BTreeMap<String, ClassStats> {
         }
     }
     totals
+}
+
+fn render_object_store_totals(out: &mut String, heading: &str, totals: ObjectStoreCensus) {
+    out.push_str(&format!("## {heading}\n\n"));
+    out.push_str("| class | get_ops | get_bytes | put_ops | put_bytes |\n");
+    out.push_str("| --- | ---: | ---: | ---: | ---: |\n");
+    let mut totals = totals.into_iter().collect::<Vec<_>>();
+    totals.sort_by_key(|(class, _)| class.name());
+    for (class, stats) in totals {
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} |\n",
+            class.name(),
+            stats.get_ops,
+            stats.get_bytes,
+            stats.put_ops,
+            stats.put_bytes
+        ));
+    }
+    out.push('\n');
 }
 
 fn percentile(values: &[u64], pct: usize) -> u64 {

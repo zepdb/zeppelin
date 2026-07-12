@@ -18,7 +18,7 @@ use zeppelin::time::Clock;
 use zeppelin::types::ConsistencyLevel;
 use zeppelin::wal::{Lease, LeaseManager, Manifest};
 
-use crate::common::counting::{counting_store, ClassStats, GetCounter};
+use crate::common::counting::{counting_store, ArtifactClass, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
 use crate::common::server::{
     cleanup_ns, start_test_server_full, start_test_server_full_with_disk_cache_max_bytes,
@@ -26,7 +26,8 @@ use crate::common::server::{
 };
 
 use super::artifacts::{
-    read_ops, read_seed_config, FailureManifest, RunArtifacts, SeedArtifacts, SeedReport,
+    read_ops, read_seed_config, FailureManifest, ObjectStoreCensus, ObjectStorePhaseCensus,
+    RunArtifacts, SeedArtifacts, SeedReport,
 };
 use super::chaos::{chaos_store, ChaosHandle, FaultPlan, FiredFault, StoreOp};
 use super::faults::clock::TestClock;
@@ -841,7 +842,7 @@ struct SeedOutcome {
     coverage: Coverage,
     violations: Vec<Violation>,
     wall_secs: f64,
-    object_store: BTreeMap<String, ClassStats>,
+    object_store: ObjectStorePhaseCensus,
     fired_faults: Vec<FiredFault>,
 }
 
@@ -1556,6 +1557,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let mut op_count = replay_op_index;
     let exact_quiescent_vector_count = operational_state.quiescent_vector_count_must_be_exact();
     let mut no_dual_writer_lease_hold = None;
+    let object_store_in_run = object_store_breakdown(&counter);
     let quiet = QuietPeriod {
         client: &client,
         server: &mut server,
@@ -1667,7 +1669,11 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             source_failure.as_ref(),
         );
     }
-    let object_store = object_store_breakdown(&counter);
+    let object_store_total = object_store_breakdown(&counter);
+    let object_store = ObjectStorePhaseCensus {
+        quiet_period: object_store_delta(&object_store_total, &object_store_in_run),
+        in_run: object_store_in_run,
+    };
     let background_compactions = background_compactions_since(&background_compaction_starts);
     if should_cleanup(env.preserve, failed) {
         for ns in &created_namespaces {
@@ -2347,11 +2353,44 @@ fn background_compaction_metric(ns: &str) -> u64 {
         .sum()
 }
 
-fn object_store_breakdown(counter: &GetCounter) -> BTreeMap<String, ClassStats> {
-    counter
-        .class_breakdown()
-        .into_iter()
-        .map(|(class, stats)| (class.name().to_string(), stats))
+fn object_store_breakdown(counter: &GetCounter) -> ObjectStoreCensus {
+    counter.class_breakdown()
+}
+
+#[must_use]
+fn object_store_delta(
+    total: &ObjectStoreCensus,
+    baseline: &ObjectStoreCensus,
+) -> ObjectStoreCensus {
+    assert_eq!(
+        total.keys().collect::<Vec<_>>(),
+        baseline.keys().collect::<Vec<_>>(),
+        "object-store census classes changed across the quiet-period boundary"
+    );
+    total
+        .iter()
+        .map(|(class, total)| {
+            let baseline = baseline
+                .get(class)
+                .unwrap_or_else(|| panic!("quiet-period baseline omitted class {class}"));
+            let subtract = |metric: &str, total: u64, baseline: u64| {
+                total.checked_sub(baseline).unwrap_or_else(|| {
+                    panic!(
+                        "object-store counter regressed for {class}.{metric}: \
+                         total={total} baseline={baseline}"
+                    )
+                })
+            };
+            (
+                *class,
+                ClassStats {
+                    get_ops: subtract("get_ops", total.get_ops, baseline.get_ops),
+                    get_bytes: subtract("get_bytes", total.get_bytes, baseline.get_bytes),
+                    put_ops: subtract("put_ops", total.put_ops, baseline.put_ops),
+                    put_bytes: subtract("put_bytes", total.put_bytes, baseline.put_bytes),
+                },
+            )
+        })
         .collect()
 }
 
@@ -3402,6 +3441,7 @@ async fn run_seed(
     }
 
     let exact_quiescent_vector_count = operational_state.quiescent_vector_count_must_be_exact();
+    let object_store_in_run = object_store_breakdown(&counter);
     let quiet = QuietPeriod {
         client: &client,
         server: &mut server,
@@ -3512,7 +3552,11 @@ async fn run_seed(
         .unwrap_or_default();
     timeline.extend(quiet.timeline);
     artifacts.write_timeline(&timeline);
-    let object_store = object_store_breakdown(&counter);
+    let object_store_total = object_store_breakdown(&counter);
+    let object_store = ObjectStorePhaseCensus {
+        quiet_period: object_store_delta(&object_store_total, &object_store_in_run),
+        in_run: object_store_in_run,
+    };
     let background_compactions = background_compactions_since(&background_compaction_starts);
 
     if failed {
@@ -7898,6 +7942,82 @@ mod outcome_tests {
 
     use super::*;
     use crate::adversarial::faults::{Direction, FaultEvent, TargetSelector};
+
+    #[test]
+    fn object_store_delta_reconstructs_every_metric_by_typed_class() {
+        let in_run = ObjectStoreCensus::from([
+            (
+                ArtifactClass::Manifest,
+                ClassStats {
+                    get_ops: 3,
+                    get_bytes: 30,
+                    put_ops: 1,
+                    put_bytes: 10,
+                },
+            ),
+            (
+                ArtifactClass::Sketch,
+                ClassStats {
+                    get_ops: 0,
+                    get_bytes: 0,
+                    put_ops: 2,
+                    put_bytes: 200,
+                },
+            ),
+        ]);
+        let total = ObjectStoreCensus::from([
+            (
+                ArtifactClass::Manifest,
+                ClassStats {
+                    get_ops: 8,
+                    get_bytes: 80,
+                    put_ops: 3,
+                    put_bytes: 30,
+                },
+            ),
+            (
+                ArtifactClass::Sketch,
+                ClassStats {
+                    get_ops: 4,
+                    get_bytes: 400,
+                    put_ops: 5,
+                    put_bytes: 500,
+                },
+            ),
+        ]);
+
+        let quiet_period = object_store_delta(&total, &in_run);
+
+        for (class, total) in total {
+            let in_run = in_run[&class];
+            let quiet_period = quiet_period[&class];
+            assert_eq!(in_run.get_ops + quiet_period.get_ops, total.get_ops);
+            assert_eq!(in_run.get_bytes + quiet_period.get_bytes, total.get_bytes);
+            assert_eq!(in_run.put_ops + quiet_period.put_ops, total.put_ops);
+            assert_eq!(in_run.put_bytes + quiet_period.put_bytes, total.put_bytes);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "object-store counter regressed for manifest.get_ops")]
+    fn object_store_delta_fails_loudly_when_a_counter_regresses() {
+        let in_run = ObjectStoreCensus::from([(
+            ArtifactClass::Manifest,
+            ClassStats {
+                get_ops: 2,
+                ..ClassStats::default()
+            },
+        )]);
+        let total = ObjectStoreCensus::from([(
+            ArtifactClass::Manifest,
+            ClassStats {
+                get_ops: 1,
+                ..ClassStats::default()
+            },
+        )]);
+
+        let _ = object_store_delta(&total, &in_run);
+    }
 
     #[test]
     fn mixed_mode_reserves_only_legacy_seed_zero_and_two_as_deterministic() {
