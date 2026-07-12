@@ -15,6 +15,8 @@ use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use zeppelin::storage::ZeppelinStore;
 
+use super::faults::{ContractClass, FaultContract, ProtectedAssumption};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StoreOp {
@@ -111,6 +113,20 @@ struct PostCommitAction {
 }
 
 impl FaultPlan {
+    /// Returns contract metadata for every enabled legacy-chaos site.
+    ///
+    /// Default generation is restricted to supported-v1 failure, latency, and
+    /// post-commit ambiguity. Hand-authored/replayed `SilentDrop` plans remain
+    /// available, but are labeled as provider-contract-abuse research.
+    #[must_use]
+    pub fn contracts(&self) -> Vec<FaultContract> {
+        self.sites
+            .iter()
+            .filter(|site| site.enabled)
+            .map(FaultSite::contract)
+            .collect()
+    }
+
     #[must_use]
     pub fn for_seed(seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed ^ 0x5eed_fa17_cafe_babe);
@@ -172,6 +188,27 @@ impl FaultPlan {
                 mode: FaultMode::PostCommitError { n: manifest_call },
                 enabled: true,
             }],
+        }
+    }
+}
+
+impl FaultSite {
+    #[must_use]
+    fn contract(&self) -> FaultContract {
+        let (contract_class, violated_assumptions) = if matches!(self.mode, FaultMode::SilentDrop) {
+            let assumption = if matches!(self.op, StoreOp::Put | StoreOp::Delete | StoreOp::Copy) {
+                ProtectedAssumption::A1
+            } else {
+                ProtectedAssumption::A2
+            };
+            (ContractClass::ProviderContractAbuse, vec![assumption])
+        } else {
+            (ContractClass::SupportedV1, Vec::new())
+        };
+        FaultContract {
+            event_id: self.id.clone(),
+            contract_class,
+            violated_assumptions,
         }
     }
 }
@@ -496,6 +533,26 @@ mod tests {
         let catalog = fault_catalog();
         assert!(catalog.contains(&("get-bootstrap", StoreOp::Get, "bootstrap.bin")));
         assert!(catalog.contains(&("get-sketch", StoreOp::Get, "coarse_sketch.bin")));
+    }
+
+    #[test]
+    fn generated_fault_plans_stay_within_supported_v1_contract() {
+        for seed in 0..4_096 {
+            let plan = FaultPlan::for_seed(seed);
+            assert!(
+                plan.sites
+                    .iter()
+                    .all(|site| !matches!(site.mode, FaultMode::SilentDrop)),
+                "default LegacyChaos seed {seed} generated a SilentDrop"
+            );
+            assert!(
+                plan.contracts().iter().all(|contract| {
+                    contract.contract_class
+                        == crate::adversarial::faults::ContractClass::SupportedV1
+                }),
+                "default LegacyChaos seed {seed} escaped the supported-v1 contract"
+            );
+        }
     }
 
     #[tokio::test]

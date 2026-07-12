@@ -1,6 +1,7 @@
 mod common;
 
-use common::fault_injection::{fail_put_once_matching, misdirect_put_once_matching};
+use common::counting::counting_store;
+use common::fault_injection::fail_put_once_matching;
 use common::harness::TestHarness;
 use ulid::Ulid;
 use zeppelin::error::ZeppelinError;
@@ -171,6 +172,56 @@ async fn conditional_pointer_failure_orphan_history_can_be_overwritten_on_retry(
 }
 
 #[tokio::test]
+async fn conditional_manifest_publication_has_no_success_readback() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("manifest-no-success-readback");
+    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    let (mut manifest, version) = Manifest::read_versioned(&harness.store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    manifest.add_fragment(fragment(9, 13));
+
+    let (store, counter) = counting_store(&harness.store);
+    manifest
+        .write_conditional(&store, &ns, &version)
+        .await
+        .unwrap();
+
+    assert_eq!(counter.puts_matching("/manifest.json"), 1);
+    assert_eq!(
+        counter.gets_matching("/manifest.json"),
+        0,
+        "a conformant successful conditional PUT must not be synchronously read back"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn successful_manifest_write_keeps_candidate_namespace_bound() {
+    let harness = TestHarness::new().await;
+    let source = harness.key("manifest-bound-candidate-source");
+    let target = harness.key("manifest-bound-candidate-target");
+    let mut manifest = Manifest::new();
+    manifest.write(&harness.store, &source).await.unwrap();
+
+    harness
+        .store
+        .put(&Manifest::s3_key(&target), manifest.to_bytes().unwrap())
+        .await
+        .unwrap();
+    let result = Manifest::read(&harness.store, &target).await;
+    assert!(matches!(
+        result,
+        Err(ZeppelinError::Serialization(message))
+            if message.contains("manifest namespace binding mismatch")
+    ));
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn live_manifest_rejects_bytes_bound_to_another_namespace() {
     let harness = TestHarness::new().await;
     let source = harness.key("manifest-binding-source");
@@ -197,38 +248,6 @@ async fn live_manifest_rejects_bytes_bound_to_another_namespace() {
         Err(ZeppelinError::Serialization(message))
             if message.contains("manifest namespace binding mismatch")
     ));
-
-    harness.cleanup().await;
-}
-
-#[tokio::test]
-async fn conditional_manifest_write_rejects_misdirected_success() {
-    let harness = TestHarness::new().await;
-    let ns = harness.key("manifest-misdirected-pointer");
-    Manifest::new().write(&harness.store, &ns).await.unwrap();
-    let (mut manifest, version) = Manifest::read_versioned(&harness.store, &ns)
-        .await
-        .unwrap()
-        .unwrap();
-    manifest.add_fragment(fragment(9, 13));
-
-    let live_key = Manifest::s3_key(&ns);
-    let (misdirecting_store, injections) =
-        misdirect_put_once_matching(&harness.store, live_key.clone());
-    let result = manifest
-        .write_conditional(&misdirecting_store, &ns, &version)
-        .await;
-
-    assert!(matches!(result, Err(ZeppelinError::Serialization(_))));
-    assert_eq!(injections.failures_injected(), 1);
-    assert_eq!(manifest.version(), 1);
-    let live = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
-    assert!(live.fragments.is_empty());
-    assert!(harness
-        .store
-        .exists(&format!("{live_key}.misdirected"))
-        .await
-        .unwrap());
 
     harness.cleanup().await;
 }

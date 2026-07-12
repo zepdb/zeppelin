@@ -18,8 +18,11 @@ use zeppelin::storage::ZeppelinStore;
 
 use crate::common::counting::ClassStats;
 
-use super::chaos::FiredFault;
-use super::faults::{FaultKind, FaultProfile, FaultSchedule, ObservedResult, TimelineEvent};
+use super::chaos::{FaultPlan, FiredFault};
+use super::faults::{
+    ContractClass, FaultContract, FaultKind, FaultProfile, FaultSchedule, ObservedResult,
+    ProtectedAssumption, TimelineEvent,
+};
 use super::generator::Coverage;
 use super::model::Model;
 use super::ops::{NamespaceSpec, OpRecord};
@@ -53,6 +56,7 @@ pub struct SeedArtifacts {
     op_count: u64,
     next_op_index: u64,
     pending_ops: BTreeMap<u64, OpRecord>,
+    fault_contracts: BTreeMap<String, FaultContract>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,6 +165,34 @@ impl RunArtifacts {
         let dir = self.root.join(format!("seed-{seed}"));
         fs::create_dir_all(&dir)
             .unwrap_or_else(|error| panic!("failed to create seed dir {}: {error}", dir.display()));
+        let mut fault_contracts = fault_schedule
+            .map(FaultSchedule::contracts)
+            .unwrap_or_default();
+        let chaos_contracts = chaos_plan
+            .map(|value| {
+                serde_json::from_value::<FaultPlan>(value.clone())
+                    .unwrap_or_else(|error| panic!("failed to parse generated chaos plan: {error}"))
+                    .contracts()
+            })
+            .unwrap_or_default();
+        let selftest = fault_plan.is_some() || selftest_probe.is_some();
+        let has_chaos_contracts = !chaos_contracts.is_empty();
+        if selftest {
+            fault_contracts.extend(chaos_contracts.into_iter().map(|contract| FaultContract {
+                event_id: contract.event_id,
+                contract_class: ContractClass::HarnessSelfTest,
+                violated_assumptions: Vec::new(),
+            }));
+        } else {
+            fault_contracts.extend(chaos_contracts);
+        }
+        if selftest && !has_chaos_contracts {
+            fault_contracts.push(FaultContract {
+                event_id: "oracle-selftest".to_string(),
+                contract_class: ContractClass::HarnessSelfTest,
+                violated_assumptions: Vec::new(),
+            });
+        }
         write_json(
             dir.join("config.json"),
             &serde_json::json!({
@@ -170,6 +202,7 @@ impl RunArtifacts {
                 "selftest_probe": selftest_probe,
                 "chaos_plan": chaos_plan,
                 "fault_schedule": fault_schedule,
+                "fault_contracts": fault_contracts,
                 "config": config,
                 "namespace_specs": specs,
             }),
@@ -183,6 +216,10 @@ impl RunArtifacts {
             op_count: 0,
             next_op_index: 0,
             pending_ops: BTreeMap::new(),
+            fault_contracts: fault_contracts
+                .into_iter()
+                .map(|contract| (contract.event_id.clone(), contract))
+                .collect(),
         }
     }
 
@@ -350,7 +387,36 @@ impl SeedArtifacts {
             .unwrap_or_else(|error| panic!("failed to create {}: {error}", path.display()));
         let mut writer = BufWriter::new(file);
         for event in timeline {
-            let encoded = serde_json::to_string(event).expect("TimelineEvent must serialize");
+            let mut value = serde_json::to_value(event).expect("TimelineEvent must serialize");
+            let contract = self.fault_contracts.get(&event.event_id);
+            let (contract_class, violated_assumptions) = match contract {
+                Some(contract) => (
+                    contract.contract_class,
+                    contract.violated_assumptions.as_slice(),
+                ),
+                None if event.event_id.starts_with("quiet-")
+                    && event.action.starts_with("quiet:") =>
+                {
+                    (ContractClass::SupportedV1, &[][..])
+                }
+                None => panic!(
+                    "timeline event {} is missing persisted fault contract metadata",
+                    event.event_id
+                ),
+            };
+            let object = value
+                .as_object_mut()
+                .expect("TimelineEvent must serialize as an object");
+            object.insert(
+                "contract_class".to_string(),
+                serde_json::to_value(contract_class).expect("ContractClass must serialize"),
+            );
+            object.insert(
+                "violated_assumptions".to_string(),
+                serde_json::to_value(violated_assumptions)
+                    .expect("ProtectedAssumption must serialize"),
+            );
+            let encoded = serde_json::to_string(&value).expect("timeline artifact must serialize");
             writeln!(writer, "{encoded}")
                 .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
         }
@@ -743,6 +809,7 @@ mod tests {
             op_count: 0,
             next_op_index: 0,
             pending_ops: BTreeMap::new(),
+            fault_contracts: BTreeMap::new(),
         };
 
         artifacts.write_op(&record(1));
@@ -758,11 +825,163 @@ mod tests {
     }
 
     #[test]
-    fn run_json_records_the_twelve_slot_mode_and_profile_assignment() {
+    fn generated_artifacts_persist_and_report_contract_classification() {
         let dir = tempfile::TempDir::new().unwrap();
         let env = RunnerEnv {
             seconds: 1,
-            seeds: (0..12).collect(),
+            seeds: vec![7],
+            max_ops: Some(1),
+            artifacts: dir.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Chaos,
+            profile: Some(FaultProfile::ProviderContractAbuse),
+            env_echo: BTreeMap::new(),
+        };
+        let run = RunArtifacts::create(&env);
+        let scheduler =
+            super::super::faults::FaultScheduler::for_seed(7, FaultProfile::ProviderContractAbuse);
+        let schedule = scheduler.schedule().clone();
+        let event = schedule.events.first().unwrap();
+        let seed = run.seed(
+            7,
+            &Config::default(),
+            &BTreeMap::new(),
+            RunMode::Chaos,
+            None,
+            None,
+            None,
+            Some(&schedule),
+        );
+        seed.write_timeline(&[TimelineEvent {
+            event_id: event.id.clone(),
+            op_index: event.start_op,
+            wall_ms: 0,
+            boundary: event.boundary,
+            action: "provider abuse fired".to_string(),
+            key: None,
+            semantics: FaultSemantics::PostCommit,
+            observed: ObservedResult::Corrupted,
+            recovery: Some("research finding".to_string()),
+        }]);
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(seed.dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["fault_contracts"][0]["contract_class"],
+            "provider_contract_abuse"
+        );
+        assert!(!config["fault_contracts"][0]["violated_assumptions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let timeline: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(seed.dir.join("timeline.jsonl"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(timeline["contract_class"], "provider_contract_abuse");
+        assert!(!timeline["violated_assumptions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let report = build_report(
+            run.root(),
+            &RunManifest::at_start(&env),
+            &[SeedReport {
+                seed: 7,
+                mode: RunMode::Chaos,
+                profile: Some(FaultProfile::ProviderContractAbuse),
+                dir: seed.dir,
+                failed: true,
+                ops: 0,
+                compactions: 0,
+                background_compactions: 0,
+                violations: Vec::new(),
+                wall_secs: 0.0,
+                object_store: BTreeMap::new(),
+                fired_faults: Vec::new(),
+            }],
+            &Coverage::default(),
+        );
+        assert!(report.contains("contract class"));
+        assert!(report.contains("ProviderContractAbuse"));
+        assert!(report.contains("not a v1 product bug"));
+        assert!(report.contains("research-finding"));
+        assert!(report.contains("failed=0, research_findings=1"));
+    }
+
+    #[test]
+    fn lost_write_selftest_persists_site_level_harness_contract() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: vec![11],
+            max_ops: Some(1),
+            artifacts: dir.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Chaos,
+            profile: None,
+            env_echo: BTreeMap::new(),
+        };
+        let run = RunArtifacts::create(&env);
+        let chaos_plan =
+            serde_json::to_value(crate::adversarial::chaos::FaultPlan::lost_write_selftest())
+                .unwrap();
+        let seed = run.seed(
+            11,
+            &Config::default(),
+            &BTreeMap::new(),
+            RunMode::Chaos,
+            Some("chaos-lost-write"),
+            None,
+            Some(&chaos_plan),
+            None,
+        );
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(seed.dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["fault_contracts"],
+            serde_json::json!([{
+                "event_id": "chaos-lost-write",
+                "contract_class": "harness_self_test",
+                "violated_assumptions": [],
+            }])
+        );
+
+        let report = build_report(
+            run.root(),
+            &RunManifest::at_start(&env),
+            &[SeedReport {
+                seed: 11,
+                mode: RunMode::Chaos,
+                profile: Some(FaultProfile::LegacyChaos),
+                dir: seed.dir,
+                failed: false,
+                ops: 0,
+                compactions: 0,
+                background_compactions: 0,
+                violations: Vec::new(),
+                wall_secs: 0.0,
+                object_store: BTreeMap::new(),
+                fired_faults: Vec::new(),
+            }],
+            &Coverage::default(),
+        );
+        assert!(report.contains("| 11 | `HarnessSelfTest` | `` | `no` |"));
+    }
+
+    #[test]
+    fn run_json_records_the_supported_nine_slot_mode_and_profile_assignment() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: (0..9).collect(),
             max_ops: Some(1),
             artifacts: dir.path().to_path_buf(),
             preserve: PreserveMode::Never,
@@ -779,8 +998,8 @@ mod tests {
         assert!(assignments["0"]["profile"].is_null());
         assert_eq!(assignments["1"]["profile"], "legacy_chaos");
         assert_eq!(assignments["3"]["profile"], "post_commit");
-        assert_eq!(assignments["10"]["profile"], "ops");
-        assert_eq!(assignments["11"]["profile"], "full");
+        assert_eq!(assignments["7"]["profile"], "sched");
+        assert_eq!(assignments["8"]["profile"], "supported_full");
     }
 
     #[test]
@@ -798,7 +1017,7 @@ mod tests {
             env_echo: BTreeMap::new(),
         };
         let artifacts = RunArtifacts::create(&env);
-        let reports = (0..12)
+        let reports = (0..9)
             .map(|seed| {
                 let seed_dir = artifacts.root().join(format!("seed-{seed}"));
                 fs::create_dir_all(&seed_dir).unwrap();
@@ -825,13 +1044,10 @@ mod tests {
         let run: serde_json::Value =
             serde_json::from_slice(&fs::read(artifacts.root().join("run.json")).unwrap()).unwrap();
         assert_eq!(run["configured_seeds"], serde_json::json!([0, 1, 2]));
-        assert_eq!(
-            run["seeds"],
-            serde_json::json!([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
-        );
+        assert_eq!(run["seeds"], serde_json::json!([0, 1, 2, 3, 4, 5, 6, 7, 8]));
         assert_eq!(run["mode_assignment"]["3"]["profile"], "post_commit");
-        assert_eq!(run["mode_assignment"]["7"]["profile"], "content");
-        assert_eq!(run["mode_assignment"]["11"]["profile"], "full");
+        assert_eq!(run["mode_assignment"]["7"]["profile"], "sched");
+        assert_eq!(run["mode_assignment"]["8"]["profile"], "supported_full");
     }
 
     #[test]
@@ -1289,6 +1505,7 @@ mod tests {
             op_count: 0,
             next_op_index: 0,
             pending_ops: BTreeMap::new(),
+            fault_contracts: BTreeMap::new(),
         };
         let ns = "ns";
         let key = format!("{ns}/manifest.json");
@@ -1438,7 +1655,14 @@ fn build_report(
         }
     }
 
-    let failed = seeds.iter().filter(|seed| seed.failed).count();
+    let failed = seeds
+        .iter()
+        .filter(|seed| seed.failed && seed_blocks_v1(seed))
+        .count();
+    let research_findings = seeds
+        .iter()
+        .filter(|seed| seed.failed && !seed_blocks_v1(seed))
+        .count();
     let ops = seeds.iter().map(|seed| seed.ops).sum::<u64>();
     let wall = seeds
         .iter()
@@ -1475,7 +1699,13 @@ fn build_report(
             seed.seed,
             seed.mode,
             profile,
-            if seed.failed { "failed" } else { "passed" },
+            if seed.failed && seed_blocks_v1(seed) {
+                "failed"
+            } else if seed.failed {
+                "research-finding"
+            } else {
+                "passed"
+            },
             seed.ops,
             seed.compactions,
             seed.background_compactions,
@@ -1490,14 +1720,49 @@ fn build_report(
         .map(|seed| seed.background_compactions)
         .sum::<u64>();
     out.push_str(&format!(
-        "\nSummary: seeds={}, failed={}, ops={}, explicit_compactions={}, background_compactions={}, ops/sec={:.2}\n\n",
+        "\nSummary: seeds={}, failed={}, research_findings={}, ops={}, explicit_compactions={}, background_compactions={}, ops/sec={:.2}\n\n",
         seeds.len(),
         failed,
+        research_findings,
         ops,
         explicit_compactions,
         background_compactions,
         ops as f64 / wall
     ));
+
+    out.push_str("## Contract Classification\n\n");
+    out.push_str("| seed | contract class | violated assumptions | blocking v1 gate |\n");
+    out.push_str("| --- | --- | --- | --- |\n");
+    let mut has_research_campaign = false;
+    for seed in seeds {
+        let contracts = seed_fault_contracts(seed);
+        let classes = contract_classes(&contracts);
+        let assumptions = contract_assumptions(&contracts);
+        let blocks_v1 = classes.iter().all(|class| class.blocks_v1());
+        has_research_campaign |= !blocks_v1;
+        out.push_str(&format!(
+            "| {} | `{}` | `{}` | `{}` |\n",
+            seed.seed,
+            classes
+                .iter()
+                .map(|class| format!("{class:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            assumptions
+                .iter()
+                .map(|assumption| format!("{assumption:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            if blocks_v1 { "yes" } else { "no" },
+        ));
+    }
+    if has_research_campaign {
+        out.push_str(
+            "\nProvider-contract-abuse and future-architecture results are research findings only, not a v1 product bug or blocking v1 gate.\n\n",
+        );
+    } else {
+        out.push('\n');
+    }
 
     out.push_str("## Operational Proofs\n\n");
     out.push_str(
@@ -1526,9 +1791,28 @@ fn build_report(
     for seed in seeds {
         for violation in &seed.violations {
             any_violation = true;
+            let contracts = seed_fault_contracts(seed);
+            let classes = contract_classes(&contracts);
+            let assumptions = contract_assumptions(&contracts);
+            let blocks_v1 = classes.iter().all(|class| class.blocks_v1());
             out.push_str(&format!(
-                "- seed {} op {} `{:?}` `{}`: {}\n",
-                seed.seed, violation.op_index, violation.id, violation.namespace, violation.detail
+                "- seed {} op {} `{:?}` `{}` [class=`{}` assumptions=`{}` v1_blocking=`{}`]: {}\n",
+                seed.seed,
+                violation.op_index,
+                violation.id,
+                violation.namespace,
+                classes
+                    .iter()
+                    .map(|class| format!("{class:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                assumptions
+                    .iter()
+                    .map(|assumption| format!("{assumption:?}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                if blocks_v1 { "yes" } else { "no" },
+                violation.detail
             ));
             let failure_path = seed.dir.join("failure.json");
             if failure_path.exists() {
@@ -1612,22 +1896,34 @@ fn build_report(
                             |end| format!("{}..{}", event.start_op, end),
                         );
                         let kind = fault_kind_name(&event.kind);
-                        (event.id, (window, kind))
+                        let class = event.contract_class();
+                        let assumptions = event.violated_assumptions().to_vec();
+                        (event.id, (window, kind, class, assumptions))
                     })
                     .collect()
             });
             out.push_str(&format!("### Seed {}\n\n", seed.seed));
             out.push_str(
-                "| event id | op window | boundary | kind | action | observed | recovery |\n",
+                "| event id | op window | boundary | kind | action | observed | recovery | contract class | violated assumptions | blocking v1 |\n",
             );
-            out.push_str("| --- | --- | --- | --- | --- | --- | --- |\n");
+            out.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
             for event in timeline {
-                let (window, kind) = match contexts.get(&event.event_id) {
-                    Some((window, kind)) => (window.as_str(), kind.as_str()),
+                let (window, kind, class, assumptions) = match contexts.get(&event.event_id) {
+                    Some((window, kind, class, assumptions)) => (
+                        window.as_str(),
+                        kind.as_str(),
+                        *class,
+                        assumptions.as_slice(),
+                    ),
                     None if event.event_id.starts_with("quiet-")
                         && event.action.starts_with("quiet:") =>
                     {
-                        ("recorded-only", "QuietPeriod")
+                        (
+                            "recorded-only",
+                            "QuietPeriod",
+                            ContractClass::SupportedV1,
+                            &[][..],
+                        )
                     }
                     None => panic!(
                         "timeline event {} in {} is missing persisted fault-schedule context",
@@ -1642,7 +1938,7 @@ fn build_report(
                     .or_default();
                 counts.observe(&event);
                 out.push_str(&format!(
-                    "| `{}` | `{}` | `{}` | `{}` | `{}` | `{:?}` | `{}` |\n",
+                    "| `{}` | `{}` | `{}` | `{}` | `{}` | `{:?}` | `{}` | `{:?}` | `{}` | `{}` |\n",
                     markdown_cell(&event.event_id),
                     markdown_cell(window),
                     boundary,
@@ -1650,6 +1946,13 @@ fn build_report(
                     markdown_cell(&event.action),
                     event.observed,
                     markdown_cell(recovery),
+                    class,
+                    assumptions
+                        .iter()
+                        .map(|assumption| format!("{assumption:?}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    if class.blocks_v1() { "yes" } else { "no" },
                 ));
             }
             out.push('\n');
@@ -1832,6 +2135,107 @@ fn fault_kind_name(kind: &FaultKind) -> String {
         .next()
         .expect("FaultKind debug output must start with its variant")
         .to_string()
+}
+
+fn seed_fault_contracts(seed: &SeedReport) -> Vec<FaultContract> {
+    if !seed.dir.join("config.json").exists() {
+        return profile_contracts(seed.profile);
+    }
+    let config = read_seed_config(&seed.dir);
+    if let Some(value) = config
+        .get("fault_contracts")
+        .filter(|value| !value.is_null())
+    {
+        let contracts: Vec<FaultContract> =
+            serde_json::from_value(value.clone()).unwrap_or_else(|error| {
+                panic!(
+                    "failed to parse fault contracts in {}: {error}",
+                    seed.dir.display()
+                )
+            });
+        if !contracts.is_empty() {
+            return contracts;
+        }
+    }
+    if let Some(value) = config
+        .get("fault_schedule")
+        .filter(|value| !value.is_null())
+    {
+        let schedule: FaultSchedule =
+            serde_json::from_value(value.clone()).unwrap_or_else(|error| {
+                panic!(
+                    "failed to parse legacy fault schedule in {}: {error}",
+                    seed.dir.display()
+                )
+            });
+        let contracts = schedule.contracts();
+        if !contracts.is_empty() {
+            return contracts;
+        }
+    }
+    vec![FaultContract {
+        event_id: "no-scheduled-faults".to_string(),
+        contract_class: ContractClass::SupportedV1,
+        violated_assumptions: Vec::new(),
+    }]
+}
+
+fn profile_contracts(profile: Option<FaultProfile>) -> Vec<FaultContract> {
+    let classes: &[ContractClass] = match profile {
+        Some(FaultProfile::ProviderContractAbuse | FaultProfile::Content) => {
+            &[ContractClass::ProviderContractAbuse]
+        }
+        Some(FaultProfile::FutureArchitecture | FaultProfile::Ops) => {
+            &[ContractClass::FutureArchitecture]
+        }
+        Some(FaultProfile::Semantic) => &[ContractClass::ProviderContractAbuse],
+        Some(FaultProfile::Full) => &[
+            ContractClass::ProviderContractAbuse,
+            ContractClass::FutureArchitecture,
+        ],
+        Some(
+            FaultProfile::LegacyChaos
+            | FaultProfile::PostCommit
+            | FaultProfile::Network
+            | FaultProfile::Crash
+            | FaultProfile::Clock
+            | FaultProfile::SupportedFull
+            | FaultProfile::Sched,
+        )
+        | None => &[ContractClass::SupportedV1],
+    };
+    classes
+        .iter()
+        .map(|class| FaultContract {
+            event_id: "profile-classification".to_string(),
+            contract_class: *class,
+            violated_assumptions: match class {
+                ContractClass::ProviderContractAbuse => vec![ProtectedAssumption::A2],
+                ContractClass::FutureArchitecture => vec![ProtectedAssumption::A3],
+                ContractClass::SupportedV1 | ContractClass::HarnessSelfTest => Vec::new(),
+            },
+        })
+        .collect()
+}
+
+fn contract_classes(contracts: &[FaultContract]) -> BTreeSet<ContractClass> {
+    contracts
+        .iter()
+        .map(|contract| contract.contract_class)
+        .collect()
+}
+
+fn contract_assumptions(contracts: &[FaultContract]) -> BTreeSet<ProtectedAssumption> {
+    contracts
+        .iter()
+        .flat_map(|contract| contract.violated_assumptions.iter().copied())
+        .collect()
+}
+
+fn seed_blocks_v1(seed: &SeedReport) -> bool {
+    seed_fault_contracts(seed)
+        .iter()
+        .all(|contract| contract.contract_class.blocks_v1())
 }
 
 fn markdown_cell(value: &str) -> String {

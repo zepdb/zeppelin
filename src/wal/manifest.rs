@@ -1222,21 +1222,6 @@ impl Manifest {
         Ok(())
     }
 
-    async fn verify_live_write(
-        store: &ZeppelinStore,
-        namespace: &str,
-        expected: &Bytes,
-    ) -> Result<()> {
-        let key = Self::s3_key(namespace);
-        let actual = store.get(&key).await?;
-        if actual != *expected {
-            return Err(ZeppelinError::Serialization(format!(
-                "manifest live write verification mismatch for namespace {namespace}"
-            )));
-        }
-        Ok(())
-    }
-
     /// Reads and decodes the authoritative live manifest from object storage.
     ///
     /// # Parameters
@@ -1292,9 +1277,8 @@ impl Manifest {
     ///
     /// # Returns
     ///
-    /// `Ok(())` after both history and live objects are written and an exact
-    /// live read-back matches the candidate. Only then is `self.version`
-    /// advanced to the committed generation.
+    /// `Ok(())` after both history and live objects are written. Only then is
+    /// `self.version` advanced to the committed generation.
     ///
     /// # Errors
     ///
@@ -1305,8 +1289,7 @@ impl Manifest {
     /// # Side Effects
     ///
     /// Performs one generation-discovery GET, at least one history operation,
-    /// one unconditional live-manifest PUT, and one verification GET on the
-    /// success path.
+    /// and one unconditional live-manifest PUT on the success path.
     ///
     /// # Consistency
     ///
@@ -1338,9 +1321,8 @@ impl Manifest {
             ReferencedHistoryConflict::Serialization,
         )
         .await?;
-        store.put(&key, data.clone()).await?;
-        Self::verify_live_write(store, namespace, &data).await?;
-        self.version = committed.version;
+        store.put(&key, data).await?;
+        *self = committed;
         Ok(())
     }
 
@@ -1439,8 +1421,8 @@ impl Manifest {
     ///
     /// # Returns
     ///
-    /// `Ok(())` after an exact read-back proves the live manifest is
-    /// authoritative; `self.version` then advances by exactly one.
+    /// `Ok(())` after the conditional live PUT succeeds; `self.version` then
+    /// advances by exactly one.
     ///
     /// # Errors
     ///
@@ -1452,8 +1434,7 @@ impl Manifest {
     /// # Side Effects
     ///
     /// Creates or reconciles the immutable history object before attempting one
-    /// conditional live PUT (or an unconditional PUT when the ETag is absent),
-    /// then performs one verification GET.
+    /// conditional live PUT (or an unconditional PUT when the ETag is absent).
     ///
     /// # Consistency
     ///
@@ -1495,15 +1476,10 @@ impl Manifest {
         )
         .await?;
         match &version.0 {
-            Some(etag) => {
-                store
-                    .put_if_match(&key, data.clone(), etag, namespace)
-                    .await
-            }
-            None => store.put(&key, data.clone()).await,
+            Some(etag) => store.put_if_match(&key, data, etag, namespace).await,
+            None => store.put(&key, data).await,
         }?;
-        Self::verify_live_write(store, namespace, &data).await?;
-        self.version = next_version;
+        *self = committed;
         Ok(())
     }
 

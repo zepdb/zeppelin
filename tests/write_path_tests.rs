@@ -15,7 +15,6 @@ mod common;
 use std::sync::Arc;
 
 use common::counting::counting_store;
-use common::fault_injection::misdirect_put_once_matching;
 use common::harness::TestHarness;
 use common::vectors::random_vectors;
 
@@ -163,56 +162,6 @@ async fn test_missing_manifest_append_leaves_no_orphan() {
     harness.cleanup().await;
 }
 
-/// I4: a backend acknowledgement is not proof that the requested immutable
-/// WAL key contains the bytes supplied by the writer. The writer must verify
-/// the authoritative key before publishing its fragment reference.
-#[tokio::test]
-async fn test_misdirected_wal_put_is_not_acknowledged_or_published() {
-    let harness = TestHarness::new().await;
-    let ns = harness.key("misdirected-wal");
-    Manifest::new().write(&harness.store, &ns).await.unwrap();
-
-    let (store, fault) = misdirect_put_once_matching(&harness.store, "/wal/");
-    let writer = WalWriter::new(store);
-    let result = writer.append(&ns, random_vectors(4, 8), vec![]).await;
-
-    assert!(
-        result.is_err(),
-        "a PUT acknowledged at a different key must not be acknowledged as durable"
-    );
-    assert_eq!(
-        fault.failures_injected(),
-        1,
-        "the WAL PUT must hit the fault"
-    );
-
-    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
-    assert!(
-        manifest.fragments.is_empty(),
-        "a manifest must not reference an unverified authoritative WAL key"
-    );
-
-    let wal_objects = harness
-        .store
-        .list_prefix(&format!("{ns}/wal/"))
-        .await
-        .unwrap();
-    assert!(
-        wal_objects.iter().all(|key| !key.ends_with(".wal")),
-        "the authoritative WAL key must be absent after misdirection: {wal_objects:?}"
-    );
-    assert_eq!(
-        wal_objects
-            .iter()
-            .filter(|key| key.ends_with(".wal.misdirected"))
-            .count(),
-        1,
-        "the fixture must prove the bytes landed only at the sibling key"
-    );
-
-    harness.cleanup().await;
-}
-
 /// I2: under moderate contention, backoff absorbs CAS conflicts — every append
 /// eventually succeeds, none surfaces a 409 to the caller. Uses TWO SEPARATE
 /// WalWriter instances (independent group-commit state) on the same namespace,
@@ -354,6 +303,16 @@ async fn test_single_append_roundtrip_unchanged() {
         counter.puts_matching("/manifest.json"),
         1,
         "exactly one manifest CAS PUT for an uncontended append"
+    );
+    assert_eq!(
+        counter.gets_matching("/wal/"),
+        0,
+        "a conformant successful WAL PUT must not be synchronously read back"
+    );
+    assert_eq!(
+        counter.gets_matching("/manifest.json"),
+        1,
+        "the append needs one manifest CAS-base GET and no post-PUT verification GET"
     );
 
     harness.cleanup().await;

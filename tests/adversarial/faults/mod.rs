@@ -23,6 +23,20 @@ pub struct FaultSchedule {
     pub events: Vec<FaultEvent>,
 }
 
+impl FaultSchedule {
+    #[must_use]
+    pub fn contracts(&self) -> Vec<FaultContract> {
+        self.events.iter().map(FaultContract::from).collect()
+    }
+
+    #[must_use]
+    pub fn blocks_v1(&self) -> bool {
+        self.events
+            .iter()
+            .all(|event| event.contract_class().blocks_v1())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FaultProfile {
@@ -31,6 +45,11 @@ pub enum FaultProfile {
     Network,
     Crash,
     Clock,
+    SupportedFull,
+    ProviderContractAbuse,
+    FutureArchitecture,
+    // Legacy Phase 5-7 profiles remain decodable and explicitly runnable for
+    // artifact replay. New default schedules do not select them.
     Content,
     Semantic,
     Sched,
@@ -47,6 +66,9 @@ impl FaultProfile {
             "network" => Self::Network,
             "crash" => Self::Crash,
             "clock" => Self::Clock,
+            "supported_full" => Self::SupportedFull,
+            "provider_contract_abuse" => Self::ProviderContractAbuse,
+            "future_architecture" => Self::FutureArchitecture,
             "content" => Self::Content,
             "semantic" => Self::Semantic,
             "sched" => Self::Sched,
@@ -64,6 +86,9 @@ impl FaultProfile {
             Self::Network => "network",
             Self::Crash => "crash",
             Self::Clock => "clock",
+            Self::SupportedFull => "supported_full",
+            Self::ProviderContractAbuse => "provider_contract_abuse",
+            Self::FutureArchitecture => "future_architecture",
             Self::Content => "content",
             Self::Semantic => "semantic",
             Self::Sched => "sched",
@@ -79,6 +104,9 @@ impl FaultProfile {
             Self::Network => "network",
             Self::Crash => "crash",
             Self::Clock => "clock",
+            Self::SupportedFull => "supported-full",
+            Self::ProviderContractAbuse => "provider-contract-abuse",
+            Self::FutureArchitecture => "future-architecture",
             Self::Content => "content",
             Self::Semantic => "semantic",
             Self::Sched => "sched",
@@ -99,6 +127,50 @@ pub enum ContentFault {
     SilentDeleteFailure,
 }
 
+/// Product contract under which a generated fault finding may be interpreted.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractClass {
+    SupportedV1,
+    ProviderContractAbuse,
+    FutureArchitecture,
+    HarnessSelfTest,
+}
+
+impl ContractClass {
+    #[must_use]
+    pub fn blocks_v1(self) -> bool {
+        matches!(self, Self::SupportedV1)
+    }
+}
+
+/// Protected assumptions named by the overreach audit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProtectedAssumption {
+    A1,
+    A2,
+    A3,
+    A4,
+    A5,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FaultContract {
+    pub event_id: String,
+    pub contract_class: ContractClass,
+    pub violated_assumptions: Vec<ProtectedAssumption>,
+}
+
+impl From<&FaultEvent> for FaultContract {
+    fn from(event: &FaultEvent) -> Self {
+        Self {
+            event_id: event.id.clone(),
+            contract_class: event.contract_class(),
+            violated_assumptions: event.violated_assumptions().to_vec(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FaultEvent {
     pub id: String,
@@ -107,6 +179,66 @@ pub struct FaultEvent {
     pub boundary: Boundary,
     pub target: TargetSelector,
     pub kind: FaultKind,
+}
+
+impl FaultEvent {
+    /// Classifies the simulated behavior independently of its legacy profile.
+    #[must_use]
+    pub fn contract_class(&self) -> ContractClass {
+        match self.kind {
+            FaultKind::Content(_)
+            | FaultKind::ListOmit { .. }
+            | FaultKind::ListDuplicate { .. }
+            | FaultKind::ListReorder
+            | FaultKind::StaleRead
+            | FaultKind::HeadGetDiverge => ContractClass::ProviderContractAbuse,
+            FaultKind::StartSecondNode { .. } => ContractClass::FutureArchitecture,
+            FaultKind::AdmitStaleManifestCas => ContractClass::HarnessSelfTest,
+            FaultKind::PreFail { .. }
+            | FaultKind::Latency { .. }
+            | FaultKind::Partition { .. }
+            | FaultKind::PostCommitFail { .. }
+            | FaultKind::TruncatedGetStream { .. }
+            | FaultKind::DropRequest
+            | FaultKind::DropResponse
+            | FaultKind::TruncateResponse { .. }
+            | FaultKind::ResetAfterRequest
+            | FaultKind::ClientCancel { .. }
+            | FaultKind::DuplicateRetry
+            | FaultKind::CrashAt { .. }
+            | FaultKind::ClockJump { .. }
+            | FaultKind::ClockFreeze { .. }
+            | FaultKind::CasConflict
+            | FaultKind::BatchDeletePartial { .. }
+            | FaultKind::CopySourceVanish
+            | FaultKind::HoldCall { .. }
+            | FaultKind::StartReadOnlyNode { .. }
+            | FaultKind::PatchConfigDuringTraffic
+            | FaultKind::DeleteNamespaceInFlight
+            | FaultKind::FillDiskCache
+            | FaultKind::ResourceExhaustion { .. } => ContractClass::SupportedV1,
+        }
+    }
+
+    #[must_use]
+    pub fn violated_assumptions(&self) -> &'static [ProtectedAssumption] {
+        match self.kind {
+            FaultKind::Content(ContentFault::TornWrite { .. })
+            | FaultKind::Content(ContentFault::MisdirectedWrite)
+            | FaultKind::Content(ContentFault::SilentDeleteFailure) => &[ProtectedAssumption::A1],
+            FaultKind::Content(ContentFault::TruncateBody { .. })
+            | FaultKind::Content(ContentFault::BitFlip { .. })
+            | FaultKind::Content(ContentFault::WrongObject)
+            | FaultKind::ListOmit { .. }
+            | FaultKind::ListDuplicate { .. }
+            | FaultKind::ListReorder
+            | FaultKind::StaleRead
+            | FaultKind::HeadGetDiverge => &[ProtectedAssumption::A2],
+            FaultKind::StartSecondNode { .. } => &[ProtectedAssumption::A3],
+            FaultKind::AdmitStaleManifestCas => &[ProtectedAssumption::A3],
+            _ => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +321,9 @@ pub enum FaultKind {
         for_ops: u64,
     },
     StartSecondNode {
+        for_ops: u64,
+    },
+    StartReadOnlyNode {
         for_ops: u64,
     },
     PatchConfigDuringTraffic,
@@ -285,6 +420,13 @@ pub enum SchedulerCommand {
     StopSecondNode {
         event_id: String,
     },
+    StartReadOnlyNode {
+        event_id: String,
+        for_ops: u64,
+    },
+    StopReadOnlyNode {
+        event_id: String,
+    },
     PatchConfigDuringTraffic {
         event_id: String,
     },
@@ -299,6 +441,34 @@ pub enum SchedulerCommand {
         max_concurrent_queries: usize,
         disk_cache_max_bytes: u64,
     },
+}
+
+impl SchedulerCommand {
+    #[must_use]
+    pub fn contract_class(&self) -> ContractClass {
+        match self {
+            Self::StartSecondNode { .. } | Self::StopSecondNode { .. } => {
+                ContractClass::FutureArchitecture
+            }
+            Self::Clock(_)
+            | Self::StartReadOnlyNode { .. }
+            | Self::StopReadOnlyNode { .. }
+            | Self::PatchConfigDuringTraffic { .. }
+            | Self::DeleteNamespaceInFlight { .. }
+            | Self::FillDiskCache { .. }
+            | Self::ResourceExhaustion { .. } => ContractClass::SupportedV1,
+        }
+    }
+
+    #[must_use]
+    pub fn violated_assumptions(&self) -> &'static [ProtectedAssumption] {
+        match self {
+            Self::StartSecondNode { .. } | Self::StopSecondNode { .. } => {
+                &[ProtectedAssumption::A3]
+            }
+            _ => &[],
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -425,6 +595,29 @@ impl FaultScheduler {
                                 .is_ok()
                         {
                             commands.push(SchedulerCommand::StopSecondNode {
+                                event_id: event.id.clone(),
+                            });
+                        }
+                    }
+                    FaultKind::StartReadOnlyNode { for_ops } => {
+                        if op_index == event.start_op
+                            && runtime
+                                .fired
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                        {
+                            commands.push(SchedulerCommand::StartReadOnlyNode {
+                                event_id: event.id.clone(),
+                                for_ops,
+                            });
+                        }
+                        if op_index == event.start_op.saturating_add(for_ops)
+                            && runtime
+                                .ended
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                        {
+                            commands.push(SchedulerCommand::StopReadOnlyNode {
                                 event_id: event.id.clone(),
                             });
                         }
@@ -821,7 +1014,10 @@ impl FaultScheduler {
         if self.runtime.quiesced.load(Ordering::SeqCst)
             || !matches!(
                 self.schedule.profile,
-                FaultProfile::Content | FaultProfile::Semantic | FaultProfile::Full
+                FaultProfile::Content
+                    | FaultProfile::Semantic
+                    | FaultProfile::ProviderContractAbuse
+                    | FaultProfile::Full
             )
         {
             return false;
@@ -1321,6 +1517,61 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
                 FaultKind::ClockJump { delta_ms },
             );
         }
+        FaultProfile::SupportedFull => {
+            let sources = [
+                FaultProfile::PostCommit,
+                FaultProfile::Network,
+                FaultProfile::Crash,
+                FaultProfile::Clock,
+                FaultProfile::Semantic,
+                FaultProfile::Sched,
+                FaultProfile::Ops,
+            ];
+            for (index, source) in sources.into_iter().enumerate() {
+                let source_seed = seed
+                    ^ (u64::try_from(index + 1)
+                        .expect("supported-full source index must fit u64")
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                let mut event =
+                    first_event_for_class(source_seed, source, ContractClass::SupportedV1);
+                event.id = format!("supported-full-{}-{index:02}", source.id_prefix());
+                events.push(event);
+            }
+            let start = rng.gen_range(40..=120);
+            push_event(
+                &mut events,
+                profile,
+                start,
+                Some(start + 20),
+                Boundary::Runner,
+                TargetSelector::default(),
+                FaultKind::StartReadOnlyNode { for_ops: 20 },
+            );
+        }
+        FaultProfile::ProviderContractAbuse => {
+            for (index, source) in [FaultProfile::Content, FaultProfile::Semantic]
+                .into_iter()
+                .enumerate()
+            {
+                let source_seed = seed
+                    ^ (u64::try_from(index + 1)
+                        .expect("provider-abuse source index must fit u64")
+                        .wrapping_mul(0xd6e8_feb8_6659_fd93));
+                let mut event = first_event_for_class(
+                    source_seed,
+                    source,
+                    ContractClass::ProviderContractAbuse,
+                );
+                event.id = format!("provider-contract-abuse-{}-{index:02}", source.id_prefix());
+                events.push(event);
+            }
+        }
+        FaultProfile::FutureArchitecture => {
+            let mut event =
+                first_event_for_class(seed, FaultProfile::Ops, ContractClass::FutureArchitecture);
+            event.id = "future-architecture-dual-writer-00".to_string();
+            events.push(event);
+        }
         FaultProfile::Content => {
             let put_targets = ["manifest.json", ".wal", "segments/"];
             let put_target = put_targets[rng.gen_range(0..put_targets.len())];
@@ -1575,6 +1826,17 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
         }
     }
     FaultSchedule { profile, events }
+}
+
+fn first_event_for_class(seed: u64, profile: FaultProfile, class: ContractClass) -> FaultEvent {
+    (0..1_024)
+        .find_map(|offset| {
+            schedule_for_seed(seed.wrapping_add(offset), profile)
+                .events
+                .into_iter()
+                .find(|event| event.contract_class() == class)
+        })
+        .unwrap_or_else(|| panic!("{profile:?} generated no {class:?} event"))
 }
 
 fn push_event(
@@ -2213,5 +2475,82 @@ mod tests {
 
         assert!(scheduler.fault_window_active(56, "ns"));
         assert!(!scheduler.fault_window_active(56, "other"));
+    }
+
+    #[test]
+    fn generated_campaigns_carry_explicit_contract_classes() {
+        for seed in 0..100 {
+            let supported = FaultScheduler::for_seed(seed, FaultProfile::SupportedFull);
+            assert!(!supported.schedule().events.is_empty(), "seed {seed}");
+            assert!(supported.schedule().events.iter().all(|event| {
+                event.contract_class() == ContractClass::SupportedV1
+                    && event.violated_assumptions().is_empty()
+            }));
+            assert!(supported
+                .schedule()
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, FaultKind::StartReadOnlyNode { .. })));
+            assert!(!supported
+                .schedule()
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, FaultKind::StartSecondNode { .. })));
+
+            let provider = FaultScheduler::for_seed(seed, FaultProfile::ProviderContractAbuse);
+            assert!(!provider.schedule().events.is_empty(), "seed {seed}");
+            assert!(provider.schedule().events.iter().all(|event| {
+                event.contract_class() == ContractClass::ProviderContractAbuse
+                    && !event.violated_assumptions().is_empty()
+            }));
+
+            let future = FaultScheduler::for_seed(seed, FaultProfile::FutureArchitecture);
+            assert!(!future.schedule().events.is_empty(), "seed {seed}");
+            assert!(future.schedule().events.iter().all(|event| {
+                event.contract_class() == ContractClass::FutureArchitecture
+                    && event.violated_assumptions() == [ProtectedAssumption::A3]
+            }));
+        }
+    }
+
+    #[test]
+    fn explicit_research_profiles_and_legacy_schedule_names_remain_decodable() {
+        assert_eq!(
+            FaultProfile::from_env("provider_contract_abuse"),
+            FaultProfile::ProviderContractAbuse
+        );
+        assert_eq!(
+            FaultProfile::from_env("future_architecture"),
+            FaultProfile::FutureArchitecture
+        );
+        assert_eq!(FaultProfile::from_env("content"), FaultProfile::Content);
+        assert_eq!(FaultProfile::from_env("full"), FaultProfile::Full);
+
+        let legacy = serde_json::json!({
+            "profile": "full",
+            "events": [{
+                "id": "full-content-04",
+                "start_op": 12,
+                "end_op": null,
+                "boundary": "object_store",
+                "target": {
+                    "store_op": "put",
+                    "key_substring": "manifest.json",
+                    "path_substring": null,
+                    "methods": null
+                },
+                "kind": { "content": "misdirected_write" }
+            }]
+        });
+        let schedule: FaultSchedule = serde_json::from_value(legacy).unwrap();
+        assert_eq!(schedule.profile, FaultProfile::Full);
+        assert_eq!(
+            schedule.events[0].contract_class(),
+            ContractClass::ProviderContractAbuse
+        );
+        assert_eq!(
+            schedule.events[0].violated_assumptions(),
+            [ProtectedAssumption::A1]
+        );
     }
 }

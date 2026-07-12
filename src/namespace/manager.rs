@@ -66,7 +66,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, instrument};
 
 use crate::config::IndexingConfig;
@@ -417,8 +417,8 @@ impl NamespaceMetadata {
 struct RegistryEntry {
     /// Owned metadata snapshot safe to return after releasing the map guard.
     meta: NamespaceMetadata,
-    /// Injected wall time when S3 last supplied or confirmed this snapshot.
-    fetched_at: DateTime<Utc>,
+    /// Monotonic instant when S3 last supplied or confirmed this snapshot.
+    fetched_at: Instant,
 }
 
 /// Result of an idempotent namespace create request.
@@ -452,7 +452,7 @@ pub struct NamespaceManager {
     registry: DashMap<String, RegistryEntry>,
     /// Maximum age at which a read-only lookup may reuse a registry entry.
     registry_ttl: Duration,
-    /// Explicit wall clock used for metadata stamps and registry expiry.
+    /// Explicit wall clock used only for persisted metadata stamps.
     clock: Clock,
 }
 
@@ -1063,16 +1063,7 @@ impl NamespaceManager {
     /// map entry and lock guard.
     fn fresh_registry_meta(&self, name: &str) -> Option<NamespaceMetadata> {
         self.registry.get(name).and_then(|entry| {
-            let age = self.clock.now().signed_duration_since(entry.fetched_at);
-            if age < chrono::Duration::zero()
-                || age
-                    .to_std()
-                    .is_ok_and(|elapsed| elapsed < self.registry_ttl)
-            {
-                Some(entry.meta.clone())
-            } else {
-                None
-            }
+            (entry.fetched_at.elapsed() < self.registry_ttl).then(|| entry.meta.clone())
         })
     }
 
@@ -1094,7 +1085,7 @@ impl NamespaceManager {
             meta.name.clone(),
             RegistryEntry {
                 meta,
-                fetched_at: self.clock.now(),
+                fetched_at: Instant::now(),
             },
         );
     }

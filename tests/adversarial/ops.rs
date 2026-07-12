@@ -253,6 +253,22 @@ where
 }
 
 impl Op {
+    /// Returns whether this operation is safe to route to a designated
+    /// read-only secondary in the supported one-writer topology.
+    #[must_use]
+    pub fn is_read_only_request(&self) -> bool {
+        matches!(
+            self,
+            Op::GetNamespace { .. }
+                | Op::FetchVectors { .. }
+                | Op::Query { .. }
+                | Op::BatchQuery { .. }
+                | Op::PaginateAll { .. }
+                | Op::GetSnapshot { .. }
+                | Op::ListSnapshots { .. }
+        )
+    }
+
     #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {

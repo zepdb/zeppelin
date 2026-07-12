@@ -1,16 +1,38 @@
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use common::harness::TestHarness;
 use common::server::start_test_server;
 use reqwest::StatusCode;
 use serde_json::json;
 use zeppelin::namespace::manager::NamespaceMetadata;
 use zeppelin::namespace::NamespaceManager;
+use zeppelin::time::{Clock, TimeSource};
 use zeppelin::types::DistanceMetric;
+
+#[derive(Debug)]
+struct AdjustableWallClock(Mutex<DateTime<Utc>>);
+
+impl AdjustableWallClock {
+    fn new(now: DateTime<Utc>) -> Self {
+        Self(Mutex::new(now))
+    }
+
+    fn jump(&self, delta: chrono::Duration) {
+        let mut now = self.0.lock().expect("test wall clock mutex poisoned");
+        *now += delta;
+    }
+}
+
+impl TimeSource for AdjustableWallClock {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().expect("test wall clock mutex poisoned")
+    }
+}
 
 fn ns(harness: &TestHarness, suffix: &str) -> String {
     format!("{}-{suffix}", harness.prefix)
@@ -125,6 +147,38 @@ async fn test_cross_node_registry_delete_converges_within_ttl() {
         }
     }
 
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_registry_ttl_is_not_extended_by_backward_frozen_wall_clock() {
+    let harness = TestHarness::new().await;
+    let name = ns(&harness, "registry-monotonic-clock-domain");
+    let manager_a = NamespaceManager::new(harness.store.clone());
+    let wall_clock = Arc::new(AdjustableWallClock::new(Utc::now()));
+    let manager_b = NamespaceManager::with_clock(
+        harness.store.clone(),
+        Duration::from_millis(50),
+        Clock::from_source(wall_clock.clone()),
+    );
+
+    manager_a
+        .create(&name, 2, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+    manager_b.get(&name).await.unwrap();
+
+    wall_clock.jump(chrono::Duration::minutes(-5));
+    manager_a.start_delete(&name).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(75)).await;
+
+    let result = manager_b.get(&name).await;
+    assert!(
+        matches!(result, Err(ref error) if error.status_code() == 410),
+        "expired local registry entry hid the authoritative tombstone: {result:?}"
+    );
+
+    manager_a.finish_delete(&name, Duration::MAX).await.unwrap();
     harness.cleanup().await;
 }
 

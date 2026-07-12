@@ -570,6 +570,7 @@ impl StoreFaultProxy {
             self.scheduler.schedule().profile,
             super::FaultProfile::Content
                 | super::FaultProfile::Semantic
+                | super::FaultProfile::ProviderContractAbuse
                 | super::FaultProfile::Full
         )
     }

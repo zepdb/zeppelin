@@ -12,16 +12,41 @@ Faults enter at four product-facing boundaries:
 1. `ObjectStore` faults wrap GET, HEAD, LIST, PUT, COPY, and DELETE calls.
 2. `ClientHttp` faults act between the workload client and the real server.
 3. `Process` faults abort and restart the test server at durable write sites.
-4. `Clock` faults change the shared test clock used by leases, GC, and TTLs.
+4. `Clock` faults change the shared wall clock used by persisted timestamps,
+   leases, GC, and PITR horizons. Process-local TTLs, timeouts, latency
+   measurements, hydration windows, and compaction upload elapsed time remain
+   monotonic and must be immune to these jumps.
 
-`Runner` events are orchestration records for operational environment changes,
-such as starting a second node. They do not replace one of the four injection
-boundaries.
+`Runner` events are orchestration records for operational environment changes.
+`StartReadOnlyNode` is the supported multi-node topology: node 0 owns all
+mutations and background work, while node 1 has no compaction loop and receives
+only read operations. The legacy `StartSecondNode` event deliberately creates
+two writers and is retained only for the explicit future-architecture campaign.
+Runner events do not replace one of the four injection boundaries.
 
 Every scheduled event has a deterministic id, logical start and optional end,
-boundary, target selector, and `FaultKind`. Every observed effect is written as
-a `TimelineEvent` with the logical operation index, boundary, action,
+boundary, target selector, `FaultKind`, `ContractClass`, and protected-assumption
+metadata. Every observed effect is written as a `TimelineEvent` with the same
+classification plus the logical operation index, boundary, action,
 `ObservedResult`, and recovery evidence. Wall time is diagnostic only.
+
+## Contract classes and interpretation
+
+- `SupportedV1` preserves the successful object-store, supported-provider,
+  single-writer, and monotonic-duration contracts. Its findings block v1.
+- `ProviderContractAbuse` simulates successful wrong-key/body operations,
+  silent successful deletes, stale/wrong reads, and inconsistent LIST/HEAD.
+  These findings certify or reject an adapter/provider; they are not v1 bugs.
+- `FutureArchitecture` runs the retained two-writer topology. Its findings feed
+  a future distributed-writer design and do not block v1.
+- `HarnessSelfTest` deliberately corrupts a model/oracle and gates only its
+  pinned self-test.
+
+`config.json` stores a `fault_contracts` entry for every generated event;
+`timeline.jsonl` repeats `contract_class` and `violated_assumptions` on every
+recorded event. Reports label v1 failures separately from non-blocking research
+findings. Legacy Phase 1-7 schedules remain decodable and replayable even though
+they predate the duplicated metadata.
 
 ## Logical time and ambiguity
 
@@ -65,11 +90,53 @@ run-level boundary/kind resolution summary. Failure reproduction commands
 carry the active `ZEPPELIN_ADVERSARIAL_PROFILE` and replay the recorded
 schedule.
 
-Mixed mode uses a stable twelve-slot table. Residues 0 and 2 are deterministic,
-residue 1 is LegacyChaos, and residues 3 through 11 are PostCommit, Network,
-Crash, Clock, Content, Semantic, Sched, Ops, and Full. An explicit profile
-overrides the table for every seed. Full takes one deterministic event from
-each scheduled family so boundary faults can overlap in one run.
+Mixed mode uses a stable nine-slot supported table. Residues 0 and 2 are
+deterministic, residue 1 is LegacyChaos, and residues 3 through 8 are
+PostCommit, Network, Crash, Clock, Sched, and SupportedFull. SupportedFull
+selects supported semantic and operational events individually and includes a
+one-writer/read-only-node window; it never includes provider lies or a second
+writer.
+
+An explicit `ZEPPELIN_ADVERSARIAL_PROFILE` overrides the table for every seed.
+Use `provider_contract_abuse` for broken provider/adapter research and
+`future_architecture` for dual-writer research. The legacy `content`,
+`semantic`, `ops`, and `full` profile names remain accepted for artifact replay
+and explicitly requested historical campaigns, but none is selected by Mixed.
+
+## Product-fix admission
+
+Before a runner finding can authorize a production `src/` change, its RCA must
+record:
+
+1. which protected assumptions the fault preserved or violated;
+2. the current public/durability contract that forbids the observed result;
+3. a conformant MinIO/S3 reproduction (or wrapper that still honors the pinned
+   `ObjectStore` contract);
+4. added storage operations, serialized stages, transferred bytes, CPU passes,
+   coordination, or fallback behavior; and
+5. the correction that instead belongs in the harness, adapter certification,
+   or future-architecture plan.
+
+Provider-abuse and future-architecture findings stop at classification and
+reporting. A proposed synchronous S3 operation also requires an approved
+before/after table of GET/HEAD/PUT/LIST counts by key class, transferred bytes,
+GET-only and PUT+GET critical-path depth, and new ambiguity states. Captured
+performance evidence never authorizes a TOML rebaseline by itself.
+
+## Provider certification
+
+The provider conformance suite certifies A1/A2 once per advertised backend:
+
+```bash
+TEST_BACKEND=minio cargo test --release --test provider_conformance_tests \
+  -- --nocapture
+```
+
+It checks exact and atomic PUT/overwrite behavior, strong visibility,
+conditional PUT and version tokens, GET/HEAD coherence, unique complete LIST,
+copy/create-only semantics, and delete visibility. Run the same test against
+every provider proposed for support; a failure means that adapter/provider is
+unsupported until corrected or the product contract is deliberately changed.
 
 ## Adding a fault kind
 
@@ -80,6 +147,11 @@ A new fault is incomplete unless the same change ships this quartet:
    boundary;
 3. a model/oracle absorption rule for every ambiguous outcome;
 4. an oracle mutation self-test pinned to the expected `ViolationId`.
+
+The schedule generator must also assign the fault's contract class and violated
+assumptions. A new provider-abuse or future-architecture event must be reachable
+only through an explicit campaign; a new supported event may join Mixed only
+after its assumption audit.
 
 The consolidated memory-backend matrix contains sixteen mutations. Each clean
 control and mutation is capped at 80 workload operations. Run it with:

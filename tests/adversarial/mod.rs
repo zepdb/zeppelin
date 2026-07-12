@@ -58,7 +58,7 @@ pub fn effective_seed_assignment(
             mode: RunMode::Chaos,
             profile: Some(FaultProfile::LegacyChaos),
         },
-        RunMode::Mixed => match seed % 12 {
+        RunMode::Mixed => match seed % 9 {
             0 | 2 => SeedAssignment {
                 mode: RunMode::Deterministic,
                 profile: None,
@@ -71,12 +71,9 @@ pub fn effective_seed_assignment(
             4 => scheduled(FaultProfile::Network),
             5 => scheduled(FaultProfile::Crash),
             6 => scheduled(FaultProfile::Clock),
-            7 => scheduled(FaultProfile::Content),
-            8 => scheduled(FaultProfile::Semantic),
-            9 => scheduled(FaultProfile::Sched),
-            10 => scheduled(FaultProfile::Ops),
-            11 => scheduled(FaultProfile::Full),
-            residue => unreachable!("seed modulo 12 produced residue {residue}"),
+            7 => scheduled(FaultProfile::Sched),
+            8 => scheduled(FaultProfile::SupportedFull),
+            residue => unreachable!("seed modulo 9 produced residue {residue}"),
         },
     }
 }
@@ -245,4 +242,31 @@ fn parse_seeds() -> Vec<u64> {
         .unwrap_or_else(|error| panic!("invalid ZEPPELIN_ADVERSARIAL_SEEDS={raw:?}: {error}"));
     assert!(count > 0, "ZEPPELIN_ADVERSARIAL_SEEDS count must be > 0");
     (0..count).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_mixed_assigns_only_supported_v1_fault_profiles() {
+        for seed in 0..240 {
+            let assignment = effective_seed_assignment(RunMode::Mixed, None, seed);
+            if let Some(profile) = assignment.profile {
+                let schedule = faults::FaultScheduler::for_seed(seed, profile);
+                assert!(
+                    schedule
+                        .schedule()
+                        .events
+                        .iter()
+                        .all(|event| event.contract_class() == faults::ContractClass::SupportedV1),
+                    "seed {seed} assigned unsupported profile {profile:?}"
+                );
+            }
+        }
+        assert!((0..240).any(|seed| {
+            effective_seed_assignment(RunMode::Mixed, None, seed).profile
+                == Some(FaultProfile::SupportedFull)
+        }));
+    }
 }

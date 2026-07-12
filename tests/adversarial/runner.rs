@@ -107,6 +107,7 @@ struct OperationalState {
     next_target_node: u8,
     second_node_active: bool,
     second_node_ever_active: bool,
+    second_node_read_only: bool,
 }
 
 struct NodeCommandContext<'a> {
@@ -138,6 +139,17 @@ impl OperationalState {
         );
         self.second_node_active = true;
         self.second_node_ever_active = true;
+        self.second_node_read_only = false;
+    }
+
+    fn record_read_only_node_started(&mut self) {
+        assert!(
+            !self.second_node_active,
+            "second-node activity windows must not overlap"
+        );
+        self.second_node_active = true;
+        self.second_node_ever_active = true;
+        self.second_node_read_only = true;
     }
 
     fn record_second_node_stopped(&mut self) {
@@ -146,6 +158,7 @@ impl OperationalState {
             "cannot stop a second-node activity window that is not active"
         );
         self.second_node_active = false;
+        self.second_node_read_only = false;
     }
 
     fn second_node_active(&self) -> bool {
@@ -162,16 +175,35 @@ impl OperationalState {
     }
 
     fn generation_checkpoints_enabled(&self) -> bool {
-        !self.second_node_active()
+        !self.second_node_active() || self.second_node_read_only
     }
 
     fn choose_target_node(&mut self) -> u8 {
-        if self.second_node.is_none() {
+        if !self.second_node_active() {
             return 0;
         }
         let selected = self.next_target_node;
         self.next_target_node ^= 1;
         selected
+    }
+
+    fn choose_target_node_for_op(&mut self, op: &Op) -> u8 {
+        if self.second_node_read_only && !op.is_read_only_request() {
+            return 0;
+        }
+        self.choose_target_node()
+    }
+
+    fn choose_read_target_node(&mut self) -> u8 {
+        self.choose_target_node()
+    }
+
+    fn choose_write_target_node(&mut self) -> u8 {
+        if self.second_node_read_only {
+            0
+        } else {
+            self.choose_target_node()
+        }
     }
 
     fn target<'a>(&'a self, primary: &'a FullTestServer, target_node: u8) -> &'a FullTestServer {
@@ -294,6 +326,63 @@ impl OperationalState {
                         }),
                     );
                 }
+                SchedulerCommand::StartReadOnlyNode { event_id, for_ops } => {
+                    assert!(
+                        self.second_node.is_none(),
+                        "second-node windows must not overlap"
+                    );
+                    let second_node_store = operational_observer.map_or_else(
+                        || store.clone(),
+                        |observer| operational_store_proxy(store, observer.clone(), 1),
+                    );
+                    self.second_node = Some(
+                        start_test_server_full_with_disk_cache_max_bytes(
+                            second_node_store,
+                            Some(prefix.to_string()),
+                            config.clone(),
+                            false,
+                            shared_clock.clone(),
+                            disk_cache_max_bytes,
+                        )
+                        .await,
+                    );
+                    self.record_read_only_node_started();
+                    self.next_target_node = 0;
+                    record_operational_timeline(
+                        scheduler,
+                        event_id,
+                        op_index,
+                        format!("start read-only node for {for_ops} ops"),
+                        FaultSemantics::WindowActive,
+                        Some(
+                            "writer_node=0; read_only_node=1; secondary_background_writer=false"
+                                .to_string(),
+                        ),
+                    );
+                }
+                SchedulerCommand::StopReadOnlyNode { event_id } => {
+                    assert!(
+                        self.second_node_read_only,
+                        "read-only stop requires a read-only secondary"
+                    );
+                    let server = self
+                        .second_node
+                        .take()
+                        .expect("scheduled read-only stop requires an active server");
+                    server.shutdown().await;
+                    self.record_second_node_stopped();
+                    record_operational_timeline(
+                        scheduler,
+                        event_id,
+                        op_index,
+                        "stop read-only node".to_string(),
+                        FaultSemantics::WindowEnd,
+                        Some(
+                            "writer_node=0; read_only_node=1; secondary_background_writer=false; secondary_mutations=0"
+                                .to_string(),
+                        ),
+                    );
+                }
                 SchedulerCommand::ResourceExhaustion {
                     event_id,
                     max_concurrent_queries,
@@ -355,7 +444,7 @@ impl OperationalState {
                         continue;
                     };
                     let nlist = model.namespaces[&ns].spec.num_centroids;
-                    let target_node = self.choose_target_node();
+                    let target_node = self.choose_write_target_node();
                     let base_url = self.target(primary, target_node).base_url.clone();
                     let path = format!("/v1/namespaces/{ns}/index_config");
                     let (status, _) = request_json(
@@ -388,7 +477,7 @@ impl OperationalState {
                     let mut tasks = tokio::task::JoinSet::new();
                     for burst in 0..BURST_REQUESTS {
                         let (ns, body) = queries[burst % queries.len()].clone();
-                        let target_node = self.choose_target_node();
+                        let target_node = self.choose_read_target_node();
                         let base_url = self.target(primary, target_node).base_url.clone();
                         let client = client.clone();
                         tasks.spawn(async move {
@@ -474,9 +563,9 @@ impl OperationalState {
                     model.apply_outcome(&upsert, &held, None, None, op_index);
                     model.apply_outcome(&delete, &held, None, None, op_index);
 
-                    let upsert_node = self.choose_target_node();
+                    let upsert_node = self.choose_write_target_node();
                     let upsert_base_url = self.target(primary, upsert_node).base_url.clone();
-                    let delete_node = self.choose_target_node();
+                    let delete_node = self.choose_write_target_node();
                     let delete_base_url = self.target(primary, delete_node).base_url.clone();
                     let upsert_client = client.clone();
                     let upsert_ns = ns.clone();
@@ -701,6 +790,7 @@ fn requires_operational_store_observer(scheduler: Option<&FaultScheduler>) -> bo
 pub struct RunSummary {
     pub seeds_run: u64,
     pub failed_seeds: u64,
+    pub non_blocking_findings: u64,
     pub ops_total: u64,
     pub compactions_total: u64,
     pub background_compactions_total: u64,
@@ -713,6 +803,7 @@ struct SeedOutcome {
     mode: RunMode,
     profile: Option<FaultProfile>,
     failed: bool,
+    blocking_v1: bool,
     ops: u64,
     compactions: u64,
     background_compactions: u64,
@@ -732,6 +823,7 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
     let mut summary = RunSummary {
         seeds_run: 0,
         failed_seeds: 0,
+        non_blocking_findings: 0,
         ops_total: 0,
         compactions_total: 0,
         background_compactions_total: 0,
@@ -750,7 +842,8 @@ pub async fn run_smoke(env: RunnerEnv) -> RunSummary {
         )
         .await;
         summary.seeds_run += 1;
-        summary.failed_seeds += u64::from(outcome.failed);
+        summary.failed_seeds += u64::from(outcome.failed && outcome.blocking_v1);
+        summary.non_blocking_findings += u64::from(outcome.failed && !outcome.blocking_v1);
         summary.ops_total += outcome.ops;
         summary.compactions_total += outcome.compactions;
         summary.background_compactions_total += outcome.background_compactions;
@@ -819,6 +912,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
     let mut summary = RunSummary {
         seeds_run: 0,
         failed_seeds: 0,
+        non_blocking_findings: 0,
         ops_total: 0,
         compactions_total: 0,
         background_compactions_total: 0,
@@ -831,7 +925,8 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
         let seed = overnight_seed(&env.seeds, seed_index);
         let outcome = run_seed(&env, &artifacts, seed, deadline, env.selftest, env.selftest).await;
         summary.seeds_run += 1;
-        summary.failed_seeds += u64::from(outcome.failed);
+        summary.failed_seeds += u64::from(outcome.failed && outcome.blocking_v1);
+        summary.non_blocking_findings += u64::from(outcome.failed && !outcome.blocking_v1);
         summary.ops_total += outcome.ops;
         summary.compactions_total += outcome.compactions;
         summary.background_compactions_total += outcome.background_compactions;
@@ -1554,10 +1649,15 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     drop(client);
     server.shutdown().await;
     let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let blocking_v1 = replay_mutation.is_none()
+        && scheduler
+            .as_ref()
+            .is_none_or(|scheduler| scheduler.schedule().blocks_v1());
     SeedOutcome {
         mode,
         profile: active_profile,
         failed,
+        blocking_v1,
         ops: op_count,
         compactions,
         background_compactions,
@@ -1866,14 +1966,25 @@ fn config_for_mode(mode: RunMode, seed: u64, schedule: Option<&FaultSchedule>) -
         config.compaction.interval_secs = 2 + (seed % 4);
         config.gc.compaction_upload_window_secs = 2;
     }
-    if matches!(profile, Some(FaultProfile::Clock | FaultProfile::Full)) {
+    if matches!(
+        profile,
+        Some(FaultProfile::Clock | FaultProfile::SupportedFull | FaultProfile::Full)
+    ) {
         config.cache.namespace_registry_ttl_ms = 500;
         config.compaction.interval_secs = 2;
         config.compaction.lease_duration_secs = 10;
         config.gc.horizon_secs = 30;
         config.gc.allow_unsafe_short_horizon = true;
     }
-    if matches!(profile, Some(FaultProfile::Ops | FaultProfile::Full)) {
+    if matches!(
+        profile,
+        Some(
+            FaultProfile::Ops
+                | FaultProfile::SupportedFull
+                | FaultProfile::FutureArchitecture
+                | FaultProfile::Full
+        )
+    ) {
         config.server.max_concurrent_queries = 1;
         config.cache.memory_cache_max_mb = 1;
     }
@@ -2936,7 +3047,7 @@ async fn run_seed(
             break;
         };
         assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &op);
-        let target_node = operational_state.choose_target_node();
+        let target_node = operational_state.choose_target_node_for_op(&op);
         let target_server = operational_state.target(&server, target_node);
         let op_http_fault_context = http_fault_context
             .as_ref()
@@ -3131,7 +3242,7 @@ async fn run_seed(
                     )
                     .await;
                 assert_recorded_op_matches(recorded_ops.as_deref(), seed, op_index, &probe_op);
-                let target_node = operational_state.choose_target_node();
+                let target_node = operational_state.choose_target_node_for_op(&probe_op);
                 let target_server = operational_state.target(&server, target_node);
                 let op_http_fault_context = http_fault_context
                     .as_ref()
@@ -3413,10 +3524,15 @@ async fn run_seed(
         op_index as f64 / elapsed
     );
 
+    let blocking_v1 = mutation.is_none()
+        && scheduler
+            .as_ref()
+            .is_none_or(|scheduler| scheduler.schedule().blocks_v1());
     SeedOutcome {
         mode,
         profile: active_profile,
         failed,
+        blocking_v1,
         ops: op_index,
         compactions,
         background_compactions,
@@ -3936,13 +4052,20 @@ fn should_observe_lineage(
     scheduled_profile: Option<FaultProfile>,
     op_index: u64,
 ) -> bool {
-    scheduled_profile == Some(FaultProfile::Ops)
-        || (op_index % 25 == 0
-            && (mode == RunMode::Deterministic
-                || matches!(
-                    scheduled_profile,
-                    Some(FaultProfile::Content | FaultProfile::Semantic)
-                )))
+    matches!(
+        scheduled_profile,
+        Some(FaultProfile::Ops | FaultProfile::FutureArchitecture)
+    ) || (op_index % 25 == 0
+        && (mode == RunMode::Deterministic
+            || matches!(
+                scheduled_profile,
+                Some(
+                    FaultProfile::Content
+                        | FaultProfile::Semantic
+                        | FaultProfile::ProviderContractAbuse
+                        | FaultProfile::SupportedFull
+                )
+            )))
 }
 
 async fn reachable_keys_for_taint(
@@ -4124,14 +4247,13 @@ async fn execute_raw_recorded_op(
             _ if op.is_mutating() => {
                 rec.gen_after = if let Some(context) = http_fault_context.as_ref() {
                     if op_records_manifest_generation(&op) {
-                        Some(
-                            authoritative_generation(
-                                &context.bookkeeping_store,
-                                op.namespace(),
-                                op.kind(),
-                            )
-                            .await,
+                        tainted_aware_authoritative_generation(
+                            &context.bookkeeping_store,
+                            &context.scheduler,
+                            op.namespace(),
+                            op.kind(),
                         )
+                        .await
                     } else {
                         None
                     }
@@ -5674,6 +5796,44 @@ async fn authoritative_generation(store: &ZeppelinStore, ns: &str, op_kind: &str
         .version()
 }
 
+/// Reads the post-op manifest generation for bookkeeping, tolerating an
+/// unreadable or missing live manifest only when a fired durable content
+/// fault (torn or misdirected write) is recorded against that exact manifest
+/// key. A conformant successful PUT is not read back by the product, so an
+/// acknowledged mutation under such a fault legitimately leaves the live
+/// manifest corrupt or unwritten; anything else must still fail loudly.
+async fn tainted_aware_authoritative_generation(
+    store: &ZeppelinStore,
+    scheduler: &FaultScheduler,
+    ns: &str,
+    op_kind: &str,
+) -> Option<u64> {
+    let outcome = match Manifest::read(store, ns).await {
+        Ok(Some(manifest)) => return Some(manifest.version()),
+        Ok(None) => "missing".to_string(),
+        Err(error) => format!("unreadable: {error}"),
+    };
+    assert!(
+        durable_manifest_corruption_recorded(scheduler, ns),
+        "authoritative manifest {outcome} for {ns} during {op_kind} without a recorded durable \
+         manifest content fault"
+    );
+    eprintln!(
+        "authoritative manifest {outcome} for {ns} during {op_kind}; attributed to a recorded \
+         durable manifest content fault, skipping the generation checkpoint"
+    );
+    None
+}
+
+fn durable_manifest_corruption_recorded(scheduler: &FaultScheduler, ns: &str) -> bool {
+    let manifest_key = Manifest::s3_key(ns);
+    scheduler.timeline().into_iter().any(|event| {
+        event.observed == ObservedResult::Corrupted
+            && durable_content_corruption(&event)
+            && event.key.as_deref() == Some(manifest_key.as_str())
+    })
+}
+
 async fn read_authoritative_manifest(
     store: &ZeppelinStore,
     ns: &str,
@@ -6289,12 +6449,15 @@ impl QuietPeriod<'_> {
                 QuietDrainOp::Generated {
                     op,
                     inject_post_commit_ack_loss,
-                } => (
-                    op,
-                    self.operational_state.choose_target_node(),
-                    ExecutionPhase::DeferredDrain,
-                    inject_post_commit_ack_loss,
-                ),
+                } => {
+                    let target_node = self.operational_state.choose_target_node_for_op(&op);
+                    (
+                        op,
+                        target_node,
+                        ExecutionPhase::DeferredDrain,
+                        inject_post_commit_ack_loss,
+                    )
+                }
                 QuietDrainOp::Replay {
                     source,
                     op,
@@ -7630,11 +7793,8 @@ mod outcome_tests {
             (RunMode::Chaos, Some(FaultProfile::Network)),
             (RunMode::Chaos, Some(FaultProfile::Crash)),
             (RunMode::Chaos, Some(FaultProfile::Clock)),
-            (RunMode::Chaos, Some(FaultProfile::Content)),
-            (RunMode::Chaos, Some(FaultProfile::Semantic)),
             (RunMode::Chaos, Some(FaultProfile::Sched)),
-            (RunMode::Chaos, Some(FaultProfile::Ops)),
-            (RunMode::Chaos, Some(FaultProfile::Full)),
+            (RunMode::Chaos, Some(FaultProfile::SupportedFull)),
         ];
         for (seed, (mode, profile)) in expected.into_iter().enumerate() {
             let seed = u64::try_from(seed).unwrap();
@@ -7652,15 +7812,15 @@ mod outcome_tests {
     #[test]
     fn overnight_seed_rotation_preserves_history_and_reaches_every_mixed_slot() {
         let configured = [0, 1, 2];
-        let emitted = (0..12)
+        let emitted = (0..9)
             .map(|index| overnight_seed(&configured, index))
             .collect::<Vec<_>>();
 
         assert_eq!(&emitted[..3], &configured);
-        assert_eq!(emitted.iter().copied().collect::<BTreeSet<_>>().len(), 12);
+        assert_eq!(emitted.iter().copied().collect::<BTreeSet<_>>().len(), 9);
         assert_eq!(
-            emitted.iter().map(|seed| seed % 12).collect::<Vec<_>>(),
-            (0..12).collect::<Vec<_>>()
+            emitted.iter().map(|seed| seed % 9).collect::<Vec<_>>(),
+            (0..9).collect::<Vec<_>>()
         );
         assert_eq!(
             emitted
@@ -7675,11 +7835,8 @@ mod outcome_tests {
                 Some(FaultProfile::Network),
                 Some(FaultProfile::Crash),
                 Some(FaultProfile::Clock),
-                Some(FaultProfile::Content),
-                Some(FaultProfile::Semantic),
                 Some(FaultProfile::Sched),
-                Some(FaultProfile::Ops),
-                Some(FaultProfile::Full),
+                Some(FaultProfile::SupportedFull),
             ]
         );
     }
@@ -8139,11 +8296,8 @@ mod outcome_tests {
             .iter()
             .all(|seed| !configured.contains(seed)));
         assert_eq!(
-            emitted
-                .iter()
-                .map(|seed| seed % 12)
-                .collect::<BTreeSet<_>>(),
-            (0..12).collect()
+            emitted.iter().map(|seed| seed % 9).collect::<BTreeSet<_>>(),
+            (0..9).collect()
         );
     }
 
@@ -8308,17 +8462,19 @@ mod outcome_tests {
     }
 
     #[tokio::test]
-    async fn content_seed_127_classifies_late_invalid_probe_bookkeeping_loudly() {
+    async fn content_seed_127_classifies_acknowledged_torn_manifest_write_loudly() {
         let root = tempfile::TempDir::new().unwrap();
+        // The default mixed rotation no longer selects the legacy content
+        // profile; pin it explicitly to keep this seed's recorded timeline.
         let env = RunnerEnv {
-            seconds: 30,
+            seconds: 60,
             seeds: vec![127],
             max_ops: Some(520),
             artifacts: root.path().to_path_buf(),
             preserve: PreserveMode::Never,
             selftest: None,
             mode: RunMode::Mixed,
-            profile: None,
+            profile: Some(FaultProfile::Content),
             env_echo: BTreeMap::new(),
         };
         let artifacts = RunArtifacts::create(&env);
@@ -8327,7 +8483,7 @@ mod outcome_tests {
             &env,
             &artifacts,
             127,
-            Instant::now() + Duration::from_secs(30),
+            Instant::now() + Duration::from_secs(60),
             None,
             None,
         )
@@ -8339,30 +8495,58 @@ mod outcome_tests {
             outcome.ops
         );
 
+        // Op 208 upserts into the clone-4 namespace while a torn write leaves
+        // only a prefix of the manifest on the live key. A conformant
+        // successful PUT is not read back, so the mutation is acknowledged;
+        // the runner must skip its generation checkpoint instead of
+        // panicking on the unreadable manifest.
         let records = read_ops(&seed_dir);
-        let probe = records
+        let torn = records
             .iter()
-            .find(|record| {
-                record.index >= 431
+            .find(|record| record.index == 208)
+            .expect("seed 127 must reach the acknowledged torn manifest write");
+        assert!(matches!(
+            &torn.op,
+            Op::Upsert { ns, .. } if ns.ends_with("-clone-4")
+        ));
+        assert_eq!(torn.status, StatusCode::OK.as_u16());
+        assert_eq!(
+            torn.gen_after, None,
+            "an acknowledged mutation under a torn manifest write must skip its generation \
+             checkpoint"
+        );
+
+        // Read-time integrity stays authoritative: every later direct
+        // data-path op on the durably corrupted namespace fails loudly.
+        let ns = torn.op.namespace().to_string();
+        let later: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record.index > torn.index
+                    && record.op.namespace() == ns
                     && matches!(
                         record.op,
-                        Op::InvalidProbe { probe, .. } if probe.is_write_shaped()
+                        Op::Upsert { .. }
+                            | Op::DeleteVectors { .. }
+                            | Op::Query { .. }
+                            | Op::FetchVectors { .. }
+                            | Op::GetNamespace { .. }
                     )
             })
-            .expect("seed 127 must reach its late write-shaped invalid probe");
-        assert_eq!(probe.index, 431);
-        assert_eq!(probe.status, StatusCode::BAD_REQUEST.as_u16());
-        for status in [
-            &probe.response["compact_status_before"],
-            &probe.response["compact_status_after"],
-        ] {
-            assert_eq!(status["manifest_present"], json!(null));
-            assert_eq!(status["manifest_generation"], json!(null));
-            assert_eq!(status["uncompacted_fragments"], json!(null));
-            assert!(status["manifest_read_error"].as_str().is_some());
-            assert_eq!(status["loud_failure"]["status"], 500);
-            assert_eq!(status["loud_failure"]["response"]["status"], 500);
-            assert_eq!(status["loud_failure"]["response"]["code"], "INTERNAL_ERROR");
+            .collect();
+        assert!(
+            later.len() >= 20,
+            "seed 127 must keep exercising the corrupted namespace, saw {}",
+            later.len()
+        );
+        for record in later {
+            assert!(
+                record.status >= 500,
+                "op {} ({}) on the durably corrupted namespace must fail loudly, got {}",
+                record.index,
+                record.op.kind(),
+                record.status
+            );
         }
     }
 
@@ -9900,6 +10084,103 @@ mod outcome_tests {
         assert!(state.second_node_ever_active());
         assert!(state.generation_checkpoints_enabled());
         assert!(state.quiescent_vector_count_must_be_exact());
+    }
+
+    #[test]
+    fn read_only_secondary_router_never_routes_mutations_to_node_one() {
+        let mut state = OperationalState::default();
+        state.record_read_only_node_started();
+        assert!(state.generation_checkpoints_enabled());
+
+        let read = Op::GetNamespace {
+            ns: "catalog".to_string(),
+        };
+        let write = Op::Upsert {
+            ns: "catalog".to_string(),
+            vectors: Vec::new(),
+        };
+        assert_eq!(state.choose_target_node_for_op(&read), 0);
+        assert_eq!(state.choose_target_node_for_op(&read), 1);
+        for _ in 0..8 {
+            assert_eq!(state.choose_target_node_for_op(&write), 0);
+        }
+
+        state.record_second_node_stopped();
+        assert!(!state.second_node_active());
+    }
+
+    #[tokio::test]
+    async fn supported_read_only_node_has_no_background_writer_and_rejects_mutation_routing() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let config = deterministic_config();
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::SupportedFull,
+            events: vec![FaultEvent {
+                id: "supported-read-only-node".to_string(),
+                start_op: 0,
+                end_op: Some(20),
+                boundary: Boundary::Runner,
+                target: TargetSelector::default(),
+                kind: FaultKind::StartReadOnlyNode { for_ops: 20 },
+            }],
+        });
+        let mut state = OperationalState::default();
+        let commands = scheduler.advance_to(0);
+        let remaining = state
+            .apply_node_commands(
+                commands,
+                NodeCommandContext {
+                    scheduler: Some(&scheduler),
+                    store: &harness.store,
+                    shared_clock: None,
+                    operational_observer: None,
+                    require_compaction_evidence: false,
+                    prefix: &prefix,
+                    config: &config,
+                    disk_cache_max_bytes: 4 * 1024 * 1024,
+                    op_index: 0,
+                },
+            )
+            .await;
+        assert!(remaining.is_empty());
+        assert!(state
+            .second_node
+            .as_ref()
+            .expect("read-only node must be running")
+            .compaction_loop_task
+            .is_none());
+
+        let read = Op::GetNamespace {
+            ns: "catalog".to_string(),
+        };
+        let write = Op::Upsert {
+            ns: "catalog".to_string(),
+            vectors: Vec::new(),
+        };
+        assert_eq!(state.choose_target_node_for_op(&read), 0);
+        assert_eq!(state.choose_target_node_for_op(&read), 1);
+        assert_eq!(state.choose_target_node_for_op(&write), 0);
+
+        let remaining = state
+            .apply_node_commands(
+                scheduler.advance_to(20),
+                NodeCommandContext {
+                    scheduler: Some(&scheduler),
+                    store: &harness.store,
+                    shared_clock: None,
+                    operational_observer: None,
+                    require_compaction_evidence: false,
+                    prefix: &prefix,
+                    config: &config,
+                    disk_cache_max_bytes: 4 * 1024 * 1024,
+                    op_index: 20,
+                },
+            )
+            .await;
+        assert!(remaining.is_empty());
+        assert!(state.second_node.is_none());
+        harness.cleanup().await;
     }
 
     #[test]

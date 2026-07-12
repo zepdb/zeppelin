@@ -128,12 +128,13 @@ async fn smoke() {
     );
 
     println!(
-        "adversarial smoke: seeds={} ops={} compactions={} background_compactions={} failed={} ops/sec={:.2}",
+        "adversarial smoke: seeds={} ops={} compactions={} background_compactions={} failed={} non_blocking_findings={} ops/sec={:.2}",
         summary.seeds_run,
         summary.ops_total,
         summary.compactions_total,
         summary.background_compactions_total,
         summary.failed_seeds,
+        summary.non_blocking_findings,
         summary.ops_per_sec
     );
 }
