@@ -658,18 +658,17 @@ impl FaultScheduler {
                     FaultKind::ResourceExhaustion {
                         max_concurrent_queries,
                         disk_cache_max_bytes,
-                    } if op_index == event.start_op => {
-                        if runtime
+                    } if op_index == event.start_op
+                        && runtime
                             .fired
                             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                            .is_ok()
-                        {
-                            commands.push(SchedulerCommand::ResourceExhaustion {
-                                event_id: event.id.clone(),
-                                max_concurrent_queries,
-                                disk_cache_max_bytes,
-                            });
-                        }
+                            .is_ok() =>
+                    {
+                        commands.push(SchedulerCommand::ResourceExhaustion {
+                            event_id: event.id.clone(),
+                            max_concurrent_queries,
+                            disk_cache_max_bytes,
+                        });
                     }
                     _ => {}
                 }
