@@ -16,9 +16,10 @@ RUN apt-get update && \
 COPY Cargo.toml Cargo.lock ./
 
 # Create dummy sources to build dependencies as a cached layer
-RUN mkdir -p src benches && \
+RUN mkdir -p src/bin benches && \
     echo "fn main() {}" > src/main.rs && \
     echo "" > src/lib.rs && \
+    echo "fn main() {}" > src/bin/quant_bakeoff.rs && \
     echo "fn main() {}" > benches/core_benchmarks.rs && \
     cargo build --release ${FEATURES:+--features $FEATURES} && \
     rm -rf src benches

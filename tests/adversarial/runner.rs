@@ -8462,7 +8462,105 @@ mod outcome_tests {
     }
 
     #[tokio::test]
-    async fn content_seed_127_classifies_acknowledged_torn_manifest_write_loudly() {
+    async fn acknowledged_torn_manifest_put_skips_generation_and_fails_loudly() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let namespace = format!("{prefix}-acknowledged-torn-manifest");
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let client = adversarial_client();
+        let setup_server = start_test_server_full(
+            harness.store.clone(),
+            Some(prefix.clone()),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+        let create = client
+            .post(format!("{}/v1/namespaces", setup_server.base_url))
+            .json(&spec.create_body(&namespace))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        setup_server.shutdown().await;
+
+        let manifest_key = Manifest::s3_key(&namespace);
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Content,
+            events: vec![FaultEvent {
+                id: "focused-torn-manifest".to_string(),
+                start_op: 1,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Put),
+                    key_substring: Some(manifest_key.clone()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(ContentFault::TornWrite { keep_bytes: 30 }),
+            }],
+        });
+        let faulted_store = store_fault_proxy(&harness.store, scheduler.clone());
+        let server = start_test_server_full(
+            faulted_store,
+            Some(prefix),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+        assert!(scheduler.advance_to(1).is_empty());
+
+        let upsert = client
+            .post(format!(
+                "{}/v1/namespaces/{namespace}/vectors",
+                server.base_url
+            ))
+            .json(&json!({
+                "vectors": [{ "id": "one", "values": [1.0, 0.0] }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upsert.status(), StatusCode::OK);
+        assert_eq!(
+            tainted_aware_authoritative_generation(
+                &harness.store,
+                &scheduler,
+                &namespace,
+                "upsert"
+            )
+            .await,
+            None
+        );
+        assert!(Manifest::read(&harness.store, &namespace).await.is_err());
+
+        let get = client
+            .get(format!("{}/v1/namespaces/{namespace}", server.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let timeline = scheduler.timeline();
+        assert_eq!(timeline.len(), 1, "{timeline:#?}");
+        assert_eq!(timeline[0].key.as_deref(), Some(manifest_key.as_str()));
+        assert_eq!(timeline[0].semantics, FaultSemantics::PostCommit);
+        assert_eq!(timeline[0].observed, ObservedResult::Corrupted);
+
+        server.shutdown().await;
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn content_seed_127_classifies_durable_torn_manifest_loudly() {
         let root = tempfile::TempDir::new().unwrap();
         // The default mixed rotation no longer selects the legacy content
         // profile; pin it explicitly to keep this seed's recorded timeline.
@@ -8495,34 +8593,38 @@ mod outcome_tests {
             outcome.ops
         );
 
-        // Op 208 upserts into the clone-4 namespace while a torn write leaves
-        // only a prefix of the manifest on the live key. A conformant
-        // successful PUT is not read back, so the mutation is acknowledged;
-        // the runner must skip its generation checkpoint instead of
-        // panicking on the unreadable manifest.
-        let records = read_ops(&seed_dir);
-        let torn = records
-            .iter()
-            .find(|record| record.index == 208)
-            .expect("seed 127 must reach the acknowledged torn manifest write");
-        assert!(matches!(
-            &torn.op,
-            Op::Upsert { ns, .. } if ns.ends_with("-clone-4")
-        ));
-        assert_eq!(torn.status, StatusCode::OK.as_u16());
-        assert_eq!(
-            torn.gen_after, None,
-            "an acknowledged mutation under a torn manifest write must skip its generation \
-             checkpoint"
-        );
+        // Attribute the durable corruption to the exact persisted timeline
+        // event. On slower targets the background compactor can consume this
+        // store-fault window concurrently with the foreground operation, so
+        // a hard-coded operation record does not prove ownership of the PUT.
+        let timeline = fs::read_to_string(seed_dir.join("timeline.jsonl")).unwrap();
+        let torn = timeline
+            .lines()
+            .map(|line| serde_json::from_str::<TimelineEvent>(line).unwrap())
+            .find(|event| {
+                event.action.starts_with("Content(TornWrite")
+                    && event
+                        .key
+                        .as_deref()
+                        .is_some_and(|key| key.ends_with("/manifest.json"))
+            })
+            .expect("seed 127 must persist one torn live manifest write");
+        assert_eq!(torn.semantics, FaultSemantics::PostCommit);
+        assert_eq!(torn.observed, ObservedResult::Corrupted);
+        let ns = torn
+            .key
+            .as_deref()
+            .and_then(|key| key.strip_suffix("/manifest.json"))
+            .expect("torn live-manifest key must contain its namespace")
+            .to_string();
 
         // Read-time integrity stays authoritative: every later direct
         // data-path op on the durably corrupted namespace fails loudly.
-        let ns = torn.op.namespace().to_string();
+        let records = read_ops(&seed_dir);
         let later: Vec<_> = records
             .iter()
             .filter(|record| {
-                record.index > torn.index
+                record.index > torn.op_index
                     && record.op.namespace() == ns
                     && matches!(
                         record.op,
