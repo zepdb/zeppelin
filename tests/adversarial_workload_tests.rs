@@ -200,6 +200,9 @@ async fn inspect() {
 #[tokio::test]
 #[ignore]
 async fn overnight() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     let env = adversarial::RunnerEnv::from_env();
     let summary = adversarial::runner::run_overnight(env).await;
     println!(

@@ -444,6 +444,16 @@ impl Model {
                 }
             }
             Op::DeleteNamespace { ns } => {
+                // Once deletion is acknowledged, any earlier ambiguous clone
+                // into this name can no longer affect the current namespace.
+                for model in self.namespaces.values_mut() {
+                    model.indeterminate_ns.retain(|entry| {
+                        !matches!(
+                            entry,
+                            NsIndeterminate::MaybeCloned { target, .. } if target == ns
+                        )
+                    });
+                }
                 self.namespaces.remove(ns);
             }
             Op::GetNamespace { .. }
@@ -909,11 +919,19 @@ pub fn model_distance(metric: DistanceMetric, query: &[f32], values: &[f32]) -> 
                 delta * delta
             })
             .sum(),
-        DistanceMetric::DotProduct => -query
-            .iter()
-            .zip(values.iter())
-            .map(|(left, right)| left * right)
-            .sum::<f32>(),
+        DistanceMetric::DotProduct => {
+            // Keep the independent oracle close to the mathematical dot
+            // product when large positive and negative terms cancel. The
+            // production SIMD kernel uses fused lane accumulators, so a
+            // sequential f32 sum can otherwise exceed the score epsilon even
+            // when the SIMD result is more accurate.
+            let dot = query
+                .iter()
+                .zip(values.iter())
+                .map(|(left, right)| f64::from(*left) * f64::from(*right))
+                .sum::<f64>();
+            (-dot) as f32
+        }
     }
 }
 
@@ -1339,6 +1357,37 @@ mod tests {
         assert!(model.namespaces[&target].live.is_empty());
     }
 
+    #[test]
+    fn acknowledged_delete_discards_stale_ambiguous_clone_for_target() {
+        let (mut model, source) = model_with_old_record();
+        let target = "deleted-after-ambiguous-clone".to_string();
+        model.apply_outcome(
+            &Op::CloneNamespace {
+                source: source.clone(),
+                target: target.clone(),
+                as_of: AsOfTarget::Generation(1),
+            },
+            &ambiguous_500(),
+            None,
+            None,
+            11,
+        );
+
+        model.apply_outcome(
+            &Op::DeleteNamespace { ns: target.clone() },
+            &OpOutcome::Applied {
+                status: 202,
+                response: json!({ "state": "deleting" }),
+            },
+            None,
+            None,
+            12,
+        );
+
+        assert!(model.namespaces[&source].indeterminate_ns.is_empty());
+        assert!(!model.namespaces.contains_key(&target));
+    }
+
     fn model_with_old_record() -> (Model, String) {
         let ns = "model-indeterminate-upsert".to_string();
         let mut model = Model::default();
@@ -1369,6 +1418,36 @@ mod tests {
             reason: AmbiguityReason::ServerError { status: 500 },
             status: Some(500),
         }
+    }
+
+    #[test]
+    fn dot_product_oracle_tolerates_simd_cancellation_roundoff() {
+        let query = [
+            -8.485_296,
+            -2.766_533,
+            2.628_774_6,
+            2.995_348,
+            5.815_317,
+            5.142_996,
+            -5.691_175_5,
+            -6.800_945,
+        ];
+        let values = [
+            -9.700_434,
+            -0.048_616_41,
+            -6.996_844,
+            3.436_107_6,
+            6.458_679,
+            -9.173_274,
+            0.962_707_5,
+            8.716_183,
+        ];
+        let production_score = 0.031_295_776;
+
+        assert!(score_close(
+            production_score,
+            model_distance(DistanceMetric::DotProduct, &query, &values)
+        ));
     }
 
     #[tokio::test]
@@ -1428,10 +1507,14 @@ mod tests {
             let response: serde_json::Value = client
                 .post(format!("{base_url}/v1/namespaces/{ns}/query"))
                 .json(&json!({
-                    "vector": query_vector,
                     "top_k": 3,
                     "candidate_k": 3,
-                    "nprobe": 1,
+                    "sources": [{
+                        "type": "ann",
+                        "vector": query_vector,
+                        "nprobe": 1
+                    }],
+                    "fusion": { "type": "none" },
                     "consistency": "strong",
                     "include_attributes": true
                 }))
@@ -1441,7 +1524,9 @@ mod tests {
                 .json()
                 .await
                 .unwrap();
-            for result in response["results"].as_array().unwrap() {
+            for result in response["results"].as_array().unwrap_or_else(|| {
+                panic!("distance query response missing results for {metric:?}: {response}")
+            }) {
                 let id = result["id"].as_str().unwrap();
                 let values = vectors
                     .iter()

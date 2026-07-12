@@ -2443,7 +2443,14 @@ mod tests {
         });
         let _ = scheduler.advance_to(5);
         let faulted = store_fault_proxy(&inner, scheduler.clone());
-        let mut held = tokio::spawn(async move { faulted.get("ns/manifest.json").await });
+        let armed_scheduler = scheduler.clone();
+        let mut held = tokio::spawn(async move {
+            armed_scheduler
+                .with_armed_hold("sched-00".to_string(), async move {
+                    faulted.get("ns/manifest.json").await
+                })
+                .await
+        });
 
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut held)
@@ -2496,7 +2503,14 @@ mod tests {
         });
         let _ = scheduler.advance_to(2);
         let faulted = store_fault_proxy(&inner, scheduler.clone());
-        let mut held = tokio::spawn(async move { faulted.list_prefix("ns/").await });
+        let armed_scheduler = scheduler.clone();
+        let mut held = tokio::spawn(async move {
+            armed_scheduler
+                .with_armed_hold("sched-list".to_string(), async move {
+                    faulted.list_prefix("ns/").await
+                })
+                .await
+        });
 
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut held)

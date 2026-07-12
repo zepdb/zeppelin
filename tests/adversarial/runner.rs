@@ -107,6 +107,7 @@ struct OperationalState {
     next_target_node: u8,
     second_node_active: bool,
     second_node_ever_active: bool,
+    writable_second_node_ever_active: bool,
     second_node_read_only: bool,
 }
 
@@ -139,6 +140,7 @@ impl OperationalState {
         );
         self.second_node_active = true;
         self.second_node_ever_active = true;
+        self.writable_second_node_ever_active = true;
         self.second_node_read_only = false;
     }
 
@@ -171,7 +173,7 @@ impl OperationalState {
     }
 
     fn quiescent_vector_count_must_be_exact(&self) -> bool {
-        self.second_node_ever_active()
+        self.writable_second_node_ever_active
     }
 
     fn generation_checkpoints_enabled(&self) -> bool {
@@ -496,17 +498,25 @@ impl OperationalState {
                     let mut completed = 0usize;
                     let mut successful = 0usize;
                     let mut load_shed = 0usize;
+                    let mut storage_faulted = 0usize;
+                    let read_partition_active = scheduler
+                        .is_some_and(|scheduler| scheduler.global_read_partition_active(op_index));
                     while let Some(result) = tasks.join_next().await {
                         let (target_node, ns, status, response) =
                             result.expect("operational query task panicked");
+                        let expected_storage_fault = read_partition_active
+                            && is_expected_partitioned_cache_fill_response(status, &response);
                         assert!(
-                            is_expected_cache_fill_response(status, &response),
+                            is_expected_cache_fill_response(status, &response)
+                                || expected_storage_fault,
                             "operational cache-fill query failed for {ns}: \
                              status={status} response={response}"
                         );
                         completed += 1;
                         if (200..300).contains(&status) {
                             successful += 1;
+                        } else if expected_storage_fault {
+                            storage_faulted += 1;
                         } else {
                             load_shed += 1;
                         }
@@ -524,7 +534,8 @@ impl OperationalState {
                         FaultSemantics::WindowEnd,
                         Some(format!(
                             "completed={completed} successful={successful} \
-                             load_shed={load_shed} nodes={served:?}"
+                             load_shed={load_shed} storage_faulted={storage_faulted} \
+                             nodes={served:?}"
                         )),
                     );
                 }
@@ -700,6 +711,26 @@ fn is_expected_cache_fill_response(status: u16, response: &serde_json::Value) ->
         return false;
     };
     object.get("code").and_then(serde_json::Value::as_str) == Some("CONCURRENCY_LIMIT")
+        && object.get("status").and_then(serde_json::Value::as_u64) == Some(u64::from(status))
+        && object.get("retryable").and_then(serde_json::Value::as_bool) == Some(true)
+        && object
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|error| !error.is_empty())
+        && object
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|request_id| !request_id.is_empty())
+}
+
+fn is_expected_partitioned_cache_fill_response(status: u16, response: &serde_json::Value) -> bool {
+    if status != StatusCode::INTERNAL_SERVER_ERROR.as_u16() {
+        return false;
+    }
+    let Some(object) = response.as_object() else {
+        return false;
+    };
+    object.get("code").and_then(serde_json::Value::as_str) == Some("STORAGE_ERROR")
         && object.get("status").and_then(serde_json::Value::as_u64) == Some(u64::from(status))
         && object.get("retryable").and_then(serde_json::Value::as_bool) == Some(true)
         && object
@@ -1997,6 +2028,15 @@ fn config_for_mode(mode: RunMode, seed: u64, schedule: Option<&FaultSchedule>) -
         config.compaction.max_wal_fragments_before_compact = 2;
         config.compaction.max_old_segments = 0;
     }
+    if mode == RunMode::Chaos {
+        // Background GC overlaps foreground WAL publication in chaos runs. A
+        // zero horizon can delete a newly listed WAL between the sweep's
+        // manifest re-read and the writer's successful manifest CAS.
+        config.gc.horizon_secs = config
+            .gc_horizon_floor_secs()
+            .expect("adversarial GC horizon floor must not overflow");
+        config.gc.allow_unsafe_short_horizon = false;
+    }
     config
 }
 
@@ -2022,11 +2062,25 @@ fn test_clock_for_scheduler(scheduler: Option<&FaultScheduler>) -> Option<Arc<Te
             scheduler.schedule().events.iter().any(|event| {
                 matches!(
                     event.kind,
-                    FaultKind::ClockJump { .. } | FaultKind::ClockFreeze { .. }
+                    FaultKind::ClockJump { .. }
+                        | FaultKind::ClockFreeze { .. }
+                        | FaultKind::CrashAt { .. }
                 ) || event.id == DUAL_WRITER_LEASE_HOLD_EVENT_ID
             })
         })
         .then(|| Arc::new(TestClock::default()))
+}
+
+fn advance_quiescence_clock_past_lease(clock: &TestClock, config: &Config) -> i64 {
+    let advance_ms = config
+        .compaction
+        .lease_duration_secs
+        .checked_add(1)
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .and_then(|millis| i64::try_from(millis).ok())
+        .expect("compaction lease duration must fit a signed millisecond clock jump");
+    clock.jump(advance_ms);
+    advance_ms
 }
 
 fn injected_clock(test_clock: Option<&Arc<TestClock>>) -> Option<Clock> {
@@ -3012,10 +3066,10 @@ async fn run_seed(
             &mut deferred_ops,
             generation_budget,
             || sanitize_op_for_mode(generator.next(&model), mode),
-            |op| {
+            |op, deferred| {
                 pending.is_some_and(|pending| {
                     op_conflicts_with_pending_hold(op, op_index, scheduler.as_ref(), pending)
-                })
+                }) || op_awaits_store_fault_window_close(op, op_index, scheduler.as_ref(), deferred)
             },
         ) else {
             if let Some(pending) = pending_held_op.as_mut() {
@@ -3025,24 +3079,22 @@ async fn run_seed(
                 );
                 pending.release_op = op_index;
                 pending.release_cause = HoldReleaseCause::Quiesce;
-                let mut ack_loss_reserved = post_commit_ack_loss_fired;
-                for (offset, op) in deferred_ops.drain(..).enumerate() {
-                    let index = op_index
-                        .checked_add(
-                            u64::try_from(offset).expect("deferred drain offset must fit in u64"),
-                        )
-                        .expect("deferred drain operation index overflowed");
-                    assert_recorded_op_matches(recorded_ops.as_deref(), seed, index, &op);
-                    let inject_post_commit_ack_loss = post_commit_selftest
-                        && !ack_loss_reserved
-                        && matches!(op, Op::Upsert { .. });
-                    ack_loss_reserved |= inject_post_commit_ack_loss;
-                    quiet_drain_ops.push_back(QuietDrainOp::Generated {
-                        op,
-                        inject_post_commit_ack_loss,
-                    });
-                }
-                break;
+            }
+            let mut ack_loss_reserved = post_commit_ack_loss_fired;
+            for (offset, op) in deferred_ops.drain(..).enumerate() {
+                let index = op_index
+                    .checked_add(
+                        u64::try_from(offset).expect("deferred drain offset must fit in u64"),
+                    )
+                    .expect("deferred drain operation index overflowed");
+                assert_recorded_op_matches(recorded_ops.as_deref(), seed, index, &op);
+                let inject_post_commit_ack_loss =
+                    post_commit_selftest && !ack_loss_reserved && matches!(op, Op::Upsert { .. });
+                ack_loss_reserved |= inject_post_commit_ack_loss;
+                quiet_drain_ops.push_back(QuietDrainOp::Generated {
+                    op,
+                    inject_post_commit_ack_loss,
+                });
             }
             break;
         };
@@ -3725,8 +3777,14 @@ async fn begin_dual_writer_lease_hold(
 
     let node_a_namespace = namespace.to_string();
     let stale_fencing_token = node_a_lease.fencing_token;
+    let armed_scheduler = scheduler.clone();
+    let hold_event_id = hold.event_id.clone();
     let node_a_renew = tokio::spawn(async move {
-        renew_or_observe_takeover(&node_a_manager, &node_a_namespace, &node_a_lease).await
+        armed_scheduler
+            .with_armed_hold(hold_event_id, async move {
+                renew_or_observe_takeover(&node_a_manager, &node_a_namespace, &node_a_lease).await
+            })
+            .await
     });
     let active = scheduler
         .wait_for_hold_window_active(DUAL_WRITER_LEASE_HOLD_EVENT_ID, hold.window_op)
@@ -3883,6 +3941,10 @@ fn op_conflicts_with_held_namespace(op: &Op, held_namespace: &str) -> bool {
     op.namespace() == held_namespace
 }
 
+fn op_can_run_while_hold_is_pending(op: &Op, held_namespace: &str) -> bool {
+    !op.is_mutating() && !op_conflicts_with_held_namespace(op, held_namespace)
+}
+
 fn foreground_hold_for_op(
     scheduler: Option<&FaultScheduler>,
     op: &Op,
@@ -3910,15 +3972,44 @@ fn op_conflicts_with_pending_hold(
     scheduler: Option<&FaultScheduler>,
     pending: &PendingHeldOp,
 ) -> bool {
-    op_conflicts_with_held_namespace(op, &pending.namespace)
+    !op_can_run_while_hold_is_pending(op, &pending.namespace)
         || foreground_hold_for_op_excluding(scheduler, op, op_index, Some(&pending.event_id))
             .is_some()
+}
+
+/// A namespace delete waits in-op until the purge converges to 404, so its
+/// logical index cannot advance past a scheduled object-store fault window
+/// that keeps failing purge deletes — the window can only close when the op
+/// index moves. Defer the delete, and every later op touching the same
+/// namespace (notably the scripted recreate), until the window has passed.
+fn op_awaits_store_fault_window_close(
+    op: &Op,
+    op_index: u64,
+    scheduler: Option<&FaultScheduler>,
+    deferred: &VecDeque<Op>,
+) -> bool {
+    let Some(scheduler) = scheduler else {
+        return false;
+    };
+    if let Op::DeleteNamespace { ns } = op {
+        if scheduler.scheduled_store_fault_window_active(op_index) {
+            return true;
+        }
+        return deferred_namespace_delete_targets(deferred, ns);
+    }
+    deferred_namespace_delete_targets(deferred, op.namespace())
+}
+
+fn deferred_namespace_delete_targets(deferred: &VecDeque<Op>, namespace: &str) -> bool {
+    deferred
+        .iter()
+        .any(|pending| matches!(pending, Op::DeleteNamespace { ns } if ns == namespace))
 }
 
 fn next_fifo_deferred_op<G, C>(deferred: &mut VecDeque<Op>, mut generate: G, mut conflicts: C) -> Op
 where
     G: FnMut() -> Op,
-    C: FnMut(&Op) -> bool,
+    C: FnMut(&Op, &VecDeque<Op>) -> bool,
 {
     next_fifo_deferred_op_with_budget(deferred, 10_000, &mut generate, &mut conflicts)
         .unwrap_or_else(|| {
@@ -3934,9 +4025,10 @@ fn next_fifo_deferred_op_with_budget<G, C>(
 ) -> Option<Op>
 where
     G: FnMut() -> Op,
-    C: FnMut(&Op) -> bool,
+    C: FnMut(&Op, &VecDeque<Op>) -> bool,
 {
-    if deferred.front().is_some_and(|op| !conflicts(op)) {
+    let front_runnable = deferred.front().is_some_and(|op| !conflicts(op, deferred));
+    if front_runnable {
         return Some(
             deferred
                 .pop_front()
@@ -3947,7 +4039,7 @@ where
     let attempts = generation_budget.min(10_000);
     for _ in 0..attempts {
         let op = generate();
-        if conflicts(&op) {
+        if conflicts(&op, deferred) {
             deferred.push_back(op);
         } else {
             return Some(op);
@@ -4303,20 +4395,29 @@ async fn execute_hold_candidate(
         unresolved_create_allows_missing_manifest_bookkeeping(model, &provisional_op);
     let event_id = hold.event_id.clone();
     let namespace = op.namespace().to_string();
-    let mut task = tokio::spawn(execute_raw_recorded_op(
-        client,
-        target,
-        op,
-        index,
-        started,
-        mode,
-        generation_checkpoints_enabled,
-        target_node,
-        http_fault_context,
-        allow_missing_manifest_bookkeeping,
-        durably_tainted_keys,
-        inject_post_commit_ack_loss,
-    ));
+    let armed_scheduler = scheduler.clone();
+    let armed_event_id = event_id.clone();
+    let mut task = tokio::spawn(async move {
+        armed_scheduler
+            .with_armed_hold(
+                armed_event_id,
+                execute_raw_recorded_op(
+                    client,
+                    target,
+                    op,
+                    index,
+                    started,
+                    mode,
+                    generation_checkpoints_enabled,
+                    target_node,
+                    http_fault_context,
+                    allow_missing_manifest_bookkeeping,
+                    durably_tainted_keys,
+                    inject_post_commit_ack_loss,
+                ),
+            )
+            .await
+    });
     tokio::select! {
         joined = &mut task => HoldCandidateOutcome::Completed(Box::new(
             joined.unwrap_or_else(|error| {
@@ -6068,6 +6169,7 @@ async fn wait_compaction_ready(client: &Client, base_url: &str, ns: &str) -> ser
 }
 
 async fn wait_namespace_gone(client: &Client, base_url: &str, ns: &str) {
+    let mut last_status = None;
     for _ in 0..300 {
         let response = client
             .get(format!("{base_url}/v1/namespaces/{ns}"))
@@ -6076,12 +6178,18 @@ async fn wait_namespace_gone(client: &Client, base_url: &str, ns: &str) {
             .unwrap_or_else(|error| panic!("namespace delete poll failed for {ns}: {error}"));
         match response.status() {
             StatusCode::NOT_FOUND => return,
-            StatusCode::OK | StatusCode::GONE | StatusCode::ACCEPTED => {}
+            status @ (StatusCode::OK | StatusCode::GONE | StatusCode::ACCEPTED) => {
+                last_status = Some(status);
+            }
             status => panic!("unexpected namespace delete poll status for {ns}: {status}"),
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("namespace {ns} did not reach 404 after delete");
+    panic!(
+        "namespace {ns} did not reach 404 after delete; last poll status={:?} \
+         (purge may be blocked by an active store fault window)",
+        last_status
+    );
 }
 
 async fn execute_sandwich_maintenance(
@@ -6599,6 +6707,9 @@ impl QuietPeriod<'_> {
         let misdirected_recovery =
             restore_misdirected_write_artifacts(&self.server.store, self.scheduler, self.mutation)
                 .await;
+        let quiescence_clock_advance_ms = self
+            .test_clock
+            .map(|clock| advance_quiescence_clock_past_lease(clock, self.config));
         push_quiet_event(
             &mut timeline,
             self.scheduler,
@@ -6608,9 +6719,13 @@ impl QuietPeriod<'_> {
             Boundary::Runner,
             "stop-background",
             ObservedResult::DefiniteApplied,
-            Some(format!(
-                "background compaction joined; {misdirected_recovery}"
-            )),
+            Some(match quiescence_clock_advance_ms {
+                Some(advance_ms) => format!(
+                    "background compaction joined; {misdirected_recovery}; \
+                     test clock advanced {advance_ms}ms past stale lease lifetime"
+                ),
+                None => format!("background compaction joined; {misdirected_recovery}"),
+            }),
         );
 
         let verify = self.verify && violations.is_empty();
@@ -7778,6 +7893,7 @@ mod outcome_tests {
     use axum::{Json, Router};
     use object_store::memory::InMemory;
     use zeppelin::index::quantization::QuantizationType;
+    use zeppelin::time::TimeSource;
     use zeppelin::types::DistanceMetric;
 
     use super::*;
@@ -7806,6 +7922,29 @@ mod outcome_tests {
         assert_eq!(
             effective_seed_assignment(RunMode::Mixed, Some(FaultProfile::Content), 0).profile,
             Some(FaultProfile::Content)
+        );
+    }
+
+    #[test]
+    fn crash_schedule_quiescence_clock_outlives_a_stranded_compaction_lease() {
+        let scheduler = FaultScheduler::for_seed(149, FaultProfile::Crash);
+        let clock = test_clock_for_scheduler(Some(&scheduler))
+            .expect("crash schedules need a shared clock for quiescence recovery");
+        let config = deterministic_config();
+        let before = clock.now();
+
+        let advance_ms = advance_quiescence_clock_past_lease(&clock, &config);
+
+        assert_eq!(
+            advance_ms,
+            i64::try_from((config.compaction.lease_duration_secs + 1) * 1_000).unwrap()
+        );
+        assert!(
+            clock.now()
+                > before
+                    + chrono::Duration::seconds(
+                        i64::try_from(config.compaction.lease_duration_secs).unwrap(),
+                    )
         );
     }
 
@@ -8445,20 +8584,27 @@ mod outcome_tests {
             }
         ));
         assert_eq!(probe.status, StatusCode::BAD_REQUEST.as_u16());
-        let missing = json!({
-            "manifest_present": false,
-            "manifest_generation": null,
-            "uncompacted_fragments": null,
+        let recovered = json!({
+            "namespace": probe.op.namespace(),
+            "manifest_generation": 4,
+            "ready": false,
+            "uncompacted_fragments": 3,
+            "segment_count": 0,
+            "active_segment": null,
+            "active_segment_vector_count": 0,
         });
-        assert_eq!(probe.response["compact_status_before"], missing);
-        assert_eq!(probe.response["compact_status_after"], missing);
+        assert_eq!(probe.response["compact_status_before"], recovered);
+        assert_eq!(probe.response["compact_status_after"], recovered);
 
         let resolutions = fs::read_to_string(seed_dir.join("resolutions.json")).unwrap();
         let resolutions: Vec<serde_json::Value> = serde_json::from_str(&resolutions).unwrap();
-        assert!(resolutions.iter().any(|resolution| {
-            resolution["effect"] == "maybe_created_namespace"
-                && resolution["resolved"] == "not_applied"
-        }));
+        assert!(
+            resolutions.iter().any(|resolution| {
+                resolution["effect"] == "maybe_created_namespace"
+                    && resolution["resolved"] == "applied"
+            }),
+            "{resolutions:#?}"
+        );
     }
 
     #[tokio::test]
@@ -8869,6 +9015,24 @@ mod outcome_tests {
     }
 
     #[test]
+    fn pending_hold_advances_with_reads_but_never_with_another_mutation() {
+        let held_read = Op::GetNamespace {
+            ns: "held".to_string(),
+        };
+        let other_read = Op::GetNamespace {
+            ns: "other".to_string(),
+        };
+        let other_mutation = Op::DeleteVectors {
+            ns: "other".to_string(),
+            ids: vec!["one".to_string()],
+        };
+
+        assert!(!op_can_run_while_hold_is_pending(&held_read, "held"));
+        assert!(op_can_run_while_hold_is_pending(&other_read, "held"));
+        assert!(!op_can_run_while_hold_is_pending(&other_mutation, "held"));
+    }
+
+    #[test]
     fn sched_fifo_deferral_preserves_every_baseline_generated_operation() {
         fn upsert(ns: &str, id: &str) -> Op {
             Op::Upsert {
@@ -8902,14 +9066,14 @@ mod outcome_tests {
             scheduled.push(next_fifo_deferred_op(
                 &mut deferred,
                 || generated.pop_front().expect("baseline stream exhausted"),
-                |op| op.namespace() == "held",
+                |op, _| op.namespace() == "held",
             ));
         }
         for _ in 0..2 {
             scheduled.push(next_fifo_deferred_op(
                 &mut deferred,
                 || generated.pop_front().expect("unexpected fresh generation"),
-                |_| false,
+                |_, _| false,
             ));
         }
 
@@ -8969,7 +9133,7 @@ mod outcome_tests {
                 &mut deferred,
                 generation_budget,
                 || generated.pop_front().expect("baseline stream exhausted"),
-                |op| op.namespace() == "held",
+                |op, _| op.namespace() == "held",
             ) else {
                 assert_eq!(
                     reserved, max_ops,
@@ -8984,7 +9148,7 @@ mod outcome_tests {
             &mut deferred,
             0,
             || panic!("boundary drain must not generate replacement operations"),
-            |_| false,
+            |_, _| false,
         ) {
             recorded.push(op);
         }
@@ -9308,6 +9472,29 @@ mod outcome_tests {
         ));
         assert!(!is_expected_cache_fill_response(503, &json!(null)));
         assert!(!is_expected_cache_fill_response(500, &canonical));
+
+        let partitioned = json!({
+            "code": "STORAGE_ERROR",
+            "error": "a transient storage error occurred; please retry",
+            "status": 500,
+            "retryable": true,
+            "request_id": "partitioned-read"
+        });
+        assert!(!is_expected_cache_fill_response(500, &partitioned));
+        assert!(is_expected_partitioned_cache_fill_response(
+            500,
+            &partitioned
+        ));
+        assert!(!is_expected_partitioned_cache_fill_response(
+            503,
+            &partitioned
+        ));
+        let mut non_retryable = partitioned.clone();
+        non_retryable["retryable"] = json!(false);
+        assert!(!is_expected_partitioned_cache_fill_response(
+            500,
+            &non_retryable
+        ));
     }
 
     #[tokio::test]
@@ -9574,6 +9761,18 @@ mod outcome_tests {
     }
 
     #[test]
+    fn chaos_network_gc_horizon_covers_inflight_wal_publication() {
+        let scheduler = FaultScheduler::for_seed(742, FaultProfile::Network);
+        let config = config_for_mode(RunMode::Chaos, 742, Some(scheduler.schedule()));
+        let floor = config
+            .gc_horizon_floor_secs()
+            .expect("adversarial GC horizon floor must not overflow");
+
+        assert_eq!(config.gc.horizon_secs, floor);
+        assert!(!config.gc.allow_unsafe_short_horizon);
+    }
+
+    #[test]
     fn standalone_ops_requires_strict_compaction_proof_but_full_overlap_does_not() {
         let standalone_ops = FaultScheduler::for_seed(7, FaultProfile::Ops);
         assert!(requires_two_node_compaction_evidence_for_schedule(Some(
@@ -9835,6 +10034,103 @@ mod outcome_tests {
             .expect("focused exhaustion burst metadata missing");
         assert!(burst.contains("completed=8"), "{burst}");
         assert!(burst.contains("nodes={0}"), "{burst}");
+
+        server.shutdown().await;
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn supported_full_cache_fill_records_scheduled_read_partition_failures() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let namespace = format!("{prefix}-partitioned-cache-fill");
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::SupportedFull,
+            events: vec![
+                FaultEvent {
+                    id: "supported-full-network-01".to_string(),
+                    start_op: 5,
+                    end_op: Some(10),
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector::default(),
+                    kind: FaultKind::Partition {
+                        direction: Direction::ReadsFail,
+                    },
+                },
+                FaultEvent {
+                    id: "supported-full-ops-06".to_string(),
+                    start_op: 5,
+                    end_op: None,
+                    boundary: Boundary::Runner,
+                    target: TargetSelector::default(),
+                    kind: FaultKind::FillDiskCache,
+                },
+            ],
+        });
+        let server = start_test_server_full(
+            store_fault_proxy(&harness.store, scheduler.clone()),
+            Some(prefix),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+        let client = adversarial_client();
+        let spec = NamespaceSpec {
+            dims: 2,
+            metric: DistanceMetric::Cosine,
+            quantization: QuantizationType::None,
+            num_centroids: 4,
+            fts_fields: Vec::new(),
+            bitmap: false,
+        };
+        let (create_status, _) = request_json(
+            &client,
+            Method::POST,
+            &format!("{}/v1/namespaces", server.base_url),
+            Some(spec.create_body(&namespace)),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CREATED.as_u16());
+        let mut model = Model::default();
+        model.apply(
+            &Op::CreateNamespace {
+                ns: namespace,
+                spec,
+            },
+            StatusCode::CREATED.as_u16(),
+            Some(1),
+            &json!({}),
+            None,
+        );
+
+        let commands = scheduler.advance_to(5);
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, SchedulerCommand::FillDiskCache { .. })));
+        OperationalState::default()
+            .apply_environment_commands(
+                commands,
+                EnvironmentCommandContext {
+                    scheduler: Some(&scheduler),
+                    operational_observer: None,
+                    client: &client,
+                    primary: &server,
+                    model: &mut model,
+                    op_index: 5,
+                },
+            )
+            .await;
+
+        let timeline = scheduler.timeline();
+        let burst = timeline
+            .iter()
+            .find(|event| event.event_id == "supported-full-ops-06")
+            .and_then(|event| event.recovery.as_deref())
+            .expect("partitioned cache-fill burst metadata missing");
+        assert!(burst.contains("completed=8"), "{burst}");
+        assert!(burst.contains("successful=0"), "{burst}");
+        assert!(burst.contains("storage_faulted=8"), "{burst}");
 
         server.shutdown().await;
         harness.cleanup().await;
@@ -10193,6 +10489,10 @@ mod outcome_tests {
         let mut state = OperationalState::default();
         state.record_read_only_node_started();
         assert!(state.generation_checkpoints_enabled());
+        assert!(
+            !state.quiescent_vector_count_must_be_exact(),
+            "a read-only secondary must preserve the single-writer count policy"
+        );
 
         let read = Op::GetNamespace {
             ns: "catalog".to_string(),
@@ -10209,6 +10509,7 @@ mod outcome_tests {
 
         state.record_second_node_stopped();
         assert!(!state.second_node_active());
+        assert!(!state.quiescent_vector_count_must_be_exact());
     }
 
     #[tokio::test]
@@ -11244,7 +11545,11 @@ mod outcome_tests {
             &harness.store,
             &source,
             1,
-            &json!({ "ready": true, "uncompacted_fragments": 0 }),
+            &json!({
+                "ready": true,
+                "uncompacted_fragments": 0,
+                "manifest_generation": source_manifest.version()
+            }),
             1,
         )
         .await;

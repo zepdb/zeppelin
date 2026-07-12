@@ -171,12 +171,14 @@ impl S3Tracker {
         let status_generation = compact_status
             .get("manifest_generation")
             .and_then(serde_json::Value::as_u64);
-        if !fault_window_active && status_generation != Some(manifest.version()) {
+        if !fault_window_active
+            && status_generation.is_none_or(|generation| generation > manifest.version())
+        {
             violations.push(violation(
                 ViolationId::I15ManifestLineage,
                 op_index,
                 namespace,
-                "compact/status generation differed from live manifest",
+                "compact/status generation was absent or ahead of live manifest",
                 json!({
                     "status_generation": status_generation,
                     "manifest_generation": manifest.version(),
@@ -275,6 +277,31 @@ impl S3Tracker {
                     continue;
                 }
                 Err(error) => {
+                    match list_history_for_oracle(store, namespace).await {
+                        Ok(current) if !history_contains_key(&current, &entry.key) => {
+                            eprintln!(
+                                "tolerated manifest-history retention race for \
+                                 {namespace}: key={} disappeared between LIST and GET",
+                                entry.key
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(relist_error) => {
+                            violations.push(violation(
+                                ViolationId::I15ManifestLineage,
+                                op_index,
+                                namespace,
+                                "manifest history relist read-failed after GET failure",
+                                json!({
+                                    "key": entry.key,
+                                    "get_error": error,
+                                    "relist_error": relist_error,
+                                }),
+                            ));
+                            continue;
+                        }
+                    }
                     violations.push(violation(
                         ViolationId::I15ManifestLineage,
                         op_index,
@@ -285,33 +312,39 @@ impl S3Tracker {
                     continue;
                 }
             };
-            let hash = xxh3_64(&bytes);
-            let key = (namespace.to_string(), entry.version);
-            if let Some(previous) = self.history_hashes.get(&key).copied() {
-                if previous != hash {
-                    if fault_window_active {
-                        eprintln!(
-                            "tolerated immutable-history byte mismatch in active fault \
-                             window for {namespace}: key={}",
-                            entry.key
-                        );
-                    } else {
-                        violations.push(violation(
-                            ViolationId::I21FencingViolation,
-                            op_index,
-                            namespace,
-                            "same-generation manifest history fork observed",
-                            json!({
-                                "generation": entry.version,
-                                "key": entry.key,
-                                "previous_hash": previous,
-                                "current_hash": hash,
-                            }),
-                        ));
+            // A failed live-manifest PUT can leave the next generation's
+            // history object unreferenced. Production deliberately replaces
+            // that orphan on retry, so immutability begins only once the live
+            // manifest reaches the history generation.
+            if entry.version <= manifest.version() {
+                let hash = xxh3_64(&bytes);
+                let key = (namespace.to_string(), entry.version);
+                if let Some(previous) = self.history_hashes.get(&key).copied() {
+                    if previous != hash {
+                        if fault_window_active {
+                            eprintln!(
+                                "tolerated immutable-history byte mismatch in active fault \
+                                 window for {namespace}: key={}",
+                                entry.key
+                            );
+                        } else {
+                            violations.push(violation(
+                                ViolationId::I21FencingViolation,
+                                op_index,
+                                namespace,
+                                "same-generation manifest history fork observed",
+                                json!({
+                                    "generation": entry.version,
+                                    "key": entry.key,
+                                    "previous_hash": previous,
+                                    "current_hash": hash,
+                                }),
+                            ));
+                        }
                     }
+                } else {
+                    self.history_hashes.insert(key, hash);
                 }
-            } else {
-                self.history_hashes.insert(key, hash);
             }
             let history_manifest = match Manifest::from_bytes(&bytes) {
                 Ok(manifest) => manifest,
@@ -507,6 +540,22 @@ async fn check_quiescent_namespace_with_count_policy(
     let uncompacted = compact_status
         .get("uncompacted_fragments")
         .and_then(serde_json::Value::as_u64);
+    let status_generation = compact_status
+        .get("manifest_generation")
+        .and_then(serde_json::Value::as_u64);
+    if status_generation != Some(manifest.version()) {
+        violations.push(violation(
+            ViolationId::I16Quiescence,
+            op_index,
+            namespace,
+            "compact/status generation differed from live manifest at quiescence",
+            json!({
+                "status_generation": status_generation,
+                "manifest_generation": manifest.version(),
+                "compact_status": compact_status,
+            }),
+        ));
+    }
     if ready != Some(true) || uncompacted != Some(0) {
         violations.push(violation(
             ViolationId::I16Quiescence,
@@ -855,6 +904,10 @@ async fn list_history_for_oracle(
     }
 }
 
+fn history_contains_key(history: &[ManifestHistoryRef], key: &str) -> bool {
+    history.iter().any(|entry| entry.key == key)
+}
+
 async fn read_manifest_for_oracle(
     store: &ZeppelinStore,
     namespace: &str,
@@ -946,6 +999,56 @@ mod tests {
 
     const V4_ROTATION_SEED: u64 = 0x5a45_5050_454c_494e;
 
+    #[test]
+    fn history_relist_distinguishes_retention_from_a_dangling_listing() {
+        let retained = ManifestHistoryRef {
+            version: 7,
+            key: "ns/manifests/00000000000000000007.msgpack".to_string(),
+        };
+        let pruned = "ns/manifests/00000000000000000006.msgpack";
+
+        assert!(history_contains_key(
+            std::slice::from_ref(&retained),
+            &retained.key
+        ));
+        assert!(!history_contains_key(&[retained], pruned));
+    }
+
+    #[tokio::test]
+    async fn older_periodic_status_is_allowed_when_live_manifest_advanced() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        Manifest::new().write(&store, "ns").await.unwrap();
+        let (mut generation_two, version) = Manifest::read_versioned(&store, "ns")
+            .await
+            .unwrap()
+            .expect("generation one must exist");
+        generation_two
+            .write_conditional(&store, "ns", &version)
+            .await
+            .unwrap();
+
+        let violations = S3Tracker::default()
+            .check_namespace(&store, "ns", 7, &json!({ "manifest_generation": 1 }), false)
+            .await;
+
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[tokio::test]
+    async fn future_periodic_status_is_a_lineage_violation() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        Manifest::new().write(&store, "ns").await.unwrap();
+
+        let violations = S3Tracker::default()
+            .check_namespace(&store, "ns", 7, &json!({ "manifest_generation": 2 }), false)
+            .await;
+
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I15ManifestLineage);
+        assert_eq!(violations[0].evidence["status_generation"], 2);
+        assert_eq!(violations[0].evidence["manifest_generation"], 1);
+    }
+
     #[tokio::test]
     async fn known_tainted_missing_key_is_not_an_s3_reachability_violation() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
@@ -984,6 +1087,99 @@ mod tests {
             )
             .await;
         assert!(tainted.is_empty(), "{tainted:#?}");
+    }
+
+    #[tokio::test]
+    async fn replacing_unreferenced_history_after_failed_live_put_is_not_a_fork() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        Manifest::new().write(&inner, "ns").await.unwrap();
+        let (mut orphan_candidate, first_version) = Manifest::read_versioned(&inner, "ns")
+            .await
+            .unwrap()
+            .expect("generation one must exist");
+        orphan_candidate.fencing_token = 1;
+
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Crash,
+            events: vec![FaultEvent {
+                id: "fail-live-manifest-put".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Put),
+                    key_substring: Some("ns/manifest.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::PreFail {
+                    error: InjectedErrorKind::Http500,
+                },
+            }],
+        });
+        let faulted = store_fault_proxy(&inner, scheduler);
+        assert!(orphan_candidate
+            .write_conditional(&faulted, "ns", &first_version)
+            .await
+            .is_err());
+
+        let mut tracker = S3Tracker::default();
+        let before_replacement = tracker
+            .check_namespace(&inner, "ns", 1, &json!({ "manifest_generation": 1 }), false)
+            .await;
+        assert!(before_replacement.is_empty(), "{before_replacement:#?}");
+
+        let (mut committed, second_version) = Manifest::read_versioned(&inner, "ns")
+            .await
+            .unwrap()
+            .expect("generation one must remain live");
+        committed.fencing_token = 2;
+        committed
+            .write_conditional(&inner, "ns", &second_version)
+            .await
+            .unwrap();
+
+        let after_replacement = tracker
+            .check_namespace(&inner, "ns", 2, &json!({ "manifest_generation": 2 }), false)
+            .await;
+        assert!(after_replacement.is_empty(), "{after_replacement:#?}");
+    }
+
+    #[tokio::test]
+    async fn replacing_live_referenced_history_is_a_fork() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        Manifest::new().write(&store, "ns").await.unwrap();
+        let (mut generation_two, version) = Manifest::read_versioned(&store, "ns")
+            .await
+            .unwrap()
+            .expect("generation one must exist");
+        generation_two.fencing_token = 1;
+        generation_two
+            .write_conditional(&store, "ns", &version)
+            .await
+            .unwrap();
+
+        let status = json!({ "manifest_generation": 2 });
+        let mut tracker = S3Tracker::default();
+        assert!(tracker
+            .check_namespace(&store, "ns", 1, &status, false)
+            .await
+            .is_empty());
+
+        generation_two.fencing_token = 2;
+        store
+            .put(
+                &Manifest::history_key("ns", 2),
+                generation_two.to_bytes().unwrap(),
+            )
+            .await
+            .unwrap();
+        let violations = tracker
+            .check_namespace(&store, "ns", 2, &status, false)
+            .await;
+
+        assert_eq!(violations.len(), 1, "{violations:#?}");
+        assert_eq!(violations[0].id, ViolationId::I21FencingViolation);
+        assert!(violations[0].detail.contains("history fork"));
     }
 
     #[tokio::test]
@@ -1286,7 +1482,11 @@ mod tests {
             &faulted,
             "ns",
             0,
-            &json!({ "ready": true, "uncompacted_fragments": 0 }),
+            &json!({
+                "ready": true,
+                "uncompacted_fragments": 0,
+                "manifest_generation": 1
+            }),
             7,
         )
         .await;
@@ -1319,7 +1519,11 @@ mod tests {
             &store,
             "ns",
             0,
-            &json!({ "ready": true, "uncompacted_fragments": 0 }),
+            &json!({
+                "ready": true,
+                "uncompacted_fragments": 0,
+                "manifest_generation": 1
+            }),
             17,
         )
         .await;
@@ -1350,7 +1554,11 @@ mod tests {
             &store,
             "ns",
             0,
-            &json!({ "ready": true, "uncompacted_fragments": 0 }),
+            &json!({
+                "ready": true,
+                "uncompacted_fragments": 0,
+                "manifest_generation": 1
+            }),
             18,
         )
         .await;
@@ -1406,7 +1614,11 @@ mod tests {
             &faulted,
             "ns",
             0,
-            &json!({ "ready": true, "uncompacted_fragments": 0 }),
+            &json!({
+                "ready": true,
+                "uncompacted_fragments": 0,
+                "manifest_generation": 1
+            }),
             13,
         )
         .await;

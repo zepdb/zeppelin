@@ -3,6 +3,7 @@ pub mod http_proxy;
 pub mod process;
 pub mod store_proxy;
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -16,6 +17,10 @@ use self::process::{CrashPoint, ProcessController, TriggerPosition};
 use super::chaos::StoreOp;
 
 const FAULT_WINDOW_TRAILING_OPS: u64 = 8;
+
+tokio::task_local! {
+    static ARMED_HOLD_EVENT_ID: String;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FaultSchedule {
@@ -485,6 +490,7 @@ struct SchedulerRuntime {
     logical_op_tx: tokio::sync::watch::Sender<u64>,
     quiesced: AtomicBool,
     release_held_calls: AtomicBool,
+    armed_hold_event_id: Mutex<Option<String>>,
     timeline: Mutex<Vec<TimelineEvent>>,
     timeline_revision_tx: tokio::sync::watch::Sender<u64>,
     events: Vec<EventRuntime>,
@@ -548,6 +554,7 @@ impl FaultScheduler {
                 logical_op_tx,
                 quiesced: AtomicBool::new(false),
                 release_held_calls: AtomicBool::new(false),
+                armed_hold_event_id: Mutex::new(None),
                 timeline: Mutex::new(Vec::new()),
                 timeline_revision_tx,
                 events,
@@ -787,6 +794,38 @@ impl FaultScheduler {
             })
     }
 
+    /// Restricts a scheduled `HoldCall` to one runner-managed async task.
+    /// Background workers share the same store proxy but must never claim a
+    /// logical-time hold that the foreground runner cannot join and release.
+    pub async fn with_armed_hold<F>(&self, event_id: String, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        {
+            let mut armed = self
+                .runtime
+                .armed_hold_event_id
+                .lock()
+                .expect("armed hold mutex poisoned");
+            assert!(
+                armed.is_none(),
+                "attempted to arm hold {event_id} while {armed:?} was still armed"
+            );
+            *armed = Some(event_id.clone());
+        }
+
+        let result = ARMED_HOLD_EVENT_ID.scope(event_id.clone(), future).await;
+        let mut armed = self
+            .runtime
+            .armed_hold_event_id
+            .lock()
+            .expect("armed hold mutex poisoned");
+        if armed.as_deref() == Some(event_id.as_str()) {
+            *armed = None;
+        }
+        result
+    }
+
     #[must_use]
     pub fn store_decision(&self, op: StoreOp, key: &str) -> Option<StoreFaultAction> {
         if self.runtime.quiesced.load(Ordering::SeqCst) {
@@ -860,11 +899,34 @@ impl FaultScheduler {
             }
         }
         if matches!(event.kind, FaultKind::HoldCall { .. }) {
+            let task_armed = ARMED_HOLD_EVENT_ID
+                .try_with(|event_id| event_id == &event.id)
+                .unwrap_or(false);
+            let request_armed = self
+                .runtime
+                .armed_hold_event_id
+                .lock()
+                .expect("armed hold mutex poisoned")
+                .as_deref()
+                == Some(event.id.as_str());
+            if !task_armed
+                && (!request_armed || crate::common::server::background_compaction_origin_active())
+            {
+                return false;
+            }
             let claimed = runtime
                 .claimed_op
                 .compare_exchange(u64::MAX, current, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok();
             if claimed {
+                let mut armed = self
+                    .runtime
+                    .armed_hold_event_id
+                    .lock()
+                    .expect("armed hold mutex poisoned");
+                if armed.as_deref() == Some(event.id.as_str()) {
+                    *armed = None;
+                }
                 runtime.fired.store(true, Ordering::SeqCst);
             }
             return claimed;
@@ -1016,6 +1078,7 @@ impl FaultScheduler {
                 FaultProfile::Content
                     | FaultProfile::Semantic
                     | FaultProfile::ProviderContractAbuse
+                    | FaultProfile::SupportedFull
                     | FaultProfile::Full
             )
         {
@@ -1060,6 +1123,47 @@ impl FaultScheduler {
                     .key
                     .as_deref()
                     .is_some_and(|key| key_is_in_namespace(key, namespace))
+        })
+    }
+
+    /// Reports whether a bounded object-store fault window is scheduled to be
+    /// active at `op_index`.
+    ///
+    /// Windows open and close on the logical op index, which freezes while an
+    /// operation waits in-op for storage convergence. A convergence wait that
+    /// starts inside such a window can therefore never observe the window
+    /// closing, so the runner must defer convergence-waiting operations until
+    /// the window has passed.
+    pub fn scheduled_store_fault_window_active(&self, op_index: u64) -> bool {
+        if self.runtime.quiesced.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.schedule.events.iter().any(|event| {
+            event.boundary == Boundary::ObjectStore
+                && event.end_op.is_some()
+                && event_is_active(event, op_index)
+        })
+    }
+
+    /// Reports whether every object-store read is deliberately partitioned at
+    /// `op_index`. Operational read bursts use this narrower proof to accept
+    /// the canonical retryable storage error without treating unrelated 500s
+    /// as expected.
+    pub fn global_read_partition_active(&self, op_index: u64) -> bool {
+        if self.runtime.quiesced.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.schedule.events.iter().any(|event| {
+            event.boundary == Boundary::ObjectStore
+                && event_is_active(event, op_index)
+                && event.target.store_op.is_none()
+                && event.target.key_substring.is_none()
+                && matches!(
+                    event.kind,
+                    FaultKind::Partition {
+                        direction: Direction::All | Direction::ReadsFail,
+                    }
+                )
         })
     }
 }
@@ -1934,7 +2038,71 @@ mod tests {
     }
 
     #[test]
-    fn foreground_hold_prediction_is_non_consuming_and_returns_exact_release() {
+    fn scheduled_store_fault_windows_are_bounded_and_quiesce_aware() {
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::SupportedFull,
+            events: vec![
+                FaultEvent {
+                    id: "supported-full-semantic-04".to_string(),
+                    start_op: 41,
+                    end_op: Some(81),
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector {
+                        store_op: Some(StoreOp::Delete),
+                        ..TargetSelector::default()
+                    },
+                    kind: FaultKind::BatchDeletePartial { fail_every: 3 },
+                },
+                FaultEvent {
+                    id: "supported-full-post-commit-00".to_string(),
+                    start_op: 10,
+                    end_op: None,
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector::default(),
+                    kind: FaultKind::PostCommitFail {
+                        error: InjectedErrorKind::Http500,
+                    },
+                },
+                FaultEvent {
+                    id: "supported-full-network-01".to_string(),
+                    start_op: 100,
+                    end_op: Some(120),
+                    boundary: Boundary::ObjectStore,
+                    target: TargetSelector::default(),
+                    kind: FaultKind::Partition {
+                        direction: Direction::ReadsFail,
+                    },
+                },
+            ],
+        });
+
+        assert!(!scheduler.scheduled_store_fault_window_active(40));
+        assert!(scheduler.scheduled_store_fault_window_active(41));
+        assert!(
+            scheduler.fault_window_active(41, "ns"),
+            "SupportedFull S3 oracles must tolerate reads inside bounded faults"
+        );
+        assert!(scheduler.scheduled_store_fault_window_active(80));
+        assert!(
+            !scheduler.scheduled_store_fault_window_active(81),
+            "end_op is exclusive, matching event_is_active"
+        );
+        assert!(
+            !scheduler.scheduled_store_fault_window_active(15),
+            "unbounded events never close, so they must not defer workload ops"
+        );
+        assert!(!scheduler.global_read_partition_active(99));
+        assert!(scheduler.global_read_partition_active(100));
+        assert!(scheduler.global_read_partition_active(119));
+        assert!(!scheduler.global_read_partition_active(120));
+
+        scheduler.quiesce();
+        assert!(!scheduler.scheduled_store_fault_window_active(41));
+        assert!(!scheduler.global_read_partition_active(100));
+    }
+
+    #[tokio::test]
+    async fn foreground_hold_prediction_is_non_consuming_and_returns_exact_release() {
         let scheduler = FaultScheduler::from_schedule(FaultSchedule {
             profile: FaultProfile::Sched,
             events: vec![FaultEvent {
@@ -1967,9 +2135,21 @@ mod tests {
             None
         );
 
+        assert!(
+            scheduler
+                .store_decision(StoreOp::Get, "ns/manifest.json")
+                .is_none(),
+            "an unarmed background call must not claim a foreground hold"
+        );
+        let hold = scheduler
+            .foreground_hold_for_calls(5, &calls)
+            .expect("matching foreground footprint must nominate the hold");
         let action = scheduler
-            .store_decision(StoreOp::Get, "ns/manifest.json")
-            .expect("prediction must not consume the hold event");
+            .with_armed_hold(hold.event_id, async {
+                scheduler.store_decision(StoreOp::Get, "ns/manifest.json")
+            })
+            .await
+            .expect("armed foreground call must claim the predicted hold");
         assert!(matches!(action.kind, FaultKind::HoldCall { for_ops: 3 }));
         assert_eq!(
             scheduler.foreground_hold_release_for_calls(5, &calls),
@@ -1977,8 +2157,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn foreground_hold_prediction_tracks_a_background_claim_until_exact_release() {
+    #[tokio::test]
+    async fn foreground_hold_prediction_tracks_an_armed_claim_until_exact_release() {
         let scheduler = FaultScheduler::from_schedule(FaultSchedule {
             profile: FaultProfile::Sched,
             events: vec![FaultEvent {
@@ -1997,9 +2177,21 @@ mod tests {
         let calls = [(StoreOp::Get, "ns/manifest.json".to_string())];
 
         scheduler.advance_to(5);
+        assert!(
+            scheduler
+                .store_decision(StoreOp::Get, "ns/manifest.json")
+                .is_none(),
+            "background calls must not claim runner-managed holds"
+        );
+        let hold = scheduler
+            .foreground_hold_for_calls(5, &calls)
+            .expect("foreground call footprint must predict the hold");
         let action = scheduler
-            .store_decision(StoreOp::Get, "ns/manifest.json")
-            .expect("background store call must claim the scheduled hold");
+            .with_armed_hold(hold.event_id, async {
+                scheduler.store_decision(StoreOp::Get, "ns/manifest.json")
+            })
+            .await
+            .expect("armed store call must claim the scheduled hold");
         assert_eq!(action.op_index, 5);
         assert_eq!(
             scheduler.foreground_hold_release_for_calls(5, &calls),
@@ -2016,8 +2208,8 @@ mod tests {
         assert_eq!(scheduler.foreground_hold_release_for_calls(8, &calls), None);
     }
 
-    #[test]
-    fn foreground_hold_preserves_background_window_op_across_logical_ops() {
+    #[tokio::test]
+    async fn foreground_hold_preserves_armed_window_op_across_logical_ops() {
         let scheduler = FaultScheduler::from_schedule(FaultSchedule {
             profile: FaultProfile::Sched,
             events: vec![FaultEvent {
@@ -2036,9 +2228,15 @@ mod tests {
         let calls = [(StoreOp::Get, "ns/manifest.json".to_string())];
 
         scheduler.advance_to(5);
+        let predicted = scheduler
+            .foreground_hold_for_calls(5, &calls)
+            .expect("foreground call footprint must predict the hold");
         scheduler
-            .store_decision(StoreOp::Get, "ns/manifest.json")
-            .expect("background store call must claim the scheduled hold");
+            .with_armed_hold(predicted.event_id, async {
+                scheduler.store_decision(StoreOp::Get, "ns/manifest.json")
+            })
+            .await
+            .expect("armed store call must claim the scheduled hold");
         scheduler.advance_to(6);
 
         let hold = scheduler
@@ -2049,8 +2247,8 @@ mod tests {
         assert_eq!(hold.release_op, 8);
     }
 
-    #[test]
-    fn foreground_hold_exclusion_finds_overlapping_matching_event() {
+    #[tokio::test]
+    async fn foreground_hold_exclusion_finds_overlapping_matching_event() {
         let manifest_get = TargetSelector {
             store_op: Some(StoreOp::Get),
             key_substring: Some("manifest.json".to_string()),
@@ -2080,8 +2278,14 @@ mod tests {
         let calls = [(StoreOp::Get, "ns/manifest.json".to_string())];
 
         scheduler.advance_to(5);
+        let first = scheduler
+            .foreground_hold_for_calls(5, &calls)
+            .expect("first scheduled hold must be predicted");
         let claimed = scheduler
-            .store_decision(StoreOp::Get, "ns/manifest.json")
+            .with_armed_hold(first.event_id, async {
+                scheduler.store_decision(StoreOp::Get, "ns/manifest.json")
+            })
+            .await
             .expect("first scheduled hold must be claimed");
         assert_eq!(claimed.event_id, "sched-first");
         assert_eq!(
@@ -2157,8 +2361,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dual_writer_fencing_selftest_pins_node_window_and_lease_hold() {
+    #[tokio::test]
+    async fn dual_writer_fencing_selftest_pins_node_window_and_lease_hold() {
         let schedule = FaultSchedule::dual_writer_fencing_selftest();
         assert_eq!(schedule.profile, FaultProfile::Ops);
         assert_eq!(schedule.events.len(), 2, "{schedule:#?}");
@@ -2188,6 +2392,7 @@ mod tests {
             lease_hold.kind,
             FaultKind::HoldCall { for_ops: 8 }
         ));
+        let lease_hold_id = lease_hold.id.clone();
 
         let scheduler = FaultScheduler::from_schedule(schedule);
         assert_eq!(
@@ -2198,7 +2403,10 @@ mod tests {
             }]
         );
         let action = scheduler
-            .store_decision(StoreOp::Put, "ns/lease.json")
+            .with_armed_hold(lease_hold_id, async {
+                scheduler.store_decision(StoreOp::Put, "ns/lease.json")
+            })
+            .await
             .expect("pinned schedule must hold the first lease PUT");
         assert_eq!(action.event_id, "ops-dual-writer-lease-hold");
         assert!(matches!(action.kind, FaultKind::HoldCall { for_ops: 8 }));
