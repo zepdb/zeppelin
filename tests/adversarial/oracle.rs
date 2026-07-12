@@ -1007,7 +1007,7 @@ fn check_expected_error(model: &Model, rec: &OpRecord, mode: RunMode) -> Vec<Vio
     let actual_code = rec.response.get("code").and_then(serde_json::Value::as_str);
     if mode == RunMode::Chaos
         && rec.status >= 500
-        && actual_code == Some("STORAGE_ERROR")
+        && matches!(actual_code, Some("STORAGE_ERROR" | "INTERNAL_DATA_MISSING"))
         && rec.response.get("_adversarial_store_fault") == Some(&serde_json::Value::Bool(true))
     {
         return Vec::new();

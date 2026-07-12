@@ -4064,7 +4064,14 @@ async fn execute_raw_recorded_op(
         (request.await, None)
     };
     rec.target_node = target_node;
-    mark_injected_store_failure(&mut rec, index, http_fault_context.as_ref(), timeline_start);
+    mark_injected_store_failure(
+        &mut rec,
+        index,
+        http_fault_context
+            .as_ref()
+            .map(|context| &context.scheduler),
+        timeline_start,
+    );
     let post_commit_ack_lost = inject_post_commit_ack_loss
         && inject_lost_http_acknowledgement_after_commit(&mut rec, ambiguity_allowed);
     let outcome = classify_record_outcome(&rec, ambiguity_allowed);
@@ -4531,23 +4538,33 @@ fn op_records_manifest_generation(op: &Op) -> bool {
 fn mark_injected_store_failure(
     rec: &mut OpRecord,
     op_index: u64,
-    context: Option<&HttpFaultContext>,
+    scheduler: Option<&FaultScheduler>,
     timeline_start: Option<usize>,
 ) {
-    if rec.status < 500
-        || rec.response.get("code").and_then(serde_json::Value::as_str) != Some("STORAGE_ERROR")
-    {
+    let code = rec.response.get("code").and_then(serde_json::Value::as_str);
+    if rec.status < 500 || !matches!(code, Some("STORAGE_ERROR" | "INTERNAL_DATA_MISSING")) {
         return;
     }
-    let Some((context, timeline_start)) = context.zip(timeline_start) else {
+    let Some((scheduler, timeline_start)) = scheduler.zip(timeline_start) else {
         return;
     };
-    let fault_fired = context
-        .scheduler
+    let manifest_key = format!("{}/manifest.json", rec.op.namespace());
+    let fault_fired = scheduler
         .timeline()
         .into_iter()
         .skip(timeline_start)
-        .any(|event| event.op_index == op_index && event.boundary == Boundary::ObjectStore);
+        .any(|event| {
+            event.op_index == op_index
+                && event.boundary == Boundary::ObjectStore
+                && match code {
+                    Some("STORAGE_ERROR") => true,
+                    Some("INTERNAL_DATA_MISSING") => {
+                        event.action.starts_with("HeadGetDiverge")
+                            && event.key.as_deref() == Some(manifest_key.as_str())
+                    }
+                    _ => false,
+                }
+        });
     if fault_fired {
         rec.response
             .as_object_mut()
@@ -7437,6 +7454,81 @@ mod outcome_tests {
                 Some(FaultProfile::Ops),
                 Some(FaultProfile::Full),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_manifest_divergence_explains_internal_missing_expected_error() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        inner
+            .put("ns/manifest.json", bytes::Bytes::from_static(b"manifest"))
+            .await
+            .unwrap();
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Semantic,
+            events: vec![FaultEvent {
+                id: "semantic-head-get-diverge".to_string(),
+                start_op: 43,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("manifest.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::HeadGetDiverge,
+            }],
+        });
+        scheduler.advance_to(43);
+        let faulted = store_fault_proxy(&inner, scheduler.clone());
+        let timeline_start = scheduler.timeline().len();
+        assert!(faulted.get("ns/manifest.json").await.is_err());
+
+        let mut rec = OpRecord {
+            index: 43,
+            wall_ms: 0,
+            op: Op::Query {
+                ns: "ns".to_string(),
+                q: GeneratedQuery {
+                    body: json!({}),
+                    class: QueryOracleClass::ExpectError {
+                        status: 410,
+                        code: "POINT_IN_TIME_NOT_RETAINED".to_string(),
+                    },
+                    pattern_tags: vec!["as-of-410".to_string()],
+                },
+                as_of: Some(super::super::ops::AsOfTarget::Generation(10_004)),
+            },
+            method: "POST".to_string(),
+            path: "/v1/namespaces/ns/query?as_of=10004".to_string(),
+            status: 500,
+            response: json!({
+                "code": "INTERNAL_DATA_MISSING",
+                "error": "an internal data object is missing; this is a server-side error",
+                "request_id": "request-id",
+                "retryable": false,
+                "status": 500,
+            }),
+            outcome: "not_applied".to_string(),
+            target_node: 0,
+            execution: ExecutionMetadata::default(),
+            gen_after: None,
+            duration_ms: 0,
+            violations: Vec::new(),
+        };
+
+        mark_injected_store_failure(&mut rec, 43, Some(&scheduler), Some(timeline_start));
+        assert_eq!(rec.response[STORE_FAULT_MARKER], true);
+        assert!(oracle::check_op(&Model::default(), &rec, RunMode::Chaos, None).is_empty());
+
+        rec.response
+            .as_object_mut()
+            .unwrap()
+            .remove(STORE_FAULT_MARKER);
+        assert!(
+            oracle::check_op(&Model::default(), &rec, RunMode::Chaos, None)
+                .iter()
+                .any(|violation| violation.id == ViolationId::I11ErrorEnvelope)
         );
     }
 
