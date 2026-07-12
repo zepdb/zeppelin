@@ -24,10 +24,10 @@ op = "upsert"
 batch = 64
 
 [baseline]
-git_rev = "04a538b85b8b452518cbb631e3f1fdbeb304a11d"
-captured = "2026-07-11T03:32:18.268416+00:00"
+git_rev = "ade36ce7c6f22c91ba8ee0cf5d74796f448ebca8"
+captured = "2026-07-12T04:41:16Z"
 approved_by = "anup"
-reason = "ZSK1 v4 manifest re-baseline after 04a538b: SketchRef rotation_seed shifts compacted setup manifest and history bands by 7 bytes per serialization; ops and depth unchanged."
+reason = "Rebaseline after ade36ce preserves manifest namespace identity while removing verification GETs; operations, depth, and quantized artifact bytes are unchanged."
 
 [assert.depth.put_get]
 mode = "exact"
@@ -81,8 +81,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.manifest]
-min = 977
-max = 1215
+min = 1033
+max = 1271
 why = "manifest serialization grows as measured batches append history across repeats"
 
 [assert.get_bytes.other]
@@ -95,8 +95,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-min = 977
-max = 1215
+min = 1033
+max = 1271
 why = "manifest serialization grows as measured batches append history across repeats"
 
 [assert.get_bytes.wal]
@@ -121,13 +121,13 @@ exact = 0
 exact = 0
 
 [assert.put_bytes.manifest]
-min = 1011
-max = 1249
+min = 1067
+max = 1305
 why = "manifest and history serialization grow with each measured batch commit"
 
 [assert.put_bytes.other]
-min = 1011
-max = 1249
+min = 1067
+max = 1305
 why = "manifest and history serialization grow with each measured batch commit"
 
 [assert.put_bytes.sketch]
@@ -137,8 +137,8 @@ exact = 0
 exact = 0
 
 [assert.put_bytes.total]
-min = 24528
-max = 25004
+min = 24640
+max = 25116
 why = "manifest and history serialization grow with each measured batch commit"
 
 [assert.put_bytes.wal]

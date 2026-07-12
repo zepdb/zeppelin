@@ -1,10 +1,11 @@
 //! Scenario lifecycle and performance-contract entry orchestration.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use object_store::path::Path as ObjectPath;
 use reqwest::Client;
 use serde::Serialize;
@@ -17,6 +18,7 @@ use zeppelin::index::ivf_flat::build::attrs_key;
 use zeppelin::index::ivf_flat::membership::deserialize_membership;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::manager::NamespaceMetadata;
+use zeppelin::time::{Clock, TimeSource};
 use zeppelin::wal::manifest::SegmentRef;
 use zeppelin::wal::Manifest;
 
@@ -38,6 +40,48 @@ const SETUP_BATCH_SIZE: usize = 256;
 const COMPACTION_ATTEMPTS: usize = 4;
 const STABILITY_REPEATS: usize = 100;
 const MSGPACK_POSITIVE_FIXINT_MAX: u64 = 127;
+
+/// Real wall time normalized to a stable six-digit RFC3339 fraction.
+///
+/// Chrono's `AutoSi` serializer emits 0, 3, 6, or 9 fractional digits. The
+/// performance contracts count serialized bytes, so landing exactly on a
+/// millisecond otherwise makes timestamp-bearing objects three bytes shorter.
+/// Elapsed-time and critical-path measurements continue to use `Instant`.
+#[derive(Debug)]
+struct StableWidthPerfTime {
+    last_micros: AtomicI64,
+}
+
+impl TimeSource for StableWidthPerfTime {
+    fn now(&self) -> DateTime<Utc> {
+        let mut previous = self.last_micros.load(Ordering::SeqCst);
+        loop {
+            let real_micros = Utc::now().timestamp_micros();
+            let mut candidate = real_micros.max(previous.saturating_add(1));
+            if candidate.rem_euclid(1_000) == 0 {
+                candidate = candidate.saturating_add(1);
+            }
+            match self.last_micros.compare_exchange_weak(
+                previous,
+                candidate,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return DateTime::from_timestamp_micros(candidate)
+                        .expect("performance timestamp must be representable");
+                }
+                Err(actual) => previous = actual,
+            }
+        }
+    }
+}
+
+fn stable_width_perf_clock() -> Clock {
+    Clock::from_source(Arc::new(StableWidthPerfTime {
+        last_micros: AtomicI64::new(i64::MIN),
+    }))
+}
 
 /// Namespace options passed as a raw HTTP creation body.
 pub type NsConfig = Value;
@@ -633,6 +677,7 @@ async fn run_scenario_inner(
 
     let harness = TestHarness::new().await;
     let config = scenario_config(spec);
+    let clock = stable_width_perf_clock();
     let (depth_wrapped, tracker) = depth_store(&harness.store);
     let (instrumented_store, counter) = counting_store(&depth_wrapped);
     let decorated_store = decorator.map_or_else(
@@ -648,7 +693,7 @@ async fn run_scenario_inner(
         Some(harness.prefix.clone()),
         config.clone(),
         false,
-        None,
+        Some(clock.clone()),
     )
     .await;
     let client = Client::new();
@@ -674,7 +719,7 @@ async fn run_scenario_inner(
                     Some(harness.prefix.clone()),
                     config.clone(),
                     false,
-                    None,
+                    Some(clock.clone()),
                 )
                 .await,
             );
@@ -713,7 +758,7 @@ async fn run_scenario_inner(
                     Some(harness.prefix.clone()),
                     config.clone(),
                     false,
-                    None,
+                    Some(clock.clone()),
                 )
                 .await,
             );
@@ -760,7 +805,7 @@ async fn run_scenario_inner(
                         Some(harness.prefix.clone()),
                         config.clone(),
                         false,
-                        None,
+                        Some(clock.clone()),
                     )
                     .await,
                 )
@@ -859,6 +904,7 @@ pub(crate) async fn run_closed_loop_scenario(
 
     let harness = TestHarness::new().await;
     let mut config = scenario_config(spec);
+    let clock = stable_width_perf_clock();
     // Tier 1 pins this to one request. Tier 3 intentionally admits the
     // profile's closed-loop clients; the production middleware load-sheds
     // instead of queueing when this semaphore is exhausted.
@@ -871,7 +917,7 @@ pub(crate) async fn run_closed_loop_scenario(
         Some(harness.prefix.clone()),
         config.clone(),
         false,
-        None,
+        Some(clock.clone()),
     )
     .await;
     let client = Client::new();
@@ -896,7 +942,7 @@ pub(crate) async fn run_closed_loop_scenario(
                     Some(harness.prefix.clone()),
                     config,
                     false,
-                    None,
+                    Some(clock),
                 )
                 .await,
             );

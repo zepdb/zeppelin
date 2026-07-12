@@ -24,10 +24,10 @@ op = "delete"
 count = 1
 
 [baseline]
-git_rev = "04a538b85b8b452518cbb631e3f1fdbeb304a11d"
-captured = "2026-07-11T03:32:18.268416+00:00"
+git_rev = "ade36ce7c6f22c91ba8ee0cf5d74796f448ebca8"
+captured = "2026-07-12T04:41:16Z"
 approved_by = "anup"
-reason = "ZSK1 v4 manifest re-baseline after 04a538b: SketchRef rotation_seed shifts compacted setup manifest and history bands by 7 bytes per serialization; ops and depth unchanged."
+reason = "Rebaseline after ade36ce preserves manifest namespace identity while removing verification GETs; operations, depth, and quantized artifact bytes are unchanged."
 
 [assert.depth.put_get]
 mode = "exact"
@@ -81,8 +81,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.manifest]
-min = 982
-max = 1206
+min = 1039
+max = 1263
 why = "manifest serialization grows as measured tombstones append history across repeats"
 
 [assert.get_bytes.other]
@@ -95,8 +95,8 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-min = 982
-max = 1206
+min = 1039
+max = 1263
 why = "manifest serialization grows as measured tombstones append history across repeats"
 
 [assert.get_bytes.wal]
@@ -121,13 +121,13 @@ exact = 0
 exact = 0
 
 [assert.put_bytes.manifest]
-min = 1014
-max = 1238
+min = 1071
+max = 1295
 why = "manifest and history serialization grow with each measured tombstone commit"
 
 [assert.put_bytes.other]
-min = 1014
-max = 1238
+min = 1071
+max = 1295
 why = "manifest and history serialization grow with each measured tombstone commit"
 
 [assert.put_bytes.sketch]
@@ -137,8 +137,8 @@ exact = 0
 exact = 0
 
 [assert.put_bytes.total]
-min = 2082
-max = 2530
+min = 2196
+max = 2644
 why = "manifest and history serialization grow with each measured tombstone commit"
 
 [assert.put_bytes.wal]

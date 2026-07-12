@@ -28,10 +28,10 @@ top_k = 10
 query_index = 0
 
 [baseline]
-git_rev = "a8f8bea0e74802fcfaace44a48ce272fad8b9fd8"
-captured = "2026-07-11T03:25:40.350315+00:00"
+git_rev = "ade36ce7c6f22c91ba8ee0cf5d74796f448ebca8"
+captured = "2026-07-12T04:41:16Z"
 approved_by = "anup"
-reason = "ZSK1 v4 two-bit re-baseline at a8f8bea: sketch/bootstrap shrink, SketchRef rotation_seed adds 11 manifest bytes; ops and depth unchanged."
+reason = "Rebaseline after ade36ce preserves manifest namespace identity while removing verification GETs; operations, depth, and quantized artifact bytes are unchanged."
 
 [assert.depth.get]
 mode = "exact"
@@ -85,10 +85,10 @@ exact = 429027
 exact = 0
 
 [assert.get_bytes.manifest]
-exact = 2490
+exact = 2545
 
 [assert.get_bytes.other]
-exact = 2456
+exact = 2511
 
 [assert.get_bytes.sketch]
 exact = 0
@@ -97,7 +97,7 @@ exact = 0
 exact = 0
 
 [assert.get_bytes.total]
-exact = 433973
+exact = 434083
 
 [assert.get_bytes.wal]
 exact = 0
