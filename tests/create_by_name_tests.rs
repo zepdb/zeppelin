@@ -1,8 +1,103 @@
 mod common;
 
-use common::server::{api_ns, start_test_server};
+use std::time::Duration;
+
+use common::fault_injection::fail_put_once_matching;
+use common::harness::TestHarness;
+use common::server::{api_ns, start_test_server, start_test_server_on_store};
+use reqwest::StatusCode;
 
 use uuid::Uuid;
+
+#[tokio::test]
+async fn recreated_namespace_recovers_after_initial_manifest_publish_failure() {
+    let harness = TestHarness::new().await;
+    let client = reqwest::Client::new();
+    let name = api_ns(&harness, "recreate-manifest-crash");
+    let (initial_url, _initial_cache, _initial_cache_dir) =
+        start_test_server_on_store(harness.store.clone(), None).await;
+
+    let created = client
+        .post(format!("{initial_url}/v1/namespaces"))
+        .json(&serde_json::json!({
+            "name": name,
+            "dimensions": 4,
+            "distance_metric": "cosine"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let deleted = client
+        .delete(format!("{initial_url}/v1/namespaces/{name}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+
+    for _ in 0..100 {
+        let status = client
+            .get(format!("{initial_url}/v1/namespaces/{name}"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        if status == StatusCode::NOT_FOUND {
+            break;
+        }
+        assert_eq!(status, StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        client
+            .get(format!("{initial_url}/v1/namespaces/{name}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+        "acknowledged deletion must finish before the same name is recreated"
+    );
+
+    let (failing_store, failure) =
+        fail_put_once_matching(&harness.store, format!("{name}/manifest.json"));
+    let (failing_url, _failing_cache, _failing_cache_dir) =
+        start_test_server_on_store(failing_store, None).await;
+    let interrupted = client
+        .post(format!("{failing_url}/v1/namespaces"))
+        .json(&serde_json::json!({
+            "name": name,
+            "dimensions": 4,
+            "distance_metric": "cosine"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(interrupted.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(failure.failures_injected(), 1);
+
+    let (restarted_url, _restarted_cache, _restarted_cache_dir) =
+        start_test_server_on_store(harness.store.clone(), None).await;
+    let recovered = client
+        .get(format!("{restarted_url}/v1/namespaces/{name}"))
+        .send()
+        .await
+        .unwrap();
+    let recovered_status = recovered.status();
+    let recovered_body: serde_json::Value = recovered.json().await.unwrap();
+    assert_eq!(
+        recovered_status,
+        StatusCode::OK,
+        "restart must recover the reserved namespace instead of exposing a missing manifest: \
+         {recovered_body}"
+    );
+    assert_eq!(recovered_body["name"], name);
+    assert_eq!(recovered_body["state"], "active");
+    assert_eq!(recovered_body["vector_count"], 0);
+
+    harness.cleanup().await;
+}
 
 #[tokio::test]
 async fn test_create_namespace_by_name_is_idempotent_for_same_config() {

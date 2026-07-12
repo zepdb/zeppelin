@@ -1824,6 +1824,9 @@ pub async fn get_namespace(
                 .get_strong_required(&state.store, &ns)
                 .await
         }
+        NamespaceState::Creating => {
+            return Err(ApiError(ZeppelinError::ManifestConflict { namespace: ns }));
+        }
         NamespaceState::Deleting => state.manifest_cache.get_strong(&state.store, &ns).await,
     }
     .map_err(ApiError::from)?;

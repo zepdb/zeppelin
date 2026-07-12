@@ -684,10 +684,18 @@ impl Compactor {
         match self.store.get(&key).await {
             Ok(data) => {
                 let meta = NamespaceMetadata::from_bytes(&data)?;
-                if meta.state == NamespaceState::Deleting {
-                    return Err(ZeppelinError::NamespaceDeleting {
-                        namespace: namespace.to_string(),
-                    });
+                match meta.state {
+                    NamespaceState::Active => {}
+                    NamespaceState::Creating => {
+                        return Err(ZeppelinError::ManifestConflict {
+                            namespace: namespace.to_string(),
+                        });
+                    }
+                    NamespaceState::Deleting => {
+                        return Err(ZeppelinError::NamespaceDeleting {
+                            namespace: namespace.to_string(),
+                        });
+                    }
                 }
                 if let Some(namespace_config) = meta.index_config.as_ref() {
                     namespace_config.validate(meta.dimensions)?;

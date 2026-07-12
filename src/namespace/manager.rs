@@ -16,10 +16,13 @@
 //! ## Lifecycle
 //!
 //! ```text
-//! create meta.json with If-None-Match: *
+//! reserve meta.json as creating with If-None-Match: *
 //!                 |
 //!                 v
 //!          create empty manifest
+//!                 |
+//!                 v
+//!        CAS meta.json -> active
 //!                 |
 //!                 v
 //!              active
@@ -89,6 +92,8 @@ pub enum NamespaceState {
     /// Namespace accepts reads and writes.
     #[default]
     Active,
+    /// Namespace name is reserved while its first manifest is published.
+    Creating,
     /// Namespace is being deleted; clients may observe status but not use it.
     Deleting,
 }
@@ -98,7 +103,7 @@ impl NamespaceState {
     ///
     /// # Returns
     ///
-    /// Returns `"active"` or `"deleting"` without allocation.
+    /// Returns `"active"`, `"creating"`, or `"deleting"` without allocation.
     ///
     /// # Examples
     ///
@@ -108,6 +113,7 @@ impl NamespaceState {
     pub fn as_str(self) -> &'static str {
         match self {
             NamespaceState::Active => "active",
+            NamespaceState::Creating => "creating",
             NamespaceState::Deleting => "deleting",
         }
     }
@@ -595,17 +601,22 @@ impl NamespaceManager {
     ///
     /// The create-only `meta.json` PUT is the concurrency boundary: two creators
     /// cannot silently overwrite one another's dimensions or analyzers. The
-    /// manifest is written only after the metadata object exists, then the
-    /// completed namespace is inserted into the local registry.
+    /// durable record remains `creating` until the first manifest exists and a
+    /// metadata CAS publishes `active`. A replacement node can therefore finish
+    /// an interrupted create without confusing later manifest loss with an empty
+    /// namespace.
     ///
     /// ```text
     /// validate request
     ///       |
     ///       v
-    /// PUT meta.json if absent ---- already exists --> conflict/deleting error
+    /// PUT creating meta if absent ---- already exists --> conflict/deleting error
     ///       |
     ///       v
-    /// write empty manifest ------- failure -------> meta.json may remain
+    /// write empty manifest ------- failure -------> creating meta remains
+    ///       |
+    ///       v
+    /// CAS meta.json active ------- failure -------> restart recovery retries
     ///       |
     ///       v
     /// cache metadata and return active namespace
@@ -633,14 +644,16 @@ impl NamespaceManager {
     /// to an active namespace, and [`ZeppelinError::NamespaceDeleting`] for a
     /// tombstoned name. Serialization and object-store failures propagate.
     ///
-    /// Metadata is written before the initial manifest. If manifest creation
-    /// fails, `meta.json` may remain even though this function returns an error;
-    /// the function does not silently roll back or report success.
+    /// Metadata is written before the initial manifest. If manifest creation or
+    /// the activation CAS fails, a durable `creating` record remains. A later
+    /// authoritative lookup explicitly resumes initialization; it never treats
+    /// a missing manifest beneath `active` metadata as an empty namespace.
     ///
     /// # Side Effects
     ///
-    /// Performs a conditional metadata PUT, writes an empty manifest, inserts a
-    /// registry snapshot, and emits a structured creation event.
+    /// Performs a conditional metadata PUT, writes an empty manifest, CASes the
+    /// metadata active, inserts a registry snapshot, and emits a structured
+    /// creation event.
     ///
     /// # Consistency
     ///
@@ -709,7 +722,7 @@ impl NamespaceManager {
             vector_count: 0,
             created_at: now,
             updated_at: now,
-            state: NamespaceState::Active,
+            state: NamespaceState::Creating,
             full_text_search,
             index_config,
             compaction_health: CompactionHealth::default(),
@@ -737,15 +750,96 @@ impl NamespaceManager {
             Err(e) => return Err(e),
         }
 
-        // Also initialize an empty manifest
-        let mut manifest = crate::wal::Manifest::new_at(self.clock.now());
+        // Publish the first manifest before exposing the namespace as active.
+        // Reusing the persisted creation timestamp makes a crash retry produce
+        // byte-identical generation-one history.
+        let mut manifest = crate::wal::Manifest::new_at(meta.created_at);
         manifest.write(&self.store, name).await?;
 
-        // Add to registry
-        self.insert_registry(meta.clone());
+        let meta = self.activate_created_namespace(name).await?;
+        let meta = self.ensure_active(meta)?;
 
         info!(namespace = name, dimensions, %distance_metric, "created namespace");
         Ok(meta)
+    }
+
+    /// Completes a namespace whose durable name reservation is still creating.
+    ///
+    /// A process may stop after publishing `meta.json` but before publishing the
+    /// first live manifest or activating the metadata. Only the explicit
+    /// `creating` state authorizes this recovery. An `active` namespace with a
+    /// missing manifest remains a loud integrity failure.
+    async fn recover_creating_namespace(
+        &self,
+        meta: NamespaceMetadata,
+    ) -> Result<NamespaceMetadata> {
+        if meta.state != NamespaceState::Creating {
+            return Ok(meta);
+        }
+
+        let name = meta.name.clone();
+        match crate::wal::Manifest::read(&self.store, &name).await? {
+            Some(manifest) => {
+                if manifest.version() != 1
+                    || manifest.vector_count() != 0
+                    || !manifest.uncompacted_fragments().is_empty()
+                    || manifest.segment_vector_count() != 0
+                {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "creating namespace {name} has non-bootstrap manifest generation {}",
+                        manifest.version()
+                    )));
+                }
+            }
+            None => {
+                let mut manifest = crate::wal::Manifest::new_at(meta.created_at);
+                manifest.write(&self.store, &name).await?;
+            }
+        }
+
+        let recovered = self.activate_created_namespace(&name).await?;
+        info!(
+            namespace = %name,
+            state = recovered.state.as_str(),
+            "recovered interrupted namespace creation"
+        );
+        Ok(recovered)
+    }
+
+    /// CAS-publishes an initialized namespace as active.
+    ///
+    /// The live manifest must already exist before this transition is called.
+    /// Re-reading metadata on every retry preserves a concurrent deletion, and
+    /// observing `active` makes the operation idempotent after a lost response.
+    async fn activate_created_namespace(&self, name: &str) -> Result<NamespaceMetadata> {
+        let key = NamespaceMetadata::s3_key(name);
+        for _ in 0..10 {
+            let (mut meta, etag) = self.read_metadata_versioned(name).await?;
+            match meta.state {
+                NamespaceState::Active | NamespaceState::Deleting => return Ok(meta),
+                NamespaceState::Creating => {}
+            }
+
+            meta.state = NamespaceState::Active;
+            meta.updated_at = self.clock.now();
+            let etag = etag.unwrap_or_default();
+            match self
+                .store
+                .put_if_match(&key, meta.to_bytes()?, &etag, name)
+                .await
+            {
+                Ok(()) => {
+                    self.insert_registry(meta.clone());
+                    return Ok(meta);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(ZeppelinError::ManifestConflict {
+            namespace: name.to_string(),
+        })
     }
 
     /// Idempotently creates a named namespace with optional FTS settings.
@@ -873,18 +967,20 @@ impl NamespaceManager {
                         namespace: name.to_string(),
                     });
                 }
-                if namespace_config_matches(
+                if !namespace_config_matches(
                     &existing,
                     dimensions,
                     distance_metric,
                     &full_text_search,
                     &index_config,
                 )? {
-                    return Ok(CreateNamespaceOutcome::Existing(existing));
+                    return Err(ZeppelinError::NamespaceAlreadyExists {
+                        namespace: name.to_string(),
+                    });
                 }
-                Err(ZeppelinError::NamespaceAlreadyExists {
-                    namespace: name.to_string(),
-                })
+                let existing = self.recover_creating_namespace(existing).await?;
+                let existing = self.ensure_active(existing)?;
+                Ok(CreateNamespaceOutcome::Existing(existing))
             }
             Err(e) => Err(e),
         }
@@ -951,11 +1047,11 @@ impl NamespaceManager {
     /// prefix cleanup.
     #[instrument(skip(self), fields(namespace = name))]
     pub async fn get_including_deleting(&self, name: &str) -> Result<NamespaceMetadata> {
-        if let Some(meta) = self.fresh_registry_meta(name) {
-            return Ok(meta);
-        }
-
-        self.read_metadata_from_s3(name).await
+        let meta = match self.fresh_registry_meta(name) {
+            Some(meta) => meta,
+            None => self.read_metadata_from_s3(name).await?,
+        };
+        self.recover_creating_namespace(meta).await
     }
 
     /// Loads authoritative metadata from S3 and refreshes the registry.
@@ -1090,11 +1186,11 @@ impl NamespaceManager {
         );
     }
 
-    /// Rejects a deletion tombstone while preserving active metadata.
+    /// Rejects non-active lifecycle states while preserving active metadata.
     ///
     /// # Parameters
     ///
-    /// - `meta`: Owned active-or-deleting metadata snapshot.
+    /// - `meta`: Owned lifecycle metadata snapshot.
     ///
     /// # Returns
     ///
@@ -1102,20 +1198,24 @@ impl NamespaceManager {
     ///
     /// # Errors
     ///
-    /// Returns namespace-deleting and moves the namespace name into the error
-    /// when cleanup has begun.
+    /// Returns namespace-deleting when cleanup has begun. A still-creating
+    /// namespace becomes a retryable manifest conflict; ordinary lookup paths
+    /// first attempt explicit recovery and should not normally expose it.
     ///
     /// # Examples
     ///
     /// Query setup can pass loaded metadata through this helper and fail before
     /// reading a manifest for a tombstoned namespace.
     fn ensure_active(&self, meta: NamespaceMetadata) -> Result<NamespaceMetadata> {
-        if meta.state == NamespaceState::Deleting {
-            return Err(ZeppelinError::NamespaceDeleting {
+        match meta.state {
+            NamespaceState::Active => Ok(meta),
+            NamespaceState::Creating => Err(ZeppelinError::ManifestConflict {
                 namespace: meta.name,
-            });
+            }),
+            NamespaceState::Deleting => Err(ZeppelinError::NamespaceDeleting {
+                namespace: meta.name,
+            }),
         }
-        Ok(meta)
     }
 
     /// Lists authoritative namespace metadata, optionally filtered by name prefix.
@@ -1187,6 +1287,7 @@ impl NamespaceManager {
             if seen.insert(ns_name.to_string()) {
                 match self.read_metadata_from_s3(ns_name).await {
                     Ok(meta) => {
+                        let meta = self.recover_creating_namespace(meta).await?;
                         found.insert(meta.name.clone());
                         namespaces.push(meta);
                     }
@@ -1751,6 +1852,9 @@ impl NamespaceManager {
             .iter()
             .filter_map(|entry| {
                 let meta = &entry.value().meta;
+                if meta.state == NamespaceState::Creating {
+                    return None;
+                }
                 match prefix {
                     Some(prefix) if !meta.name.starts_with(prefix) => None,
                     _ => Some(meta.clone()),

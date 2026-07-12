@@ -987,6 +987,13 @@ pub async fn compaction_loop(
         );
 
         for ns in &namespaces {
+            if ns.state == NamespaceState::Creating {
+                warn!(
+                    namespace = %ns.name,
+                    "skipping namespace whose initial manifest is not yet active"
+                );
+                continue;
+            }
             if ns.state == NamespaceState::Deleting {
                 match namespace_manager
                     .finish_delete(&ns.name, Duration::from_secs(25))
