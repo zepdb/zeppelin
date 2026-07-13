@@ -825,6 +825,9 @@ async fn execute_gc(case: &IdealCase, operation: GarbageCollectionCase) -> Optio
         GarbageCollectionCase::IdleChangedSnapshot => {
             Some(execute_idle_changed_control(case, IdleControlMutation::Snapshot).await)
         }
+        GarbageCollectionCase::ParallelSnapshotPins => {
+            Some(execute_idle_changed_control(case, IdleControlMutation::SnapshotPair).await)
+        }
         GarbageCollectionCase::IdleChangedStaging => {
             Some(execute_idle_changed_control(case, IdleControlMutation::Staging).await)
         }
@@ -946,7 +949,7 @@ async fn execute_idle_new_orphan(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle new-orphan cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 1, 6);
+    assert_full_gc_census(&sample, 0, 6, 5, 2, 1, 3);
     assert_eq!(report.candidates_marked, 1);
     assert_eq!(report.objects_deleted, 1);
     assert!(
@@ -1003,7 +1006,7 @@ async fn execute_idle_candidate_maturity(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle candidate maturity cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 1, 6);
+    assert_full_gc_census(&sample, 0, 6, 5, 2, 1, 3);
     assert_eq!(report.candidates_marked, 0);
     assert_eq!(report.objects_deleted, 1);
     assert!(
@@ -1059,7 +1062,7 @@ async fn execute_idle_pending_delete_maturity(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle pending-delete maturity cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 1, 7, 6, 4, 1, 7);
+    assert_full_gc_census(&sample, 1, 7, 6, 4, 1, 4);
     assert_eq!(report.pending_deletes_deleted, 1);
     assert_eq!(report.pending_deletes_pruned, 1);
     assert_eq!(report.pending_deletes_retained, 0);
@@ -1094,7 +1097,7 @@ async fn execute_idle_pitr_expiry(case: &IdealCase) -> IdealSample {
         .expect("ideal idle PITR-expiry cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 17, 6);
+    assert_full_gc_census(&sample, 0, 6, 5, 2, 17, 3);
     let histories = Manifest::list_history(&world.harness.store, &namespace)
         .await
         .expect("ideal idle PITR-expiry history oracle failed");
@@ -1150,7 +1153,7 @@ async fn execute_idle_staging_lease_expiry(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle staging lease-expiry cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 1, 6);
+    assert_full_gc_census(&sample, 0, 6, 5, 2, 1, 3);
     assert_eq!(report.candidates_marked, 1);
     assert_eq!(report.objects_deleted, 1);
     assert!(
@@ -1168,6 +1171,7 @@ async fn execute_idle_staging_lease_expiry(case: &IdealCase) -> IdealSample {
 #[derive(Clone, Copy)]
 enum IdleControlMutation {
     Snapshot,
+    SnapshotPair,
     Staging,
     CandidateLedger,
 }
@@ -1184,16 +1188,27 @@ async fn execute_idle_changed_control(
     prime_history_memo(&mut runner, &incarnation, world.now).await;
 
     match mutation {
-        IdleControlMutation::Snapshot => {
-            NamedSnapshot::create_at(
-                &world.store,
-                &namespace,
-                "idle-control-change",
-                manifest.version(),
-                world.now,
-            )
-            .await
-            .expect("ideal idle changed-snapshot setup failed");
+        IdleControlMutation::Snapshot | IdleControlMutation::SnapshotPair => {
+            let names: &[&str] = match mutation {
+                IdleControlMutation::Snapshot => &["idle-control-change"],
+                IdleControlMutation::SnapshotPair => {
+                    &["idle-control-change-a", "idle-control-change-b"]
+                }
+                IdleControlMutation::Staging | IdleControlMutation::CandidateLedger => {
+                    unreachable!("snapshot branch must have snapshot mutation")
+                }
+            };
+            for name in names {
+                NamedSnapshot::create_at(
+                    &world.store,
+                    &namespace,
+                    name,
+                    manifest.version(),
+                    world.now,
+                )
+                .await
+                .expect("ideal idle changed-snapshot setup failed");
+            }
         }
         IdleControlMutation::Staging => {
             write_compaction_staging(&world.store, &namespace, 777, BTreeSet::new())
@@ -1228,20 +1243,30 @@ async fn execute_idle_changed_control(
     assert_eq!(report.pending_deletes_deleted, 0);
     let sample = world.snapshot(case).await;
     match mutation {
-        IdleControlMutation::Snapshot => {
-            assert_full_gc_census(&sample, 0, 7, 5, 2, 0, 7);
-            assert!(
-                NamedSnapshot::read(&world.harness.store, &namespace, "idle-control-change")
+        IdleControlMutation::Snapshot | IdleControlMutation::SnapshotPair => {
+            let (names, expected_gets, expected_bytes): (&[&str], u64, u64) = match mutation {
+                IdleControlMutation::Snapshot => (&["idle-control-change"], 7, 375),
+                IdleControlMutation::SnapshotPair => {
+                    (&["idle-control-change-a", "idle-control-change-b"], 8, 406)
+                }
+                IdleControlMutation::Staging | IdleControlMutation::CandidateLedger => {
+                    unreachable!("snapshot branch must have snapshot mutation")
+                }
+            };
+            assert_full_gc_census(&sample, 0, expected_gets, 5, 2, 0, 4);
+            assert_eq!(sample.total_get_bytes, expected_bytes);
+            for name in names {
+                assert!(NamedSnapshot::read(&world.harness.store, &namespace, name)
                     .await
                     .expect("ideal idle changed-snapshot oracle failed")
-                    .is_some()
-            );
+                    .is_some());
+            }
         }
         IdleControlMutation::Staging => {
-            assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 6);
+            assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 3);
         }
         IdleControlMutation::CandidateLedger => {
-            assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 6);
+            assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 3);
             assert!(
                 load_gc_candidates(&world.harness.store, &namespace)
                     .await
@@ -1269,7 +1294,7 @@ async fn execute_idle_backward_clock(case: &IdealCase) -> IdealSample {
         .expect("ideal idle backward-clock cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.finish(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 6);
+    assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 3);
     sample
 }
 
@@ -1292,7 +1317,7 @@ async fn execute_idle_shorter_retention_config(case: &IdealCase) -> IdealSample 
         .expect("ideal idle shorter-retention cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 17, 6);
+    assert_full_gc_census(&sample, 0, 6, 5, 2, 17, 3);
     let histories = Manifest::list_history(&world.harness.store, &namespace)
         .await
         .expect("ideal idle shorter-retention history oracle failed");
@@ -1337,7 +1362,7 @@ async fn execute_idle_prior_partial_failure(case: &IdealCase) -> IdealSample {
         .expect("ideal idle post-failure retry failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.finish(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 6);
+    assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 3);
     sample
 }
 
@@ -1405,13 +1430,14 @@ fn assert_prune_reuse_empty_pending_census(sample: &IdealSample) {
             history_gets,
             history_get_bytes,
             sample.total_get_ops,
+            sample.total_get_bytes,
             physical_mode_ops(sample, "list_recursive"),
             physical_verb_ops(sample, "put"),
             calls,
             sample.serial_get_chain.depth,
         ),
-        (36, 18_278, 42, 5, 2, 49, 42),
-        "safe prune-result reuse must remove one immediate history refresh (18 GETs, 9,139 bytes, and one LIST) while preserving the fresh sweep refresh",
+        (36, 18_278, 42, 18_673, 5, 2, 49, 5),
+        "warm GC must preserve prune-result reuse traffic while overlapping independent retention, mark, and sweep reads",
     );
 }
 
@@ -1465,12 +1491,13 @@ async fn execute_prune_reuse_eligible_pending_refresh(case: &IdealCase) -> Ideal
         (
             history_gets,
             sample.total_get_ops,
+            sample.total_get_bytes,
             physical_mode_ops(&sample, "list_recursive"),
             physical_verb_ops(&sample, "put"),
             physical_verb_ops(&sample, "delete"),
             sample.serial_get_chain.depth,
         ),
-        (55, 61, 6, 4, 1, 61),
+        (55, 61, 28_050, 6, 4, 1, 6),
         "an eligible pending delete must retain the fresh middle history refresh before deleting",
     );
     assert_eq!(report.pending_deletes_deleted, 1);
@@ -1507,7 +1534,8 @@ async fn execute_history_memo_new_generation(case: &IdealCase) -> IdealSample {
     assert_eq!(report.pending_deletes_deleted, 0);
 
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 8);
+    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 5);
+    assert_eq!(sample.total_get_bytes, 583);
     sample
 }
 
@@ -1544,7 +1572,7 @@ async fn execute_history_memo_changed_etag(case: &IdealCase) -> IdealSample {
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 8);
+    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 5);
     sample
 }
 
@@ -1568,7 +1596,7 @@ async fn execute_history_memo_missing_etag(case: &IdealCase) -> IdealSample {
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 8);
+    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 5);
     sample
 }
 
@@ -1667,7 +1695,7 @@ async fn execute_history_memo_unpublished_orphan_overwrite(case: &IdealCase) -> 
     let sample = world.snapshot(case).await;
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
-    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 8);
+    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 5);
     assert!(
         world
             .harness
@@ -2275,7 +2303,22 @@ async fn execute_active_staging(case: &IdealCase, shape: ActiveStagingShape) -> 
             assert_eq!(observed, expected);
         }
     }
-    world.finish(case).await
+    let sample = world.finish(case).await;
+    if matches!(shape, ActiveStagingShape::MixedTokens) {
+        assert_eq!(
+            (
+                sample.total_get_ops,
+                sample.total_get_bytes,
+                physical_mode_ops(&sample, "list_recursive"),
+                sample.serial_get_chain.depth,
+            ),
+            (3, 575, 1, 2),
+            "staging records must retain their exact census while sharing one bounded GET stage after the lease",
+        );
+        assert_eq!(physical_verb_ops(&sample, "put"), 0);
+        assert_eq!(physical_verb_ops(&sample, "delete"), 0);
+    }
+    sample
 }
 
 fn staged_keys(namespace: &str) -> BTreeSet<String> {
@@ -2423,6 +2466,7 @@ mod tests {
                 "gc.idle_pitr_expiry",
                 "gc.idle_staging_lease_expiry",
                 "gc.idle_changed_snapshot",
+                "gc.parallel_snapshot_pins",
                 "gc.idle_changed_staging",
                 "gc.idle_changed_candidate_ledger",
                 "gc.idle_backward_clock",

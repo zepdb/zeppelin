@@ -483,6 +483,7 @@ struct HistoryMetadataControlStore {
     inner: Arc<dyn ObjectStore>,
     strip_list_version_prefixes: Arc<Mutex<Vec<Path>>>,
     fail_next_get: Arc<Mutex<Option<String>>>,
+    miss_next_get: Arc<Mutex<Option<String>>>,
     late_list_mutation: Arc<Mutex<Option<LateListMutation>>>,
     list_calls: Arc<AtomicUsize>,
     delete_calls: Arc<AtomicUsize>,
@@ -493,6 +494,7 @@ struct HistoryMetadataControlHandle {
     default_strip_prefix: Path,
     strip_list_version_prefixes: Arc<Mutex<Vec<Path>>>,
     fail_next_get: Arc<Mutex<Option<String>>>,
+    miss_next_get: Arc<Mutex<Option<String>>>,
     late_list_mutation: Arc<Mutex<Option<LateListMutation>>>,
     list_calls: Arc<AtomicUsize>,
     delete_calls: Arc<AtomicUsize>,
@@ -527,6 +529,13 @@ impl HistoryMetadataControlHandle {
             .fail_next_get
             .lock()
             .expect("history GET fault mutex poisoned") = Some(key);
+    }
+
+    fn miss_next_get(&self, key: String) {
+        *self
+            .miss_next_get
+            .lock()
+            .expect("history missing-GET fault mutex poisoned") = Some(key);
     }
 
     fn put_on_next_list(&self, prefix: &str, key: &str, body: Bytes) {
@@ -582,6 +591,7 @@ impl HistoryMetadataControlStore {
             .expect("history control prefix must be a valid object path");
         let strip_list_version_prefixes = Arc::new(Mutex::new(Vec::new()));
         let fail_next_get = Arc::new(Mutex::new(None));
+        let miss_next_get = Arc::new(Mutex::new(None));
         let late_list_mutation = Arc::new(Mutex::new(None));
         let list_calls = Arc::new(AtomicUsize::new(0));
         let delete_calls = Arc::new(AtomicUsize::new(0));
@@ -589,6 +599,7 @@ impl HistoryMetadataControlStore {
             default_strip_prefix,
             strip_list_version_prefixes: Arc::clone(&strip_list_version_prefixes),
             fail_next_get: Arc::clone(&fail_next_get),
+            miss_next_get: Arc::clone(&miss_next_get),
             late_list_mutation: Arc::clone(&late_list_mutation),
             list_calls: Arc::clone(&list_calls),
             delete_calls: Arc::clone(&delete_calls),
@@ -597,6 +608,7 @@ impl HistoryMetadataControlStore {
             inner: store.inner(),
             strip_list_version_prefixes,
             fail_next_get,
+            miss_next_get,
             late_list_mutation,
             list_calls,
             delete_calls,
@@ -649,6 +661,24 @@ impl ObjectStore for HistoryMetadataControlStore {
                 source: Box::new(std::io::Error::other(
                     "injected one-shot history GET failure",
                 )),
+            });
+        }
+        let should_be_missing = {
+            let mut miss_next_get = self
+                .miss_next_get
+                .lock()
+                .expect("history missing-GET fault mutex poisoned");
+            if miss_next_get.as_deref() == Some(location.as_ref()) {
+                miss_next_get.take();
+                true
+            } else {
+                false
+            }
+        };
+        if should_be_missing {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "injected missing history body".into(),
             });
         }
         self.inner.get_opts(location, options).await
@@ -2447,6 +2477,88 @@ async fn gc_runner_failed_refresh_does_not_commit_partial_memo() {
     );
 
     harness.cleanup().await;
+}
+
+#[derive(Clone, Copy)]
+enum LateHistoryBodyFailure {
+    Corrupt,
+    Missing,
+}
+
+async fn assert_late_history_body_failure_prevents_prune_deletes(failure: LateHistoryBodyFailure) {
+    let harness = TestHarness::new().await;
+    let suffix = match failure {
+        LateHistoryBodyFailure::Corrupt => "corrupt",
+        LateHistoryBodyFailure::Missing => "missing",
+    };
+    let namespace = harness.key(&format!("storage-gc-runner-prune-barrier-{suffix}"));
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    let first_key = Manifest::history_key(&namespace, 1);
+    let second_key = Manifest::history_key(&namespace, 2);
+    let third_key = Manifest::history_key(&namespace, 3);
+    seed_manifest_history(&store, &namespace, 3).await;
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, history_prefix.clone());
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(counted_store, memo_gc());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+
+    put_history_revision(&store, &namespace, 1, 31).await;
+    put_history_revision(&store, &namespace, 2, 32).await;
+    match failure {
+        LateHistoryBodyFailure::Corrupt => {
+            store
+                .put(&third_key, Bytes::from_static(b"corrupt retained history"))
+                .await
+                .unwrap();
+        }
+        LateHistoryBodyFailure::Missing => {
+            put_history_revision(&store, &namespace, 3, 33).await;
+            control.miss_next_get(third_key.clone());
+        }
+    }
+
+    let mut pruning_gc = memo_gc();
+    pruning_gc.manifest_history_keep_count = 1;
+    runner.update_config(pruning_gc);
+    let report = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+
+    assert_eq!(report, GcCycleReport::default());
+    assert_eq!(counter.gets_matching(&history_prefix), 3);
+    assert_eq!(counter.gets_matching(&first_key), 1);
+    assert_eq!(counter.gets_matching(&second_key), 1);
+    assert_eq!(counter.gets_matching(&third_key), 1);
+    assert_eq!(
+        control.delete_calls(),
+        0,
+        "no prunable generation may be deleted before every retention body validates"
+    );
+    assert_s3_object_exists(&store, &first_key).await;
+    assert_s3_object_exists(&store, &second_key).await;
+    assert_s3_object_exists(&store, &third_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_warm_corrupt_history_aborts_before_any_prune_delete() {
+    assert_late_history_body_failure_prevents_prune_deletes(LateHistoryBodyFailure::Corrupt).await;
+}
+
+#[tokio::test]
+async fn gc_runner_warm_missing_history_aborts_before_any_prune_delete() {
+    assert_late_history_body_failure_prevents_prune_deletes(LateHistoryBodyFailure::Missing).await;
 }
 
 #[tokio::test]

@@ -217,6 +217,7 @@ pub(crate) enum GarbageCollectionCase {
     IdlePitrExpiry,
     IdleStagingLeaseExpiry,
     IdleChangedSnapshot,
+    ParallelSnapshotPins,
     IdleChangedStaging,
     IdleChangedCandidateLedger,
     IdleBackwardClock,
@@ -737,6 +738,11 @@ pub(crate) const IDEAL_CASES: &[IdealCase] = &[
         "gc.idle_changed_snapshot",
         IdealCaseGroup::GarbageCollection,
         IdealOperation::GarbageCollection(GarbageCollectionCase::IdleChangedSnapshot),
+    ),
+    ideal_case(
+        "gc.parallel_snapshot_pins",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::ParallelSnapshotPins),
     ),
     ideal_case(
         "gc.idle_changed_staging",

@@ -2303,21 +2303,30 @@ impl NamedSnapshot {
         let prefix = Self::prefix(namespace);
         let mut snapshots = Vec::new();
         for object in store.list_prefix_meta(&prefix).await? {
-            let name = snapshot_name_from_key(namespace, &object.key)?;
-            let data = store.get(&object.key).await?;
-            let snapshot = Self::from_bytes(&data)?;
-            snapshots.push(NamedSnapshotObservation {
-                snapshot: NamedSnapshotRef {
-                    name,
-                    key: object.key.clone(),
-                    generation: snapshot.generation,
-                    created_at: snapshot.created_at,
-                },
-                object,
-            });
+            snapshots.push(Self::read_listed_observation(store, namespace, object).await?);
         }
         snapshots.sort_by(|a, b| a.snapshot.name.cmp(&b.snapshot.name));
         Ok(snapshots)
+    }
+
+    /// Reads and decodes one pin discovered by a metadata-preserving LIST.
+    pub(crate) async fn read_listed_observation(
+        store: &ZeppelinStore,
+        namespace: &str,
+        object: ListedObject,
+    ) -> Result<NamedSnapshotObservation> {
+        let name = snapshot_name_from_key(namespace, &object.key)?;
+        let data = store.get(&object.key).await?;
+        let snapshot = Self::from_bytes(&data)?;
+        Ok(NamedSnapshotObservation {
+            snapshot: NamedSnapshotRef {
+                name,
+                key: object.key.clone(),
+                generation: snapshot.generation,
+                created_at: snapshot.created_at,
+            },
+            object,
+        })
     }
 
     /// Deletes a named pin, allowing its generation to age out of retention.

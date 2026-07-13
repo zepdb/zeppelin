@@ -1102,6 +1102,21 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
         ideal_case("gc.idle_changed_snapshot"),
     ),
     path(
+        "catalog.gc.parallel_snapshot_pins",
+        "src/compaction/gc.rs:GcRunner::run_cycle_at",
+        &[
+            StoreMethod::Get,
+            StoreMethod::ListPrefixMeta,
+            StoreMethod::Put,
+        ],
+        &[
+            PhysicalVariant::GetFull,
+            PhysicalVariant::ListRecursive,
+            PhysicalVariant::PutOverwrite,
+        ],
+        ideal_case("gc.parallel_snapshot_pins"),
+    ),
+    path(
         "catalog.gc.idle_changed_staging",
         "src/compaction/gc.rs:GcRunner::run_cycle_at",
         &[

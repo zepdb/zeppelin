@@ -104,6 +104,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use ulid::Ulid;
@@ -131,6 +133,21 @@ const GC_CANDIDATE_STORE_VERSION: u32 = 1;
 
 /// Maximum fresh-read/CAS attempts made while pruning `pending_deletes`.
 const GC_MANIFEST_CAS_RETRIES: usize = 10;
+
+/// Maximum number of reads polled concurrently within one variable-size GC batch.
+const GC_READ_BATCH_CONCURRENCY: usize = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GcReadMode {
+    Sequential,
+    WarmBounded,
+}
+
+impl GcReadMode {
+    fn is_bounded(self) -> bool {
+        self == Self::WarmBounded
+    }
+}
 
 /// Process-local discriminator for one lifetime of a namespace name.
 ///
@@ -1678,11 +1695,13 @@ pub fn mark_gc_candidates(
 /// A cold cycle includes the retention scan, a complete post-prune history
 /// refresh, and the final sweep refresh. A warm runner omits the middle refresh
 /// when its pending queue is empty, young, or already protected by prune roots.
-/// Both paths also perform one namespace LIST, candidate-ledger GET plus one or
-/// two full PUTs, at least two live-manifest GETs for mark and sweep, two
-/// active-staging scans, and sequential artifact DELETEs. Network roundtrips
-/// grow with retained generations, staging records, pending entries, and mature
-/// candidates; candidates are not deleted concurrently.
+/// It also overlaps independent retention LISTs and bounded body reads, then
+/// overlaps the namespace, candidate-ledger, manifest, and staging inputs to
+/// mark. Sweep overlaps its manifest and staging inputs before taking the final
+/// history observation. Results remain inspected in the former sequential error
+/// order. The one-shot path keeps its original request sequence. Both paths
+/// still perform one or two candidate-ledger PUTs and sequential artifact
+/// DELETEs; those writes are not part of the read fan-out.
 ///
 /// # Examples
 ///
@@ -1834,15 +1853,30 @@ async fn load_history_observation(
     observation: &ManifestHistoryObservation,
     prior: Option<&BTreeMap<String, CachedHistory>>,
 ) -> Result<(Manifest, Option<CachedHistory>)> {
-    if let Some(listed_version) = observation.storage_version.as_ref() {
-        if listed_version.etag().is_some() {
-            if let Some(cached) = prior
-                .and_then(|entries| entries.get(&observation.history.key))
-                .filter(|cached| cached.storage_version == *listed_version)
-            {
-                return Ok((cached.manifest.clone(), Some(cached.clone())));
-            }
-        }
+    let cached = matching_cached_history(observation, prior);
+    load_history_observation_owned(store, namespace, observation, cached).await
+}
+
+fn matching_cached_history(
+    observation: &ManifestHistoryObservation,
+    prior: Option<&BTreeMap<String, CachedHistory>>,
+) -> Option<CachedHistory> {
+    let listed_version = observation.storage_version.as_ref()?;
+    listed_version.etag()?;
+    prior
+        .and_then(|entries| entries.get(&observation.history.key))
+        .filter(|cached| cached.storage_version == *listed_version)
+        .cloned()
+}
+
+async fn load_history_observation_owned(
+    store: &ZeppelinStore,
+    namespace: &str,
+    observation: &ManifestHistoryObservation,
+    cached: Option<CachedHistory>,
+) -> Result<(Manifest, Option<CachedHistory>)> {
+    if let Some(cached) = cached {
+        return Ok((cached.manifest.clone(), Some(cached)));
     }
 
     let (bytes, get_etag) = store.get_with_meta(&observation.history.key).await?;
@@ -1866,6 +1900,53 @@ async fn load_history_observation(
     Ok((manifest, cacheable))
 }
 
+async fn collect_bounded_ordered<T>(futures: Vec<BoxFuture<'static, Result<T>>>) -> Vec<Result<T>> {
+    futures::stream::iter(futures)
+        .buffered(GC_READ_BATCH_CONCURRENCY)
+        .collect()
+        .await
+}
+
+async fn load_history_observations_bounded(
+    store: &ZeppelinStore,
+    namespace: &str,
+    observations: &[ManifestHistoryObservation],
+    prior: Option<&BTreeMap<String, CachedHistory>>,
+) -> Vec<Result<(Manifest, Option<CachedHistory>)>> {
+    let futures = observations
+        .iter()
+        .map(|observation| {
+            let store = store.clone();
+            let namespace = namespace.to_string();
+            let observation = observation.clone();
+            let cached = matching_cached_history(&observation, prior);
+            async move {
+                load_history_observation_owned(&store, &namespace, &observation, cached).await
+            }
+            .boxed()
+        })
+        .collect();
+    collect_bounded_ordered(futures).await
+}
+
+async fn load_snapshot_observations_bounded(
+    store: &ZeppelinStore,
+    namespace: &str,
+    mut objects: Vec<ListedObject>,
+) -> Vec<Result<NamedSnapshotObservation>> {
+    objects.sort_by(|left, right| left.key.cmp(&right.key));
+    let futures = objects
+        .into_iter()
+        .map(|object| {
+            let store = store.clone();
+            let namespace = namespace.to_string();
+            async move { NamedSnapshot::read_listed_observation(&store, &namespace, object).await }
+                .boxed()
+        })
+        .collect();
+    collect_bounded_ordered(futures).await
+}
+
 async fn load_history_snapshot(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1874,13 +1955,25 @@ async fn load_history_snapshot(
     let observations = Manifest::list_history_observations(store, namespace).await?;
     let mut entries = Vec::with_capacity(observations.len());
     let mut cacheable = BTreeMap::new();
-    for observation in observations {
-        let (manifest, cached) =
-            load_history_observation(store, namespace, &observation, prior).await?;
-        if let Some(cached) = cached {
-            cacheable.insert(observation.history.key.clone(), cached);
+    if prior.is_some() {
+        let loaded =
+            load_history_observations_bounded(store, namespace, &observations, prior).await;
+        for (observation, result) in observations.into_iter().zip(loaded) {
+            let (manifest, cached) = result?;
+            if let Some(cached) = cached {
+                cacheable.insert(observation.history.key.clone(), cached);
+            }
+            entries.push((observation, manifest));
         }
-        entries.push((observation, manifest));
+    } else {
+        for observation in observations {
+            let (manifest, cached) =
+                load_history_observation(store, namespace, &observation, prior).await?;
+            if let Some(cached) = cached {
+                cacheable.insert(observation.history.key.clone(), cached);
+            }
+            entries.push((observation, manifest));
+        }
     }
     Ok(HistorySnapshot { entries, cacheable })
 }
@@ -1897,6 +1990,10 @@ async fn prune_history_with_memo_at(
             "gc.manifest_history_keep_count must be greater than zero".to_string(),
         ));
     }
+    if prior.is_some() {
+        return prune_history_with_memo_parallel_at(store, namespace, retention, now, prior).await;
+    }
+
     let observations = Manifest::list_history_observations(store, namespace).await?;
     let keep_from = observations.len().saturating_sub(retention.keep_count);
     let snapshot_observations = NamedSnapshot::list_observations(store, namespace).await?;
@@ -1930,6 +2027,70 @@ async fn prune_history_with_memo_at(
     Ok(MemoizedHistoryPruneResult {
         result: ManifestHistoryPruneResult {
             pruned,
+            retained_manifests,
+        },
+        retained_history_observations,
+        snapshot_observations,
+    })
+}
+
+async fn prune_history_with_memo_parallel_at(
+    store: &ZeppelinStore,
+    namespace: &str,
+    retention: ManifestHistoryRetention,
+    now: DateTime<Utc>,
+    prior: Option<&BTreeMap<String, CachedHistory>>,
+) -> Result<MemoizedHistoryPruneResult> {
+    let snapshot_prefix = NamedSnapshot::prefix(namespace);
+    let (history_result, snapshot_result) = tokio::join!(
+        Manifest::list_history_observations(store, namespace),
+        store.list_prefix_meta(&snapshot_prefix),
+    );
+    let observations = history_result?;
+    let snapshot_objects = snapshot_result?;
+    let keep_from = observations.len().saturating_sub(retention.keep_count);
+
+    let (history_results, snapshot_results) = tokio::join!(
+        load_history_observations_bounded(store, namespace, &observations, prior),
+        load_snapshot_observations_bounded(store, namespace, snapshot_objects),
+    );
+    let mut snapshot_observations = snapshot_results.into_iter().collect::<Result<Vec<_>>>()?;
+    let history_entries = history_results.into_iter().collect::<Result<Vec<_>>>()?;
+    snapshot_observations.sort_by(|left, right| left.snapshot.name.cmp(&right.snapshot.name));
+    let pinned_generations = snapshot_observations
+        .iter()
+        .map(|observation| observation.snapshot.generation)
+        .collect::<BTreeSet<_>>();
+    let retention_window = retention
+        .pitr_retention_secs
+        .saturating_add(retention.skew_slop_secs);
+    let mut retained_manifests = Vec::new();
+    let mut retained_history_observations = Vec::new();
+    let mut prunable = Vec::new();
+
+    for (index, (observation, (manifest, _))) in
+        observations.into_iter().zip(history_entries).enumerate()
+    {
+        let keep_by_count = index >= keep_from;
+        let keep_by_pin = pinned_generations.contains(&observation.history.version);
+        let keep_by_time = retention.pitr_retention_secs > 0
+            && now.signed_duration_since(manifest.updated_at).num_seconds()
+                <= retention_window as i64;
+        if keep_by_count || keep_by_time || keep_by_pin {
+            retained_history_observations.push(observation);
+            retained_manifests.push(manifest);
+        } else {
+            prunable.push(observation.history.key);
+        }
+    }
+
+    for key in &prunable {
+        store.delete(key).await?;
+    }
+
+    Ok(MemoizedHistoryPruneResult {
+        result: ManifestHistoryPruneResult {
+            pruned: prunable.len(),
             retained_manifests,
         },
         retained_history_observations,
@@ -2024,6 +2185,128 @@ fn deadline_after_secs(
     let seconds = i64::try_from(seconds).map_err(|_| ())?;
     base.checked_add_signed(chrono::Duration::seconds(seconds))
         .ok_or(())
+}
+
+struct MarkReadInputs {
+    listed_objects: Vec<ListedObject>,
+    persisted_candidates: Vec<GcCandidate>,
+    manifest: Manifest,
+    staging: ActiveStagingObservation,
+}
+
+enum MarkReadFailure {
+    NamespaceList(ZeppelinError),
+    CandidateLedger(ZeppelinError),
+    ManifestMissing,
+    Manifest(ZeppelinError),
+    Staging(ZeppelinError),
+}
+
+fn assemble_mark_read_inputs(
+    listed_objects: Result<Vec<ListedObject>>,
+    persisted_candidates: Result<Vec<GcCandidate>>,
+    manifest: Result<Option<Manifest>>,
+    staging: Result<ActiveStagingObservation>,
+) -> std::result::Result<MarkReadInputs, MarkReadFailure> {
+    let listed_objects = listed_objects.map_err(MarkReadFailure::NamespaceList)?;
+    let persisted_candidates = persisted_candidates.map_err(MarkReadFailure::CandidateLedger)?;
+    let manifest = manifest
+        .map_err(MarkReadFailure::Manifest)?
+        .ok_or(MarkReadFailure::ManifestMissing)?;
+    let staging = staging.map_err(MarkReadFailure::Staging)?;
+    Ok(MarkReadInputs {
+        listed_objects,
+        persisted_candidates,
+        manifest,
+        staging,
+    })
+}
+
+async fn load_mark_read_inputs(
+    store: &ZeppelinStore,
+    namespace: &str,
+    now: DateTime<Utc>,
+    read_mode: GcReadMode,
+) -> std::result::Result<MarkReadInputs, MarkReadFailure> {
+    let prefix = format!("{namespace}/");
+    if read_mode.is_bounded() {
+        let (listed, candidates, manifest, staging) = tokio::join!(
+            store.list_prefix_meta(&prefix),
+            load_gc_candidates(store, namespace),
+            read_manifest_for_gc(store, namespace),
+            active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::WarmBounded,),
+        );
+        assemble_mark_read_inputs(listed, candidates, manifest, staging)
+    } else {
+        let listed = store
+            .list_prefix_meta(&prefix)
+            .await
+            .map_err(MarkReadFailure::NamespaceList)?;
+        let candidates = load_gc_candidates(store, namespace)
+            .await
+            .map_err(MarkReadFailure::CandidateLedger)?;
+        let manifest = read_manifest_for_gc(store, namespace)
+            .await
+            .map_err(MarkReadFailure::Manifest)?
+            .ok_or(MarkReadFailure::ManifestMissing)?;
+        let staging =
+            active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::Sequential)
+                .await
+                .map_err(MarkReadFailure::Staging)?;
+        Ok(MarkReadInputs {
+            listed_objects: listed,
+            persisted_candidates: candidates,
+            manifest,
+            staging,
+        })
+    }
+}
+
+struct SweepReadInputs {
+    manifest: Manifest,
+    staging: ActiveStagingObservation,
+}
+
+enum SweepReadFailure {
+    ManifestMissing,
+    Manifest(ZeppelinError),
+    Staging(ZeppelinError),
+}
+
+fn assemble_sweep_read_inputs(
+    manifest: Result<Option<Manifest>>,
+    staging: Result<ActiveStagingObservation>,
+) -> std::result::Result<SweepReadInputs, SweepReadFailure> {
+    let manifest = manifest
+        .map_err(SweepReadFailure::Manifest)?
+        .ok_or(SweepReadFailure::ManifestMissing)?;
+    let staging = staging.map_err(SweepReadFailure::Staging)?;
+    Ok(SweepReadInputs { manifest, staging })
+}
+
+async fn load_sweep_read_inputs(
+    store: &ZeppelinStore,
+    namespace: &str,
+    now: DateTime<Utc>,
+    read_mode: GcReadMode,
+) -> std::result::Result<SweepReadInputs, SweepReadFailure> {
+    if read_mode.is_bounded() {
+        let (manifest, staging) = tokio::join!(
+            read_manifest_for_gc(store, namespace),
+            active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::WarmBounded,),
+        );
+        assemble_sweep_read_inputs(manifest, staging)
+    } else {
+        let manifest = read_manifest_for_gc(store, namespace)
+            .await
+            .map_err(SweepReadFailure::Manifest)?
+            .ok_or(SweepReadFailure::ManifestMissing)?;
+        let staging =
+            active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::Sequential)
+                .await
+                .map_err(SweepReadFailure::Staging)?;
+        Ok(SweepReadInputs { manifest, staging })
+    }
 }
 
 /// Runs one stateless GC cycle using the current wall clock.
@@ -2168,11 +2451,36 @@ async fn run_gc_cycle_at_inner(
         ..GcCycleReport::default()
     };
 
-    let prefix = format!("{namespace}/");
-    let listed_objects = match store.list_prefix_meta(&prefix).await {
-        Ok(objects) => objects,
-        Err(e) => {
+    let read_mode = if prior_entries.is_some() {
+        GcReadMode::WarmBounded
+    } else {
+        GcReadMode::Sequential
+    };
+    let MarkReadInputs {
+        listed_objects,
+        persisted_candidates: persisted,
+        manifest: mark_manifest,
+        staging: mark_staging,
+    } = match load_mark_read_inputs(store, namespace, now, read_mode).await {
+        Ok(inputs) => inputs,
+        Err(MarkReadFailure::NamespaceList(e)) => {
             warn!(namespace, error = %e, "gc listing failed; aborting cycle");
+            return Ok(GcCycleOutcome::incomplete(base_report));
+        }
+        Err(MarkReadFailure::CandidateLedger(e)) => {
+            warn!(namespace, error = %e, "gc candidate load failed; aborting cycle");
+            return Ok(GcCycleOutcome::incomplete(base_report));
+        }
+        Err(MarkReadFailure::ManifestMissing) => {
+            warn!(namespace, "gc manifest missing; skipping namespace");
+            return Ok(GcCycleOutcome::incomplete(base_report));
+        }
+        Err(MarkReadFailure::Manifest(e)) => {
+            warn!(namespace, error = %e, "gc manifest read failed; aborting cycle");
+            return Ok(GcCycleOutcome::incomplete(base_report));
+        }
+        Err(MarkReadFailure::Staging(e)) => {
+            warn!(namespace, error = %e, "gc active staging read failed; aborting cycle");
             return Ok(GcCycleOutcome::incomplete(base_report));
         }
     };
@@ -2181,33 +2489,6 @@ async fn run_gc_cycle_at_inner(
         .map(|object| object.key.clone())
         .collect::<BTreeSet<_>>();
     let mut completed_inventory = InventoryFingerprint::from_listed(listed_objects);
-
-    let persisted = match load_gc_candidates(store, namespace).await {
-        Ok(candidates) => candidates,
-        Err(e) => {
-            warn!(namespace, error = %e, "gc candidate load failed; aborting cycle");
-            return Ok(GcCycleOutcome::incomplete(base_report));
-        }
-    };
-
-    let mark_manifest = match read_manifest_for_gc(store, namespace).await {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => {
-            warn!(namespace, "gc manifest missing; skipping namespace");
-            return Ok(GcCycleOutcome::incomplete(base_report));
-        }
-        Err(e) => {
-            warn!(namespace, error = %e, "gc manifest read failed; aborting cycle");
-            return Ok(GcCycleOutcome::incomplete(base_report));
-        }
-    };
-    let mark_staging = match active_staging_observation_at(store, namespace, now).await {
-        Ok(staging) => staging,
-        Err(e) => {
-            warn!(namespace, error = %e, "gc active staging read failed; aborting cycle");
-            return Ok(GcCycleOutcome::incomplete(base_report));
-        }
-    };
     let mark_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         &mark_manifest,
@@ -2250,9 +2531,12 @@ async fn run_gc_cycle_at_inner(
         .with_label_values(&[namespace])
         .inc_by(candidates_marked as u64);
 
-    let sweep_manifest = match read_manifest_for_gc(store, namespace).await {
-        Ok(Some(manifest)) => manifest,
-        Ok(None) => {
+    let SweepReadInputs {
+        manifest: sweep_manifest,
+        staging: sweep_staging,
+    } = match load_sweep_read_inputs(store, namespace, now, read_mode).await {
+        Ok(inputs) => inputs,
+        Err(SweepReadFailure::ManifestMissing) => {
             warn!(
                 namespace,
                 "gc manifest missing before sweep; skipping deletes"
@@ -2262,17 +2546,14 @@ async fn run_gc_cycle_at_inner(
             report.candidates_skipped = unknown_shape_skips;
             return Ok(GcCycleOutcome::incomplete(report));
         }
-        Err(e) => {
+        Err(SweepReadFailure::Manifest(e)) => {
             warn!(namespace, error = %e, "gc manifest re-read failed; skipping deletes");
             let mut report = base_report;
             report.candidates_marked = candidates_marked;
             report.candidates_skipped = unknown_shape_skips;
             return Ok(GcCycleOutcome::incomplete(report));
         }
-    };
-    let sweep_staging = match active_staging_observation_at(store, namespace, now).await {
-        Ok(staging) => staging,
-        Err(e) => {
+        Err(SweepReadFailure::Staging(e)) => {
             warn!(namespace, error = %e, "gc active staging re-read failed; skipping sweep");
             let mut report = base_report;
             report.candidates_marked = candidates_marked;
@@ -3019,7 +3300,9 @@ pub async fn clear_compaction_staging(
 ///
 /// A missing/expired lease costs one GET. An active lease costs one lease GET,
 /// one staging-prefix LIST, and one full GET plus JSON decode per listed staging
-/// object, processed sequentially.
+/// object. Record bodies are read with bounded concurrency after the lease and
+/// LIST succeed, collected in key order, and all outcomes are inspected before
+/// an error is returned.
 ///
 /// # Examples
 ///
@@ -3056,6 +3339,15 @@ async fn active_staging_observation_at(
     namespace: &str,
     now: DateTime<Utc>,
 ) -> Result<ActiveStagingObservation> {
+    active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::WarmBounded).await
+}
+
+async fn active_staging_observation_at_with_mode(
+    store: &ZeppelinStore,
+    namespace: &str,
+    now: DateTime<Utc>,
+    read_mode: GcReadMode,
+) -> Result<ActiveStagingObservation> {
     let lease_data = match store.get(&format!("{namespace}/lease.json")).await {
         Ok(data) => data,
         Err(crate::error::ZeppelinError::NotFound { .. }) => {
@@ -3076,11 +3368,34 @@ async fn active_staging_observation_at(
 
     let mut staged = BTreeSet::new();
     let prefix = format!("{namespace}/_staging/");
-    for key in store.list_prefix(&prefix).await? {
-        let data = store.get(&key).await?;
-        let entry: CompactionStaging = serde_json::from_slice(&data)?;
-        if entry.fencing_token == lease.fencing_token {
-            staged.extend(entry.keys);
+    let mut keys = store.list_prefix(&prefix).await?;
+    if read_mode.is_bounded() {
+        keys.sort();
+        let futures = keys
+            .into_iter()
+            .map(|key| {
+                let store = store.clone();
+                async move {
+                    let data = store.get(&key).await?;
+                    serde_json::from_slice::<CompactionStaging>(&data).map_err(Into::into)
+                }
+                .boxed()
+            })
+            .collect();
+        let results = collect_bounded_ordered(futures).await;
+        for result in results {
+            let entry = result?;
+            if entry.fencing_token == lease.fencing_token {
+                staged.extend(entry.keys);
+            }
+        }
+    } else {
+        for key in keys {
+            let data = store.get(&key).await?;
+            let entry: CompactionStaging = serde_json::from_slice(&data)?;
+            if entry.fencing_token == lease.fencing_token {
+                staged.extend(entry.keys);
+            }
         }
     }
     let lease_expires_at = (!staged.is_empty()).then_some(lease.expires_at);
@@ -3106,7 +3421,9 @@ mod tests {
 
     use chrono::Utc;
     use object_store::memory::InMemory;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
     use ulid::Ulid;
 
     use crate::fts::global_index::global_fts_key;
@@ -3127,6 +3444,114 @@ mod tests {
 
     /// Stable namespace prefix used to make expected artifact keys readable.
     const NS: &str = "gc_ns";
+
+    #[tokio::test]
+    async fn bounded_read_collection_drains_all_futures_and_preserves_input_order() {
+        let count = GC_READ_BATCH_CONCURRENCY + 3;
+        let barrier = Arc::new(tokio::sync::Barrier::new(GC_READ_BATCH_CONCURRENCY));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let futures = (0..count)
+            .map(|index| {
+                let barrier = Arc::clone(&barrier);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let completed = Arc::clone(&completed);
+                async move {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now_active, Ordering::SeqCst);
+                    if index < GC_READ_BATCH_CONCURRENCY {
+                        barrier.wait().await;
+                    }
+                    if index == 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    match index {
+                        1 => Err(ZeppelinError::Serialization(
+                            "lower-index failure".to_string(),
+                        )),
+                        2 => Err(ZeppelinError::Serialization(
+                            "higher-index failure".to_string(),
+                        )),
+                        _ => Ok(index),
+                    }
+                }
+                .boxed()
+            })
+            .collect();
+
+        let results = collect_bounded_ordered(futures).await;
+        assert_eq!(results.len(), count);
+        assert_eq!(completed.load(Ordering::SeqCst), count);
+        assert_eq!(peak.load(Ordering::SeqCst), GC_READ_BATCH_CONCURRENCY);
+        for (index, result) in results.iter().enumerate() {
+            match index {
+                1 => assert!(result
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("lower-index failure")),
+                2 => assert!(result
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("higher-index failure")),
+                _ => assert_eq!(*result.as_ref().unwrap(), index),
+            }
+        }
+        let error = results.into_iter().collect::<Result<Vec<_>>>().unwrap_err();
+        assert!(error.to_string().contains("lower-index failure"));
+    }
+
+    #[test]
+    fn joined_phase_errors_keep_the_former_sequential_priority() {
+        let error = |label: &str| ZeppelinError::Serialization(label.to_string());
+
+        let mark = assemble_mark_read_inputs(
+            Err(error("namespace-list")),
+            Err(error("candidate-ledger")),
+            Err(error("manifest")),
+            Err(error("staging")),
+        );
+        assert!(matches!(
+            mark,
+            Err(MarkReadFailure::NamespaceList(error))
+                if error.to_string().contains("namespace-list")
+        ));
+
+        let mark = assemble_mark_read_inputs(
+            Ok(Vec::new()),
+            Err(error("candidate-ledger")),
+            Err(error("manifest")),
+            Err(error("staging")),
+        );
+        assert!(matches!(
+            mark,
+            Err(MarkReadFailure::CandidateLedger(error))
+                if error.to_string().contains("candidate-ledger")
+        ));
+
+        let mark = assemble_mark_read_inputs(
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(None),
+            Err(error("staging")),
+        );
+        assert!(matches!(mark, Err(MarkReadFailure::ManifestMissing)));
+
+        let sweep = assemble_sweep_read_inputs(Err(error("manifest")), Err(error("staging")));
+        assert!(matches!(
+            sweep,
+            Err(SweepReadFailure::Manifest(error))
+                if error.to_string().contains("manifest")
+        ));
+
+        let sweep = assemble_sweep_read_inputs(Ok(None), Err(error("staging")));
+        assert!(matches!(sweep, Err(SweepReadFailure::ManifestMissing)));
+    }
 
     /// Builds the smallest manifest fragment descriptor useful to reachability tests.
     ///
