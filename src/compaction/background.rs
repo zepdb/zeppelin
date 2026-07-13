@@ -146,6 +146,7 @@ use crate::fts::FtsFieldConfig;
 use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
 use crate::namespace::NamespaceManager;
 use crate::storage::ZeppelinStore;
+use crate::wal::FragmentCachePolicy;
 use crate::wal::Lease;
 use crate::wal::LeaseManager;
 use crate::wal::Manifest;
@@ -440,6 +441,8 @@ impl LeaseHeartbeat {
 ///   namespace discovery, but the compactor re-reads authoritative state.
 /// - `fts_configs`: Full-text field definitions from the namespace metadata
 ///   snapshot used for this cycle.
+/// - `fragment_cache`: Immutable WAL-byte cache behavior for the compaction
+///   read. Production supplies read-only access; direct tools may bypass it.
 ///
 /// # Returns
 ///
@@ -492,9 +495,18 @@ pub async fn compact_namespace_under_lease(
     lease_manager: &Arc<LeaseManager>,
     namespace: &str,
     fts_configs: &HashMap<String, FtsFieldConfig>,
+    fragment_cache: FragmentCachePolicy<'_>,
 ) -> Result<CompactionResult> {
     let lease = lease_manager.acquire(namespace).await?;
-    run_compaction_with_lease(compactor, lease_manager, namespace, lease, fts_configs).await
+    run_compaction_with_lease(
+        compactor,
+        lease_manager,
+        namespace,
+        lease,
+        fts_configs,
+        fragment_cache,
+    )
+    .await
 }
 
 /// Runs fenced compaction after the caller has already acquired the lease.
@@ -526,6 +538,8 @@ pub async fn compact_namespace_under_lease(
 /// - `lease`: Owned lease snapshot acquired for this namespace. Its original
 ///   token is used for compaction and final release.
 /// - `fts_configs`: Borrowed full-text field definitions to materialize.
+/// - `fragment_cache`: Immutable WAL-byte cache behavior used while building
+///   the segment.
 ///
 /// # Returns
 ///
@@ -586,6 +600,7 @@ pub async fn run_compaction_with_lease(
     namespace: &str,
     lease: Lease,
     fts_configs: &HashMap<String, FtsFieldConfig>,
+    fragment_cache: FragmentCachePolicy<'_>,
 ) -> Result<CompactionResult> {
     info!(
         namespace = %namespace,
@@ -606,6 +621,7 @@ pub async fn run_compaction_with_lease(
             Some(lease.fencing_token),
             fts_configs,
             Some(Arc::clone(&heartbeat.lease_lost)),
+            fragment_cache,
         )
         .await;
 
@@ -1173,6 +1189,7 @@ pub async fn compaction_loop(
                         &lease_manager,
                         &ns.name,
                         &ns.full_text_search,
+                        FragmentCachePolicy::ReadOnly(&cache),
                     )
                     .await
                     {

@@ -177,6 +177,7 @@ pub(crate) enum CompactionCase {
     FullWithFts,
     FencedFull,
     FencedIncremental,
+    FragmentCacheWarm,
     HttpNoop,
     FlatPqFull,
     FlatPqIncremental,
@@ -623,6 +624,11 @@ pub(crate) const IDEAL_CASES: &[IdealCase] = &[
         "compaction.fenced_incremental",
         IdealCaseGroup::Compaction,
         IdealOperation::Compaction(CompactionCase::FencedIncremental),
+    ),
+    ideal_case(
+        "compaction.fragment_cache_warm",
+        IdealCaseGroup::Compaction,
+        IdealOperation::Compaction(CompactionCase::FragmentCacheWarm),
     ),
     ideal_case(
         "compaction.http_noop",

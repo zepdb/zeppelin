@@ -837,6 +837,28 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
         ideal_case("compaction.fenced_incremental"),
     ),
     path(
+        "catalog.compaction.fragment_cache_warm",
+        "src/compaction/background.rs:compact_namespace_under_lease",
+        &[
+            StoreMethod::Get,
+            StoreMethod::GetWithMeta,
+            StoreMethod::Put,
+            StoreMethod::PutIfMatch,
+            StoreMethod::PutIfNotExists,
+            StoreMethod::ListPrefix,
+            StoreMethod::Delete,
+        ],
+        &[
+            PhysicalVariant::GetFull,
+            PhysicalVariant::PutOverwrite,
+            PhysicalVariant::PutUpdate,
+            PhysicalVariant::PutCreate,
+            PhysicalVariant::ListRecursive,
+            PhysicalVariant::Delete,
+        ],
+        ideal_case("compaction.fragment_cache_warm"),
+    ),
+    path(
         "catalog.compaction.full_with_fts",
         "src/compaction/mod.rs:Compactor::compact",
         &[

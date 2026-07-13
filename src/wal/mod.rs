@@ -81,7 +81,7 @@ pub use fragment::WalFragment;
 pub use lease::{Lease, LeaseManager};
 /// Re-exports the authoritative manifest and its object-store version token.
 pub use manifest::{Manifest, ManifestVersion};
-/// Re-exports the fragment reader used by queries and compaction.
-pub use reader::WalReader;
+/// Re-exports the fragment reader and its explicit immutable-byte cache policy.
+pub use reader::{FragmentCachePolicy, WalReader};
 /// Re-exports the fragment uploader and manifest group-commit coordinator.
 pub use writer::WalWriter;

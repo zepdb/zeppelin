@@ -18,6 +18,7 @@ use object_store::{
 };
 use ulid::Ulid;
 use zeppelin::cache::manifest_cache::ManifestCache;
+use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{
     compact_namespace_under_lease, evaluate_compaction_trigger,
 };
@@ -38,7 +39,7 @@ use zeppelin::types::{AttributeValue, DistanceMetric, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::FragmentRef;
 use zeppelin::wal::manifest::NamedSnapshot;
-use zeppelin::wal::{LeaseManager, Manifest, WalReader, WalWriter};
+use zeppelin::wal::{FragmentCachePolicy, LeaseManager, Manifest, WalReader, WalWriter};
 
 use crate::common::counting::{perf_counting_store, ArtifactClass, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
@@ -65,6 +66,7 @@ pub(crate) fn supports(case: &IdealCase) -> bool {
                 | CompactionCase::FullWithFts
                 | CompactionCase::FencedFull
                 | CompactionCase::FencedIncremental
+                | CompactionCase::FragmentCacheWarm
         ) | IdealOperation::GarbageCollection(_)
             | IdealOperation::BackgroundMaintenance(_)
     )
@@ -101,6 +103,9 @@ pub(crate) async fn execute(case: &IdealCase) -> Option<IdealSample> {
         }
         IdealOperation::Compaction(CompactionCase::FencedIncremental) => {
             Some(execute_fenced_incremental(case).await)
+        }
+        IdealOperation::Compaction(CompactionCase::FragmentCacheWarm) => {
+            Some(execute_fragment_cache_warm(case).await)
         }
         IdealOperation::GarbageCollection(operation) => execute_gc(case, operation).await,
         IdealOperation::BackgroundMaintenance(operation) => {
@@ -440,10 +445,15 @@ async fn execute_fenced_full(case: &IdealCase) -> IdealSample {
     let lease_manager = maintenance_lease_manager(&world, "ideal-fenced-full");
 
     world.begin_measurement().await;
-    let result =
-        compact_namespace_under_lease(&compactor, &lease_manager, &namespace, &HashMap::new())
-            .await
-            .expect("ideal fenced full compaction failed");
+    let result = compact_namespace_under_lease(
+        &compactor,
+        &lease_manager,
+        &namespace,
+        &HashMap::new(),
+        FragmentCachePolicy::Bypass,
+    )
+    .await
+    .expect("ideal fenced full compaction failed");
     assert_eq!(result.vectors_compacted, 16);
     assert_eq!(result.fragments_removed, 1);
     assert!(result.segment_id.is_some());
@@ -478,15 +488,87 @@ async fn execute_fenced_incremental(case: &IdealCase) -> IdealSample {
     let lease_manager = maintenance_lease_manager(&world, "ideal-fenced-incremental");
 
     world.begin_measurement().await;
-    let result =
-        compact_namespace_under_lease(&compactor, &lease_manager, &namespace, &HashMap::new())
-            .await
-            .expect("ideal fenced incremental compaction failed");
+    let result = compact_namespace_under_lease(
+        &compactor,
+        &lease_manager,
+        &namespace,
+        &HashMap::new(),
+        FragmentCachePolicy::Bypass,
+    )
+    .await
+    .expect("ideal fenced incremental compaction failed");
     assert_eq!(result.vectors_compacted, 34);
     assert_eq!(result.fragments_removed, 1);
     assert!(result.segment_id.is_some());
     assert_eq!(result.old_segment_removed, initial.segment_id);
     world.finish(case).await
+}
+
+async fn execute_fragment_cache_warm(case: &IdealCase) -> IdealSample {
+    let mut world = MaintenanceWorld::new().await;
+    let indexing = maintenance_indexing_config();
+    let namespace =
+        create_active_compaction_namespace(&mut world, case.id.as_str(), &indexing, HashMap::new())
+            .await;
+    let writer = WalWriter::with_clock(world.store.clone(), world.clock());
+    for fragment in 0..4 {
+        writer
+            .append(
+                &namespace,
+                maintenance_vectors(&format!("cache-warm-{fragment}"), 4),
+                Vec::new(),
+            )
+            .await
+            .expect("ideal cache-warm WAL setup failed");
+    }
+    let manifest = Manifest::read(&world.store, &namespace)
+        .await
+        .expect("ideal cache-warm manifest setup read failed")
+        .expect("ideal cache-warm setup manifest missing");
+    let fragment_refs = manifest.uncompacted_fragments().to_vec();
+    assert_eq!(fragment_refs.len(), 4);
+
+    let cache_dir = tempfile::TempDir::new().expect("ideal cache-warm tempdir failed");
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 8 * 1024 * 1024)
+            .expect("ideal cache-warm cache construction failed"),
+    );
+    WalReader::new(world.store.clone())
+        .read_fragments_from_refs_unchecked(
+            &namespace,
+            &fragment_refs,
+            FragmentCachePolicy::ReadWrite(&cache),
+        )
+        .await
+        .expect("ideal cache-warm prime failed");
+    let cache_size_before = cache.total_size();
+    assert!(cache_size_before > 0);
+
+    let compactor = maintenance_compactor(&world, CompactionConfig::default());
+    let lease_manager = maintenance_lease_manager(&world, "ideal-cache-warm");
+    world.begin_measurement().await;
+    let result = compact_namespace_under_lease(
+        &compactor,
+        &lease_manager,
+        &namespace,
+        &HashMap::new(),
+        FragmentCachePolicy::ReadOnly(&cache),
+    )
+    .await
+    .expect("ideal cache-warm compaction failed");
+    assert_eq!(result.fragments_removed, 4);
+    assert_eq!(cache.total_size(), cache_size_before);
+
+    let sample = world.snapshot(case).await;
+    assert!(
+        !sample
+            .physical_operations
+            .iter()
+            .any(|operation| operation.verb == "get" && operation.class == ArtifactClass::Wal),
+        "warm compaction must issue zero WAL GETs: {:?}",
+        sample.physical_operations
+    );
+    world.cleanup(sample).await
 }
 
 async fn execute_background(case: &IdealCase, operation: BackgroundMaintenanceCase) -> IdealSample {
@@ -851,8 +933,14 @@ async fn execute_tick_lease_held(case: &IdealCase) -> IdealSample {
             .await
             .expect("ideal held-lease trigger check failed")
     );
-    let result =
-        compact_namespace_under_lease(&compactor, &contender, &namespace, &HashMap::new()).await;
+    let result = compact_namespace_under_lease(
+        &compactor,
+        &contender,
+        &namespace,
+        &HashMap::new(),
+        FragmentCachePolicy::Bypass,
+    )
+    .await;
     assert!(matches!(result, Err(ZeppelinError::LeaseHeld { .. })));
     world.finish(case).await
 }
@@ -891,10 +979,15 @@ async fn execute_tick_compaction_success(case: &IdealCase) -> IdealSample {
             .await
             .expect("ideal successful-tick trigger check failed")
     );
-    let result =
-        compact_namespace_under_lease(&compactor, &lease_manager, &namespace, &HashMap::new())
-            .await
-            .expect("ideal successful-tick compaction failed");
+    let result = compact_namespace_under_lease(
+        &compactor,
+        &lease_manager,
+        &namespace,
+        &HashMap::new(),
+        FragmentCachePolicy::Bypass,
+    )
+    .await
+    .expect("ideal successful-tick compaction failed");
     assert_eq!(result.vectors_compacted, 16);
     assert_eq!(result.fragments_removed, 1);
     assert!(
@@ -2708,6 +2801,7 @@ mod tests {
                 "compaction.full_with_fts",
                 "compaction.fenced_full",
                 "compaction.fenced_incremental",
+                "compaction.fragment_cache_warm",
                 "background.discovery_tick_empty",
                 "background.discovery_tick_active",
                 "background.cached_tick_idle",
@@ -2765,6 +2859,22 @@ mod tests {
             });
             assert_eq!(sample.scenario_id, case.id.as_str());
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn warm_fragment_cache_eliminates_compaction_wal_gets() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "compaction.fragment_cache_warm")
+            .expect("warm fragment-cache catalog case missing");
+        let sample = execute(case)
+            .await
+            .expect("warm fragment-cache case must have a maintenance executor");
+        assert!(!sample
+            .physical_operations
+            .iter()
+            .any(|operation| operation.verb == "get" && operation.class == ArtifactClass::Wal));
     }
 
     #[tokio::test]

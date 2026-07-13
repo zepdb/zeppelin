@@ -64,10 +64,9 @@
 //! pointer plus length; Rust's slice additionally guarantees a valid contiguous
 //! view for the duration of the async call. [`futures::future::join_all`] owns
 //! all per-fragment futures and preserves their input order while polling them
-//! concurrently. Optional cache access uses
-//! `Option<&Arc<crate::cache::DiskCache>>`: the `Arc` shares cache ownership
-//! across tasks, while this reader only borrows the handle and performs no
-//! reference-count clone on each call.
+//! concurrently. [`FragmentCachePolicy`] makes bypass, query read-through, and
+//! compaction read-only behavior distinct states. Each cached variant borrows an
+//! `Arc`, so the reader performs no reference-count clone per fragment.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -81,6 +80,37 @@ use crate::storage::ZeppelinStore;
 
 use super::fragment::WalFragment;
 use super::manifest::{FragmentRef, Manifest};
+
+/// Cache behavior for a batch of immutable WAL fragment reads.
+///
+/// The policy does not choose which fragments are visible. Callers must first
+/// select exact immutable keys through an authoritative manifest snapshot.
+#[derive(Clone, Copy)]
+pub enum FragmentCachePolicy<'a> {
+    /// Read every requested fragment directly from object storage.
+    Bypass,
+    /// Serve cache hits and populate the cache after authoritative misses.
+    ReadWrite(&'a Arc<DiskCache>),
+    /// Serve cache hits but never populate misses that are about to be compacted.
+    ReadOnly(&'a Arc<DiskCache>),
+}
+
+impl<'a> FragmentCachePolicy<'a> {
+    fn cache(self) -> Option<&'a Arc<DiskCache>> {
+        match self {
+            Self::Bypass => None,
+            Self::ReadWrite(cache) | Self::ReadOnly(cache) => Some(cache),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Bypass => "bypass",
+            Self::ReadWrite(_) => "read_write",
+            Self::ReadOnly(_) => "read_only",
+        }
+    }
+}
 
 /// Object-store-backed reader for immutable WAL fragments.
 ///
@@ -183,7 +213,7 @@ impl WalReader {
     #[instrument(skip(self), fields(namespace = namespace, fragment_id = %fragment_id))]
     pub async fn read_fragment(&self, namespace: &str, fragment_id: &Ulid) -> Result<WalFragment> {
         let data = self
-            .read_fragment_bytes(namespace, fragment_id, None)
+            .read_fragment_bytes(namespace, fragment_id, FragmentCachePolicy::Bypass)
             .await?;
         Self::validate_fragment_identity(WalFragment::from_bytes(&data)?, fragment_id)
     }
@@ -230,7 +260,8 @@ impl WalReader {
         };
 
         let refs = manifest.uncompacted_fragments().to_vec();
-        self.read_fragments_from_refs(namespace, &refs, None).await
+        self.read_fragments_from_refs(namespace, &refs, FragmentCachePolicy::Bypass)
+            .await
     }
 
     /// Reads and checksum-validates specific refs while preserving input order.
@@ -244,7 +275,7 @@ impl WalReader {
     /// - `namespace`: Namespace used to derive object keys and revalidate any
     ///   missing ref.
     /// - `refs`: Borrowed manifest refs in the caller's required replay order.
-    /// - `cache`: Optional shared tiered cache for immutable fragment bytes.
+    /// - `cache_policy`: Explicit cache behavior for immutable fragment bytes.
     ///
     /// # Returns
     ///
@@ -273,17 +304,17 @@ impl WalReader {
     /// Refs `[12, 13, 14]` return fragments in that order. If `13` disappears and
     /// a fresh manifest no longer references it, the result is `[12, 14]`; if the
     /// fresh manifest still references `13`, the whole call fails.
-    #[instrument(skip(self, refs, cache), fields(namespace = namespace, ref_count = refs.len(), cache_enabled = cache.is_some()))]
+    #[instrument(skip(self, refs, cache_policy), fields(namespace = namespace, ref_count = refs.len(), cache_policy = cache_policy.name()))]
     pub async fn read_fragments_from_refs(
         &self,
         namespace: &str,
         refs: &[FragmentRef],
-        cache: Option<&Arc<DiskCache>>,
+        cache_policy: FragmentCachePolicy<'_>,
     ) -> Result<Vec<WalFragment>> {
         // Parallel prefetch all fragments concurrently.
         let results = futures::future::join_all(
             refs.iter()
-                .map(|fref| self.read_fragment_with_cache(namespace, &fref.id, cache)),
+                .map(|fref| self.read_fragment_with_cache(namespace, &fref.id, cache_policy)),
         )
         .await;
 
@@ -343,7 +374,7 @@ impl WalReader {
     ///
     /// - `namespace`: Namespace used for keys and fresh-manifest verification.
     /// - `refs`: Borrowed refs in required replay order.
-    /// - `cache`: Optional immutable-byte cache.
+    /// - `cache_policy`: Explicit cache behavior for immutable fragment bytes.
     ///
     /// # Returns
     ///
@@ -364,17 +395,16 @@ impl WalReader {
     ///
     /// A compaction snapshot loads selected immutable refs in manifest order
     /// and rejects any payload whose checksum changed after upload.
-    #[instrument(skip(self, refs, cache), fields(namespace = namespace, ref_count = refs.len(), cache_enabled = cache.is_some()))]
+    #[instrument(skip(self, refs, cache_policy), fields(namespace = namespace, ref_count = refs.len(), cache_policy = cache_policy.name()))]
     pub async fn read_fragments_from_refs_unchecked(
         &self,
         namespace: &str,
         refs: &[FragmentRef],
-        cache: Option<&Arc<DiskCache>>,
+        cache_policy: FragmentCachePolicy<'_>,
     ) -> Result<Vec<WalFragment>> {
-        let results = futures::future::join_all(
-            refs.iter()
-                .map(|fref| self.read_fragment_unchecked_with_cache(namespace, &fref.id, cache)),
-        )
+        let results = futures::future::join_all(refs.iter().map(|fref| {
+            self.read_fragment_unchecked_with_cache(namespace, &fref.id, cache_policy)
+        }))
         .await;
 
         let fragments = self
@@ -401,7 +431,7 @@ impl WalReader {
     /// - `namespace`: Namespace used for fragment reads and race verification.
     /// - `refs`: Manifest-ordered refs from which only `delete_count > 0` entries
     ///   are selected.
-    /// - `cache`: Optional shared immutable-byte cache.
+    /// - `cache_policy`: Explicit cache behavior for immutable fragment bytes.
     ///
     /// # Returns
     ///
@@ -438,12 +468,12 @@ impl WalReader {
     /// requires an explicit hash-table library and ownership policy for strings;
     /// Rust's set owns each cloned [`String`] and frees it automatically when the
     /// set drops.
-    #[instrument(skip(self, refs, cache), fields(namespace = namespace, ref_count = refs.len(), cache_enabled = cache.is_some()))]
+    #[instrument(skip(self, refs, cache_policy), fields(namespace = namespace, ref_count = refs.len(), cache_policy = cache_policy.name()))]
     pub async fn read_delete_ids_from_refs_unchecked(
         &self,
         namespace: &str,
         refs: &[FragmentRef],
-        cache: Option<&Arc<DiskCache>>,
+        cache_policy: FragmentCachePolicy<'_>,
     ) -> Result<HashSet<String>> {
         let delete_refs: Vec<FragmentRef> = refs
             .iter()
@@ -461,7 +491,7 @@ impl WalReader {
         }
 
         let fragments = self
-            .read_fragments_from_refs_unchecked(namespace, &delete_refs, cache)
+            .read_fragments_from_refs_unchecked(namespace, &delete_refs, cache_policy)
             .await?;
         let mut deleted_ids = HashSet::new();
         for fragment in &fragments {
@@ -488,7 +518,7 @@ impl WalReader {
     ///
     /// - `namespace`: Namespace owning the object.
     /// - `fragment_id`: Fragment identity used for storage and cache keys.
-    /// - `cache`: Optional borrowed cache shared by the caller.
+    /// - `cache_policy`: Explicit cache behavior selected by the caller.
     ///
     /// # Returns
     ///
@@ -506,15 +536,15 @@ impl WalReader {
         &self,
         namespace: &str,
         fragment_id: &Ulid,
-        cache: Option<&Arc<DiskCache>>,
+        cache_policy: FragmentCachePolicy<'_>,
     ) -> Result<WalFragment> {
         let data = self
-            .read_fragment_bytes(namespace, fragment_id, cache)
+            .read_fragment_bytes(namespace, fragment_id, cache_policy)
             .await?;
         let result = WalFragment::from_bytes(&data)
             .and_then(|fragment| Self::validate_fragment_identity(fragment, fragment_id));
         if result.is_err() {
-            if let Some(cache) = cache {
+            if let Some(cache) = cache_policy.cache() {
                 let cache_key = Self::fragment_cache_key(fragment_id);
                 if let Err(error) = cache.invalidate(&cache_key).await {
                     warn!(
@@ -535,7 +565,7 @@ impl WalReader {
     ///
     /// - `namespace`: Namespace owning the object.
     /// - `fragment_id`: Fragment identity used for storage and cache keys.
-    /// - `cache`: Optional borrowed cache shared by the caller.
+    /// - `cache_policy`: Explicit cache behavior selected by the caller.
     ///
     /// # Returns
     ///
@@ -553,9 +583,9 @@ impl WalReader {
         &self,
         namespace: &str,
         fragment_id: &Ulid,
-        cache: Option<&Arc<DiskCache>>,
+        cache_policy: FragmentCachePolicy<'_>,
     ) -> Result<WalFragment> {
-        self.read_fragment_with_cache(namespace, fragment_id, cache)
+        self.read_fragment_with_cache(namespace, fragment_id, cache_policy)
             .await
     }
 
@@ -582,7 +612,7 @@ impl WalReader {
     ///
     /// - `namespace`: Namespace used in the authoritative S3 key.
     /// - `fragment_id`: ULID used for both object and cache keys.
-    /// - `cache`: Optional tiered cache. `None` forces a direct S3 GET.
+    /// - `cache_policy`: Bypass, query read-through, or compaction read-only.
     ///
     /// # Returns
     ///
@@ -596,8 +626,8 @@ impl WalReader {
     ///
     /// # Side Effects
     ///
-    /// May update cache hit/miss diagnostics, perform one full S3 GET, populate
-    /// memory and disk cache tiers, or log a best-effort cache-fill failure.
+    /// May update cache hit/miss diagnostics or perform one full S3 GET.
+    /// `ReadWrite` may populate memory and disk tiers; `ReadOnly` never does.
     ///
     /// # Consistency
     ///
@@ -621,19 +651,20 @@ impl WalReader {
     ///
     /// # Rust Notes for Java/C Engineers
     ///
-    /// `let Some(cache) = cache else` exhaustively handles the optional borrowed
-    /// cache and exits early for the direct path. The returned [`bytes::Bytes`]
-    /// owns a reference-counted immutable buffer; cloning it is closer to sharing
-    /// a Java immutable buffer view than copying a C byte array.
+    /// The enum match exhaustively handles every cache mode. The returned
+    /// [`bytes::Bytes`] owns a reference-counted immutable buffer; cloning it is
+    /// closer to sharing a Java immutable buffer view than copying a C byte array.
     async fn read_fragment_bytes(
         &self,
         namespace: &str,
         fragment_id: &Ulid,
-        cache: Option<&Arc<DiskCache>>,
+        cache_policy: FragmentCachePolicy<'_>,
     ) -> Result<bytes::Bytes> {
         let s3_key = WalFragment::s3_key(namespace, fragment_id);
-        let Some(cache) = cache else {
-            return self.store.get(&s3_key).await;
+        let (cache, populate_on_miss) = match cache_policy {
+            FragmentCachePolicy::Bypass => return self.store.get(&s3_key).await,
+            FragmentCachePolicy::ReadWrite(cache) => (cache, true),
+            FragmentCachePolicy::ReadOnly(cache) => (cache, false),
         };
 
         // A cache HIT serves the immutable fragment without S3. On a MISS we
@@ -647,13 +678,15 @@ impl WalReader {
             return Ok(data);
         }
         let data = self.store.get(&s3_key).await?;
-        if let Err(e) = cache.put(&cache_key, &data).await {
-            warn!(
-                namespace = namespace,
-                fragment_id = %fragment_id,
-                error = %e,
-                "WAL fragment cache write failed; serving from S3 uncached"
-            );
+        if populate_on_miss {
+            if let Err(e) = cache.put(&cache_key, &data).await {
+                warn!(
+                    namespace = namespace,
+                    fragment_id = %fragment_id,
+                    error = %e,
+                    "WAL fragment cache write failed; serving from S3 uncached"
+                );
+            }
         }
         Ok(data)
     }

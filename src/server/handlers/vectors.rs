@@ -151,7 +151,7 @@ use crate::query;
 use crate::server::AppState;
 use crate::types::{AttributeValue, ConsistencyLevel, VectorEntry, VectorId};
 use crate::wal::manifest::SegmentRef;
-use crate::wal::Manifest;
+use crate::wal::{FragmentCachePolicy, Manifest};
 
 use super::ApiError;
 
@@ -1490,7 +1490,7 @@ async fn fetch_vectors_by_id(
                 .read_delete_ids_from_refs_unchecked(
                     ns,
                     manifest.uncompacted_fragments(),
-                    Some(&state.cache),
+                    FragmentCachePolicy::ReadWrite(&state.cache),
                 )
                 .await?;
         }
@@ -1598,7 +1598,7 @@ async fn fetch_strong_wal_records(
         .read_fragments_from_refs_unchecked(
             ns,
             manifest.uncompacted_fragments(),
-            Some(&state.cache),
+            FragmentCachePolicy::ReadWrite(&state.cache),
         )
         .await?;
     for fragment in fragments {

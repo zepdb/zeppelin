@@ -450,7 +450,14 @@ async fn test_lease_renewed_during_long_compaction() {
         let lease_manager = Arc::clone(&lease_manager);
         let ns = ns.clone();
         tokio::spawn(async move {
-            compact_namespace_under_lease(&compactor, &lease_manager, &ns, &HashMap::new()).await
+            compact_namespace_under_lease(
+                &compactor,
+                &lease_manager,
+                &ns,
+                &HashMap::new(),
+                zeppelin::wal::FragmentCachePolicy::Bypass,
+            )
+            .await
         })
     };
 
@@ -545,7 +552,14 @@ async fn test_stolen_lease_aborts_compaction_before_cas() {
         let lease_manager = Arc::clone(&lease_manager);
         let ns = ns.clone();
         tokio::spawn(async move {
-            compact_namespace_under_lease(&compactor, &lease_manager, &ns, &HashMap::new()).await
+            compact_namespace_under_lease(
+                &compactor,
+                &lease_manager,
+                &ns,
+                &HashMap::new(),
+                zeppelin::wal::FragmentCachePolicy::Bypass,
+            )
+            .await
         })
     };
 

@@ -156,7 +156,7 @@ use crate::namespace::manager::{
 use crate::server::AppState;
 use crate::types::{DistanceMetric, IndexType};
 use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
-use crate::wal::Manifest;
+use crate::wal::{FragmentCachePolicy, Manifest};
 
 use super::{as_of, ApiError};
 
@@ -2011,6 +2011,7 @@ pub async fn compact_namespace(
     let compactor = state.compactor.clone();
     let lease_manager = state.lease_manager.clone();
     let manifest_cache = state.manifest_cache.clone();
+    let cache = state.cache.clone();
     let clock = state.clock.clone();
     let ns_for_task = ns.clone();
     let fts_configs = meta.full_text_search.clone();
@@ -2021,6 +2022,7 @@ pub async fn compact_namespace(
             &ns_for_task,
             lease,
             &fts_configs,
+            FragmentCachePolicy::ReadOnly(&cache),
         )
         .await
         {

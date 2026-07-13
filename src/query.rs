@@ -152,7 +152,7 @@ use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
-use crate::wal::WalReader;
+use crate::wal::{FragmentCachePolicy, WalReader};
 
 /// Carries one ranked query result set and the optional HTTP enrichments.
 ///
@@ -1286,7 +1286,7 @@ async fn execute_query_with_manifest_scoped(
                     .read_delete_ids_from_refs_unchecked(
                         namespace,
                         manifest.uncompacted_fragments(),
-                        cache,
+                        cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
                     )
                     .await?;
                 WalScanResult {
@@ -1577,7 +1577,11 @@ async fn wal_scan(
     // Skip checksum validation on query reads — fragments were already
     // validated on write. Saves ~11% CPU on fragment deserialization.
     let fragments = wal_reader
-        .read_fragments_from_refs_unchecked(namespace, &refs, cache)
+        .read_fragments_from_refs_unchecked(
+            namespace,
+            &refs,
+            cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
+        )
         .await?;
     let frag_count = fragments.len();
 
@@ -2314,7 +2318,11 @@ async fn execute_bm25_query_with_manifest_scoped(
                 let refs = manifest.uncompacted_fragments().to_vec();
                 // Skip checksum validation — already validated on write.
                 let fragments = wal_reader
-                    .read_fragments_from_refs_unchecked(namespace, &refs, cache)
+                    .read_fragments_from_refs_unchecked(
+                        namespace,
+                        &refs,
+                        cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
+                    )
                     .await?;
                 let scan_result = wal_bm25_scan(
                     &fragments,
@@ -2336,7 +2344,7 @@ async fn execute_bm25_query_with_manifest_scoped(
                     .read_delete_ids_from_refs_unchecked(
                         namespace,
                         manifest.uncompacted_fragments(),
-                        cache,
+                        cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
                     )
                     .await?;
                 Vec::new()

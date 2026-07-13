@@ -3,11 +3,12 @@ mod common;
 use std::collections::HashMap;
 
 use chrono::Utc;
-use common::counting::counting_store;
+use common::counting::{counting_store, ArtifactClass};
 use common::harness::TestHarness;
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 
 use zeppelin::cache::manifest_cache::ManifestCache;
+use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{
     compact_namespace_under_lease, evaluate_compaction_trigger, CompactionLoopOptions,
 };
@@ -21,7 +22,7 @@ use zeppelin::types::{
 };
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::{Manifest, SegmentRef};
-use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
+use zeppelin::wal::{FragmentCachePolicy, LeaseManager, WalReader, WalWriter};
 
 use common::assertions::*;
 
@@ -44,6 +45,146 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
         indexing_config,
         common::default_gc_upload_window(),
     )
+}
+
+fn normalize_segment_descriptor(mut segment: SegmentRef) -> SegmentRef {
+    fn normalize_key(key: &mut String) {
+        *key = key
+            .rsplit('/')
+            .next()
+            .expect("segment artifact key must have a filename")
+            .to_string();
+    }
+
+    let segment_id = std::mem::replace(&mut segment.id, "<segment>".to_string());
+    for owner in &mut segment.cluster_owners {
+        if owner == &segment_id {
+            *owner = "<segment>".to_string();
+        }
+    }
+    if let Some(sketch) = &mut segment.sketch {
+        normalize_key(&mut sketch.key);
+    }
+    for object in &mut segment.cluster_objects {
+        normalize_key(&mut object.key);
+    }
+    if let Some(bootstrap) = &mut segment.bootstrap {
+        normalize_key(&mut bootstrap.key);
+    }
+    if let Some(membership) = &mut segment.membership {
+        normalize_key(&mut membership.key);
+    }
+    segment
+}
+
+async fn cluster_checksums(
+    store: &zeppelin::storage::ZeppelinStore,
+    segment: &SegmentRef,
+) -> Vec<(Vec<usize>, u64)> {
+    let mut checksums = Vec::with_capacity(segment.cluster_objects.len());
+    for object in &segment.cluster_objects {
+        let bytes = store
+            .get(&object.key)
+            .await
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", object.key));
+        checksums.push((object.clusters.clone(), xxhash_rust::xxh3::xxh3_64(&bytes)));
+    }
+    checksums.sort_by(|left, right| left.0.cmp(&right.0));
+    checksums
+}
+
+#[tokio::test]
+async fn test_compaction_fragment_cache_is_read_only_and_output_deterministic() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let mut outputs = Vec::new();
+
+    for (label, warm_fragments) in [("cold", 0usize), ("partial", 2), ("warm", 4)] {
+        let namespace = harness.key(&format!("compaction-fragment-cache-{label}"));
+        Manifest::new().write(&store, &namespace).await.unwrap();
+        common::write_active_namespace_metadata(&store, &namespace, 16, DistanceMetric::Euclidean)
+            .await;
+
+        let writer = WalWriter::new(store.clone());
+        let vectors = random_vectors(24, 16);
+        for chunk in vectors.chunks(6) {
+            writer
+                .append(&namespace, chunk.to_vec(), Vec::new())
+                .await
+                .unwrap();
+        }
+        let manifest = Manifest::read(&store, &namespace).await.unwrap().unwrap();
+        let fragment_refs = manifest.uncompacted_fragments().to_vec();
+        assert_eq!(fragment_refs.len(), 4);
+
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = Arc::new(
+            DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 8 * 1024 * 1024).unwrap(),
+        );
+        if warm_fragments > 0 {
+            WalReader::new(store.clone())
+                .read_fragments_from_refs_unchecked(
+                    &namespace,
+                    &fragment_refs[..warm_fragments],
+                    FragmentCachePolicy::ReadWrite(&cache),
+                )
+                .await
+                .unwrap();
+        }
+        let cache_size_before = cache.total_size();
+        counter.reset();
+
+        let lease_manager = Arc::new(LeaseManager::new(
+            store.clone(),
+            format!("fragment-cache-{label}"),
+            Duration::from_secs(30),
+        ));
+        let result = compact_namespace_under_lease(
+            &test_compactor(&store),
+            &lease_manager,
+            &namespace,
+            &HashMap::new(),
+            FragmentCachePolicy::ReadOnly(&cache),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.fragments_removed, 4);
+        assert_eq!(
+            counter.gets_for(ArtifactClass::Wal),
+            (4 - warm_fragments) as u64,
+            "{label} compaction fetched the wrong number of WAL fragments"
+        );
+        assert_eq!(
+            cache.total_size(),
+            cache_size_before,
+            "{label} compaction populated its read-only cache on a miss"
+        );
+
+        let manifest = Manifest::read(&store, &namespace).await.unwrap().unwrap();
+        let segment = manifest
+            .segments
+            .iter()
+            .find(|segment| Some(&segment.id) == manifest.active_segment.as_ref())
+            .expect("compaction must publish one active segment")
+            .clone();
+        assert!(!segment.cluster_objects.is_empty());
+        let checksums = cluster_checksums(&store, &segment).await;
+        outputs.push((label, normalize_segment_descriptor(segment), checksums));
+    }
+
+    let (_, expected_descriptor, expected_checksums) = &outputs[0];
+    for (label, descriptor, checksums) in &outputs[1..] {
+        assert_eq!(
+            descriptor, expected_descriptor,
+            "{label} cache state changed the published segment descriptor"
+        );
+        assert_eq!(
+            checksums, expected_checksums,
+            "{label} cache state changed compacted cluster bytes"
+        );
+    }
+
+    harness.cleanup().await;
 }
 
 fn trigger_metadata(namespace: &str, dimensions: usize) -> NamespaceMetadata {
@@ -909,6 +1050,7 @@ async fn test_leased_compaction_rejects_missing_authoritative_metadata() {
         &lease_manager,
         &ns,
         &HashMap::new(),
+        FragmentCachePolicy::Bypass,
     )
     .await
     .expect_err("missing authoritative metadata must stop leased compaction");
@@ -1171,7 +1313,6 @@ async fn test_compaction_populates_cluster_object_size_bytes() {
 
 use std::sync::Arc;
 use std::time::Duration;
-use zeppelin::cache::DiskCache;
 use zeppelin::index::ivf_flat::build::centroids_key;
 
 /// Build a `QueryParams` for the Task 3 tests (Eventual → segment-only).

@@ -230,7 +230,7 @@ use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
     BootstrapRef, ClusterDataObjectRef, Manifest, MembershipRef, SegmentRef,
 };
-use crate::wal::WalReader;
+use crate::wal::{FragmentCachePolicy, WalReader};
 
 /// Maximum number of fresh-read/CAS publication attempts in one compaction.
 ///
@@ -978,8 +978,14 @@ impl Compactor {
         fencing_token: Option<u64>,
         fts_configs: &HashMap<String, FtsFieldConfig>,
     ) -> Result<CompactionResult> {
-        self.compact_with_fts_signaled(namespace, fencing_token, fts_configs, None)
-            .await
+        self.compact_with_fts_signaled(
+            namespace,
+            fencing_token,
+            fts_configs,
+            None,
+            FragmentCachePolicy::Bypass,
+        )
+        .await
     }
 
     /// Executes the complete compaction transaction with an optional abort signal.
@@ -1019,6 +1025,8 @@ impl Compactor {
     ///   enabled in the effective index config.
     /// - `lease_lost`: Optional atomically shared heartbeat signal. `true`
     ///   forbids every subsequent manifest commit attempt.
+    /// - `fragment_cache`: Immutable WAL-byte cache behavior. Production
+    ///   background compaction uses read-only hits; direct callers bypass it.
     ///
     /// # Returns
     ///
@@ -1065,13 +1073,15 @@ impl Compactor {
     ///
     /// # Performance
     ///
-    /// The full path reads every surviving old vector and trains an index. The
-    /// centroid-reuse path avoids k-means but can still read all clusters. The
-    /// bounded path reads membership, the resident sketch, and touched clusters
-    /// only, then writes touched clusters plus segment-global sidecars. Full-text
-    /// indexing reads all attribute blobs, builds clusters on blocking workers,
-    /// and uploads per-cluster plus global artifacts. CAS retries do not repeat
-    /// the expensive build.
+    /// The full path reads every surviving old vector and trains an index. WAL
+    /// fragment cache hits avoid object-store GETs; read-only misses fetch once
+    /// without filling soon-dead data into the cache. The centroid-reuse path
+    /// avoids k-means but can still read all clusters. The bounded path reads
+    /// membership, the resident sketch, and touched clusters only, then writes
+    /// touched clusters plus segment-global sidecars. Full-text indexing reads
+    /// all attribute blobs, builds clusters on blocking workers, and uploads
+    /// per-cluster plus global artifacts. CAS retries do not repeat the
+    /// expensive build.
     ///
     /// # Examples
     ///
@@ -1097,13 +1107,14 @@ impl Compactor {
     /// Cloning a [`VectorEntry`] deep-clones its strings, vector values, and
     /// attributes; cloning [`bytes::Bytes`] for concurrent PUTs shares its
     /// immutable allocation instead.
-    #[instrument(skip(self, fts_configs, lease_lost), fields(namespace = namespace))]
+    #[instrument(skip(self, fts_configs, lease_lost, fragment_cache), fields(namespace = namespace))]
     pub async fn compact_with_fts_signaled(
         &self,
         namespace: &str,
         fencing_token: Option<u64>,
         fts_configs: &HashMap<String, FtsFieldConfig>,
         lease_lost: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        fragment_cache: FragmentCachePolicy<'_>,
     ) -> Result<CompactionResult> {
         let start = std::time::Instant::now();
 
@@ -1149,7 +1160,7 @@ impl Compactor {
         // Uses unchecked read — fragments were validated on write.
         let fragments = self
             .wal_reader
-            .read_fragments_from_refs_unchecked(namespace, &fragment_refs, None)
+            .read_fragments_from_refs_unchecked(namespace, &fragment_refs, fragment_cache)
             .await?;
 
         // 4. Merge vectors: process in manifest order (sequence number), latest wins.

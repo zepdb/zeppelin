@@ -12,7 +12,7 @@ use zeppelin::index::quantization::QuantizationType;
 use zeppelin::types::{AttributeValue, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::Manifest;
-use zeppelin::wal::{WalReader, WalWriter};
+use zeppelin::wal::{FragmentCachePolicy, WalReader, WalWriter};
 
 const DIM: usize = 4;
 
@@ -242,7 +242,7 @@ async fn test_wal_fragment_notfound_tolerated_only_after_manifest_reread_and_met
     let before = gc_race_metric_value(&ns);
     let reader = WalReader::new(harness.store.clone());
     let fragments = reader
-        .read_fragments_from_refs_unchecked(&ns, &old_refs, None)
+        .read_fragments_from_refs_unchecked(&ns, &old_refs, FragmentCachePolicy::Bypass)
         .await
         .unwrap();
     let after = gc_race_metric_value(&ns);
@@ -302,14 +302,16 @@ async fn test_wal_fragment_notfound_still_referenced_is_error_not_skip() {
 
     // Unchecked path must error.
     let unchecked = reader
-        .read_fragments_from_refs_unchecked(&ns, &refs, None)
+        .read_fragments_from_refs_unchecked(&ns, &refs, FragmentCachePolicy::Bypass)
         .await;
     assert!(
         unchecked.is_err(),
         "a NotFound on a still-referenced fragment must ERROR (unchecked), got {unchecked:?}"
     );
     // Checked path must error too.
-    let checked = reader.read_fragments_from_refs(&ns, &refs, None).await;
+    let checked = reader
+        .read_fragments_from_refs(&ns, &refs, FragmentCachePolicy::Bypass)
+        .await;
     assert!(
         checked.is_err(),
         "a NotFound on a still-referenced fragment must ERROR (checked), got {checked:?}"
@@ -371,7 +373,7 @@ async fn test_consumed_wal_read_rejects_checksum_mismatch() {
         .unwrap();
 
     let result = WalReader::new(harness.store.clone())
-        .read_fragments_from_refs_unchecked(&ns, &refs, None)
+        .read_fragments_from_refs_unchecked(&ns, &refs, FragmentCachePolicy::Bypass)
         .await;
     assert!(matches!(
         result,
@@ -413,7 +415,7 @@ async fn test_consumed_wal_read_rejects_payload_id_mismatch() {
         .unwrap();
 
     let result = WalReader::new(harness.store.clone())
-        .read_fragments_from_refs_unchecked(&ns, &refs, None)
+        .read_fragments_from_refs_unchecked(&ns, &refs, FragmentCachePolicy::Bypass)
         .await;
     assert!(matches!(
         result,
@@ -465,7 +467,7 @@ async fn test_checksum_failure_evicts_poisoned_wal_cache_entry() {
     );
     let reader = WalReader::new(harness.store.clone());
     let first = reader
-        .read_fragments_from_refs_unchecked(&ns, &refs, Some(&cache))
+        .read_fragments_from_refs_unchecked(&ns, &refs, FragmentCachePolicy::ReadWrite(&cache))
         .await;
     assert!(matches!(
         first,
@@ -474,7 +476,7 @@ async fn test_checksum_failure_evicts_poisoned_wal_cache_entry() {
 
     harness.store.put(&key, correct).await.unwrap();
     let second = reader
-        .read_fragments_from_refs_unchecked(&ns, &refs, Some(&cache))
+        .read_fragments_from_refs_unchecked(&ns, &refs, FragmentCachePolicy::ReadWrite(&cache))
         .await;
     assert!(
         second.is_ok(),

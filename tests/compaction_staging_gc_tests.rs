@@ -206,7 +206,14 @@ async fn test_gc_does_not_delete_active_staged_compaction_uploads() {
         let lease_manager = Arc::clone(&lease_manager);
         let ns = ns.clone();
         tokio::spawn(async move {
-            compact_namespace_under_lease(&compactor, &lease_manager, &ns, &HashMap::new()).await
+            compact_namespace_under_lease(
+                &compactor,
+                &lease_manager,
+                &ns,
+                &HashMap::new(),
+                zeppelin::wal::FragmentCachePolicy::Bypass,
+            )
+            .await
         })
     };
 
@@ -257,7 +264,14 @@ async fn test_stolen_lease_staging_drops_and_orphans_obey_horizon() {
         let lease_manager = Arc::clone(&lease_manager);
         let ns = ns.clone();
         tokio::spawn(async move {
-            compact_namespace_under_lease(&compactor, &lease_manager, &ns, &HashMap::new()).await
+            compact_namespace_under_lease(
+                &compactor,
+                &lease_manager,
+                &ns,
+                &HashMap::new(),
+                zeppelin::wal::FragmentCachePolicy::Bypass,
+            )
+            .await
         })
     };
 
