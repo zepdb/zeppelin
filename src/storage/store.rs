@@ -87,10 +87,10 @@ use chrono::{DateTime, Utc};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut, S3CopyIfNotExists};
 use object_store::path::Path;
 use object_store::{
-    BackoffConfig, ClientOptions, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload,
-    RetryConfig, UpdateVersion,
+    Attribute, AttributeValue, Attributes, BackoffConfig, ClientOptions, GetOptions, ObjectStore,
+    PutMode, PutOptions, PutPayload, RetryConfig, UpdateVersion,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
 use std::sync::Arc;
@@ -161,6 +161,65 @@ pub enum StorageVersion {
     Etag(String),
     /// Backend-specific version used only when no ETag is available.
     BackendVersion(String),
+}
+
+/// User-defined object metadata carried through the storage boundary.
+///
+/// Domain modules use this owned map instead of depending on
+/// `object_store::Attributes`. The values travel as S3 user-metadata headers
+/// and therefore do not alter object bodies or object-store call counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectUserMetadata(BTreeMap<String, String>);
+
+impl ObjectUserMetadata {
+    /// Creates an empty metadata collection.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inserts one owned user-metadata value.
+    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let _ = self.0.insert(key.into(), value.into());
+    }
+
+    /// Returns one user-metadata value by its unprefixed key.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    fn from_attributes(attributes: &Attributes) -> Self {
+        let values = attributes
+            .iter()
+            .filter_map(|(attribute, value)| match attribute {
+                Attribute::Metadata(key) => Some((key.to_string(), value.as_ref().to_string())),
+                _ => None,
+            })
+            .collect();
+        Self(values)
+    }
+
+    fn to_attributes(&self) -> Attributes {
+        self.0
+            .iter()
+            .map(|(key, value)| {
+                (
+                    Attribute::Metadata(key.clone().into()),
+                    AttributeValue::from(value.clone()),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Body-adjacent metadata returned by one authoritative object GET.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectReadMetadata {
+    /// ETag identifying the exact body returned by the same request.
+    pub e_tag: Option<String>,
+    /// User-defined metadata headers attached to that object version.
+    pub user_metadata: ObjectUserMetadata,
 }
 
 impl StorageVersion {
@@ -871,6 +930,17 @@ impl ZeppelinStore {
     /// ```
     #[instrument(skip(self), fields(key = key))]
     pub async fn get_with_meta(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+        let (bytes, metadata) = self.get_with_object_metadata(key).await?;
+        Ok((bytes, metadata.e_tag))
+    }
+
+    /// Downloads an object with its ETag and user-defined metadata headers.
+    ///
+    /// This is the typed storage seam for domain identities that must accompany
+    /// an object body without becoming part of its serialized bytes. The body,
+    /// ETag, and user metadata all come from the same authoritative GET.
+    #[instrument(skip(self), fields(key = key))]
+    pub async fn get_with_object_metadata(&self, key: &str) -> Result<(Bytes, ObjectReadMetadata)> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let result = self.inner.get(&path).await.map_err(|e| {
@@ -885,6 +955,7 @@ impl ZeppelinStore {
             }
         })?;
         let etag = result.meta.e_tag.clone();
+        let user_metadata = ObjectUserMetadata::from_attributes(&result.attributes);
         let bytes = result.bytes().await?;
         let elapsed = start.elapsed();
         debug!(
@@ -896,7 +967,13 @@ impl ZeppelinStore {
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["get"])
             .observe(elapsed.as_secs_f64());
-        Ok((bytes, etag))
+        Ok((
+            bytes,
+            ObjectReadMetadata {
+                e_tag: etag,
+                user_metadata,
+            },
+        ))
     }
 
     /// Downloads an object only when its current ETag differs from a known version.
@@ -1077,6 +1154,23 @@ impl ZeppelinStore {
         etag: &str,
         namespace: &str,
     ) -> Result<Option<String>> {
+        self.put_if_match_with_user_metadata(key, data, etag, namespace, &ObjectUserMetadata::new())
+            .await
+    }
+
+    /// Conditionally replaces an object while publishing user metadata.
+    ///
+    /// The metadata headers are part of the same atomic PUT as the body. No
+    /// preliminary read or follow-up write is issued.
+    #[instrument(skip(self, data, user_metadata), fields(key = key))]
+    pub async fn put_if_match_with_user_metadata(
+        &self,
+        key: &str,
+        data: Bytes,
+        etag: &str,
+        namespace: &str,
+        user_metadata: &ObjectUserMetadata,
+    ) -> Result<Option<String>> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let options = PutOptions {
@@ -1084,6 +1178,7 @@ impl ZeppelinStore {
                 e_tag: Some(etag.to_string()),
                 version: None,
             }),
+            attributes: user_metadata.to_attributes(),
             ..PutOptions::default()
         };
         let result = self
@@ -1149,10 +1244,27 @@ impl ZeppelinStore {
     /// metadata object remains authoritative.
     #[instrument(skip(self, data), fields(key = key))]
     pub async fn put_if_not_exists(&self, key: &str, data: Bytes, namespace: &str) -> Result<()> {
+        self.put_if_not_exists_with_user_metadata(key, data, namespace, &ObjectUserMetadata::new())
+            .await
+    }
+
+    /// Creates an object and atomically attaches user-defined metadata.
+    ///
+    /// The create-only precondition, body, and metadata headers share one
+    /// backend request, so a losing creator cannot replace any of them.
+    #[instrument(skip(self, data, user_metadata), fields(key = key))]
+    pub async fn put_if_not_exists_with_user_metadata(
+        &self,
+        key: &str,
+        data: Bytes,
+        namespace: &str,
+        user_metadata: &ObjectUserMetadata,
+    ) -> Result<()> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let options = PutOptions {
             mode: PutMode::Create,
+            attributes: user_metadata.to_attributes(),
             ..PutOptions::default()
         };
         self.inner

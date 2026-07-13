@@ -76,14 +76,42 @@ use crate::config::IndexingConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
-use crate::storage::ZeppelinStore;
+use crate::storage::{ObjectUserMetadata, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::{DistanceMetric, IndexType};
 
 /// Default lifetime of a process-local namespace registry entry.
 const DEFAULT_NAMESPACE_REGISTRY_TTL: Duration = Duration::from_secs(5);
+const NAMESPACE_INCARNATION_METADATA_KEY: &str = "zeppelin-namespace-incarnation";
 /// Consecutive compaction failures before a namespace is reported degraded.
 pub const COMPACTION_DEGRADED_FAILURE_THRESHOLD: u32 = 5;
+
+/// Collision-resistant identity for one lifetime of a namespace name.
+///
+/// The value is stored as S3 user metadata on `meta.json`, outside its JSON
+/// body. This lets cache and GC memos distinguish delete/recreate even when a
+/// frozen or regressed wall clock repeats the exact creation timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NamespaceIncarnationId(uuid::Uuid);
+
+impl NamespaceIncarnationId {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        uuid::Uuid::parse_str(value).map(Self).map_err(|error| {
+            ZeppelinError::Serialization(format!(
+                "invalid namespace incarnation metadata {value:?}: {error}"
+            ))
+        })
+    }
+
+    fn as_string(&self) -> String {
+        self.0.to_string()
+    }
+}
 
 /// Lifecycle state stored in `meta.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -343,6 +371,10 @@ pub struct NamespaceMetadata {
     /// Compaction/index health surfaced through namespace reads.
     #[serde(default)]
     pub compaction_health: CompactionHealth,
+    /// Runtime identity read from S3 user metadata, absent only for legacy
+    /// objects written before incarnation IDs were introduced.
+    #[serde(skip)]
+    pub incarnation_id: Option<NamespaceIncarnationId>,
 }
 
 impl NamespaceMetadata {
@@ -415,6 +447,25 @@ impl NamespaceMetadata {
     /// default “never compacted” health record.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         Ok(serde_json::from_slice(data)?)
+    }
+
+    fn user_metadata(&self) -> ObjectUserMetadata {
+        let mut metadata = ObjectUserMetadata::new();
+        if let Some(incarnation_id) = self.incarnation_id.as_ref() {
+            metadata.insert(
+                NAMESPACE_INCARNATION_METADATA_KEY,
+                incarnation_id.as_string(),
+            );
+        }
+        metadata
+    }
+
+    fn attach_user_metadata(mut self, metadata: &ObjectUserMetadata) -> Result<Self> {
+        self.incarnation_id = metadata
+            .get(NAMESPACE_INCARNATION_METADATA_KEY)
+            .map(NamespaceIncarnationId::parse)
+            .transpose()?;
+        Ok(self)
     }
 }
 
@@ -726,12 +777,14 @@ impl NamespaceManager {
             full_text_search,
             index_config,
             compaction_health: CompactionHealth::default(),
+            incarnation_id: Some(NamespaceIncarnationId::new()),
         };
 
         // Atomic write — returns NamespaceAlreadyExists if meta.json exists
+        let user_metadata = meta.user_metadata();
         match self
             .store
-            .put_if_not_exists(&key, meta.to_bytes()?, name)
+            .put_if_not_exists_with_user_metadata(&key, meta.to_bytes()?, name, &user_metadata)
             .await
         {
             Ok(()) => {}
@@ -823,11 +876,7 @@ impl NamespaceManager {
             meta.state = NamespaceState::Active;
             meta.updated_at = self.clock.now();
             let etag = etag.unwrap_or_default();
-            match self
-                .store
-                .put_if_match(&key, meta.to_bytes()?, &etag, name)
-                .await
-            {
+            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
                 Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);
@@ -1079,9 +1128,10 @@ impl NamespaceManager {
     /// registers the decoded namespace for later maintenance scans.
     async fn read_metadata_from_s3(&self, name: &str) -> Result<NamespaceMetadata> {
         let key = NamespaceMetadata::s3_key(name);
-        match self.store.get(&key).await {
-            Ok(data) => {
-                let meta = NamespaceMetadata::from_bytes(&data)?;
+        match self.store.get_with_object_metadata(&key).await {
+            Ok((data, object_metadata)) => {
+                let meta = NamespaceMetadata::from_bytes(&data)?
+                    .attach_user_metadata(&object_metadata.user_metadata)?;
                 self.insert_registry(meta.clone());
                 Ok(meta)
             }
@@ -1122,17 +1172,32 @@ impl NamespaceManager {
         name: &str,
     ) -> Result<(NamespaceMetadata, Option<String>)> {
         let key = NamespaceMetadata::s3_key(name);
-        match self.store.get_with_meta(&key).await {
-            Ok((data, etag)) => {
-                let meta = NamespaceMetadata::from_bytes(&data)?;
+        match self.store.get_with_object_metadata(&key).await {
+            Ok((data, object_metadata)) => {
+                let meta = NamespaceMetadata::from_bytes(&data)?
+                    .attach_user_metadata(&object_metadata.user_metadata)?;
                 self.insert_registry(meta.clone());
-                Ok((meta, etag))
+                Ok((meta, object_metadata.e_tag))
             }
             Err(ZeppelinError::NotFound { .. }) => Err(ZeppelinError::NamespaceNotFound {
                 namespace: name.to_string(),
             }),
             Err(e) => Err(e),
         }
+    }
+
+    /// CAS-publishes metadata while preserving its namespace incarnation ID.
+    async fn put_metadata_if_match(
+        &self,
+        key: &str,
+        meta: &NamespaceMetadata,
+        etag: &str,
+        namespace: &str,
+    ) -> Result<Option<String>> {
+        let user_metadata = meta.user_metadata();
+        self.store
+            .put_if_match_with_user_metadata(key, meta.to_bytes()?, etag, namespace, &user_metadata)
+            .await
     }
 
     /// Returns an owned registry snapshot when it remains inside the TTL.
@@ -1556,8 +1621,7 @@ impl NamespaceManager {
             meta.updated_at = self.clock.now();
             let etag = etag.unwrap_or_default();
             match self
-                .store
-                .put_if_match(&key, meta.to_bytes()?, &etag, &meta_name)
+                .put_metadata_if_match(&key, &meta, &etag, &meta_name)
                 .await
             {
                 Ok(_) => {
@@ -1701,8 +1765,7 @@ impl NamespaceManager {
                 >= COMPACTION_DEGRADED_FAILURE_THRESHOLD;
             let etag = etag.unwrap_or_default();
             match self
-                .store
-                .put_if_match(&key, meta.to_bytes()?, &etag, &meta_name)
+                .put_metadata_if_match(&key, &meta, &etag, &meta_name)
                 .await
             {
                 Ok(_) => {
@@ -1753,11 +1816,7 @@ impl NamespaceManager {
             meta.state = NamespaceState::Deleting;
             meta.updated_at = self.clock.now();
             let etag = etag.unwrap_or_default();
-            match self
-                .store
-                .put_if_match(&key, meta.to_bytes()?, &etag, name)
-                .await
-            {
+            match self.put_metadata_if_match(&key, &meta, &etag, name).await {
                 Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);
@@ -1971,7 +2030,35 @@ fn fts_config_value(
 mod tests {
     //! Unit tests for the namespace-name boundary shared by S3 keys and routes.
 
-    use super::is_valid_namespace_name;
+    use super::*;
+
+    #[test]
+    fn malformed_incarnation_metadata_fails_loudly() {
+        let now = Utc::now();
+        let metadata = NamespaceMetadata {
+            name: "invalid-incarnation".to_string(),
+            dimensions: 16,
+            distance_metric: DistanceMetric::Euclidean,
+            index_type: IndexType::IvfFlat,
+            vector_count: 0,
+            created_at: now,
+            updated_at: now,
+            state: NamespaceState::Active,
+            full_text_search: std::collections::HashMap::new(),
+            index_config: None,
+            compaction_health: CompactionHealth::default(),
+            incarnation_id: None,
+        };
+        let mut user_metadata = ObjectUserMetadata::new();
+        user_metadata.insert(NAMESPACE_INCARNATION_METADATA_KEY, "not-a-uuid");
+
+        let error = match metadata.attach_user_metadata(&user_metadata) {
+            Ok(_) => panic!("malformed incarnation metadata unexpectedly decoded"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ZeppelinError::Serialization(_)));
+    }
 
     /// Verifies the accepted grammar covers the intended portable name forms.
     #[test]

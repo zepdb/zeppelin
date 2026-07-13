@@ -121,6 +121,7 @@ use crate::index::ivf_flat::build::{attrs_key, centroids_key, cluster_key};
 use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
 use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
 use crate::index::quantization::QuantizationType;
+use crate::namespace::manager::{NamespaceIncarnationId, NamespaceMetadata};
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{ListedObject, StorageVersion, ZeppelinStore};
 use crate::wal::fragment::WalFragment;
@@ -154,13 +155,13 @@ impl GcReadMode {
 /// Process-local discriminator for one lifetime of a namespace name.
 ///
 /// Namespace names can be deleted and recreated. A GC history memo therefore
-/// belongs to both the name and its authoritative creation timestamp; a later
-/// incarnation with the same name starts cold instead of inheriting disposable
-/// state from the deleted namespace.
+/// belongs to the name and its authoritative per-create identity. Legacy
+/// metadata without that identity falls back to its creation timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GcNamespaceIncarnation {
     name: String,
     created_at: DateTime<Utc>,
+    incarnation_id: Option<NamespaceIncarnationId>,
 }
 
 impl GcNamespaceIncarnation {
@@ -168,7 +169,38 @@ impl GcNamespaceIncarnation {
     #[must_use]
     pub fn new(name: String, created_at: DateTime<Utc>) -> Self {
         assert!(!name.is_empty(), "GC namespace incarnation cannot be empty");
-        Self { name, created_at }
+        Self {
+            name,
+            created_at,
+            incarnation_id: None,
+        }
+    }
+
+    /// Captures the lifecycle identity carried by an authoritative metadata GET.
+    #[must_use]
+    pub fn from_metadata(metadata: &NamespaceMetadata) -> Self {
+        assert!(
+            !metadata.name.is_empty(),
+            "GC namespace incarnation cannot be empty"
+        );
+        Self {
+            name: metadata.name.clone(),
+            created_at: metadata.created_at,
+            incarnation_id: metadata.incarnation_id.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_incarnation_id(
+        name: String,
+        created_at: DateTime<Utc>,
+        incarnation_id: NamespaceIncarnationId,
+    ) -> Self {
+        Self {
+            name,
+            created_at,
+            incarnation_id: Some(incarnation_id),
+        }
     }
 
     /// Returns the namespace name used for object-store keys.
@@ -4570,6 +4602,40 @@ mod tests {
 
     /// Stable namespace prefix used to make expected artifact keys readable.
     const NS: &str = "gc_ns";
+
+    #[test]
+    fn gc_runner_drops_memo_for_same_timestamp_new_incarnation() {
+        let now = Utc::now();
+        let old = GcNamespaceIncarnation::with_incarnation_id(
+            NS.to_string(),
+            now,
+            NamespaceIncarnationId::new(),
+        );
+        let replacement = GcNamespaceIncarnation::with_incarnation_id(
+            NS.to_string(),
+            now,
+            NamespaceIncarnationId::new(),
+        );
+        let gc = GcConfig::default();
+        let mut runner = GcRunner::new(ZeppelinStore::new(Arc::new(InMemory::new())), gc.clone());
+        runner.namespaces.insert(
+            NS.to_string(),
+            NamespaceGcMemo {
+                incarnation: old,
+                history: BTreeMap::new(),
+                inventory: None,
+                next_due_at: None,
+                last_now: now,
+                last_cycle_complete: true,
+                candidate_phase_due: false,
+                config: GcConfigFingerprint::from(&gc),
+            },
+        );
+
+        runner.retain_namespaces(&BTreeSet::from([replacement]));
+
+        assert!(runner.namespaces.is_empty());
+    }
 
     #[tokio::test]
     async fn bounded_read_collection_drains_all_futures_and_preserves_input_order() {

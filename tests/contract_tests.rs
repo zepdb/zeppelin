@@ -1163,6 +1163,7 @@ async fn seed_deleting_namespace(store: &zeppelin::storage::ZeppelinStore, ns: &
             &Config::default().indexing,
         )),
         compaction_health: CompactionHealth::default(),
+        incarnation_id: None,
     };
     store
         .put(&NamespaceMetadata::s3_key(ns), meta.to_bytes().unwrap())

@@ -4,8 +4,11 @@ use common::assertions::{assert_s3_object_exists, assert_s3_object_not_exists};
 use common::harness::TestHarness;
 
 use chrono::Utc;
+use zeppelin::config::IndexingConfig;
 use zeppelin::error::ZeppelinError;
-use zeppelin::namespace::manager::{CompactionHealth, NamespaceMetadata, NamespaceState};
+use zeppelin::namespace::manager::{
+    CompactionHealth, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
+};
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::types::DistanceMetric;
 use zeppelin::types::IndexType;
@@ -47,6 +50,61 @@ async fn test_create_namespace() {
     assert_s3_object_exists(&harness.store, &manifest_key).await;
 
     cleanup_ns(&harness.store, &name).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_namespace_incarnation_survives_metadata_cas_updates() {
+    let harness = TestHarness::new().await;
+    let name = ns(&harness, "incarnation-cas");
+    let manager = NamespaceManager::new(harness.store.clone());
+    let created = manager
+        .create(&name, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    let incarnation = created
+        .incarnation_id
+        .clone()
+        .expect("new namespaces must carry an incarnation ID");
+    let mut body_without_runtime_identity = created.clone();
+    body_without_runtime_identity.incarnation_id = None;
+    assert_eq!(
+        created.to_bytes().unwrap(),
+        body_without_runtime_identity.to_bytes().unwrap(),
+        "the runtime incarnation identity must not change meta.json bytes"
+    );
+
+    let configured = manager
+        .update_index_config(
+            &name,
+            NamespaceIndexConfig::from_indexing_config(&IndexingConfig::default()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(configured.incarnation_id.as_ref(), Some(&incarnation));
+
+    let failed = manager
+        .record_compaction_failure(
+            &name,
+            &ZeppelinError::Index("incarnation preservation proof".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.incarnation_id.as_ref(), Some(&incarnation));
+
+    let deleting = manager.start_delete(&name).await.unwrap();
+    assert_eq!(deleting.incarnation_id.as_ref(), Some(&incarnation));
+
+    let remote = NamespaceManager::new(harness.store.clone())
+        .get_including_deleting(&name)
+        .await
+        .unwrap();
+    assert_eq!(remote.incarnation_id.as_ref(), Some(&incarnation));
+
+    manager
+        .finish_delete(&name, std::time::Duration::MAX)
+        .await
+        .unwrap();
     harness.cleanup().await;
 }
 
@@ -146,6 +204,7 @@ async fn test_list_namespaces_ignores_nested_meta_objects() {
         full_text_search: std::collections::HashMap::new(),
         index_config: None,
         compaction_health: CompactionHealth::default(),
+        incarnation_id: None,
     };
     harness
         .store

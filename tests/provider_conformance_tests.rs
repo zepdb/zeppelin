@@ -9,6 +9,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use common::harness::TestHarness;
 use zeppelin::error::ZeppelinError;
+use zeppelin::storage::ObjectUserMetadata;
 
 #[tokio::test]
 async fn list_metadata_preserves_version_token() {
@@ -160,6 +161,101 @@ async fn supported_backend_honors_exact_atomic_strong_object_semantics() {
         .await
         .unwrap()
         .contains(&copy));
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn supported_backend_keeps_user_metadata_atomic_with_body_and_cas() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("provider-conformance-user-metadata");
+    let key = format!("{namespace}/object.bin");
+    let first_body = Bytes::from_static(b"first-body");
+    let second_body = Bytes::from_static(b"second-body");
+    let mut first_metadata = ObjectUserMetadata::new();
+    first_metadata.insert("zeppelin-test-incarnation", "first");
+    let mut second_metadata = ObjectUserMetadata::new();
+    second_metadata.insert("zeppelin-test-incarnation", "second");
+
+    harness
+        .store
+        .put_if_not_exists_with_user_metadata(&key, first_body.clone(), &namespace, &first_metadata)
+        .await
+        .unwrap();
+    let (created_body, created_metadata) =
+        harness.store.get_with_object_metadata(&key).await.unwrap();
+    assert_eq!(created_body, first_body);
+    assert_eq!(
+        created_metadata
+            .user_metadata
+            .get("zeppelin-test-incarnation"),
+        Some("first")
+    );
+    let created_etag = created_metadata
+        .e_tag
+        .expect("supported backend must return an ETag with user metadata");
+
+    assert!(harness
+        .store
+        .put_if_not_exists_with_user_metadata(
+            &key,
+            second_body.clone(),
+            &namespace,
+            &second_metadata,
+        )
+        .await
+        .is_err());
+    let (after_create_conflict, after_create_conflict_metadata) =
+        harness.store.get_with_object_metadata(&key).await.unwrap();
+    assert_eq!(after_create_conflict, first_body);
+    assert_eq!(
+        after_create_conflict_metadata
+            .user_metadata
+            .get("zeppelin-test-incarnation"),
+        Some("first")
+    );
+
+    harness
+        .store
+        .put_if_match_with_user_metadata(
+            &key,
+            second_body.clone(),
+            &created_etag,
+            &namespace,
+            &second_metadata,
+        )
+        .await
+        .unwrap();
+    let (after_cas, after_cas_metadata) =
+        harness.store.get_with_object_metadata(&key).await.unwrap();
+    assert_eq!(after_cas, second_body);
+    assert_eq!(
+        after_cas_metadata
+            .user_metadata
+            .get("zeppelin-test-incarnation"),
+        Some("second")
+    );
+
+    let stale = harness
+        .store
+        .put_if_match_with_user_metadata(
+            &key,
+            Bytes::from_static(b"stale-body"),
+            &created_etag,
+            &namespace,
+            &first_metadata,
+        )
+        .await;
+    assert!(matches!(stale, Err(ZeppelinError::ManifestConflict { .. })));
+    let (after_stale_cas, after_stale_cas_metadata) =
+        harness.store.get_with_object_metadata(&key).await.unwrap();
+    assert_eq!(after_stale_cas, second_body);
+    assert_eq!(
+        after_stale_cas_metadata
+            .user_metadata
+            .get("zeppelin-test-incarnation"),
+        Some("second")
+    );
 
     harness.cleanup().await;
 }

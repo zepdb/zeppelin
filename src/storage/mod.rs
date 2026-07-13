@@ -35,4 +35,7 @@
 pub mod store;
 
 /// Re-exports the storage gateway and its domain-facing result types.
-pub use store::{DeletePrefixOutcome, ListedObject, StorageVersion, ZeppelinStore};
+pub use store::{
+    DeletePrefixOutcome, ListedObject, ObjectReadMetadata, ObjectUserMetadata, StorageVersion,
+    ZeppelinStore,
+};

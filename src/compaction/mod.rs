@@ -4304,6 +4304,7 @@ mod tests {
             full_text_search: HashMap::new(),
             index_config: None,
             compaction_health: CompactionHealth::default(),
+            incarnation_id: None,
         }
     }
 

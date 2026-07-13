@@ -1019,7 +1019,7 @@ pub async fn compaction_loop(
         .cached_namespaces(namespace_prefix.as_deref())
         .into_iter()
         .filter(|namespace| namespace.state == NamespaceState::Active)
-        .map(|namespace| GcNamespaceIncarnation::new(namespace.name, namespace.created_at))
+        .map(|namespace| GcNamespaceIncarnation::from_metadata(&namespace))
         .collect::<BTreeSet<_>>();
     let mut tick: u64 = 0;
 
@@ -1055,15 +1055,13 @@ pub async fn compaction_loop(
             let active = namespaces
                 .iter()
                 .filter(|namespace| namespace.state == NamespaceState::Active)
-                .map(|namespace| {
-                    GcNamespaceIncarnation::new(namespace.name.clone(), namespace.created_at)
-                })
+                .map(GcNamespaceIncarnation::from_metadata)
                 .collect::<BTreeSet<_>>();
 
-            // A name can disappear or return with a new creation timestamp
-            // while this process still holds its old manifest generation
-            // floor. Reconcile every successful discovery before any strong
-            // trigger read so a removed/replaced incarnation starts cold.
+            // A name can disappear or return with a new per-create identity
+            // while this process still holds its old manifest generation floor.
+            // Reconcile every successful discovery before any strong trigger
+            // read so a removed/replaced incarnation starts cold.
             let changed_names = changed_namespace_names(&known_incarnations, &active);
             for namespace in changed_names {
                 manifest_cache.invalidate_at(&namespace, compactor.clock().now());
@@ -1126,7 +1124,7 @@ pub async fn compaction_loop(
 
             match gc_runner
                 .run_cycle_at(
-                    GcNamespaceIncarnation::new(ns.name.clone(), ns.created_at),
+                    GcNamespaceIncarnation::from_metadata(ns),
                     compactor.clock().now(),
                 )
                 .await
@@ -1267,6 +1265,7 @@ mod tests {
 
     use super::{changed_namespace_names, is_fresh_namespace_discovery_tick};
     use crate::compaction::gc::GcNamespaceIncarnation;
+    use crate::namespace::manager::NamespaceIncarnationId;
 
     #[test]
     fn namespace_discovery_refreshes_on_first_and_every_twelfth_tick() {
@@ -1282,16 +1281,23 @@ mod tests {
         let Some(old_created) = DateTime::<Utc>::from_timestamp(1, 0) else {
             panic!("one second after the Unix epoch must be representable");
         };
-        let Some(new_created) = DateTime::<Utc>::from_timestamp(2, 0) else {
-            panic!("two seconds after the Unix epoch must be representable");
-        };
+        let old_incarnation = NamespaceIncarnationId::new();
+        let new_incarnation = NamespaceIncarnationId::new();
         let known = BTreeSet::from([
-            GcNamespaceIncarnation::new("recreated".to_string(), old_created),
+            GcNamespaceIncarnation::with_incarnation_id(
+                "recreated".to_string(),
+                old_created,
+                old_incarnation,
+            ),
             GcNamespaceIncarnation::new("removed".to_string(), old_created),
             GcNamespaceIncarnation::new("unchanged".to_string(), old_created),
         ]);
         let active = BTreeSet::from([
-            GcNamespaceIncarnation::new("recreated".to_string(), new_created),
+            GcNamespaceIncarnation::with_incarnation_id(
+                "recreated".to_string(),
+                old_created,
+                new_incarnation,
+            ),
             GcNamespaceIncarnation::new("unchanged".to_string(), old_created),
         ]);
 

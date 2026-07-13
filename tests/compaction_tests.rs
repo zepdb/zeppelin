@@ -60,6 +60,7 @@ fn trigger_metadata(namespace: &str, dimensions: usize) -> NamespaceMetadata {
         full_text_search: HashMap::new(),
         index_config: None,
         compaction_health: CompactionHealth::default(),
+        incarnation_id: None,
     }
 }
 
@@ -1823,7 +1824,7 @@ async fn test_background_first_discovery_preserves_prewarmed_manifest_cache() {
 }
 
 #[tokio::test]
-async fn test_background_discovery_resets_manifest_cache_across_remote_recreate() {
+async fn test_background_discovery_resets_manifest_cache_across_remote_recreate_with_same_time() {
     #[derive(Debug)]
     struct FixedNamespaceTime(chrono::DateTime<Utc>);
 
@@ -1837,7 +1838,7 @@ async fn test_background_discovery_resets_manifest_cache_across_remote_recreate(
     let store = harness.store.clone();
     let ns = format!("{}-recreated-background-manifest", harness.prefix);
     let old_created_at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-    let new_created_at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_060, 0).unwrap();
+    let new_created_at = old_created_at;
     let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::with_clock(
         store.clone(),
         Duration::from_secs(3_600),
@@ -1887,7 +1888,10 @@ async fn test_background_discovery_resets_manifest_cache_across_remote_recreate(
         .await
         .unwrap();
     assert_eq!(old_metadata.created_at, old_created_at);
-    assert_eq!(new_metadata.created_at, new_created_at);
+    assert_eq!(new_metadata.created_at, old_metadata.created_at);
+    assert!(old_metadata.incarnation_id.is_some());
+    assert!(new_metadata.incarnation_id.is_some());
+    assert_ne!(old_metadata.incarnation_id, new_metadata.incarnation_id);
     let recreated = Manifest::read(&store, &ns).await.unwrap().unwrap();
     assert_eq!(recreated.version(), 1);
     let stale_error = manifest_cache

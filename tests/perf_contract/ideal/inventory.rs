@@ -24,9 +24,12 @@ pub(crate) enum StoreMethod {
     GetRange,
     GetRanges,
     GetWithMeta,
+    GetWithObjectMetadata,
     GetIfNoneMatch,
     PutIfMatch,
+    PutIfMatchWithUserMetadata,
     PutIfNotExists,
+    PutIfNotExistsWithUserMetadata,
     CopyIfNotExists,
     Delete,
     DeleteMany,
@@ -52,9 +55,21 @@ const STORAGE_METHOD_INVENTORY: &[StorageMethodInventory] = &[
     object_store_method(StoreMethod::GetRange, "get_range"),
     object_store_method(StoreMethod::GetRanges, "get_ranges"),
     object_store_method(StoreMethod::GetWithMeta, "get_with_meta"),
+    object_store_method(
+        StoreMethod::GetWithObjectMetadata,
+        "get_with_object_metadata",
+    ),
     object_store_method(StoreMethod::GetIfNoneMatch, "get_if_none_match"),
     object_store_method(StoreMethod::PutIfMatch, "put_if_match"),
+    object_store_method(
+        StoreMethod::PutIfMatchWithUserMetadata,
+        "put_if_match_with_user_metadata",
+    ),
     object_store_method(StoreMethod::PutIfNotExists, "put_if_not_exists"),
+    object_store_method(
+        StoreMethod::PutIfNotExistsWithUserMetadata,
+        "put_if_not_exists_with_user_metadata",
+    ),
     object_store_method(StoreMethod::CopyIfNotExists, "copy_if_not_exists"),
     object_store_method(StoreMethod::Delete, "delete"),
     object_store_method(StoreMethod::DeleteMany, "delete_many"),
@@ -204,7 +219,10 @@ const PRODUCTION_PATHS: &[ProductionPath] = &[
     path(
         "background.discovery_tick",
         "src/compaction/background.rs:compaction_loop",
-        &[StoreMethod::ListCommonPrefixes, StoreMethod::Get],
+        &[
+            StoreMethod::ListCommonPrefixes,
+            StoreMethod::GetWithObjectMetadata,
+        ],
         &[PhysicalVariant::ListDelimiter, PhysicalVariant::GetFull],
         PathCoverage::IdealScenario {
             scenario: "background.discovery_tick_active",
@@ -378,9 +396,9 @@ const PRODUCTION_PATHS: &[ProductionPath] = &[
         "namespace.create_fresh",
         "src/namespace/manager.rs:NamespaceManager::create_with_fts_and_index_config",
         &[
-            StoreMethod::PutIfNotExists,
+            StoreMethod::PutIfNotExistsWithUserMetadata,
             StoreMethod::Put,
-            StoreMethod::PutIfMatch,
+            StoreMethod::PutIfMatchWithUserMetadata,
         ],
         &[
             PhysicalVariant::PutCreate,
@@ -412,7 +430,10 @@ const PRODUCTION_PATHS: &[ProductionPath] = &[
     path(
         "namespace.get_cold",
         "src/server/handlers/namespace.rs:get_namespace",
-        &[StoreMethod::Get, StoreMethod::GetIfNoneMatch],
+        &[
+            StoreMethod::GetWithObjectMetadata,
+            StoreMethod::GetIfNoneMatch,
+        ],
         &[PhysicalVariant::GetFull, PhysicalVariant::GetConditional],
         PathCoverage::IdealScenario {
             scenario: "namespace.get_metadata_cold",
@@ -421,7 +442,10 @@ const PRODUCTION_PATHS: &[ProductionPath] = &[
     path(
         "namespace.patch_index_config",
         "src/namespace/manager.rs:NamespaceManager::update_index_config",
-        &[StoreMethod::GetWithMeta, StoreMethod::PutIfMatch],
+        &[
+            StoreMethod::GetWithObjectMetadata,
+            StoreMethod::PutIfMatchWithUserMetadata,
+        ],
         &[PhysicalVariant::GetFull, PhysicalVariant::PutUpdate],
         PathCoverage::IdealScenario {
             scenario: "namespace.patch_index_config",
@@ -1563,7 +1587,10 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
     path(
         "catalog.namespace.create_idempotent_existing",
         "src/namespace/manager.rs:NamespaceManager::create_idempotent_with_fts_and_index_config",
-        &[StoreMethod::PutIfNotExists, StoreMethod::Get],
+        &[
+            StoreMethod::PutIfNotExistsWithUserMetadata,
+            StoreMethod::GetWithObjectMetadata,
+        ],
         &[PhysicalVariant::PutCreate, PhysicalVariant::GetFull],
         ideal_case("namespace.create_idempotent_existing"),
     ),
@@ -1587,8 +1614,8 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
         "catalog.namespace.delete_publish_tombstone",
         "src/namespace/manager.rs:NamespaceManager::start_delete",
         &[
-            StoreMethod::GetWithMeta,
-            StoreMethod::PutIfMatch,
+            StoreMethod::GetWithObjectMetadata,
+            StoreMethod::PutIfMatchWithUserMetadata,
             StoreMethod::Delete,
         ],
         &[
@@ -1608,7 +1635,10 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
     path(
         "catalog.namespace.scan_active_many",
         "src/namespace/manager.rs:NamespaceManager::list",
-        &[StoreMethod::ListCommonPrefixes, StoreMethod::Get],
+        &[
+            StoreMethod::ListCommonPrefixes,
+            StoreMethod::GetWithObjectMetadata,
+        ],
         &[PhysicalVariant::ListDelimiter, PhysicalVariant::GetFull],
         ideal_case("namespace.scan_active_many"),
     ),
@@ -1624,9 +1654,9 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
         "src/namespace/manager.rs:NamespaceManager::list",
         &[
             StoreMethod::ListCommonPrefixes,
-            StoreMethod::Get,
+            StoreMethod::GetWithObjectMetadata,
             StoreMethod::Put,
-            StoreMethod::PutIfMatch,
+            StoreMethod::PutIfMatchWithUserMetadata,
         ],
         &[
             PhysicalVariant::ListDelimiter,
@@ -1641,8 +1671,8 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
         "src/namespace/manager.rs:NamespaceManager::list",
         &[
             StoreMethod::ListCommonPrefixes,
-            StoreMethod::Get,
-            StoreMethod::PutIfMatch,
+            StoreMethod::GetWithObjectMetadata,
+            StoreMethod::PutIfMatchWithUserMetadata,
         ],
         &[
             PhysicalVariant::ListDelimiter,
