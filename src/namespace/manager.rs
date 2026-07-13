@@ -828,7 +828,7 @@ impl NamespaceManager {
                 .put_if_match(&key, meta.to_bytes()?, &etag, name)
                 .await
             {
-                Ok(()) => {
+                Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);
                 }
@@ -1560,7 +1560,7 @@ impl NamespaceManager {
                 .put_if_match(&key, meta.to_bytes()?, &etag, &meta_name)
                 .await
             {
-                Ok(()) => {
+                Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);
                 }
@@ -1705,7 +1705,7 @@ impl NamespaceManager {
                 .put_if_match(&key, meta.to_bytes()?, &etag, &meta_name)
                 .await
             {
-                Ok(()) => {
+                Ok(_) => {
                     self.insert_registry(meta.clone());
                     crate::metrics::COMPACTION_NAMESPACE_DEGRADED
                         .with_label_values(&[name])
@@ -1758,7 +1758,7 @@ impl NamespaceManager {
                 .put_if_match(&key, meta.to_bytes()?, &etag, name)
                 .await
             {
-                Ok(()) => {
+                Ok(_) => {
                     self.insert_registry(meta.clone());
                     return Ok(meta);
                 }

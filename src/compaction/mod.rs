@@ -1371,7 +1371,7 @@ impl Compactor {
                     .write_conditional(&self.store, namespace, &version)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         let elapsed = start.elapsed();
                         crate::metrics::COMPACTION_DURATION
                             .with_label_values(&[namespace])
@@ -1932,7 +1932,7 @@ impl Compactor {
                 .write_conditional(&self.store, namespace, &version)
                 .await
             {
-                Ok(()) => {
+                Ok(_) => {
                     let elapsed = start.elapsed();
                     crate::metrics::COMPACTION_DURATION
                         .with_label_values(&[namespace])

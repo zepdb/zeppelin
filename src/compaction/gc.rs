@@ -1584,7 +1584,7 @@ async fn drain_pending_deletes_with_retained_history_from(
         manifest.updated_at = now;
 
         match manifest.write_conditional(store, namespace, &version).await {
-            Ok(()) => {
+            Ok(_) => {
                 return Ok((
                     PendingDeleteDrainOutcome::new(
                         PendingDeleteDrainReport {
@@ -1737,7 +1737,7 @@ async fn drain_pending_deletes_with_inventory_authority_from(
         manifest.updated_at = now;
 
         match manifest.write_conditional(store, namespace, &version).await {
-            Ok(()) => {
+            Ok(_) => {
                 return Ok(PendingDeleteDrainOutcome::new(
                     PendingDeleteDrainReport {
                         objects_deleted: deleted_keys.len(),
@@ -4348,6 +4348,7 @@ pub async fn write_compaction_staging(
     store
         .put(&staging_key(namespace, fencing_token), data)
         .await
+        .map(|_| ())
 }
 
 /// Clears one lease token's staging record idempotently.

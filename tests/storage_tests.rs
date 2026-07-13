@@ -6,6 +6,7 @@ use futures::StreamExt;
 use std::time::Duration;
 use zeppelin::config::{StorageBackend, StorageConfig};
 use zeppelin::storage::ZeppelinStore;
+use zeppelin::wal::{Manifest, ManifestVersion};
 
 /// Smoke test: connect to S3, write an object, read it back, verify content, delete it.
 #[tokio::test]
@@ -134,6 +135,85 @@ async fn test_s3_overwrite() {
         Bytes::from("version 2"),
         "should read overwritten value"
     );
+
+    harness.cleanup().await;
+}
+
+/// A successful ordinary or CAS PUT returns the exact ETag that a fresh
+/// authoritative read observes for the newly written object.
+#[tokio::test]
+async fn test_put_and_put_if_match_return_authoritative_etags() {
+    let harness = TestHarness::new().await;
+    let key = harness.key("returned-put-etag.bin");
+
+    let first_etag = harness
+        .store
+        .put(&key, Bytes::from_static(b"first"))
+        .await
+        .expect("initial PUT should succeed");
+    let Some(first_etag) = first_etag else {
+        eprintln!("backend omitted the initial PUT ETag; skipping ETag equality assertions");
+        harness.cleanup().await;
+        return;
+    };
+    let (_, observed_first_etag) = harness
+        .store
+        .get_with_meta(&key)
+        .await
+        .expect("initial object should be readable with metadata");
+    assert_eq!(observed_first_etag.as_deref(), Some(first_etag.as_str()));
+
+    let second_etag = harness
+        .store
+        .put_if_match(
+            &key,
+            Bytes::from_static(b"second"),
+            &first_etag,
+            "returned-put-etag",
+        )
+        .await
+        .expect("matching conditional PUT should succeed");
+    let Some(second_etag) = second_etag else {
+        eprintln!("backend omitted the conditional PUT ETag; skipping its equality assertion");
+        harness.cleanup().await;
+        return;
+    };
+    let (body, observed_second_etag) = harness
+        .store
+        .get_with_meta(&key)
+        .await
+        .expect("updated object should be readable with metadata");
+
+    assert_eq!(body, Bytes::from_static(b"second"));
+    assert_eq!(observed_second_etag.as_deref(), Some(second_etag.as_str()));
+
+    harness.cleanup().await;
+}
+
+/// A fresh conditional manifest publication exposes the ETag returned by its
+/// ordinary live-manifest PUT as the next CAS capability.
+#[tokio::test]
+async fn test_fresh_manifest_write_conditional_returns_authoritative_etag() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("returned-manifest-etag");
+    let mut manifest = Manifest::new();
+
+    let written_version = manifest
+        .write_conditional(&harness.store, &namespace, &ManifestVersion(None))
+        .await
+        .expect("fresh conditional manifest publication should succeed");
+    let Some(written_etag) = written_version.0 else {
+        eprintln!("backend omitted the manifest PUT ETag; skipping its equality assertion");
+        harness.cleanup().await;
+        return;
+    };
+    let (_, observed_version) = Manifest::read_versioned(&harness.store, &namespace)
+        .await
+        .expect("fresh manifest should be readable")
+        .expect("fresh manifest should exist");
+
+    assert_eq!(observed_version.0.as_deref(), Some(written_etag.as_str()));
+    assert_eq!(manifest.version(), 1);
 
     harness.cleanup().await;
 }

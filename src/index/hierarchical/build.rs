@@ -655,7 +655,7 @@ async fn write_leaf_cluster(
         if let Some((bkey, bitmap_data)) = bitmap_payload {
             store.put(&bkey, bitmap_data).await
         } else {
-            Ok(())
+            Ok(None)
         }
     };
     let (r1, r2, r3) = tokio::join!(

@@ -480,7 +480,7 @@ impl LeaseManager {
                 released.expires_at = self.clock.now() - chrono::Duration::seconds(1);
                 let release_data = Bytes::from(serde_json::to_vec_pretty(&released)?);
                 match self.store.put(&key, release_data).await {
-                    Ok(()) => {
+                    Ok(_) => {
                         debug!("lease released");
                         Ok(())
                     }

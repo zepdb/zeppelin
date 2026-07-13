@@ -2344,6 +2344,7 @@ async fn execute_pending_delete(case: &IdealCase, shape: PendingShape) -> IdealS
                     .expect("ideal pending-delete manifest serialization failed"),
             )
             .await
+            .map(|_| ())
             .expect("ideal pending-delete live manifest setup failed"),
     }
 

@@ -1450,8 +1450,9 @@ impl Manifest {
     ///
     /// # Returns
     ///
-    /// `Ok(())` after the conditional live PUT succeeds; `self.version` then
-    /// advances by exactly one.
+    /// The new live-object ETag after the conditional PUT succeeds;
+    /// `self.version` then advances by exactly one. Backends that omit an ETag
+    /// produce `ManifestVersion(None)` without fabricating a CAS capability.
     ///
     /// # Errors
     ///
@@ -1489,7 +1490,7 @@ impl Manifest {
         store: &ZeppelinStore,
         namespace: &str,
         version: &ManifestVersion,
-    ) -> Result<()> {
+    ) -> Result<ManifestVersion> {
         let key = Self::s3_key(namespace);
         let next_version = self.next_committed_version()?;
         let mut committed = self.clone();
@@ -1504,12 +1505,12 @@ impl Manifest {
             ReferencedHistoryConflict::ManifestConflict,
         )
         .await?;
-        match &version.0 {
+        let new_etag = match &version.0 {
             Some(etag) => store.put_if_match(&key, data, etag, namespace).await,
             None => store.put(&key, data).await,
         }?;
         *self = committed;
-        Ok(())
+        Ok(ManifestVersion(new_etag))
     }
 
     /// Lists retained manifest history descriptors in ascending generation order.
@@ -1875,7 +1876,7 @@ impl Manifest {
                         }
                     };
                 }
-                store.put(&key, data).await
+                store.put(&key, data).await.map(|_| ())
             }
         }
     }

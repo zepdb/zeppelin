@@ -689,7 +689,7 @@ impl WalWriter {
                 .write_conditional(&self.store, namespace, &version)
                 .await
             {
-                Ok(()) => {
+                Ok(_) => {
                     debug!(
                         batched = batch.len(),
                         fragment_count = manifest.fragments.len(),

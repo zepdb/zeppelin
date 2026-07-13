@@ -637,7 +637,7 @@ async fn test_tla_compaction_retry_starvation() {
                 );
                 conflict_count += 1;
             }
-            Ok(()) => {
+            Ok(_) => {
                 panic!("CAS should have conflicted on attempt {attempt} (writer interfered)");
             }
             Err(e) => panic!("unexpected error on CAS attempt {attempt}: {e}"),

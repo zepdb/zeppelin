@@ -1569,9 +1569,10 @@ pub async fn run_crash_matrix() {
                     | CrashPoint::ManifestCas
                     | CrashPoint::SegmentPut
                     | CrashPoint::StagingSideObjectPut
-                    | CrashPoint::SnapshotPut => {
-                        faulted.put(&task_key, Bytes::from_static(b"after")).await
-                    }
+                    | CrashPoint::SnapshotPut => faulted
+                        .put(&task_key, Bytes::from_static(b"after"))
+                        .await
+                        .map(|_| ()),
                     CrashPoint::StagingDrop | CrashPoint::NamespaceDeleteBatch { .. } => {
                         faulted.delete(&task_key).await
                     }

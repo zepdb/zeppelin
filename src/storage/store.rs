@@ -546,7 +546,9 @@ impl ZeppelinStore {
     ///
     /// # Returns
     ///
-    /// `Ok(())` after the backend has atomically accepted the complete payload.
+    /// The backend-provided ETag after it atomically accepts the complete
+    /// payload. Backends that omit an ETag return `None` without fabricating an
+    /// identity.
     ///
     /// # Errors
     ///
@@ -574,8 +576,8 @@ impl ZeppelinStore {
     /// exists, but queries continue to use the previous segment set until a
     /// later conditional manifest update references it.
     #[instrument(skip(self, data), fields(key = key, size = data.len()))]
-    pub async fn put(&self, key: &str, data: Bytes) -> Result<()> {
-        self.put_with_version(key, data).await.map(|_| ())
+    pub async fn put(&self, key: &str, data: Bytes) -> Result<Option<String>> {
+        self.put_result(key, data).await.map(|result| result.e_tag)
     }
 
     /// Writes one object and preserves the backend identity returned by PUT.
@@ -589,6 +591,12 @@ impl ZeppelinStore {
         key: &str,
         data: Bytes,
     ) -> Result<Option<StorageVersion>> {
+        let result = self.put_result(key, data).await?;
+        Ok(StorageVersion::from_parts(result.e_tag, result.version))
+    }
+
+    /// Performs the shared ordinary-PUT request and instrumentation once.
+    async fn put_result(&self, key: &str, data: Bytes) -> Result<object_store::PutResult> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let result = self.inner.put(&path, PutPayload::from(data)).await?;
@@ -597,7 +605,7 @@ impl ZeppelinStore {
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
-        Ok(StorageVersion::from_parts(result.e_tag, result.version))
+        Ok(result)
     }
 
     /// Downloads the complete object stored at a key.
@@ -1018,7 +1026,8 @@ impl ZeppelinStore {
     ///
     /// # Returns
     ///
-    /// `Ok(())` only after the conditional replacement succeeds.
+    /// The new backend-provided ETag after the conditional replacement
+    /// succeeds. A backend may legally omit it, represented as `None`.
     ///
     /// # Errors
     ///
@@ -1067,7 +1076,7 @@ impl ZeppelinStore {
         data: Bytes,
         etag: &str,
         namespace: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
         let options = PutOptions {
@@ -1077,7 +1086,8 @@ impl ZeppelinStore {
             }),
             ..PutOptions::default()
         };
-        self.inner
+        let result = self
+            .inner
             .put_opts(&path, PutPayload::from(data), options)
             .await
             .map_err(|e| match e {
@@ -1096,7 +1106,7 @@ impl ZeppelinStore {
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
-        Ok(())
+        Ok(result.e_tag)
     }
 
     /// Creates an object only when its key does not already exist.
