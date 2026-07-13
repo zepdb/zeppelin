@@ -2353,6 +2353,12 @@ fn background_compaction_metric(ns: &str) -> u64 {
         .sum()
 }
 
+fn successful_background_compaction_metric(ns: &str) -> u64 {
+    zeppelin::metrics::COMPACTIONS_TOTAL
+        .with_label_values(&[ns, "success"])
+        .get()
+}
+
 fn object_store_breakdown(counter: &GetCounter) -> ObjectStoreCensus {
     counter.class_breakdown()
 }
@@ -9961,7 +9967,7 @@ mod outcome_tests {
         )
         .await;
         assert_eq!(create_status, StatusCode::CREATED.as_u16());
-        let background_start = background_compaction_metric(&namespace);
+        let background_start = successful_background_compaction_metric(&namespace);
 
         let mut state = OperationalState::default();
         let remaining = state
@@ -10021,6 +10027,17 @@ mod outcome_tests {
             assert_eq!(upsert_status, StatusCode::OK.as_u16());
         }
 
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while successful_background_compaction_metric(&namespace) == background_start {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(
+            "the focused two-node window published a fenced manifest but did not finish a \
+             background compaction",
+        );
+
         let remaining = state
             .apply_node_commands(
                 vec![SchedulerCommand::StopSecondNode {
@@ -10041,7 +10058,7 @@ mod outcome_tests {
             .await;
         assert!(remaining.is_empty());
         assert!(
-            background_compaction_metric(&namespace) > background_start,
+            successful_background_compaction_metric(&namespace) > background_start,
             "the focused two-node window recorded no background compaction"
         );
         let stop = scheduler
