@@ -21,8 +21,8 @@ use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{compaction_loop, CompactionLoopOptions};
 use zeppelin::compaction::gc::{
-    load_gc_candidates, run_gc_cycle, run_gc_cycle_at, write_compaction_staging, GcCycleReport,
-    GcNamespaceIncarnation, GcRunner,
+    load_gc_candidates, run_gc_cycle, run_gc_cycle_at, save_gc_candidates,
+    write_compaction_staging, GcCandidate, GcCycleReport, GcNamespaceIncarnation, GcRunner,
 };
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, GcConfig, IndexingConfig};
@@ -1876,6 +1876,11 @@ async fn gc_runner_warm_empty_pending_reuses_prune_history_roots() {
         0,
         "unchanged retained generation bodies must remain memoized"
     );
+    assert_eq!(
+        counter.puts_matching(&format!("{namespace}/_gc/candidates.json")),
+        0,
+        "a canonical candidate ledger whose contents did not change must not be rewritten"
+    );
 
     harness.cleanup().await;
 }
@@ -2914,6 +2919,327 @@ async fn gc_runner_mature_candidate_delete_uses_two_full_namespace_inventories()
     assert_eq!(due.objects_deleted, 1);
     assert_s3_object_not_exists(&store, &orphan_key).await;
     assert_only_full_namespace_inventory_lists(&namespace, &counter, &control, 2);
+    assert_eq!(
+        counter.puts_matching(&format!("{namespace}/_gc/candidates.json")),
+        1,
+        "a mature unchanged mark needs only the final cleanup PUT after deletion"
+    );
+    assert!(
+        load_gc_candidates(&store, &namespace)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the cleanup PUT must durably remove the deleted candidate"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_changed_candidate_ledger_after_mark_prevents_sweep() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-ledger-changed-before-sweep");
+    let store = harness.store.clone();
+    let now = Utc::now();
+    let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 318);
+    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
+
+    Manifest::new_at(now)
+        .write(&store, &namespace)
+        .await
+        .unwrap();
+    store
+        .put(
+            &orphan_key,
+            Bytes::from_static(b"candidate whose durable mark is replaced"),
+        )
+        .await
+        .unwrap();
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(
+        counted_store,
+        GcConfig {
+            manifest_history_keep_count: 64,
+            ..unsafe_short_gc(10)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), now);
+
+    let marked = run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    assert_eq!(marked.candidates_marked, 1);
+
+    control.replace_on_nth_list(
+        &format!("{namespace}/"),
+        &candidate_ledger_key,
+        Bytes::from(
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "candidates": [],
+            }))
+            .unwrap(),
+        ),
+        2,
+    );
+    let raced = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(11),
+        &counter,
+        &control,
+    )
+    .await;
+
+    assert_eq!(raced.objects_deleted, 0);
+    assert_eq!(
+        control.delete_calls(),
+        0,
+        "a candidate cannot be swept after its durable mark identity changes"
+    );
+    assert_s3_object_exists(&store, &orphan_key).await;
+    assert!(
+        load_gc_candidates(&store, &namespace)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the injected replacement ledger must remain authoritative"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_warm_new_immature_candidate_is_persisted_once_and_survives() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-new-candidate-one-put");
+    let store = harness.store.clone();
+    let now = Utc::now();
+    let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 314);
+    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
+
+    Manifest::new_at(now)
+        .write(&store, &namespace)
+        .await
+        .unwrap();
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(
+        counted_store,
+        GcConfig {
+            manifest_history_keep_count: 64,
+            ..unsafe_short_gc(10)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), now);
+
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    store
+        .put(
+            &orphan_key,
+            Bytes::from_static(b"new candidate must be durable before sweep"),
+        )
+        .await
+        .unwrap();
+
+    let marked = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+
+    assert_eq!(marked.candidates_marked, 1);
+    assert_eq!(marked.objects_deleted, 0);
+    assert_eq!(
+        counter.puts_matching(&candidate_ledger_key),
+        1,
+        "a new immature candidate needs one durable mark PUT and no unchanged final PUT"
+    );
+    assert_eq!(
+        load_gc_candidates(&store, &namespace)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect::<Vec<_>>(),
+        vec![orphan_key.clone()]
+    );
+    assert_s3_object_exists(&store, &orphan_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_warm_equal_legacy_candidate_ledger_migrates_once() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-legacy-candidate-one-put");
+    let store = harness.store.clone();
+    let now = Utc::now();
+    let orphan_id = ulid_at(now - chrono::Duration::seconds(120), 315);
+    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
+    let candidate = GcCandidate {
+        key: orphan_key.clone(),
+        first_seen_unreachable_at: now,
+        unreachable_since_manifest_version: 1,
+    };
+
+    Manifest::new_at(now)
+        .write(&store, &namespace)
+        .await
+        .unwrap();
+    store
+        .put(&orphan_key, Bytes::from_static(b"legacy candidate"))
+        .await
+        .unwrap();
+    save_gc_candidates(&store, &namespace, std::slice::from_ref(&candidate))
+        .await
+        .unwrap();
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(
+        counted_store,
+        GcConfig {
+            manifest_history_keep_count: 64,
+            ..unsafe_short_gc(60)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), now);
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+
+    store
+        .put(
+            &candidate_ledger_key,
+            Bytes::from(serde_json::to_vec(&vec![candidate.clone()]).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    let report = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(
+        counter.puts_matching(&candidate_ledger_key),
+        1,
+        "semantic equality must not suppress the one required legacy-to-canonical migration PUT"
+    );
+    assert_eq!(
+        load_gc_candidates(&store, &namespace).await.unwrap(),
+        vec![candidate]
+    );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&store.get(&candidate_ledger_key).await.unwrap()).unwrap();
+    assert_eq!(persisted.get("version"), Some(&serde_json::json!(1)));
+    assert!(persisted.get("candidates").is_some());
+    assert_s3_object_exists(&store, &orphan_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_required_mark_put_failure_prevents_candidate_delete() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-required-mark-put-failure");
+    let store = harness.store.clone();
+    let now = Utc::now();
+    let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 316);
+    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
+
+    Manifest::new_at(now)
+        .write(&store, &namespace)
+        .await
+        .unwrap();
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(
+        counted_store,
+        GcConfig {
+            manifest_history_keep_count: 64,
+            ..unsafe_short_gc(0)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), now);
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+
+    store
+        .put(
+            &orphan_key,
+            Bytes::from_static(b"candidate cannot be swept before its mark is durable"),
+        )
+        .await
+        .unwrap();
+    control.fail_nth_put(&candidate_ledger_key, 1);
+
+    let failed = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+
+    assert_eq!(failed.candidates_marked, 0);
+    assert_eq!(failed.objects_deleted, 0);
+    assert_eq!(control.delete_calls(), 0);
+    assert_s3_object_exists(&store, &orphan_key).await;
+    assert!(load_gc_candidates(&store, &namespace)
+        .await
+        .unwrap()
+        .is_empty());
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn cold_one_shot_gc_preserves_two_exact_candidate_ledger_puts() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-cold-ledger-two-puts");
+    let store = harness.store.clone();
+    let now = Utc::now();
+    let candidate_ledger_key = format!("{namespace}/_gc/candidates.json");
+
+    Manifest::new_at(now)
+        .write(&store, &namespace)
+        .await
+        .unwrap();
+    let (counted_store, counter) = counting_store(&store);
+    counter.reset();
+
+    let report = run_gc_cycle_at(&counted_store, &namespace, &memo_gc(), now)
+        .await
+        .unwrap();
+
+    assert_eq!(report.candidates_marked, 0);
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(
+        counter.puts_matching(&candidate_ledger_key),
+        2,
+        "the frozen cold one-shot path intentionally preserves its two exact ledger PUTs"
+    );
+    assert!(load_gc_candidates(&store, &namespace)
+        .await
+        .unwrap()
+        .is_empty());
 
     harness.cleanup().await;
 }
@@ -3191,7 +3517,7 @@ async fn gc_runner_replacement_horizon_survives_candidate_cleanup_put_failure() 
         Bytes::from_static(b"replacement whose durable re-mark will fail"),
         2,
     );
-    control.fail_nth_put(&candidate_ledger_key, 2);
+    control.fail_nth_put(&candidate_ledger_key, 1);
     let raced = run_observed_gc_cycle(
         &mut runner,
         &incarnation,

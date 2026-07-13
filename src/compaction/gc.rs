@@ -933,11 +933,44 @@ pub struct GcCandidate {
 struct GcCandidateStore {
     /// Wrapper schema marker written with new ledgers.
     ///
-    /// The current decoder accepts the wrapper without rejecting other numeric
-    /// values; this field records format intent rather than enforcing migration.
+    /// The decoder accepts other numeric values so old data remains readable;
+    /// the next successful mark rewrites any noncurrent value canonically.
     version: u32,
     /// Complete candidate ledger replacing the previous object contents.
     candidates: Vec<GcCandidate>,
+}
+
+/// Persisted representation observed while loading the candidate ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateLedgerEncoding {
+    /// No ledger object exists yet.
+    Missing,
+    /// A ledger object exists but has an empty body.
+    EmptyBody,
+    /// The ledger uses the legacy bare-array JSON representation.
+    LegacyArray,
+    /// The ledger uses the versioned wrapper with the recorded schema value.
+    Versioned(u32),
+}
+
+/// Candidate contents paired with the representation that produced them.
+#[derive(Debug, Clone)]
+struct LoadedCandidateLedger {
+    candidates: Vec<GcCandidate>,
+    encoding: CandidateLedgerEncoding,
+}
+
+impl LoadedCandidateLedger {
+    fn missing() -> Self {
+        Self {
+            candidates: Vec::new(),
+            encoding: CandidateLedgerEncoding::Missing,
+        }
+    }
+
+    fn is_canonical(&self) -> bool {
+        self.encoding == CandidateLedgerEncoding::Versioned(GC_CANDIDATE_STORE_VERSION)
+    }
 }
 
 /// Observable counters from one attempted mark/sweep cycle.
@@ -1181,9 +1214,18 @@ pub async fn load_gc_candidates(
     store: &ZeppelinStore,
     namespace: &str,
 ) -> Result<Vec<GcCandidate>> {
+    load_candidate_ledger(store, namespace)
+        .await
+        .map(|ledger| ledger.candidates)
+}
+
+async fn load_candidate_ledger(
+    store: &ZeppelinStore,
+    namespace: &str,
+) -> Result<LoadedCandidateLedger> {
     match store.get(&gc_candidate_store_key(namespace)).await {
-        Ok(data) => decode_gc_candidates(&data),
-        Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(Vec::new()),
+        Ok(data) => decode_candidate_ledger(&data),
+        Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(LoadedCandidateLedger::missing()),
         Err(e) => Err(e),
     }
 }
@@ -1880,8 +1922,9 @@ fn debug_pending_delete_absent(namespace: &str, key: &str) {
 ///
 /// # Returns
 ///
-/// An empty vector for empty bytes, the wrapper's candidates for versioned JSON,
-/// or the array contents for the legacy bare-vector representation.
+/// Candidate contents plus whether the bytes were empty, a legacy array, or a
+/// versioned wrapper. Callers use that distinction to preserve migrations even
+/// when two representations contain the same candidates.
 ///
 /// # Errors
 ///
@@ -1896,16 +1939,25 @@ fn debug_pending_delete_absent(namespace: &str, key: &str) {
 /// # Rust Notes for Java/C Engineers
 ///
 /// The nested `match` tries two strongly typed serde targets without mutating
-/// the input. Each successful branch returns one owned `Vec`; the compiler
-/// requires every failure branch to produce the same `Result` type.
-fn decode_gc_candidates(data: &[u8]) -> Result<Vec<GcCandidate>> {
+/// the input. Each successful branch returns one owned ledger and its encoding;
+/// the compiler requires every failure branch to produce the same `Result` type.
+fn decode_candidate_ledger(data: &[u8]) -> Result<LoadedCandidateLedger> {
     if data.is_empty() {
-        return Ok(Vec::new());
+        return Ok(LoadedCandidateLedger {
+            candidates: Vec::new(),
+            encoding: CandidateLedgerEncoding::EmptyBody,
+        });
     }
     match serde_json::from_slice::<GcCandidateStore>(data) {
-        Ok(store) => Ok(store.candidates),
+        Ok(store) => Ok(LoadedCandidateLedger {
+            candidates: store.candidates,
+            encoding: CandidateLedgerEncoding::Versioned(store.version),
+        }),
         Err(wrapper_error) => match serde_json::from_slice::<Vec<GcCandidate>>(data) {
-            Ok(candidates) => Ok(candidates),
+            Ok(candidates) => Ok(LoadedCandidateLedger {
+                candidates,
+                encoding: CandidateLedgerEncoding::LegacyArray,
+            }),
             Err(_) => Err(wrapper_error.into()),
         },
     }
@@ -2069,13 +2121,15 @@ pub fn mark_gc_candidates(
 ///
 /// The mark ledger is a hint. Sweep authority comes from the second live
 /// manifest read plus freshly loaded retained history and active staging.
-/// Candidate ledger writes are unconditional and have no cross-cycle lock; a
-/// competing cycle may delay/re-mark work, but no ledger entry bypasses fresh
-/// reachability and age predicates. The horizon protects in-flight readers of
-/// stale cached manifests even though this function does not inspect caches. A
-/// ledger candidate absent from the cycle's original LIST is not deleted and is
-/// omitted from the cleaned ledger; if it later appears again, it must be marked
-/// and wait through the horizon again.
+/// Candidate ledger replacements use unconditional PUTs and have no cross-cycle
+/// lock, but an unchanged canonical ledger is not rewritten. A competing cycle
+/// may delay or re-mark work; a newly changed mark must be durably written before
+/// sweep, and no ledger entry bypasses fresh reachability and age predicates.
+/// The horizon protects in-flight readers of stale cached manifests even though
+/// this function does not inspect caches. A ledger candidate absent from the
+/// cycle's original LIST is not deleted and is omitted from the cleaned ledger;
+/// if it later appears again, it must be marked and wait through the horizon
+/// again.
 ///
 /// # Performance
 ///
@@ -2086,9 +2140,11 @@ pub fn mark_gc_candidates(
 /// overlaps the namespace, candidate-ledger, manifest, and staging inputs to
 /// mark. Sweep overlaps its manifest and staging inputs before taking the final
 /// history observation. Results remain inspected in the former sequential error
-/// order. The one-shot path keeps its original request sequence. Both paths
-/// still perform one or two candidate-ledger PUTs and sequential artifact
-/// DELETEs; those writes are not part of the read fan-out.
+/// order. The one-shot path keeps its original request sequence and two ledger
+/// PUTs. A warm cycle performs zero PUTs when the canonical ledger is unchanged,
+/// one when only mark or cleanup changes it, and two when a newly durable mark
+/// is also cleaned in the same cycle. Artifact DELETEs remain sequential; those
+/// writes are not part of the read fan-out.
 ///
 /// # Examples
 ///
@@ -2690,7 +2746,7 @@ fn deadline_after_secs(
 
 struct MarkReadInputs {
     listed_objects: Vec<ListedObject>,
-    persisted_candidates: Vec<GcCandidate>,
+    persisted_ledger: LoadedCandidateLedger,
     manifest: Manifest,
     staging: ActiveStagingObservation,
 }
@@ -2735,11 +2791,11 @@ async fn load_candidates_from_inventory(
     namespace: &str,
     inventory: &NamespaceInventory,
     require_etag: bool,
-) -> Result<Vec<GcCandidate>> {
+) -> Result<LoadedCandidateLedger> {
     let key = gc_candidate_store_key(namespace);
     match read_inventory_object(store, &key, inventory.object(&key), require_etag).await? {
-        Some(bytes) => decode_gc_candidates(&bytes),
-        None => Ok(Vec::new()),
+        Some(bytes) => decode_candidate_ledger(&bytes),
+        None => Ok(LoadedCandidateLedger::missing()),
     }
 }
 
@@ -2887,19 +2943,19 @@ enum MarkReadFailure {
 
 fn assemble_mark_read_inputs(
     listed_objects: Result<Vec<ListedObject>>,
-    persisted_candidates: Result<Vec<GcCandidate>>,
+    persisted_ledger: Result<LoadedCandidateLedger>,
     manifest: Result<Option<Manifest>>,
     staging: Result<ActiveStagingObservation>,
 ) -> std::result::Result<MarkReadInputs, MarkReadFailure> {
     let listed_objects = listed_objects.map_err(MarkReadFailure::NamespaceList)?;
-    let persisted_candidates = persisted_candidates.map_err(MarkReadFailure::CandidateLedger)?;
+    let persisted_ledger = persisted_ledger.map_err(MarkReadFailure::CandidateLedger)?;
     let manifest = manifest
         .map_err(MarkReadFailure::Manifest)?
         .ok_or(MarkReadFailure::ManifestMissing)?;
     let staging = staging.map_err(MarkReadFailure::Staging)?;
     Ok(MarkReadInputs {
         listed_objects,
-        persisted_candidates,
+        persisted_ledger,
         manifest,
         staging,
     })
@@ -2915,7 +2971,7 @@ async fn load_mark_read_inputs(
     if read_mode.is_bounded() {
         let (listed, candidates, manifest, staging) = tokio::join!(
             store.list_prefix_meta(&prefix),
-            load_gc_candidates(store, namespace),
+            load_candidate_ledger(store, namespace),
             read_manifest_for_gc(store, namespace),
             active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::WarmBounded,),
         );
@@ -2929,7 +2985,7 @@ async fn load_mark_read_inputs(
         // mask corruption already present in this authoritative inventory.
         NamespaceInventory::from_listed(namespace, listed.clone())
             .map_err(MarkReadFailure::NamespaceList)?;
-        let candidates = load_gc_candidates(store, namespace)
+        let candidates = load_candidate_ledger(store, namespace)
             .await
             .map_err(MarkReadFailure::CandidateLedger)?;
         let manifest = read_manifest_for_gc(store, namespace)
@@ -2942,7 +2998,7 @@ async fn load_mark_read_inputs(
                 .map_err(MarkReadFailure::Staging)?;
         Ok(MarkReadInputs {
             listed_objects: listed,
-            persisted_candidates: candidates,
+            persisted_ledger: candidates,
             manifest,
             staging,
         })
@@ -2969,7 +3025,7 @@ async fn load_sequential_mark_reads_from_inventory(
     now: DateTime<Utc>,
     inventory: &NamespaceInventory,
 ) -> std::result::Result<MarkReadInputs, MarkReadFailure> {
-    let candidates = load_gc_candidates(store, namespace)
+    let candidates = load_candidate_ledger(store, namespace)
         .await
         .map_err(MarkReadFailure::CandidateLedger)?;
     let manifest = read_manifest_for_gc(store, namespace)
@@ -2982,7 +3038,7 @@ async fn load_sequential_mark_reads_from_inventory(
             .map_err(MarkReadFailure::Staging)?;
     Ok(MarkReadInputs {
         listed_objects: inventory.all_objects(),
-        persisted_candidates: candidates,
+        persisted_ledger: candidates,
         manifest,
         staging,
     })
@@ -3265,6 +3321,7 @@ async fn run_gc_cycle_at_inner(
     } else {
         GcReadMode::Sequential
     };
+    let mark_read_from_inventory = initial_inventory.is_some();
     let mark_inputs = match initial_inventory.as_ref() {
         Some(inventory) if read_mode.is_bounded() => {
             load_mark_read_inputs_from_inventory(store, namespace, now, inventory).await
@@ -3276,7 +3333,7 @@ async fn run_gc_cycle_at_inner(
     };
     let MarkReadInputs {
         listed_objects,
-        persisted_candidates: persisted,
+        persisted_ledger,
         manifest: mark_manifest,
         staging: mark_staging,
     } = match mark_inputs {
@@ -3305,6 +3362,8 @@ async fn run_gc_cycle_at_inner(
             return Ok(GcCycleOutcome::incomplete(base_report));
         }
     };
+    let persisted_is_canonical = persisted_ledger.is_canonical();
+    let persisted = persisted_ledger.candidates;
     if force_candidate_phase {
         let retained = mark_manifest
             .pending_deletes
@@ -3356,20 +3415,37 @@ async fn run_gc_cycle_at_inner(
             .count(),
     );
 
-    match save_gc_candidates_with_version(store, namespace, &marked_candidates).await {
-        Ok((size, version)) => {
-            if let Some(inventory) = completed_inventory.as_mut() {
-                inventory.upsert(gc_candidate_store_key(namespace), size, version);
+    let candidate_ledger_key = gc_candidate_store_key(namespace);
+    let mark_put_required = !read_mode.is_bounded()
+        || !mark_read_from_inventory
+        || !persisted_is_canonical
+        || persisted != marked_candidates;
+    if mark_put_required {
+        match save_gc_candidates_with_version(store, namespace, &marked_candidates).await {
+            Ok((size, version)) => {
+                if let Some(inventory) = completed_inventory.as_mut() {
+                    inventory.upsert(candidate_ledger_key.clone(), size, version);
+                }
+            }
+            Err(e) => {
+                warn!(namespace, error = %e, "gc candidate mark persist failed; skipping sweep");
+                let mut report = base_report;
+                report.candidates_marked = 0;
+                report.candidates_skipped = marked_candidates.len();
+                return Ok(GcCycleOutcome::incomplete(report));
             }
         }
-        Err(e) => {
-            warn!(namespace, error = %e, "gc candidate mark persist failed; skipping sweep");
-            let mut report = base_report;
-            report.candidates_marked = 0;
-            report.candidates_skipped = marked_candidates.len();
-            return Ok(GcCycleOutcome::incomplete(report));
-        }
+    } else {
+        debug!(
+            namespace,
+            "gc candidate mark already canonical and unchanged; skipping persist"
+        );
     }
+    let durable_mark = marked_candidates.clone();
+    let durable_mark_identity = completed_inventory
+        .as_ref()
+        .and_then(|inventory| inventory.object(&candidate_ledger_key))
+        .cloned();
     crate::metrics::GC_CANDIDATES_MARKED_TOTAL
         .with_label_values(&[namespace])
         .inc_by(candidates_marked as u64);
@@ -3430,6 +3506,26 @@ async fn run_gc_cycle_at_inner(
         used_fresh_inventory = true;
     } else if candidate_may_delete && inventory_is_predelete {
         used_fresh_inventory = true;
+    }
+
+    if candidate_may_delete
+        && !durable_mark_identity
+            .as_ref()
+            .zip(
+                completed_inventory
+                    .as_ref()
+                    .and_then(|inventory| inventory.object(&candidate_ledger_key)),
+            )
+            .is_some_and(|(before, after)| listed_object_identity_matches(before, after))
+    {
+        warn!(
+            namespace,
+            "gc candidate ledger changed after durable mark; skipping sweep"
+        );
+        let mut report = base_report;
+        report.candidates_marked = candidates_marked;
+        report.candidates_skipped = unknown_shape_skips + marked_candidates.len();
+        return Ok(GcCycleOutcome::incomplete(report));
     }
 
     let sweep_inputs = match completed_inventory
@@ -3639,20 +3735,28 @@ async fn run_gc_cycle_at_inner(
         }
     }
 
-    match save_gc_candidates_with_version(store, namespace, &retained).await {
-        Ok((size, version)) => {
-            if let Some(inventory) = completed_inventory.as_mut() {
-                inventory.upsert(gc_candidate_store_key(namespace), size, version);
+    let cleanup_put_required = !read_mode.is_bounded() || retained != durable_mark;
+    if cleanup_put_required {
+        match save_gc_candidates_with_version(store, namespace, &retained).await {
+            Ok((size, version)) => {
+                if let Some(inventory) = completed_inventory.as_mut() {
+                    inventory.upsert(candidate_ledger_key, size, version);
+                }
+            }
+            Err(e) => {
+                cycle_complete = false;
+                warn!(
+                    namespace,
+                    error = %e,
+                    "gc candidate cleanup persist failed after sweep"
+                );
             }
         }
-        Err(e) => {
-            cycle_complete = false;
-            warn!(
-                namespace,
-                error = %e,
-                "gc candidate cleanup persist failed after sweep"
-            );
-        }
+    } else {
+        debug!(
+            namespace,
+            "gc candidate cleanup equals durable mark; skipping persist"
+        );
     }
 
     let pending_history_stable = pending_history_snapshots
@@ -4533,7 +4637,10 @@ mod tests {
 
         let mark = assemble_mark_read_inputs(
             Ok(Vec::new()),
-            Ok(Vec::new()),
+            Ok(LoadedCandidateLedger {
+                candidates: Vec::new(),
+                encoding: CandidateLedgerEncoding::Versioned(GC_CANDIDATE_STORE_VERSION),
+            }),
             Ok(None),
             Err(error("staging")),
         );
@@ -5346,7 +5453,9 @@ mod tests {
     /// reinterpret empty storage as corrupt.
     #[test]
     fn candidate_store_decodes_empty_versioned_and_legacy_json() {
-        assert!(decode_gc_candidates(b"").unwrap().is_empty());
+        let empty = decode_candidate_ledger(b"").unwrap();
+        assert!(empty.candidates.is_empty());
+        assert_eq!(empty.encoding, CandidateLedgerEncoding::EmptyBody);
 
         let candidate = GcCandidate {
             key: WalFragment::s3_key(NS, &ulid_seconds_ago(30, 95)),
@@ -5358,13 +5467,17 @@ mod tests {
             candidates: vec![candidate.clone()],
         })
         .unwrap();
+        let versioned = decode_candidate_ledger(&versioned).unwrap();
+        assert_eq!(versioned.candidates, vec![candidate.clone()]);
         assert_eq!(
-            decode_gc_candidates(&versioned).unwrap(),
-            vec![candidate.clone()]
+            versioned.encoding,
+            CandidateLedgerEncoding::Versioned(GC_CANDIDATE_STORE_VERSION)
         );
 
         let legacy = serde_json::to_vec(&vec![candidate.clone()]).unwrap();
-        assert_eq!(decode_gc_candidates(&legacy).unwrap(), vec![candidate]);
+        let legacy = decode_candidate_ledger(&legacy).unwrap();
+        assert_eq!(legacy.candidates, vec![candidate]);
+        assert_eq!(legacy.encoding, CandidateLedgerEncoding::LegacyArray);
     }
 
     /// Verifies pre-generation candidate records default to generation zero.
@@ -5403,7 +5516,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            decode_gc_candidates(&legacy).unwrap(),
+            decode_candidate_ledger(&legacy).unwrap().candidates,
             vec![GcCandidate {
                 key,
                 first_seen_unreachable_at,
