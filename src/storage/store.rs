@@ -572,15 +572,29 @@ impl ZeppelinStore {
     /// later conditional manifest update references it.
     #[instrument(skip(self, data), fields(key = key, size = data.len()))]
     pub async fn put(&self, key: &str, data: Bytes) -> Result<()> {
+        self.put_with_version(key, data).await.map(|_| ())
+    }
+
+    /// Writes one object and preserves the backend identity returned by PUT.
+    ///
+    /// This crate-visible variant performs the same single physical request and
+    /// metrics work as [`Self::put`]. Maintenance code uses the returned opaque
+    /// identity to update an already-observed inventory without an extra HEAD or
+    /// LIST. An absent identity remains `None` and cannot authorize later reuse.
+    pub(crate) async fn put_with_version(
+        &self,
+        key: &str,
+        data: Bytes,
+    ) -> Result<Option<StorageVersion>> {
         let start = std::time::Instant::now();
         let path = Path::parse(key)?;
-        self.inner.put(&path, PutPayload::from(data)).await?;
+        let result = self.inner.put(&path, PutPayload::from(data)).await?;
         let elapsed = start.elapsed();
         debug!(elapsed_ms = elapsed.as_millis(), "s3 put");
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["put"])
             .observe(elapsed.as_secs_f64());
-        Ok(())
+        Ok(StorageVersion::from_parts(result.e_tag, result.version))
     }
 
     /// Downloads the complete object stored at a key.

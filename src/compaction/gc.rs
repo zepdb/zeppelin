@@ -105,7 +105,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use crate::config::GcConfig;
@@ -118,11 +118,11 @@ use crate::index::ivf_flat::build::{attrs_key, centroids_key, cluster_key};
 use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
 use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
 use crate::index::quantization::QuantizationType;
-use crate::storage::{StorageVersion, ZeppelinStore};
+use crate::storage::{ListedObject, StorageVersion, ZeppelinStore};
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
     Manifest, ManifestHistoryObservation, ManifestHistoryPruneResult, ManifestHistoryRetention,
-    NamedSnapshot,
+    NamedSnapshot, NamedSnapshotObservation,
 };
 use crate::wal::Lease;
 
@@ -168,13 +168,37 @@ impl GcNamespaceIncarnation {
 pub struct GcRunner {
     store: ZeppelinStore,
     gc: GcConfig,
-    histories: BTreeMap<String, NamespaceHistoryMemo>,
+    namespaces: BTreeMap<String, NamespaceGcMemo>,
 }
 
 #[derive(Debug, Clone)]
-struct NamespaceHistoryMemo {
+struct NamespaceGcMemo {
     incarnation: GcNamespaceIncarnation,
-    entries: BTreeMap<String, CachedHistory>,
+    history: BTreeMap<String, CachedHistory>,
+    inventory: Option<InventoryFingerprint>,
+    next_due_at: Option<DateTime<Utc>>,
+    last_now: DateTime<Utc>,
+    last_cycle_complete: bool,
+    config: GcConfigFingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InventoryFingerprint(BTreeMap<String, InventoryObjectFingerprint>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InventoryObjectFingerprint {
+    size: u64,
+    version: StorageVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GcConfigFingerprint {
+    horizon_secs: u64,
+    compaction_upload_window_secs: u64,
+    skew_slop_secs: u64,
+    allow_unsafe_short_horizon: bool,
+    manifest_history_keep_count: usize,
+    pitr_retention_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -190,23 +214,120 @@ struct HistorySnapshot {
     cacheable: BTreeMap<String, CachedHistory>,
 }
 
+struct MemoizedHistoryPruneResult {
+    result: ManifestHistoryPruneResult,
+    retained_history_observations: Vec<ManifestHistoryObservation>,
+    snapshot_observations: Vec<NamedSnapshotObservation>,
+}
+
 struct GcCycleOutcome {
     report: GcCycleReport,
-    completed_history: Option<BTreeMap<String, CachedHistory>>,
+    completed: Option<CompletedGcState>,
+}
+
+struct CompletedGcState {
+    history: BTreeMap<String, CachedHistory>,
+    inventory: Option<InventoryFingerprint>,
+    next_due_at: Option<DateTime<Utc>>,
 }
 
 impl GcCycleOutcome {
     fn incomplete(report: GcCycleReport) -> Self {
         Self {
             report,
-            completed_history: None,
+            completed: None,
         }
     }
 
-    fn complete(report: GcCycleReport, completed_history: BTreeMap<String, CachedHistory>) -> Self {
+    fn complete(report: GcCycleReport, completed: CompletedGcState) -> Self {
         Self {
             report,
-            completed_history: Some(completed_history),
+            completed: Some(completed),
+        }
+    }
+}
+
+impl InventoryFingerprint {
+    fn from_listed(objects: Vec<ListedObject>) -> Option<Self> {
+        let mut entries = BTreeMap::new();
+        for object in objects {
+            let version = object.version?;
+            if entries
+                .insert(
+                    object.key,
+                    InventoryObjectFingerprint {
+                        size: object.size,
+                        version,
+                    },
+                )
+                .is_some()
+            {
+                return None;
+            }
+        }
+        Some(Self(entries))
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.0.remove(key);
+    }
+
+    fn upsert(&mut self, key: String, size: u64, version: StorageVersion) {
+        self.0
+            .insert(key, InventoryObjectFingerprint { size, version });
+    }
+
+    fn matches_listed_prefix<'a>(
+        &self,
+        prefix: &str,
+        listed: impl IntoIterator<Item = &'a ListedObject>,
+    ) -> bool {
+        let mut expected = BTreeMap::new();
+        for object in listed {
+            let Some(version) = object.version.clone() else {
+                return false;
+            };
+            if !object.key.starts_with(prefix)
+                || expected
+                    .insert(
+                        object.key.clone(),
+                        InventoryObjectFingerprint {
+                            size: object.size,
+                            version,
+                        },
+                    )
+                    .is_some()
+            {
+                return false;
+            }
+        }
+        let actual = self
+            .0
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        actual == expected
+    }
+}
+
+impl From<&GcConfig> for GcConfigFingerprint {
+    fn from(gc: &GcConfig) -> Self {
+        let GcConfig {
+            horizon_secs,
+            compaction_upload_window_secs,
+            skew_slop_secs,
+            allow_unsafe_short_horizon,
+            manifest_history_keep_count,
+            pitr_retention_secs,
+        } = gc;
+        Self {
+            horizon_secs: *horizon_secs,
+            compaction_upload_window_secs: *compaction_upload_window_secs,
+            skew_slop_secs: *skew_slop_secs,
+            allow_unsafe_short_horizon: *allow_unsafe_short_horizon,
+            manifest_history_keep_count: *manifest_history_keep_count,
+            pitr_retention_secs: *pitr_retention_secs,
         }
     }
 }
@@ -232,6 +353,11 @@ pub struct CompactionStaging {
     /// Exact object keys uploaded by compaction but not yet manifest-visible.
     #[serde(default)]
     pub keys: BTreeSet<String>,
+}
+
+struct ActiveStagingObservation {
+    keys: BTreeSet<String>,
+    lease_expires_at: Option<DateTime<Utc>>,
 }
 
 /// Builds the object key for one lease holder's compaction staging record.
@@ -643,11 +769,20 @@ pub struct PendingDeleteDrainReport {
 struct PendingDeleteDrainOutcome {
     report: PendingDeleteDrainReport,
     complete: bool,
+    observed_pending_deletes: Option<Vec<String>>,
 }
 
 impl PendingDeleteDrainOutcome {
-    fn new(report: PendingDeleteDrainReport, complete: bool) -> Self {
-        Self { report, complete }
+    fn new(
+        report: PendingDeleteDrainReport,
+        complete: bool,
+        observed_pending_deletes: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            report,
+            complete,
+            observed_pending_deletes,
+        }
     }
 }
 
@@ -855,16 +990,30 @@ pub async fn save_gc_candidates(
     namespace: &str,
     candidates: &[GcCandidate],
 ) -> Result<()> {
+    save_gc_candidates_with_version(store, namespace, candidates)
+        .await
+        .map(|_| ())
+}
+
+async fn save_gc_candidates_with_version(
+    store: &ZeppelinStore,
+    namespace: &str,
+    candidates: &[GcCandidate],
+) -> Result<(u64, Option<StorageVersion>)> {
     let store_doc = GcCandidateStore {
         version: GC_CANDIDATE_STORE_VERSION,
         candidates: candidates.to_vec(),
     };
-    store
-        .put(
-            &gc_candidate_store_key(namespace),
-            Bytes::from(serde_json::to_vec_pretty(&store_doc)?),
-        )
-        .await
+    let data = Bytes::from(serde_json::to_vec_pretty(&store_doc)?);
+    let size = u64::try_from(data.len()).map_err(|_| {
+        ZeppelinError::Validation(format!(
+            "GC candidate ledger for {namespace} does not fit in u64 bytes"
+        ))
+    })?;
+    let version = store
+        .put_with_version(&gc_candidate_store_key(namespace), data)
+        .await?;
+    Ok((size, version))
 }
 
 /// Deletes live-manifest `pending_deletes` and prunes only confirmed entries.
@@ -1005,6 +1154,7 @@ async fn drain_pending_deletes_with_retained_history(
                     ..PendingDeleteDrainReport::default()
                 },
                 complete,
+                None,
             ));
         };
 
@@ -1015,6 +1165,7 @@ async fn drain_pending_deletes_with_retained_history(
                     ..PendingDeleteDrainReport::default()
                 },
                 complete,
+                Some(Vec::new()),
             ));
         }
 
@@ -1071,6 +1222,7 @@ async fn drain_pending_deletes_with_retained_history(
                     entries_retained: retained.len(),
                 },
                 complete,
+                Some(manifest.pending_deletes),
             ));
         }
 
@@ -1088,6 +1240,7 @@ async fn drain_pending_deletes_with_retained_history(
                         entries_retained: retained.len(),
                     },
                     complete,
+                    Some(manifest.pending_deletes),
                 ));
             }
             Err(crate::error::ZeppelinError::ManifestConflict { .. }) => {
@@ -1410,8 +1563,18 @@ impl GcRunner {
         Self {
             store,
             gc,
-            histories: BTreeMap::new(),
+            namespaces: BTreeMap::new(),
         }
+    }
+
+    /// Replaces the GC policy used by subsequent cycles.
+    ///
+    /// Existing disposable history bodies remain available, but the exact
+    /// configuration fingerprint no longer matches. The next call therefore
+    /// performs a full authoritative cycle before a later idle decision can be
+    /// admitted under the new policy.
+    pub fn update_config(&mut self, gc: GcConfig) {
+        self.gc = gc;
     }
 
     /// Runs one cycle and commits history bodies only after a complete refresh.
@@ -1420,10 +1583,52 @@ impl GcRunner {
         incarnation: GcNamespaceIncarnation,
         now: DateTime<Utc>,
     ) -> Result<GcCycleReport> {
-        let previous = self
-            .histories
+        let mut previous = self
+            .namespaces
             .remove(incarnation.name())
             .filter(|memo| memo.incarnation == incarnation);
+
+        if let Some(memo) = previous.as_mut() {
+            let prefix = format!("{}/", incarnation.name());
+            let listed = match self.store.list_prefix_meta(&prefix).await {
+                Ok(listed) => listed,
+                Err(error) => {
+                    warn!(
+                        namespace = incarnation.name(),
+                        error = %error,
+                        "gc idle inventory refresh failed; skipping cycle"
+                    );
+                    memo.last_now = now;
+                    memo.last_cycle_complete = false;
+                    self.namespaces
+                        .insert(memo.incarnation.name.clone(), memo.clone());
+                    return Ok(GcCycleReport::default());
+                }
+            };
+            let inventory = InventoryFingerprint::from_listed(listed);
+            let config = GcConfigFingerprint::from(&self.gc);
+            let before_deadline = memo.next_due_at.is_none_or(|deadline| now < deadline);
+            let inventory_matches = inventory
+                .as_ref()
+                .is_some_and(|inventory| memo.inventory.as_ref() == Some(inventory));
+            if memo.last_cycle_complete
+                && memo.config == config
+                && now >= memo.last_now
+                && before_deadline
+                && inventory_matches
+            {
+                memo.last_now = now;
+                debug!(
+                    namespace = incarnation.name(),
+                    next_due_at = ?memo.next_due_at,
+                    "gc idle inventory unchanged; skipping full cycle"
+                );
+                self.namespaces
+                    .insert(memo.incarnation.name.clone(), memo.clone());
+                return Ok(GcCycleReport::default());
+            }
+        }
+
         let outcome = run_gc_cycle_at_inner(
             &self.store,
             incarnation.name(),
@@ -1435,23 +1640,32 @@ impl GcRunner {
 
         match outcome {
             Ok(outcome) => {
-                if let Some(entries) = outcome.completed_history {
-                    self.histories.insert(
+                if let Some(completed) = outcome.completed {
+                    self.namespaces.insert(
                         incarnation.name.clone(),
-                        NamespaceHistoryMemo {
+                        NamespaceGcMemo {
                             incarnation,
-                            entries,
+                            history: completed.history,
+                            inventory: completed.inventory,
+                            next_due_at: completed.next_due_at,
+                            last_now: now,
+                            last_cycle_complete: true,
+                            config: GcConfigFingerprint::from(&self.gc),
                         },
                     );
-                } else if let Some(previous) = previous {
-                    self.histories
+                } else if let Some(mut previous) = previous {
+                    previous.last_now = now;
+                    previous.last_cycle_complete = false;
+                    self.namespaces
                         .insert(previous.incarnation.name.clone(), previous);
                 }
                 Ok(outcome.report)
             }
             Err(error) => {
-                if let Some(previous) = previous {
-                    self.histories
+                if let Some(mut previous) = previous {
+                    previous.last_now = now;
+                    previous.last_cycle_complete = false;
+                    self.namespaces
                         .insert(previous.incarnation.name.clone(), previous);
                 }
                 Err(error)
@@ -1461,12 +1675,12 @@ impl GcRunner {
 
     /// Drops memo state for a namespace that is no longer active.
     pub(crate) fn forget_namespace(&mut self, namespace: &str) {
-        self.histories.remove(namespace);
+        self.namespaces.remove(namespace);
     }
 
     /// Retains memo state only for freshly discovered active incarnations.
     pub(crate) fn retain_namespaces(&mut self, active: &BTreeSet<GcNamespaceIncarnation>) {
-        self.histories
+        self.namespaces
             .retain(|_, memo| active.contains(&memo.incarnation));
     }
 }
@@ -1534,7 +1748,7 @@ async fn prune_history_with_memo_at(
     retention: ManifestHistoryRetention,
     now: DateTime<Utc>,
     prior: Option<&BTreeMap<String, CachedHistory>>,
-) -> Result<ManifestHistoryPruneResult> {
+) -> Result<MemoizedHistoryPruneResult> {
     if retention.keep_count == 0 {
         return Err(ZeppelinError::Config(
             "gc.manifest_history_keep_count must be greater than zero".to_string(),
@@ -1542,11 +1756,16 @@ async fn prune_history_with_memo_at(
     }
     let observations = Manifest::list_history_observations(store, namespace).await?;
     let keep_from = observations.len().saturating_sub(retention.keep_count);
-    let pinned_generations = NamedSnapshot::pinned_generations(store, namespace).await?;
+    let snapshot_observations = NamedSnapshot::list_observations(store, namespace).await?;
+    let pinned_generations = snapshot_observations
+        .iter()
+        .map(|observation| observation.snapshot.generation)
+        .collect::<BTreeSet<_>>();
     let retention_window = retention
         .pitr_retention_secs
         .saturating_add(retention.skew_slop_secs);
     let mut retained_manifests = Vec::new();
+    let mut retained_history_observations = Vec::new();
     let mut pruned = 0usize;
 
     for (index, observation) in observations.into_iter().enumerate() {
@@ -1557,6 +1776,7 @@ async fn prune_history_with_memo_at(
             && now.signed_duration_since(manifest.updated_at).num_seconds()
                 <= retention_window as i64;
         if keep_by_count || keep_by_time || keep_by_pin {
+            retained_history_observations.push(observation.clone());
             retained_manifests.push(manifest.clone());
         } else {
             store.delete(&observation.history.key).await?;
@@ -1564,9 +1784,13 @@ async fn prune_history_with_memo_at(
         }
     }
 
-    Ok(ManifestHistoryPruneResult {
-        pruned,
-        retained_manifests,
+    Ok(MemoizedHistoryPruneResult {
+        result: ManifestHistoryPruneResult {
+            pruned,
+            retained_manifests,
+        },
+        retained_history_observations,
+        snapshot_observations,
     })
 }
 
@@ -1583,6 +1807,87 @@ fn history_snapshot_reachable_keys(
         }
     }
     keys
+}
+
+fn same_history_observations(left: &HistorySnapshot, right: &HistorySnapshot) -> bool {
+    left.entries
+        .iter()
+        .map(|(observation, _)| observation)
+        .eq(right.entries.iter().map(|(observation, _)| observation))
+}
+
+fn history_observations_match_snapshot(
+    expected: &[ManifestHistoryObservation],
+    actual: &HistorySnapshot,
+) -> bool {
+    expected
+        .iter()
+        .eq(actual.entries.iter().map(|(observation, _)| observation))
+}
+
+fn next_gc_deadline(
+    namespace: &str,
+    gc: &GcConfig,
+    now: DateTime<Utc>,
+    candidates: &[GcCandidate],
+    manifest: &Manifest,
+    history: &HistorySnapshot,
+    staging: &ActiveStagingObservation,
+) -> std::result::Result<Option<DateTime<Utc>>, ()> {
+    let mut next = None;
+    let mut consider = |deadline: DateTime<Utc>| {
+        if deadline > now && next.is_none_or(|current| deadline < current) {
+            next = Some(deadline);
+        }
+    };
+
+    for candidate in candidates {
+        let first_seen = deadline_after_secs(candidate.first_seen_unreachable_at, gc.horizon_secs)?;
+        let artifact = parse_gc_artifact_key(namespace, &candidate.key).ok_or(())?;
+        let artifact_created = DateTime::<Utc>::from_timestamp_millis(
+            i64::try_from(artifact.ulid().timestamp_ms()).map_err(|_| ())?,
+        )
+        .ok_or(())?;
+        let artifact_due = deadline_after_secs(artifact_created, gc.horizon_secs)?;
+        consider(first_seen.max(artifact_due));
+    }
+
+    for key in &manifest.pending_deletes {
+        let Some(artifact) = parse_gc_artifact_key(namespace, key) else {
+            continue;
+        };
+        let artifact_created = DateTime::<Utc>::from_timestamp_millis(
+            i64::try_from(artifact.ulid().timestamp_ms()).map_err(|_| ())?,
+        )
+        .ok_or(())?;
+        consider(deadline_after_secs(artifact_created, gc.horizon_secs)?);
+    }
+
+    if gc.pitr_retention_secs > 0 {
+        let retention = gc
+            .pitr_retention_secs
+            .checked_add(gc.skew_slop_secs)
+            .and_then(|seconds| seconds.checked_add(1))
+            .ok_or(())?;
+        for (_, manifest) in &history.entries {
+            consider(deadline_after_secs(manifest.updated_at, retention)?);
+        }
+    }
+
+    if let Some(expires_at) = staging.lease_expires_at {
+        consider(expires_at);
+    }
+
+    Ok(next)
+}
+
+fn deadline_after_secs(
+    base: DateTime<Utc>,
+    seconds: u64,
+) -> std::result::Result<DateTime<Utc>, ()> {
+    let seconds = i64::try_from(seconds).map_err(|_| ())?;
+    base.checked_add_signed(chrono::Duration::seconds(seconds))
+        .ok_or(())
 }
 
 /// Runs one stateless GC cycle using the current wall clock.
@@ -1611,9 +1916,9 @@ async fn run_gc_cycle_at_inner(
     namespace: &str,
     gc: &GcConfig,
     now: DateTime<Utc>,
-    prior_history: Option<&NamespaceHistoryMemo>,
+    prior_history: Option<&NamespaceGcMemo>,
 ) -> Result<GcCycleOutcome> {
-    let prior_entries = prior_history.map(|memo| &memo.entries);
+    let prior_entries = prior_history.map(|memo| &memo.history);
     let history_prune = match prune_history_with_memo_at(
         store,
         namespace,
@@ -1637,6 +1942,11 @@ async fn run_gc_cycle_at_inner(
             return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
         }
     };
+    let MemoizedHistoryPruneResult {
+        result: history_prune,
+        retained_history_observations: prune_history_observations,
+        snapshot_observations: prune_snapshot_observations,
+    } = history_prune;
     let manifest_history_pruned = history_prune.pruned;
     let retained_history_snapshot =
         match load_history_snapshot(store, namespace, prior_entries).await {
@@ -1673,6 +1983,7 @@ async fn run_gc_cycle_at_inner(
     let PendingDeleteDrainOutcome {
         report: pending_report,
         complete: pending_complete,
+        observed_pending_deletes,
     } = pending_outcome;
     let base_report = GcCycleReport {
         objects_deleted: pending_report.objects_deleted,
@@ -1683,13 +1994,18 @@ async fn run_gc_cycle_at_inner(
     };
 
     let prefix = format!("{namespace}/");
-    let listed_keys = match store.list_prefix(&prefix).await {
-        Ok(keys) => keys.into_iter().collect::<BTreeSet<_>>(),
+    let listed_objects = match store.list_prefix_meta(&prefix).await {
+        Ok(objects) => objects,
         Err(e) => {
             warn!(namespace, error = %e, "gc listing failed; aborting cycle");
             return Ok(GcCycleOutcome::incomplete(base_report));
         }
     };
+    let listed_keys = listed_objects
+        .iter()
+        .map(|object| object.key.clone())
+        .collect::<BTreeSet<_>>();
+    let mut completed_inventory = InventoryFingerprint::from_listed(listed_objects);
 
     let persisted = match load_gc_candidates(store, namespace).await {
         Ok(candidates) => candidates,
@@ -1710,7 +2026,7 @@ async fn run_gc_cycle_at_inner(
             return Ok(GcCycleOutcome::incomplete(base_report));
         }
     };
-    let mark_staging = match active_staged_keys_at(store, namespace, now).await {
+    let mark_staging = match active_staging_observation_at(store, namespace, now).await {
         Ok(staging) => staging,
         Err(e) => {
             warn!(namespace, error = %e, "gc active staging read failed; aborting cycle");
@@ -1720,7 +2036,7 @@ async fn run_gc_cycle_at_inner(
     let mark_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         &mark_manifest,
-        &mark_staging,
+        &mark_staging.keys,
         &retained_history,
     );
     let unknown_shape_skips = listed_keys
@@ -1779,7 +2095,7 @@ async fn run_gc_cycle_at_inner(
             return Ok(GcCycleOutcome::incomplete(report));
         }
     };
-    let sweep_staging = match active_staged_keys_at(store, namespace, now).await {
+    let sweep_staging = match active_staging_observation_at(store, namespace, now).await {
         Ok(staging) => staging,
         Err(e) => {
             warn!(namespace, error = %e, "gc active staging re-read failed; skipping sweep");
@@ -1805,10 +2121,10 @@ async fn run_gc_cycle_at_inner(
     let sweep_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         &sweep_manifest,
-        &sweep_staging,
+        &sweep_staging.keys,
         &sweep_retained_history,
     );
-    let oldest_inflight_ms = oldest_inflight_ulid_ms(namespace, &sweep_staging);
+    let oldest_inflight_ms = oldest_inflight_ulid_ms(namespace, &sweep_staging.keys);
     let known_sizes = known_reclaimable_sizes(namespace, &sweep_manifest);
 
     let mut retained = Vec::new();
@@ -1837,6 +2153,9 @@ async fn run_gc_cycle_at_inner(
         ) {
             DeleteDecision::Delete => match store.delete(&candidate.key).await {
                 Ok(()) | Err(crate::error::ZeppelinError::NotFound { .. }) => {
+                    if let Some(inventory) = completed_inventory.as_mut() {
+                        inventory.remove(&candidate.key);
+                    }
                     let reclaimed = known_sizes.get(&candidate.key).copied().unwrap_or(0);
                     objects_deleted += 1;
                     bytes_reclaimed += reclaimed;
@@ -1874,13 +2193,52 @@ async fn run_gc_cycle_at_inner(
         }
     }
 
-    if let Err(e) = save_gc_candidates(store, namespace, &retained).await {
-        cycle_complete = false;
-        warn!(
+    match save_gc_candidates_with_version(store, namespace, &retained).await {
+        Ok((size, Some(version))) => {
+            if let Some(inventory) = completed_inventory.as_mut() {
+                inventory.upsert(gc_candidate_store_key(namespace), size, version);
+            }
+        }
+        Ok((_, None)) => completed_inventory = None,
+        Err(e) => {
+            cycle_complete = false;
+            warn!(
+                namespace,
+                error = %e,
+                "gc candidate cleanup persist failed after sweep"
+            );
+        }
+    }
+
+    let history_inputs_stable =
+        history_observations_match_snapshot(
+            &prune_history_observations,
+            &retained_history_snapshot,
+        ) && history_observations_match_snapshot(
+            &prune_history_observations,
+            &sweep_history_snapshot,
+        ) && same_history_observations(&retained_history_snapshot, &sweep_history_snapshot);
+    let snapshot_prefix = NamedSnapshot::prefix(namespace);
+    let snapshot_inputs_stable = completed_inventory.as_ref().is_some_and(|inventory| {
+        inventory.matches_listed_prefix(
+            &snapshot_prefix,
+            prune_snapshot_observations
+                .iter()
+                .map(|observation| &observation.object),
+        )
+    });
+    let pending_inputs_stable = observed_pending_deletes
+        .as_ref()
+        .is_some_and(|pending| pending == &sweep_manifest.pending_deletes);
+    if !(history_inputs_stable && snapshot_inputs_stable && pending_inputs_stable) {
+        debug!(
             namespace,
-            error = %e,
-            "gc candidate cleanup persist failed after sweep"
+            history_inputs_stable,
+            snapshot_inputs_stable,
+            pending_inputs_stable,
+            "gc decision inputs changed during cycle; disabling next idle admission"
         );
+        completed_inventory = None;
     }
 
     info!(
@@ -1907,9 +2265,28 @@ async fn run_gc_cycle_at_inner(
         candidates_skipped,
     };
     if cycle_complete {
+        let next_due_at = match next_gc_deadline(
+            namespace,
+            gc,
+            now,
+            &retained,
+            &sweep_manifest,
+            &sweep_history_snapshot,
+            &sweep_staging,
+        ) {
+            Ok(deadline) => deadline,
+            Err(()) => {
+                completed_inventory = None;
+                None
+            }
+        };
         Ok(GcCycleOutcome::complete(
             report,
-            sweep_history_snapshot.cacheable,
+            CompletedGcState {
+                history: sweep_history_snapshot.cacheable,
+                inventory: completed_inventory,
+                next_due_at,
+            },
         ))
     } else {
         Ok(GcCycleOutcome::incomplete(report))
@@ -2494,14 +2871,32 @@ pub async fn active_staged_keys_at(
     namespace: &str,
     now: DateTime<Utc>,
 ) -> Result<BTreeSet<String>> {
+    Ok(active_staging_observation_at(store, namespace, now)
+        .await?
+        .keys)
+}
+
+async fn active_staging_observation_at(
+    store: &ZeppelinStore,
+    namespace: &str,
+    now: DateTime<Utc>,
+) -> Result<ActiveStagingObservation> {
     let lease_data = match store.get(&format!("{namespace}/lease.json")).await {
         Ok(data) => data,
-        Err(crate::error::ZeppelinError::NotFound { .. }) => return Ok(BTreeSet::new()),
+        Err(crate::error::ZeppelinError::NotFound { .. }) => {
+            return Ok(ActiveStagingObservation {
+                keys: BTreeSet::new(),
+                lease_expires_at: None,
+            });
+        }
         Err(e) => return Err(e),
     };
     let lease: Lease = serde_json::from_slice(&lease_data)?;
     if lease.expires_at <= now {
-        return Ok(BTreeSet::new());
+        return Ok(ActiveStagingObservation {
+            keys: BTreeSet::new(),
+            lease_expires_at: None,
+        });
     }
 
     let mut staged = BTreeSet::new();
@@ -2513,7 +2908,11 @@ pub async fn active_staged_keys_at(
             staged.extend(entry.keys);
         }
     }
-    Ok(staged)
+    let lease_expires_at = (!staged.is_empty()).then_some(lease.expires_at);
+    Ok(ActiveStagingObservation {
+        keys: staged,
+        lease_expires_at,
+    })
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]

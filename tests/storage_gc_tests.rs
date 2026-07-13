@@ -1,7 +1,8 @@
 mod common;
 
+use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
@@ -20,7 +21,8 @@ use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{compaction_loop, CompactionLoopOptions};
 use zeppelin::compaction::gc::{
-    load_gc_candidates, run_gc_cycle, GcCycleReport, GcNamespaceIncarnation, GcRunner,
+    load_gc_candidates, run_gc_cycle, write_compaction_staging, GcCycleReport,
+    GcNamespaceIncarnation, GcRunner,
 };
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, GcConfig, IndexingConfig};
@@ -293,22 +295,77 @@ impl ObjectStore for PutOnNthDeleteStore {
 /// Tests place [`common::counting::CountingStore`] outside this layer so every
 /// attempted GET, including an injected failure, remains observable.
 #[derive(Debug)]
+struct LateListMutation {
+    prefix: Path,
+    operations: Vec<LateListOperation>,
+}
+
+#[derive(Debug)]
+enum LateListOperation {
+    Put { key: Path, body: Bytes },
+    Delete { key: Path },
+}
+
+impl LateListMutation {
+    fn prefix(&self) -> &Path {
+        &self.prefix
+    }
+
+    async fn apply(self, inner: &Arc<dyn ObjectStore>) -> OsResult<()> {
+        for operation in self.operations {
+            match operation {
+                LateListOperation::Put { key, body } => {
+                    inner.put(&key, PutPayload::from(body)).await?;
+                }
+                LateListOperation::Delete { key } => inner.delete(&key).await?,
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 struct HistoryMetadataControlStore {
     inner: Arc<dyn ObjectStore>,
-    history_prefix: Path,
-    strip_list_versions: Arc<AtomicBool>,
+    strip_list_version_prefixes: Arc<Mutex<Vec<Path>>>,
     fail_next_get: Arc<Mutex<Option<String>>>,
+    late_list_mutation: Arc<Mutex<Option<LateListMutation>>>,
+    list_calls: Arc<AtomicUsize>,
+    delete_calls: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug)]
 struct HistoryMetadataControlHandle {
-    strip_list_versions: Arc<AtomicBool>,
+    default_strip_prefix: Path,
+    strip_list_version_prefixes: Arc<Mutex<Vec<Path>>>,
     fail_next_get: Arc<Mutex<Option<String>>>,
+    late_list_mutation: Arc<Mutex<Option<LateListMutation>>>,
+    list_calls: Arc<AtomicUsize>,
+    delete_calls: Arc<AtomicUsize>,
 }
 
 impl HistoryMetadataControlHandle {
     fn set_strip_list_versions(&self, strip: bool) {
-        self.strip_list_versions.store(strip, Ordering::SeqCst);
+        self.set_strip_list_versions_for_path(self.default_strip_prefix.clone(), strip);
+    }
+
+    fn set_strip_list_versions_for(&self, prefix: &str, strip: bool) {
+        let prefix = Path::parse(prefix).expect("controlled LIST prefix must be valid");
+        self.set_strip_list_versions_for_path(prefix, strip);
+    }
+
+    fn set_strip_list_versions_for_path(&self, prefix: Path, strip: bool) {
+        let mut prefixes = self
+            .strip_list_version_prefixes
+            .lock()
+            .expect("LIST metadata control mutex poisoned");
+        if strip {
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
+            }
+        } else {
+            prefixes.retain(|candidate| candidate != &prefix);
+        }
     }
 
     fn fail_next_get(&self, key: String) {
@@ -317,6 +374,49 @@ impl HistoryMetadataControlHandle {
             .lock()
             .expect("history GET fault mutex poisoned") = Some(key);
     }
+
+    fn put_on_next_list(&self, prefix: &str, key: &str, body: Bytes) {
+        let mutation = LateListMutation {
+            prefix: Path::parse(prefix).expect("controlled LIST prefix must be valid"),
+            operations: vec![LateListOperation::Put {
+                key: Path::parse(key).expect("injected PUT key must be valid"),
+                body,
+            }],
+        };
+        self.set_late_list_mutation(mutation);
+    }
+
+    fn replace_on_next_list(&self, prefix: &str, key: &str, body: Bytes) {
+        let key = Path::parse(key).expect("injected replacement key must be valid");
+        let mutation = LateListMutation {
+            prefix: Path::parse(prefix).expect("controlled LIST prefix must be valid"),
+            operations: vec![
+                LateListOperation::Delete { key: key.clone() },
+                LateListOperation::Put { key, body },
+            ],
+        };
+        self.set_late_list_mutation(mutation);
+    }
+
+    fn set_late_list_mutation(&self, mutation: LateListMutation) {
+        *self
+            .late_list_mutation
+            .lock()
+            .expect("late LIST mutation mutex poisoned") = Some(mutation);
+    }
+
+    fn reset_observed_operations(&self) {
+        self.list_calls.store(0, Ordering::SeqCst);
+        self.delete_calls.store(0, Ordering::SeqCst);
+    }
+
+    fn list_calls(&self) -> usize {
+        self.list_calls.load(Ordering::SeqCst)
+    }
+
+    fn delete_calls(&self) -> usize {
+        self.delete_calls.load(Ordering::SeqCst)
+    }
 }
 
 impl HistoryMetadataControlStore {
@@ -324,18 +424,28 @@ impl HistoryMetadataControlStore {
         store: &ZeppelinStore,
         history_prefix: String,
     ) -> (ZeppelinStore, HistoryMetadataControlHandle) {
-        let strip_list_versions = Arc::new(AtomicBool::new(false));
+        let default_strip_prefix = Path::parse(history_prefix)
+            .expect("history control prefix must be a valid object path");
+        let strip_list_version_prefixes = Arc::new(Mutex::new(Vec::new()));
         let fail_next_get = Arc::new(Mutex::new(None));
+        let late_list_mutation = Arc::new(Mutex::new(None));
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let delete_calls = Arc::new(AtomicUsize::new(0));
         let handle = HistoryMetadataControlHandle {
-            strip_list_versions: Arc::clone(&strip_list_versions),
+            default_strip_prefix,
+            strip_list_version_prefixes: Arc::clone(&strip_list_version_prefixes),
             fail_next_get: Arc::clone(&fail_next_get),
+            late_list_mutation: Arc::clone(&late_list_mutation),
+            list_calls: Arc::clone(&list_calls),
+            delete_calls: Arc::clone(&delete_calls),
         };
         let controlled = Self {
             inner: store.inner(),
-            history_prefix: Path::parse(history_prefix)
-                .expect("history control prefix must be a valid object path"),
-            strip_list_versions,
+            strip_list_version_prefixes,
             fail_next_get,
+            late_list_mutation,
+            list_calls,
+            delete_calls,
         };
         (ZeppelinStore::new(Arc::new(controlled)), handle)
     }
@@ -395,6 +505,7 @@ impl ObjectStore for HistoryMetadataControlStore {
     }
 
     async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.delete_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.delete(location).await
     }
 
@@ -402,12 +513,55 @@ impl ObjectStore for HistoryMetadataControlStore {
         &'a self,
         locations: BoxStream<'a, OsResult<Path>>,
     ) -> BoxStream<'a, OsResult<Path>> {
+        self.delete_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
-        let strip_versions =
-            self.strip_list_versions.load(Ordering::SeqCst) && prefix == Some(&self.history_prefix);
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        let mutation = {
+            let mut mutation = self
+                .late_list_mutation
+                .lock()
+                .expect("late LIST mutation mutex poisoned");
+            if mutation
+                .as_ref()
+                .is_some_and(|mutation| prefix == Some(mutation.prefix()))
+            {
+                mutation.take()
+            } else {
+                None
+            }
+        };
+        let strip_versions = prefix.is_some_and(|prefix| {
+            self.strip_list_version_prefixes
+                .lock()
+                .expect("LIST metadata control mutex poisoned")
+                .contains(prefix)
+        });
+        if let Some(mutation) = mutation {
+            let inner = Arc::clone(&self.inner);
+            let prefix = prefix.cloned();
+            return futures::stream::once(async move {
+                mutation.apply(&inner).await?;
+                inner.list(prefix.as_ref()).try_collect::<Vec<_>>().await
+            })
+            .map(|result| match result {
+                Ok(objects) => futures::stream::iter(objects.into_iter().map(Ok)).boxed(),
+                Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
+            })
+            .flatten()
+            .map(move |result| {
+                result.map(|mut object| {
+                    if strip_versions {
+                        object.e_tag = None;
+                        object.version = None;
+                    }
+                    object
+                })
+            })
+            .boxed();
+        }
         self.inner
             .list(prefix)
             .map(move |result| {
@@ -490,6 +644,53 @@ async fn run_counted_gc_cycle(
 ) -> GcCycleReport {
     counter.reset();
     runner.run_cycle_at(incarnation.clone(), now).await.unwrap()
+}
+
+async fn run_observed_gc_cycle(
+    runner: &mut GcRunner,
+    incarnation: &GcNamespaceIncarnation,
+    now: DateTime<Utc>,
+    counter: &GetCounter,
+    control: &HistoryMetadataControlHandle,
+) -> GcCycleReport {
+    counter.reset();
+    control.reset_observed_operations();
+    runner.run_cycle_at(incarnation.clone(), now).await.unwrap()
+}
+
+fn assert_idle_cycle_only_listed_namespace(
+    namespace: &str,
+    counter: &GetCounter,
+    control: &HistoryMetadataControlHandle,
+) {
+    let namespace_prefix = Path::parse(format!("{namespace}/"))
+        .expect("namespace prefix must be a valid object path")
+        .to_string();
+    assert_eq!(control.list_calls(), 1, "idle cycle must issue one LIST");
+    assert_eq!(
+        counter.list_calls_for_prefix(&namespace_prefix),
+        1,
+        "idle cycle must LIST the full namespace metadata exactly once"
+    );
+    assert_eq!(counter.total_gets(), 0, "idle cycle must issue no GETs");
+    assert_eq!(
+        counter.puts_matching(""),
+        0,
+        "idle cycle must issue no PUTs"
+    );
+    assert_eq!(
+        control.delete_calls(),
+        0,
+        "idle cycle must issue no DELETEs"
+    );
+}
+
+fn ulid_at(now: DateTime<Utc>, entropy: u128) -> Ulid {
+    let timestamp = now
+        .timestamp_millis()
+        .try_into()
+        .expect("test timestamp must be after epoch");
+    Ulid::from_parts(timestamp, entropy)
 }
 
 #[tokio::test]
@@ -1281,6 +1482,7 @@ async fn gc_runner_missing_history_etag_is_never_cacheable() {
     let (controlled_store, control) =
         HistoryMetadataControlStore::wrap(&store, history_prefix.clone());
     control.set_strip_list_versions(true);
+    control.set_strip_list_versions_for(&format!("{namespace}/"), true);
     let (counted_store, counter) = counting_store(&controlled_store);
     let mut runner = GcRunner::new(counted_store, memo_gc());
     let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
@@ -1378,6 +1580,843 @@ async fn gc_runner_failed_refresh_does_not_commit_partial_memo() {
         counter.gets_matching(&history_prefix),
         0,
         "the first complete retry should commit the refreshed memo"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_idle_gate_skips_unchanged_and_wakes_on_inventory_change() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-idle-inventory");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    seed_manifest_history(&store, &namespace, 2).await;
+
+    let (controlled_store, control) = HistoryMetadataControlStore::wrap(&store, history_prefix);
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(counted_store, memo_gc());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    assert!(
+        counter.total_gets() > 0,
+        "the cold cycle must establish a complete authoritative memo"
+    );
+
+    let unchanged = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_eq!(unchanged, GcCycleReport::default());
+    assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
+
+    let probe_key = format!("{namespace}/idle-gate-probe.bin");
+    store
+        .put(&probe_key, Bytes::from_static(b"new inventory object"))
+        .await
+        .unwrap();
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(2),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "a new namespace object must force a full cycle"
+    );
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(3),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
+
+    store
+        .put(
+            &probe_key,
+            Bytes::from_static(b"changed inventory object with a new version"),
+        )
+        .await
+        .unwrap();
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(4),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "a changed namespace object must force a full cycle"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_idle_gate_reconciles_history_published_during_late_inventory_list() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-idle-late-history");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    seed_manifest_history(&store, &namespace, 2).await;
+
+    let late_history_key = Manifest::history_key(&namespace, 3);
+    let late_history = Manifest::new_at(
+        DateTime::<Utc>::from_timestamp(1_720_000_003, 0)
+            .expect("fixed late-history timestamp must be valid"),
+    );
+    let (controlled_store, control) = HistoryMetadataControlStore::wrap(&store, history_prefix);
+    control.put_on_next_list(
+        &format!("{namespace}/"),
+        &late_history_key,
+        manifest_json_bytes_with_version(&late_history, 3),
+    );
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(
+        counted_store,
+        GcConfig {
+            manifest_history_keep_count: 1,
+            pitr_retention_secs: 0,
+            ..unsafe_short_gc(0)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    assert!(
+        Manifest::read_history(&store, &namespace, 2)
+            .await
+            .unwrap()
+            .is_some(),
+        "the late generation arrives after the current cycle's prune decision"
+    );
+    assert!(
+        Manifest::read_history(&store, &namespace, 3)
+            .await
+            .unwrap()
+            .is_some(),
+        "the injected history generation must be visible in MinIO"
+    );
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "history published after prune but before inventory LIST must force one reconciliation cycle"
+    );
+    assert!(
+        Manifest::read_history(&store, &namespace, 2)
+            .await
+            .unwrap()
+            .is_none(),
+        "the reconciliation cycle must apply keep-count retention to the displaced generation"
+    );
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(2),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_idle_gate_reconciles_history_published_after_prune_observation() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-idle-mid-prune-history");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    seed_manifest_history(&store, &namespace, 2).await;
+
+    let pruned_history_key = Manifest::history_key(&namespace, 1);
+    let injected_history_key = Manifest::history_key(&namespace, 3);
+    let injected_history = Manifest::new_at(
+        DateTime::<Utc>::from_timestamp(1_720_000_013, 0)
+            .expect("fixed mid-prune history timestamp must be valid"),
+    );
+    let (injecting_store, injection) = PutOnNthDeleteStore::wrap(
+        store.inner(),
+        pruned_history_key,
+        injected_history_key,
+        manifest_json_bytes_with_version(&injected_history, 3),
+        1,
+    );
+    let injecting_store = ZeppelinStore::new(Arc::new(injecting_store));
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&injecting_store, history_prefix);
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(
+        counted_store,
+        GcConfig {
+            manifest_history_keep_count: 1,
+            pitr_retention_secs: 0,
+            ..unsafe_short_gc(0)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    assert_eq!(
+        injection.puts_injected(),
+        1,
+        "the fixture must publish generation 3 after prune listed generations 1 and 2"
+    );
+    assert!(
+        Manifest::read_history(&store, &namespace, 2)
+            .await
+            .unwrap()
+            .is_some(),
+        "generation 2 was retained by the stale pre-injection keep-count decision"
+    );
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "history published after prune's LIST but before the retained-history scan must force reconciliation"
+    );
+    assert!(
+        Manifest::read_history(&store, &namespace, 2)
+            .await
+            .unwrap()
+            .is_none(),
+        "reconciliation must apply keep-count retention to the displaced generation"
+    );
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(2),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_idle_gate_reconciles_snapshot_recreated_during_late_inventory_list() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-idle-late-snapshot-recreate");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    seed_manifest_history(&store, &namespace, 2).await;
+    NamedSnapshot::create(&store, &namespace, "moving-pin", 1)
+        .await
+        .unwrap();
+
+    let snapshot_key = NamedSnapshot::key(&namespace, "moving-pin").unwrap();
+    let replacement = NamedSnapshot {
+        generation: 2,
+        created_at: Utc::now(),
+    }
+    .to_bytes()
+    .unwrap();
+    let (controlled_store, control) = HistoryMetadataControlStore::wrap(&store, history_prefix);
+    control.replace_on_next_list(&format!("{namespace}/"), &snapshot_key, replacement);
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(
+        counted_store,
+        GcConfig {
+            manifest_history_keep_count: 1,
+            pitr_retention_secs: 0,
+            ..unsafe_short_gc(0)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    assert_eq!(
+        NamedSnapshot::read(&store, &namespace, "moving-pin")
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        2,
+        "the late LIST hook must recreate the same snapshot key with a new identity"
+    );
+    assert!(
+        Manifest::read_history(&store, &namespace, 1)
+            .await
+            .unwrap()
+            .is_some(),
+        "the early prune decision observed generation 1 as pinned"
+    );
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "a snapshot delete/recreate after pin scan must force one reconciliation cycle"
+    );
+    assert!(
+        Manifest::read_history(&store, &namespace, 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "reconciliation must prune the generation no longer pinned by the recreated snapshot"
+    );
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(2),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_idle_gate_reconciles_mature_pending_delete_published_during_late_inventory_list()
+{
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-idle-late-pending");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    let now = Utc::now();
+    let pending_id = old_ulid(60, 151);
+    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    store
+        .put(
+            &pending_key,
+            Bytes::from_static(b"late mature pending delete"),
+        )
+        .await
+        .unwrap();
+
+    let mut manifest = Manifest::new_at(now);
+    manifest.write(&store, &namespace).await.unwrap();
+    let mut late_manifest = manifest;
+    late_manifest.pending_deletes.push(pending_key.clone());
+    late_manifest.updated_at = now;
+    let (controlled_store, control) = HistoryMetadataControlStore::wrap(&store, history_prefix);
+    control.put_on_next_list(
+        &format!("{namespace}/"),
+        &Manifest::s3_key(&namespace),
+        manifest_json_bytes_with_version(&late_manifest, 2),
+    );
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(
+        counted_store,
+        GcConfig {
+            manifest_history_keep_count: 64,
+            ..unsafe_short_gc(10)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+
+    let raced = run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    assert_eq!(raced.pending_deletes_deleted, 0);
+    assert_s3_object_exists(&store, &pending_key).await;
+    assert_eq!(
+        Manifest::read(&store, &namespace)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_deletes,
+        vec![pending_key.clone()],
+        "the late publication must land after this cycle's pending-delete drain"
+    );
+
+    let reconciled = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "a mature pending delete published after drain must force one reconciliation cycle"
+    );
+    assert_eq!(reconciled.pending_deletes_deleted, 1);
+    assert_eq!(reconciled.pending_deletes_pruned, 1);
+    assert_s3_object_not_exists(&store, &pending_key).await;
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(2),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "the drain CAS publishes history after prune, requiring one conservative history reconciliation"
+    );
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(3),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_idle_gate_requires_versioned_namespace_inventory() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-idle-unversioned");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    seed_manifest_history(&store, &namespace, 2).await;
+
+    let (controlled_store, control) = HistoryMetadataControlStore::wrap(&store, history_prefix);
+    control.set_strip_list_versions_for(&format!("{namespace}/"), true);
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(counted_store, memo_gc());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "missing namespace LIST ETags/backend versions must disable the idle gate"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_idle_gate_wakes_at_candidate_pending_pitr_and_lease_deadlines() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let now = DateTime::<Utc>::from_timestamp(1_750_000_000, 0)
+        .expect("fixed idle-gate timestamp must be valid");
+
+    let candidate_namespace = harness.key("storage-gc-runner-idle-candidate-deadline");
+    let mut candidate_manifest = Manifest::new_at(now);
+    candidate_manifest
+        .write(&store, &candidate_namespace)
+        .await
+        .unwrap();
+    let candidate_key = WalFragment::s3_key(
+        &candidate_namespace,
+        &ulid_at(now - chrono::Duration::seconds(60), 101),
+    );
+    store
+        .put(&candidate_key, Bytes::from_static(b"candidate deadline"))
+        .await
+        .unwrap();
+    let (candidate_controlled, candidate_control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&candidate_namespace));
+    let (candidate_counted, candidate_counter) = counting_store(&candidate_controlled);
+    let mut candidate_runner = GcRunner::new(
+        candidate_counted,
+        GcConfig {
+            manifest_history_keep_count: 64,
+            ..unsafe_short_gc(10)
+        },
+    );
+    let candidate_incarnation =
+        GcNamespaceIncarnation::new(candidate_namespace.clone(), Utc::now());
+    let candidate_first = run_observed_gc_cycle(
+        &mut candidate_runner,
+        &candidate_incarnation,
+        now,
+        &candidate_counter,
+        &candidate_control,
+    )
+    .await;
+    assert_eq!(candidate_first.candidates_marked, 1);
+    run_observed_gc_cycle(
+        &mut candidate_runner,
+        &candidate_incarnation,
+        now + chrono::Duration::seconds(9),
+        &candidate_counter,
+        &candidate_control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(
+        &candidate_namespace,
+        &candidate_counter,
+        &candidate_control,
+    );
+    let candidate_due = run_observed_gc_cycle(
+        &mut candidate_runner,
+        &candidate_incarnation,
+        now + chrono::Duration::seconds(10),
+        &candidate_counter,
+        &candidate_control,
+    )
+    .await;
+    assert_eq!(candidate_due.objects_deleted, 1);
+    assert!(candidate_counter.total_gets() > 0);
+    assert_s3_object_not_exists(&store, &candidate_key).await;
+    run_observed_gc_cycle(
+        &mut candidate_runner,
+        &candidate_incarnation,
+        now + chrono::Duration::seconds(11),
+        &candidate_counter,
+        &candidate_control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(
+        &candidate_namespace,
+        &candidate_counter,
+        &candidate_control,
+    );
+
+    let pending_namespace = harness.key("storage-gc-runner-idle-pending-deadline");
+    let pending_key = WalFragment::s3_key(&pending_namespace, &ulid_at(now, 102));
+    store
+        .put(&pending_key, Bytes::from_static(b"pending deadline"))
+        .await
+        .unwrap();
+    let mut pending_manifest = Manifest::new_at(now);
+    pending_manifest.pending_deletes.push(pending_key.clone());
+    pending_manifest
+        .write(&store, &pending_namespace)
+        .await
+        .unwrap();
+    store
+        .delete(&Manifest::history_key(&pending_namespace, 1))
+        .await
+        .unwrap();
+    let (pending_controlled, pending_control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&pending_namespace));
+    let (pending_counted, pending_counter) = counting_store(&pending_controlled);
+    let mut pending_runner = GcRunner::new(
+        pending_counted,
+        GcConfig {
+            manifest_history_keep_count: 64,
+            ..unsafe_short_gc(10)
+        },
+    );
+    let pending_incarnation = GcNamespaceIncarnation::new(pending_namespace.clone(), Utc::now());
+    let pending_first = run_observed_gc_cycle(
+        &mut pending_runner,
+        &pending_incarnation,
+        now,
+        &pending_counter,
+        &pending_control,
+    )
+    .await;
+    assert_eq!(pending_first.pending_deletes_retained, 1);
+    run_observed_gc_cycle(
+        &mut pending_runner,
+        &pending_incarnation,
+        now + chrono::Duration::seconds(9),
+        &pending_counter,
+        &pending_control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&pending_namespace, &pending_counter, &pending_control);
+    let pending_due = run_observed_gc_cycle(
+        &mut pending_runner,
+        &pending_incarnation,
+        now + chrono::Duration::seconds(10),
+        &pending_counter,
+        &pending_control,
+    )
+    .await;
+    assert_eq!(pending_due.pending_deletes_deleted, 1);
+    assert!(pending_counter.total_gets() > 0);
+    assert_s3_object_not_exists(&store, &pending_key).await;
+
+    let pitr_namespace = harness.key("storage-gc-runner-idle-pitr-deadline");
+    let mut pitr_manifest = Manifest::new_at(now);
+    pitr_manifest.write(&store, &pitr_namespace).await.unwrap();
+    let (mut pitr_manifest, pitr_version) = Manifest::read_versioned(&store, &pitr_namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    pitr_manifest.updated_at = now;
+    pitr_manifest
+        .write_conditional(&store, &pitr_namespace, &pitr_version)
+        .await
+        .unwrap();
+    let pitr_history_one = Manifest::history_key(&pitr_namespace, 1);
+    let (pitr_controlled, pitr_control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&pitr_namespace));
+    let (pitr_counted, pitr_counter) = counting_store(&pitr_controlled);
+    let mut pitr_runner = GcRunner::new(
+        pitr_counted,
+        GcConfig {
+            manifest_history_keep_count: 1,
+            pitr_retention_secs: 10,
+            ..unsafe_short_gc(0)
+        },
+    );
+    let pitr_incarnation = GcNamespaceIncarnation::new(pitr_namespace.clone(), Utc::now());
+    run_observed_gc_cycle(
+        &mut pitr_runner,
+        &pitr_incarnation,
+        now,
+        &pitr_counter,
+        &pitr_control,
+    )
+    .await;
+    run_observed_gc_cycle(
+        &mut pitr_runner,
+        &pitr_incarnation,
+        now + chrono::Duration::seconds(10),
+        &pitr_counter,
+        &pitr_control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&pitr_namespace, &pitr_counter, &pitr_control);
+    run_observed_gc_cycle(
+        &mut pitr_runner,
+        &pitr_incarnation,
+        now + chrono::Duration::seconds(11),
+        &pitr_counter,
+        &pitr_control,
+    )
+    .await;
+    assert!(
+        pitr_counter.total_gets() > 0,
+        "PITR expiry must force a full cycle at the first whole-second boundary"
+    );
+    assert_s3_object_not_exists(&store, &pitr_history_one).await;
+
+    let lease_namespace = harness.key("storage-gc-runner-idle-lease-deadline");
+    let mut lease_manifest = Manifest::new_at(now);
+    lease_manifest
+        .write(&store, &lease_namespace)
+        .await
+        .unwrap();
+    let staged_key = WalFragment::s3_key(
+        &lease_namespace,
+        &ulid_at(now - chrono::Duration::seconds(60), 103),
+    );
+    store
+        .put(&staged_key, Bytes::from_static(b"lease deadline"))
+        .await
+        .unwrap();
+    let lease_token = 41;
+    let lease = serde_json::json!({
+        "holder_id": "idle-gate-holder",
+        "fencing_token": lease_token,
+        "acquired_at": now,
+        "expires_at": now + chrono::Duration::seconds(10),
+    });
+    store
+        .put(
+            &format!("{lease_namespace}/lease.json"),
+            Bytes::from(serde_json::to_vec(&lease).unwrap()),
+        )
+        .await
+        .unwrap();
+    write_compaction_staging(
+        &store,
+        &lease_namespace,
+        lease_token,
+        BTreeSet::from([staged_key.clone()]),
+    )
+    .await
+    .unwrap();
+    let (lease_controlled, lease_control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&lease_namespace));
+    let (lease_counted, lease_counter) = counting_store(&lease_controlled);
+    let mut lease_runner = GcRunner::new(lease_counted, memo_gc());
+    let lease_incarnation = GcNamespaceIncarnation::new(lease_namespace.clone(), Utc::now());
+    run_observed_gc_cycle(
+        &mut lease_runner,
+        &lease_incarnation,
+        now,
+        &lease_counter,
+        &lease_control,
+    )
+    .await;
+    run_observed_gc_cycle(
+        &mut lease_runner,
+        &lease_incarnation,
+        now + chrono::Duration::seconds(9),
+        &lease_counter,
+        &lease_control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&lease_namespace, &lease_counter, &lease_control);
+    let lease_due = run_observed_gc_cycle(
+        &mut lease_runner,
+        &lease_incarnation,
+        now + chrono::Duration::seconds(10),
+        &lease_counter,
+        &lease_control,
+    )
+    .await;
+    assert_eq!(lease_due.objects_deleted, 1);
+    assert!(lease_counter.total_gets() > 0);
+    assert_s3_object_not_exists(&store, &staged_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_idle_gate_rejects_backward_clock_config_change_and_partial_failure() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-idle-invalidations");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    let first_history = Manifest::history_key(&namespace, 1);
+    seed_manifest_history(&store, &namespace, 2).await;
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, history_prefix.clone());
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(counted_store, memo_gc());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now - chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "a backward wall-clock jump must disable the idle gate"
+    );
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(2),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
+
+    runner.update_config(GcConfig {
+        horizon_secs: 1,
+        ..memo_gc()
+    });
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(3),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "a GC policy change must force a full cycle"
+    );
+    assert_eq!(
+        counter.gets_matching(&history_prefix),
+        0,
+        "a policy change may retain ETag-validated immutable history bodies"
+    );
+
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(4),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_idle_cycle_only_listed_namespace(&namespace, &counter, &control);
+
+    let probe_key = format!("{namespace}/partial-refresh-probe.bin");
+    store
+        .put(&probe_key, Bytes::from_static(b"force full refresh"))
+        .await
+        .unwrap();
+    control.set_strip_list_versions(true);
+    control.fail_next_get(first_history);
+    let failed = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(5),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_eq!(failed, GcCycleReport::default());
+
+    control.set_strip_list_versions(false);
+    store.delete(&probe_key).await.unwrap();
+    run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(6),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        counter.total_gets() > 0,
+        "a partial refresh must invalidate the idle gate even when inventory rolls back"
     );
 
     harness.cleanup().await;

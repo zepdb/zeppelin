@@ -599,6 +599,20 @@ pub struct NamedSnapshotRef {
     pub created_at: DateTime<Utc>,
 }
 
+/// One named-snapshot body paired with the identity observed by its LIST.
+///
+/// Garbage collection keeps this crate-private observation until its later
+/// namespace inventory is available. A different key, size, or opaque version
+/// means the retention decision and the inventory did not describe one stable
+/// snapshot-pin set, so that cycle cannot authorize a subsequent idle skip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamedSnapshotObservation {
+    /// Decoded, caller-facing pin metadata.
+    pub(crate) snapshot: NamedSnapshotRef,
+    /// Exact object metadata returned by the same prefix LIST.
+    pub(crate) object: ListedObject,
+}
+
 /// Observable result of a manifest-history pruning pass.
 #[derive(Debug, Clone)]
 pub struct ManifestHistoryPruneResult {
@@ -2270,20 +2284,39 @@ impl NamedSnapshot {
     /// Pins named `weekly` and `daily` are returned as `daily`, then `weekly`,
     /// regardless of object-store listing order.
     pub async fn list(store: &ZeppelinStore, namespace: &str) -> Result<Vec<NamedSnapshotRef>> {
+        Ok(Self::list_observations(store, namespace)
+            .await?
+            .into_iter()
+            .map(|observation| observation.snapshot)
+            .collect())
+    }
+
+    /// Lists and decodes pins while preserving each LIST-observed identity.
+    ///
+    /// This is the metadata-preserving implementation behind [`Self::list`].
+    /// It performs the same one LIST plus one GET per pin; callers that do not
+    /// need the storage observation project only [`NamedSnapshotRef`].
+    pub(crate) async fn list_observations(
+        store: &ZeppelinStore,
+        namespace: &str,
+    ) -> Result<Vec<NamedSnapshotObservation>> {
         let prefix = Self::prefix(namespace);
         let mut snapshots = Vec::new();
-        for key in store.list_prefix(&prefix).await? {
-            let name = snapshot_name_from_key(namespace, &key)?;
-            let data = store.get(&key).await?;
+        for object in store.list_prefix_meta(&prefix).await? {
+            let name = snapshot_name_from_key(namespace, &object.key)?;
+            let data = store.get(&object.key).await?;
             let snapshot = Self::from_bytes(&data)?;
-            snapshots.push(NamedSnapshotRef {
-                name,
-                key,
-                generation: snapshot.generation,
-                created_at: snapshot.created_at,
+            snapshots.push(NamedSnapshotObservation {
+                snapshot: NamedSnapshotRef {
+                    name,
+                    key: object.key.clone(),
+                    generation: snapshot.generation,
+                    created_at: snapshot.created_at,
+                },
+                object,
             });
         }
-        snapshots.sort_by(|a, b| a.name.cmp(&b.name));
+        snapshots.sort_by(|a, b| a.snapshot.name.cmp(&b.snapshot.name));
         Ok(snapshots)
     }
 

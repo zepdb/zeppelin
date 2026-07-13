@@ -210,7 +210,18 @@ pub(crate) enum BackgroundMaintenanceCase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GarbageCollectionCase {
-    HistoryMemoWarmUnchanged,
+    IdleWarmSecondCycle,
+    IdleNewOrphan,
+    IdleCandidateMaturity,
+    IdlePendingDeleteMaturity,
+    IdlePitrExpiry,
+    IdleStagingLeaseExpiry,
+    IdleChangedSnapshot,
+    IdleChangedStaging,
+    IdleChangedCandidateLedger,
+    IdleBackwardClock,
+    IdleShorterRetentionConfig,
+    IdlePriorPartialFailure,
     HistoryMemoNewGeneration,
     HistoryMemoChangedEtag,
     HistoryMemoMissingEtag,
@@ -691,9 +702,64 @@ pub(crate) const IDEAL_CASES: &[IdealCase] = &[
     ),
     // GC mark/sweep, pending-delete, history, and staging states.
     ideal_case(
-        "gc.history_memo_warm_unchanged",
+        "gc.idle_warm_second_cycle",
         IdealCaseGroup::GarbageCollection,
-        IdealOperation::GarbageCollection(GarbageCollectionCase::HistoryMemoWarmUnchanged),
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdleWarmSecondCycle),
+    ),
+    ideal_case(
+        "gc.idle_new_orphan",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdleNewOrphan),
+    ),
+    ideal_case(
+        "gc.idle_candidate_maturity",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdleCandidateMaturity),
+    ),
+    ideal_case(
+        "gc.idle_pending_delete_maturity",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdlePendingDeleteMaturity),
+    ),
+    ideal_case(
+        "gc.idle_pitr_expiry",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdlePitrExpiry),
+    ),
+    ideal_case(
+        "gc.idle_staging_lease_expiry",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdleStagingLeaseExpiry),
+    ),
+    ideal_case(
+        "gc.idle_changed_snapshot",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdleChangedSnapshot),
+    ),
+    ideal_case(
+        "gc.idle_changed_staging",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdleChangedStaging),
+    ),
+    ideal_case(
+        "gc.idle_changed_candidate_ledger",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdleChangedCandidateLedger),
+    ),
+    ideal_case(
+        "gc.idle_backward_clock",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdleBackwardClock),
+    ),
+    ideal_case(
+        "gc.idle_shorter_retention_config",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdleShorterRetentionConfig),
+    ),
+    ideal_case(
+        "gc.idle_prior_partial_failure",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::IdlePriorPartialFailure),
     ),
     ideal_case(
         "gc.history_memo_new_generation",

@@ -19,8 +19,8 @@ use object_store::{
 use ulid::Ulid;
 use zeppelin::compaction::background::compact_namespace_under_lease;
 use zeppelin::compaction::gc::{
-    active_staged_keys_at, clear_compaction_staging, drain_pending_deletes_at, run_gc_cycle_at,
-    save_gc_candidates, write_compaction_staging, GcCandidate, GcCycleReport,
+    active_staged_keys_at, clear_compaction_staging, drain_pending_deletes_at, load_gc_candidates,
+    run_gc_cycle_at, save_gc_candidates, write_compaction_staging, GcCandidate, GcCycleReport,
     GcNamespaceIncarnation, GcRunner,
 };
 use zeppelin::compaction::Compactor;
@@ -34,6 +34,7 @@ use zeppelin::time::{Clock, TimeSource};
 use zeppelin::types::{AttributeValue, DistanceMetric, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::FragmentRef;
+use zeppelin::wal::manifest::NamedSnapshot;
 use zeppelin::wal::{LeaseManager, Manifest, WalReader, WalWriter};
 
 use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
@@ -807,8 +808,35 @@ fn maintenance_fts_vectors(count: usize) -> Vec<VectorEntry> {
 
 async fn execute_gc(case: &IdealCase, operation: GarbageCollectionCase) -> Option<IdealSample> {
     match operation {
-        GarbageCollectionCase::HistoryMemoWarmUnchanged => {
-            Some(execute_history_memo_warm_unchanged(case).await)
+        GarbageCollectionCase::IdleWarmSecondCycle => {
+            Some(execute_idle_warm_second_cycle(case).await)
+        }
+        GarbageCollectionCase::IdleNewOrphan => Some(execute_idle_new_orphan(case).await),
+        GarbageCollectionCase::IdleCandidateMaturity => {
+            Some(execute_idle_candidate_maturity(case).await)
+        }
+        GarbageCollectionCase::IdlePendingDeleteMaturity => {
+            Some(execute_idle_pending_delete_maturity(case).await)
+        }
+        GarbageCollectionCase::IdlePitrExpiry => Some(execute_idle_pitr_expiry(case).await),
+        GarbageCollectionCase::IdleStagingLeaseExpiry => {
+            Some(execute_idle_staging_lease_expiry(case).await)
+        }
+        GarbageCollectionCase::IdleChangedSnapshot => {
+            Some(execute_idle_changed_control(case, IdleControlMutation::Snapshot).await)
+        }
+        GarbageCollectionCase::IdleChangedStaging => {
+            Some(execute_idle_changed_control(case, IdleControlMutation::Staging).await)
+        }
+        GarbageCollectionCase::IdleChangedCandidateLedger => {
+            Some(execute_idle_changed_control(case, IdleControlMutation::CandidateLedger).await)
+        }
+        GarbageCollectionCase::IdleBackwardClock => Some(execute_idle_backward_clock(case).await),
+        GarbageCollectionCase::IdleShorterRetentionConfig => {
+            Some(execute_idle_shorter_retention_config(case).await)
+        }
+        GarbageCollectionCase::IdlePriorPartialFailure => {
+            Some(execute_idle_prior_partial_failure(case).await)
         }
         GarbageCollectionCase::HistoryMemoNewGeneration => {
             Some(execute_history_memo_new_generation(case).await)
@@ -863,70 +891,462 @@ async fn execute_gc(case: &IdealCase, operation: GarbageCollectionCase) -> Optio
     }
 }
 
-async fn execute_history_memo_warm_unchanged(case: &IdealCase) -> IdealSample {
+async fn execute_idle_warm_second_cycle(case: &IdealCase) -> IdealSample {
     let world = MaintenanceWorld::new().await;
     let namespace = world.namespace(case.id.as_str());
-    let mut manifest = Manifest::new_at(world.now);
-    for _ in 0..18 {
-        manifest
-            .write(&world.store, &namespace)
-            .await
-            .expect("ideal GC history-memo setup write failed");
-    }
-
-    let gc = GcConfig {
-        horizon_secs: 0,
-        compaction_upload_window_secs: 0,
-        skew_slop_secs: 0,
-        allow_unsafe_short_horizon: true,
-        manifest_history_keep_count: 1_024,
-        pitr_retention_secs: 0,
-    };
-    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
-    let mut runner = GcRunner::new(world.store.clone(), gc);
-    let cold = runner
-        .run_cycle_at(incarnation.clone(), world.now)
-        .await
-        .expect("ideal cold GC history-memo prime failed");
-    assert_eq!(cold.objects_deleted, 0);
-    assert_eq!(cold.pending_deletes_deleted, 0);
+    seed_history_generations(&world, &namespace, 18).await;
+    let incarnation = GcNamespaceIncarnation::new(namespace, world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
 
     world.begin_measurement().await;
-    let warm = runner
+    let report = runner
         .run_cycle_at(incarnation, world.now)
         .await
-        .expect("ideal warm GC history-memo cycle failed");
-    assert_eq!(warm.objects_deleted, 0);
-    assert_eq!(warm.pending_deletes_deleted, 0);
-
+        .expect("ideal warm idle GC cycle failed");
     let sample = world.finish(case).await;
-    let history_gets = sample
-        .physical_operations
-        .iter()
-        .filter(|operation| operation.verb == "get" && operation.key == "<generation>.msgpack")
-        .count();
-    assert_eq!(history_gets, 0, "warm unchanged GC reread history objects");
-    assert_eq!(sample.total_get_ops, 6);
-    assert_eq!(sample.serial_get_chain.depth, 6);
-    assert_eq!(physical_mode_ops(&sample, "list_recursive"), 5);
-    assert_eq!(
-        sample
-            .physical_verb_mode_totals
-            .iter()
-            .filter(|total| total.verb == "put")
-            .map(|total| total.ops)
-            .sum::<u64>(),
-        2
-    );
-    assert_eq!(
-        sample
-            .physical_verb_mode_totals
-            .iter()
-            .map(|total| total.ops)
-            .sum::<u64>(),
-        13
-    );
+    assert_idle_gate_census(&sample);
+    assert_eq!(report, GcCycleReport::default());
     sample
+}
+
+fn assert_idle_gate_census(sample: &IdealSample) {
+    assert_history_memo_census(sample, 0, 0, 1, 0, 1, 0);
+    assert_eq!(physical_verb_ops(sample, "delete"), 0);
+}
+
+async fn execute_idle_new_orphan(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    let orphan = idle_wal_key(
+        &namespace,
+        world.now - ChronoDuration::seconds(IDLE_DEADLINE_SECS),
+        101,
+    );
+    world
+        .store
+        .put(&orphan, Bytes::from_static(b"idle-new-orphan"))
+        .await
+        .expect("ideal idle new-orphan setup failed");
+
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal idle new-orphan cycle failed");
+    let sample = world.snapshot(case).await;
+    assert_full_gc_census(&sample, 0, 6, 6, 2, 1, 6);
+    assert_eq!(report.candidates_marked, 1);
+    assert_eq!(report.objects_deleted, 1);
+    assert!(
+        !world
+            .harness
+            .store
+            .exists(&orphan)
+            .await
+            .expect("ideal idle new-orphan absence oracle failed"),
+        "a post-prime orphan must invalidate the idle gate and be collected"
+    );
+    world.cleanup(sample).await
+}
+
+async fn execute_idle_candidate_maturity(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    let manifest = seed_history_generations(&world, &namespace, 18).await;
+    let candidate = idle_wal_key(
+        &namespace,
+        world.now - ChronoDuration::seconds(IDLE_DEADLINE_SECS * 2),
+        102,
+    );
+    world
+        .store
+        .put(&candidate, Bytes::from_static(b"idle-maturing-candidate"))
+        .await
+        .expect("ideal idle candidate setup failed");
+    save_gc_candidates(
+        &world.store,
+        &namespace,
+        &[GcCandidate {
+            key: candidate.clone(),
+            first_seen_unreachable_at: world.now,
+            unreachable_since_manifest_version: manifest.version(),
+        }],
+    )
+    .await
+    .expect("ideal idle candidate ledger setup failed");
+
+    let incarnation = GcNamespaceIncarnation::new(namespace, world.now);
+    let mut runner = GcRunner::new(world.store.clone(), idle_deadline_gc_config());
+    let prime = runner
+        .run_cycle_at(incarnation.clone(), world.now)
+        .await
+        .expect("ideal idle candidate prime failed");
+    assert_eq!(prime.objects_deleted, 0);
+    assert!(prime.candidates_skipped >= 1);
+
+    let mature_at = world.now + ChronoDuration::seconds(IDLE_DEADLINE_SECS);
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, mature_at)
+        .await
+        .expect("ideal idle candidate maturity cycle failed");
+    let sample = world.snapshot(case).await;
+    assert_full_gc_census(&sample, 0, 6, 6, 2, 1, 6);
+    assert_eq!(report.candidates_marked, 0);
+    assert_eq!(report.objects_deleted, 1);
+    assert!(
+        !world
+            .harness
+            .store
+            .exists(&candidate)
+            .await
+            .expect("ideal idle candidate absence oracle failed"),
+        "a candidate deadline must invalidate the idle gate"
+    );
+    world.cleanup(sample).await
+}
+
+async fn execute_idle_pending_delete_maturity(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    let pending = idle_wal_key(&namespace, world.now, 103);
+    world
+        .store
+        .put(
+            &pending,
+            Bytes::from_static(b"idle-maturing-pending-delete"),
+        )
+        .await
+        .expect("ideal idle pending-delete object setup failed");
+    let mut manifest = persist_empty_manifest(&world, &namespace).await;
+    manifest.pending_deletes.push(pending.clone());
+    world
+        .store
+        .put(
+            &Manifest::s3_key(&namespace),
+            manifest
+                .to_bytes()
+                .expect("ideal idle pending-delete manifest encode failed"),
+        )
+        .await
+        .expect("ideal idle pending-delete live manifest setup failed");
+
+    let incarnation = GcNamespaceIncarnation::new(namespace, world.now);
+    let mut runner = GcRunner::new(world.store.clone(), idle_deadline_gc_config());
+    let prime = runner
+        .run_cycle_at(incarnation.clone(), world.now)
+        .await
+        .expect("ideal idle pending-delete prime failed");
+    assert_eq!(prime.pending_deletes_deleted, 0);
+    assert_eq!(prime.pending_deletes_retained, 1);
+
+    let mature_at = world.now + ChronoDuration::seconds(IDLE_DEADLINE_SECS);
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, mature_at)
+        .await
+        .expect("ideal idle pending-delete maturity cycle failed");
+    let sample = world.snapshot(case).await;
+    assert_full_gc_census(&sample, 1, 7, 6, 4, 1, 7);
+    assert_eq!(report.pending_deletes_deleted, 1);
+    assert_eq!(report.pending_deletes_pruned, 1);
+    assert_eq!(report.pending_deletes_retained, 0);
+    assert!(
+        !world
+            .harness
+            .store
+            .exists(&pending)
+            .await
+            .expect("ideal idle pending-delete absence oracle failed"),
+        "a pending-delete age deadline must invalidate the idle gate"
+    );
+    world.cleanup(sample).await
+}
+
+async fn execute_idle_pitr_expiry(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut gc = history_memo_gc_config();
+    gc.manifest_history_keep_count = 1;
+    gc.pitr_retention_secs = IDLE_DEADLINE_SECS as u64;
+    let mut runner = GcRunner::new(world.store.clone(), gc);
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    let expired_at = world.now + ChronoDuration::seconds(IDLE_DEADLINE_SECS + 1);
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, expired_at)
+        .await
+        .expect("ideal idle PITR-expiry cycle failed");
+    assert_eq!(report.objects_deleted, 0);
+    let sample = world.snapshot(case).await;
+    assert_full_gc_census(&sample, 0, 6, 6, 2, 17, 6);
+    let histories = Manifest::list_history(&world.harness.store, &namespace)
+        .await
+        .expect("ideal idle PITR-expiry history oracle failed");
+    assert_eq!(histories.len(), 1);
+    world.cleanup(sample).await
+}
+
+async fn execute_idle_staging_lease_expiry(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    persist_empty_manifest(&world, &namespace).await;
+    let staged_id = Ulid::from_parts(
+        (world.now - ChronoDuration::seconds(IDLE_DEADLINE_SECS * 2)).timestamp_millis() as u64,
+        104,
+    );
+    let staged = format!("{namespace}/segments/seg_{staged_id}/bootstrap.bin");
+    world
+        .store
+        .put(&staged, Bytes::from_static(b"idle-staged-upload"))
+        .await
+        .expect("ideal idle staged artifact setup failed");
+    let lease_manager = LeaseManager::with_clock(
+        world.store.clone(),
+        "ideal-idle-staging-holder".to_string(),
+        Duration::from_secs(IDLE_DEADLINE_SECS as u64),
+        world.clock(),
+    );
+    let lease = lease_manager
+        .acquire(&namespace)
+        .await
+        .expect("ideal idle staging lease setup failed");
+    write_compaction_staging(
+        &world.store,
+        &namespace,
+        lease.fencing_token,
+        BTreeSet::from([staged.clone()]),
+    )
+    .await
+    .expect("ideal idle staging record setup failed");
+
+    let incarnation = GcNamespaceIncarnation::new(namespace, world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    let prime = runner
+        .run_cycle_at(incarnation.clone(), world.now)
+        .await
+        .expect("ideal idle active-staging prime failed");
+    assert_eq!(prime.objects_deleted, 0);
+
+    let expired_at = world.now + ChronoDuration::seconds(IDLE_DEADLINE_SECS);
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, expired_at)
+        .await
+        .expect("ideal idle staging lease-expiry cycle failed");
+    let sample = world.snapshot(case).await;
+    assert_full_gc_census(&sample, 0, 6, 6, 2, 1, 6);
+    assert_eq!(report.candidates_marked, 1);
+    assert_eq!(report.objects_deleted, 1);
+    assert!(
+        !world
+            .harness
+            .store
+            .exists(&staged)
+            .await
+            .expect("ideal idle staged artifact absence oracle failed"),
+        "lease expiry must invalidate the idle gate and release staging protection"
+    );
+    world.cleanup(sample).await
+}
+
+#[derive(Clone, Copy)]
+enum IdleControlMutation {
+    Snapshot,
+    Staging,
+    CandidateLedger,
+}
+
+async fn execute_idle_changed_control(
+    case: &IdealCase,
+    mutation: IdleControlMutation,
+) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    let manifest = seed_history_generations(&world, &namespace, 18).await;
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    match mutation {
+        IdleControlMutation::Snapshot => {
+            NamedSnapshot::create_at(
+                &world.store,
+                &namespace,
+                "idle-control-change",
+                manifest.version(),
+                world.now,
+            )
+            .await
+            .expect("ideal idle changed-snapshot setup failed");
+        }
+        IdleControlMutation::Staging => {
+            write_compaction_staging(&world.store, &namespace, 777, BTreeSet::new())
+                .await
+                .expect("ideal idle changed-staging setup failed");
+        }
+        IdleControlMutation::CandidateLedger => {
+            save_gc_candidates(
+                &world.store,
+                &namespace,
+                &[GcCandidate {
+                    key: idle_wal_key(
+                        &namespace,
+                        world.now - ChronoDuration::seconds(IDLE_DEADLINE_SECS * 2),
+                        105,
+                    ),
+                    first_seen_unreachable_at: world.now,
+                    unreachable_since_manifest_version: manifest.version(),
+                }],
+            )
+            .await
+            .expect("ideal idle changed-candidate-ledger setup failed");
+        }
+    }
+
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal idle changed-control cycle failed");
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(report.pending_deletes_deleted, 0);
+    let sample = world.snapshot(case).await;
+    match mutation {
+        IdleControlMutation::Snapshot => {
+            assert_full_gc_census(&sample, 0, 7, 6, 2, 0, 7);
+            assert!(
+                NamedSnapshot::read(&world.harness.store, &namespace, "idle-control-change")
+                    .await
+                    .expect("ideal idle changed-snapshot oracle failed")
+                    .is_some()
+            );
+        }
+        IdleControlMutation::Staging => {
+            assert_full_gc_census(&sample, 0, 6, 6, 2, 0, 6);
+        }
+        IdleControlMutation::CandidateLedger => {
+            assert_full_gc_census(&sample, 0, 6, 6, 2, 0, 6);
+            assert!(
+                load_gc_candidates(&world.harness.store, &namespace)
+                    .await
+                    .expect("ideal idle changed-candidate-ledger oracle failed")
+                    .is_empty(),
+                "a changed candidate ledger must be revalidated instead of idled"
+            );
+        }
+    }
+    world.cleanup(sample).await
+}
+
+async fn execute_idle_backward_clock(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let incarnation = GcNamespaceIncarnation::new(namespace, world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now - ChronoDuration::microseconds(1))
+        .await
+        .expect("ideal idle backward-clock cycle failed");
+    assert_eq!(report.objects_deleted, 0);
+    let sample = world.finish(case).await;
+    assert_full_gc_census(&sample, 0, 6, 6, 2, 0, 6);
+    sample
+}
+
+async fn execute_idle_shorter_retention_config(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    let mut shorter = history_memo_gc_config();
+    shorter.manifest_history_keep_count = 1;
+    runner.update_config(shorter);
+
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal idle shorter-retention cycle failed");
+    assert_eq!(report.objects_deleted, 0);
+    let sample = world.snapshot(case).await;
+    assert_full_gc_census(&sample, 0, 6, 6, 2, 17, 6);
+    let histories = Manifest::list_history(&world.harness.store, &namespace)
+        .await
+        .expect("ideal idle shorter-retention history oracle failed");
+    assert_eq!(histories.len(), 1);
+    world.cleanup(sample).await
+}
+
+async fn execute_idle_prior_partial_failure(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    let target = Manifest::history_key(&namespace, 1);
+    let original = world
+        .store
+        .get(&target)
+        .await
+        .expect("ideal idle partial-failure history read failed");
+    world
+        .store
+        .put(&target, Bytes::from_static(b"corrupt-history"))
+        .await
+        .expect("ideal idle partial-failure corruption setup failed");
+    let partial = runner
+        .run_cycle_at(incarnation.clone(), world.now)
+        .await
+        .expect("ideal idle partial-failure cycle returned an error");
+    assert_eq!(partial, GcCycleReport::default());
+    world
+        .store
+        .put(&target, original)
+        .await
+        .expect("ideal idle partial-failure history restore failed");
+
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal idle post-failure retry failed");
+    assert_eq!(report.objects_deleted, 0);
+    let sample = world.finish(case).await;
+    assert_full_gc_census(&sample, 0, 6, 6, 2, 0, 6);
+    sample
+}
+
+const IDLE_DEADLINE_SECS: i64 = 30;
+
+fn idle_deadline_gc_config() -> GcConfig {
+    GcConfig {
+        horizon_secs: IDLE_DEADLINE_SECS as u64,
+        ..history_memo_gc_config()
+    }
+}
+
+fn idle_wal_key(namespace: &str, created_at: DateTime<Utc>, entropy: u128) -> String {
+    let id = Ulid::from_parts(created_at.timestamp_millis() as u64, entropy);
+    format!("{namespace}/wal/{id}.wal")
 }
 
 async fn execute_history_memo_new_generation(case: &IdealCase) -> IdealSample {
@@ -952,7 +1372,7 @@ async fn execute_history_memo_new_generation(case: &IdealCase) -> IdealSample {
     assert_eq!(report.pending_deletes_deleted, 0);
 
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 3, 9, 5, 2, 16, 9);
+    assert_history_memo_census(&sample, 3, 9, 6, 2, 17, 9);
     sample
 }
 
@@ -989,7 +1409,7 @@ async fn execute_history_memo_changed_etag(case: &IdealCase) -> IdealSample {
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 3, 9, 5, 2, 16, 9);
+    assert_history_memo_census(&sample, 3, 9, 6, 2, 17, 9);
     sample
 }
 
@@ -1013,7 +1433,7 @@ async fn execute_history_memo_missing_etag(case: &IdealCase) -> IdealSample {
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 3, 9, 5, 2, 16, 9);
+    assert_history_memo_census(&sample, 3, 9, 6, 2, 17, 9);
     sample
 }
 
@@ -1112,7 +1532,7 @@ async fn execute_history_memo_unpublished_orphan_overwrite(case: &IdealCase) -> 
     let sample = world.snapshot(case).await;
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
-    assert_history_memo_census(&sample, 3, 9, 5, 2, 16, 9);
+    assert_history_memo_census(&sample, 3, 9, 6, 2, 17, 9);
     assert!(
         world
             .harness
@@ -1204,7 +1624,7 @@ async fn execute_history_memo_cold_runner_restart(case: &IdealCase) -> IdealSamp
 
 fn assert_history_failure_closed(report: &GcCycleReport, sample: &IdealSample) {
     assert_eq!(report, &GcCycleReport::default());
-    assert_history_memo_census(sample, 1, 1, 2, 0, 3, 1);
+    assert_history_memo_census(sample, 1, 1, 3, 0, 4, 1);
     assert_eq!(physical_verb_ops(sample, "delete"), 0);
 }
 
@@ -1402,6 +1822,28 @@ fn assert_history_memo_census(
             .sum::<u64>(),
         calls
     );
+}
+
+fn assert_full_gc_census(
+    sample: &IdealSample,
+    history_gets: u64,
+    total_gets: u64,
+    lists: u64,
+    puts: u64,
+    deletes: u64,
+    get_depth: u32,
+) {
+    let calls = total_gets + lists + puts + deletes;
+    assert_history_memo_census(
+        sample,
+        history_gets,
+        total_gets,
+        lists,
+        puts,
+        calls,
+        get_depth,
+    );
+    assert_eq!(physical_verb_ops(sample, "delete"), deletes);
 }
 
 fn physical_verb_ops(sample: &IdealSample, verb: &str) -> u64 {
@@ -1788,7 +2230,18 @@ mod tests {
                 "background.tick_resume_delete",
                 "background.tick_lease_held",
                 "background.tick_compaction_success",
-                "gc.history_memo_warm_unchanged",
+                "gc.idle_warm_second_cycle",
+                "gc.idle_new_orphan",
+                "gc.idle_candidate_maturity",
+                "gc.idle_pending_delete_maturity",
+                "gc.idle_pitr_expiry",
+                "gc.idle_staging_lease_expiry",
+                "gc.idle_changed_snapshot",
+                "gc.idle_changed_staging",
+                "gc.idle_changed_candidate_ledger",
+                "gc.idle_backward_clock",
+                "gc.idle_shorter_retention_config",
+                "gc.idle_prior_partial_failure",
                 "gc.history_memo_new_generation",
                 "gc.history_memo_changed_etag",
                 "gc.history_memo_missing_etag",
