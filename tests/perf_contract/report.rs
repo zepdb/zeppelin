@@ -880,7 +880,7 @@ fn flatten_toml(prefix: &str, value: &toml::Value, fields: &mut BTreeMap<String,
     }
 }
 
-fn stable_depth_key(key: &str) -> String {
+pub(crate) fn stable_depth_key(key: &str) -> String {
     let filename = key.rsplit('/').next().unwrap_or(key);
     if filename.ends_with(".wal") {
         "<wal>.wal".to_string()

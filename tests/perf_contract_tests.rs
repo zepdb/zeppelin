@@ -36,3 +36,15 @@ async fn predict() {
 async fn latency_validate() {
     perf_contract::run_latency_validate_entry().await;
 }
+
+#[tokio::test]
+#[ignore = "requires MinIO and an explicit exhaustive ideal-analysis budget"]
+async fn ideal_analysis() {
+    let summary = perf_contract::run_ideal_analysis_entry().await;
+    println!(
+        "ideal-analysis report: {} (cycles={}, scenario_runs={})",
+        summary.report.display(),
+        summary.cycles_completed,
+        summary.scenario_runs
+    );
+}

@@ -4,6 +4,7 @@ pub mod contract;
 pub mod dataset;
 pub mod depth;
 pub mod ground_truth;
+pub mod ideal;
 pub mod injection;
 pub mod latency;
 pub mod predict;
@@ -14,6 +15,7 @@ pub mod scenarios;
 
 use std::path::PathBuf;
 
+pub use ideal::run_ideal_analysis_entry;
 pub use latency::run_latency_validate_entry;
 pub use predict::run_predict_entry;
 pub use scenario::{

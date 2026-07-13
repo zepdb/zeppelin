@@ -19,8 +19,8 @@ use futures::stream::BoxStream;
 use futures::Stream;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
+    GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMode, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use serde::Serialize;
 use zeppelin::storage::ZeppelinStore;
@@ -38,15 +38,115 @@ pub enum SpanKind {
     Delete,
 }
 
+/// Semantic request shape presented to the `ObjectStore` adapter.
+///
+/// This deliberately omits ETag values and other high-cardinality request
+/// data while preserving the distinctions that change S3 cost or behavior.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalRequest {
+    GetFull,
+    GetRange { start: usize, end: Option<usize> },
+    GetSuffix { bytes: usize },
+    GetConditional,
+    GetConditionalRange { start: usize, end: Option<usize> },
+    GetConditionalSuffix { bytes: usize },
+    PutOverwrite,
+    PutCreate,
+    PutUpdate,
+    Head,
+    ListRecursive,
+    ListDelimiter,
+    CopyOverwrite,
+    CopyIfAbsent,
+    Delete,
+}
+
+/// Typed completion state for one observed object-store operation.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanOutcome {
+    Success,
+    NotModified,
+    Precondition,
+    NotFound,
+    Failure,
+    Cancelled,
+}
+
+impl SpanOutcome {
+    fn from_error(error: &object_store::Error) -> Self {
+        match error {
+            object_store::Error::NotModified { .. } => Self::NotModified,
+            object_store::Error::Precondition { .. }
+            | object_store::Error::AlreadyExists { .. } => Self::Precondition,
+            object_store::Error::NotFound { .. } => Self::NotFound,
+            _ => Self::Failure,
+        }
+    }
+
+    fn from_result<T>(result: &OsResult<T>) -> Self {
+        match result {
+            Ok(_) => Self::Success,
+            Err(error) => Self::from_error(error),
+        }
+    }
+}
+
+impl PhysicalRequest {
+    fn from_get_options(options: &GetOptions) -> Self {
+        if options.head {
+            return Self::Head;
+        }
+        let conditional = options.if_match.is_some()
+            || options.if_none_match.is_some()
+            || options.if_modified_since.is_some()
+            || options.if_unmodified_since.is_some();
+        match (&options.range, conditional) {
+            (None, false) => Self::GetFull,
+            (None, true) => Self::GetConditional,
+            (Some(GetRange::Bounded(range)), false) => Self::GetRange {
+                start: range.start,
+                end: Some(range.end),
+            },
+            (Some(GetRange::Offset(start)), false) => Self::GetRange {
+                start: *start,
+                end: None,
+            },
+            (Some(GetRange::Suffix(bytes)), false) => Self::GetSuffix { bytes: *bytes },
+            (Some(GetRange::Bounded(range)), true) => Self::GetConditionalRange {
+                start: range.start,
+                end: Some(range.end),
+            },
+            (Some(GetRange::Offset(start)), true) => Self::GetConditionalRange {
+                start: *start,
+                end: None,
+            },
+            (Some(GetRange::Suffix(bytes)), true) => Self::GetConditionalSuffix { bytes: *bytes },
+        }
+    }
+
+    fn from_put_mode(mode: &PutMode) -> Self {
+        match mode {
+            PutMode::Overwrite => Self::PutOverwrite,
+            PutMode::Create => Self::PutCreate,
+            PutMode::Update(_) => Self::PutUpdate,
+        }
+    }
+}
+
 /// One observed object-store operation.
 #[derive(Debug, Clone, Serialize)]
 pub struct OpSpan {
     pub kind: SpanKind,
+    pub request: PhysicalRequest,
     pub class: ArtifactClass,
     pub key: String,
     pub start_seq: u64,
     pub end_seq: u64,
     pub bytes: u64,
+    pub outcome: SpanOutcome,
+    /// Compatibility projection retained for frozen reports and contracts.
     pub ok: bool,
     pub wall_start_us: u64,
     pub wall_end_us: u64,
@@ -99,6 +199,7 @@ pub struct DepthTracker {
 #[derive(Debug)]
 struct PendingSpan {
     kind: SpanKind,
+    request: PhysicalRequest,
     class: ArtifactClass,
     key: String,
     start_seq: u64,
@@ -127,9 +228,9 @@ impl GetSpanStream {
         }
     }
 
-    fn close(&mut self, ok: bool) {
+    fn close(&mut self, outcome: SpanOutcome) {
         if let Some(pending) = self.pending.take() {
-            self.tracker.finish(pending, ok, Some(self.bytes));
+            self.tracker.finish(pending, outcome, Some(self.bytes));
         }
     }
 }
@@ -147,11 +248,11 @@ impl Stream for GetSpanStream {
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(error))) => {
-                self.close(false);
+                self.close(SpanOutcome::from_error(&error));
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
-                self.close(true);
+                self.close(SpanOutcome::Success);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -165,7 +266,62 @@ impl Stream for GetSpanStream {
 
 impl Drop for GetSpanStream {
     fn drop(&mut self) {
-        self.close(false);
+        self.close(SpanOutcome::Cancelled);
+    }
+}
+
+struct ListSpanStream<'a> {
+    inner: BoxStream<'a, OsResult<ObjectMeta>>,
+    tracker: DepthTracker,
+    pending: Option<PendingSpan>,
+}
+
+impl<'a> ListSpanStream<'a> {
+    fn new(
+        inner: BoxStream<'a, OsResult<ObjectMeta>>,
+        tracker: DepthTracker,
+        pending: PendingSpan,
+    ) -> Self {
+        Self {
+            inner,
+            tracker,
+            pending: Some(pending),
+        }
+    }
+
+    fn close(&mut self, outcome: SpanOutcome) {
+        if let Some(pending) = self.pending.take() {
+            self.tracker.finish(pending, outcome, None);
+        }
+    }
+}
+
+impl Stream for ListSpanStream<'_> {
+    type Item = OsResult<ObjectMeta>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(meta))) => Poll::Ready(Some(Ok(meta))),
+            Poll::Ready(Some(Err(error))) => {
+                self.close(SpanOutcome::from_error(&error));
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.close(SpanOutcome::Success);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for ListSpanStream<'_> {
+    fn drop(&mut self) {
+        self.close(SpanOutcome::Cancelled);
     }
 }
 
@@ -195,7 +351,14 @@ impl DepthTracker {
         self.state.active.load(Ordering::SeqCst)
     }
 
-    fn begin(&self, kind: SpanKind, class: ArtifactClass, key: String, bytes: u64) -> PendingSpan {
+    fn begin(
+        &self,
+        kind: SpanKind,
+        request: PhysicalRequest,
+        class: ArtifactClass,
+        key: String,
+        bytes: u64,
+    ) -> PendingSpan {
         let start_seq = self.state.counter.load(Ordering::SeqCst);
         self.state
             .active
@@ -205,6 +368,7 @@ impl DepthTracker {
             .expect("depth tracker active operation count overflowed");
         PendingSpan {
             kind,
+            request,
             class,
             key,
             start_seq,
@@ -213,7 +377,7 @@ impl DepthTracker {
         }
     }
 
-    fn finish(&self, pending: PendingSpan, ok: bool, bytes: Option<u64>) {
+    fn finish(&self, pending: PendingSpan, outcome: SpanOutcome, bytes: Option<u64>) {
         let end_seq = self
             .state
             .counter
@@ -222,12 +386,14 @@ impl DepthTracker {
             .expect("depth tracker event counter overflowed");
         let span = OpSpan {
             kind: pending.kind,
+            request: pending.request,
             class: pending.class,
             key: pending.key,
             start_seq: pending.start_seq,
             end_seq,
             bytes: bytes.unwrap_or(pending.bytes),
-            ok,
+            outcome,
+            ok: outcome == SpanOutcome::Success,
             wall_start_us: pending.wall_start_us,
             wall_end_us: self.elapsed_us(),
         };
@@ -428,12 +594,14 @@ impl ObjectStore for DepthStore {
     ) -> OsResult<PutResult> {
         let pending = self.tracker.begin(
             SpanKind::Put,
+            PhysicalRequest::from_put_mode(&opts.mode),
             classify(location.as_ref()),
             location.to_string(),
             payload.content_length() as u64,
         );
         let result = self.inner.put_opts(location, payload, opts).await;
-        self.tracker.finish(pending, result.is_ok(), None);
+        self.tracker
+            .finish(pending, SpanOutcome::from_result(&result), None);
         result
     }
 
@@ -450,6 +618,7 @@ impl ObjectStore for DepthStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
         let pending = self.tracker.begin(
             SpanKind::Get,
+            PhysicalRequest::from_get_options(&options),
             classify(location.as_ref()),
             location.to_string(),
             0,
@@ -457,7 +626,8 @@ impl ObjectStore for DepthStore {
         let result = match self.inner.get_opts(location, options).await {
             Ok(result) => result,
             Err(error) => {
-                self.tracker.finish(pending, false, Some(0));
+                self.tracker
+                    .finish(pending, SpanOutcome::from_error(&error), Some(0));
                 return Err(error);
             }
         };
@@ -482,66 +652,87 @@ impl ObjectStore for DepthStore {
     async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
         let pending = self.tracker.begin(
             SpanKind::Head,
+            PhysicalRequest::Head,
             classify(location.as_ref()),
             location.to_string(),
             0,
         );
         let result = self.inner.head(location).await;
-        self.tracker.finish(pending, result.is_ok(), None);
+        self.tracker
+            .finish(pending, SpanOutcome::from_result(&result), None);
         result
     }
 
     async fn delete(&self, location: &Path) -> OsResult<()> {
         let pending = self.tracker.begin(
             SpanKind::Delete,
+            PhysicalRequest::Delete,
             classify(location.as_ref()),
             location.to_string(),
             0,
         );
         let result = self.inner.delete(location).await;
-        self.tracker.finish(pending, result.is_ok(), None);
+        self.tracker
+            .finish(pending, SpanOutcome::from_result(&result), None);
         result
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
         let key = prefix.map(ToString::to_string).unwrap_or_default();
-        let pending = self.tracker.begin(SpanKind::List, classify(&key), key, 0);
-        let result = self.inner.list(prefix);
-        // Phase 1 closes LIST when the stream is created. Stream consumption
-        // and any later item errors are intentionally outside this span.
-        self.tracker.finish(pending, true, None);
-        result
+        let pending = self.tracker.begin(
+            SpanKind::List,
+            PhysicalRequest::ListRecursive,
+            classify(&key),
+            key,
+            0,
+        );
+        Box::pin(ListSpanStream::new(
+            self.inner.list(prefix),
+            self.tracker.clone(),
+            pending,
+        ))
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
         let key = prefix.map(ToString::to_string).unwrap_or_default();
-        let pending = self.tracker.begin(SpanKind::List, classify(&key), key, 0);
+        let pending = self.tracker.begin(
+            SpanKind::List,
+            PhysicalRequest::ListDelimiter,
+            classify(&key),
+            key,
+            0,
+        );
         let result = self.inner.list_with_delimiter(prefix).await;
-        self.tracker.finish(pending, result.is_ok(), None);
+        self.tracker
+            .finish(pending, SpanOutcome::from_result(&result), None);
         result
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
         let pending = self.tracker.begin(
             SpanKind::Copy,
+            PhysicalRequest::CopyOverwrite,
             classify(to.as_ref()),
             format!("{from}->{to}"),
             0,
         );
         let result = self.inner.copy(from, to).await;
-        self.tracker.finish(pending, result.is_ok(), None);
+        self.tracker
+            .finish(pending, SpanOutcome::from_result(&result), None);
         result
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
         let pending = self.tracker.begin(
             SpanKind::Copy,
+            PhysicalRequest::CopyIfAbsent,
             classify(to.as_ref()),
             format!("{from}->{to}"),
             0,
         );
         let result = self.inner.copy_if_not_exists(from, to).await;
-        self.tracker.finish(pending, result.is_ok(), None);
+        self.tracker
+            .finish(pending, SpanOutcome::from_result(&result), None);
         result
     }
 }
@@ -551,6 +742,7 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use object_store::memory::InMemory;
+    use object_store::{GetRange, PutMode, UpdateVersion};
 
     async fn instrumented_get(payload: &'static [u8]) -> (GetResult, DepthTracker) {
         let location = Path::from("segments/test/cluster_0.bin");
@@ -572,11 +764,13 @@ mod tests {
     fn span(key: &str, start_seq: u64, end_seq: u64) -> OpSpan {
         OpSpan {
             kind: SpanKind::Get,
+            request: PhysicalRequest::GetFull,
             class: classify(key),
             key: key.to_string(),
             start_seq,
             end_seq,
             bytes: 0,
+            outcome: SpanOutcome::Success,
             ok: true,
             wall_start_us: start_seq,
             wall_end_us: end_seq,
@@ -635,11 +829,12 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].kind, SpanKind::Get);
         assert_eq!(spans[0].bytes, 7);
+        assert_eq!(spans[0].outcome, SpanOutcome::Success);
         assert!(spans[0].ok);
     }
 
     #[tokio::test]
-    async fn dropping_get_payload_finishes_once_as_failed() {
+    async fn dropping_get_payload_finishes_once_as_cancelled() {
         let (result, tracker) = instrumented_get(b"payload").await;
         assert!(tracker.take_spans().is_empty());
 
@@ -648,6 +843,7 @@ mod tests {
         let spans = tracker.take_spans();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].bytes, 0);
+        assert_eq!(spans[0].outcome, SpanOutcome::Cancelled);
         assert!(!spans[0].ok);
     }
 
@@ -656,6 +852,7 @@ mod tests {
         let tracker = DepthTracker::new();
         let pending = tracker.begin(
             SpanKind::Get,
+            PhysicalRequest::GetFull,
             ArtifactClass::Cluster,
             "segments/test/cluster_0.bin".to_string(),
             0,
@@ -673,6 +870,7 @@ mod tests {
         let spans = tracker.take_spans();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].bytes, 0);
+        assert_eq!(spans[0].outcome, SpanOutcome::Failure);
         assert!(!spans[0].ok);
     }
 
@@ -689,5 +887,200 @@ mod tests {
 
         drop(result);
         assert_eq!(tracker.active_operations(), 0);
+    }
+
+    #[tokio::test]
+    async fn conditional_not_modified_is_a_typed_expected_outcome() {
+        let location = Path::from("manifest.json");
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let put = inner
+            .put(&location, PutPayload::from_static(b"manifest"))
+            .await
+            .expect("seed conditional GET object");
+        let store = ZeppelinStore::new(inner);
+        let (store, tracker) = depth_store(&store);
+        let options = GetOptions {
+            if_none_match: put.e_tag,
+            ..GetOptions::default()
+        };
+
+        let result = store.inner().get_opts(&location, options).await;
+
+        assert!(matches!(
+            result,
+            Err(object_store::Error::NotModified { .. })
+        ));
+        let spans = tracker.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].outcome, SpanOutcome::NotModified);
+        assert!(!spans[0].ok);
+    }
+
+    #[tokio::test]
+    async fn recursive_list_stays_active_until_stream_eof() {
+        let location = Path::from("ns/meta.json");
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        inner
+            .put(&location, PutPayload::from_static(b"metadata"))
+            .await
+            .expect("seed recursive LIST object");
+        let store = ZeppelinStore::new(inner);
+        let (store, tracker) = depth_store(&store);
+        let prefix = Path::from("ns");
+        let backend = store.inner();
+        let mut stream = backend.list(Some(&prefix));
+
+        assert_eq!(tracker.active_operations(), 1);
+        assert!(tracker.take_spans().is_empty());
+        assert!(stream.next().await.expect("recursive LIST item").is_ok());
+        assert!(stream.next().await.is_none());
+
+        assert_eq!(tracker.active_operations(), 0);
+        let spans = tracker.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].outcome, SpanOutcome::Success);
+        assert!(spans[0].ok);
+    }
+
+    #[tokio::test]
+    async fn dropping_recursive_list_records_cancelled_once() {
+        let location = Path::from("ns/meta.json");
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        inner
+            .put(&location, PutPayload::from_static(b"metadata"))
+            .await
+            .expect("seed cancelled recursive LIST object");
+        let store = ZeppelinStore::new(inner);
+        let (store, tracker) = depth_store(&store);
+        let prefix = Path::from("ns");
+        let backend = store.inner();
+        let stream = backend.list(Some(&prefix));
+
+        assert_eq!(tracker.active_operations(), 1);
+        drop(stream);
+
+        assert_eq!(tracker.active_operations(), 0);
+        let spans = tracker.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].outcome, SpanOutcome::Cancelled);
+        assert!(!spans[0].ok);
+    }
+
+    #[tokio::test]
+    async fn recursive_list_stream_error_records_failure_once() {
+        let tracker = DepthTracker::new();
+        let pending = tracker.begin(
+            SpanKind::List,
+            PhysicalRequest::ListRecursive,
+            ArtifactClass::Other,
+            "ns".to_string(),
+            0,
+        );
+        let error = object_store::Error::Generic {
+            store: "depth_test",
+            source: Box::new(std::io::Error::other("injected LIST stream error")),
+        };
+        let inner = futures::stream::once(async move { Err(error) }).boxed();
+        let mut stream = ListSpanStream::new(inner, tracker.clone(), pending);
+
+        assert!(stream
+            .next()
+            .await
+            .expect("LIST error stream item")
+            .is_err());
+        drop(stream);
+
+        assert_eq!(tracker.active_operations(), 0);
+        let spans = tracker.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].outcome, SpanOutcome::Failure);
+        assert!(!spans[0].ok);
+    }
+
+    #[tokio::test]
+    async fn missing_get_and_create_conflict_have_typed_outcomes() {
+        let location = Path::from("meta.json");
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = ZeppelinStore::new(inner);
+        let (store, tracker) = depth_store(&store);
+        let backend = store.inner();
+
+        let missing = backend.get(&location).await;
+        assert!(matches!(missing, Err(object_store::Error::NotFound { .. })));
+
+        backend
+            .put(&location, PutPayload::from_static(b"first"))
+            .await
+            .expect("seed create-conflict object");
+        let conflict = backend
+            .put_opts(
+                &location,
+                PutPayload::from_static(b"second"),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(object_store::Error::AlreadyExists { .. })
+                | Err(object_store::Error::Precondition { .. })
+        ));
+
+        let spans = tracker.take_spans();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].outcome, SpanOutcome::NotFound);
+        assert_eq!(spans[1].outcome, SpanOutcome::Success);
+        assert_eq!(spans[2].outcome, SpanOutcome::Precondition);
+    }
+
+    #[test]
+    fn get_request_shape_distinguishes_full_range_and_conditional_reads() {
+        let full = GetOptions::default();
+        assert_eq!(
+            PhysicalRequest::from_get_options(&full),
+            PhysicalRequest::GetFull
+        );
+
+        let ranged = GetOptions {
+            range: Some(GetRange::Bounded(7..19)),
+            ..GetOptions::default()
+        };
+        assert_eq!(
+            PhysicalRequest::from_get_options(&ranged),
+            PhysicalRequest::GetRange {
+                start: 7,
+                end: Some(19),
+            }
+        );
+
+        let conditional = GetOptions {
+            if_none_match: Some("etag".to_string()),
+            ..GetOptions::default()
+        };
+        assert_eq!(
+            PhysicalRequest::from_get_options(&conditional),
+            PhysicalRequest::GetConditional
+        );
+    }
+
+    #[test]
+    fn put_request_shape_distinguishes_overwrite_create_and_update() {
+        assert_eq!(
+            PhysicalRequest::from_put_mode(&PutMode::Overwrite),
+            PhysicalRequest::PutOverwrite
+        );
+        assert_eq!(
+            PhysicalRequest::from_put_mode(&PutMode::Create),
+            PhysicalRequest::PutCreate
+        );
+        assert_eq!(
+            PhysicalRequest::from_put_mode(&PutMode::Update(UpdateVersion {
+                e_tag: Some("etag".to_string()),
+                version: None,
+            })),
+            PhysicalRequest::PutUpdate
+        );
     }
 }
