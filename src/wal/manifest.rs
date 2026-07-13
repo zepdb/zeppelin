@@ -1563,16 +1563,24 @@ impl Manifest {
     }
 
     /// Parses one metadata-preserving LIST result using the canonical key grammar.
-    fn history_observations_from_listed(
+    pub(crate) fn history_observations_from_listed(
         namespace: &str,
         listed: Vec<ListedObject>,
     ) -> Result<Vec<ManifestHistoryObservation>> {
         let mut observations = listed
             .into_iter()
             .map(|object| {
+                let key = object.key.clone();
+                let version = Self::history_version_from_key(namespace, &key).map_err(|error| {
+                    ZeppelinError::MalformedControlKey {
+                        family: "manifest-history",
+                        key: key.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
                 Ok(ManifestHistoryObservation {
                     history: ManifestHistoryRef {
-                        version: Self::history_version_from_key(namespace, &object.key)?,
+                        version,
                         key: object.key,
                     },
                     storage_version: object.version,
@@ -2302,11 +2310,45 @@ impl NamedSnapshot {
     ) -> Result<Vec<NamedSnapshotObservation>> {
         let prefix = Self::prefix(namespace);
         let mut snapshots = Vec::new();
-        for object in store.list_prefix_meta(&prefix).await? {
+        for object in
+            Self::validate_listed_objects(namespace, store.list_prefix_meta(&prefix).await?)?
+        {
             snapshots.push(Self::read_listed_observation(store, namespace, object).await?);
         }
-        snapshots.sort_by(|a, b| a.snapshot.name.cmp(&b.snapshot.name));
         Ok(snapshots)
+    }
+
+    /// Validates snapshot objects supplied by an enclosing namespace LIST.
+    ///
+    /// This pure seam applies the same exact key grammar and lexical name order
+    /// as [`Self::list_observations`] without performing another LIST or any
+    /// body GETs. Garbage collection can therefore validate a namespace-wide
+    /// inventory first, then retain control of bounded observation reads through
+    /// [`Self::read_listed_observation`].
+    pub(crate) fn validate_listed_objects(
+        namespace: &str,
+        listed: Vec<ListedObject>,
+    ) -> Result<Vec<ListedObject>> {
+        let mut objects = listed
+            .into_iter()
+            .map(|object| {
+                let key = object.key.clone();
+                let name = snapshot_name_from_key(namespace, &key).map_err(|error| {
+                    ZeppelinError::MalformedControlKey {
+                        family: "snapshot",
+                        key: key.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok((name, object))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        objects.sort_by(|(left_name, left), (right_name, right)| {
+            left_name
+                .cmp(right_name)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        Ok(objects.into_iter().map(|(_, object)| object).collect())
     }
 
     /// Reads and decodes one pin discovered by a metadata-preserving LIST.
@@ -2316,7 +2358,15 @@ impl NamedSnapshot {
         object: ListedObject,
     ) -> Result<NamedSnapshotObservation> {
         let name = snapshot_name_from_key(namespace, &object.key)?;
-        let data = store.get(&object.key).await?;
+        let (data, get_etag) = store.get_with_meta(&object.key).await?;
+        if let Some(StorageVersion::Etag(list_etag)) = object.version.as_ref() {
+            if get_etag.as_deref() != Some(list_etag.as_str()) {
+                return Err(ZeppelinError::Serialization(format!(
+                    "snapshot pin {} changed between LIST ETag {:?} and GET ETag {:?}",
+                    object.key, list_etag, get_etag
+                )));
+            }
+        }
         let snapshot = Self::from_bytes(&data)?;
         Ok(NamedSnapshotObservation {
             snapshot: NamedSnapshotRef {
@@ -2993,6 +3043,98 @@ mod tests {
 
         let json = serde_json::to_vec(&snapshot).unwrap();
         assert_eq!(NamedSnapshot::from_bytes(&json).unwrap(), snapshot);
+    }
+
+    /// Lets namespace-wide inventories reuse the exact snapshot-key grammar
+    /// while preserving LIST metadata and canonical name order.
+    #[test]
+    fn named_snapshot_validates_inventory_objects_and_sorts_by_name() {
+        let namespace = "snapshot_inventory";
+        let now = Utc::now();
+        let listed = vec![
+            ListedObject {
+                key: NamedSnapshot::key(namespace, "weekly").unwrap(),
+                size: 31,
+                last_modified: now,
+                version: Some(StorageVersion::BackendVersion("weekly-v1".to_string())),
+            },
+            ListedObject {
+                key: NamedSnapshot::key(namespace, "daily").unwrap(),
+                size: 29,
+                last_modified: now,
+                version: Some(StorageVersion::Etag("daily-etag".to_string())),
+            },
+        ];
+
+        let validated = NamedSnapshot::validate_listed_objects(namespace, listed).unwrap();
+
+        assert_eq!(
+            validated
+                .iter()
+                .map(|object| object.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "snapshot_inventory/snapshots/daily.msgpack",
+                "snapshot_inventory/snapshots/weekly.msgpack",
+            ]
+        );
+        assert_eq!(
+            validated[0].version,
+            Some(StorageVersion::Etag("daily-etag".to_string()))
+        );
+        assert_eq!(validated[0].size, 29);
+    }
+
+    /// Rejects malformed keys from a namespace-wide LIST instead of silently
+    /// excluding them from the snapshot retention root set.
+    #[test]
+    fn named_snapshot_inventory_rejects_nested_snapshot_key() {
+        let namespace = "snapshot_inventory_invalid";
+        let malformed = ListedObject {
+            key: format!("{namespace}/snapshots/team/daily.msgpack"),
+            size: 31,
+            last_modified: Utc::now(),
+            version: None,
+        };
+
+        let error = NamedSnapshot::validate_listed_objects(namespace, vec![malformed])
+            .expect_err("nested snapshot keys must fail canonical validation");
+
+        assert!(
+            matches!(&error, ZeppelinError::MalformedControlKey { key, family, .. }
+                if key.contains("team/daily") && *family == "snapshot"),
+            "malformed inventory key must be rejected by snapshot-name grammar, got {error:?}"
+        );
+    }
+
+    /// Refuses to pair a snapshot body with a different ETag than the
+    /// namespace inventory observed for that key.
+    #[tokio::test]
+    async fn named_snapshot_rejects_body_changed_since_inventory_list() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let namespace = "snapshot_inventory_changed";
+        let key = NamedSnapshot::key(namespace, "daily").unwrap();
+        let snapshot = NamedSnapshot {
+            generation: 7,
+            created_at: Utc::now(),
+        };
+        store.put(&key, snapshot.to_bytes().unwrap()).await.unwrap();
+        let listed = ListedObject {
+            key: key.clone(),
+            size: 31,
+            last_modified: Utc::now(),
+            version: Some(StorageVersion::Etag("stale-list-etag".to_string())),
+        };
+
+        let error = NamedSnapshot::read_listed_observation(&store, namespace, listed)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, ZeppelinError::Serialization(message) if
+                message.contains("changed between LIST ETag") && message.contains(&key)),
+            "LIST/GET identity mismatch must fail loud, got {error:?}"
+        );
     }
 
     /// Protects exact-set compaction removal when a concurrently appended ULID

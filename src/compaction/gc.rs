@@ -196,7 +196,18 @@ struct NamespaceGcMemo {
     next_due_at: Option<DateTime<Utc>>,
     last_now: DateTime<Utc>,
     last_cycle_complete: bool,
+    candidate_phase_due: bool,
     config: GcConfigFingerprint,
+}
+
+/// One validated recursive observation of every object below a namespace.
+///
+/// This is disposable routing state, never storage authority by itself. Root
+/// bodies still have to be read and paired with their LIST-observed identity
+/// before they can authorize a physical delete.
+#[derive(Debug, Clone)]
+struct NamespaceInventory {
+    objects: BTreeMap<String, ListedObject>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +251,7 @@ struct MemoizedHistoryPruneResult {
 struct GcCycleOutcome {
     report: GcCycleReport,
     completed: Option<CompletedGcState>,
+    candidate_phase_due: bool,
 }
 
 struct CompletedGcState {
@@ -253,6 +265,15 @@ impl GcCycleOutcome {
         Self {
             report,
             completed: None,
+            candidate_phase_due: false,
+        }
+    }
+
+    fn incomplete_with_candidate_phase(report: GcCycleReport) -> Self {
+        Self {
+            report,
+            completed: None,
+            candidate_phase_due: true,
         }
     }
 
@@ -260,18 +281,19 @@ impl GcCycleOutcome {
         Self {
             report,
             completed: Some(completed),
+            candidate_phase_due: false,
         }
     }
 }
 
 impl InventoryFingerprint {
-    fn from_listed(objects: Vec<ListedObject>) -> Option<Self> {
+    fn from_listed<'a>(objects: impl IntoIterator<Item = &'a ListedObject>) -> Option<Self> {
         let mut entries = BTreeMap::new();
         for object in objects {
-            let version = object.version?;
+            let version = object.version.clone()?;
             if entries
                 .insert(
-                    object.key,
+                    object.key.clone(),
                     InventoryObjectFingerprint {
                         size: object.size,
                         version,
@@ -283,15 +305,6 @@ impl InventoryFingerprint {
             }
         }
         Some(Self(entries))
-    }
-
-    fn remove(&mut self, key: &str) {
-        self.0.remove(key);
-    }
-
-    fn upsert(&mut self, key: String, size: u64, version: StorageVersion) {
-        self.0
-            .insert(key, InventoryObjectFingerprint { size, version });
     }
 
     fn matches_listed_prefix<'a>(
@@ -325,6 +338,191 @@ impl InventoryFingerprint {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<BTreeMap<_, _>>();
         actual == expected
+    }
+}
+
+fn malformed_control_key(
+    family: &'static str,
+    key: impl Into<String>,
+    reason: impl Into<String>,
+) -> ZeppelinError {
+    ZeppelinError::MalformedControlKey {
+        family,
+        key: key.into(),
+        reason: reason.into(),
+    }
+}
+
+fn listed_object_identity_matches(before: &ListedObject, after: &ListedObject) -> bool {
+    before.size == after.size
+        && before
+            .version
+            .as_ref()
+            .zip(after.version.as_ref())
+            .is_some_and(|(before, after)| before == after)
+}
+
+fn listed_object_horizon_satisfied(
+    object: &ListedObject,
+    now: DateTime<Utc>,
+    horizon_secs: u64,
+) -> bool {
+    if horizon_secs == 0 {
+        return true;
+    }
+    let Ok(horizon_secs) = i64::try_from(horizon_secs) else {
+        return false;
+    };
+    object
+        .last_modified
+        .checked_add_signed(chrono::Duration::seconds(horizon_secs))
+        .is_some_and(|deadline| now >= deadline)
+}
+
+impl NamespaceInventory {
+    fn from_listed(namespace: &str, listed: Vec<ListedObject>) -> Result<Self> {
+        let namespace_prefix = format!("{namespace}/");
+        let history_prefix = Manifest::history_prefix(namespace);
+        let snapshot_prefix = NamedSnapshot::prefix(namespace);
+        let staging_prefix = format!("{namespace}/_staging/");
+        let gc_prefix = format!("{namespace}/_gc/");
+        let candidate_key = gc_candidate_store_key(namespace);
+        let mut objects = BTreeMap::new();
+        let mut history_objects = Vec::new();
+        let mut snapshot_objects = Vec::new();
+
+        for object in listed {
+            if !object.key.starts_with(&namespace_prefix) {
+                return Err(malformed_control_key(
+                    "namespace-inventory",
+                    object.key,
+                    format!("key is outside namespace {namespace}"),
+                ));
+            }
+            if object.key.starts_with(&history_prefix) {
+                history_objects.push(object.clone());
+            } else if object.key.starts_with(&snapshot_prefix) {
+                snapshot_objects.push(object.clone());
+            } else if let Some(suffix) = object.key.strip_prefix(&staging_prefix) {
+                let Some(token) = suffix.strip_suffix(".json") else {
+                    return Err(malformed_control_key(
+                        "staging",
+                        object.key,
+                        "key must end with .json",
+                    ));
+                };
+                let token = token.parse::<u64>().map_err(|_| {
+                    malformed_control_key(
+                        "staging",
+                        object.key.clone(),
+                        "key must contain a decimal fencing token",
+                    )
+                })?;
+                if staging_key(namespace, token) != object.key {
+                    return Err(malformed_control_key(
+                        "staging",
+                        object.key,
+                        "key is not canonical",
+                    ));
+                }
+            } else if object.key.starts_with(&gc_prefix) && object.key != candidate_key {
+                return Err(malformed_control_key(
+                    "gc",
+                    object.key,
+                    "unrecognized reserved key",
+                ));
+            }
+
+            let duplicate_key = object.key.clone();
+            if objects.insert(object.key.clone(), object).is_some() {
+                return Err(malformed_control_key(
+                    "namespace-inventory",
+                    duplicate_key,
+                    "duplicate key",
+                ));
+            }
+        }
+
+        // Delegate reserved-key grammar to the modules that own it. These
+        // parsers validate the full batch before any retention DELETE begins.
+        Manifest::history_observations_from_listed(namespace, history_objects)?;
+        NamedSnapshot::validate_listed_objects(namespace, snapshot_objects)?;
+
+        Ok(Self { objects })
+    }
+
+    fn fingerprint(&self) -> Option<InventoryFingerprint> {
+        InventoryFingerprint::from_listed(self.objects.values())
+    }
+
+    fn all_objects(&self) -> Vec<ListedObject> {
+        self.objects.values().cloned().collect()
+    }
+
+    fn all_keys(&self) -> BTreeSet<String> {
+        self.objects.keys().cloned().collect()
+    }
+
+    fn object(&self, key: &str) -> Option<&ListedObject> {
+        self.objects.get(key)
+    }
+
+    fn history_observations(&self, namespace: &str) -> Result<Vec<ManifestHistoryObservation>> {
+        let prefix = Manifest::history_prefix(namespace);
+        Manifest::history_observations_from_listed(
+            namespace,
+            self.objects
+                .range(prefix.clone()..)
+                .take_while(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, object)| object.clone())
+                .collect(),
+        )
+    }
+
+    fn snapshot_objects(&self, namespace: &str) -> Result<Vec<ListedObject>> {
+        let prefix = NamedSnapshot::prefix(namespace);
+        NamedSnapshot::validate_listed_objects(
+            namespace,
+            self.objects
+                .range(prefix.clone()..)
+                .take_while(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, object)| object.clone())
+                .collect(),
+        )
+    }
+
+    fn staging_objects(&self, namespace: &str) -> Vec<ListedObject> {
+        let prefix = format!("{namespace}/_staging/");
+        self.objects
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, object)| object.clone())
+            .collect()
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.objects.remove(key);
+    }
+
+    fn upsert(&mut self, key: String, size: u64, version: Option<StorageVersion>) {
+        self.objects.insert(
+            key.clone(),
+            ListedObject {
+                key,
+                size,
+                last_modified: Utc::now(),
+                version,
+            },
+        );
+    }
+
+    fn matches_listed_prefix<'a>(
+        &self,
+        prefix: &str,
+        listed: impl IntoIterator<Item = &'a ListedObject>,
+    ) -> bool {
+        self.fingerprint()
+            .is_some_and(|fingerprint| fingerprint.matches_listed_prefix(prefix, listed))
     }
 }
 
@@ -808,6 +1006,7 @@ struct PendingDeleteDrainOutcome {
 struct PreparedPendingDeleteDrain {
     outcome: PendingDeleteDrainOutcome,
     refreshed_history: Vec<HistorySnapshot>,
+    predelete_inventory: Option<NamespaceInventory>,
 }
 
 impl PendingDeleteDrainOutcome {
@@ -841,6 +1040,10 @@ enum SkipReason {
     NotEnoughManifestGenerations,
     /// The object was absent from the namespace LIST captured for this cycle.
     NotListedThisCycle,
+    /// The key's object identity was missing or changed between inventories.
+    ObjectIdentityChanged,
+    /// The listed object's own modification time has not crossed the horizon.
+    ObjectModifiedTooRecently,
     /// The object-store DELETE failed and the candidate remains retryable.
     DeleteFailed,
 }
@@ -864,6 +1067,8 @@ impl SkipReason {
             Self::NewerThanInflightCompaction => "inflight_watermark",
             Self::NotEnoughManifestGenerations => "manifest_generation_guard",
             Self::NotListedThisCycle => "not_listed",
+            Self::ObjectIdentityChanged => "object_identity_changed",
+            Self::ObjectModifiedTooRecently => "object_modified_too_recently",
             Self::DeleteFailed => "delete_failed",
         }
     }
@@ -1352,6 +1557,165 @@ async fn drain_pending_deletes_with_retained_history_from(
     })
 }
 
+/// Drains only keys authorized by one full pre-delete namespace inventory.
+///
+/// A CAS conflict may retry publication of keys already confirmed absent, but
+/// it never expands the destructive set. Newly observed pending entries wait
+/// for a later cycle and a new full inventory.
+async fn drain_pending_deletes_with_inventory_authority_from(
+    store: &ZeppelinStore,
+    namespace: &str,
+    gc: &GcConfig,
+    retained_history: &BTreeSet<String>,
+    now: DateTime<Utc>,
+    initial_manifest: (Manifest, ManifestVersion),
+) -> Result<PendingDeleteDrainOutcome> {
+    let mut observed = Some(initial_manifest);
+    let mut confirmed_absent = BTreeSet::new();
+    let mut deleted_keys = BTreeSet::new();
+    let mut complete = true;
+
+    for attempt in 0..GC_MANIFEST_CAS_RETRIES {
+        let Some((mut manifest, version)) = observed.take() else {
+            return Ok(PendingDeleteDrainOutcome::new(
+                PendingDeleteDrainReport {
+                    objects_deleted: deleted_keys.len(),
+                    ..PendingDeleteDrainReport::default()
+                },
+                complete,
+                None,
+            ));
+        };
+        if manifest.pending_deletes.is_empty() {
+            return Ok(PendingDeleteDrainOutcome::new(
+                PendingDeleteDrainReport {
+                    objects_deleted: deleted_keys.len(),
+                    ..PendingDeleteDrainReport::default()
+                },
+                complete,
+                Some(Vec::new()),
+            ));
+        }
+
+        if attempt == 0 {
+            let mut live = manifest.clone();
+            live.pending_deletes.clear();
+            let live_reachable = reachable_keys(namespace, &live);
+            for key in &manifest.pending_deletes {
+                if retained_history.contains(key)
+                    || !pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs)
+                {
+                    continue;
+                }
+                if live_reachable.contains(key) {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "pending-delete key {key} is also reachable from the live manifest"
+                    )));
+                }
+                match store.delete(key).await {
+                    Ok(()) => {
+                        deleted_keys.insert(key.clone());
+                        confirmed_absent.insert(key.clone());
+                        crate::metrics::GC_OBJECTS_DELETED_TOTAL
+                            .with_label_values(&[namespace])
+                            .inc();
+                        info!(namespace, key = %key, "gc deleted pending-delete object");
+                    }
+                    Err(ZeppelinError::NotFound { .. }) => {
+                        confirmed_absent.insert(key.clone());
+                        debug_pending_delete_absent(namespace, key);
+                    }
+                    Err(e) => {
+                        complete = false;
+                        warn!(
+                            namespace,
+                            key = %key,
+                            error = %e,
+                            "gc pending-delete failed; retaining manifest entry"
+                        );
+                    }
+                }
+            }
+        }
+
+        let removable = manifest
+            .pending_deletes
+            .iter()
+            .filter(|key| confirmed_absent.contains(*key))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if removable.is_empty() {
+            let retained = manifest
+                .pending_deletes
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len();
+            return Ok(PendingDeleteDrainOutcome::new(
+                PendingDeleteDrainReport {
+                    objects_deleted: deleted_keys.len(),
+                    entries_pruned: 0,
+                    entries_retained: retained,
+                },
+                complete,
+                Some(manifest.pending_deletes),
+            ));
+        }
+
+        let mut live = manifest.clone();
+        live.pending_deletes.clear();
+        let live_reachable = reachable_keys(namespace, &live);
+        if let Some(key) = removable.iter().find(|key| live_reachable.contains(*key)) {
+            return Err(ZeppelinError::Serialization(format!(
+                "pending-delete key {key} became live after it was confirmed absent"
+            )));
+        }
+        manifest
+            .pending_deletes
+            .retain(|key| !removable.contains(key));
+        manifest.updated_at = now;
+
+        match manifest.write_conditional(store, namespace, &version).await {
+            Ok(()) => {
+                return Ok(PendingDeleteDrainOutcome::new(
+                    PendingDeleteDrainReport {
+                        objects_deleted: deleted_keys.len(),
+                        entries_pruned: removable.len(),
+                        entries_retained: manifest
+                            .pending_deletes
+                            .iter()
+                            .collect::<BTreeSet<_>>()
+                            .len(),
+                    },
+                    complete,
+                    Some(manifest.pending_deletes),
+                ));
+            }
+            Err(ZeppelinError::ManifestConflict { .. }) => {
+                warn!(
+                    namespace,
+                    attempt,
+                    "gc pending-delete manifest CAS conflict; retrying confirmed pruning only"
+                );
+                observed = Manifest::read_versioned(store, namespace).await?;
+                if observed
+                    .as_ref()
+                    .is_some_and(|(_, version)| version.0.is_none())
+                {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "manifest {} has no ETag after pending-delete CAS conflict",
+                        Manifest::s3_key(namespace)
+                    )));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(ZeppelinError::ManifestConflict {
+        namespace: namespace.to_string(),
+    })
+}
+
 async fn prepare_warm_pending_delete_drain(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1360,7 +1724,7 @@ async fn prepare_warm_pending_delete_drain(
     prior_history: &BTreeMap<String, CachedHistory>,
     now: DateTime<Utc>,
 ) -> Result<PreparedPendingDeleteDrain> {
-    let Some((manifest, version)) = Manifest::read_versioned(store, namespace).await? else {
+    let Some((manifest, _)) = Manifest::read_versioned(store, namespace).await? else {
         return Ok(PreparedPendingDeleteDrain {
             outcome: PendingDeleteDrainOutcome::new(
                 PendingDeleteDrainReport::default(),
@@ -1368,6 +1732,7 @@ async fn prepare_warm_pending_delete_drain(
                 None,
             ),
             refreshed_history: Vec::new(),
+            predelete_inventory: None,
         });
     };
 
@@ -1392,26 +1757,48 @@ async fn prepare_warm_pending_delete_drain(
                 Some(manifest.pending_deletes),
             ),
             refreshed_history: Vec::new(),
+            predelete_inventory: None,
         });
     }
 
-    let history = load_history_snapshot(store, namespace, Some(prior_history)).await?;
+    let prefix = format!("{namespace}/");
+    let predelete_inventory =
+        NamespaceInventory::from_listed(namespace, store.list_prefix_meta(&prefix).await?)?;
+    let observations = predelete_inventory.history_observations(namespace)?;
+    if observations
+        .iter()
+        .any(|observation| !matches!(observation.storage_version, Some(StorageVersion::Etag(_))))
+    {
+        return Err(ZeppelinError::Serialization(format!(
+            "namespace {namespace} history lacks ETags for pending-delete validation"
+        )));
+    }
+    let history = load_history_snapshot_from_observations(
+        store,
+        namespace,
+        observations,
+        Some(prior_history),
+    )
+    .await?;
     let retained_history = history_snapshot_reachable_keys(namespace, &history);
-    let (outcome, mut retry_history) = drain_pending_deletes_with_retained_history_from(
+    let observed = read_versioned_manifest_from_inventory(store, namespace, &predelete_inventory)
+        .await?
+        .ok_or_else(|| ZeppelinError::NotFound {
+            key: Manifest::s3_key(namespace),
+        })?;
+    let outcome = drain_pending_deletes_with_inventory_authority_from(
         store,
         namespace,
         gc,
         &retained_history,
         now,
-        Some((manifest, version)),
-        Some(prior_history),
+        observed,
     )
     .await?;
-    let mut refreshed_history = vec![history];
-    refreshed_history.append(&mut retry_history);
     Ok(PreparedPendingDeleteDrain {
         outcome,
-        refreshed_history,
+        refreshed_history: vec![history],
+        predelete_inventory: Some(predelete_inventory),
     })
 }
 
@@ -1749,6 +2136,7 @@ impl GcRunner {
             .namespaces
             .remove(incarnation.name())
             .filter(|memo| memo.incarnation == incarnation);
+        let mut initial_inventory = None;
 
         if let Some(memo) = previous.as_mut() {
             let prefix = format!("{}/", incarnation.name());
@@ -1767,13 +2155,29 @@ impl GcRunner {
                     return Ok(GcCycleReport::default());
                 }
             };
-            let inventory = InventoryFingerprint::from_listed(listed);
+            let inventory = match NamespaceInventory::from_listed(incarnation.name(), listed) {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    warn!(
+                        namespace = incarnation.name(),
+                        error = %error,
+                        "gc namespace inventory validation failed; aborting cycle"
+                    );
+                    memo.last_now = now;
+                    memo.last_cycle_complete = false;
+                    self.namespaces
+                        .insert(memo.incarnation.name.clone(), memo.clone());
+                    return Err(error);
+                }
+            };
+            let fingerprint = inventory.fingerprint();
             let config = GcConfigFingerprint::from(&self.gc);
             let before_deadline = memo.next_due_at.is_none_or(|deadline| now < deadline);
-            let inventory_matches = inventory
+            let inventory_matches = fingerprint
                 .as_ref()
                 .is_some_and(|inventory| memo.inventory.as_ref() == Some(inventory));
             if memo.last_cycle_complete
+                && !memo.candidate_phase_due
                 && memo.config == config
                 && now >= memo.last_now
                 && before_deadline
@@ -1789,6 +2193,7 @@ impl GcRunner {
                     .insert(memo.incarnation.name.clone(), memo.clone());
                 return Ok(GcCycleReport::default());
             }
+            initial_inventory = Some(inventory);
         }
 
         let outcome = run_gc_cycle_at_inner(
@@ -1797,6 +2202,7 @@ impl GcRunner {
             &self.gc,
             now,
             previous.as_ref(),
+            initial_inventory,
         )
         .await;
 
@@ -1812,12 +2218,14 @@ impl GcRunner {
                             next_due_at: completed.next_due_at,
                             last_now: now,
                             last_cycle_complete: true,
+                            candidate_phase_due: false,
                             config: GcConfigFingerprint::from(&self.gc),
                         },
                     );
                 } else if let Some(mut previous) = previous {
                     previous.last_now = now;
                     previous.last_cycle_complete = false;
+                    previous.candidate_phase_due |= outcome.candidate_phase_due;
                     self.namespaces
                         .insert(previous.incarnation.name.clone(), previous);
                 }
@@ -1953,6 +2361,15 @@ async fn load_history_snapshot(
     prior: Option<&BTreeMap<String, CachedHistory>>,
 ) -> Result<HistorySnapshot> {
     let observations = Manifest::list_history_observations(store, namespace).await?;
+    load_history_snapshot_from_observations(store, namespace, observations, prior).await
+}
+
+async fn load_history_snapshot_from_observations(
+    store: &ZeppelinStore,
+    namespace: &str,
+    observations: Vec<ManifestHistoryObservation>,
+    prior: Option<&BTreeMap<String, CachedHistory>>,
+) -> Result<HistorySnapshot> {
     let mut entries = Vec::with_capacity(observations.len());
     let mut cacheable = BTreeMap::new();
     if prior.is_some() {
@@ -2048,6 +2465,58 @@ async fn prune_history_with_memo_parallel_at(
     );
     let observations = history_result?;
     let snapshot_objects = snapshot_result?;
+    prune_history_with_memo_parallel_from_observations(
+        store,
+        namespace,
+        retention,
+        now,
+        prior,
+        observations,
+        snapshot_objects,
+        None,
+    )
+    .await
+}
+
+async fn prune_history_with_inventory_at(
+    store: &ZeppelinStore,
+    namespace: &str,
+    retention: ManifestHistoryRetention,
+    now: DateTime<Utc>,
+    prior: Option<&BTreeMap<String, CachedHistory>>,
+    inventory: &mut NamespaceInventory,
+) -> Result<MemoizedHistoryPruneResult> {
+    if retention.keep_count == 0 {
+        return Err(ZeppelinError::Config(
+            "gc.manifest_history_keep_count must be greater than zero".to_string(),
+        ));
+    }
+    let observations = inventory.history_observations(namespace)?;
+    let snapshot_objects = inventory.snapshot_objects(namespace)?;
+    prune_history_with_memo_parallel_from_observations(
+        store,
+        namespace,
+        retention,
+        now,
+        prior,
+        observations,
+        snapshot_objects,
+        Some(inventory),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prune_history_with_memo_parallel_from_observations(
+    store: &ZeppelinStore,
+    namespace: &str,
+    retention: ManifestHistoryRetention,
+    now: DateTime<Utc>,
+    prior: Option<&BTreeMap<String, CachedHistory>>,
+    observations: Vec<ManifestHistoryObservation>,
+    snapshot_objects: Vec<ListedObject>,
+    mut inventory: Option<&mut NamespaceInventory>,
+) -> Result<MemoizedHistoryPruneResult> {
     let keep_from = observations.len().saturating_sub(retention.keep_count);
 
     let (history_results, snapshot_results) = tokio::join!(
@@ -2086,6 +2555,9 @@ async fn prune_history_with_memo_parallel_at(
 
     for key in &prunable {
         store.delete(key).await?;
+        if let Some(inventory) = inventory.as_deref_mut() {
+            inventory.remove(key);
+        }
     }
 
     Ok(MemoizedHistoryPruneResult {
@@ -2132,13 +2604,37 @@ fn next_gc_deadline(
     staging: &ActiveStagingObservation,
 ) -> std::result::Result<Option<DateTime<Utc>>, ()> {
     let mut next = None;
-    let mut consider = |deadline: DateTime<Utc>| {
-        if deadline > now && next.is_none_or(|current| deadline < current) {
+    let mut consider_deadline = |deadline: DateTime<Utc>, include_overdue: bool| {
+        let deadline = if include_overdue && deadline <= now {
+            now
+        } else {
+            deadline
+        };
+        if deadline >= now && next.is_none_or(|current| deadline < current) {
             next = Some(deadline);
         }
     };
 
+    let retained_history = history_snapshot_reachable_keys(namespace, history);
+    let candidate_reachable = reachable_keys_with_retained_history_and_staging_keys(
+        namespace,
+        manifest,
+        &staging.keys,
+        &retained_history,
+    );
+    let mut live_without_pending = manifest.clone();
+    live_without_pending.pending_deletes.clear();
+    let pending_reachable = reachable_keys_with_retained_history_and_staging_keys(
+        namespace,
+        &live_without_pending,
+        &staging.keys,
+        &retained_history,
+    );
+
     for candidate in candidates {
+        if candidate_reachable.contains(&candidate.key) {
+            continue;
+        }
         let first_seen = deadline_after_secs(candidate.first_seen_unreachable_at, gc.horizon_secs)?;
         let artifact = parse_gc_artifact_key(namespace, &candidate.key).ok_or(())?;
         let artifact_created = DateTime::<Utc>::from_timestamp_millis(
@@ -2146,10 +2642,14 @@ fn next_gc_deadline(
         )
         .ok_or(())?;
         let artifact_due = deadline_after_secs(artifact_created, gc.horizon_secs)?;
-        consider(first_seen.max(artifact_due));
+        let deadline = first_seen.max(artifact_due);
+        consider_deadline(deadline, true);
     }
 
     for key in &manifest.pending_deletes {
+        if pending_reachable.contains(key) {
+            continue;
+        }
         let Some(artifact) = parse_gc_artifact_key(namespace, key) else {
             continue;
         };
@@ -2157,7 +2657,8 @@ fn next_gc_deadline(
             i64::try_from(artifact.ulid().timestamp_ms()).map_err(|_| ())?,
         )
         .ok_or(())?;
-        consider(deadline_after_secs(artifact_created, gc.horizon_secs)?);
+        let deadline = deadline_after_secs(artifact_created, gc.horizon_secs)?;
+        consider_deadline(deadline, true);
     }
 
     if gc.pitr_retention_secs > 0 {
@@ -2167,12 +2668,12 @@ fn next_gc_deadline(
             .and_then(|seconds| seconds.checked_add(1))
             .ok_or(())?;
         for (_, manifest) in &history.entries {
-            consider(deadline_after_secs(manifest.updated_at, retention)?);
+            consider_deadline(deadline_after_secs(manifest.updated_at, retention)?, false);
         }
     }
 
     if let Some(expires_at) = staging.lease_expires_at {
-        consider(expires_at);
+        consider_deadline(expires_at, false);
     }
 
     Ok(next)
@@ -2192,6 +2693,188 @@ struct MarkReadInputs {
     persisted_candidates: Vec<GcCandidate>,
     manifest: Manifest,
     staging: ActiveStagingObservation,
+}
+
+async fn read_inventory_object(
+    store: &ZeppelinStore,
+    key: &str,
+    listed: Option<&ListedObject>,
+    require_etag: bool,
+) -> Result<Option<Bytes>> {
+    match store.get_with_meta(key).await {
+        Ok((bytes, get_etag)) => {
+            let object = listed.ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "object {key} appeared after the namespace inventory LIST"
+                ))
+            })?;
+            match object.version.as_ref() {
+                Some(StorageVersion::Etag(list_etag)) => {
+                    if get_etag.as_deref() != Some(list_etag.as_str()) {
+                        return Err(ZeppelinError::Serialization(format!(
+                            "object {key} changed between LIST ETag {list_etag:?} and GET ETag {get_etag:?}"
+                        )));
+                    }
+                }
+                Some(StorageVersion::BackendVersion(_)) | None if require_etag => {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "object {key} has no LIST ETag for pre-delete validation"
+                    )));
+                }
+                Some(StorageVersion::BackendVersion(_)) | None => {}
+            }
+            Ok(Some(bytes))
+        }
+        Err(ZeppelinError::NotFound { .. }) if listed.is_none() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn load_candidates_from_inventory(
+    store: &ZeppelinStore,
+    namespace: &str,
+    inventory: &NamespaceInventory,
+    require_etag: bool,
+) -> Result<Vec<GcCandidate>> {
+    let key = gc_candidate_store_key(namespace);
+    match read_inventory_object(store, &key, inventory.object(&key), require_etag).await? {
+        Some(bytes) => decode_gc_candidates(&bytes),
+        None => Ok(Vec::new()),
+    }
+}
+
+async fn read_manifest_from_inventory(
+    store: &ZeppelinStore,
+    namespace: &str,
+    inventory: &NamespaceInventory,
+    require_etag: bool,
+) -> Result<Option<Manifest>> {
+    let key = Manifest::s3_key(namespace);
+    read_inventory_object(store, &key, inventory.object(&key), require_etag)
+        .await?
+        .map(|bytes| Manifest::from_bytes_for_namespace(&bytes, namespace))
+        .transpose()
+}
+
+async fn read_versioned_manifest_from_inventory(
+    store: &ZeppelinStore,
+    namespace: &str,
+    inventory: &NamespaceInventory,
+) -> Result<Option<(Manifest, ManifestVersion)>> {
+    let key = Manifest::s3_key(namespace);
+    let listed = inventory.object(&key);
+    match store.get_with_meta(&key).await {
+        Ok((bytes, get_etag)) => {
+            let object = listed.ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "manifest {key} appeared after the namespace inventory LIST"
+                ))
+            })?;
+            let Some(StorageVersion::Etag(list_etag)) = object.version.as_ref() else {
+                return Err(ZeppelinError::Serialization(format!(
+                    "manifest {key} has no LIST ETag for pending-delete validation"
+                )));
+            };
+            if get_etag.as_deref() != Some(list_etag.as_str()) {
+                return Err(ZeppelinError::Serialization(format!(
+                    "manifest {key} changed between LIST ETag {list_etag:?} and GET ETag {get_etag:?}"
+                )));
+            }
+            Ok(Some((
+                Manifest::from_bytes_for_namespace(&bytes, namespace)?,
+                ManifestVersion(get_etag),
+            )))
+        }
+        Err(ZeppelinError::NotFound { .. }) if listed.is_none() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn active_staging_from_inventory(
+    store: &ZeppelinStore,
+    namespace: &str,
+    now: DateTime<Utc>,
+    inventory: &NamespaceInventory,
+    require_etag: bool,
+) -> Result<ActiveStagingObservation> {
+    let lease_key = format!("{namespace}/lease.json");
+    let Some(lease_data) = read_inventory_object(
+        store,
+        &lease_key,
+        inventory.object(&lease_key),
+        require_etag,
+    )
+    .await?
+    else {
+        return Ok(ActiveStagingObservation {
+            keys: BTreeSet::new(),
+            lease_expires_at: None,
+        });
+    };
+    let lease: Lease = serde_json::from_slice(&lease_data)?;
+    if lease.expires_at <= now {
+        return Ok(ActiveStagingObservation {
+            keys: BTreeSet::new(),
+            lease_expires_at: None,
+        });
+    }
+
+    let objects = inventory.staging_objects(namespace);
+    let active_key = staging_key(namespace, lease.fencing_token);
+    let active_was_listed = inventory.object(&active_key).is_some();
+    let futures = objects
+        .into_iter()
+        .map(|object| {
+            let store = store.clone();
+            async move {
+                let key = object.key.clone();
+                let data = read_inventory_object(&store, &key, Some(&object), require_etag)
+                    .await?
+                    .ok_or_else(|| ZeppelinError::NotFound { key: key.clone() })?;
+                let entry = serde_json::from_slice::<CompactionStaging>(&data)?;
+                Ok((key, entry))
+            }
+            .boxed()
+        })
+        .collect();
+    let mut staged = BTreeSet::new();
+    for result in collect_bounded_ordered(futures).await {
+        let (key, entry) = result?;
+        if staging_key(namespace, entry.fencing_token) != key {
+            return Err(ZeppelinError::Serialization(format!(
+                "staging key {key} contains mismatched token {}",
+                entry.fencing_token
+            )));
+        }
+        if entry.fencing_token == lease.fencing_token {
+            staged.extend(entry.keys);
+        }
+    }
+    if !active_was_listed {
+        // The active token has exactly one canonical staging key. Probe it
+        // after reading the lease so a compactor that publishes its staging
+        // root between the full inventory LIST and this lease observation is
+        // not omitted merely because the earlier LIST did not contain it.
+        match store.get(&active_key).await {
+            Ok(data) => {
+                let entry: CompactionStaging = serde_json::from_slice(&data)?;
+                if entry.fencing_token != lease.fencing_token {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "staging key {active_key} contains token {}, expected {}",
+                        entry.fencing_token, lease.fencing_token
+                    )));
+                }
+                staged.extend(entry.keys);
+            }
+            Err(ZeppelinError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let lease_expires_at = (!staged.is_empty()).then_some(lease.expires_at);
+    Ok(ActiveStagingObservation {
+        keys: staged,
+        lease_expires_at,
+    })
 }
 
 enum MarkReadFailure {
@@ -2242,6 +2925,10 @@ async fn load_mark_read_inputs(
             .list_prefix_meta(&prefix)
             .await
             .map_err(MarkReadFailure::NamespaceList)?;
+        // Validate reserved control-key grammar before any later body read can
+        // mask corruption already present in this authoritative inventory.
+        NamespaceInventory::from_listed(namespace, listed.clone())
+            .map_err(MarkReadFailure::NamespaceList)?;
         let candidates = load_gc_candidates(store, namespace)
             .await
             .map_err(MarkReadFailure::CandidateLedger)?;
@@ -2260,6 +2947,45 @@ async fn load_mark_read_inputs(
             staging,
         })
     }
+}
+
+async fn load_mark_read_inputs_from_inventory(
+    store: &ZeppelinStore,
+    namespace: &str,
+    now: DateTime<Utc>,
+    inventory: &NamespaceInventory,
+) -> std::result::Result<MarkReadInputs, MarkReadFailure> {
+    let (candidates, manifest, staging) = tokio::join!(
+        load_candidates_from_inventory(store, namespace, inventory, false),
+        read_manifest_from_inventory(store, namespace, inventory, false),
+        active_staging_from_inventory(store, namespace, now, inventory, false),
+    );
+    assemble_mark_read_inputs(Ok(inventory.all_objects()), candidates, manifest, staging)
+}
+
+async fn load_sequential_mark_reads_from_inventory(
+    store: &ZeppelinStore,
+    namespace: &str,
+    now: DateTime<Utc>,
+    inventory: &NamespaceInventory,
+) -> std::result::Result<MarkReadInputs, MarkReadFailure> {
+    let candidates = load_gc_candidates(store, namespace)
+        .await
+        .map_err(MarkReadFailure::CandidateLedger)?;
+    let manifest = read_manifest_for_gc(store, namespace)
+        .await
+        .map_err(MarkReadFailure::Manifest)?
+        .ok_or(MarkReadFailure::ManifestMissing)?;
+    let staging =
+        active_staging_observation_at_with_mode(store, namespace, now, GcReadMode::Sequential)
+            .await
+            .map_err(MarkReadFailure::Staging)?;
+    Ok(MarkReadInputs {
+        listed_objects: inventory.all_objects(),
+        persisted_candidates: candidates,
+        manifest,
+        staging,
+    })
 }
 
 struct SweepReadInputs {
@@ -2309,6 +3035,20 @@ async fn load_sweep_read_inputs(
     }
 }
 
+async fn load_sweep_read_inputs_from_inventory(
+    store: &ZeppelinStore,
+    namespace: &str,
+    now: DateTime<Utc>,
+    inventory: &NamespaceInventory,
+    require_etag: bool,
+) -> std::result::Result<SweepReadInputs, SweepReadFailure> {
+    let (manifest, staging) = tokio::join!(
+        read_manifest_from_inventory(store, namespace, inventory, require_etag),
+        active_staging_from_inventory(store, namespace, now, inventory, require_etag),
+    );
+    assemble_sweep_read_inputs(manifest, staging)
+}
+
 /// Runs one stateless GC cycle using the current wall clock.
 pub async fn run_gc_cycle(
     store: &ZeppelinStore,
@@ -2325,7 +3065,7 @@ pub async fn run_gc_cycle_at(
     gc: &GcConfig,
     now: DateTime<Utc>,
 ) -> Result<GcCycleReport> {
-    Ok(run_gc_cycle_at_inner(store, namespace, gc, now, None)
+    Ok(run_gc_cycle_at_inner(store, namespace, gc, now, None, None)
         .await?
         .report)
 }
@@ -2336,22 +3076,35 @@ async fn run_gc_cycle_at_inner(
     gc: &GcConfig,
     now: DateTime<Utc>,
     prior_history: Option<&NamespaceGcMemo>,
+    initial_inventory: Option<NamespaceInventory>,
 ) -> Result<GcCycleOutcome> {
+    let mut initial_inventory = initial_inventory;
+    let cycle_opening_inventory_objects = initial_inventory
+        .as_ref()
+        .map(|inventory| inventory.objects.clone());
     let prior_entries = prior_history.map(|memo| &memo.history);
-    let history_prune = match prune_history_with_memo_at(
-        store,
-        namespace,
-        ManifestHistoryRetention {
-            keep_count: gc.manifest_history_keep_count,
-            pitr_retention_secs: gc.pitr_retention_secs,
-            skew_slop_secs: gc.skew_slop_secs,
-        },
-        now,
-        prior_entries,
-    )
-    .await
-    {
+    let retention = ManifestHistoryRetention {
+        keep_count: gc.manifest_history_keep_count,
+        pitr_retention_secs: gc.pitr_retention_secs,
+        skew_slop_secs: gc.skew_slop_secs,
+    };
+    let history_prune = match initial_inventory.as_mut() {
+        Some(inventory) => {
+            prune_history_with_inventory_at(
+                store,
+                namespace,
+                retention,
+                now,
+                prior_entries,
+                inventory,
+            )
+            .await
+        }
+        None => prune_history_with_memo_at(store, namespace, retention, now, prior_entries).await,
+    };
+    let history_prune = match history_prune {
         Ok(result) => result,
+        Err(error @ ZeppelinError::MalformedControlKey { .. }) => return Err(error),
         Err(e) => {
             warn!(
                 namespace,
@@ -2369,100 +3122,168 @@ async fn run_gc_cycle_at_inner(
     let manifest_history_pruned = history_prune.pruned;
     let prune_reachable =
         reachable_keys_from_manifests(namespace, &history_prune.retained_manifests);
-    let (retained_history, pending_outcome, pending_history_snapshots) = if let Some(
-        prior_entries,
-    ) = prior_entries
-    {
-        let prepared = match prepare_warm_pending_delete_drain(
-            store,
-            namespace,
-            gc,
-            &prune_reachable,
-            prior_entries,
-            now,
-        )
-        .await
-        {
-            Ok(prepared) => prepared,
-            Err(e) => {
+    if prior_entries.is_none() && initial_inventory.is_none() {
+        let prefix = format!("{namespace}/");
+        let listed = match store.list_prefix_meta(&prefix).await {
+            Ok(listed) => listed,
+            Err(error) => {
                 warn!(
                     namespace,
-                    error = %e,
-                    "gc pending-delete preparation failed; aborting cycle"
+                    error = %error,
+                    "gc cold namespace inventory failed before pending-delete drain"
                 );
                 return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
             }
         };
-        (
-            prune_reachable,
-            prepared.outcome,
-            prepared.refreshed_history,
-        )
-    } else {
-        let retained_history_snapshot = match load_history_snapshot(store, namespace, None).await {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                warn!(
-                    namespace,
-                    error = %e,
-                    "gc retained history re-read failed before pending-delete drain; aborting cycle"
-                );
-                return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
-            }
-        };
-        let retained_history =
-            history_snapshot_reachable_keys(namespace, &retained_history_snapshot);
-        let (pending_outcome, mut retry_history_snapshots) =
-            match drain_pending_deletes_with_retained_history_from(
+        initial_inventory = Some(NamespaceInventory::from_listed(namespace, listed)?);
+    }
+    let force_candidate_phase = prior_history.is_some_and(|memo| memo.candidate_phase_due);
+    let (retained_history, pending_outcome, pending_history_snapshots, pending_predelete_inventory) =
+        if force_candidate_phase {
+            debug!(
+                namespace,
+                "gc candidate phase is due; deferring pending-delete drain for one cycle"
+            );
+            (
+                prune_reachable,
+                PendingDeleteDrainOutcome::new(PendingDeleteDrainReport::default(), true, None),
+                Vec::new(),
+                None,
+            )
+        } else if let Some(prior_entries) = prior_entries {
+            let prepared = match prepare_warm_pending_delete_drain(
                 store,
                 namespace,
                 gc,
-                &retained_history,
+                &prune_reachable,
+                prior_entries,
                 now,
-                None,
-                None,
             )
             .await
             {
-                Ok(outcome) => outcome,
+                Ok(prepared) => prepared,
+                Err(error @ ZeppelinError::MalformedControlKey { .. }) => return Err(error),
                 Err(e) => {
                     warn!(
                         namespace,
                         error = %e,
-                        "gc pending-delete drain failed; aborting cycle"
+                        "gc pending-delete preparation failed; aborting cycle"
                     );
                     return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
                 }
             };
-        let mut pending_history_snapshots = vec![retained_history_snapshot];
-        pending_history_snapshots.append(&mut retry_history_snapshots);
-        (retained_history, pending_outcome, pending_history_snapshots)
-    };
+            (
+                prune_reachable,
+                prepared.outcome,
+                prepared.refreshed_history,
+                prepared.predelete_inventory,
+            )
+        } else {
+            let retained_history_snapshot = match load_history_snapshot(store, namespace, None)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error @ ZeppelinError::MalformedControlKey { .. }) => return Err(error),
+                Err(e) => {
+                    warn!(
+                        namespace,
+                        error = %e,
+                        "gc retained history re-read failed before pending-delete drain; aborting cycle"
+                    );
+                    return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
+                }
+            };
+            let retained_history =
+                history_snapshot_reachable_keys(namespace, &retained_history_snapshot);
+            let (pending_outcome, mut retry_history_snapshots) =
+                match drain_pending_deletes_with_retained_history_from(
+                    store,
+                    namespace,
+                    gc,
+                    &retained_history,
+                    now,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error @ ZeppelinError::MalformedControlKey { .. }) => return Err(error),
+                    Err(e) => {
+                        warn!(
+                            namespace,
+                            error = %e,
+                            "gc pending-delete drain failed; aborting cycle"
+                        );
+                        return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
+                    }
+                };
+            let mut pending_history_snapshots = vec![retained_history_snapshot];
+            pending_history_snapshots.append(&mut retry_history_snapshots);
+            (
+                retained_history,
+                pending_outcome,
+                pending_history_snapshots,
+                None,
+            )
+        };
     let PendingDeleteDrainOutcome {
-        report: pending_report,
+        report: mut pending_report,
         complete: pending_complete,
         observed_pending_deletes,
     } = pending_outcome;
-    let base_report = GcCycleReport {
+    let mut base_report = GcCycleReport {
         objects_deleted: pending_report.objects_deleted,
         pending_deletes_deleted: pending_report.objects_deleted,
         pending_deletes_pruned: pending_report.entries_pruned,
         pending_deletes_retained: pending_report.entries_retained,
         ..GcCycleReport::default()
     };
+    if prior_entries.is_none()
+        && (pending_report.objects_deleted > 0 || pending_report.entries_pruned > 0)
+    {
+        // The early cold inventory was validated before pending work. Once
+        // that protocol mutates objects or the live manifest, mark must relist
+        // instead of treating the now-stale inventory as current authority.
+        initial_inventory = None;
+    }
+    let mut inventory_is_predelete = false;
+    if let Some(predelete_inventory) = pending_predelete_inventory {
+        if pending_report.objects_deleted > 0 || pending_report.entries_pruned > 0 {
+            debug!(
+                namespace,
+                "gc pending-delete authority mutated storage; deferring candidate mark/sweep to the next cycle"
+            );
+            return Ok(GcCycleOutcome::incomplete_with_candidate_phase(base_report));
+        }
+        initial_inventory = Some(predelete_inventory);
+        inventory_is_predelete = true;
+    }
 
     let read_mode = if prior_entries.is_some() {
         GcReadMode::WarmBounded
     } else {
         GcReadMode::Sequential
     };
+    let mark_inputs = match initial_inventory.as_ref() {
+        Some(inventory) if read_mode.is_bounded() => {
+            load_mark_read_inputs_from_inventory(store, namespace, now, inventory).await
+        }
+        Some(inventory) => {
+            load_sequential_mark_reads_from_inventory(store, namespace, now, inventory).await
+        }
+        None => load_mark_read_inputs(store, namespace, now, read_mode).await,
+    };
     let MarkReadInputs {
         listed_objects,
         persisted_candidates: persisted,
         manifest: mark_manifest,
         staging: mark_staging,
-    } = match load_mark_read_inputs(store, namespace, now, read_mode).await {
+    } = match mark_inputs {
         Ok(inputs) => inputs,
+        Err(MarkReadFailure::NamespaceList(error @ ZeppelinError::MalformedControlKey { .. })) => {
+            return Err(error)
+        }
         Err(MarkReadFailure::NamespaceList(e)) => {
             warn!(namespace, error = %e, "gc listing failed; aborting cycle");
             return Ok(GcCycleOutcome::incomplete(base_report));
@@ -2484,11 +3305,26 @@ async fn run_gc_cycle_at_inner(
             return Ok(GcCycleOutcome::incomplete(base_report));
         }
     };
+    if force_candidate_phase {
+        let retained = mark_manifest
+            .pending_deletes
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len();
+        pending_report.entries_retained = retained;
+        base_report.pending_deletes_retained = retained;
+    }
     let listed_keys = listed_objects
         .iter()
         .map(|object| object.key.clone())
         .collect::<BTreeSet<_>>();
-    let mut completed_inventory = InventoryFingerprint::from_listed(listed_objects);
+    let mut completed_inventory = match initial_inventory.take() {
+        Some(inventory) => Some(inventory),
+        None => match NamespaceInventory::from_listed(namespace, listed_objects) {
+            Ok(inventory) => Some(inventory),
+            Err(error) => return Err(error),
+        },
+    };
     let mark_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         &mark_manifest,
@@ -2520,21 +3356,102 @@ async fn run_gc_cycle_at_inner(
             .count(),
     );
 
-    if let Err(e) = save_gc_candidates(store, namespace, &marked_candidates).await {
-        warn!(namespace, error = %e, "gc candidate mark persist failed; skipping sweep");
-        let mut report = base_report;
-        report.candidates_marked = 0;
-        report.candidates_skipped = marked_candidates.len();
-        return Ok(GcCycleOutcome::incomplete(report));
+    match save_gc_candidates_with_version(store, namespace, &marked_candidates).await {
+        Ok((size, version)) => {
+            if let Some(inventory) = completed_inventory.as_mut() {
+                inventory.upsert(gc_candidate_store_key(namespace), size, version);
+            }
+        }
+        Err(e) => {
+            warn!(namespace, error = %e, "gc candidate mark persist failed; skipping sweep");
+            let mut report = base_report;
+            report.candidates_marked = 0;
+            report.candidates_skipped = marked_candidates.len();
+            return Ok(GcCycleOutcome::incomplete(report));
+        }
     }
     crate::metrics::GC_CANDIDATES_MARKED_TOTAL
         .with_label_values(&[namespace])
         .inc_by(candidates_marked as u64);
 
+    let mark_oldest_inflight_ms = oldest_inflight_ulid_ms(namespace, &mark_staging.keys);
+    let candidate_may_delete = marked_candidates.iter().any(|candidate| {
+        listed_keys.contains(&candidate.key)
+            && matches!(
+                should_delete_candidate(
+                    namespace,
+                    candidate,
+                    &mark_reachable,
+                    DeletePredicateContext {
+                        horizon_secs: gc.horizon_secs,
+                        now,
+                        oldest_inflight_ulid_ms: mark_oldest_inflight_ms,
+                        current_manifest_version: mark_manifest.version(),
+                        min_newer_manifest_versions: None,
+                    },
+                ),
+                DeleteDecision::Delete
+            )
+    });
+    let mark_inventory_objects = cycle_opening_inventory_objects.or_else(|| {
+        completed_inventory
+            .as_ref()
+            .map(|inventory| inventory.objects.clone())
+    });
+    let mut used_fresh_inventory = false;
+    let mut unaccounted_artifact_drift = false;
+    if candidate_may_delete && !inventory_is_predelete {
+        let prefix = format!("{namespace}/");
+        let listed = match store.list_prefix_meta(&prefix).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                warn!(namespace, error = %e, "gc fresh pre-delete inventory failed");
+                let mut report = base_report;
+                report.candidates_marked = candidates_marked;
+                report.candidates_skipped = unknown_shape_skips + marked_candidates.len();
+                return Ok(GcCycleOutcome::incomplete(report));
+            }
+        };
+        let fresh = match NamespaceInventory::from_listed(namespace, listed) {
+            Ok(inventory) => inventory,
+            Err(error) => return Err(error),
+        };
+        unaccounted_artifact_drift = fresh.objects.values().any(|object| {
+            let Some(previous) = mark_inventory_objects
+                .as_ref()
+                .and_then(|objects| objects.get(&object.key))
+            else {
+                return parse_gc_artifact_key(namespace, &object.key).is_some();
+            };
+            parse_gc_artifact_key(namespace, &object.key).is_some()
+                && !listed_object_identity_matches(previous, object)
+        });
+        completed_inventory = Some(fresh);
+        used_fresh_inventory = true;
+    } else if candidate_may_delete && inventory_is_predelete {
+        used_fresh_inventory = true;
+    }
+
+    let sweep_inputs = match completed_inventory
+        .as_ref()
+        .filter(|_| read_mode.is_bounded())
+    {
+        Some(inventory) => {
+            load_sweep_read_inputs_from_inventory(
+                store,
+                namespace,
+                now,
+                inventory,
+                used_fresh_inventory,
+            )
+            .await
+        }
+        None => load_sweep_read_inputs(store, namespace, now, read_mode).await,
+    };
     let SweepReadInputs {
         manifest: sweep_manifest,
         staging: sweep_staging,
-    } = match load_sweep_read_inputs(store, namespace, now, read_mode).await {
+    } = match sweep_inputs {
         Ok(inputs) => inputs,
         Err(SweepReadFailure::ManifestMissing) => {
             warn!(
@@ -2561,9 +3478,37 @@ async fn run_gc_cycle_at_inner(
             return Ok(GcCycleOutcome::incomplete(report));
         }
     };
-    let sweep_history_snapshot = match load_history_snapshot(store, namespace, prior_entries).await
+    let sweep_history = match completed_inventory
+        .as_ref()
+        .filter(|_| read_mode.is_bounded())
     {
+        Some(inventory) => match inventory.history_observations(namespace) {
+            Ok(observations) => {
+                if used_fresh_inventory
+                    && observations.iter().any(|observation| {
+                        !matches!(observation.storage_version, Some(StorageVersion::Etag(_)))
+                    })
+                {
+                    Err(ZeppelinError::Serialization(format!(
+                        "namespace {namespace} history lacks ETags for pre-delete validation"
+                    )))
+                } else {
+                    load_history_snapshot_from_observations(
+                        store,
+                        namespace,
+                        observations,
+                        prior_entries,
+                    )
+                    .await
+                }
+            }
+            Err(error) => Err(error),
+        },
+        None => load_history_snapshot(store, namespace, prior_entries).await,
+    };
+    let sweep_history_snapshot = match sweep_history {
         Ok(snapshot) => snapshot,
+        Err(error @ ZeppelinError::MalformedControlKey { .. }) => return Err(error),
         Err(e) => {
             warn!(namespace, error = %e, "gc retained history re-read failed; skipping sweep");
             let mut report = base_report;
@@ -2582,6 +3527,9 @@ async fn run_gc_cycle_at_inner(
     );
     let oldest_inflight_ms = oldest_inflight_ulid_ms(namespace, &sweep_staging.keys);
     let known_sizes = known_reclaimable_sizes(namespace, &sweep_manifest);
+    let sweep_listed_keys = completed_inventory
+        .as_ref()
+        .map_or_else(|| listed_keys.clone(), NamespaceInventory::all_keys);
 
     let mut retained = Vec::new();
     let mut objects_deleted = pending_report.objects_deleted;
@@ -2593,6 +3541,32 @@ async fn run_gc_cycle_at_inner(
         if !listed_keys.contains(&candidate.key) {
             log_gc_skip(namespace, &candidate.key, SkipReason::NotListedThisCycle);
             candidates_skipped += 1;
+            continue;
+        }
+        if !sweep_listed_keys.contains(&candidate.key) {
+            log_gc_skip(namespace, &candidate.key, SkipReason::NotListedThisCycle);
+            candidates_skipped += 1;
+            continue;
+        }
+        if used_fresh_inventory
+            && !mark_inventory_objects
+                .as_ref()
+                .and_then(|objects| objects.get(&candidate.key))
+                .zip(
+                    completed_inventory
+                        .as_ref()
+                        .and_then(|inventory| inventory.object(&candidate.key)),
+                )
+                .is_some_and(|(before, after)| listed_object_identity_matches(before, after))
+        {
+            cycle_complete = false;
+            log_gc_skip(namespace, &candidate.key, SkipReason::ObjectIdentityChanged);
+            candidates_skipped += 1;
+            retained.push(GcCandidate {
+                key: candidate.key,
+                first_seen_unreachable_at: now,
+                unreachable_since_manifest_version: sweep_manifest.version(),
+            });
             continue;
         }
         match should_delete_candidate(
@@ -2607,6 +3581,22 @@ async fn run_gc_cycle_at_inner(
                 min_newer_manifest_versions: None,
             },
         ) {
+            DeleteDecision::Delete
+                if !completed_inventory
+                    .as_ref()
+                    .and_then(|inventory| inventory.object(&candidate.key))
+                    .is_some_and(|object| {
+                        listed_object_horizon_satisfied(object, now, gc.horizon_secs)
+                    }) =>
+            {
+                log_gc_skip(
+                    namespace,
+                    &candidate.key,
+                    SkipReason::ObjectModifiedTooRecently,
+                );
+                candidates_skipped += 1;
+                retained.push(candidate);
+            }
             DeleteDecision::Delete => match store.delete(&candidate.key).await {
                 Ok(()) | Err(crate::error::ZeppelinError::NotFound { .. }) => {
                     if let Some(inventory) = completed_inventory.as_mut() {
@@ -2650,12 +3640,11 @@ async fn run_gc_cycle_at_inner(
     }
 
     match save_gc_candidates_with_version(store, namespace, &retained).await {
-        Ok((size, Some(version))) => {
+        Ok((size, version)) => {
             if let Some(inventory) = completed_inventory.as_mut() {
                 inventory.upsert(gc_candidate_store_key(namespace), size, version);
             }
         }
-        Ok((_, None)) => completed_inventory = None,
         Err(e) => {
             cycle_complete = false;
             warn!(
@@ -2683,9 +3672,10 @@ async fn run_gc_cycle_at_inner(
                 .map(|observation| &observation.object),
         )
     });
-    let pending_inputs_stable = observed_pending_deletes
-        .as_ref()
-        .is_some_and(|pending| pending == &sweep_manifest.pending_deletes);
+    let pending_inputs_stable = force_candidate_phase
+        || observed_pending_deletes
+            .as_ref()
+            .is_some_and(|pending| pending == &sweep_manifest.pending_deletes);
     if !(history_inputs_stable && snapshot_inputs_stable && pending_inputs_stable) {
         debug!(
             namespace,
@@ -2693,6 +3683,13 @@ async fn run_gc_cycle_at_inner(
             snapshot_inputs_stable,
             pending_inputs_stable,
             "gc decision inputs changed during cycle; disabling next idle admission"
+        );
+        completed_inventory = None;
+    }
+    if unaccounted_artifact_drift {
+        debug!(
+            namespace,
+            "gc fresh inventory contained unmarked artifact drift; disabling next idle admission"
         );
         completed_inventory = None;
     }
@@ -2740,7 +3737,7 @@ async fn run_gc_cycle_at_inner(
             report,
             CompletedGcState {
                 history: sweep_history_snapshot.cacheable,
-                inventory: completed_inventory,
+                inventory: completed_inventory.and_then(|inventory| inventory.fingerprint()),
                 next_due_at,
             },
         ))

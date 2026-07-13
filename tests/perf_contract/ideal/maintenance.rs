@@ -949,7 +949,7 @@ async fn execute_idle_new_orphan(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle new-orphan cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 1, 3);
+    assert_full_gc_census(&sample, 0, 6, 2, 2, 1, 3);
     assert_eq!(report.candidates_marked, 1);
     assert_eq!(report.objects_deleted, 1);
     assert!(
@@ -1006,7 +1006,7 @@ async fn execute_idle_candidate_maturity(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle candidate maturity cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 1, 3);
+    assert_full_gc_census(&sample, 0, 6, 2, 2, 1, 3);
     assert_eq!(report.candidates_marked, 0);
     assert_eq!(report.objects_deleted, 1);
     assert!(
@@ -1062,7 +1062,7 @@ async fn execute_idle_pending_delete_maturity(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle pending-delete maturity cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 1, 7, 6, 4, 1, 4);
+    assert_full_gc_census(&sample, 0, 2, 2, 2, 1, 2);
     assert_eq!(report.pending_deletes_deleted, 1);
     assert_eq!(report.pending_deletes_pruned, 1);
     assert_eq!(report.pending_deletes_retained, 0);
@@ -1097,7 +1097,7 @@ async fn execute_idle_pitr_expiry(case: &IdealCase) -> IdealSample {
         .expect("ideal idle PITR-expiry cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 17, 3);
+    assert_full_gc_census(&sample, 0, 6, 1, 2, 17, 3);
     let histories = Manifest::list_history(&world.harness.store, &namespace)
         .await
         .expect("ideal idle PITR-expiry history oracle failed");
@@ -1153,7 +1153,7 @@ async fn execute_idle_staging_lease_expiry(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal idle staging lease-expiry cycle failed");
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 1, 3);
+    assert_full_gc_census(&sample, 0, 6, 2, 2, 1, 3);
     assert_eq!(report.candidates_marked, 1);
     assert_eq!(report.objects_deleted, 1);
     assert!(
@@ -1253,7 +1253,7 @@ async fn execute_idle_changed_control(
                     unreachable!("snapshot branch must have snapshot mutation")
                 }
             };
-            assert_full_gc_census(&sample, 0, expected_gets, 5, 2, 0, 4);
+            assert_full_gc_census(&sample, 0, expected_gets, 1, 2, 0, 4);
             assert_eq!(sample.total_get_bytes, expected_bytes);
             for name in names {
                 assert!(NamedSnapshot::read(&world.harness.store, &namespace, name)
@@ -1263,10 +1263,10 @@ async fn execute_idle_changed_control(
             }
         }
         IdleControlMutation::Staging => {
-            assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 3);
+            assert_full_gc_census(&sample, 0, 6, 1, 2, 0, 3);
         }
         IdleControlMutation::CandidateLedger => {
-            assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 3);
+            assert_full_gc_census(&sample, 0, 6, 1, 2, 0, 3);
             assert!(
                 load_gc_candidates(&world.harness.store, &namespace)
                     .await
@@ -1294,7 +1294,7 @@ async fn execute_idle_backward_clock(case: &IdealCase) -> IdealSample {
         .expect("ideal idle backward-clock cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.finish(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 3);
+    assert_full_gc_census(&sample, 0, 6, 1, 2, 0, 3);
     sample
 }
 
@@ -1317,7 +1317,7 @@ async fn execute_idle_shorter_retention_config(case: &IdealCase) -> IdealSample 
         .expect("ideal idle shorter-retention cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 17, 3);
+    assert_full_gc_census(&sample, 0, 6, 1, 2, 17, 3);
     let histories = Manifest::list_history(&world.harness.store, &namespace)
         .await
         .expect("ideal idle shorter-retention history oracle failed");
@@ -1362,7 +1362,7 @@ async fn execute_idle_prior_partial_failure(case: &IdealCase) -> IdealSample {
         .expect("ideal idle post-failure retry failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.finish(case).await;
-    assert_full_gc_census(&sample, 0, 6, 5, 2, 0, 3);
+    assert_full_gc_census(&sample, 0, 6, 1, 2, 0, 3);
     sample
 }
 
@@ -1436,7 +1436,7 @@ fn assert_prune_reuse_empty_pending_census(sample: &IdealSample) {
             calls,
             sample.serial_get_chain.depth,
         ),
-        (36, 18_278, 42, 18_673, 5, 2, 49, 5),
+        (36, 18_278, 42, 18_673, 1, 2, 45, 5),
         "warm GC must preserve prune-result reuse traffic while overlapping independent retention, mark, and sweep reads",
     );
 }
@@ -1497,17 +1497,17 @@ async fn execute_prune_reuse_eligible_pending_refresh(case: &IdealCase) -> Ideal
             physical_verb_ops(&sample, "delete"),
             sample.serial_get_chain.depth,
         ),
-        (55, 61, 28_050, 6, 4, 1, 6),
-        "an eligible pending delete must retain the fresh middle history refresh before deleting",
+        (18, 19, 9_377, 2, 0, 0, 2),
+        "an eligible pending delete must fail closed when the fresh full inventory lacks history ETags",
     );
-    assert_eq!(report.pending_deletes_deleted, 1);
-    assert_eq!(report.pending_deletes_pruned, 1);
-    assert!(!world
+    assert_eq!(report.pending_deletes_deleted, 0);
+    assert_eq!(report.pending_deletes_pruned, 0);
+    assert!(world
         .harness
         .store
         .exists(&pending)
         .await
-        .expect("ideal prune-reuse pending absence oracle failed"));
+        .expect("ideal prune-reuse pending preservation oracle failed"));
     world.cleanup(sample).await
 }
 
@@ -1534,7 +1534,7 @@ async fn execute_history_memo_new_generation(case: &IdealCase) -> IdealSample {
     assert_eq!(report.pending_deletes_deleted, 0);
 
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 5);
+    assert_history_memo_census(&sample, 2, 8, 1, 2, 11, 5);
     assert_eq!(sample.total_get_bytes, 583);
     sample
 }
@@ -1572,7 +1572,7 @@ async fn execute_history_memo_changed_etag(case: &IdealCase) -> IdealSample {
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 5);
+    assert_history_memo_census(&sample, 2, 8, 1, 2, 11, 5);
     sample
 }
 
@@ -1596,7 +1596,7 @@ async fn execute_history_memo_missing_etag(case: &IdealCase) -> IdealSample {
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
     let sample = world.finish(case).await;
-    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 5);
+    assert_history_memo_census(&sample, 2, 8, 1, 2, 11, 5);
     sample
 }
 
@@ -1695,7 +1695,7 @@ async fn execute_history_memo_unpublished_orphan_overwrite(case: &IdealCase) -> 
     let sample = world.snapshot(case).await;
     assert_eq!(report.objects_deleted, 0);
     assert_eq!(report.pending_deletes_deleted, 0);
-    assert_history_memo_census(&sample, 2, 8, 5, 2, 15, 5);
+    assert_history_memo_census(&sample, 2, 8, 1, 2, 11, 5);
     assert!(
         world
             .harness
@@ -1787,7 +1787,7 @@ async fn execute_history_memo_cold_runner_restart(case: &IdealCase) -> IdealSamp
 
 fn assert_history_failure_closed(report: &GcCycleReport, sample: &IdealSample) {
     assert_eq!(report, &GcCycleReport::default());
-    assert_history_memo_census(sample, 1, 1, 3, 0, 4, 1);
+    assert_history_memo_census(sample, 1, 1, 1, 0, 2, 1);
     assert_eq!(physical_verb_ops(sample, "delete"), 0);
 }
 

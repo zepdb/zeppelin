@@ -115,6 +115,17 @@ pub enum ZeppelinError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    /// A listed key under a reserved storage-control prefix has invalid grammar.
+    #[error("malformed {family} control key {key}: {reason}")]
+    MalformedControlKey {
+        /// Reserved key family whose canonical grammar was violated.
+        family: &'static str,
+        /// Exact invalid object-store key.
+        key: String,
+        /// Canonical parser's diagnostic.
+        reason: String,
+    },
+
     // WAL errors
     /// Data integrity failure: stored checksum does not match computed checksum.
     #[error("checksum mismatch: expected {expected}, got {actual}")]
@@ -507,6 +518,7 @@ impl ZeppelinError {
             ZeppelinError::Json(_) => "INTERNAL_ERROR",
             ZeppelinError::Bincode(_) => "INTERNAL_ERROR",
             ZeppelinError::Serialization(_) => "INTERNAL_ERROR",
+            ZeppelinError::MalformedControlKey { .. } => "DATA_CORRUPTION",
             ZeppelinError::ChecksumMismatch { .. } => "DATA_CORRUPTION",
             ZeppelinError::ManifestNotFound { .. } => "NAMESPACE_NOT_FOUND",
             ZeppelinError::ManifestConflict { .. } => "CONFLICT_RETRY",
@@ -640,6 +652,7 @@ impl ZeppelinError {
             ZeppelinError::Json(_)
             | ZeppelinError::Bincode(_)
             | ZeppelinError::Serialization(_)
+            | ZeppelinError::MalformedControlKey { .. }
             | ZeppelinError::Index(_)
             | ZeppelinError::CoarseSketch(_)
             | ZeppelinError::Rabitq(_)
