@@ -1,16 +1,27 @@
 //! Isolated direct measurements for compaction and garbage-collection work.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use object_store::path::Path;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
+    PutOptions, PutPayload, PutResult, Result as OsResult,
+};
 use ulid::Ulid;
 use zeppelin::compaction::background::compact_namespace_under_lease;
 use zeppelin::compaction::gc::{
     active_staged_keys_at, clear_compaction_staging, drain_pending_deletes_at, run_gc_cycle_at,
-    save_gc_candidates, write_compaction_staging, GcCandidate,
+    save_gc_candidates, write_compaction_staging, GcCandidate, GcCycleReport,
+    GcNamespaceIncarnation, GcRunner,
 };
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, GcConfig, IndexingConfig};
@@ -21,6 +32,8 @@ use zeppelin::namespace::manager::{NamespaceIndexConfig, NamespaceManager};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::{Clock, TimeSource};
 use zeppelin::types::{AttributeValue, DistanceMetric, VectorEntry};
+use zeppelin::wal::fragment::WalFragment;
+use zeppelin::wal::manifest::FragmentRef;
 use zeppelin::wal::{LeaseManager, Manifest, WalReader, WalWriter};
 
 use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
@@ -794,6 +807,33 @@ fn maintenance_fts_vectors(count: usize) -> Vec<VectorEntry> {
 
 async fn execute_gc(case: &IdealCase, operation: GarbageCollectionCase) -> Option<IdealSample> {
     match operation {
+        GarbageCollectionCase::HistoryMemoWarmUnchanged => {
+            Some(execute_history_memo_warm_unchanged(case).await)
+        }
+        GarbageCollectionCase::HistoryMemoNewGeneration => {
+            Some(execute_history_memo_new_generation(case).await)
+        }
+        GarbageCollectionCase::HistoryMemoChangedEtag => {
+            Some(execute_history_memo_changed_etag(case).await)
+        }
+        GarbageCollectionCase::HistoryMemoMissingEtag => {
+            Some(execute_history_memo_missing_etag(case).await)
+        }
+        GarbageCollectionCase::HistoryMemoDisappearsBetweenListAndGet => {
+            Some(execute_history_memo_disappears_between_list_and_get(case).await)
+        }
+        GarbageCollectionCase::HistoryMemoUnpublishedOrphanOverwrite => {
+            Some(execute_history_memo_unpublished_orphan_overwrite(case).await)
+        }
+        GarbageCollectionCase::HistoryMemoCorruptChangedBody => {
+            Some(execute_history_memo_corrupt_changed_body(case).await)
+        }
+        GarbageCollectionCase::HistoryMemoNamespaceRecreated => {
+            Some(execute_history_memo_namespace_recreated(case).await)
+        }
+        GarbageCollectionCase::HistoryMemoColdRunnerRestart => {
+            Some(execute_history_memo_cold_runner_restart(case).await)
+        }
         GarbageCollectionCase::PendingDeleteYoung => {
             Some(execute_pending_delete(case, PendingShape::Young).await)
         }
@@ -821,6 +861,556 @@ async fn execute_gc(case: &IdealCase, operation: GarbageCollectionCase) -> Optio
             Some(execute_active_staging(case, ActiveStagingShape::MixedTokens).await)
         }
     }
+}
+
+async fn execute_history_memo_warm_unchanged(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    let mut manifest = Manifest::new_at(world.now);
+    for _ in 0..18 {
+        manifest
+            .write(&world.store, &namespace)
+            .await
+            .expect("ideal GC history-memo setup write failed");
+    }
+
+    let gc = GcConfig {
+        horizon_secs: 0,
+        compaction_upload_window_secs: 0,
+        skew_slop_secs: 0,
+        allow_unsafe_short_horizon: true,
+        manifest_history_keep_count: 1_024,
+        pitr_retention_secs: 0,
+    };
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(world.store.clone(), gc);
+    let cold = runner
+        .run_cycle_at(incarnation.clone(), world.now)
+        .await
+        .expect("ideal cold GC history-memo prime failed");
+    assert_eq!(cold.objects_deleted, 0);
+    assert_eq!(cold.pending_deletes_deleted, 0);
+
+    world.begin_measurement().await;
+    let warm = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal warm GC history-memo cycle failed");
+    assert_eq!(warm.objects_deleted, 0);
+    assert_eq!(warm.pending_deletes_deleted, 0);
+
+    let sample = world.finish(case).await;
+    let history_gets = sample
+        .physical_operations
+        .iter()
+        .filter(|operation| operation.verb == "get" && operation.key == "<generation>.msgpack")
+        .count();
+    assert_eq!(history_gets, 0, "warm unchanged GC reread history objects");
+    assert_eq!(sample.total_get_ops, 6);
+    assert_eq!(sample.serial_get_chain.depth, 6);
+    assert_eq!(physical_mode_ops(&sample, "list_recursive"), 5);
+    assert_eq!(
+        sample
+            .physical_verb_mode_totals
+            .iter()
+            .filter(|total| total.verb == "put")
+            .map(|total| total.ops)
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(
+        sample
+            .physical_verb_mode_totals
+            .iter()
+            .map(|total| total.ops)
+            .sum::<u64>(),
+        13
+    );
+    sample
+}
+
+async fn execute_history_memo_new_generation(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    let mut manifest = seed_history_generations(&world, &namespace, 18).await;
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    manifest.updated_at = world.now + ChronoDuration::seconds(1);
+    manifest
+        .write(&world.store, &namespace)
+        .await
+        .expect("ideal GC new-history generation setup write failed");
+
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal GC new-history generation cycle failed");
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(report.pending_deletes_deleted, 0);
+
+    let sample = world.finish(case).await;
+    assert_history_memo_census(&sample, 3, 9, 5, 2, 16, 9);
+    sample
+}
+
+async fn execute_history_memo_changed_etag(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let target = Manifest::history_key(&namespace, 1);
+    let mut changed = Manifest::read_history(&world.store, &namespace, 1)
+        .await
+        .expect("ideal GC changed-ETag history setup read failed")
+        .expect("ideal GC changed-ETag history setup object missing");
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    changed.updated_at = world.now + ChronoDuration::seconds(1);
+    world
+        .store
+        .put(
+            &target,
+            changed
+                .to_bytes()
+                .expect("ideal GC changed-ETag history serialization failed"),
+        )
+        .await
+        .expect("ideal GC changed-ETag history overwrite failed");
+
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal GC changed-ETag cycle failed");
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(report.pending_deletes_deleted, 0);
+    let sample = world.finish(case).await;
+    assert_history_memo_census(&sample, 3, 9, 5, 2, 16, 9);
+    sample
+}
+
+async fn execute_history_memo_missing_etag(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let target = Manifest::history_key(&namespace, 1);
+    let (fault_store, control) =
+        history_observation_fault_store(&world, target, HistoryObservationFault::MissingListEtag);
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(fault_store, history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    control.arm();
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal GC missing-ETag cycle failed");
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(report.pending_deletes_deleted, 0);
+    let sample = world.finish(case).await;
+    assert_history_memo_census(&sample, 3, 9, 5, 2, 16, 9);
+    sample
+}
+
+async fn execute_history_memo_disappears_between_list_and_get(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let target = Manifest::history_key(&namespace, 1);
+    let (fault_store, control) = history_observation_fault_store(
+        &world,
+        target,
+        HistoryObservationFault::DeleteBeforeFirstGet,
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(fault_store, history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    control.arm();
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal GC disappearing-history cycle returned a storage error");
+    let sample = world.finish(case).await;
+    assert_history_failure_closed(&report, &sample);
+    sample
+}
+
+async fn execute_history_memo_unpublished_orphan_overwrite(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    let mut orphan = seed_history_generations(&world, &namespace, 19).await;
+    let authoritative = Manifest::read_history(&world.store, &namespace, 18)
+        .await
+        .expect("ideal GC orphan history authoritative setup read failed")
+        .expect("ideal GC orphan history authoritative generation missing");
+    world
+        .store
+        .put(
+            &Manifest::s3_key(&namespace),
+            authoritative
+                .to_bytes()
+                .expect("ideal GC orphan authoritative manifest serialization failed"),
+        )
+        .await
+        .expect("ideal GC orphan authoritative manifest rewind failed");
+
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+
+    let protected_id = Ulid::from_parts(
+        (world.now - ChronoDuration::seconds(60)).timestamp_millis() as u64,
+        0xA11CE,
+    );
+    let protected_key = WalFragment::s3_key(&namespace, &protected_id);
+    world
+        .store
+        .put(&protected_key, Bytes::from_static(b"orphan-history-root"))
+        .await
+        .expect("ideal GC orphan protected artifact setup failed");
+    save_gc_candidates(
+        &world.store,
+        &namespace,
+        &[GcCandidate {
+            key: protected_key.clone(),
+            first_seen_unreachable_at: world.now - ChronoDuration::seconds(60),
+            unreachable_since_manifest_version: authoritative.version(),
+        }],
+    )
+    .await
+    .expect("ideal GC orphan candidate setup failed");
+    orphan.add_fragment(FragmentRef {
+        id: protected_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 19,
+    });
+    world
+        .store
+        .put(
+            &Manifest::history_key(&namespace, 19),
+            orphan
+                .to_bytes()
+                .expect("ideal GC orphan overwrite serialization failed"),
+        )
+        .await
+        .expect("ideal GC orphan history overwrite failed");
+
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal GC orphan overwrite cycle failed");
+    let sample = world.snapshot(case).await;
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(report.pending_deletes_deleted, 0);
+    assert_history_memo_census(&sample, 3, 9, 5, 2, 16, 9);
+    assert!(
+        world
+            .harness
+            .store
+            .exists(&protected_key)
+            .await
+            .expect("ideal GC orphan protected artifact oracle failed"),
+        "changed unpublished history body must remain an authoritative GC root"
+    );
+    world.cleanup(sample).await
+}
+
+async fn execute_history_memo_corrupt_changed_body(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &incarnation, world.now).await;
+    world
+        .store
+        .put(
+            &Manifest::history_key(&namespace, 1),
+            Bytes::from_static(b"corrupt changed history body"),
+        )
+        .await
+        .expect("ideal GC corrupt history setup overwrite failed");
+
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal GC corrupt-history cycle returned a storage error");
+    let sample = world.finish(case).await;
+    assert_history_failure_closed(&report, &sample);
+    sample
+}
+
+async fn execute_history_memo_namespace_recreated(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let original = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut runner, &original, world.now).await;
+
+    world
+        .store
+        .delete_prefix(&format!("{namespace}/"))
+        .await
+        .expect("ideal GC recreated namespace old incarnation cleanup failed");
+    seed_history_generations(&world, &namespace, 18).await;
+    let recreated =
+        GcNamespaceIncarnation::new(namespace, world.now + ChronoDuration::microseconds(1));
+
+    world.begin_measurement().await;
+    let report = runner
+        .run_cycle_at(recreated, world.now)
+        .await
+        .expect("ideal GC recreated namespace cycle failed");
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(report.pending_deletes_deleted, 0);
+    let sample = world.finish(case).await;
+    assert_history_memo_census(&sample, 54, 60, 5, 2, 67, 60);
+    sample
+}
+
+async fn execute_history_memo_cold_runner_restart(case: &IdealCase) -> IdealSample {
+    let world = MaintenanceWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    seed_history_generations(&world, &namespace, 18).await;
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), world.now);
+    let mut first_runner = GcRunner::new(world.store.clone(), history_memo_gc_config());
+    prime_history_memo(&mut first_runner, &incarnation, world.now).await;
+    drop(first_runner);
+    let mut restarted = GcRunner::new(world.store.clone(), history_memo_gc_config());
+
+    world.begin_measurement().await;
+    let report = restarted
+        .run_cycle_at(incarnation, world.now)
+        .await
+        .expect("ideal GC cold runner restart cycle failed");
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(report.pending_deletes_deleted, 0);
+    let sample = world.finish(case).await;
+    assert_history_memo_census(&sample, 54, 60, 5, 2, 67, 60);
+    sample
+}
+
+fn assert_history_failure_closed(report: &GcCycleReport, sample: &IdealSample) {
+    assert_eq!(report, &GcCycleReport::default());
+    assert_history_memo_census(sample, 1, 1, 2, 0, 3, 1);
+    assert_eq!(physical_verb_ops(sample, "delete"), 0);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryObservationFault {
+    MissingListEtag,
+    DeleteBeforeFirstGet,
+}
+
+#[derive(Debug, Default)]
+struct HistoryObservationFaultControl {
+    armed: AtomicBool,
+    fired: AtomicBool,
+}
+
+impl HistoryObservationFaultControl {
+    fn arm(&self) {
+        self.fired.store(false, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+struct HistoryObservationFaultStore {
+    inner: Arc<dyn ObjectStore>,
+    mutation_inner: Arc<dyn ObjectStore>,
+    target: String,
+    fault: HistoryObservationFault,
+    control: Arc<HistoryObservationFaultControl>,
+}
+
+fn history_observation_fault_store(
+    world: &MaintenanceWorld,
+    target: String,
+    fault: HistoryObservationFault,
+) -> (ZeppelinStore, Arc<HistoryObservationFaultControl>) {
+    let control = Arc::new(HistoryObservationFaultControl::default());
+    let store = HistoryObservationFaultStore {
+        inner: world.store.inner(),
+        mutation_inner: world.harness.store.inner(),
+        target,
+        fault,
+        control: Arc::clone(&control),
+    };
+    (
+        ZeppelinStore::new_with_native_batch_delete(Arc::new(store)),
+        control,
+    )
+}
+
+impl fmt::Display for HistoryObservationFaultStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "HistoryObservationFaultStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for HistoryObservationFaultStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        if self.control.armed.load(Ordering::SeqCst)
+            && self.fault == HistoryObservationFault::DeleteBeforeFirstGet
+            && location.as_ref() == self.target
+            && !self.control.fired.swap(true, Ordering::SeqCst)
+        {
+            self.mutation_inner.delete(location).await?;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        let armed = self.control.armed.load(Ordering::SeqCst);
+        let target = self.target.clone();
+        self.inner
+            .list(prefix)
+            .map(move |result| {
+                result.map(|mut object| {
+                    if armed && object.location.as_ref() == target {
+                        object.e_tag = None;
+                        object.version = None;
+                    }
+                    object
+                })
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+async fn seed_history_generations(
+    world: &MaintenanceWorld,
+    namespace: &str,
+    count: usize,
+) -> Manifest {
+    let mut manifest = Manifest::new_at(world.now);
+    for _ in 0..count {
+        manifest
+            .write(&world.store, namespace)
+            .await
+            .expect("ideal GC history-memo fixture write failed");
+    }
+    manifest
+}
+
+fn history_memo_gc_config() -> GcConfig {
+    GcConfig {
+        horizon_secs: 0,
+        compaction_upload_window_secs: 0,
+        skew_slop_secs: 0,
+        allow_unsafe_short_horizon: true,
+        manifest_history_keep_count: 1_024,
+        pitr_retention_secs: 0,
+    }
+}
+
+async fn prime_history_memo(
+    runner: &mut GcRunner,
+    incarnation: &GcNamespaceIncarnation,
+    now: DateTime<Utc>,
+) {
+    let report = runner
+        .run_cycle_at(incarnation.clone(), now)
+        .await
+        .expect("ideal cold GC history-memo prime failed");
+    assert_eq!(report.objects_deleted, 0);
+    assert_eq!(report.pending_deletes_deleted, 0);
+}
+
+fn assert_history_memo_census(
+    sample: &IdealSample,
+    history_gets: u64,
+    total_gets: u64,
+    lists: u64,
+    puts: u64,
+    calls: u64,
+    get_depth: u32,
+) {
+    let actual_history_gets = sample
+        .physical_operations
+        .iter()
+        .filter(|operation| operation.verb == "get" && operation.key == "<generation>.msgpack")
+        .count() as u64;
+    assert_eq!(actual_history_gets, history_gets);
+    assert_eq!(sample.total_get_ops, total_gets);
+    assert_eq!(sample.serial_get_chain.depth, get_depth);
+    assert_eq!(physical_mode_ops(sample, "list_recursive"), lists);
+    assert_eq!(physical_verb_ops(sample, "put"), puts);
+    assert_eq!(
+        sample
+            .physical_verb_mode_totals
+            .iter()
+            .map(|total| total.ops)
+            .sum::<u64>(),
+        calls
+    );
+}
+
+fn physical_verb_ops(sample: &IdealSample, verb: &str) -> u64 {
+    sample
+        .physical_verb_mode_totals
+        .iter()
+        .filter(|total| total.verb == verb)
+        .map(|total| total.ops)
+        .sum()
 }
 
 #[derive(Clone, Copy)]
@@ -1198,6 +1788,15 @@ mod tests {
                 "background.tick_resume_delete",
                 "background.tick_lease_held",
                 "background.tick_compaction_success",
+                "gc.history_memo_warm_unchanged",
+                "gc.history_memo_new_generation",
+                "gc.history_memo_changed_etag",
+                "gc.history_memo_missing_etag",
+                "gc.history_memo_disappears_between_list_and_get",
+                "gc.history_memo_unpublished_orphan_overwrite",
+                "gc.history_memo_corrupt_changed_body",
+                "gc.history_memo_namespace_recreated",
+                "gc.history_memo_cold_runner_restart",
                 "gc.pending_delete_young",
                 "gc.pending_delete_history_pinned",
                 "gc.pending_delete_eligible",

@@ -109,7 +109,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::config::GcConfig;
-use crate::error::Result;
+use crate::error::{Result, ZeppelinError};
 use crate::fts::global_index::global_fts_key;
 use crate::fts::inverted_index::fts_index_key;
 use crate::index::bitmap::bitmap_key;
@@ -118,9 +118,12 @@ use crate::index::ivf_flat::build::{attrs_key, centroids_key, cluster_key};
 use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
 use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
 use crate::index::quantization::QuantizationType;
-use crate::storage::ZeppelinStore;
+use crate::storage::{StorageVersion, ZeppelinStore};
 use crate::wal::fragment::WalFragment;
-use crate::wal::manifest::{Manifest, ManifestHistoryRetention};
+use crate::wal::manifest::{
+    Manifest, ManifestHistoryObservation, ManifestHistoryPruneResult, ManifestHistoryRetention,
+    NamedSnapshot,
+};
 use crate::wal::Lease;
 
 /// Persisted JSON wrapper version written for new candidate ledgers.
@@ -128,6 +131,85 @@ const GC_CANDIDATE_STORE_VERSION: u32 = 1;
 
 /// Maximum fresh-read/CAS attempts made while pruning `pending_deletes`.
 const GC_MANIFEST_CAS_RETRIES: usize = 10;
+
+/// Process-local discriminator for one lifetime of a namespace name.
+///
+/// Namespace names can be deleted and recreated. A GC history memo therefore
+/// belongs to both the name and its authoritative creation timestamp; a later
+/// incarnation with the same name starts cold instead of inheriting disposable
+/// state from the deleted namespace.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GcNamespaceIncarnation {
+    name: String,
+    created_at: DateTime<Utc>,
+}
+
+impl GcNamespaceIncarnation {
+    /// Creates one process-local namespace incarnation identity.
+    #[must_use]
+    pub fn new(name: String, created_at: DateTime<Utc>) -> Self {
+        assert!(!name.is_empty(), "GC namespace incarnation cannot be empty");
+        Self { name, created_at }
+    }
+
+    /// Returns the namespace name used for object-store keys.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Stateful background GC entrypoint with a disposable validated history memo.
+///
+/// The runner owns no authority: every cycle freshly lists history metadata and
+/// reuses a decoded body only when the exact key and nonempty S3 ETag match the
+/// prior completed cycle. One-shot callers continue to use [`run_gc_cycle`] or
+/// [`run_gc_cycle_at`] and therefore never retain process state.
+pub struct GcRunner {
+    store: ZeppelinStore,
+    gc: GcConfig,
+    histories: BTreeMap<String, NamespaceHistoryMemo>,
+}
+
+#[derive(Debug, Clone)]
+struct NamespaceHistoryMemo {
+    incarnation: GcNamespaceIncarnation,
+    entries: BTreeMap<String, CachedHistory>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedHistory {
+    storage_version: StorageVersion,
+    manifest: Manifest,
+    reachable_keys: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct HistorySnapshot {
+    entries: Vec<(ManifestHistoryObservation, Manifest)>,
+    cacheable: BTreeMap<String, CachedHistory>,
+}
+
+struct GcCycleOutcome {
+    report: GcCycleReport,
+    completed_history: Option<BTreeMap<String, CachedHistory>>,
+}
+
+impl GcCycleOutcome {
+    fn incomplete(report: GcCycleReport) -> Self {
+        Self {
+            report,
+            completed_history: None,
+        }
+    }
+
+    fn complete(report: GcCycleReport, completed_history: BTreeMap<String, CachedHistory>) -> Self {
+        Self {
+            report,
+            completed_history: Some(completed_history),
+        }
+    }
+}
 
 /// Lease-scoped record of compaction uploads not yet committed to a manifest.
 ///
@@ -558,6 +640,17 @@ pub struct PendingDeleteDrainReport {
     pub entries_retained: usize,
 }
 
+struct PendingDeleteDrainOutcome {
+    report: PendingDeleteDrainReport,
+    complete: bool,
+}
+
+impl PendingDeleteDrainOutcome {
+    fn new(report: PendingDeleteDrainReport, complete: bool) -> Self {
+        Self { report, complete }
+    }
+}
+
 /// Auditable reason that a known or listed object was not deleted this cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkipReason {
@@ -858,7 +951,11 @@ pub async fn drain_pending_deletes_at(
     now: DateTime<Utc>,
 ) -> Result<PendingDeleteDrainReport> {
     let history_reachable = retained_manifest_history_reachable_keys(store, namespace).await?;
-    drain_pending_deletes_with_retained_history(store, namespace, gc, &history_reachable, now).await
+    Ok(
+        drain_pending_deletes_with_retained_history(store, namespace, gc, &history_reachable, now)
+            .await?
+            .report,
+    )
 }
 
 /// Drains pending deletes using a retained-history union already loaded by the caller.
@@ -895,23 +992,30 @@ async fn drain_pending_deletes_with_retained_history(
     gc: &GcConfig,
     retained_history: &BTreeSet<String>,
     now: DateTime<Utc>,
-) -> Result<PendingDeleteDrainReport> {
+) -> Result<PendingDeleteDrainOutcome> {
     let mut deleted_keys = BTreeSet::new();
+    let mut complete = true;
 
     for attempt in 0..GC_MANIFEST_CAS_RETRIES {
         let Some((mut manifest, version)) = Manifest::read_versioned(store, namespace).await?
         else {
-            return Ok(PendingDeleteDrainReport {
-                objects_deleted: deleted_keys.len(),
-                ..PendingDeleteDrainReport::default()
-            });
+            return Ok(PendingDeleteDrainOutcome::new(
+                PendingDeleteDrainReport {
+                    objects_deleted: deleted_keys.len(),
+                    ..PendingDeleteDrainReport::default()
+                },
+                complete,
+            ));
         };
 
         if manifest.pending_deletes.is_empty() {
-            return Ok(PendingDeleteDrainReport {
-                objects_deleted: deleted_keys.len(),
-                ..PendingDeleteDrainReport::default()
-            });
+            return Ok(PendingDeleteDrainOutcome::new(
+                PendingDeleteDrainReport {
+                    objects_deleted: deleted_keys.len(),
+                    ..PendingDeleteDrainReport::default()
+                },
+                complete,
+            ));
         }
 
         let pending = manifest.pending_deletes.clone();
@@ -947,6 +1051,7 @@ async fn drain_pending_deletes_with_retained_history(
                     debug_pending_delete_absent(namespace, key);
                 }
                 Err(e) => {
+                    complete = false;
                     retained.insert(key.clone());
                     warn!(
                         namespace,
@@ -959,11 +1064,14 @@ async fn drain_pending_deletes_with_retained_history(
         }
 
         if confirmed_absent.is_empty() {
-            return Ok(PendingDeleteDrainReport {
-                objects_deleted: deleted_keys.len(),
-                entries_pruned: 0,
-                entries_retained: retained.len(),
-            });
+            return Ok(PendingDeleteDrainOutcome::new(
+                PendingDeleteDrainReport {
+                    objects_deleted: deleted_keys.len(),
+                    entries_pruned: 0,
+                    entries_retained: retained.len(),
+                },
+                complete,
+            ));
         }
 
         manifest
@@ -973,11 +1081,14 @@ async fn drain_pending_deletes_with_retained_history(
 
         match manifest.write_conditional(store, namespace, &version).await {
             Ok(()) => {
-                return Ok(PendingDeleteDrainReport {
-                    objects_deleted: deleted_keys.len(),
-                    entries_pruned: confirmed_absent.len(),
-                    entries_retained: retained.len(),
-                });
+                return Ok(PendingDeleteDrainOutcome::new(
+                    PendingDeleteDrainReport {
+                        objects_deleted: deleted_keys.len(),
+                        entries_pruned: confirmed_absent.len(),
+                        entries_retained: retained.len(),
+                    },
+                    complete,
+                ));
             }
             Err(crate::error::ZeppelinError::ManifestConflict { .. }) => {
                 warn!(
@@ -1292,6 +1403,189 @@ pub fn mark_gc_candidates(
 /// are shared borrows. Unlike a Java exception or C error code that might skip
 /// cleanup implicitly, each early return constructs the exact partial report;
 /// Rust also drops all owned temporary collections automatically.
+impl GcRunner {
+    /// Creates a stateful runner with an initially empty disposable memo.
+    #[must_use]
+    pub fn new(store: ZeppelinStore, gc: GcConfig) -> Self {
+        Self {
+            store,
+            gc,
+            histories: BTreeMap::new(),
+        }
+    }
+
+    /// Runs one cycle and commits history bodies only after a complete refresh.
+    pub async fn run_cycle_at(
+        &mut self,
+        incarnation: GcNamespaceIncarnation,
+        now: DateTime<Utc>,
+    ) -> Result<GcCycleReport> {
+        let previous = self
+            .histories
+            .remove(incarnation.name())
+            .filter(|memo| memo.incarnation == incarnation);
+        let outcome = run_gc_cycle_at_inner(
+            &self.store,
+            incarnation.name(),
+            &self.gc,
+            now,
+            previous.as_ref(),
+        )
+        .await;
+
+        match outcome {
+            Ok(outcome) => {
+                if let Some(entries) = outcome.completed_history {
+                    self.histories.insert(
+                        incarnation.name.clone(),
+                        NamespaceHistoryMemo {
+                            incarnation,
+                            entries,
+                        },
+                    );
+                } else if let Some(previous) = previous {
+                    self.histories
+                        .insert(previous.incarnation.name.clone(), previous);
+                }
+                Ok(outcome.report)
+            }
+            Err(error) => {
+                if let Some(previous) = previous {
+                    self.histories
+                        .insert(previous.incarnation.name.clone(), previous);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Drops memo state for a namespace that is no longer active.
+    pub(crate) fn forget_namespace(&mut self, namespace: &str) {
+        self.histories.remove(namespace);
+    }
+
+    /// Retains memo state only for freshly discovered active incarnations.
+    pub(crate) fn retain_namespaces(&mut self, active: &BTreeSet<GcNamespaceIncarnation>) {
+        self.histories
+            .retain(|_, memo| active.contains(&memo.incarnation));
+    }
+}
+
+async fn load_history_observation(
+    store: &ZeppelinStore,
+    namespace: &str,
+    observation: &ManifestHistoryObservation,
+    prior: Option<&BTreeMap<String, CachedHistory>>,
+) -> Result<(Manifest, Option<CachedHistory>)> {
+    if let Some(listed_version) = observation.storage_version.as_ref() {
+        if listed_version.etag().is_some() {
+            if let Some(cached) = prior
+                .and_then(|entries| entries.get(&observation.history.key))
+                .filter(|cached| cached.storage_version == *listed_version)
+            {
+                return Ok((cached.manifest.clone(), Some(cached.clone())));
+            }
+        }
+    }
+
+    let (bytes, get_etag) = store.get_with_meta(&observation.history.key).await?;
+    let manifest = Manifest::decode_history_body(&bytes, namespace, &observation.history)?;
+    let cacheable = match observation.storage_version.as_ref() {
+        Some(StorageVersion::Etag(list_etag)) => {
+            if get_etag.as_deref() != Some(list_etag.as_str()) {
+                return Err(ZeppelinError::Serialization(format!(
+                    "manifest history {} changed between LIST ETag {:?} and GET ETag {:?}",
+                    observation.history.key, list_etag, get_etag
+                )));
+            }
+            Some(CachedHistory {
+                storage_version: StorageVersion::Etag(list_etag.clone()),
+                manifest: manifest.clone(),
+                reachable_keys: reachable_keys(namespace, &manifest),
+            })
+        }
+        Some(StorageVersion::BackendVersion(_)) | None => None,
+    };
+    Ok((manifest, cacheable))
+}
+
+async fn load_history_snapshot(
+    store: &ZeppelinStore,
+    namespace: &str,
+    prior: Option<&BTreeMap<String, CachedHistory>>,
+) -> Result<HistorySnapshot> {
+    let observations = Manifest::list_history_observations(store, namespace).await?;
+    let mut entries = Vec::with_capacity(observations.len());
+    let mut cacheable = BTreeMap::new();
+    for observation in observations {
+        let (manifest, cached) =
+            load_history_observation(store, namespace, &observation, prior).await?;
+        if let Some(cached) = cached {
+            cacheable.insert(observation.history.key.clone(), cached);
+        }
+        entries.push((observation, manifest));
+    }
+    Ok(HistorySnapshot { entries, cacheable })
+}
+
+async fn prune_history_with_memo_at(
+    store: &ZeppelinStore,
+    namespace: &str,
+    retention: ManifestHistoryRetention,
+    now: DateTime<Utc>,
+    prior: Option<&BTreeMap<String, CachedHistory>>,
+) -> Result<ManifestHistoryPruneResult> {
+    if retention.keep_count == 0 {
+        return Err(ZeppelinError::Config(
+            "gc.manifest_history_keep_count must be greater than zero".to_string(),
+        ));
+    }
+    let observations = Manifest::list_history_observations(store, namespace).await?;
+    let keep_from = observations.len().saturating_sub(retention.keep_count);
+    let pinned_generations = NamedSnapshot::pinned_generations(store, namespace).await?;
+    let retention_window = retention
+        .pitr_retention_secs
+        .saturating_add(retention.skew_slop_secs);
+    let mut retained_manifests = Vec::new();
+    let mut pruned = 0usize;
+
+    for (index, observation) in observations.into_iter().enumerate() {
+        let (manifest, _) = load_history_observation(store, namespace, &observation, prior).await?;
+        let keep_by_count = index >= keep_from;
+        let keep_by_pin = pinned_generations.contains(&observation.history.version);
+        let keep_by_time = retention.pitr_retention_secs > 0
+            && now.signed_duration_since(manifest.updated_at).num_seconds()
+                <= retention_window as i64;
+        if keep_by_count || keep_by_time || keep_by_pin {
+            retained_manifests.push(manifest.clone());
+        } else {
+            store.delete(&observation.history.key).await?;
+            pruned += 1;
+        }
+    }
+
+    Ok(ManifestHistoryPruneResult {
+        pruned,
+        retained_manifests,
+    })
+}
+
+fn history_snapshot_reachable_keys(
+    namespace: &str,
+    snapshot: &HistorySnapshot,
+) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for (observation, manifest) in &snapshot.entries {
+        if let Some(cached) = snapshot.cacheable.get(&observation.history.key) {
+            keys.extend(cached.reachable_keys.iter().cloned());
+        } else {
+            keys.extend(reachable_keys(namespace, manifest));
+        }
+    }
+    keys
+}
+
+/// Runs one stateless GC cycle using the current wall clock.
 pub async fn run_gc_cycle(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1307,7 +1601,20 @@ pub async fn run_gc_cycle_at(
     gc: &GcConfig,
     now: DateTime<Utc>,
 ) -> Result<GcCycleReport> {
-    let history_prune = match Manifest::prune_history_with_retention_at(
+    Ok(run_gc_cycle_at_inner(store, namespace, gc, now, None)
+        .await?
+        .report)
+}
+
+async fn run_gc_cycle_at_inner(
+    store: &ZeppelinStore,
+    namespace: &str,
+    gc: &GcConfig,
+    now: DateTime<Utc>,
+    prior_history: Option<&NamespaceHistoryMemo>,
+) -> Result<GcCycleOutcome> {
+    let prior_entries = prior_history.map(|memo| &memo.entries);
+    let history_prune = match prune_history_with_memo_at(
         store,
         namespace,
         ManifestHistoryRetention {
@@ -1316,6 +1623,7 @@ pub async fn run_gc_cycle_at(
             skew_slop_secs: gc.skew_slop_secs,
         },
         now,
+        prior_entries,
     )
     .await
     {
@@ -1326,22 +1634,24 @@ pub async fn run_gc_cycle_at(
                 error = %e,
                 "gc manifest-history prune failed; aborting cycle"
             );
-            return Ok(GcCycleReport::default());
+            return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
         }
     };
     let manifest_history_pruned = history_prune.pruned;
-    let retained_history = match retained_manifest_history_reachable_keys(store, namespace).await {
-        Ok(keys) => keys,
-        Err(e) => {
-            warn!(
-                namespace,
-                error = %e,
-                "gc retained history re-read failed before pending-delete drain; aborting cycle"
-            );
-            return Ok(GcCycleReport::default());
-        }
-    };
-    let pending_report = match drain_pending_deletes_with_retained_history(
+    let retained_history_snapshot =
+        match load_history_snapshot(store, namespace, prior_entries).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                warn!(
+                    namespace,
+                    error = %e,
+                    "gc retained history re-read failed before pending-delete drain; aborting cycle"
+                );
+                return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
+            }
+        };
+    let retained_history = history_snapshot_reachable_keys(namespace, &retained_history_snapshot);
+    let pending_outcome = match drain_pending_deletes_with_retained_history(
         store,
         namespace,
         gc,
@@ -1357,9 +1667,13 @@ pub async fn run_gc_cycle_at(
                 error = %e,
                 "gc pending-delete drain failed; aborting cycle"
             );
-            return Ok(GcCycleReport::default());
+            return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
         }
     };
+    let PendingDeleteDrainOutcome {
+        report: pending_report,
+        complete: pending_complete,
+    } = pending_outcome;
     let base_report = GcCycleReport {
         objects_deleted: pending_report.objects_deleted,
         pending_deletes_deleted: pending_report.objects_deleted,
@@ -1373,7 +1687,7 @@ pub async fn run_gc_cycle_at(
         Ok(keys) => keys.into_iter().collect::<BTreeSet<_>>(),
         Err(e) => {
             warn!(namespace, error = %e, "gc listing failed; aborting cycle");
-            return Ok(base_report);
+            return Ok(GcCycleOutcome::incomplete(base_report));
         }
     };
 
@@ -1381,7 +1695,7 @@ pub async fn run_gc_cycle_at(
         Ok(candidates) => candidates,
         Err(e) => {
             warn!(namespace, error = %e, "gc candidate load failed; aborting cycle");
-            return Ok(base_report);
+            return Ok(GcCycleOutcome::incomplete(base_report));
         }
     };
 
@@ -1389,18 +1703,18 @@ pub async fn run_gc_cycle_at(
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
             warn!(namespace, "gc manifest missing; skipping namespace");
-            return Ok(base_report);
+            return Ok(GcCycleOutcome::incomplete(base_report));
         }
         Err(e) => {
             warn!(namespace, error = %e, "gc manifest read failed; aborting cycle");
-            return Ok(base_report);
+            return Ok(GcCycleOutcome::incomplete(base_report));
         }
     };
     let mark_staging = match active_staged_keys_at(store, namespace, now).await {
         Ok(staging) => staging,
         Err(e) => {
             warn!(namespace, error = %e, "gc active staging read failed; aborting cycle");
-            return Ok(base_report);
+            return Ok(GcCycleOutcome::incomplete(base_report));
         }
     };
     let mark_reachable = reachable_keys_with_retained_history_and_staging_keys(
@@ -1439,7 +1753,7 @@ pub async fn run_gc_cycle_at(
         let mut report = base_report;
         report.candidates_marked = 0;
         report.candidates_skipped = marked_candidates.len();
-        return Ok(report);
+        return Ok(GcCycleOutcome::incomplete(report));
     }
     crate::metrics::GC_CANDIDATES_MARKED_TOTAL
         .with_label_values(&[namespace])
@@ -1455,14 +1769,14 @@ pub async fn run_gc_cycle_at(
             let mut report = base_report;
             report.candidates_marked = candidates_marked;
             report.candidates_skipped = unknown_shape_skips;
-            return Ok(report);
+            return Ok(GcCycleOutcome::incomplete(report));
         }
         Err(e) => {
             warn!(namespace, error = %e, "gc manifest re-read failed; skipping deletes");
             let mut report = base_report;
             report.candidates_marked = candidates_marked;
             report.candidates_skipped = unknown_shape_skips;
-            return Ok(report);
+            return Ok(GcCycleOutcome::incomplete(report));
         }
     };
     let sweep_staging = match active_staged_keys_at(store, namespace, now).await {
@@ -1472,20 +1786,22 @@ pub async fn run_gc_cycle_at(
             let mut report = base_report;
             report.candidates_marked = candidates_marked;
             report.candidates_skipped = unknown_shape_skips;
-            return Ok(report);
+            return Ok(GcCycleOutcome::incomplete(report));
+        }
+    };
+    let sweep_history_snapshot = match load_history_snapshot(store, namespace, prior_entries).await
+    {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            warn!(namespace, error = %e, "gc retained history re-read failed; skipping sweep");
+            let mut report = base_report;
+            report.candidates_marked = candidates_marked;
+            report.candidates_skipped = unknown_shape_skips;
+            return Ok(GcCycleOutcome::incomplete(report));
         }
     };
     let sweep_retained_history =
-        match retained_manifest_history_reachable_keys(store, namespace).await {
-            Ok(keys) => keys,
-            Err(e) => {
-                warn!(namespace, error = %e, "gc retained history re-read failed; skipping sweep");
-                let mut report = base_report;
-                report.candidates_marked = candidates_marked;
-                report.candidates_skipped = unknown_shape_skips;
-                return Ok(report);
-            }
-        };
+        history_snapshot_reachable_keys(namespace, &sweep_history_snapshot);
     let sweep_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         &sweep_manifest,
@@ -1499,6 +1815,7 @@ pub async fn run_gc_cycle_at(
     let mut objects_deleted = pending_report.objects_deleted;
     let mut bytes_reclaimed = 0u64;
     let mut candidates_skipped = unknown_shape_skips;
+    let mut cycle_complete = pending_complete;
 
     for candidate in marked_candidates {
         if !listed_keys.contains(&candidate.key) {
@@ -1537,6 +1854,7 @@ pub async fn run_gc_cycle_at(
                     );
                 }
                 Err(e) => {
+                    cycle_complete = false;
                     log_gc_skip(namespace, &candidate.key, SkipReason::DeleteFailed);
                     warn!(
                         namespace,
@@ -1557,6 +1875,7 @@ pub async fn run_gc_cycle_at(
     }
 
     if let Err(e) = save_gc_candidates(store, namespace, &retained).await {
+        cycle_complete = false;
         warn!(
             namespace,
             error = %e,
@@ -1574,10 +1893,11 @@ pub async fn run_gc_cycle_at(
         manifest_history_pruned,
         bytes_reclaimed,
         candidates_skipped,
-        "gc cycle complete"
+        cycle_complete,
+        "gc cycle finished"
     );
 
-    Ok(GcCycleReport {
+    let report = GcCycleReport {
         candidates_marked,
         objects_deleted,
         pending_deletes_deleted: pending_report.objects_deleted,
@@ -1585,7 +1905,15 @@ pub async fn run_gc_cycle_at(
         pending_deletes_retained: pending_report.entries_retained,
         bytes_reclaimed,
         candidates_skipped,
-    })
+    };
+    if cycle_complete {
+        Ok(GcCycleOutcome::complete(
+            report,
+            sweep_history_snapshot.cacheable,
+        ))
+    } else {
+        Ok(GcCycleOutcome::incomplete(report))
+    }
 }
 
 /// Reads the current authoritative manifest without consulting a cache.

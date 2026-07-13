@@ -131,7 +131,7 @@
 //! The coordinator itself holds no mutex guard across object-store `.await`
 //! points; `Arc` expresses shared lifetime, not automatic locking.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,6 +150,7 @@ use crate::wal::Lease;
 use crate::wal::LeaseManager;
 use crate::wal::Manifest;
 
+use super::gc::{GcNamespaceIncarnation, GcRunner};
 use super::{CompactionResult, Compactor};
 
 /// Boot-time settings moved into the dedicated compaction runtime thread.
@@ -957,6 +958,7 @@ pub async fn compaction_loop(
         "background compaction loop started"
     );
 
+    let mut gc_runner = GcRunner::new(compactor.store().clone(), gc_config.clone());
     let mut tick: u64 = 0;
 
     loop {
@@ -969,17 +971,34 @@ pub async fn compaction_loop(
         }
 
         tick = tick.saturating_add(1);
-        let namespaces = if tick == 1 || tick % 12 == 0 {
+        let (namespaces, fresh_discovery) = if tick == 1 || tick % 12 == 0 {
             match namespace_manager.list(namespace_prefix.as_deref()).await {
-                Ok(ns) => ns,
+                Ok(ns) => (ns, true),
                 Err(e) => {
                     warn!(error = %e, "failed to list namespaces for compaction");
-                    namespace_manager.cached_namespaces(namespace_prefix.as_deref())
+                    (
+                        namespace_manager.cached_namespaces(namespace_prefix.as_deref()),
+                        false,
+                    )
                 }
             }
         } else {
-            namespace_manager.cached_namespaces(namespace_prefix.as_deref())
+            (
+                namespace_manager.cached_namespaces(namespace_prefix.as_deref()),
+                false,
+            )
         };
+
+        if fresh_discovery {
+            let active = namespaces
+                .iter()
+                .filter(|namespace| namespace.state == NamespaceState::Active)
+                .map(|namespace| {
+                    GcNamespaceIncarnation::new(namespace.name.clone(), namespace.created_at)
+                })
+                .collect::<BTreeSet<_>>();
+            gc_runner.retain_namespaces(&active);
+        }
 
         debug!(
             namespace_count = namespaces.len(),
@@ -988,6 +1007,7 @@ pub async fn compaction_loop(
 
         for ns in &namespaces {
             if ns.state == NamespaceState::Creating {
+                gc_runner.forget_namespace(&ns.name);
                 warn!(
                     namespace = %ns.name,
                     "skipping namespace whose initial manifest is not yet active"
@@ -995,6 +1015,7 @@ pub async fn compaction_loop(
                 continue;
             }
             if ns.state == NamespaceState::Deleting {
+                gc_runner.forget_namespace(&ns.name);
                 match namespace_manager
                     .finish_delete(&ns.name, Duration::from_secs(25))
                     .await
@@ -1031,13 +1052,12 @@ pub async fn compaction_loop(
                 continue;
             }
 
-            match super::gc::run_gc_cycle_at(
-                compactor.store(),
-                &ns.name,
-                &gc_config,
-                compactor.clock().now(),
-            )
-            .await
+            match gc_runner
+                .run_cycle_at(
+                    GcNamespaceIncarnation::new(ns.name.clone(), ns.created_at),
+                    compactor.clock().now(),
+                )
+                .await
             {
                 Ok(report) => {
                     if report.objects_deleted > 0

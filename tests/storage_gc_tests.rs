@@ -1,14 +1,15 @@
 mod common;
 
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
@@ -18,17 +19,20 @@ use ulid::Ulid;
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{compaction_loop, CompactionLoopOptions};
-use zeppelin::compaction::gc::{load_gc_candidates, run_gc_cycle};
+use zeppelin::compaction::gc::{
+    load_gc_candidates, run_gc_cycle, GcCycleReport, GcNamespaceIncarnation, GcRunner,
+};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, GcConfig, IndexingConfig};
 use zeppelin::namespace::NamespaceManager;
+use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::DistanceMetric;
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::{FragmentRef, Manifest, NamedSnapshot};
 use zeppelin::wal::{LeaseManager, WalReader};
 
 use common::assertions::{assert_s3_object_exists, assert_s3_object_not_exists};
-use common::counting::counting_store;
+use common::counting::{counting_store, GetCounter};
 use common::harness::TestHarness;
 
 fn unsafe_short_gc(horizon_secs: u64) -> GcConfig {
@@ -283,6 +287,154 @@ impl ObjectStore for PutOnNthDeleteStore {
     }
 }
 
+/// Transparent control layer for history LIST metadata and one-shot GET faults.
+///
+/// The wrapped backend remains the real MinIO store supplied by [`TestHarness`].
+/// Tests place [`common::counting::CountingStore`] outside this layer so every
+/// attempted GET, including an injected failure, remains observable.
+#[derive(Debug)]
+struct HistoryMetadataControlStore {
+    inner: Arc<dyn ObjectStore>,
+    history_prefix: Path,
+    strip_list_versions: Arc<AtomicBool>,
+    fail_next_get: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryMetadataControlHandle {
+    strip_list_versions: Arc<AtomicBool>,
+    fail_next_get: Arc<Mutex<Option<String>>>,
+}
+
+impl HistoryMetadataControlHandle {
+    fn set_strip_list_versions(&self, strip: bool) {
+        self.strip_list_versions.store(strip, Ordering::SeqCst);
+    }
+
+    fn fail_next_get(&self, key: String) {
+        *self
+            .fail_next_get
+            .lock()
+            .expect("history GET fault mutex poisoned") = Some(key);
+    }
+}
+
+impl HistoryMetadataControlStore {
+    fn wrap(
+        store: &ZeppelinStore,
+        history_prefix: String,
+    ) -> (ZeppelinStore, HistoryMetadataControlHandle) {
+        let strip_list_versions = Arc::new(AtomicBool::new(false));
+        let fail_next_get = Arc::new(Mutex::new(None));
+        let handle = HistoryMetadataControlHandle {
+            strip_list_versions: Arc::clone(&strip_list_versions),
+            fail_next_get: Arc::clone(&fail_next_get),
+        };
+        let controlled = Self {
+            inner: store.inner(),
+            history_prefix: Path::parse(history_prefix)
+                .expect("history control prefix must be a valid object path"),
+            strip_list_versions,
+            fail_next_get,
+        };
+        (ZeppelinStore::new(Arc::new(controlled)), handle)
+    }
+}
+
+impl fmt::Display for HistoryMetadataControlStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HistoryMetadataControlStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for HistoryMetadataControlStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        let should_fail = {
+            let mut fail_next_get = self
+                .fail_next_get
+                .lock()
+                .expect("history GET fault mutex poisoned");
+            if fail_next_get.as_deref() == Some(location.as_ref()) {
+                fail_next_get.take();
+                true
+            } else {
+                false
+            }
+        };
+        if should_fail {
+            return Err(object_store::Error::Generic {
+                store: "history_metadata_control",
+                source: Box::new(std::io::Error::other(
+                    "injected one-shot history GET failure",
+                )),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        let strip_versions =
+            self.strip_list_versions.load(Ordering::SeqCst) && prefix == Some(&self.history_prefix);
+        self.inner
+            .list(prefix)
+            .map(move |result| {
+                result.map(|mut object| {
+                    if strip_versions {
+                        object.e_tag = None;
+                        object.version = None;
+                    }
+                    object
+                })
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
 fn manifest_json_bytes_with_version(manifest: &Manifest, version: u64) -> Bytes {
     let mut value = serde_json::to_value(manifest).expect("manifest must serialize");
     value
@@ -290,6 +442,54 @@ fn manifest_json_bytes_with_version(manifest: &Manifest, version: u64) -> Bytes 
         .expect("manifest must serialize as an object")
         .insert("version".to_string(), serde_json::json!(version));
     Bytes::from(serde_json::to_vec(&value).expect("manifest json must serialize"))
+}
+
+fn memo_gc() -> GcConfig {
+    GcConfig {
+        manifest_history_keep_count: 64,
+        pitr_retention_secs: 0,
+        ..unsafe_short_gc(0)
+    }
+}
+
+async fn seed_manifest_history(store: &ZeppelinStore, namespace: &str, generations: u64) {
+    assert!(generations > 0, "history fixture must contain a generation");
+    Manifest::new().write(store, namespace).await.unwrap();
+    for generation in 2..=generations {
+        let (mut manifest, etag) = Manifest::read_versioned(store, namespace)
+            .await
+            .unwrap()
+            .unwrap();
+        manifest.updated_at = DateTime::<Utc>::from_timestamp(1_700_000_000 + generation as i64, 0)
+            .expect("fixed fixture timestamp must be valid");
+        manifest
+            .write_conditional(store, namespace, &etag)
+            .await
+            .unwrap();
+    }
+}
+
+async fn put_history_revision(store: &ZeppelinStore, namespace: &str, version: u64, revision: i64) {
+    let updated_at = DateTime::<Utc>::from_timestamp(1_710_000_000 + revision, 0)
+        .expect("fixed history revision timestamp must be valid");
+    let manifest = Manifest::new_at(updated_at);
+    store
+        .put(
+            &Manifest::history_key(namespace, version),
+            manifest_json_bytes_with_version(&manifest, version),
+        )
+        .await
+        .unwrap();
+}
+
+async fn run_counted_gc_cycle(
+    runner: &mut GcRunner,
+    incarnation: &GcNamespaceIncarnation,
+    now: DateTime<Utc>,
+    counter: &GetCounter,
+) -> GcCycleReport {
+    counter.reset();
+    runner.run_cycle_at(incarnation.clone(), now).await.unwrap()
 }
 
 #[tokio::test]
@@ -942,6 +1142,290 @@ async fn gc_cycle_rereads_retained_manifest_history_before_sweep() {
     assert!(
         counter.list_calls_for_prefix(&history_prefix) <= 3,
         "one GC cycle should list retained history only for pruning, drain/mark, and sweep revalidation"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_history_memo_tracks_etags_and_lifecycle() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-history-memo");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    seed_manifest_history(&store, &namespace, 3).await;
+
+    let (counted_store, counter) = counting_store(&store);
+    let gc = memo_gc();
+    let mut runner = GcRunner::new(counted_store.clone(), gc.clone());
+    let created_at = Utc::now();
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), created_at);
+    let now = Utc::now();
+
+    run_counted_gc_cycle(&mut runner, &incarnation, now, &counter).await;
+    assert_eq!(counter.gets_matching(&history_prefix), 9);
+    for version in 1..=3 {
+        assert_eq!(
+            counter.gets_matching(&Manifest::history_key(&namespace, version)),
+            3,
+            "cold runner must read generation {version} in every GC history phase"
+        );
+    }
+
+    run_counted_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+    )
+    .await;
+    assert_eq!(
+        counter.gets_matching(&history_prefix),
+        0,
+        "an unchanged completed cycle must reuse every validated history body"
+    );
+
+    put_history_revision(&store, &namespace, 4, 1).await;
+    run_counted_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(2),
+        &counter,
+    )
+    .await;
+    assert_eq!(counter.gets_matching(&history_prefix), 3);
+    for version in 1..=3 {
+        assert_eq!(
+            counter.gets_matching(&Manifest::history_key(&namespace, version)),
+            0,
+            "existing generation {version} must remain memoized"
+        );
+    }
+    assert_eq!(
+        counter.gets_matching(&Manifest::history_key(&namespace, 4)),
+        3,
+        "a newly listed generation must be read in every authority phase"
+    );
+
+    run_counted_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(3),
+        &counter,
+    )
+    .await;
+    assert_eq!(counter.gets_matching(&history_prefix), 0);
+
+    put_history_revision(&store, &namespace, 4, 2).await;
+    run_counted_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(4),
+        &counter,
+    )
+    .await;
+    assert_eq!(counter.gets_matching(&history_prefix), 3);
+    assert_eq!(
+        counter.gets_matching(&Manifest::history_key(&namespace, 4)),
+        3,
+        "a changed ETag must invalidate the exact cached generation"
+    );
+    for version in 1..=3 {
+        assert_eq!(
+            counter.gets_matching(&Manifest::history_key(&namespace, version)),
+            0,
+            "a changed sibling must not invalidate generation {version}"
+        );
+    }
+
+    let recreated =
+        GcNamespaceIncarnation::new(namespace.clone(), created_at + chrono::Duration::seconds(1));
+    run_counted_gc_cycle(
+        &mut runner,
+        &recreated,
+        now + chrono::Duration::seconds(5),
+        &counter,
+    )
+    .await;
+    assert_eq!(
+        counter.gets_matching(&history_prefix),
+        12,
+        "a new incarnation of the same namespace name must start cold"
+    );
+
+    let mut restarted = GcRunner::new(counted_store, gc);
+    run_counted_gc_cycle(
+        &mut restarted,
+        &recreated,
+        now + chrono::Duration::seconds(6),
+        &counter,
+    )
+    .await;
+    assert_eq!(
+        counter.gets_matching(&history_prefix),
+        12,
+        "a fresh process-local runner must never inherit memo state"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_missing_history_etag_is_never_cacheable() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-history-unversioned");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    seed_manifest_history(&store, &namespace, 3).await;
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, history_prefix.clone());
+    control.set_strip_list_versions(true);
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(counted_store, memo_gc());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+
+    run_counted_gc_cycle(&mut runner, &incarnation, now, &counter).await;
+    assert_eq!(counter.gets_matching(&history_prefix), 9);
+
+    run_counted_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+    )
+    .await;
+    assert_eq!(
+        counter.gets_matching(&history_prefix),
+        9,
+        "history with no LIST ETag/backend version must be reread every cycle"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_failed_refresh_does_not_commit_partial_memo() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-history-refresh-failure");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    let first_key = Manifest::history_key(&namespace, 1);
+    let second_key = Manifest::history_key(&namespace, 2);
+    let third_key = Manifest::history_key(&namespace, 3);
+    seed_manifest_history(&store, &namespace, 3).await;
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, history_prefix.clone());
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(counted_store, memo_gc());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+
+    run_counted_gc_cycle(&mut runner, &incarnation, now, &counter).await;
+    assert_eq!(counter.gets_matching(&history_prefix), 9);
+    run_counted_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+    )
+    .await;
+    assert_eq!(counter.gets_matching(&history_prefix), 0);
+
+    put_history_revision(&store, &namespace, 1, 11).await;
+    put_history_revision(&store, &namespace, 2, 12).await;
+    control.fail_next_get(second_key.clone());
+
+    let failed = run_counted_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(2),
+        &counter,
+    )
+    .await;
+    assert_eq!(failed, GcCycleReport::default());
+    assert_eq!(counter.gets_matching(&history_prefix), 2);
+    assert_eq!(counter.gets_matching(&first_key), 1);
+    assert_eq!(counter.gets_matching(&second_key), 1);
+    assert_eq!(counter.gets_matching(&third_key), 0);
+
+    run_counted_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(3),
+        &counter,
+    )
+    .await;
+    assert_eq!(
+        counter.gets_matching(&history_prefix),
+        6,
+        "retry must reload both changed entries; no partial failed refresh may commit"
+    );
+    assert_eq!(counter.gets_matching(&first_key), 3);
+    assert_eq!(counter.gets_matching(&second_key), 3);
+    assert_eq!(counter.gets_matching(&third_key), 0);
+
+    run_counted_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(4),
+        &counter,
+    )
+    .await;
+    assert_eq!(
+        counter.gets_matching(&history_prefix),
+        0,
+        "the first complete retry should commit the refreshed memo"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_pending_delete_failure_does_not_publish_history_memo() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-pending-delete-failure");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+
+    Manifest::new().write(&store, &namespace).await.unwrap();
+    let (mut live, etag) = Manifest::read_versioned(&store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    live.pending_deletes
+        .push(format!("{namespace}/wal//invalid.wal"));
+    live.write_conditional(&store, &namespace, &etag)
+        .await
+        .unwrap();
+    store
+        .delete(&Manifest::history_key(&namespace, 2))
+        .await
+        .unwrap();
+
+    let (counted_store, counter) = counting_store(&store);
+    let mut runner = GcRunner::new(counted_store, memo_gc());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+
+    let first = run_counted_gc_cycle(&mut runner, &incarnation, now, &counter).await;
+    assert_eq!(first.pending_deletes_retained, 1);
+    assert_eq!(counter.gets_matching(&history_prefix), 3);
+
+    let second = run_counted_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+    )
+    .await;
+    assert_eq!(second.pending_deletes_retained, 1);
+    assert_eq!(
+        counter.gets_matching(&history_prefix),
+        3,
+        "a caught pending-delete storage failure must keep the next cycle cold"
     );
 
     harness.cleanup().await;

@@ -134,7 +134,7 @@ use std::ops::Range;
 use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
-use crate::storage::ZeppelinStore;
+use crate::storage::{ListedObject, StorageVersion, ZeppelinStore};
 
 /// Prefix byte identifying Zeppelin's current MessagePack manifest encoding.
 ///
@@ -558,6 +558,20 @@ pub struct ManifestHistoryRef {
     pub version: u64,
     /// Immutable S3 key containing the serialized manifest snapshot.
     pub key: String,
+}
+
+/// One fresh object-store observation of an immutable history generation.
+///
+/// The history reference is parsed from the reserved key grammar while the
+/// optional storage version is preserved exactly as LIST reported it. Absence
+/// never authorizes reuse: callers must read and validate the body whenever
+/// `storage_version` is `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestHistoryObservation {
+    /// Parsed generation and exact immutable object key.
+    pub(crate) history: ManifestHistoryRef,
+    /// Opaque backend identity observed by the same recursive LIST.
+    pub(crate) storage_version: Option<StorageVersion>,
 }
 
 /// Persisted point-in-time-recovery pin for one manifest generation.
@@ -1513,20 +1527,51 @@ impl Manifest {
         store: &ZeppelinStore,
         namespace: &str,
     ) -> Result<Vec<ManifestHistoryRef>> {
-        let prefix = Self::history_prefix(namespace);
-        let mut entries = store
-            .list_prefix(&prefix)
+        Ok(Self::list_history_observations(store, namespace)
             .await?
             .into_iter()
-            .map(|key| {
-                Ok(ManifestHistoryRef {
-                    version: Self::history_version_from_key(namespace, &key)?,
-                    key,
+            .map(|observation| observation.history)
+            .collect())
+    }
+
+    /// Lists history refs together with the opaque version observed by LIST.
+    ///
+    /// Every invocation performs a fresh metadata-preserving prefix LIST. The
+    /// result is sorted by parsed generation, matching [`Self::list_history`],
+    /// and a missing backend version remains `None` so disposable callers cannot
+    /// mistake two unversioned observations for proof that an object is unchanged.
+    pub(crate) async fn list_history_observations(
+        store: &ZeppelinStore,
+        namespace: &str,
+    ) -> Result<Vec<ManifestHistoryObservation>> {
+        let prefix = Self::history_prefix(namespace);
+        Self::history_observations_from_listed(namespace, store.list_prefix_meta(&prefix).await?)
+    }
+
+    /// Parses one metadata-preserving LIST result using the canonical key grammar.
+    fn history_observations_from_listed(
+        namespace: &str,
+        listed: Vec<ListedObject>,
+    ) -> Result<Vec<ManifestHistoryObservation>> {
+        let mut observations = listed
+            .into_iter()
+            .map(|object| {
+                Ok(ManifestHistoryObservation {
+                    history: ManifestHistoryRef {
+                        version: Self::history_version_from_key(namespace, &object.key)?,
+                        key: object.key,
+                    },
+                    storage_version: object.version,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        entries.sort_by_key(|entry| entry.version);
-        Ok(entries)
+        observations.sort_by(|left, right| {
+            left.history
+                .version
+                .cmp(&right.history.version)
+                .then_with(|| left.history.key.cmp(&right.history.key))
+        });
+        Ok(observations)
     }
 
     /// Reads and validates a retained manifest by persisted generation.
@@ -1563,20 +1608,36 @@ impl Manifest {
         version: u64,
     ) -> Result<Option<Self>> {
         let key = Self::history_key(namespace, version);
-        match store.get(&key).await {
-            Ok(data) => {
-                let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
-                if manifest.version() != version {
-                    return Err(ZeppelinError::Serialization(format!(
-                        "manifest history key {key} contains version {}, expected {version}",
-                        manifest.version()
-                    )));
-                }
-                Ok(Some(manifest))
-            }
+        let history = ManifestHistoryRef { version, key };
+        match store.get(&history.key).await {
+            Ok(data) => Ok(Some(Self::decode_history_body(&data, namespace, &history)?)),
             Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Decodes one history body against its observed namespace and generation.
+    ///
+    /// This crate-visible seam is shared by direct reads and disposable history
+    /// memos. It deliberately delegates namespace binding to
+    /// [`Self::from_bytes_for_namespace`] and performs the same persisted-version
+    /// check as [`Self::read_history`], keeping one validation grammar for every
+    /// body consumer.
+    pub(crate) fn decode_history_body(
+        data: &[u8],
+        namespace: &str,
+        history: &ManifestHistoryRef,
+    ) -> Result<Self> {
+        let manifest = Self::from_bytes_for_namespace(data, namespace)?;
+        if manifest.version() != history.version {
+            return Err(ZeppelinError::Serialization(format!(
+                "manifest history key {} contains version {}, expected {}",
+                history.key,
+                manifest.version(),
+                history.version
+            )));
+        }
+        Ok(manifest)
     }
 
     /// Deletes old history using only a most-recent-count retention rule.
@@ -2278,7 +2339,10 @@ impl NamedSnapshot {
     ///
     /// Pins `daily` and `weekly` may both target generation 7 while `release`
     /// targets generation 9; the returned set is `{7, 9}`.
-    async fn pinned_generations(store: &ZeppelinStore, namespace: &str) -> Result<HashSet<u64>> {
+    pub(crate) async fn pinned_generations(
+        store: &ZeppelinStore,
+        namespace: &str,
+    ) -> Result<HashSet<u64>> {
         Ok(Self::list(store, namespace)
             .await?
             .into_iter()
@@ -2561,6 +2625,126 @@ mod tests {
             .unwrap();
         assert_eq!(v2.fragments.len(), 1);
         assert_eq!(v2.fragments[0].vector_count, 3);
+    }
+
+    /// Preserves LIST metadata alongside strict, numerically sorted history refs.
+    #[tokio::test]
+    async fn manifest_history_observations_preserve_versions_and_project_to_refs() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let ns = "manifest_history_observations";
+
+        Manifest::new().write(&store, ns).await.unwrap();
+        for _ in 2..=3 {
+            let (mut manifest, etag) = Manifest::read_versioned(&store, ns).await.unwrap().unwrap();
+            manifest.updated_at = Utc::now();
+            manifest.write_conditional(&store, ns, &etag).await.unwrap();
+        }
+
+        let observations = Manifest::list_history_observations(&store, ns)
+            .await
+            .unwrap();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.history.version)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.storage_version.is_some()),
+            "the in-memory backend supplies opaque object versions"
+        );
+
+        let projected = observations
+            .into_iter()
+            .map(|observation| observation.history)
+            .collect::<Vec<_>>();
+        assert_eq!(Manifest::list_history(&store, ns).await.unwrap(), projected);
+    }
+
+    /// Makes ordering independent of backend LIST order without inventing versions.
+    #[test]
+    fn manifest_history_observations_sort_numeric_generations_and_keep_none() {
+        let ns = "manifest_history_observation_sort";
+        let now = Utc::now();
+        let listed = vec![
+            ListedObject {
+                key: Manifest::history_key(ns, 10),
+                size: 10,
+                last_modified: now,
+                version: Some(StorageVersion::BackendVersion("v10".to_string())),
+            },
+            ListedObject {
+                key: Manifest::history_key(ns, 2),
+                size: 2,
+                last_modified: now,
+                version: None,
+            },
+            ListedObject {
+                key: Manifest::history_key(ns, 3),
+                size: 3,
+                last_modified: now,
+                version: Some(StorageVersion::Etag("etag-3".to_string())),
+            },
+        ];
+
+        let observations = Manifest::history_observations_from_listed(ns, listed).unwrap();
+
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.history.version)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 10]
+        );
+        assert_eq!(observations[0].storage_version, None);
+        assert_eq!(
+            observations[1].storage_version,
+            Some(StorageVersion::Etag("etag-3".to_string()))
+        );
+        assert_eq!(
+            observations[2].storage_version,
+            Some(StorageVersion::BackendVersion("v10".to_string()))
+        );
+    }
+
+    /// Keeps namespace binding and key-generation checks centralized for memo fills.
+    #[test]
+    fn manifest_history_body_decode_reuses_namespace_and_generation_validation() {
+        let ns = "manifest_history_decode";
+        let mut manifest = Manifest::new();
+        manifest.version = 7;
+        manifest.namespace = Some(ns.to_string());
+        let bytes = manifest.to_bytes().unwrap();
+        let history = ManifestHistoryRef {
+            version: 7,
+            key: Manifest::history_key(ns, 7),
+        };
+
+        let decoded = Manifest::decode_history_body(&bytes, ns, &history).unwrap();
+        assert_eq!(decoded.version(), 7);
+
+        let wrong_generation = ManifestHistoryRef {
+            version: 8,
+            key: Manifest::history_key(ns, 8),
+        };
+        let generation_error =
+            Manifest::decode_history_body(&bytes, ns, &wrong_generation).unwrap_err();
+        assert!(
+            matches!(generation_error, ZeppelinError::Serialization(message)
+                if message.contains("contains version 7, expected 8"))
+        );
+
+        let namespace_error =
+            Manifest::decode_history_body(&bytes, "another_namespace", &history).unwrap_err();
+        assert!(
+            matches!(namespace_error, ZeppelinError::Serialization(message)
+            if message.contains(
+                "namespace binding mismatch: expected another_namespace, got manifest_history_decode"
+            ))
+        );
     }
 
     /// Protects count-only retention: pruning removes the oldest generations

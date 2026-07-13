@@ -210,6 +210,15 @@ pub(crate) enum BackgroundMaintenanceCase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GarbageCollectionCase {
+    HistoryMemoWarmUnchanged,
+    HistoryMemoNewGeneration,
+    HistoryMemoChangedEtag,
+    HistoryMemoMissingEtag,
+    HistoryMemoDisappearsBetweenListAndGet,
+    HistoryMemoUnpublishedOrphanOverwrite,
+    HistoryMemoCorruptChangedBody,
+    HistoryMemoNamespaceRecreated,
+    HistoryMemoColdRunnerRestart,
     PendingDeleteYoung,
     PendingDeleteHistoryPinned,
     PendingDeleteEligible,
@@ -681,6 +690,55 @@ pub(crate) const IDEAL_CASES: &[IdealCase] = &[
         IdealOperation::BackgroundMaintenance(BackgroundMaintenanceCase::TickCompactionSuccess),
     ),
     // GC mark/sweep, pending-delete, history, and staging states.
+    ideal_case(
+        "gc.history_memo_warm_unchanged",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::HistoryMemoWarmUnchanged),
+    ),
+    ideal_case(
+        "gc.history_memo_new_generation",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::HistoryMemoNewGeneration),
+    ),
+    ideal_case(
+        "gc.history_memo_changed_etag",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::HistoryMemoChangedEtag),
+    ),
+    ideal_case(
+        "gc.history_memo_missing_etag",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::HistoryMemoMissingEtag),
+    ),
+    ideal_case(
+        "gc.history_memo_disappears_between_list_and_get",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(
+            GarbageCollectionCase::HistoryMemoDisappearsBetweenListAndGet,
+        ),
+    ),
+    ideal_case(
+        "gc.history_memo_unpublished_orphan_overwrite",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(
+            GarbageCollectionCase::HistoryMemoUnpublishedOrphanOverwrite,
+        ),
+    ),
+    ideal_case(
+        "gc.history_memo_corrupt_changed_body",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::HistoryMemoCorruptChangedBody),
+    ),
+    ideal_case(
+        "gc.history_memo_namespace_recreated",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::HistoryMemoNamespaceRecreated),
+    ),
+    ideal_case(
+        "gc.history_memo_cold_runner_restart",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::HistoryMemoColdRunnerRestart),
+    ),
     ideal_case(
         "gc.pending_delete_young",
         IdealCaseGroup::GarbageCollection,
