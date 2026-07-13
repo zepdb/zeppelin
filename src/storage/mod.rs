@@ -25,8 +25,8 @@
 //!
 //! ## Rust concepts used here
 //!
-//! `pub use` re-exports the gateway and deletion result so callers depend on the
-//! stable `crate::storage` boundary rather than the implementation file layout.
+//! `pub use` re-exports the gateway, LIST metadata, and deletion result so callers
+//! depend on the stable `crate::storage` boundary rather than the implementation file layout.
 //! This resembles a Java package facade or a public C header: implementation can
 //! stay in a submodule while the compiler checks which names are part of the
 //! public API.
@@ -34,5 +34,5 @@
 /// Implements backend construction and normalized storage operations.
 pub mod store;
 
-/// Re-exports the storage gateway and bounded-cleanup progress type.
-pub use store::{DeletePrefixOutcome, ZeppelinStore};
+/// Re-exports the storage gateway and its domain-facing result types.
+pub use store::{DeletePrefixOutcome, ListedObject, StorageVersion, ZeppelinStore};

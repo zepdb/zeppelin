@@ -30,6 +30,7 @@ pub(crate) enum StoreMethod {
     CopyIfNotExists,
     Delete,
     ListPrefix,
+    ListPrefixMeta,
     ListCommonPrefixes,
     Exists,
     Head,
@@ -56,6 +57,7 @@ const STORAGE_METHOD_INVENTORY: &[StorageMethodInventory] = &[
     object_store_method(StoreMethod::CopyIfNotExists, "copy_if_not_exists"),
     object_store_method(StoreMethod::Delete, "delete"),
     object_store_method(StoreMethod::ListPrefix, "list_prefix"),
+    object_store_method(StoreMethod::ListPrefixMeta, "list_prefix_meta"),
     object_store_method(StoreMethod::ListCommonPrefixes, "list_common_prefixes"),
     object_store_method(StoreMethod::Exists, "exists"),
     object_store_method(StoreMethod::Head, "head"),
@@ -523,6 +525,15 @@ const PRODUCTION_PATHS: &[ProductionPath] = &[
         &[PhysicalVariant::GetMultiRange],
         PathCoverage::NoProductionCaller {
             reason: "the gateway method currently has no production caller",
+        },
+    ),
+    path(
+        "storage.list_prefix_meta_no_production_caller",
+        "src/storage/store.rs:ZeppelinStore::list_prefix_meta",
+        &[StoreMethod::ListPrefixMeta],
+        &[PhysicalVariant::ListRecursive],
+        PathCoverage::NoProductionCaller {
+            reason: "metadata-preserving recursive LIST is introduced for the validated warm-GC inventory and has no production caller before that optimization lands",
         },
     ),
     path(

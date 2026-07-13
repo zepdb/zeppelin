@@ -1,11 +1,14 @@
 //! Safe HTTP/control-plane executors for ideal-analysis catalog cases.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use zeppelin::config::Config;
 use zeppelin::namespace::manager::{NamespaceMetadata, NamespaceState};
+use zeppelin::time::{Clock, TimeSource};
 use zeppelin::wal::manifest::NamedSnapshot;
 
 use crate::common::counting::{counting_store, ClassStats, GetCounter};
@@ -22,6 +25,21 @@ use super::catalog::{
 
 const SNAPSHOT_NAME: &str = "ideal-pin";
 
+#[derive(Debug)]
+struct FixedHttpTime(DateTime<Utc>);
+
+impl TimeSource for FixedHttpTime {
+    fn now(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+fn ideal_http_clock() -> Clock {
+    let now = DateTime::from_timestamp(1_750_000_000, 987_654_321)
+        .expect("fixed HTTP ideal timestamp must be representable");
+    Clock::from_source(Arc::new(FixedHttpTime(now)))
+}
+
 /// Execute one supported HTTP/control-plane case against real TestHarness
 /// storage. Unsupported catalog groups return `None` for another executor.
 #[must_use]
@@ -37,12 +55,13 @@ pub(crate) async fn execute(case: &IdealCase) -> Option<IdealSample> {
     let config = ideal_http_config();
     let namespace = api_ns(&harness, "ideal-http");
     let client = Client::new();
+    let clock = ideal_http_clock();
     let mut server = start_test_server_full(
         instrumented_store.clone(),
         Some(harness.prefix.clone()),
         config.clone(),
         false,
-        None,
+        Some(clock.clone()),
     )
     .await;
 
@@ -54,7 +73,7 @@ pub(crate) async fn execute(case: &IdealCase) -> Option<IdealSample> {
             Some(harness.prefix.clone()),
             config,
             false,
-            None,
+            Some(clock),
         )
         .await;
     }

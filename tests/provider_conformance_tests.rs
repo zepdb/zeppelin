@@ -11,6 +11,57 @@ use common::harness::TestHarness;
 use zeppelin::error::ZeppelinError;
 
 #[tokio::test]
+async fn list_metadata_preserves_version_token() {
+    let harness = TestHarness::new().await;
+    let prefix = harness.key("provider-conformance-list-meta");
+    let key = format!("{prefix}/object.bin");
+    let first = Bytes::from_static(b"first-version");
+    let second = Bytes::from_static(b"other-version");
+
+    harness.store.put(&key, first.clone()).await.unwrap();
+
+    let listed = harness
+        .store
+        .list_prefix_meta(&format!("{prefix}/"))
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].key, key);
+    assert_eq!(listed[0].size, first.len() as u64);
+    let first_etag = listed[0]
+        .version
+        .as_ref()
+        .and_then(zeppelin::storage::StorageVersion::etag)
+        .expect("supported backend LIST must preserve the object ETag");
+    assert!(harness
+        .store
+        .get_if_none_match(&key, first_etag)
+        .await
+        .unwrap()
+        .is_none());
+    let head = harness.store.head(&key).await.unwrap();
+    assert_eq!(head.e_tag.as_deref(), Some(first_etag));
+
+    harness.store.put(&key, second.clone()).await.unwrap();
+    let relisted = harness
+        .store
+        .list_prefix_meta(&format!("{prefix}/"))
+        .await
+        .unwrap();
+    assert_eq!(relisted.len(), 1);
+    assert_eq!(relisted[0].key, key);
+    assert_eq!(relisted[0].size, second.len() as u64);
+    let second_etag = relisted[0]
+        .version
+        .as_ref()
+        .and_then(zeppelin::storage::StorageVersion::etag)
+        .expect("supported backend LIST must preserve the replacement ETag");
+    assert_ne!(second_etag, first_etag);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn supported_backend_honors_exact_atomic_strong_object_semantics() {
     let harness = TestHarness::new().await;
     let store = harness.store.clone();

@@ -83,6 +83,7 @@
 //! conflicts, missing objects, and storage failures explicitly.
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut, S3CopyIfNotExists};
 use object_store::path::Path;
 use object_store::{
@@ -134,6 +135,59 @@ pub struct DeletePrefixOutcome {
     pub deleted: usize,
     /// Whether the pass observed the end of the source listing before stopping.
     pub complete: bool,
+}
+
+/// One non-empty opaque backend identity observed for an object-store object.
+///
+/// ETag takes precedence when a backend supplies both forms because S3 exposes
+/// it consistently on LIST and GET. Absence is represented by `None` on the
+/// containing [`ListedObject`], so two unversioned observations cannot compare
+/// equal as if they authorized cache reuse.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StorageVersion {
+    /// Entity tag supplied by the backend.
+    Etag(String),
+    /// Backend-specific version used only when no ETag is available.
+    BackendVersion(String),
+}
+
+impl StorageVersion {
+    /// Returns the ETag when this identity came from an ETag observation.
+    #[must_use]
+    pub fn etag(&self) -> Option<&str> {
+        match self {
+            Self::Etag(etag) => Some(etag),
+            Self::BackendVersion(_) => None,
+        }
+    }
+
+    fn from_parts(etag: Option<String>, backend_version: Option<String>) -> Option<Self> {
+        etag.filter(|value| !value.is_empty())
+            .map(Self::Etag)
+            .or_else(|| {
+                backend_version
+                    .filter(|value| !value.is_empty())
+                    .map(Self::BackendVersion)
+            })
+    }
+}
+
+/// Storage-owned metadata for one object returned by a recursive LIST.
+///
+/// Domain layers receive this type instead of depending directly on
+/// `object_store::ObjectMeta`. The metadata is an observation from S3, not a
+/// replacement for an authoritative body read when the version is absent or
+/// has changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    /// Exact object key returned by the backend.
+    pub key: String,
+    /// Object payload size in bytes.
+    pub size: u64,
+    /// Backend-reported last modification timestamp.
+    pub last_modified: DateTime<Utc>,
+    /// Non-empty opaque identity, or `None` when this observation is unversioned.
+    pub version: Option<StorageVersion>,
 }
 
 /// Constructs backends and performs Zeppelin's normalized storage operations.
@@ -1225,6 +1279,27 @@ impl ZeppelinStore {
     /// [`Self::list_common_prefixes`] for immediate children instead.
     #[instrument(skip(self), fields(prefix = prefix))]
     pub async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list_prefix_meta_inner(prefix)
+            .await?
+            .into_iter()
+            .map(|object| object.key)
+            .collect())
+    }
+
+    /// Lists every object and its backend metadata beneath a non-empty prefix.
+    ///
+    /// This performs the same one logical recursive LIST as
+    /// [`Self::list_prefix`] while preserving the object identity needed to
+    /// validate disposable caches. Backend pagination may issue multiple remote
+    /// requests. An absent ETag and backend version produces `version: None`;
+    /// Zeppelin never invents a version token.
+    #[instrument(skip(self), fields(prefix = prefix))]
+    pub async fn list_prefix_meta(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        self.list_prefix_meta_inner(prefix).await
+    }
+
+    async fn list_prefix_meta_inner(&self, prefix: &str) -> Result<Vec<ListedObject>> {
         assert!(
             !prefix.is_empty(),
             "recursive root listing must use list_common_prefixes"
@@ -1235,17 +1310,34 @@ impl ZeppelinStore {
         let path = Path::parse(prefix)?;
         let stream = self.inner.list(Some(&path));
         let objects: Vec<_> = stream.try_collect().await?;
-        let keys: Vec<String> = objects.iter().map(|o| o.location.to_string()).collect();
+        let objects = objects
+            .into_iter()
+            .map(|object| {
+                let key = object.location.to_string();
+                let size = u64::try_from(object.size).map_err(|_| {
+                    ZeppelinError::Validation(format!(
+                        "listed object {key} size does not fit in u64: {}",
+                        object.size
+                    ))
+                })?;
+                Ok(ListedObject {
+                    key,
+                    size,
+                    last_modified: object.last_modified,
+                    version: StorageVersion::from_parts(object.e_tag, object.version),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let elapsed = start.elapsed();
         debug!(
             elapsed_ms = elapsed.as_millis(),
-            count = keys.len(),
+            count = objects.len(),
             "s3 list_prefix"
         );
         crate::metrics::S3_OPERATION_DURATION
             .with_label_values(&["list_prefix"])
             .observe(elapsed.as_secs_f64());
-        Ok(keys)
+        Ok(objects)
     }
 
     /// Discovers unique immediate child prefixes without recursively returning all objects.

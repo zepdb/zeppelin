@@ -1,13 +1,16 @@
 //! Isolated namespace-discovery, recovery, and deletion measurements.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use zeppelin::namespace::manager::{NamespaceMetadata, NamespaceState};
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::storage::ZeppelinStore;
+use zeppelin::time::{Clock, TimeSource};
 use zeppelin::types::DistanceMetric;
 use zeppelin::wal::Manifest;
 
@@ -90,6 +93,15 @@ struct NamespaceWorld {
     tracker: DepthTracker,
 }
 
+#[derive(Debug)]
+struct FixedNamespaceTime(DateTime<Utc>);
+
+impl TimeSource for FixedNamespaceTime {
+    fn now(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
 impl NamespaceWorld {
     async fn new() -> Self {
         let harness = TestHarness::new().await;
@@ -108,7 +120,13 @@ impl NamespaceWorld {
     }
 
     fn manager(&self) -> NamespaceManager {
-        NamespaceManager::new_with_registry_ttl(self.store.clone(), Duration::from_secs(3_600))
+        let now = DateTime::from_timestamp(1_750_000_000, 123_456_789)
+            .expect("fixed namespace ideal timestamp must be representable");
+        NamespaceManager::with_clock(
+            self.store.clone(),
+            Duration::from_secs(3_600),
+            Clock::from_source(Arc::new(FixedNamespaceTime(now))),
+        )
     }
 
     async fn begin_measurement(&self) {
