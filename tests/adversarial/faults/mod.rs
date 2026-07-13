@@ -3,6 +3,7 @@ pub mod http_proxy;
 pub mod process;
 pub mod store_proxy;
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -398,6 +399,16 @@ pub struct StoreFaultAction {
     pub call_ordinal: u64,
     pub latency_ms: Option<u64>,
     pub window: bool,
+    event_index: usize,
+    deferred_get: bool,
+    reserved_get: bool,
+}
+
+impl StoreFaultAction {
+    #[must_use]
+    pub fn is_deferred_get(&self) -> bool {
+        self.deferred_get
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -482,6 +493,14 @@ struct EventRuntime {
     ended: AtomicBool,
     matches: AtomicU64,
     claimed_op: AtomicU64,
+    store_reservation: Mutex<StoreReservationState>,
+    store_reservation_revision_tx: tokio::sync::watch::Sender<u64>,
+}
+
+#[derive(Debug, Default)]
+struct StoreReservationState {
+    owner: Option<u64>,
+    waiters: VecDeque<u64>,
 }
 
 #[derive(Debug)]
@@ -504,6 +523,89 @@ pub struct FaultScheduler {
     runtime: Arc<SchedulerRuntime>,
     rng_salt: u64,
     process: Option<Arc<Mutex<ProcessController>>>,
+}
+
+struct StoreReservationWaiter {
+    runtime: Arc<SchedulerRuntime>,
+    event_index: usize,
+    call_ordinal: u64,
+    queued: bool,
+}
+
+impl StoreReservationWaiter {
+    fn enqueue(scheduler: &FaultScheduler, event_index: usize, call_ordinal: u64) -> Self {
+        let event_runtime = &scheduler.runtime.events[event_index];
+        let mut reservation = event_runtime
+            .store_reservation
+            .lock()
+            .expect("store reservation mutex poisoned");
+        assert!(
+            !reservation.waiters.contains(&call_ordinal),
+            "store call {call_ordinal} queued twice"
+        );
+        reservation.waiters.push_back(call_ordinal);
+        drop(reservation);
+        event_runtime
+            .store_reservation_revision_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+        Self {
+            runtime: Arc::clone(&scheduler.runtime),
+            event_index,
+            call_ordinal,
+            queued: true,
+        }
+    }
+
+    fn try_acquire(&mut self) -> bool {
+        assert!(self.queued, "dequeued store waiter polled again");
+        let event_runtime = &self.runtime.events[self.event_index];
+        let mut reservation = event_runtime
+            .store_reservation
+            .lock()
+            .expect("store reservation mutex poisoned");
+        if reservation.owner.is_some()
+            || reservation.waiters.front().copied() != Some(self.call_ordinal)
+        {
+            return false;
+        }
+        assert_eq!(reservation.waiters.pop_front(), Some(self.call_ordinal));
+        reservation.owner = Some(self.call_ordinal);
+        self.queued = false;
+        true
+    }
+
+    fn cancel(&mut self) {
+        if !self.queued {
+            return;
+        }
+        let event_runtime = &self.runtime.events[self.event_index];
+        let mut reservation = event_runtime
+            .store_reservation
+            .lock()
+            .expect("store reservation mutex poisoned");
+        let position = reservation
+            .waiters
+            .iter()
+            .position(|waiter| *waiter == self.call_ordinal)
+            .unwrap_or_else(|| {
+                panic!(
+                    "queued store call {} disappeared from event {}",
+                    self.call_ordinal, self.event_index
+                )
+            });
+        reservation.waiters.remove(position);
+        self.queued = false;
+        drop(reservation);
+        event_runtime
+            .store_reservation_revision_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+}
+
+impl Drop for StoreReservationWaiter {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,11 +640,16 @@ impl FaultScheduler {
         let events = schedule
             .events
             .iter()
-            .map(|_| EventRuntime {
-                fired: AtomicBool::new(false),
-                ended: AtomicBool::new(false),
-                matches: AtomicU64::new(0),
-                claimed_op: AtomicU64::new(u64::MAX),
+            .map(|_| {
+                let (store_reservation_revision_tx, _) = tokio::sync::watch::channel(0);
+                EventRuntime {
+                    fired: AtomicBool::new(false),
+                    ended: AtomicBool::new(false),
+                    matches: AtomicU64::new(0),
+                    claimed_op: AtomicU64::new(u64::MAX),
+                    store_reservation: Mutex::new(StoreReservationState::default()),
+                    store_reservation_revision_tx,
+                }
             })
             .collect();
         let (logical_op_tx, _) = tokio::sync::watch::channel(0);
@@ -842,27 +949,201 @@ impl FaultScheduler {
             {
                 continue;
             }
-            let latency_ms = match event.kind {
-                FaultKind::Latency { base_ms, jitter_ms } => {
-                    let jitter = if jitter_ms == 0 {
-                        0
-                    } else {
-                        StdRng::seed_from_u64(self.rng_salt ^ call_ordinal).gen_range(0..=jitter_ms)
-                    };
-                    Some(base_ms + jitter)
-                }
-                _ => None,
-            };
-            return Some(StoreFaultAction {
-                event_id: event.id.clone(),
-                op_index: current,
-                kind: event.kind.clone(),
-                call_ordinal,
-                latency_ms,
-                window: event.end_op.is_some(),
-            });
+            return Some(self.store_action(index, event, current, call_ordinal, false, false));
         }
         None
+    }
+
+    /// Selects a GET fault while deferring faults that require a successful
+    /// body-bearing response until the inner store has answered.
+    ///
+    /// A one-shot deferred event, and any nth-selected windowed crash, is
+    /// reserved, not fired. Calls contending for that same event wait here so
+    /// they cannot skip ahead to a later schedule entry. Calls that do not
+    /// match the event remain fully concurrent.
+    #[must_use]
+    pub async fn get_decision(&self, key: &str) -> Option<StoreFaultAction> {
+        if self.runtime.quiesced.load(Ordering::SeqCst) {
+            return None;
+        }
+        let current = self.runtime.logical_op.load(Ordering::SeqCst);
+        let call_ordinal = self.runtime.store_calls.fetch_add(1, Ordering::SeqCst) + 1;
+
+        'events: for (index, event) in self.schedule.events.iter().enumerate() {
+            if !matches!(event.boundary, Boundary::ObjectStore | Boundary::Process)
+                || !event_is_active(event, current)
+                || !store_target_matches(event, StoreOp::Get, key)
+                || !partition_matches(&event.kind, StoreOp::Get)
+            {
+                continue;
+            }
+
+            if !deferred_get_fault(&event.kind) {
+                if !self.claim(index, event, current) {
+                    continue;
+                }
+                return Some(self.store_action(index, event, current, call_ordinal, false, false));
+            }
+
+            let runtime = &self.runtime.events[index];
+            let requires_reservation = event.end_op.is_none()
+                || matches!(
+                    event.kind,
+                    FaultKind::CrashAt {
+                        position: TriggerPosition::Post,
+                        ..
+                    }
+                );
+            if !requires_reservation {
+                return Some(self.store_action(index, event, current, call_ordinal, true, false));
+            }
+
+            let mut revision = runtime.store_reservation_revision_tx.subscribe();
+            let mut waiter = StoreReservationWaiter::enqueue(self, index, call_ordinal);
+            loop {
+                if self.runtime.quiesced.load(Ordering::SeqCst) {
+                    waiter.cancel();
+                    return None;
+                }
+                if runtime.fired.load(Ordering::SeqCst) {
+                    waiter.cancel();
+                    continue 'events;
+                }
+                if waiter.try_acquire() {
+                    // Quiescence can race the FIFO acquisition after the loop's
+                    // first check. A queued call must still bypass the event.
+                    if self.runtime.quiesced.load(Ordering::SeqCst) {
+                        self.release_store_reservation(index, call_ordinal);
+                        return None;
+                    }
+                    // A committer may have fired the event between the first
+                    // load and this FIFO acquisition. Release that stale
+                    // reservation before considering later events.
+                    if runtime.fired.load(Ordering::SeqCst) {
+                        self.release_store_reservation(index, call_ordinal);
+                        continue 'events;
+                    }
+                    return Some(self.store_action(
+                        index,
+                        event,
+                        current,
+                        call_ordinal,
+                        true,
+                        true,
+                    ));
+                }
+                revision
+                    .changed()
+                    .await
+                    .expect("store reservation revision sender dropped");
+            }
+        }
+        None
+    }
+
+    /// Commits a deferred GET fault after its response mutation is ready.
+    /// Returns false only when a post-GET crash has not yet reached its exact
+    /// body-bearing-success ordinal.
+    #[must_use]
+    pub fn commit_deferred_get(&self, action: &StoreFaultAction) -> bool {
+        assert!(action.deferred_get, "committed an immediate store fault");
+        let runtime = &self.runtime.events[action.event_index];
+        let should_apply = if let FaultKind::CrashAt {
+            point,
+            position: TriggerPosition::Post,
+        } = action.kind
+        {
+            let (_, _, nth) = point.selector();
+            let successful_body_ordinal = runtime.matches.fetch_add(1, Ordering::SeqCst) + 1;
+            successful_body_ordinal == u64::from(nth)
+        } else {
+            runtime.matches.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+
+        if !should_apply {
+            if action.reserved_get {
+                self.release_store_reservation(action.event_index, action.call_ordinal);
+            }
+            return false;
+        }
+        if action.window {
+            if action.reserved_get {
+                self.release_store_reservation(action.event_index, action.call_ordinal);
+            }
+            return true;
+        }
+
+        assert!(
+            action.reserved_get,
+            "one-shot deferred GET fault was not reserved"
+        );
+        runtime
+            .fired
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_or_else(|_| panic!("deferred event {} fired twice", action.event_id));
+        self.release_store_reservation(action.event_index, action.call_ordinal);
+        true
+    }
+
+    /// Releases a deferred GET reservation when the inner store returned no
+    /// body (including NotModified, Precondition, NotFound, or transport error).
+    pub fn cancel_deferred_get(&self, action: &StoreFaultAction) {
+        assert!(action.deferred_get, "cancelled an immediate store fault");
+        if action.reserved_get {
+            self.release_store_reservation(action.event_index, action.call_ordinal);
+        }
+    }
+
+    fn store_action(
+        &self,
+        index: usize,
+        event: &FaultEvent,
+        current: u64,
+        call_ordinal: u64,
+        deferred_get: bool,
+        reserved_get: bool,
+    ) -> StoreFaultAction {
+        let latency_ms = match event.kind {
+            FaultKind::Latency { base_ms, jitter_ms } => {
+                let jitter = if jitter_ms == 0 {
+                    0
+                } else {
+                    StdRng::seed_from_u64(self.rng_salt ^ call_ordinal).gen_range(0..=jitter_ms)
+                };
+                Some(base_ms + jitter)
+            }
+            _ => None,
+        };
+        StoreFaultAction {
+            event_id: event.id.clone(),
+            op_index: current,
+            kind: event.kind.clone(),
+            call_ordinal,
+            latency_ms,
+            window: event.end_op.is_some(),
+            event_index: index,
+            deferred_get,
+            reserved_get,
+        }
+    }
+
+    fn release_store_reservation(&self, event_index: usize, call_ordinal: u64) {
+        let runtime = &self.runtime.events[event_index];
+        let mut reservation = runtime
+            .store_reservation
+            .lock()
+            .expect("store reservation mutex poisoned");
+        assert_eq!(
+            reservation.owner,
+            Some(call_ordinal),
+            "store reservation owner changed"
+        );
+        reservation.owner = None;
+        drop(reservation);
+        runtime
+            .store_reservation_revision_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
     }
 
     #[must_use]
@@ -942,6 +1223,7 @@ impl FaultScheduler {
         self.runtime.quiesced.store(true, Ordering::SeqCst);
         let current = self.runtime.logical_op.load(Ordering::SeqCst);
         self.runtime.logical_op_tx.send_replace(current);
+        self.wake_store_reservation_waiters();
     }
 
     pub fn begin_quiet_period(&self, event: TimelineEvent) {
@@ -955,9 +1237,18 @@ impl FaultScheduler {
         let current = self.runtime.logical_op.load(Ordering::SeqCst);
         self.runtime.logical_op_tx.send_replace(current);
         drop(timeline);
+        self.wake_store_reservation_waiters();
         self.runtime
             .timeline_revision_tx
             .send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+
+    fn wake_store_reservation_waiters(&self) {
+        for runtime in &self.runtime.events {
+            runtime
+                .store_reservation_revision_tx
+                .send_modify(|revision| *revision = revision.saturating_add(1));
+        }
     }
 
     pub fn release_held_calls(&self) {
@@ -1349,6 +1640,23 @@ fn store_target_matches(event: &FaultEvent, op: StoreOp, key: &str) -> bool {
             .key_substring
             .as_deref()
             .is_none_or(|needle| key.contains(needle))
+}
+
+fn deferred_get_fault(kind: &FaultKind) -> bool {
+    matches!(
+        kind,
+        FaultKind::StaleRead
+            | FaultKind::Content(
+                ContentFault::TruncateBody { .. }
+                    | ContentFault::BitFlip { .. }
+                    | ContentFault::WrongObject
+            )
+            | FaultKind::TruncatedGetStream { .. }
+            | FaultKind::CrashAt {
+                position: TriggerPosition::Post,
+                ..
+            }
+    )
 }
 
 fn partition_matches(kind: &FaultKind, op: StoreOp) -> bool {

@@ -753,6 +753,36 @@ impl StoreFaultProxy {
     }
 }
 
+struct DeferredGetReservation<'a> {
+    scheduler: &'a FaultScheduler,
+    action: &'a StoreFaultAction,
+    active: bool,
+}
+
+impl<'a> DeferredGetReservation<'a> {
+    fn new(scheduler: &'a FaultScheduler, action: &'a StoreFaultAction) -> Self {
+        Self {
+            scheduler,
+            action,
+            active: true,
+        }
+    }
+
+    fn commit(&mut self) -> bool {
+        let should_apply = self.scheduler.commit_deferred_get(self.action);
+        self.active = false;
+        should_apply
+    }
+}
+
+impl Drop for DeferredGetReservation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.scheduler.cancel_deferred_get(self.action);
+        }
+    }
+}
+
 fn injected_error(kind: InjectedErrorKind, key: &str) -> object_store::Error {
     let detail = match kind {
         InjectedErrorKind::Generic => "generic injected failure".to_string(),
@@ -1018,7 +1048,7 @@ impl ObjectStore for StoreFaultProxy {
         if let Some((observer, node)) = &self.operational_observer {
             observer.rendezvous_lease_get(*node, &key).await;
         }
-        if let Some(action) = self.scheduler.store_decision(StoreOp::Get, &key) {
+        if let Some(action) = self.scheduler.get_decision(&key).await {
             if matches!(action.kind, FaultKind::HeadGetDiverge) {
                 self.inner.head(location).await?;
                 self.record(
@@ -1030,106 +1060,131 @@ impl ObjectStore for StoreFaultProxy {
                 );
                 return Err(injected_error(InjectedErrorKind::NotFound, &key));
             }
-            if matches!(action.kind, FaultKind::StaleRead) {
-                let previous = self
-                    .bodies
-                    .lock()
-                    .expect("store fault body-history mutex poisoned")
-                    .previous(&key)
-                    .ok_or_else(|| injected_error(InjectedErrorKind::Generic, &key))?;
+            if action.is_deferred_get() {
+                let mut reservation = DeferredGetReservation::new(&self.scheduler, &action);
+                let replacement = match action.kind {
+                    FaultKind::StaleRead => {
+                        match self
+                            .bodies
+                            .lock()
+                            .expect("store fault body-history mutex poisoned")
+                            .previous(&key)
+                        {
+                            Some(previous) => Some(previous),
+                            None => {
+                                assert!(reservation.commit());
+                                return Err(injected_error(InjectedErrorKind::Generic, &key));
+                            }
+                        }
+                    }
+                    FaultKind::Content(super::ContentFault::WrongObject) => {
+                        match self
+                            .bodies
+                            .lock()
+                            .expect("store fault body-history mutex poisoned")
+                            .most_recent_other(&key)
+                        {
+                            Some(replacement) => Some(replacement),
+                            None => {
+                                assert!(reservation.commit());
+                                return Err(injected_error(InjectedErrorKind::Generic, &key));
+                            }
+                        }
+                    }
+                    _ => None,
+                };
                 let result = self.inner.get_opts(location, options).await?;
-                let result = content_result(result, |_| previous).await?;
-                self.record(
-                    &action,
-                    &key,
-                    FaultSemantics::PostCommit,
-                    ObservedResult::Corrupted,
-                    Some("served the previous successful PUT body".to_string()),
-                );
-                return Ok(result);
-            }
-            if matches!(
-                action.kind,
-                FaultKind::Content(super::ContentFault::WrongObject)
-            ) {
-                let replacement = self
-                    .bodies
-                    .lock()
-                    .expect("store fault body-history mutex poisoned")
-                    .most_recent_other(&key)
-                    .ok_or_else(|| injected_error(InjectedErrorKind::Generic, &key))?;
-                let result = self.inner.get_opts(location, options).await?;
-                let replacement_len = replacement.len();
-                let result = content_result(result, |_| replacement).await?;
-                self.record(
-                    &action,
-                    &key,
-                    FaultSemantics::PostCommit,
-                    ObservedResult::Corrupted,
-                    Some(format!(
-                        "served {replacement_len} bytes from another live key"
-                    )),
-                );
-                return Ok(result);
-            }
-            if let FaultKind::Content(super::ContentFault::BitFlip { offset_hint }) = action.kind {
-                let result = self.inner.get_opts(location, options).await?;
-                let result = content_result(result, |bytes| {
-                    assert!(!bytes.is_empty(), "BitFlip requires a non-empty GET body");
-                    let mut corrupted = bytes.to_vec();
-                    let offset = usize::try_from(offset_hint)
-                        .unwrap_or(usize::MAX)
-                        .wrapping_rem(corrupted.len());
-                    corrupted[offset] ^= 1;
-                    corrupted.into()
-                })
-                .await?;
-                self.record(
-                    &action,
-                    &key,
-                    FaultSemantics::PostCommit,
-                    ObservedResult::Corrupted,
-                    Some(format!("successful body bit flipped at hint {offset_hint}")),
-                );
-                return Ok(result);
-            }
-            if let FaultKind::Content(super::ContentFault::TruncateBody { keep_bytes }) =
-                action.kind
-            {
-                let result = self.inner.get_opts(location, options).await?;
-                let result =
-                    content_result(result, |bytes| bytes.slice(..keep_bytes.min(bytes.len())))
+                return match action.kind.clone() {
+                    FaultKind::StaleRead => {
+                        let previous = replacement.expect("stale-read replacement disappeared");
+                        let result = content_result(result, |_| previous).await?;
+                        assert!(reservation.commit());
+                        self.record(
+                            &action,
+                            &key,
+                            FaultSemantics::PostCommit,
+                            ObservedResult::Corrupted,
+                            Some("served the previous successful PUT body".to_string()),
+                        );
+                        Ok(result)
+                    }
+                    FaultKind::Content(super::ContentFault::WrongObject) => {
+                        let replacement =
+                            replacement.expect("wrong-object replacement disappeared");
+                        let replacement_len = replacement.len();
+                        let result = content_result(result, |_| replacement).await?;
+                        assert!(reservation.commit());
+                        self.record(
+                            &action,
+                            &key,
+                            FaultSemantics::PostCommit,
+                            ObservedResult::Corrupted,
+                            Some(format!(
+                                "served {replacement_len} bytes from another live key"
+                            )),
+                        );
+                        Ok(result)
+                    }
+                    FaultKind::Content(super::ContentFault::BitFlip { offset_hint }) => {
+                        let result = content_result(result, |bytes| {
+                            assert!(!bytes.is_empty(), "BitFlip requires a non-empty GET body");
+                            let mut corrupted = bytes.to_vec();
+                            let offset = usize::try_from(offset_hint)
+                                .unwrap_or(usize::MAX)
+                                .wrapping_rem(corrupted.len());
+                            corrupted[offset] ^= 1;
+                            corrupted.into()
+                        })
                         .await?;
-                self.record(
-                    &action,
-                    &key,
-                    FaultSemantics::PostCommit,
-                    ObservedResult::Corrupted,
-                    Some(format!("successful body truncated to {keep_bytes} bytes")),
-                );
-                return Ok(result);
-            }
-            if let FaultKind::TruncatedGetStream { after_bytes } = action.kind {
-                let result = self.inner.get_opts(location, options).await?;
-                self.record(
-                    &action,
-                    &key,
-                    FaultSemantics::PostCommit,
-                    ObservedResult::Ambiguous,
-                    Some(format!("stream errors after {after_bytes} bytes")),
-                );
-                return Ok(truncated_result(result, after_bytes, key));
-            }
-            if let FaultKind::CrashAt {
-                point,
-                position: TriggerPosition::Post,
-            } = action.kind
-            {
-                return match self.inner.get_opts(location, options).await {
-                    Ok(_) => Err(self
-                        .trigger_crash(&action, &key, point, TriggerPosition::Post)
-                        .await),
-                    Err(error) => Err(error),
+                        assert!(reservation.commit());
+                        self.record(
+                            &action,
+                            &key,
+                            FaultSemantics::PostCommit,
+                            ObservedResult::Corrupted,
+                            Some(format!("successful body bit flipped at hint {offset_hint}")),
+                        );
+                        Ok(result)
+                    }
+                    FaultKind::Content(super::ContentFault::TruncateBody { keep_bytes }) => {
+                        let result = content_result(result, |bytes| {
+                            bytes.slice(..keep_bytes.min(bytes.len()))
+                        })
+                        .await?;
+                        assert!(reservation.commit());
+                        self.record(
+                            &action,
+                            &key,
+                            FaultSemantics::PostCommit,
+                            ObservedResult::Corrupted,
+                            Some(format!("successful body truncated to {keep_bytes} bytes")),
+                        );
+                        Ok(result)
+                    }
+                    FaultKind::TruncatedGetStream { after_bytes } => {
+                        let result = truncated_result(result, after_bytes, key.clone());
+                        assert!(reservation.commit());
+                        self.record(
+                            &action,
+                            &key,
+                            FaultSemantics::PostCommit,
+                            ObservedResult::Ambiguous,
+                            Some(format!("stream errors after {after_bytes} bytes")),
+                        );
+                        Ok(result)
+                    }
+                    FaultKind::CrashAt {
+                        point,
+                        position: TriggerPosition::Post,
+                    } => {
+                        if !reservation.commit() {
+                            return Ok(result);
+                        }
+                        Err(self
+                            .trigger_crash(&action, &key, point, TriggerPosition::Post)
+                            .await)
+                    }
+                    other => panic!("non-deferred GET fault reached deferred path: {other:?}"),
                 };
             }
             self.apply_before(&action, &key).await?;
@@ -1600,13 +1655,226 @@ fn crash_matrix_key(point: CrashPoint) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::Poll;
+
     use bytes::Bytes;
     use object_store::memory::InMemory;
+    use tokio::sync::{Barrier, Notify};
 
     use super::*;
     use crate::adversarial::faults::{
         Boundary, ContentFault, FaultEvent, FaultProfile, FaultSchedule, TargetSelector,
     };
+
+    #[derive(Debug)]
+    struct FirstGetGate {
+        inner: Arc<InMemory>,
+        calls: AtomicU64,
+        first_started: Barrier,
+        release_first: Notify,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum FirstBodyBehavior {
+        Pass,
+        Fail,
+        Block,
+    }
+
+    #[derive(Debug)]
+    struct FirstBodyStore {
+        inner: Arc<InMemory>,
+        calls: AtomicU64,
+        behavior: FirstBodyBehavior,
+        body_started: Arc<Notify>,
+        release_body: Arc<Notify>,
+    }
+
+    impl FirstBodyStore {
+        fn new(inner: Arc<InMemory>, behavior: FirstBodyBehavior) -> Self {
+            Self {
+                inner,
+                calls: AtomicU64::new(0),
+                behavior,
+                body_started: Arc::new(Notify::new()),
+                release_body: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    impl fmt::Display for FirstBodyStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("FirstBodyStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FirstBodyStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOpts,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let result = self.inner.get_opts(location, options).await?;
+            if call != 0 || matches!(self.behavior, FirstBodyBehavior::Pass) {
+                return Ok(result);
+            }
+
+            let meta = result.meta.clone();
+            let range = result.range.clone();
+            let attributes = result.attributes.clone();
+            let bytes = result.bytes().await?;
+            let payload = match self.behavior {
+                FirstBodyBehavior::Pass => unreachable!("pass returned before body replacement"),
+                FirstBodyBehavior::Fail => stream::once(async move {
+                    drop(bytes);
+                    Err(object_store::Error::Generic {
+                        store: "first_body_store",
+                        source: Box::new(std::io::Error::other("scripted body stream failure")),
+                    })
+                })
+                .boxed(),
+                FirstBodyBehavior::Block => {
+                    let body_started = self.body_started.clone();
+                    let release_body = self.release_body.clone();
+                    stream::once(async move {
+                        body_started.notify_one();
+                        release_body.notified().await;
+                        Ok(bytes)
+                    })
+                    .boxed()
+                }
+            };
+            Ok(GetResult {
+                payload: GetResultPayload::Stream(payload),
+                meta,
+                range,
+                attributes,
+            })
+        }
+
+        async fn delete(&self, location: &Path) -> OsResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    impl FirstGetGate {
+        fn new(inner: Arc<InMemory>) -> Self {
+            Self {
+                inner,
+                calls: AtomicU64::new(0),
+                first_started: Barrier::new(2),
+                release_first: Notify::new(),
+            }
+        }
+    }
+
+    fn bit_flip_schedule(
+        event_id: &str,
+        key_substring: &str,
+        end_op: Option<u64>,
+    ) -> FaultScheduler {
+        FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Content,
+            events: vec![FaultEvent {
+                id: event_id.to_string(),
+                start_op: 0,
+                end_op,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some(key_substring.to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(ContentFault::BitFlip { offset_hint: 1 }),
+            }],
+        })
+    }
+
+    impl fmt::Display for FirstGetGate {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("FirstGetGate")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FirstGetGate {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOpts,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_started.wait().await;
+                self.release_first.notified().await;
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &Path) -> OsResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
 
     #[tokio::test]
     async fn truncate_body_returns_successful_short_payload_and_records_taint() {
@@ -1674,6 +1942,473 @@ mod tests {
             Some("ns/object.bin")
         );
         assert_eq!(scheduler.timeline()[0].observed, ObservedResult::Corrupted);
+    }
+
+    #[tokio::test]
+    async fn bodyless_conditional_get_does_not_consume_body_fault() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        inner
+            .put("ns/object.bin", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let (_, etag) = inner.get_with_meta("ns/object.bin").await.unwrap();
+        let etag = etag.expect("in-memory object must expose an ETag");
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Content,
+            events: vec![FaultEvent {
+                id: "content-conditional-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("object.bin".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(ContentFault::BitFlip { offset_hint: 1 }),
+            }],
+        });
+        let faulted = store_fault_proxy(&inner, scheduler.clone());
+
+        assert!(faulted
+            .get_if_none_match("ns/object.bin", &etag)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            scheduler.timeline().is_empty(),
+            "a bodyless freshness response cannot apply a body fault"
+        );
+
+        assert_eq!(
+            faulted.get("ns/object.bin").await.unwrap(),
+            Bytes::from_static(b"acc")
+        );
+        assert_eq!(scheduler.timeline().len(), 1);
+        assert_eq!(scheduler.timeline()[0].event_id, "content-conditional-00");
+    }
+
+    #[tokio::test]
+    async fn changed_conditional_get_commits_body_fault() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        inner
+            .put("ns/object.bin", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let (_, old_etag) = inner.get_with_meta("ns/object.bin").await.unwrap();
+        let old_etag = old_etag.expect("in-memory object must expose an ETag");
+        inner
+            .put("ns/object.bin", Bytes::from_static(b"adc"))
+            .await
+            .unwrap();
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Content,
+            events: vec![FaultEvent {
+                id: "content-conditional-changed-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("object.bin".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(ContentFault::BitFlip { offset_hint: 1 }),
+            }],
+        });
+        let faulted = store_fault_proxy(&inner, scheduler.clone());
+
+        let (bytes, _) = faulted
+            .get_if_none_match("ns/object.bin", &old_etag)
+            .await
+            .unwrap()
+            .expect("changed conditional GET must return a body");
+        assert_eq!(bytes, Bytes::from_static(b"aec"));
+        assert_eq!(scheduler.timeline().len(), 1);
+        assert_eq!(
+            scheduler.timeline()[0].event_id,
+            "content-conditional-changed-00"
+        );
+    }
+
+    #[tokio::test]
+    async fn bodyless_conditional_get_remains_eligible_for_pre_call_fault() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        inner
+            .put("ns/object.bin", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let (_, etag) = inner.get_with_meta("ns/object.bin").await.unwrap();
+        let etag = etag.expect("in-memory object must expose an ETag");
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Network,
+            events: vec![FaultEvent {
+                id: "pre-call-conditional-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("object.bin".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::PreFail {
+                    error: InjectedErrorKind::Http503,
+                },
+            }],
+        });
+        let faulted = store_fault_proxy(&inner, scheduler.clone());
+
+        assert!(faulted
+            .get_if_none_match("ns/object.bin", &etag)
+            .await
+            .is_err());
+        assert_eq!(scheduler.timeline().len(), 1);
+        assert_eq!(scheduler.timeline()[0].semantics, FaultSemantics::PreCall);
+        assert_eq!(
+            scheduler.timeline()[0].observed,
+            ObservedResult::DefiniteNotApplied
+        );
+        assert!(faulted
+            .get_if_none_match("ns/object.bin", &etag)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_body_gets_inherit_fault_in_fifo_order_after_bodyless_owner_cancels() {
+        let inner = Arc::new(InMemory::new());
+        let setup = ZeppelinStore::new(inner.clone());
+        setup
+            .put("ns/object.bin", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let (_, etag) = setup.get_with_meta("ns/object.bin").await.unwrap();
+        let etag = etag.expect("in-memory object must expose an ETag");
+        let gate = Arc::new(FirstGetGate::new(inner));
+        let gated = ZeppelinStore::new(gate.clone());
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Content,
+            events: vec![FaultEvent {
+                id: "content-concurrent-conditional-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("object.bin".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(ContentFault::BitFlip { offset_hint: 1 }),
+            }],
+        });
+        let faulted = store_fault_proxy(&gated, scheduler.clone());
+
+        let first_store = faulted.clone();
+        let first =
+            tokio::spawn(
+                async move { first_store.get_if_none_match("ns/object.bin", &etag).await },
+            );
+        gate.first_started.wait().await;
+
+        let mut second = Box::pin(faulted.get("ns/object.bin"));
+        assert!(matches!(futures::poll!(&mut second), Poll::Pending));
+        let mut third = Box::pin(faulted.get("ns/object.bin"));
+        assert!(matches!(futures::poll!(&mut third), Poll::Pending));
+        assert_eq!(
+            gate.calls.load(Ordering::SeqCst),
+            1,
+            "both waiters must enter the scheduler without delegating"
+        );
+
+        gate.release_first.notify_one();
+        assert!(first.await.unwrap().unwrap().is_none());
+        assert!(
+            matches!(futures::poll!(&mut third), Poll::Pending),
+            "the later waiter must not overtake the earlier queued call"
+        );
+        assert_eq!(second.await.unwrap(), Bytes::from_static(b"acc"));
+        assert_eq!(third.await.unwrap(), Bytes::from_static(b"abc"));
+        assert_eq!(scheduler.timeline().len(), 1);
+        assert_eq!(
+            scheduler.timeline()[0].event_id,
+            "content-concurrent-conditional-00"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_get_bypasses_reserved_fault_when_scheduler_quiesces() {
+        let inner = Arc::new(InMemory::new());
+        let setup = ZeppelinStore::new(inner.clone());
+        setup
+            .put("ns/object.bin", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let (_, etag) = setup.get_with_meta("ns/object.bin").await.unwrap();
+        let etag = etag.expect("in-memory object must expose an ETag");
+        let gate = Arc::new(FirstGetGate::new(inner));
+        let gated = ZeppelinStore::new(gate.clone());
+        let scheduler = bit_flip_schedule("content-quiesced-waiter-00", "object.bin", None);
+        let faulted = store_fault_proxy(&gated, scheduler.clone());
+
+        let owner_store = faulted.clone();
+        let owner =
+            tokio::spawn(
+                async move { owner_store.get_if_none_match("ns/object.bin", &etag).await },
+            );
+        gate.first_started.wait().await;
+
+        let mut queued = Box::pin(faulted.get("ns/object.bin"));
+        assert!(matches!(futures::poll!(&mut queued), Poll::Pending));
+        scheduler.quiesce();
+
+        let bypassed = match futures::poll!(&mut queued) {
+            Poll::Ready(result) => result.unwrap(),
+            Poll::Pending => panic!("quiescence must wake and bypass a queued reservation"),
+        };
+        assert_eq!(bypassed, Bytes::from_static(b"abc"));
+
+        gate.release_first.notify_one();
+        assert!(owner.await.unwrap().unwrap().is_none());
+        assert!(scheduler.timeline().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failing_body_stream_releases_fault_for_next_body_get() {
+        let inner = Arc::new(InMemory::new());
+        let setup = ZeppelinStore::new(inner.clone());
+        setup
+            .put("ns/object.bin", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let scripted = Arc::new(FirstBodyStore::new(inner, FirstBodyBehavior::Fail));
+        let store = ZeppelinStore::new(scripted);
+        let scheduler = bit_flip_schedule("content-stream-error-00", "object.bin", None);
+        let faulted = store_fault_proxy(&store, scheduler.clone());
+
+        assert!(faulted.get("ns/object.bin").await.is_err());
+        assert!(scheduler.timeline().is_empty());
+        assert_eq!(
+            faulted.get("ns/object.bin").await.unwrap(),
+            Bytes::from_static(b"acc")
+        );
+        assert_eq!(scheduler.timeline().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn aborted_owner_during_body_transfer_releases_fault_for_next_get() {
+        let inner = Arc::new(InMemory::new());
+        let setup = ZeppelinStore::new(inner.clone());
+        setup
+            .put("ns/object.bin", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        let scripted = Arc::new(FirstBodyStore::new(inner, FirstBodyBehavior::Block));
+        let store = ZeppelinStore::new(scripted.clone());
+        let scheduler = bit_flip_schedule("content-cancelled-owner-00", "object.bin", None);
+        let faulted = store_fault_proxy(&store, scheduler.clone());
+
+        let owner_store = faulted.clone();
+        let owner = tokio::spawn(async move { owner_store.get("ns/object.bin").await });
+        scripted.body_started.notified().await;
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        assert!(scheduler.timeline().is_empty());
+
+        assert_eq!(
+            faulted.get("ns/object.bin").await.unwrap(),
+            Bytes::from_static(b"acc")
+        );
+        assert_eq!(scheduler.timeline().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn conditional_not_found_releases_fault_for_later_body() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let scheduler = bit_flip_schedule("content-not-found-00", "object.bin", None);
+        let faulted = store_fault_proxy(&inner, scheduler.clone());
+
+        assert!(faulted
+            .get_if_none_match("ns/object.bin", "absent-etag")
+            .await
+            .is_err());
+        assert!(scheduler.timeline().is_empty());
+        inner
+            .put("ns/object.bin", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        assert_eq!(
+            faulted.get("ns/object.bin").await.unwrap(),
+            Bytes::from_static(b"acc")
+        );
+        assert_eq!(scheduler.timeline().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_read_missing_history_preserves_zero_inner_get_precondition() {
+        let inner = Arc::new(InMemory::new());
+        inner
+            .put(
+                &Path::from("ns/object.bin"),
+                PutPayload::from(Bytes::from_static(b"abc")),
+            )
+            .await
+            .unwrap();
+        let counted = Arc::new(FirstBodyStore::new(inner, FirstBodyBehavior::Pass));
+        let store = ZeppelinStore::new(counted.clone());
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Semantic,
+            events: vec![FaultEvent {
+                id: "semantic-missing-history-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("object.bin".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::StaleRead,
+            }],
+        });
+        let faulted = store_fault_proxy(&store, scheduler);
+
+        assert!(faulted.get("ns/object.bin").await.is_err());
+        assert_eq!(counted.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            faulted.get("ns/object.bin").await.unwrap(),
+            Bytes::from_static(b"abc")
+        );
+        assert_eq!(counted.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_object_missing_replacement_preserves_zero_inner_get_precondition() {
+        let inner = Arc::new(InMemory::new());
+        inner
+            .put(
+                &Path::from("ns/object.bin"),
+                PutPayload::from(Bytes::from_static(b"abc")),
+            )
+            .await
+            .unwrap();
+        let counted = Arc::new(FirstBodyStore::new(inner, FirstBodyBehavior::Pass));
+        let store = ZeppelinStore::new(counted.clone());
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Content,
+            events: vec![FaultEvent {
+                id: "content-missing-replacement-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::ObjectStore,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("object.bin".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::Content(ContentFault::WrongObject),
+            }],
+        });
+        let faulted = store_fault_proxy(&store, scheduler);
+
+        assert!(faulted.get("ns/object.bin").await.is_err());
+        assert_eq!(counted.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            faulted.get("ns/object.bin").await.unwrap(),
+            Bytes::from_static(b"abc")
+        );
+        assert_eq!(counted.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn conditional_not_modified_does_not_advance_post_get_crash_ordinal() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let key = "ns/segments/cluster_0.bin";
+        inner.put(key, Bytes::from_static(b"abc")).await.unwrap();
+        let (_, etag) = inner.get_with_meta(key).await.unwrap();
+        let etag = etag.expect("in-memory object must expose an ETag");
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Crash,
+            events: vec![FaultEvent {
+                id: "crash-conditional-get-00".to_string(),
+                start_op: 0,
+                end_op: None,
+                boundary: Boundary::Process,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("cluster_".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::CrashAt {
+                    point: CrashPoint::HydrationGet,
+                    position: TriggerPosition::Post,
+                },
+            }],
+        });
+        let controller = scheduler.process_controller().unwrap();
+        let faulted = store_fault_proxy(&inner, scheduler);
+
+        assert!(faulted
+            .get_if_none_match(key, &etag)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(controller.try_take_request().is_none());
+
+        let crashing_store = faulted.clone();
+        let crashing = tokio::spawn(async move { crashing_store.get(key).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            controller.crash_requested.notified(),
+        )
+        .await
+        .expect("the first body-bearing GET must trigger the post-GET crash");
+        assert_eq!(controller.take_request().point, CrashPoint::HydrationGet);
+        controller.park_token.cancel();
+        assert!(crashing.await.unwrap().is_err());
+        assert_eq!(faulted.get(key).await.unwrap(), Bytes::from_static(b"abc"));
+    }
+
+    #[tokio::test]
+    async fn windowed_post_get_crash_preserves_exact_nth_match_semantics() {
+        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let key = "ns/segments/cluster_0.bin";
+        inner.put(key, Bytes::from_static(b"abc")).await.unwrap();
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Crash,
+            events: vec![FaultEvent {
+                id: "crash-window-get-00".to_string(),
+                start_op: 0,
+                end_op: Some(10),
+                boundary: Boundary::Process,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("cluster_".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::CrashAt {
+                    point: CrashPoint::HydrationGet,
+                    position: TriggerPosition::Post,
+                },
+            }],
+        });
+        let controller = scheduler.process_controller().unwrap();
+        let faulted = store_fault_proxy(&inner, scheduler);
+
+        let crashing_store = faulted.clone();
+        let crashing = tokio::spawn(async move { crashing_store.get(key).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            controller.crash_requested.notified(),
+        )
+        .await
+        .expect("the first windowed body GET must trigger the post-GET crash");
+        assert_eq!(controller.take_request().point, CrashPoint::HydrationGet);
+        controller.park_token.cancel();
+        assert!(crashing.await.unwrap().is_err());
+
+        assert_eq!(faulted.get(key).await.unwrap(), Bytes::from_static(b"abc"));
     }
 
     #[tokio::test]
