@@ -640,9 +640,30 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
     path(
         "catalog.background.cached_tick_idle",
         "src/compaction/background.rs:compaction_loop",
-        &[StoreMethod::Get],
-        &[PhysicalVariant::GetFull],
+        &[StoreMethod::GetIfNoneMatch],
+        &[PhysicalVariant::GetConditional],
         ideal_case("background.cached_tick_idle"),
+    ),
+    path(
+        "catalog.background.trigger_manifest_changed",
+        "src/compaction/background.rs:compaction_loop",
+        &[StoreMethod::GetIfNoneMatch],
+        &[PhysicalVariant::GetConditional],
+        ideal_case("background.trigger_manifest_changed"),
+    ),
+    path(
+        "catalog.background.trigger_cache_invalidated",
+        "src/compaction/background.rs:compaction_loop",
+        &[StoreMethod::GetWithMeta],
+        &[PhysicalVariant::GetFull],
+        ideal_case("background.trigger_cache_invalidated"),
+    ),
+    path(
+        "catalog.background.trigger_layout_change",
+        "src/compaction/background.rs:compaction_loop",
+        &[StoreMethod::GetIfNoneMatch],
+        &[PhysicalVariant::GetConditional],
+        ideal_case("background.trigger_layout_change"),
     ),
     path(
         "catalog.background.discovery_tick_empty",

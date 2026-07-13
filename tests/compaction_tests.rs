@@ -2,17 +2,23 @@ mod common;
 
 use std::collections::HashMap;
 
+use chrono::Utc;
 use common::counting::counting_store;
 use common::harness::TestHarness;
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 
-use zeppelin::compaction::background::{compact_namespace_under_lease, CompactionLoopOptions};
+use zeppelin::cache::manifest_cache::ManifestCache;
+use zeppelin::compaction::background::{
+    compact_namespace_under_lease, evaluate_compaction_trigger, CompactionLoopOptions,
+};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::index::ivf_flat::build::build_ivf_flat;
-use zeppelin::namespace::manager::NamespaceMetadata;
+use zeppelin::namespace::manager::{CompactionHealth, NamespaceMetadata, NamespaceState};
 use zeppelin::query::{execute_query, QueryParams};
-use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
+use zeppelin::types::{
+    AttributeValue, ConsistencyLevel, DistanceMetric, Filter, IndexType, VectorEntry,
+};
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::{Manifest, SegmentRef};
 use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
@@ -38,6 +44,23 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
         indexing_config,
         common::default_gc_upload_window(),
     )
+}
+
+fn trigger_metadata(namespace: &str, dimensions: usize) -> NamespaceMetadata {
+    let now = Utc::now();
+    NamespaceMetadata {
+        name: namespace.to_string(),
+        dimensions,
+        distance_metric: DistanceMetric::Euclidean,
+        index_type: IndexType::IvfFlat,
+        vector_count: 0,
+        created_at: now,
+        updated_at: now,
+        state: NamespaceState::Active,
+        full_text_search: HashMap::new(),
+        index_config: None,
+        compaction_health: CompactionHealth::default(),
+    }
 }
 
 #[tokio::test]
@@ -721,7 +744,9 @@ async fn test_compact_trigger_by_fragment_count() {
         .unwrap();
 
     // Should not compact yet (2 < 3)
-    assert!(!compactor.should_compact(&ns).await.unwrap());
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    let metadata = trigger_metadata(&ns, 16);
+    assert!(!compactor.should_compact(&ns, &manifest, &metadata).unwrap());
 
     // Append 1 more (now 3 >= 3)
     writer
@@ -729,37 +754,9 @@ async fn test_compact_trigger_by_fragment_count() {
         .await
         .unwrap();
 
-    assert!(compactor.should_compact(&ns).await.unwrap());
+    let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+    assert!(compactor.should_compact(&ns, &manifest, &metadata).unwrap());
 
-    harness.cleanup().await;
-}
-
-#[tokio::test]
-async fn test_should_compact_rejects_missing_manifest_for_active_namespace() {
-    let harness = TestHarness::new().await;
-    let ns = format!("{}-missing-trigger-manifest", harness.prefix);
-    let store = &harness.store;
-    let namespace_manager = zeppelin::namespace::NamespaceManager::new(store.clone());
-    namespace_manager
-        .create(&ns, 16, DistanceMetric::Euclidean)
-        .await
-        .unwrap();
-    store.delete(&Manifest::s3_key(&ns)).await.unwrap();
-
-    let error = test_compactor(store)
-        .should_compact(&ns)
-        .await
-        .expect_err("an active namespace without its manifest must fail loudly");
-    assert!(
-        matches!(
-            error,
-            zeppelin::error::ZeppelinError::ManifestNotFound { ref namespace }
-                if namespace == &ns
-        ),
-        "missing active manifest must return ManifestNotFound, got {error:?}"
-    );
-
-    store.delete_prefix(&format!("{ns}/")).await.unwrap();
     harness.cleanup().await;
 }
 
@@ -793,6 +790,91 @@ async fn test_compact_rejects_missing_manifest_for_active_namespace() {
     );
 
     store.delete_prefix(&format!("{ns}/")).await.unwrap();
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_trigger_refresh_rejects_missing_manifest_instead_of_using_cached_snapshot() {
+    let harness = TestHarness::new().await;
+    let ns = format!("{}-missing-trigger-manifest", harness.prefix);
+    let manager = zeppelin::namespace::NamespaceManager::new(harness.store.clone());
+    let metadata = manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    let compactor = test_compactor(&harness.store);
+    let manifest_cache = ManifestCache::new(std::time::Duration::from_secs(3_600));
+
+    assert!(
+        !evaluate_compaction_trigger(&compactor, &manifest_cache, &metadata)
+            .await
+            .unwrap()
+    );
+    harness.store.delete(&Manifest::s3_key(&ns)).await.unwrap();
+
+    for _ in 0..2 {
+        let error = evaluate_compaction_trigger(&compactor, &manifest_cache, &metadata)
+            .await
+            .expect_err("a required trigger refresh must reject a missing manifest");
+        assert!(
+            matches!(
+                error,
+                zeppelin::error::ZeppelinError::ManifestNotFound { ref namespace }
+                    if namespace == &ns
+            ),
+            "missing trigger manifest must fail loudly, got {error:?}"
+        );
+    }
+
+    harness
+        .store
+        .delete_prefix(&format!("{ns}/"))
+        .await
+        .unwrap();
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_trigger_refresh_rejects_corrupt_manifest_instead_of_using_cached_snapshot() {
+    let harness = TestHarness::new().await;
+    let ns = format!("{}-corrupt-trigger-manifest", harness.prefix);
+    let manager = zeppelin::namespace::NamespaceManager::new(harness.store.clone());
+    let metadata = manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    let compactor = test_compactor(&harness.store);
+    let manifest_cache = ManifestCache::new(std::time::Duration::from_secs(3_600));
+
+    assert!(
+        !evaluate_compaction_trigger(&compactor, &manifest_cache, &metadata)
+            .await
+            .unwrap()
+    );
+    harness
+        .store
+        .put(
+            &Manifest::s3_key(&ns),
+            bytes::Bytes::from_static(b"\x01not-a-valid-manifest"),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let error = evaluate_compaction_trigger(&compactor, &manifest_cache, &metadata)
+            .await
+            .expect_err("a required trigger refresh must reject a corrupt manifest");
+        assert!(
+            matches!(error, zeppelin::error::ZeppelinError::Serialization(_)),
+            "corrupt trigger manifest must fail loudly, got {error:?}"
+        );
+    }
+
+    harness
+        .store
+        .delete_prefix(&format!("{ns}/"))
+        .await
+        .unwrap();
     harness.cleanup().await;
 }
 
@@ -904,9 +986,11 @@ async fn test_age_trigger_compacts_quiet_namespace() {
     // trigger fires. The age trigger must fire within ~2s; give it a
     // bounded number of intervals before declaring failure.
     let mut compacted = false;
+    let metadata = trigger_metadata(&ns, 16);
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        if compactor.should_compact(&ns).await.unwrap() {
+        let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
+        if compactor.should_compact(&ns, &manifest, &metadata).unwrap() {
             compactor.compact(&ns).await.unwrap();
             compacted = true;
             break;
@@ -967,10 +1051,12 @@ async fn test_idle_namespace_untouched_across_intervals() {
     );
 
     // Several intervals: the trigger must never fire with 0 fragments.
+    let metadata = trigger_metadata(&ns, 16);
     for _ in 0..3 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let manifest = Manifest::read(store, &ns).await.unwrap().unwrap();
         assert!(
-            !compactor.should_compact(&ns).await.unwrap(),
+            !compactor.should_compact(&ns, &manifest, &metadata).unwrap(),
             "idle namespace (0 fragments) must never trigger compaction"
         );
     }
@@ -1026,15 +1112,17 @@ async fn test_bytes_trigger_uses_recorded_sizes() {
             common::default_gc_upload_window(),
         )
     };
+    let metadata = trigger_metadata(&ns, 16);
     assert!(
-        make_compactor(recorded).should_compact(&ns).await.unwrap(),
+        make_compactor(recorded)
+            .should_compact(&ns, &manifest, &metadata)
+            .unwrap(),
         "total WAL bytes >= threshold must trigger compaction"
     );
     // Threshold above the recorded size → does not trigger.
     assert!(
         !make_compactor(recorded + 1)
-            .should_compact(&ns)
-            .await
+            .should_compact(&ns, &manifest, &metadata)
             .unwrap(),
         "total WAL bytes < threshold must not trigger compaction"
     );
@@ -1605,6 +1693,268 @@ async fn test_background_compaction_records_missing_active_manifest_failure() {
         !store.exists(&Manifest::s3_key(&ns)).await.unwrap(),
         "background failure handling must not recreate the manifest"
     );
+
+    store.delete_prefix(&format!("{ns}/")).await.unwrap();
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_background_first_discovery_preserves_prewarmed_manifest_cache() {
+    #[allow(clippy::too_many_arguments)]
+    async fn run_one_tick(
+        compactor: Arc<Compactor>,
+        namespace_manager: Arc<zeppelin::namespace::NamespaceManager>,
+        manifest_cache: Arc<ManifestCache>,
+        lease_manager: Arc<LeaseManager>,
+        cache: Arc<DiskCache>,
+        namespace_prefix: String,
+        counter: &common::counting::GetCounter,
+        manifest_key: &str,
+    ) -> (u64, u64) {
+        counter.reset();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let loop_handle = tokio::spawn(async move {
+            zeppelin::compaction::background::compaction_loop(
+                compactor,
+                namespace_manager,
+                shutdown_rx,
+                manifest_cache,
+                lease_manager,
+                cache,
+                CompactionLoopOptions {
+                    gc_config: zeppelin::config::GcConfig::default(),
+                    namespace_prefix: Some(namespace_prefix),
+                },
+            )
+            .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while counter.delimiter_list_calls_for_prefix("") == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("tick one must begin fresh namespace discovery");
+        shutdown_tx.send(true).unwrap();
+        loop_handle.await.unwrap();
+
+        (
+            counter.gets_matching(manifest_key),
+            counter.get_bytes_for(common::counting::ArtifactClass::Manifest),
+        )
+    }
+
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
+    let ns = format!("{}-warm-first-background-tick", harness.prefix);
+    namespace_manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    let manifest_key = Manifest::s3_key(&ns);
+    let manifest_bytes = store.get(&manifest_key).await.unwrap().len() as u64;
+
+    let manifest_cache = Arc::new(ManifestCache::new(Duration::from_secs(3_600)));
+    manifest_cache
+        .get_strong_required(&store, &ns)
+        .await
+        .unwrap();
+
+    let compaction_config = CompactionConfig {
+        interval_secs: 1,
+        ..Default::default()
+    };
+    let compactor = Arc::new(Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        compaction_config.clone(),
+        IndexingConfig::default(),
+        common::default_gc_upload_window(),
+    ));
+    let lease_manager = Arc::new(LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(compaction_config.lease_duration_secs),
+    ));
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+
+    let (warm_gets, warm_bytes) = run_one_tick(
+        compactor.clone(),
+        namespace_manager.clone(),
+        manifest_cache.clone(),
+        lease_manager.clone(),
+        cache.clone(),
+        harness.prefix.clone(),
+        &counter,
+        &manifest_key,
+    )
+    .await;
+
+    manifest_cache.invalidate_at(&ns, compactor.clock().now());
+    let (cold_gets, cold_bytes) = run_one_tick(
+        compactor,
+        namespace_manager,
+        manifest_cache,
+        lease_manager,
+        cache,
+        harness.prefix.clone(),
+        &counter,
+        &manifest_key,
+    )
+    .await;
+
+    assert_eq!(
+        warm_gets, cold_gets,
+        "warm and cold ticks must issue the same number of manifest requests"
+    );
+    assert_eq!(
+        cold_bytes,
+        warm_bytes + manifest_bytes,
+        "tick one must preserve the resident ETag and receive NotModified; an explicitly cold tick must transfer exactly one additional manifest body"
+    );
+
+    store.delete_prefix(&format!("{ns}/")).await.unwrap();
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_background_discovery_resets_manifest_cache_across_remote_recreate() {
+    #[derive(Debug)]
+    struct FixedNamespaceTime(chrono::DateTime<Utc>);
+
+    impl zeppelin::time::TimeSource for FixedNamespaceTime {
+        fn now(&self) -> chrono::DateTime<Utc> {
+            self.0
+        }
+    }
+
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let ns = format!("{}-recreated-background-manifest", harness.prefix);
+    let old_created_at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let new_created_at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_060, 0).unwrap();
+    let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::with_clock(
+        store.clone(),
+        Duration::from_secs(3_600),
+        zeppelin::time::Clock::from_source(Arc::new(FixedNamespaceTime(old_created_at))),
+    ));
+    let old_metadata = namespace_manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    let writer = WalWriter::new(store.clone());
+    writer
+        .append(&ns, random_vectors(2, 16), Vec::new())
+        .await
+        .unwrap();
+    writer
+        .append(
+            &ns,
+            (0..2)
+                .map(|index| VectorEntry {
+                    id: format!("recreated-{index}"),
+                    values: vec![index as f32; 16],
+                    attributes: None,
+                })
+                .collect(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let old_manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    assert!(old_manifest.version() > 1);
+
+    let manifest_cache = Arc::new(ManifestCache::new(Duration::from_secs(3_600)));
+    let cached_old = manifest_cache
+        .get_strong_required(&store, &ns)
+        .await
+        .unwrap();
+    assert_eq!(cached_old.version(), old_manifest.version());
+
+    let remote_manager = zeppelin::namespace::NamespaceManager::with_clock(
+        store.clone(),
+        Duration::from_secs(3_600),
+        zeppelin::time::Clock::from_source(Arc::new(FixedNamespaceTime(new_created_at))),
+    );
+    remote_manager.delete(&ns).await.unwrap();
+    let new_metadata = remote_manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    assert_eq!(old_metadata.created_at, old_created_at);
+    assert_eq!(new_metadata.created_at, new_created_at);
+    let recreated = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    assert_eq!(recreated.version(), 1);
+    let stale_error = manifest_cache
+        .get_strong_required(&store, &ns)
+        .await
+        .expect_err("the old lifecycle floor must initially reject generation one");
+    assert!(matches!(
+        stale_error,
+        zeppelin::error::ZeppelinError::Serialization(ref message)
+            if message.contains("generation regressed")
+    ));
+
+    let compaction_config = CompactionConfig {
+        interval_secs: 1,
+        ..Default::default()
+    };
+    let compactor = Arc::new(Compactor::new(
+        store.clone(),
+        WalReader::new(store.clone()),
+        compaction_config.clone(),
+        IndexingConfig::default(),
+        common::default_gc_upload_window(),
+    ));
+    let lease_manager = Arc::new(LeaseManager::new(
+        store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(compaction_config.lease_duration_secs),
+    ));
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache = Arc::new(
+        DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let loop_handle = {
+        let namespace_manager = namespace_manager.clone();
+        let manifest_cache = manifest_cache.clone();
+        let namespace_prefix = Some(harness.prefix.clone());
+        tokio::spawn(async move {
+            zeppelin::compaction::background::compaction_loop(
+                compactor,
+                namespace_manager,
+                shutdown_rx,
+                manifest_cache,
+                lease_manager,
+                cache,
+                CompactionLoopOptions {
+                    gc_config: zeppelin::config::GcConfig::default(),
+                    namespace_prefix,
+                },
+            )
+            .await;
+        })
+    };
+
+    let observed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match manifest_cache.get_strong_required(&store, &ns).await {
+                Ok(manifest) if manifest.version() == recreated.version() => break manifest,
+                Ok(_) | Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("fresh discovery must reset the manifest cache lifecycle floor");
+    shutdown_tx.send(true).unwrap();
+    loop_handle.await.unwrap();
+    assert_eq!(observed.version(), 1);
 
     store.delete_prefix(&format!("{ns}/")).await.unwrap();
     harness.cleanup().await;

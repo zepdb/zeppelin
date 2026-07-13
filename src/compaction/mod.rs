@@ -350,6 +350,38 @@ fn manifest_needs_index_rewrite(manifest: &Manifest, config: &IndexingConfig) ->
         .is_some_and(|segment| !segment_matches_index_config(segment, config))
 }
 
+/// Resolves process defaults with one already-observed namespace overlay.
+///
+/// The metadata snapshot may be stale when it is used only to decide whether
+/// background compaction should wake up. The compaction transaction performs a
+/// separate authoritative metadata GET under the lease before it changes any
+/// visible state.
+fn resolve_indexing_config(
+    namespace: &str,
+    metadata: &NamespaceMetadata,
+    defaults: &IndexingConfig,
+) -> Result<IndexingConfig> {
+    match metadata.state {
+        NamespaceState::Active => {}
+        NamespaceState::Creating => {
+            return Err(ZeppelinError::ManifestConflict {
+                namespace: namespace.to_string(),
+            });
+        }
+        NamespaceState::Deleting => {
+            return Err(ZeppelinError::NamespaceDeleting {
+                namespace: namespace.to_string(),
+            });
+        }
+    }
+
+    if let Some(namespace_config) = metadata.index_config.as_ref() {
+        namespace_config.validate(metadata.dimensions)?;
+        return Ok(namespace_config.apply_to_indexing_config(defaults));
+    }
+    Ok(defaults.clone())
+}
+
 /// Compares manifest-visible layout choices with the effective index config.
 ///
 /// # Parameters
@@ -685,24 +717,7 @@ impl Compactor {
         match self.store.get(&key).await {
             Ok(data) => {
                 let meta = NamespaceMetadata::from_bytes(&data)?;
-                match meta.state {
-                    NamespaceState::Active => {}
-                    NamespaceState::Creating => {
-                        return Err(ZeppelinError::ManifestConflict {
-                            namespace: namespace.to_string(),
-                        });
-                    }
-                    NamespaceState::Deleting => {
-                        return Err(ZeppelinError::NamespaceDeleting {
-                            namespace: namespace.to_string(),
-                        });
-                    }
-                }
-                if let Some(namespace_config) = meta.index_config.as_ref() {
-                    namespace_config.validate(meta.dimensions)?;
-                    return Ok(namespace_config.apply_to_indexing_config(&self.indexing_config));
-                }
-                Ok(self.indexing_config.clone())
+                resolve_indexing_config(namespace, &meta, &self.indexing_config)
             }
             Err(ZeppelinError::NotFound { .. }) => Err(ZeppelinError::NamespaceNotFound {
                 namespace: namespace.to_string(),
@@ -728,8 +743,10 @@ impl Compactor {
     ///
     /// # Parameters
     ///
-    /// - `namespace`: Namespace whose live manifest and, when necessary,
-    ///   indexing metadata should be inspected.
+    /// - `namespace`: Namespace label used for diagnostics and metrics.
+    /// - `manifest`: Caller-supplied, strongly revalidated visibility snapshot.
+    /// - `metadata`: Caller-supplied discovery snapshot used only by the
+    ///   advisory idle-layout trigger.
     ///
     /// # Returns
     ///
@@ -738,22 +755,20 @@ impl Compactor {
     ///
     /// # Errors
     ///
-    /// Returns [`ZeppelinError::ManifestNotFound`] when an active namespace has
-    /// lost its authoritative manifest. Also propagates manifest decoding,
-    /// metadata/config, storage, and pre-Unix-epoch clock errors.
+    /// Propagates metadata/config and pre-Unix-epoch clock errors. Fetching and
+    /// decoding the authoritative snapshots is the caller's responsibility.
     ///
     /// # Consistency
     ///
-    /// The decision uses the current object-store manifest. It is advisory: a
-    /// later compaction reads its own fresh snapshot and remains correct if the
-    /// manifest changes between check and execution.
+    /// The decision is advisory. The background caller strongly revalidates the
+    /// manifest and may use a bounded-staleness discovery metadata snapshot; a
+    /// later lease-protected compaction reads both objects afresh and remains
+    /// correct if either changes between trigger and execution.
     ///
     /// # Performance
     ///
-    /// Performs one manifest GET. Idle namespaces require one additional
-    /// metadata GET only to check for an index-layout rewrite. Threshold checks
-    /// otherwise scan the in-memory fragment descriptors in linear time without
-    /// reading WAL payloads.
+    /// Performs no object-store I/O. Threshold checks scan the in-memory
+    /// fragment descriptors in linear time without reading WAL payloads.
     ///
     /// # Examples
     ///
@@ -768,20 +783,21 @@ impl Compactor {
     /// can aggregate its descriptors without copying them. Iterator chains are
     /// statically specialized like hand-written C loops, rather than allocating
     /// Java stream objects for each element.
-    #[instrument(skip(self), fields(namespace = namespace))]
-    pub async fn should_compact(&self, namespace: &str) -> Result<bool> {
-        let manifest = Manifest::read(&self.store, namespace)
-            .await?
-            .ok_or_else(|| ZeppelinError::ManifestNotFound {
-                namespace: namespace.to_string(),
-            })?;
+    #[instrument(skip(self, manifest, metadata), fields(namespace = namespace))]
+    pub fn should_compact(
+        &self,
+        namespace: &str,
+        manifest: &Manifest,
+        metadata: &NamespaceMetadata,
+    ) -> Result<bool> {
         let fragments = manifest.uncompacted_fragments();
 
         // Idle namespace: nothing to compact, never trigger (no busy work,
         // no S3 churn on quiet namespaces).
         if fragments.is_empty() {
-            let indexing_config = self.effective_indexing_config(namespace).await?;
-            if manifest_needs_index_rewrite(&manifest, &indexing_config) {
+            let indexing_config =
+                resolve_indexing_config(namespace, metadata, &self.indexing_config)?;
+            if manifest_needs_index_rewrite(manifest, &indexing_config) {
                 info!("compaction triggered by index config layout change");
                 return Ok(true);
             }
@@ -4080,7 +4096,9 @@ mod tests {
 
     use super::*;
     use crate::config::{Config, GcConfig};
+    use crate::namespace::manager::{CompactionHealth, NamespaceIndexConfig};
     use crate::time::TimeSource;
+    use crate::types::{DistanceMetric, IndexType};
     use crate::wal::manifest::FragmentRef;
 
     #[derive(Debug)]
@@ -4255,29 +4273,171 @@ mod tests {
         )
     }
 
-    /// Publishes a test manifest containing the supplied fragment descriptors.
+    /// Builds a test manifest containing the supplied fragment descriptors.
     ///
     /// # Parameters
     ///
-    /// - `compactor`: Supplies the isolated in-memory store.
-    /// - `ns`: Test namespace key.
     /// - `fragments`: Visible descriptors added in the provided order.
     ///
-    /// # Side Effects
+    /// # Returns
     ///
-    /// Performs an unconditional test-only manifest write and panics on failure.
-    async fn write_manifest(compactor: &Compactor, ns: &str, fragments: Vec<FragmentRef>) {
+    /// An owned in-memory snapshot suitable for the pure trigger seam.
+    fn manifest_with_fragments(fragments: Vec<FragmentRef>) -> Manifest {
         let mut manifest = Manifest::new();
         for f in fragments {
             manifest.add_fragment(f);
         }
-        manifest.write(&compactor.store, ns).await.unwrap();
+        manifest
+    }
+
+    fn active_metadata(namespace: &str) -> NamespaceMetadata {
+        let now = Utc::now();
+        NamespaceMetadata {
+            name: namespace.to_string(),
+            dimensions: 4,
+            distance_metric: DistanceMetric::Euclidean,
+            index_type: IndexType::IvfFlat,
+            vector_count: 0,
+            created_at: now,
+            updated_at: now,
+            state: NamespaceState::Active,
+            full_text_search: HashMap::new(),
+            index_config: None,
+            compaction_health: CompactionHealth::default(),
+        }
+    }
+
+    fn segment_for_config(id: &str, vector_count: usize, config: &IndexingConfig) -> SegmentRef {
+        SegmentRef {
+            id: id.to_string(),
+            vector_count,
+            cluster_count: config.effective_num_centroids(vector_count),
+            quantization: config.quantization,
+            hierarchical: config.hierarchical,
+            bitmap_fields: Vec::new(),
+            fts_fields: Vec::new(),
+            has_global_fts: false,
+            cluster_owners: Vec::new(),
+            sketch: None,
+            cluster_objects: Vec::new(),
+            bootstrap: None,
+            membership: None,
+        }
+    }
+
+    /// Trigger evaluation consumes caller-supplied snapshots and therefore
+    /// performs no storage reads of its own.
+    #[test]
+    fn should_compact_uses_supplied_snapshots_without_store_io() {
+        let compactor = mem_compactor(CompactionConfig::default());
+        let manifest = Manifest::new();
+        let metadata = active_metadata("ns-pure-trigger");
+
+        assert!(!compactor
+            .should_compact("ns-pure-trigger", &manifest, &metadata)
+            .unwrap());
+    }
+
+    #[test]
+    fn idle_trigger_preserves_requested_namespace_in_lifecycle_errors() {
+        let compactor = mem_compactor(CompactionConfig::default());
+        let manifest = Manifest::new();
+        let mut metadata = active_metadata("embedded-name");
+        metadata.state = NamespaceState::Deleting;
+
+        let error = compactor
+            .should_compact("requested-name", &manifest, &metadata)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ZeppelinError::NamespaceDeleting { namespace }
+                if namespace == "requested-name"
+        ));
+    }
+
+    #[test]
+    fn idle_trigger_rejects_creating_metadata_as_manifest_conflict() {
+        let compactor = mem_compactor(CompactionConfig::default());
+        let manifest = Manifest::new();
+        let mut metadata = active_metadata("embedded-name");
+        metadata.state = NamespaceState::Creating;
+
+        let error = compactor
+            .should_compact("requested-name", &manifest, &metadata)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ZeppelinError::ManifestConflict { namespace }
+                if namespace == "requested-name"
+        ));
+    }
+
+    #[test]
+    fn idle_trigger_without_overlay_uses_process_defaults() {
+        let defaults = IndexingConfig::default();
+        let compactor = mem_compactor(CompactionConfig::default());
+        let mut manifest = Manifest::new();
+        manifest.add_segment(segment_for_config("seg-defaults", 10, &defaults));
+        let metadata = active_metadata("ns-defaults");
+
+        assert!(!compactor
+            .should_compact("ns-defaults", &manifest, &metadata)
+            .unwrap());
+    }
+
+    #[test]
+    fn idle_trigger_applies_valid_namespace_overlay() {
+        let defaults = IndexingConfig::default();
+        let compactor = mem_compactor(CompactionConfig::default());
+        let mut manifest = Manifest::new();
+        manifest.add_segment(segment_for_config("seg-overlay", 10, &defaults));
+        let mut metadata = active_metadata("ns-overlay");
+        let mut override_config = NamespaceIndexConfig::from_indexing_config(&defaults);
+        override_config.nlist = 2;
+        metadata.index_config = Some(override_config);
+
+        assert!(compactor
+            .should_compact("ns-overlay", &manifest, &metadata)
+            .unwrap());
+    }
+
+    #[test]
+    fn idle_trigger_rejects_invalid_namespace_overlay() {
+        let defaults = IndexingConfig::default();
+        let compactor = mem_compactor(CompactionConfig::default());
+        let manifest = Manifest::new();
+        let mut metadata = active_metadata("ns-invalid-overlay");
+        let mut override_config = NamespaceIndexConfig::from_indexing_config(&defaults);
+        override_config.quantization = crate::index::quantization::QuantizationType::Product;
+        override_config.pq_m = 3;
+        metadata.index_config = Some(override_config);
+
+        let error = compactor
+            .should_compact("ns-invalid-overlay", &manifest, &metadata)
+            .unwrap_err();
+        assert!(matches!(error, ZeppelinError::Validation(_)));
+    }
+
+    #[test]
+    fn nonempty_trigger_does_not_resolve_advisory_metadata() {
+        let compactor = mem_compactor(CompactionConfig {
+            max_wal_fragments_before_compact: 1,
+            ..Default::default()
+        });
+        let manifest =
+            manifest_with_fragments(vec![fragment_ref(Ulid::from_parts(now_ms(), 1), 1)]);
+        let mut metadata = active_metadata("ns-nonempty");
+        metadata.state = NamespaceState::Deleting;
+
+        assert!(compactor
+            .should_compact("ns-nonempty", &manifest, &metadata)
+            .unwrap());
     }
 
     /// I1: a single old fragment must trigger compaction via the age
     /// trigger even when the count threshold is far away.
-    #[tokio::test]
-    async fn test_should_compact_age_exceeded_single_fragment() {
+    #[test]
+    fn test_should_compact_age_exceeded_single_fragment() {
         let compactor = mem_compactor(CompactionConfig {
             max_wal_fragments_before_compact: 1000,
             max_wal_age_before_compact_secs: 60, // 1 minute
@@ -4286,18 +4446,21 @@ mod tests {
         });
         // Fragment written 1 hour ago (ULID encodes the timestamp).
         let old_id = Ulid::from_parts(now_ms() - 3_600_000, 42);
-        write_manifest(&compactor, "ns-age", vec![fragment_ref(old_id, 100)]).await;
+        let manifest = manifest_with_fragments(vec![fragment_ref(old_id, 100)]);
+        let metadata = active_metadata("ns-age");
 
         assert!(
-            compactor.should_compact("ns-age").await.unwrap(),
+            compactor
+                .should_compact("ns-age", &manifest, &metadata)
+                .unwrap(),
             "1 fragment older than max_wal_age_before_compact_secs must trigger compaction"
         );
     }
 
     /// Advancing only the injected clock must make a fresh fragment age into
     /// compaction eligibility without changing count or byte thresholds.
-    #[tokio::test]
-    async fn test_should_compact_age_uses_injected_clock() {
+    #[test]
+    fn test_should_compact_age_uses_injected_clock() {
         let source = Arc::new(AdjustableTimeSource::new(Utc::now()));
         let compactor = mem_compactor_with_clock(
             CompactionConfig {
@@ -4311,30 +4474,30 @@ mod tests {
         let fragment_timestamp = u64::try_from(source.now().timestamp_millis())
             .expect("compactor-test clock must be after the Unix epoch");
         let fragment_id = Ulid::from_parts(fragment_timestamp, 42);
-        write_manifest(
-            &compactor,
-            "ns-injected-age",
-            vec![fragment_ref(fragment_id, 100)],
-        )
-        .await;
+        let manifest = manifest_with_fragments(vec![fragment_ref(fragment_id, 100)]);
+        let metadata = active_metadata("ns-injected-age");
 
         assert!(
-            !compactor.should_compact("ns-injected-age").await.unwrap(),
+            !compactor
+                .should_compact("ns-injected-age", &manifest, &metadata)
+                .unwrap(),
             "fragment at the injected current time must remain below all thresholds"
         );
 
         source.jump(chrono::Duration::seconds(301));
 
         assert!(
-            compactor.should_compact("ns-injected-age").await.unwrap(),
+            compactor
+                .should_compact("ns-injected-age", &manifest, &metadata)
+                .unwrap(),
             "advancing the injected clock past the age threshold must trigger compaction"
         );
     }
 
     /// A pre-epoch injected clock is invalid configuration, not a young
     /// fragment; reject it instead of saturating or consulting host time.
-    #[tokio::test]
-    async fn test_should_compact_rejects_pre_epoch_injected_clock() {
+    #[test]
+    fn test_should_compact_rejects_pre_epoch_injected_clock() {
         let before_epoch = DateTime::from_timestamp_millis(-1)
             .expect("one millisecond before the Unix epoch must be representable");
         let compactor = mem_compactor_with_clock(
@@ -4346,16 +4509,11 @@ mod tests {
             },
             Clock::from_source(Arc::new(AdjustableTimeSource::new(before_epoch))),
         );
-        write_manifest(
-            &compactor,
-            "ns-pre-epoch-age",
-            vec![fragment_ref(Ulid::from_parts(0, 42), 100)],
-        )
-        .await;
+        let manifest = manifest_with_fragments(vec![fragment_ref(Ulid::from_parts(0, 42), 100)]);
+        let metadata = active_metadata("ns-pre-epoch-age");
 
         let error = compactor
-            .should_compact("ns-pre-epoch-age")
-            .await
+            .should_compact("ns-pre-epoch-age", &manifest, &metadata)
             .unwrap_err();
         assert!(
             matches!(error, ZeppelinError::Index(ref message) if message.contains("compactor clock before Unix epoch")),
@@ -4364,8 +4522,8 @@ mod tests {
     }
 
     /// A fresh fragment below all thresholds must NOT trigger.
-    #[tokio::test]
-    async fn test_should_compact_fresh_fragment_below_thresholds() {
+    #[test]
+    fn test_should_compact_fresh_fragment_below_thresholds() {
         let compactor = mem_compactor(CompactionConfig {
             max_wal_fragments_before_compact: 1000,
             max_wal_age_before_compact_secs: 3600,
@@ -4373,18 +4531,21 @@ mod tests {
             ..Default::default()
         });
         let fresh_id = Ulid::from_parts(now_ms(), 42);
-        write_manifest(&compactor, "ns-fresh", vec![fragment_ref(fresh_id, 100)]).await;
+        let manifest = manifest_with_fragments(vec![fragment_ref(fresh_id, 100)]);
+        let metadata = active_metadata("ns-fresh");
 
         assert!(
-            !compactor.should_compact("ns-fresh").await.unwrap(),
+            !compactor
+                .should_compact("ns-fresh", &manifest, &metadata)
+                .unwrap(),
             "fresh fragment below all thresholds must not trigger compaction"
         );
     }
 
     /// I2: total uncompacted WAL bytes over the threshold must trigger,
     /// so few-but-huge fragments don't linger under the count trigger.
-    #[tokio::test]
-    async fn test_should_compact_bytes_exceeded() {
+    #[test]
+    fn test_should_compact_bytes_exceeded() {
         let compactor = mem_compactor(CompactionConfig {
             max_wal_fragments_before_compact: 1000,
             max_wal_age_before_compact_secs: u64::MAX / 1000,
@@ -4392,43 +4553,44 @@ mod tests {
             ..Default::default()
         });
         let now = now_ms();
-        write_manifest(
-            &compactor,
-            "ns-bytes",
-            vec![
-                fragment_ref(Ulid::from_parts(now, 1), 40 * 1024 * 1024),
-                fragment_ref(Ulid::from_parts(now, 2), 40 * 1024 * 1024),
-            ],
-        )
-        .await;
+        let manifest = manifest_with_fragments(vec![
+            fragment_ref(Ulid::from_parts(now, 1), 40 * 1024 * 1024),
+            fragment_ref(Ulid::from_parts(now, 2), 40 * 1024 * 1024),
+        ]);
+        let metadata = active_metadata("ns-bytes");
 
         assert!(
-            compactor.should_compact("ns-bytes").await.unwrap(),
+            compactor
+                .should_compact("ns-bytes", &manifest, &metadata)
+                .unwrap(),
             "80MB of WAL over a 64MB threshold must trigger compaction"
         );
     }
 
     /// I4: zero uncompacted fragments and no active layout mismatch stays idle,
     /// no matter how aggressive the WAL thresholds are.
-    #[tokio::test]
-    async fn test_should_compact_zero_fragments_never_triggers() {
+    #[test]
+    fn test_should_compact_zero_fragments_never_triggers() {
         let compactor = mem_compactor(CompactionConfig {
             max_wal_fragments_before_compact: 0,
             max_wal_age_before_compact_secs: 0,
             max_wal_bytes_before_compact: 0,
             ..Default::default()
         });
-        write_manifest(&compactor, "ns-idle", vec![]).await;
+        let manifest = manifest_with_fragments(vec![]);
+        let metadata = active_metadata("ns-idle");
 
         assert!(
-            !compactor.should_compact("ns-idle").await.unwrap(),
+            !compactor
+                .should_compact("ns-idle", &manifest, &metadata)
+                .unwrap(),
             "an idle namespace (0 fragments) must never be compacted"
         );
     }
 
     /// I3: the count trigger keeps working (backward compat).
-    #[tokio::test]
-    async fn test_should_compact_count_trigger_preserved() {
+    #[test]
+    fn test_should_compact_count_trigger_preserved() {
         let compactor = mem_compactor(CompactionConfig {
             max_wal_fragments_before_compact: 3,
             max_wal_age_before_compact_secs: u64::MAX / 1000,
@@ -4436,17 +4598,17 @@ mod tests {
             ..Default::default()
         });
         let now = now_ms();
-        write_manifest(
-            &compactor,
-            "ns-count",
+        let manifest = manifest_with_fragments(
             (0..3)
                 .map(|i| fragment_ref(Ulid::from_parts(now, i as u128), 10))
                 .collect(),
-        )
-        .await;
+        );
+        let metadata = active_metadata("ns-count");
 
         assert!(
-            compactor.should_compact("ns-count").await.unwrap(),
+            compactor
+                .should_compact("ns-count", &manifest, &metadata)
+                .unwrap(),
             "reaching the fragment-count threshold must trigger compaction"
         );
     }

@@ -202,6 +202,9 @@ pub(crate) enum BackgroundMaintenanceCase {
     DiscoveryTickEmpty,
     DiscoveryTickActive,
     CachedTickIdle,
+    TriggerManifestChanged,
+    TriggerCacheInvalidated,
+    TriggerLayoutChange,
     TickResumeDelete,
     TickLeaseHeld,
     TickCompactionSuccess,
@@ -687,6 +690,21 @@ pub(crate) const IDEAL_CASES: &[IdealCase] = &[
         "background.cached_tick_idle",
         IdealCaseGroup::BackgroundMaintenance,
         IdealOperation::BackgroundMaintenance(BackgroundMaintenanceCase::CachedTickIdle),
+    ),
+    ideal_case(
+        "background.trigger_manifest_changed",
+        IdealCaseGroup::BackgroundMaintenance,
+        IdealOperation::BackgroundMaintenance(BackgroundMaintenanceCase::TriggerManifestChanged),
+    ),
+    ideal_case(
+        "background.trigger_cache_invalidated",
+        IdealCaseGroup::BackgroundMaintenance,
+        IdealOperation::BackgroundMaintenance(BackgroundMaintenanceCase::TriggerCacheInvalidated),
+    ),
+    ideal_case(
+        "background.trigger_layout_change",
+        IdealCaseGroup::BackgroundMaintenance,
+        IdealOperation::BackgroundMaintenance(BackgroundMaintenanceCase::TriggerLayoutChange),
     ),
     ideal_case(
         "background.tick_resume_delete",

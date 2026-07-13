@@ -154,7 +154,16 @@ async fn test_patch_index_config_forces_next_compaction_rewrite() {
     assert_eq!(body["status"], "accepted");
     assert_eq!(body["index_config"]["nlist"], 2);
 
-    assert!(compactor.should_compact(&ns).await.unwrap());
+    let manifest = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    let metadata = NamespaceMetadata::from_bytes(
+        &harness
+            .store
+            .get(&NamespaceMetadata::s3_key(&ns))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(compactor.should_compact(&ns, &manifest, &metadata).unwrap());
     compactor.compact(&ns).await.unwrap();
     let rewritten = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
     let active_id = rewritten.active_segment.as_ref().unwrap();
@@ -165,6 +174,82 @@ async fn test_patch_index_config_forces_next_compaction_rewrite() {
         .unwrap();
     assert_eq!(active.cluster_count, 2);
     assert_eq!(active.vector_count, 16);
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_stale_layout_trigger_cannot_override_fresh_compaction_metadata() {
+    let (base_url, harness, _cache, _cache_dir, compactor) =
+        start_test_server_with_compactor(None).await;
+    let client = reqwest::Client::new();
+    let ns = create_ns_api_with(
+        &client,
+        &base_url,
+        serde_json::json!({
+            "dimensions": 4,
+            "distance_metric": "euclidean",
+            "index_config": {
+                "nlist": 4,
+                "quantization": "none"
+            }
+        }),
+    )
+    .await;
+    let vectors: Vec<_> = (0..16)
+        .map(|i| {
+            serde_json::json!({
+                "id": format!("stale-trigger-{i}"),
+                "values": [i as f32, 1.0, 0.0, 0.0]
+            })
+        })
+        .collect();
+    let response = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&serde_json::json!({ "vectors": vectors }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    compactor.compact(&ns).await.unwrap();
+
+    let response = client
+        .patch(format!("{base_url}/v1/namespaces/{ns}/index_config"))
+        .json(&serde_json::json!({ "nlist": 2 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 202);
+    let stale_metadata = NamespaceMetadata::from_bytes(
+        &harness
+            .store
+            .get(&NamespaceMetadata::s3_key(&ns))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let response = client
+        .patch(format!("{base_url}/v1/namespaces/{ns}/index_config"))
+        .json(&serde_json::json!({ "nlist": 4 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 202);
+
+    let before = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert!(compactor
+        .should_compact(&ns, &before, &stale_metadata)
+        .unwrap());
+    let result = compactor.compact(&ns).await.unwrap();
+    assert!(result.segment_id.is_none());
+    assert_eq!(result.vectors_compacted, 0);
+    assert_eq!(result.fragments_removed, 0);
+
+    let after = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(after.version(), before.version());
+    assert_eq!(after.active_segment, before.active_segment);
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;

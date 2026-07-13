@@ -143,7 +143,7 @@ use crate::cache::DiskCache;
 use crate::config::GcConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
-use crate::namespace::manager::NamespaceState;
+use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
 use crate::namespace::NamespaceManager;
 use crate::storage::ZeppelinStore;
 use crate::wal::Lease;
@@ -152,6 +152,24 @@ use crate::wal::Manifest;
 
 use super::gc::{GcNamespaceIncarnation, GcRunner};
 use super::{CompactionResult, Compactor};
+
+const NAMESPACE_DISCOVERY_REFRESH_TICKS: u64 = 12;
+
+#[must_use]
+fn is_fresh_namespace_discovery_tick(tick: u64) -> bool {
+    tick == 1 || tick % NAMESPACE_DISCOVERY_REFRESH_TICKS == 0
+}
+
+#[must_use]
+fn changed_namespace_names(
+    known: &BTreeSet<GcNamespaceIncarnation>,
+    active: &BTreeSet<GcNamespaceIncarnation>,
+) -> BTreeSet<String> {
+    known
+        .symmetric_difference(active)
+        .map(|incarnation| incarnation.name().to_string())
+        .collect()
+}
 
 /// Boot-time settings moved into the dedicated compaction runtime thread.
 ///
@@ -829,6 +847,39 @@ pub fn start_compaction_thread(
         .expect("failed to spawn compaction thread")
 }
 
+/// Strongly revalidates one live manifest and evaluates its advisory trigger.
+///
+/// This is the single scheduler seam shared by the production loop and the
+/// dedicated performance harness. A resident manifest permits a conditional
+/// GET, but cache presence never substitutes for successful object-store
+/// verification. Namespace metadata is the bounded-staleness discovery hint;
+/// an actual lease-protected compaction reloads both manifest and metadata
+/// before publishing anything.
+///
+/// # Errors
+///
+/// Maps a missing required live manifest to [`ZeppelinError::ManifestNotFound`]
+/// using the discovered namespace name. Storage, conditional-read, binding,
+/// and decoding errors propagate unchanged; no stale cached snapshot is used
+/// after a failed refresh.
+pub async fn evaluate_compaction_trigger(
+    compactor: &Compactor,
+    manifest_cache: &ManifestCache,
+    namespace: &NamespaceMetadata,
+) -> Result<bool> {
+    let manifest = manifest_cache
+        .get_strong_required(compactor.store(), &namespace.name)
+        .await
+        .map_err(|error| match error {
+            ZeppelinError::NotFound { .. } => ZeppelinError::ManifestNotFound {
+                namespace: namespace.name.clone(),
+            },
+            error => error,
+        })?;
+
+    compactor.should_compact(&namespace.name, &manifest, namespace)
+}
+
 /// Repeatedly discovers namespaces and performs deletion, GC, and compaction.
 ///
 /// The first maintenance pass occurs after one configured interval. Tick 1 and
@@ -959,6 +1010,17 @@ pub async fn compaction_loop(
     );
 
     let mut gc_runner = GcRunner::new(compactor.store().clone(), gc_config.clone());
+    // The registry and manifest cache are warmed by startup before this loop is
+    // spawned. Seed matching lifecycle identities so tick one's authoritative
+    // discovery does not evict an unchanged resident manifest. A missing or
+    // stale registry entry still differs from the fresh S3 listing below and
+    // therefore preserves delete/recreate invalidation safety.
+    let mut known_incarnations = namespace_manager
+        .cached_namespaces(namespace_prefix.as_deref())
+        .into_iter()
+        .filter(|namespace| namespace.state == NamespaceState::Active)
+        .map(|namespace| GcNamespaceIncarnation::new(namespace.name, namespace.created_at))
+        .collect::<BTreeSet<_>>();
     let mut tick: u64 = 0;
 
     loop {
@@ -971,7 +1033,7 @@ pub async fn compaction_loop(
         }
 
         tick = tick.saturating_add(1);
-        let (namespaces, fresh_discovery) = if tick == 1 || tick % 12 == 0 {
+        let (namespaces, fresh_discovery) = if is_fresh_namespace_discovery_tick(tick) {
             match namespace_manager.list(namespace_prefix.as_deref()).await {
                 Ok(ns) => (ns, true),
                 Err(e) => {
@@ -997,6 +1059,16 @@ pub async fn compaction_loop(
                     GcNamespaceIncarnation::new(namespace.name.clone(), namespace.created_at)
                 })
                 .collect::<BTreeSet<_>>();
+
+            // A name can disappear or return with a new creation timestamp
+            // while this process still holds its old manifest generation
+            // floor. Reconcile every successful discovery before any strong
+            // trigger read so a removed/replaced incarnation starts cold.
+            let changed_names = changed_namespace_names(&known_incarnations, &active);
+            for namespace in changed_names {
+                manifest_cache.invalidate_at(&namespace, compactor.clock().now());
+            }
+            known_incarnations = active.clone();
             gc_runner.retain_namespaces(&active);
         }
 
@@ -1087,7 +1159,10 @@ pub async fn compaction_loop(
                 }
             }
 
-            match compactor.should_compact(&ns.name).await {
+            let trigger =
+                evaluate_compaction_trigger(compactor.as_ref(), manifest_cache.as_ref(), ns).await;
+
+            match trigger {
                 Ok(true) => {
                     // Compact under the per-namespace lease (acquire →
                     // heartbeat → compact → release). LeaseHeld means
@@ -1181,5 +1256,49 @@ pub async fn compaction_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use chrono::{DateTime, Utc};
+
+    use super::{changed_namespace_names, is_fresh_namespace_discovery_tick};
+    use crate::compaction::gc::GcNamespaceIncarnation;
+
+    #[test]
+    fn namespace_discovery_refreshes_on_first_and_every_twelfth_tick() {
+        let refresh_ticks = (1..=36)
+            .filter(|tick| is_fresh_namespace_discovery_tick(*tick))
+            .collect::<Vec<_>>();
+
+        assert_eq!(refresh_ticks, vec![1, 12, 24, 36]);
+    }
+
+    #[test]
+    fn namespace_incarnation_diff_deduplicates_replacements_and_tracks_removals() {
+        let Some(old_created) = DateTime::<Utc>::from_timestamp(1, 0) else {
+            panic!("one second after the Unix epoch must be representable");
+        };
+        let Some(new_created) = DateTime::<Utc>::from_timestamp(2, 0) else {
+            panic!("two seconds after the Unix epoch must be representable");
+        };
+        let known = BTreeSet::from([
+            GcNamespaceIncarnation::new("recreated".to_string(), old_created),
+            GcNamespaceIncarnation::new("removed".to_string(), old_created),
+            GcNamespaceIncarnation::new("unchanged".to_string(), old_created),
+        ]);
+        let active = BTreeSet::from([
+            GcNamespaceIncarnation::new("recreated".to_string(), new_created),
+            GcNamespaceIncarnation::new("unchanged".to_string(), old_created),
+        ]);
+
+        assert_eq!(
+            changed_namespace_names(&known, &active),
+            BTreeSet::from(["recreated".to_string(), "removed".to_string()])
+        );
+        assert!(changed_namespace_names(&active, &active).is_empty());
     }
 }

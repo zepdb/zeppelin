@@ -17,7 +17,10 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use ulid::Ulid;
-use zeppelin::compaction::background::compact_namespace_under_lease;
+use zeppelin::cache::manifest_cache::ManifestCache;
+use zeppelin::compaction::background::{
+    compact_namespace_under_lease, evaluate_compaction_trigger,
+};
 use zeppelin::compaction::gc::{
     active_staged_keys_at, clear_compaction_staging, drain_pending_deletes_at, load_gc_candidates,
     run_gc_cycle_at, save_gc_candidates, write_compaction_staging, GcCandidate, GcCycleReport,
@@ -37,9 +40,11 @@ use zeppelin::wal::manifest::FragmentRef;
 use zeppelin::wal::manifest::NamedSnapshot;
 use zeppelin::wal::{LeaseManager, Manifest, WalReader, WalWriter};
 
-use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
+use crate::common::counting::{perf_counting_store, ArtifactClass, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
-use crate::perf_contract::depth::{depth_store, DepthTracker, PhysicalRequest, SpanKind};
+use crate::perf_contract::depth::{
+    depth_store, DepthTracker, PhysicalRequest, SpanKind, SpanOutcome,
+};
 use crate::perf_contract::scenario::RepeatCounters;
 
 use super::artifacts::IdealSample;
@@ -67,7 +72,7 @@ pub(crate) fn supports(case: &IdealCase) -> bool {
 
 /// Execute one sound, directly awaited maintenance case.
 ///
-/// The six scheduler shapes execute their owned production steps rather than
+/// The scheduler shapes execute their owned production steps rather than
 /// driving the infinite timer loop. Detached cache warming and hydration
 /// deliberately remain unsupported because neither exposes an awaitable
 /// completion boundary suitable for an isolated measurement interval.
@@ -489,6 +494,13 @@ async fn execute_background(case: &IdealCase, operation: BackgroundMaintenanceCa
         BackgroundMaintenanceCase::DiscoveryTickEmpty => execute_discovery_empty(case).await,
         BackgroundMaintenanceCase::DiscoveryTickActive => execute_discovery_active(case).await,
         BackgroundMaintenanceCase::CachedTickIdle => execute_cached_idle(case).await,
+        BackgroundMaintenanceCase::TriggerManifestChanged => {
+            execute_trigger_manifest_changed(case).await
+        }
+        BackgroundMaintenanceCase::TriggerCacheInvalidated => {
+            execute_trigger_cache_invalidated(case).await
+        }
+        BackgroundMaintenanceCase::TriggerLayoutChange => execute_trigger_layout_change(case).await,
         BackgroundMaintenanceCase::TickResumeDelete => execute_resume_delete(case).await,
         BackgroundMaintenanceCase::TickLeaseHeld => execute_tick_lease_held(case).await,
         BackgroundMaintenanceCase::TickCompactionSuccess => {
@@ -545,16 +557,215 @@ async fn execute_cached_idle(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal cached-idle namespace setup failed");
     let compactor = maintenance_compactor(&world, CompactionConfig::default());
+    let manifest_cache = ManifestCache::new(Duration::from_secs(3_600));
+    manifest_cache
+        .get_strong_required(&world.store, &namespace)
+        .await
+        .expect("ideal cached-idle manifest prime failed");
 
     world.begin_measurement().await;
     let cached = manager.cached_namespaces(Some(&world.harness.prefix));
     assert_eq!(cached.len(), 1);
     assert_eq!(cached[0].name, namespace);
-    assert!(!compactor
-        .should_compact(&cached[0].name)
+    assert!(
+        !evaluate_compaction_trigger(&compactor, &manifest_cache, &cached[0])
+            .await
+            .expect("ideal cached-idle trigger check failed")
+    );
+    let sample = world.snapshot(case).await;
+    assert_eq!(sample.total_get_ops, 1);
+    assert_eq!(sample.total_get_bytes, 0);
+    assert_single_manifest_get(
+        &sample,
+        PhysicalRequest::GetConditional,
+        SpanOutcome::NotModified,
+    );
+    world.cleanup(sample).await
+}
+
+async fn execute_trigger_manifest_changed(case: &IdealCase) -> IdealSample {
+    let mut world = MaintenanceWorld::new().await;
+    let namespace = world.managed_namespace(case.id.as_str());
+    let manager = maintenance_namespace_manager(&world);
+    let indexing = maintenance_indexing_config();
+    let metadata = manager
+        .create_with_fts_and_index_config(
+            &namespace,
+            4,
+            DistanceMetric::Euclidean,
+            HashMap::new(),
+            Some(NamespaceIndexConfig::from_indexing_config(&indexing)),
+        )
         .await
-        .expect("ideal cached-idle trigger check failed"));
-    world.finish(case).await
+        .expect("ideal changed-trigger namespace setup failed");
+    let manifest_cache = ManifestCache::new(Duration::from_secs(3_600));
+    manifest_cache
+        .get_strong_required(&world.store, &namespace)
+        .await
+        .expect("ideal changed-trigger manifest prime failed");
+    WalWriter::with_clock(world.store.clone(), world.clock())
+        .append(
+            &namespace,
+            maintenance_vectors("trigger-changed", 1),
+            Vec::new(),
+        )
+        .await
+        .expect("ideal changed-trigger WAL publication failed");
+    let compactor = maintenance_compactor(&world, trigger_each_fragment());
+
+    world.begin_measurement().await;
+    assert!(
+        evaluate_compaction_trigger(&compactor, &manifest_cache, &metadata)
+            .await
+            .expect("ideal changed-trigger evaluation failed")
+    );
+    let sample = world.snapshot(case).await;
+    assert_eq!(sample.total_get_ops, 1);
+    assert_eq!(sample.total_get_bytes, 146);
+    assert_eq!(sample.serial_get_chain.depth, 1);
+    assert_single_manifest_get(
+        &sample,
+        PhysicalRequest::GetConditional,
+        SpanOutcome::Success,
+    );
+    world.cleanup(sample).await
+}
+
+async fn execute_trigger_cache_invalidated(case: &IdealCase) -> IdealSample {
+    let mut world = MaintenanceWorld::new().await;
+    let namespace = world.managed_namespace(case.id.as_str());
+    let manager = maintenance_namespace_manager(&world);
+    let indexing = maintenance_indexing_config();
+    let metadata = manager
+        .create_with_fts_and_index_config(
+            &namespace,
+            4,
+            DistanceMetric::Euclidean,
+            HashMap::new(),
+            Some(NamespaceIndexConfig::from_indexing_config(&indexing)),
+        )
+        .await
+        .expect("ideal invalidated-trigger namespace setup failed");
+    let manifest_cache = ManifestCache::new(Duration::from_secs(3_600));
+    manifest_cache
+        .get_strong_required(&world.store, &namespace)
+        .await
+        .expect("ideal invalidated-trigger manifest prime failed");
+    manifest_cache.invalidate_at(&namespace, world.now);
+    let compactor = maintenance_compactor(&world, CompactionConfig::default());
+
+    world.begin_measurement().await;
+    assert!(
+        !evaluate_compaction_trigger(&compactor, &manifest_cache, &metadata)
+            .await
+            .expect("ideal invalidated-trigger evaluation failed")
+    );
+    let sample = world.snapshot(case).await;
+    assert_eq!(sample.total_get_ops, 1);
+    assert_eq!(sample.total_get_bytes, 115);
+    assert_eq!(sample.serial_get_chain.depth, 1);
+    assert_single_manifest_get(&sample, PhysicalRequest::GetFull, SpanOutcome::Success);
+    world.cleanup(sample).await
+}
+
+async fn execute_trigger_layout_change(case: &IdealCase) -> IdealSample {
+    let mut world = MaintenanceWorld::new().await;
+    let namespace = world.managed_namespace(case.id.as_str());
+    let publishing_manager = maintenance_namespace_manager(&world);
+    let discovery_manager = maintenance_namespace_manager(&world);
+    let indexing = maintenance_indexing_config();
+    publishing_manager
+        .create_with_fts_and_index_config(
+            &namespace,
+            4,
+            DistanceMetric::Euclidean,
+            HashMap::new(),
+            Some(NamespaceIndexConfig::from_indexing_config(&indexing)),
+        )
+        .await
+        .expect("ideal layout-trigger namespace setup failed");
+    let initial_discovery = discovery_manager
+        .list(Some(&world.harness.prefix))
+        .await
+        .expect("ideal layout-trigger initial discovery failed");
+    assert_eq!(initial_discovery.len(), 1);
+    assert_eq!(
+        initial_discovery[0]
+            .index_config
+            .as_ref()
+            .map(|config| config.nlist),
+        Some(2)
+    );
+    WalWriter::with_clock(world.store.clone(), world.clock())
+        .append(
+            &namespace,
+            maintenance_vectors("trigger-layout", 16),
+            Vec::new(),
+        )
+        .await
+        .expect("ideal layout-trigger WAL setup failed");
+    let compactor = maintenance_compactor(&world, CompactionConfig::default());
+    compactor
+        .compact(&namespace)
+        .await
+        .expect("ideal layout-trigger initial compaction failed");
+    let manifest = Manifest::read(&world.store, &namespace)
+        .await
+        .expect("ideal layout-trigger manifest read failed")
+        .expect("ideal layout-trigger manifest missing");
+    let manifest_cache = ManifestCache::new(Duration::from_secs(3_600));
+    manifest_cache
+        .get_strong_required(&world.store, &namespace)
+        .await
+        .expect("ideal layout-trigger manifest prime failed");
+    let mut changed = NamespaceIndexConfig::from_indexing_config(&indexing);
+    changed.nlist = 4;
+    publishing_manager
+        .update_index_config(&namespace, changed)
+        .await
+        .expect("ideal layout-trigger metadata update failed");
+    let stale = discovery_manager
+        .cached_namespaces(Some(&world.harness.prefix))
+        .into_iter()
+        .next()
+        .expect("ideal layout-trigger stale discovery snapshot missing");
+    assert_eq!(
+        stale.index_config.as_ref().map(|config| config.nlist),
+        Some(2)
+    );
+    assert!(
+        !compactor
+            .should_compact(&namespace, &manifest, &stale)
+            .expect("ideal stale layout-trigger evaluation failed"),
+        "an external metadata update must not mutate another manager's registry"
+    );
+    let refreshed = discovery_manager
+        .list(Some(&world.harness.prefix))
+        .await
+        .expect("ideal layout-trigger discovery refresh failed")
+        .into_iter()
+        .next()
+        .expect("ideal layout-trigger refreshed discovery snapshot missing");
+    assert_eq!(
+        refreshed.index_config.as_ref().map(|config| config.nlist),
+        Some(4)
+    );
+
+    world.begin_measurement().await;
+    assert!(
+        evaluate_compaction_trigger(&compactor, &manifest_cache, &refreshed)
+            .await
+            .expect("ideal layout-trigger evaluation failed")
+    );
+    let sample = world.snapshot(case).await;
+    assert_eq!(sample.total_get_ops, 1);
+    assert_eq!(sample.total_get_bytes, 0);
+    assert_single_manifest_get(
+        &sample,
+        PhysicalRequest::GetConditional,
+        SpanOutcome::NotModified,
+    );
+    world.cleanup(sample).await
 }
 
 async fn execute_resume_delete(case: &IdealCase) -> IdealSample {
@@ -627,12 +838,19 @@ async fn execute_tick_lease_held(case: &IdealCase) -> IdealSample {
         .expect("ideal held-lease setup acquisition failed");
     let contender = maintenance_lease_manager(&world, "ideal-contender");
     let compactor = maintenance_compactor(&world, trigger_each_fragment());
+    let manifest_cache = ManifestCache::new(Duration::from_secs(3_600));
+    let metadata = manager
+        .cached_namespaces(Some(&world.harness.prefix))
+        .into_iter()
+        .next()
+        .expect("ideal held-lease discovery snapshot missing");
 
     world.begin_measurement().await;
-    assert!(compactor
-        .should_compact(&namespace)
-        .await
-        .expect("ideal held-lease trigger check failed"));
+    assert!(
+        evaluate_compaction_trigger(&compactor, &manifest_cache, &metadata)
+            .await
+            .expect("ideal held-lease trigger check failed")
+    );
     let result =
         compact_namespace_under_lease(&compactor, &contender, &namespace, &HashMap::new()).await;
     assert!(matches!(result, Err(ZeppelinError::LeaseHeld { .. })));
@@ -660,12 +878,19 @@ async fn execute_tick_compaction_success(case: &IdealCase) -> IdealSample {
         .expect("ideal successful-tick WAL setup failed");
     let compactor = maintenance_compactor(&world, trigger_each_fragment());
     let lease_manager = maintenance_lease_manager(&world, "ideal-tick");
+    let manifest_cache = ManifestCache::new(Duration::from_secs(3_600));
+    let metadata = manager
+        .cached_namespaces(Some(&world.harness.prefix))
+        .into_iter()
+        .next()
+        .expect("ideal successful-tick discovery snapshot missing");
 
     world.begin_measurement().await;
-    assert!(compactor
-        .should_compact(&namespace)
-        .await
-        .expect("ideal successful-tick trigger check failed"));
+    assert!(
+        evaluate_compaction_trigger(&compactor, &manifest_cache, &metadata)
+            .await
+            .expect("ideal successful-tick trigger check failed")
+    );
     let result =
         compact_namespace_under_lease(&compactor, &lease_manager, &namespace, &HashMap::new())
             .await
@@ -680,6 +905,7 @@ async fn execute_tick_compaction_success(case: &IdealCase) -> IdealSample {
         .record_compaction_success(&namespace)
         .await
         .expect("ideal successful-tick health publication failed");
+    manifest_cache.invalidate_at(&namespace, world.now);
     // Production's subsequent cache warm is intentionally not called: it is
     // detached and exposes no completion handle that can bound this interval.
     world.finish(case).await
@@ -691,6 +917,19 @@ fn maintenance_namespace_manager(world: &MaintenanceWorld) -> NamespaceManager {
         Duration::from_secs(3_600),
         world.clock(),
     )
+}
+
+fn assert_single_manifest_get(
+    sample: &IdealSample,
+    request: PhysicalRequest,
+    outcome: SpanOutcome,
+) {
+    assert_eq!(sample.physical_operations.len(), 1);
+    let operation = &sample.physical_operations[0];
+    assert_eq!(operation.request, request);
+    assert_eq!(operation.outcome, outcome);
+    assert_eq!(operation.class, ArtifactClass::Manifest);
+    assert_eq!(operation.key, "manifest.json");
 }
 
 async fn create_active_compaction_namespace(
@@ -2471,6 +2710,9 @@ mod tests {
                 "background.discovery_tick_empty",
                 "background.discovery_tick_active",
                 "background.cached_tick_idle",
+                "background.trigger_manifest_changed",
+                "background.trigger_cache_invalidated",
+                "background.trigger_layout_change",
                 "background.tick_resume_delete",
                 "background.tick_lease_held",
                 "background.tick_compaction_success",
@@ -2522,5 +2764,116 @@ mod tests {
             });
             assert_eq!(sample.scenario_id, case.id.as_str());
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn warm_trigger_ticks_are_conditional_and_skip_metadata_gets() {
+        // The analyzer catalogs one logical tick so repeated calls do not
+        // manufacture serial depth. This focused proof owns the N-tick
+        // steady-state invariant outside the exhaustive scenario sample.
+        const TICKS: usize = 3;
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "background.cached_tick_idle")
+            .expect("cached-idle catalog case missing");
+        let mut world = MaintenanceWorld::new().await;
+        let namespace = world.managed_namespace("warm-trigger-ticks");
+        let manager = maintenance_namespace_manager(&world);
+        let indexing = maintenance_indexing_config();
+        let metadata = manager
+            .create_with_fts_and_index_config(
+                &namespace,
+                4,
+                DistanceMetric::Euclidean,
+                HashMap::new(),
+                Some(NamespaceIndexConfig::from_indexing_config(&indexing)),
+            )
+            .await
+            .expect("warm-trigger namespace setup failed");
+        let cache = ManifestCache::new(Duration::from_secs(3_600));
+        cache
+            .get_strong_required(&world.store, &namespace)
+            .await
+            .expect("warm-trigger manifest prime failed");
+        let compactor = maintenance_compactor(&world, CompactionConfig::default());
+
+        world.begin_measurement().await;
+        for _ in 0..TICKS {
+            assert!(!evaluate_compaction_trigger(&compactor, &cache, &metadata)
+                .await
+                .expect("warm-trigger evaluation failed"));
+        }
+        let sample = world.snapshot(case).await;
+        assert_eq!(sample.total_get_ops, TICKS as u64);
+        assert_eq!(sample.total_get_bytes, 0);
+        assert_eq!(sample.physical_operations.len(), TICKS);
+        for operation in &sample.physical_operations {
+            assert_eq!(operation.request, PhysicalRequest::GetConditional);
+            assert_eq!(operation.outcome, SpanOutcome::NotModified);
+            assert_eq!(operation.class, ArtifactClass::Manifest);
+            assert_eq!(operation.key, "manifest.json");
+        }
+        world.cleanup(sample).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn invalidated_trigger_refills_once_then_returns_to_conditionals() {
+        // Keep the two-call transition out of the one-operation catalog while
+        // proving the refill is followed by steady conditional revalidation.
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "background.trigger_cache_invalidated")
+            .expect("invalidated-trigger catalog case missing");
+        let mut world = MaintenanceWorld::new().await;
+        let namespace = world.managed_namespace("invalidated-trigger-refill");
+        let manager = maintenance_namespace_manager(&world);
+        let indexing = maintenance_indexing_config();
+        let metadata = manager
+            .create_with_fts_and_index_config(
+                &namespace,
+                4,
+                DistanceMetric::Euclidean,
+                HashMap::new(),
+                Some(NamespaceIndexConfig::from_indexing_config(&indexing)),
+            )
+            .await
+            .expect("invalidated-trigger namespace setup failed");
+        let cache = ManifestCache::new(Duration::from_secs(3_600));
+        cache
+            .get_strong_required(&world.store, &namespace)
+            .await
+            .expect("invalidated-trigger manifest prime failed");
+        cache.invalidate_at(&namespace, world.now);
+        let compactor = maintenance_compactor(&world, CompactionConfig::default());
+
+        world.begin_measurement().await;
+        for _ in 0..2 {
+            assert!(!evaluate_compaction_trigger(&compactor, &cache, &metadata)
+                .await
+                .expect("invalidated-trigger evaluation failed"));
+        }
+        let sample = world.snapshot(case).await;
+        assert_eq!(sample.total_get_ops, 2);
+        assert!(sample.total_get_bytes > 0);
+        assert_eq!(sample.physical_operations.len(), 2);
+        assert_eq!(
+            sample.physical_operations[0].request,
+            PhysicalRequest::GetFull
+        );
+        assert_eq!(sample.physical_operations[0].outcome, SpanOutcome::Success);
+        assert_eq!(
+            sample.physical_operations[1].request,
+            PhysicalRequest::GetConditional
+        );
+        assert_eq!(
+            sample.physical_operations[1].outcome,
+            SpanOutcome::NotModified
+        );
+        assert!(sample.physical_operations.iter().all(|operation| {
+            operation.class == ArtifactClass::Manifest && operation.key == "manifest.json"
+        }));
+        world.cleanup(sample).await;
     }
 }
