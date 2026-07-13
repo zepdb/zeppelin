@@ -39,6 +39,8 @@
 
 EXTENDS Naturals, FiniteSets, Sequences
 
+CONSTANT AllowBuggyRenewWithoutCAS
+
 \* ==========================================================================
 \* State Variables
 \* ==========================================================================
@@ -67,6 +69,7 @@ VARIABLES
     w1_snap_etag,       \* w1's snapshot of manifest_etag
     w1_local_token,     \* w1's fencing token from lease
     w1_frag,            \* w1's fragment ID (assigned at WriteFragment)
+    w1_renew,           \* process-local lease ETag memo + renewal state
 
     \* --- Writer w2 local state ---
     w2_pc,
@@ -85,7 +88,7 @@ VARIABLES
 vars == <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
           s3_frag_data, lease_holder, lease_token, lease_expired, lease_etag,
           next_token, committed,
-          w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+          w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
           w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
           c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -121,6 +124,7 @@ Init ==
     /\ w1_snap_etag = 0
     /\ w1_local_token = 0
     /\ w1_frag = 0
+    /\ w1_renew = [memo_etag |-> 0, pc |-> "unavailable", drifts_left |-> 0]
     /\ w2_pc = "idle"
     /\ w2_snap = {}
     /\ w2_snap_etag = 0
@@ -148,6 +152,7 @@ ClockExpireLease ==
                    s3_frag_data, lease_holder, lease_token, lease_etag,
                    next_token, committed,
                    w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -167,10 +172,111 @@ W1_AcquireLease ==
     /\ lease_token' = next_token               \* = w1_local_token'
     /\ lease_expired' = FALSE                  \* Fresh lease
     /\ lease_etag' = lease_etag + 1            \* New etag after CAS write
+    /\ w1_renew' = [memo_etag |-> lease_etag + 1,
+                     pc |-> "ready",
+                     drifts_left |-> 2]
     /\ w1_pc' = "has_lease"
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, committed,
                    w1_snap, w1_snap_etag, w1_frag,
+                   w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
+                   c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
+
+\* Lease renewal is modeled for w1 as the symmetry representative. Writers
+\* and compactors call the same Rust LeaseManager::renew implementation.
+\*
+\* The correct fast path uses the process-local ETag as the CAS precondition.
+\* The bug toggle deliberately overwrites an intervening takeover without CAS,
+\* demonstrating why the memo may only be an optimistic precondition.
+W1_RenewFast ==
+    /\ w1_renew.pc = "ready"
+    /\ lease_etag < 20
+    /\ IF AllowBuggyRenewWithoutCAS
+       THEN /\ lease_holder' = "w1"
+            /\ lease_token' = w1_local_token
+            /\ lease_expired' = FALSE
+            /\ lease_etag' = lease_etag + 1
+            /\ w1_renew' = [memo_etag |-> lease_etag + 1,
+                             pc |-> "succeeded",
+                             drifts_left |-> w1_renew.drifts_left]
+       ELSE IF lease_etag = w1_renew.memo_etag
+            THEN \* Fast CAS succeeds: one PUT, no classification GET.
+                 /\ lease_holder' = "w1"
+                 /\ lease_token' = w1_local_token
+                 /\ lease_expired' = FALSE
+                 /\ lease_etag' = lease_etag + 1
+                 /\ w1_renew' = [memo_etag |-> lease_etag + 1,
+                                  pc |-> "succeeded",
+                                  drifts_left |-> w1_renew.drifts_left]
+            ELSE \* CAS conflict: classify with one authoritative read.
+                 /\ w1_renew' = [memo_etag |-> w1_renew.memo_etag,
+                                  pc |-> "classify",
+                                  drifts_left |-> w1_renew.drifts_left]
+                 /\ UNCHANGED <<lease_holder, lease_token, lease_expired,
+                                lease_etag>>
+    /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
+                   s3_frag_data, next_token, committed,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
+                   c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
+
+\* The one classification GET either proves the same holder/token and captures
+\* the fresh ETag, or fails closed. No local wall-clock inference is used.
+W1_RenewClassify ==
+    /\ w1_renew.pc = "classify"
+    /\ IF lease_holder = "w1" /\ lease_token = w1_local_token
+       THEN w1_renew' = [memo_etag |-> lease_etag,
+                          pc |-> "retry",
+                          drifts_left |-> w1_renew.drifts_left]
+       ELSE w1_renew' = [memo_etag |-> w1_renew.memo_etag,
+                          pc |-> "expired",
+                          drifts_left |-> w1_renew.drifts_left]
+    /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
+                   s3_frag_data, lease_holder, lease_token, lease_expired,
+                   lease_etag, next_token, committed,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
+                   c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
+
+\* Retry exactly once. A second ETag change is terminal instead of looping.
+W1_RenewRetry ==
+    /\ w1_renew.pc = "retry"
+    /\ lease_etag < 20
+    /\ IF lease_etag = w1_renew.memo_etag
+       THEN /\ lease_holder' = "w1"
+            /\ lease_token' = w1_local_token
+            /\ lease_expired' = FALSE
+            /\ lease_etag' = lease_etag + 1
+            /\ w1_renew' = [memo_etag |-> lease_etag + 1,
+                             pc |-> "succeeded",
+                             drifts_left |-> w1_renew.drifts_left]
+       ELSE /\ w1_renew' = [memo_etag |-> w1_renew.memo_etag,
+                             pc |-> "expired",
+                             drifts_left |-> w1_renew.drifts_left]
+            /\ UNCHANGED <<lease_holder, lease_token, lease_expired, lease_etag>>
+    /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
+                   s3_frag_data, next_token, committed,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
+                   c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
+
+\* An identical-holder/token rewrite changes only the authoritative ETag. This
+\* represents benign external drift or a renewal whose PUT landed but whose
+\* acknowledgement was lost before the caller advanced its memo.
+W1_RewriteSameLeaseBody ==
+    /\ w1_renew.pc \in {"ready", "classify", "retry"}
+    /\ lease_holder = "w1"
+    /\ lease_token = w1_local_token
+    /\ w1_renew.drifts_left > 0
+    /\ lease_etag < 20
+    /\ lease_etag' = lease_etag + 1
+    /\ w1_renew' = [memo_etag |-> w1_renew.memo_etag,
+                     pc |-> w1_renew.pc,
+                     drifts_left |-> w1_renew.drifts_left - 1]
+    /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
+                   s3_frag_data, lease_holder, lease_token, lease_expired,
+                   next_token, committed,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -183,7 +289,7 @@ W1_WriteFragment ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    lease_holder, lease_token, lease_expired, lease_etag,
                    next_token, committed,
-                   w1_snap, w1_snap_etag, w1_local_token,
+                   w1_snap, w1_snap_etag, w1_local_token, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -196,7 +302,7 @@ W1_ReadManifest ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, lease_holder, lease_token, lease_expired, lease_etag,
                    next_token, committed,
-                   w1_local_token, w1_frag,
+                   w1_local_token, w1_frag, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -210,7 +316,7 @@ W1_CheckFencing ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, lease_holder, lease_token, lease_expired, lease_etag,
                    next_token, committed,
-                   w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -232,7 +338,7 @@ W1_WriteManifest ==
     /\ UNCHANGED <<manifest_seg, s3_frag_data,
                    lease_holder, lease_token, lease_expired, lease_etag,
                    next_token,
-                   w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -250,7 +356,7 @@ W1_ReleaseLease ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, lease_token,
                    next_token, committed,
-                   w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -271,7 +377,7 @@ W2_AcquireLease ==
     /\ w2_pc' = "has_lease"
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_snap, w2_snap_etag, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -283,7 +389,7 @@ W2_WriteFragment ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    lease_holder, lease_token, lease_expired, lease_etag,
                    next_token, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_snap, w2_snap_etag, w2_local_token,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -295,7 +401,7 @@ W2_ReadManifest ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, lease_holder, lease_token, lease_expired, lease_etag,
                    next_token, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -307,7 +413,7 @@ W2_CheckFencing ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, lease_holder, lease_token, lease_expired, lease_etag,
                    next_token, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -324,7 +430,7 @@ W2_WriteManifest ==
     /\ UNCHANGED <<manifest_seg, s3_frag_data,
                    lease_holder, lease_token, lease_expired, lease_etag,
                    next_token,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -339,7 +445,7 @@ W2_ReleaseLease ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, lease_token,
                    next_token, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_pc, c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -360,7 +466,7 @@ C_AcquireLease ==
     /\ c_pc' = "has_lease"
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_snap, c_snap_etag, c_seg_contents>>
 
@@ -373,7 +479,7 @@ C_ReadManifest ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, lease_holder, lease_token, lease_expired, lease_etag,
                    next_token, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_local_token, c_seg_contents>>
 
@@ -384,7 +490,7 @@ C_BuildSegment ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, lease_holder, lease_token, lease_expired, lease_etag,
                    next_token, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_snap, c_snap_etag, c_local_token>>
 
@@ -396,7 +502,7 @@ C_CheckFencing ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, lease_holder, lease_token, lease_expired, lease_etag,
                    next_token, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -419,7 +525,7 @@ C_WriteManifest ==
             /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag>>
     /\ UNCHANGED <<s3_frag_data, lease_holder, lease_token, lease_expired, lease_etag,
                    next_token, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_snap, c_snap_etag, c_local_token, c_seg_contents>>
 
@@ -434,9 +540,15 @@ C_ReleaseLease ==
     /\ UNCHANGED <<manifest_frags, manifest_seg, manifest_fencing, manifest_etag,
                    s3_frag_data, lease_token,
                    next_token, committed,
-                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag,
+                   w1_pc, w1_snap, w1_snap_etag, w1_local_token, w1_frag, w1_renew,
                    w2_pc, w2_snap, w2_snap_etag, w2_local_token, w2_frag,
                    c_snap, c_snap_etag, c_local_token, c_seg_contents>>
+
+TerminalStutter ==
+    /\ w1_pc = "done"
+    /\ w2_pc = "done"
+    /\ c_pc = "done"
+    /\ UNCHANGED vars
 
 \* ==========================================================================
 \* Next-State Relation
@@ -447,6 +559,10 @@ Next ==
     \/ ClockExpireLease
     \* Writer w1
     \/ W1_AcquireLease
+    \/ W1_RenewFast
+    \/ W1_RenewClassify
+    \/ W1_RenewRetry
+    \/ W1_RewriteSameLeaseBody
     \/ W1_WriteFragment
     \/ W1_ReadManifest
     \/ W1_CheckFencing
@@ -466,6 +582,7 @@ Next ==
     \/ C_CheckFencing
     \/ C_WriteManifest
     \/ C_ReleaseLease
+    \/ TerminalStutter
 
 \* ==========================================================================
 \* Specification
@@ -528,6 +645,12 @@ FencingPreventsZombie ==
     /\ (w2_pc = "committed" => manifest_fencing >= w2_local_token)
     /\ (c_pc = "committed" => manifest_fencing >= c_local_token)
 
+\* Every persisted lease token is either the initial zero or the most recently
+\* granted token. A stale holder can retain a local token, but renewal must not
+\* overwrite a successor and make that older token authoritative again.
+LeaseTokenTracksLatestGrant ==
+    lease_token = 0 \/ lease_token + 1 = next_token
+
 \* TYPE INVARIANT: Basic type checking.
 TypeOK ==
     /\ manifest_frags \subseteq {1, 2, 3, 4}
@@ -541,6 +664,10 @@ TypeOK ==
     /\ lease_etag \in 0..20
     /\ next_token \in 1..10
     /\ committed \subseteq {1, 2, 3, 4}
+    /\ w1_renew \in [memo_etag : 0..20,
+                      pc : {"unavailable", "ready", "classify", "retry",
+                            "succeeded", "expired"},
+                      drifts_left : 0..2]
     /\ w1_pc \in {"idle", "has_lease", "frag_written", "manifest_read",
                    "fencing_ok", "committed", "aborted", "done"}
     /\ w2_pc \in {"idle", "has_lease", "frag_written", "manifest_read",

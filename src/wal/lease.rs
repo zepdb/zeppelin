@@ -50,7 +50,9 @@
 //!   but correctness-sensitive writes still require fencing plus manifest CAS.
 //! - Initial creation is an unconditional PUT and relies on Zeppelin's v1
 //!   single-writer-per-namespace operating rule. Expired-object takeover and
-//!   renewal use ETag CAS.
+//!   renewal use ETag CAS. Renewal treats the returned ETag as an optimistic
+//!   precondition; one authoritative read classifies a conflict before one
+//!   bounded retry.
 //!
 //! ## Rust concepts used here
 //!
@@ -109,9 +111,10 @@ pub struct Lease {
     pub expires_at: DateTime<Utc>,
     /// ETag observed when this snapshot was read from object storage.
     ///
-    /// This process-local concurrency token is excluded from JSON. Current
-    /// renewal code obtains a fresh ETag directly rather than relying on this
-    /// stored value.
+    /// This process-local concurrency token is excluded from JSON. Renewal uses
+    /// it only as an optimistic CAS precondition and replaces it with the ETag
+    /// returned by each successful conditional PUT. A conflict never trusts the
+    /// memo: it is classified through one fresh authoritative read.
     #[serde(skip)]
     pub(crate) etag: String,
 }
@@ -120,7 +123,9 @@ pub struct Lease {
 ///
 /// Each manager represents one `holder_id` and grants leases with one configured
 /// duration. The manager talks only through [`crate::storage::ZeppelinStore`];
-/// it has no local authority and does not cache the lease object.
+/// it has no local authority. Returned [`Lease`] snapshots carry a disposable
+/// ETag memo, but object-store CAS and conflict classification remain the
+/// ownership authority.
 ///
 /// The manager coordinates writers, but stale-write prevention is completed by
 /// passing the returned token into a manifest operation that performs both the
@@ -334,11 +339,13 @@ impl LeaseManager {
 
     /// Replaces a still-owned lease record with the same token and a fresh expiry.
     ///
-    /// Ownership is established by comparing the authoritative holder and token
-    /// with this manager and the supplied snapshot, then using the freshly read
-    /// ETag for a conditional PUT. The wall-clock expiry itself is not rejected:
-    /// an expired record may be renewed if no takeover has changed its identity
-    /// or token.
+    /// An ETag-bearing snapshot first attempts one conditional PUT directly.
+    /// CAS success proves the object has not changed since that snapshot. A
+    /// conflict performs one authoritative read, rejects a different holder or
+    /// token, and retries once only when the body still names this owner. An
+    /// ETag-less snapshot takes the cold read-validate-CAS path. Wall-clock
+    /// expiry itself is not rejected: an expired record may be renewed if no
+    /// takeover has changed its identity or token.
     ///
     /// # Parameters
     ///
@@ -348,68 +355,176 @@ impl LeaseManager {
     ///
     /// # Returns
     ///
-    /// A re-read [`Lease`] with the same fencing token, refreshed timestamps,
-    /// and the ETag of the renewed object.
+    /// A [`Lease`] with the same fencing token, refreshed timestamps, and the
+    /// ETag returned by the successful CAS. A backend that omits the PUT ETag
+    /// causes one fallback read to recover it.
     ///
     /// # Errors
     ///
-    /// A missing object, different holder, or different token becomes
-    /// [`ZeppelinError::LeaseExpired`]. JSON, storage, and conditional-write
-    /// errors propagate; a CAS race currently remains the storage layer's
-    /// [`ZeppelinError::ManifestConflict`] variant. If the conditional write
-    /// succeeds but the final GET fails, the remote expiry may already be
+    /// A missing object, different holder, different token, or second CAS
+    /// conflict becomes [`ZeppelinError::LeaseExpired`]. JSON and unrelated
+    /// storage errors propagate. If a conditional write succeeds without an
+    /// ETag and the fallback GET fails, the remote expiry may already be
     /// extended even though no renewed snapshot is returned.
     ///
     /// # Side Effects
     ///
-    /// Performs a GET, one conditional PUT, and a final GET on success. Renewal
-    /// rewrites `acquired_at` as well as `expires_at` but does not increment the
-    /// fencing token.
+    /// Warm success performs one conditional PUT and no GET. A fast-path
+    /// conflict adds exactly one classification GET and at most one retry. The
+    /// cold path performs one GET plus one conditional PUT. A successful PUT
+    /// whose response omits its ETag adds one fallback GET. Renewal rewrites
+    /// `acquired_at` as well as `expires_at` but does not increment the token.
     ///
     /// # Consistency
     ///
-    /// The ETag closes the race between checking holder/token and replacing the
-    /// lease. A heartbeat must still stop correctness-sensitive work when it can
-    /// no longer prove renewal before the last confirmed expiry.
+    /// The memo is never ownership evidence by itself: it is only a CAS
+    /// precondition. A failed CAS is resolved from S3, and a second change fails
+    /// closed instead of looping. A heartbeat must still stop
+    /// correctness-sensitive work when it can no longer prove renewal before
+    /// the last confirmed expiry.
     ///
     /// # Examples
     ///
-    /// Holder `node-a` renews token `7`, extending its expiry while keeping token
-    /// `7`. If `node-b` has already taken over with token `8`, renewal returns
-    /// `LeaseExpired` and must not revive `node-a`'s ownership.
+    /// Holder `node-a` renews token `7` with one CAS, extending its expiry while
+    /// keeping token `7`. If `node-b` has already taken over with token `8`, the
+    /// failed CAS plus one GET returns `LeaseExpired` and never revives
+    /// `node-a`'s ownership.
     #[instrument(skip(self, lease), fields(namespace = namespace, holder = %self.holder_id))]
     pub async fn renew(&self, namespace: &str, lease: &Lease) -> Result<Lease> {
         let key = lease_key(namespace);
-        let (data, etag) = match self.store.get_with_meta(&key).await {
-            Ok(value) => value,
-            Err(ZeppelinError::NotFound { .. }) => {
-                return Err(ZeppelinError::LeaseExpired {
-                    namespace: namespace.to_string(),
-                });
-            }
-            Err(e) => return Err(e),
-        };
-        let current: Lease = serde_json::from_slice(&data)?;
 
-        if current.holder_id != self.holder_id || current.fencing_token != lease.fencing_token {
-            return Err(ZeppelinError::LeaseExpired {
-                namespace: namespace.to_string(),
-            });
+        if lease.holder_id != self.holder_id {
+            return Err(Self::expired(namespace));
         }
 
-        // Same token, extended expiry.
-        let renewed = self.build_lease(lease.fencing_token);
+        let mut renewed = self.build_lease(lease.fencing_token);
         let data = Bytes::from(serde_json::to_vec_pretty(&renewed)?);
-        let etag_str = etag.unwrap_or_default();
-        self.store
-            .put_if_match(&key, data, &etag_str, namespace)
-            .await?;
 
-        let (data, new_etag) = self.store.get_with_meta(&key).await?;
-        let mut renewed: Lease = serde_json::from_slice(&data)?;
-        renewed.etag = new_etag.unwrap_or_default();
-        debug!(fencing_token = renewed.fencing_token, "lease renewed");
-        Ok(renewed)
+        if !lease.etag.is_empty() {
+            match self
+                .store
+                .put_if_match(&key, data.clone(), &lease.etag, namespace)
+                .await
+            {
+                Ok(Some(new_etag)) => {
+                    renewed.etag = new_etag;
+                    debug!(
+                        fencing_token = renewed.fencing_token,
+                        fast_path = true,
+                        "lease renewed"
+                    );
+                    return Ok(renewed);
+                }
+                Ok(None) => {
+                    let renewed = self
+                        .read_owned_lease(&key, namespace, lease.fencing_token)
+                        .await?;
+                    debug!(
+                        fencing_token = renewed.fencing_token,
+                        fast_path = true,
+                        "lease renewed"
+                    );
+                    return Ok(renewed);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => {
+                    let current = self
+                        .read_owned_lease(&key, namespace, lease.fencing_token)
+                        .await?;
+                    match self
+                        .store
+                        .put_if_match(&key, data, &current.etag, namespace)
+                        .await
+                    {
+                        Ok(Some(new_etag)) => {
+                            renewed.etag = new_etag;
+                            debug!(
+                                fencing_token = renewed.fencing_token,
+                                fast_path = false,
+                                "lease renewed after ETag classification"
+                            );
+                            return Ok(renewed);
+                        }
+                        Ok(None) => {
+                            let renewed = self
+                                .read_owned_lease(&key, namespace, lease.fencing_token)
+                                .await?;
+                            debug!(
+                                fencing_token = renewed.fencing_token,
+                                fast_path = false,
+                                "lease renewed after ETag classification"
+                            );
+                            return Ok(renewed);
+                        }
+                        Err(ZeppelinError::ManifestConflict { .. }) => {
+                            return Err(Self::expired(namespace));
+                        }
+                        Err(ZeppelinError::Storage(object_store::Error::NotFound { .. })) => {
+                            return Err(Self::expired(namespace));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(ZeppelinError::Storage(object_store::Error::NotFound { .. })) => {
+                    return Err(Self::expired(namespace));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let current = self
+            .read_owned_lease(&key, namespace, lease.fencing_token)
+            .await?;
+        match self
+            .store
+            .put_if_match(&key, data, &current.etag, namespace)
+            .await?
+        {
+            Some(new_etag) => {
+                renewed.etag = new_etag;
+                debug!(
+                    fencing_token = renewed.fencing_token,
+                    fast_path = false,
+                    "lease renewed"
+                );
+                Ok(renewed)
+            }
+            None => {
+                let renewed = self
+                    .read_owned_lease(&key, namespace, lease.fencing_token)
+                    .await?;
+                debug!(
+                    fencing_token = renewed.fencing_token,
+                    fast_path = false,
+                    "lease renewed"
+                );
+                Ok(renewed)
+            }
+        }
+    }
+
+    async fn read_owned_lease(
+        &self,
+        key: &str,
+        namespace: &str,
+        fencing_token: u64,
+    ) -> Result<Lease> {
+        let (data, etag) = match self.store.get_with_meta(key).await {
+            Ok(value) => value,
+            Err(ZeppelinError::NotFound { .. }) => return Err(Self::expired(namespace)),
+            Err(error) => return Err(error),
+        };
+        let mut current: Lease = serde_json::from_slice(&data)?;
+        if current.holder_id != self.holder_id || current.fencing_token != fencing_token {
+            return Err(Self::expired(namespace));
+        }
+        current.etag = etag.unwrap_or_default();
+        Ok(current)
+    }
+
+    fn expired(namespace: &str) -> ZeppelinError {
+        ZeppelinError::LeaseExpired {
+            namespace: namespace.to_string(),
+        }
     }
 
     /// Marks this manager's current lease as expired on a best-effort basis.

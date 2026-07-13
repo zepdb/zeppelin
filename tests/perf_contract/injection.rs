@@ -1,6 +1,7 @@
 //! Test-side cost-regression injections for `perf_selftest`.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,7 +9,7 @@ use futures::stream::{self, BoxStream};
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
+    PutMode, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use zeppelin::storage::ZeppelinStore;
 
@@ -57,6 +58,249 @@ pub fn inject_store(store: &ZeppelinStore, injection: Injection) -> ZeppelinStor
         injection,
         cluster_get: tokio::sync::Mutex::new(()),
     }))
+}
+
+/// Control and proof handle for one same-owner lease rewrite before CAS retry.
+#[derive(Clone, Debug)]
+pub(crate) struct LeaseRetryConflictHandle {
+    armed: Arc<AtomicBool>,
+    conditional_puts: Arc<AtomicUsize>,
+    injections: Arc<AtomicUsize>,
+}
+
+impl LeaseRetryConflictHandle {
+    pub(crate) fn arm(&self) {
+        self.conditional_puts.store(0, Ordering::SeqCst);
+        self.injections.store(0, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub(crate) fn injections(&self) -> usize {
+        self.injections.load(Ordering::SeqCst)
+    }
+}
+
+/// Real-store decorator that advances a lease ETag immediately before the
+/// second armed conditional PUT.
+///
+/// The first conditional PUT is expected to expose an already-stale memo. The
+/// production code then performs its one classification GET. Before its retry,
+/// this decorator writes the same lease body with extra insignificant JSON
+/// whitespace through the real backend, guaranteeing a different ETag without
+/// changing holder or fencing token. The retry therefore loses a genuine S3
+/// CAS race.
+#[derive(Debug)]
+struct LeaseRetryConflictStore {
+    inner: Arc<dyn ObjectStore>,
+    armed: Arc<AtomicBool>,
+    conditional_puts: Arc<AtomicUsize>,
+    injections: Arc<AtomicUsize>,
+}
+
+pub(crate) fn inject_lease_retry_conflict(
+    store: &ZeppelinStore,
+) -> (ZeppelinStore, LeaseRetryConflictHandle) {
+    let armed = Arc::new(AtomicBool::new(false));
+    let conditional_puts = Arc::new(AtomicUsize::new(0));
+    let injections = Arc::new(AtomicUsize::new(0));
+    let wrapped = LeaseRetryConflictStore {
+        inner: store.inner(),
+        armed: Arc::clone(&armed),
+        conditional_puts: Arc::clone(&conditional_puts),
+        injections: Arc::clone(&injections),
+    };
+    (
+        ZeppelinStore::new_with_native_batch_delete(Arc::new(wrapped)),
+        LeaseRetryConflictHandle {
+            armed,
+            conditional_puts,
+            injections,
+        },
+    )
+}
+
+impl fmt::Display for LeaseRetryConflictStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LeaseRetryConflictStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for LeaseRetryConflictStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        let is_lease_update =
+            location.as_ref().ends_with("lease.json") && matches!(opts.mode, PutMode::Update(_));
+        if self.armed.load(Ordering::SeqCst) && is_lease_update {
+            let ordinal = self.conditional_puts.fetch_add(1, Ordering::SeqCst) + 1;
+            if ordinal == 2 {
+                self.armed.store(false, Ordering::SeqCst);
+                let mut body = bytes::BytesMut::with_capacity(payload.content_length() + 1);
+                for chunk in payload.as_ref() {
+                    body.extend_from_slice(chunk);
+                }
+                body.extend_from_slice(b"\n");
+                let mut overwrite = opts.clone();
+                overwrite.mode = PutMode::Overwrite;
+                self.inner
+                    .put_opts(location, PutPayload::from(body.freeze()), overwrite)
+                    .await?;
+                self.injections.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+/// Proof handle for a backend response that omits conditional-PUT ETags.
+#[derive(Clone, Debug)]
+pub(crate) struct MissingLeasePutEtagHandle {
+    stripped: Arc<AtomicUsize>,
+}
+
+impl MissingLeasePutEtagHandle {
+    #[must_use]
+    pub(crate) fn stripped(&self) -> usize {
+        self.stripped.load(Ordering::SeqCst)
+    }
+}
+
+/// Real-store decorator that preserves a successful lease CAS but removes its
+/// response ETag, exercising object-store implementations that omit it.
+#[derive(Debug)]
+struct MissingLeasePutEtagStore {
+    inner: Arc<dyn ObjectStore>,
+    stripped: Arc<AtomicUsize>,
+}
+
+pub(crate) fn inject_missing_lease_put_etag(
+    store: &ZeppelinStore,
+) -> (ZeppelinStore, MissingLeasePutEtagHandle) {
+    let stripped = Arc::new(AtomicUsize::new(0));
+    let wrapped = MissingLeasePutEtagStore {
+        inner: store.inner(),
+        stripped: Arc::clone(&stripped),
+    };
+    (
+        ZeppelinStore::new_with_native_batch_delete(Arc::new(wrapped)),
+        MissingLeasePutEtagHandle { stripped },
+    )
+}
+
+impl fmt::Display for MissingLeasePutEtagStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MissingLeasePutEtagStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for MissingLeasePutEtagStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        let omit_etag =
+            location.as_ref().ends_with("lease.json") && matches!(opts.mode, PutMode::Update(_));
+        let mut result = self.inner.put_opts(location, payload, opts).await?;
+        if omit_etag {
+            result.e_tag = None;
+            self.stripped.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(result)
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
 }
 
 impl fmt::Display for InjectionStore {

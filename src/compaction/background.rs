@@ -288,23 +288,26 @@ impl LeaseHeartbeat {
     ///
     /// # Side Effects
     ///
-    /// Spawns one task, issues periodic lease GET/CAS/GET operations, increments
+    /// Spawns one task, issues periodic lease CAS operations, increments
     /// lease-renewal or lease-loss metrics, and emits structured diagnostics.
-    /// It never changes the manifest or the fencing token.
+    /// Normal ETag-bearing renewals issue no GET; conflicts and missing backend
+    /// ETags use the lease manager's bounded authoritative-read paths. The task
+    /// never changes the manifest or the fencing token.
     ///
     /// # Consistency
     ///
     /// Renewal proves lease-object ownership only. The compactor must still
     /// carry the fencing token into manifest CAS. If a conditional PUT succeeds
-    /// but its confirming GET fails, the heartbeat conservatively retains the
-    /// older local expiry and may later declare loss even though S3 received the
-    /// extension; failing closed is safer than a stale publication.
+    /// without returning an ETag and its fallback GET fails, the heartbeat
+    /// conservatively retains the older local expiry and may later declare loss
+    /// even though S3 received the extension; failing closed is safer than a
+    /// stale publication.
     ///
     /// # Performance
     ///
-    /// Each successful heartbeat performs the lease manager's three remote
-    /// operations. Renewal runs concurrently with compaction and performs no
-    /// busy polling for a normal positive lease duration.
+    /// Each normal successful heartbeat performs one remote conditional PUT.
+    /// Renewal runs concurrently with compaction and performs no busy polling
+    /// for a normal positive lease duration.
     ///
     /// # Examples
     ///

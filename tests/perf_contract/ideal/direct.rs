@@ -8,12 +8,16 @@ use std::time::Duration;
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::error::ZeppelinError;
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::wal::{LeaseManager, Manifest};
+use zeppelin::wal::{Lease, LeaseManager, Manifest};
 
 use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
 use crate::perf_contract::depth::{
     depth_store, DepthTracker, PhysicalRequest, SpanKind, SpanOutcome,
+};
+use crate::perf_contract::injection::{
+    inject_lease_retry_conflict, inject_missing_lease_put_etag, LeaseRetryConflictHandle,
+    MissingLeasePutEtagHandle,
 };
 use crate::perf_contract::scenario::RepeatCounters;
 
@@ -57,7 +61,24 @@ struct DirectWorld {
 impl DirectWorld {
     async fn new() -> Self {
         let harness = TestHarness::new().await;
-        let (depth_wrapped, tracker) = depth_store(&harness.store);
+        let store = harness.store.clone();
+        Self::from_store(harness, &store)
+    }
+
+    async fn with_lease_retry_conflict() -> (Self, LeaseRetryConflictHandle) {
+        let harness = TestHarness::new().await;
+        let (store, handle) = inject_lease_retry_conflict(&harness.store);
+        (Self::from_store(harness, &store), handle)
+    }
+
+    async fn with_missing_lease_put_etag() -> (Self, MissingLeasePutEtagHandle) {
+        let harness = TestHarness::new().await;
+        let (store, handle) = inject_missing_lease_put_etag(&harness.store);
+        (Self::from_store(harness, &store), handle)
+    }
+
+    fn from_store(harness: TestHarness, store: &ZeppelinStore) -> Self {
+        let (depth_wrapped, tracker) = depth_store(store);
         let (store, counter) = perf_counting_store(&depth_wrapped);
         Self {
             harness,
@@ -116,6 +137,25 @@ async fn execute_operational(case: &IdealCase, operation: OperationalCase) -> Id
     world.finish(case).await
 }
 
+fn assert_warm_lease_renewal_shape(sample: &IdealSample) {
+    assert_eq!(
+        sample.total_get_ops, 0,
+        "a warm lease renewal must not issue an authoritative GET"
+    );
+    assert_eq!(sample.total_get_bytes, 0);
+    assert_eq!(
+        sample.physical_operations.len(),
+        1,
+        "a warm lease renewal must be exactly one conditional PUT: {:?}",
+        sample.physical_operations
+    );
+    let operation = &sample.physical_operations[0];
+    assert_eq!(operation.verb, "put");
+    assert_eq!(operation.request, PhysicalRequest::PutUpdate);
+    assert_eq!(operation.outcome, SpanOutcome::Success);
+    assert_eq!(operation.key, "lease.json");
+}
+
 fn assert_manifest_cache_shape(operation: ManifestCacheCase, sample: &IdealSample) {
     let expected = match operation {
         ManifestCacheCase::EventualExpired | ManifestCacheCase::StrongWriteThroughWithoutEtag => {
@@ -166,13 +206,25 @@ fn assert_manifest_cache_shape(operation: ManifestCacheCase, sample: &IdealSampl
 }
 
 async fn execute_lease(case: &IdealCase, operation: LeaseCase) -> IdealSample {
-    let world = DirectWorld::new().await;
+    let (world, retry_conflict, missing_put_etag) = match operation {
+        LeaseCase::RenewDoubleConflict => {
+            let (world, handle) = DirectWorld::with_lease_retry_conflict().await;
+            (world, Some(handle), None)
+        }
+        LeaseCase::RenewPutEtagMissing => {
+            let (world, handle) = DirectWorld::with_missing_lease_put_etag().await;
+            (world, None, Some(handle))
+        }
+        _ => (DirectWorld::new().await, None, None),
+    };
     let namespace = world.namespace(case.id.as_str());
     let owned = LeaseManager::new(
         world.store.clone(),
         "ideal-holder-a".to_string(),
         Duration::from_secs(3_600),
     );
+    let mut etag_fallback_lease: Option<Lease> = None;
+    let mut cold_renewed_lease: Option<Lease> = None;
 
     match operation {
         LeaseCase::AcquireNew => {
@@ -233,6 +285,124 @@ async fn execute_lease(case: &IdealCase, operation: LeaseCase) -> IdealSample {
                 .expect("ideal owned lease renewal failed");
             assert_eq!(renewed.fencing_token, lease.fencing_token);
         }
+        LeaseCase::RenewEtagDrift => {
+            let stale = owned
+                .acquire(&namespace)
+                .await
+                .expect("ideal ETag-drift setup acquisition failed");
+            owned
+                .renew(&namespace, &stale)
+                .await
+                .expect("ideal ETag-drift setup renewal failed");
+            world.begin_measurement().await;
+            let renewed = owned
+                .renew(&namespace, &stale)
+                .await
+                .expect("same-owner ETag drift must retry once");
+            assert_eq!(renewed.fencing_token, stale.fencing_token);
+        }
+        LeaseCase::RenewDoubleConflict => {
+            let stale = owned
+                .acquire(&namespace)
+                .await
+                .expect("ideal double-conflict setup acquisition failed");
+            owned
+                .renew(&namespace, &stale)
+                .await
+                .expect("ideal double-conflict setup renewal failed");
+            let handle = retry_conflict
+                .as_ref()
+                .expect("double-conflict case must install its race decorator");
+            handle.arm();
+            world.begin_measurement().await;
+            assert!(matches!(
+                owned.renew(&namespace, &stale).await,
+                Err(ZeppelinError::LeaseExpired { .. })
+            ));
+            assert_eq!(
+                handle.injections(),
+                1,
+                "double-conflict scenario did not perturb the retry"
+            );
+        }
+        LeaseCase::RenewMissing => {
+            let lease = owned
+                .acquire(&namespace)
+                .await
+                .expect("ideal missing-renewal setup acquisition failed");
+            world
+                .store
+                .delete(&format!("{namespace}/lease.json"))
+                .await
+                .expect("ideal missing-renewal setup delete failed");
+            world.begin_measurement().await;
+            assert!(matches!(
+                owned.renew(&namespace, &lease).await,
+                Err(ZeppelinError::LeaseExpired { .. })
+            ));
+        }
+        LeaseCase::RenewCold => {
+            let acquired = owned
+                .acquire(&namespace)
+                .await
+                .expect("ideal cold-renewal setup acquisition failed");
+            let cold: Lease = serde_json::from_slice(
+                &serde_json::to_vec(&acquired).expect("serialize cold-renewal snapshot"),
+            )
+            .expect("deserialize cold-renewal snapshot");
+            world.begin_measurement().await;
+            let renewed = owned
+                .renew(&namespace, &cold)
+                .await
+                .expect("cold lease renewal failed");
+            assert_eq!(renewed.fencing_token, acquired.fencing_token);
+            cold_renewed_lease = Some(renewed);
+        }
+        LeaseCase::RenewPutEtagMissing => {
+            let lease = owned
+                .acquire(&namespace)
+                .await
+                .expect("ideal missing-PUT-ETag setup acquisition failed");
+            world.begin_measurement().await;
+            let renewed = owned
+                .renew(&namespace, &lease)
+                .await
+                .expect("renewal must recover a missing PUT ETag");
+            assert_eq!(renewed.fencing_token, lease.fencing_token);
+            assert_eq!(
+                missing_put_etag
+                    .as_ref()
+                    .expect("missing-PUT-ETag case must install its decorator")
+                    .stripped(),
+                1
+            );
+            etag_fallback_lease = Some(renewed);
+        }
+        LeaseCase::RenewTakenOver => {
+            let expired = LeaseManager::new(
+                world.store.clone(),
+                "ideal-holder-a".to_string(),
+                Duration::ZERO,
+            );
+            let stale = expired
+                .acquire(&namespace)
+                .await
+                .expect("ideal stale-renewal setup acquisition failed");
+            let successor = LeaseManager::new(
+                world.store.clone(),
+                "ideal-holder-b".to_string(),
+                Duration::from_secs(3_600),
+            );
+            successor
+                .acquire(&namespace)
+                .await
+                .expect("ideal stale-renewal takeover setup failed");
+            world.begin_measurement().await;
+            assert!(matches!(
+                expired.renew(&namespace, &stale).await,
+                Err(ZeppelinError::LeaseExpired { .. })
+            ));
+        }
         LeaseCase::ReleaseOwned => {
             let lease = owned
                 .acquire(&namespace)
@@ -287,7 +457,154 @@ async fn execute_lease(case: &IdealCase, operation: LeaseCase) -> IdealSample {
         }
     }
 
-    world.finish(case).await
+    let sample = world.snapshot(case).await;
+    match operation {
+        LeaseCase::RenewOwned => assert_warm_lease_renewal_shape(&sample),
+        LeaseCase::RenewEtagDrift => assert_benign_lease_etag_drift_shape(&sample),
+        LeaseCase::RenewDoubleConflict => assert_double_lease_conflict_shape(&sample),
+        LeaseCase::RenewMissing => assert_missing_lease_renewal_shape(&sample),
+        LeaseCase::RenewCold => assert_cold_lease_renewal_shape(&sample),
+        LeaseCase::RenewPutEtagMissing => assert_missing_put_etag_renewal_shape(&sample),
+        LeaseCase::RenewTakenOver => assert_taken_over_lease_renewal_shape(&sample),
+        _ => {}
+    }
+
+    if let Some(renewed) = etag_fallback_lease {
+        world.begin_measurement().await;
+        owned
+            .renew(&namespace, &renewed)
+            .await
+            .expect("fallback GET must return the ETag used by the next renewal");
+        let proof = world.snapshot(case).await;
+        assert_missing_put_etag_renewal_shape(&proof);
+        assert_eq!(
+            missing_put_etag
+                .as_ref()
+                .expect("missing-PUT-ETag proof lost its decorator")
+                .stripped(),
+            2
+        );
+    }
+    if let Some(renewed) = cold_renewed_lease {
+        world.begin_measurement().await;
+        owned
+            .renew(&namespace, &renewed)
+            .await
+            .expect("cold renewal must return a warm ETag-bearing lease");
+        let proof = world.snapshot(case).await;
+        assert_warm_lease_renewal_shape(&proof);
+    }
+    world.cleanup(sample).await
+}
+
+fn assert_cold_lease_renewal_shape(sample: &IdealSample) {
+    assert_eq!(sample.total_get_ops, 1);
+    assert_eq!(sample.physical_operations.len(), 2);
+    let expected = [
+        ("get", PhysicalRequest::GetFull, SpanOutcome::Success),
+        ("put", PhysicalRequest::PutUpdate, SpanOutcome::Success),
+    ];
+    for (operation, (verb, request, outcome)) in sample.physical_operations.iter().zip(expected) {
+        assert_eq!(operation.verb, verb);
+        assert_eq!(operation.request, request);
+        assert_eq!(operation.outcome, outcome);
+        assert_eq!(operation.key, "lease.json");
+    }
+}
+
+fn assert_missing_put_etag_renewal_shape(sample: &IdealSample) {
+    assert_eq!(sample.total_get_ops, 1);
+    assert_eq!(sample.physical_operations.len(), 2);
+    let expected = [
+        ("put", PhysicalRequest::PutUpdate, SpanOutcome::Success),
+        ("get", PhysicalRequest::GetFull, SpanOutcome::Success),
+    ];
+    for (operation, (verb, request, outcome)) in sample.physical_operations.iter().zip(expected) {
+        assert_eq!(operation.verb, verb);
+        assert_eq!(operation.request, request);
+        assert_eq!(operation.outcome, outcome);
+        assert_eq!(operation.key, "lease.json");
+    }
+}
+
+fn assert_missing_lease_renewal_shape(sample: &IdealSample) {
+    assert_eq!(sample.total_get_ops, 1);
+    assert_eq!(sample.physical_operations.len(), 2);
+    let expected = [
+        ("put", PhysicalRequest::PutUpdate, SpanOutcome::Precondition),
+        ("get", PhysicalRequest::GetFull, SpanOutcome::NotFound),
+    ];
+    for (operation, (verb, request, outcome)) in sample.physical_operations.iter().zip(expected) {
+        assert_eq!(operation.verb, verb);
+        assert_eq!(operation.request, request);
+        assert_eq!(operation.outcome, outcome);
+        assert_eq!(operation.key, "lease.json");
+    }
+}
+
+fn assert_double_lease_conflict_shape(sample: &IdealSample) {
+    assert_eq!(
+        sample.total_get_ops, 1,
+        "a second CAS conflict must not start another classification loop"
+    );
+    assert_eq!(sample.physical_operations.len(), 3);
+    let expected = [
+        ("put", PhysicalRequest::PutUpdate, SpanOutcome::Precondition),
+        ("get", PhysicalRequest::GetFull, SpanOutcome::Success),
+        ("put", PhysicalRequest::PutUpdate, SpanOutcome::Precondition),
+    ];
+    for (operation, (verb, request, outcome)) in sample.physical_operations.iter().zip(expected) {
+        assert_eq!(operation.verb, verb);
+        assert_eq!(operation.request, request);
+        assert_eq!(operation.outcome, outcome);
+        assert_eq!(operation.key, "lease.json");
+    }
+}
+
+fn assert_benign_lease_etag_drift_shape(sample: &IdealSample) {
+    assert_eq!(
+        sample.total_get_ops, 1,
+        "benign ETag drift must use one authoritative classification GET"
+    );
+    assert_eq!(sample.physical_operations.len(), 3);
+    let expected = [
+        ("put", PhysicalRequest::PutUpdate, SpanOutcome::Precondition),
+        ("get", PhysicalRequest::GetFull, SpanOutcome::Success),
+        ("put", PhysicalRequest::PutUpdate, SpanOutcome::Success),
+    ];
+    for (operation, (verb, request, outcome)) in sample.physical_operations.iter().zip(expected) {
+        assert_eq!(operation.verb, verb);
+        assert_eq!(operation.request, request);
+        assert_eq!(operation.outcome, outcome);
+        assert_eq!(operation.key, "lease.json");
+    }
+}
+
+fn assert_taken_over_lease_renewal_shape(sample: &IdealSample) {
+    assert_eq!(
+        sample.total_get_ops, 1,
+        "a stale holder must classify one failed CAS with one authoritative GET"
+    );
+    assert_eq!(sample.physical_operations.len(), 2);
+    assert_eq!(sample.physical_operations[0].verb, "put");
+    assert_eq!(
+        sample.physical_operations[0].request,
+        PhysicalRequest::PutUpdate
+    );
+    assert_eq!(
+        sample.physical_operations[0].outcome,
+        SpanOutcome::Precondition
+    );
+    assert_eq!(sample.physical_operations[1].verb, "get");
+    assert_eq!(
+        sample.physical_operations[1].request,
+        PhysicalRequest::GetFull
+    );
+    assert_eq!(sample.physical_operations[1].outcome, SpanOutcome::Success);
+    assert!(sample
+        .physical_operations
+        .iter()
+        .all(|operation| operation.key == "lease.json"));
 }
 
 async fn execute_manifest_cache(case: &IdealCase, operation: ManifestCacheCase) -> IdealSample {
@@ -502,5 +819,151 @@ mod tests {
             .physical_verb_mode_totals
             .iter()
             .any(|total| total.verb == "list" && total.mode == "list_delimiter"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn warm_lease_renewal_is_one_cas_put_without_get() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "lease.renew_owned")
+            .expect("owned-renewal direct case must exist");
+
+        let sample = execute(case)
+            .await
+            .expect("owned-renewal case must have a direct executor");
+
+        assert_warm_lease_renewal_shape(&sample);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn consecutive_warm_lease_renewals_never_regress_to_gets() {
+        const RENEWALS: usize = 4;
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "lease.renew_owned")
+            .expect("owned-renewal direct case must exist");
+        let world = DirectWorld::new().await;
+        let namespace = world.namespace("lease.renew_owned.repeated");
+        let manager = LeaseManager::new(
+            world.store.clone(),
+            "ideal-holder-repeated".to_string(),
+            Duration::from_secs(3_600),
+        );
+        let mut lease = manager
+            .acquire(&namespace)
+            .await
+            .expect("repeated renewal setup acquisition failed");
+
+        world.begin_measurement().await;
+        for _ in 0..RENEWALS {
+            lease = manager
+                .renew(&namespace, &lease)
+                .await
+                .expect("repeated warm renewal failed");
+        }
+        let sample = world.snapshot(case).await;
+
+        assert_eq!(sample.total_get_ops, 0);
+        assert_eq!(sample.total_get_bytes, 0);
+        assert_eq!(sample.physical_operations.len(), RENEWALS);
+        assert!(sample.physical_operations.iter().all(|operation| {
+            operation.verb == "put"
+                && operation.request == PhysicalRequest::PutUpdate
+                && operation.outcome == SpanOutcome::Success
+                && operation.key == "lease.json"
+        }));
+        world.cleanup(sample).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn taken_over_lease_renewal_classifies_once_and_expires() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "lease.renew_taken_over")
+            .expect("taken-over renewal direct case must exist");
+
+        let sample = execute(case)
+            .await
+            .expect("taken-over renewal case must have a direct executor");
+
+        assert_taken_over_lease_renewal_shape(&sample);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn benign_lease_etag_drift_classifies_once_and_retries_once() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "lease.renew_etag_drift")
+            .expect("ETag-drift renewal direct case must exist");
+
+        let sample = execute(case)
+            .await
+            .expect("ETag-drift renewal case must have a direct executor");
+
+        assert_benign_lease_etag_drift_shape(&sample);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn double_lease_conflict_is_bounded_and_fails_closed() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "lease.renew_double_conflict")
+            .expect("double-conflict renewal direct case must exist");
+
+        let sample = execute(case)
+            .await
+            .expect("double-conflict renewal case must have a direct executor");
+
+        assert_double_lease_conflict_shape(&sample);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn missing_lease_renewal_fails_closed_after_one_classification() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "lease.renew_missing")
+            .expect("missing renewal direct case must exist");
+
+        let sample = execute(case)
+            .await
+            .expect("missing renewal case must have a direct executor");
+
+        assert_missing_lease_renewal_shape(&sample);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn cold_lease_renewal_reads_once_then_returns_a_warm_memo() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "lease.renew_cold")
+            .expect("cold renewal direct case must exist");
+
+        let sample = execute(case)
+            .await
+            .expect("cold renewal case must have a direct executor");
+
+        assert_cold_lease_renewal_shape(&sample);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn missing_put_etag_falls_back_to_one_get_and_advances_the_memo() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "lease.renew_put_etag_missing")
+            .expect("missing-PUT-ETag renewal direct case must exist");
+
+        let sample = execute(case)
+            .await
+            .expect("missing-PUT-ETag renewal case must have a direct executor");
+
+        assert_missing_put_etag_renewal_shape(&sample);
     }
 }

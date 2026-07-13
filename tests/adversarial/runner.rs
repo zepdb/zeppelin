@@ -3760,7 +3760,13 @@ async fn renew_or_observe_takeover(
     lease: &Lease,
 ) -> Result<Lease, ZeppelinError> {
     match manager.renew(namespace, lease).await {
-        Err(ZeppelinError::ManifestConflict { .. }) => manager.acquire(namespace).await,
+        // Older renewal surfaced the lost CAS directly. CAS-first renewal now
+        // classifies that conflict authoritatively and reports LeaseExpired.
+        // The selftest still performs one explicit acquire probe so its proof
+        // records the exact successor holder instead of weakening the oracle.
+        Err(ZeppelinError::ManifestConflict { .. } | ZeppelinError::LeaseExpired { .. }) => {
+            manager.acquire(namespace).await
+        }
         result => result,
     }
 }
