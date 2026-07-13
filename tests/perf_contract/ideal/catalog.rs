@@ -222,6 +222,8 @@ pub(crate) enum GarbageCollectionCase {
     IdleBackwardClock,
     IdleShorterRetentionConfig,
     IdlePriorPartialFailure,
+    PruneReuseEmptyPendingUncacheable,
+    PruneReuseEligiblePendingRefresh,
     HistoryMemoNewGeneration,
     HistoryMemoChangedEtag,
     HistoryMemoMissingEtag,
@@ -760,6 +762,16 @@ pub(crate) const IDEAL_CASES: &[IdealCase] = &[
         "gc.idle_prior_partial_failure",
         IdealCaseGroup::GarbageCollection,
         IdealOperation::GarbageCollection(GarbageCollectionCase::IdlePriorPartialFailure),
+    ),
+    ideal_case(
+        "gc.prune_reuse_empty_pending_uncacheable",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::PruneReuseEmptyPendingUncacheable),
+    ),
+    ideal_case(
+        "gc.prune_reuse_eligible_pending_refresh",
+        IdealCaseGroup::GarbageCollection,
+        IdealOperation::GarbageCollection(GarbageCollectionCase::PruneReuseEligiblePendingRefresh),
     ),
     ideal_case(
         "gc.history_memo_new_generation",

@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -269,6 +269,160 @@ impl ObjectStore for PutOnNthDeleteStore {
                 self.puts_injected.fetch_add(1, Ordering::Relaxed);
             }
         }
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+/// Transparent real-store race seam that publishes a concurrent manifest
+/// immediately after the pending-delete drain writes its history snapshot and
+/// immediately before its stale live-manifest CAS.
+#[derive(Debug)]
+struct PublishManifestOnHistoryWriteStore {
+    inner: Arc<dyn ObjectStore>,
+    trigger_history_key: Path,
+    manifest_key: Path,
+    concurrent_history: Bytes,
+    concurrent_manifest: Bytes,
+    remove_history_on_second_manifest_read: bool,
+    published: Arc<AtomicBool>,
+    history_removed: Arc<AtomicBool>,
+    manifest_reads_after_publish: AtomicUsize,
+}
+
+#[derive(Clone, Debug)]
+struct PublishManifestOnHistoryWriteHandle {
+    published: Arc<AtomicBool>,
+    history_removed: Arc<AtomicBool>,
+}
+
+impl PublishManifestOnHistoryWriteHandle {
+    fn published(&self) -> bool {
+        self.published.load(Ordering::SeqCst)
+    }
+
+    fn history_removed(&self) -> bool {
+        self.history_removed.load(Ordering::SeqCst)
+    }
+}
+
+impl PublishManifestOnHistoryWriteStore {
+    fn wrap(
+        inner: Arc<dyn ObjectStore>,
+        trigger_history_key: String,
+        manifest_key: String,
+        concurrent_history: Bytes,
+        concurrent_manifest: Bytes,
+        remove_history_on_second_manifest_read: bool,
+    ) -> (Self, PublishManifestOnHistoryWriteHandle) {
+        let published = Arc::new(AtomicBool::new(false));
+        let history_removed = Arc::new(AtomicBool::new(false));
+        let handle = PublishManifestOnHistoryWriteHandle {
+            published: Arc::clone(&published),
+            history_removed: Arc::clone(&history_removed),
+        };
+        (
+            Self {
+                inner,
+                trigger_history_key: Path::parse(trigger_history_key)
+                    .expect("trigger history key must be valid"),
+                manifest_key: Path::parse(manifest_key).expect("manifest key must be valid"),
+                concurrent_history,
+                concurrent_manifest,
+                remove_history_on_second_manifest_read,
+                published,
+                history_removed,
+                manifest_reads_after_publish: AtomicUsize::new(0),
+            },
+            handle,
+        )
+    }
+}
+
+impl fmt::Display for PublishManifestOnHistoryWriteStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PublishManifestOnHistoryWriteStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PublishManifestOnHistoryWriteStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        let result = self.inner.put_opts(location, payload, opts).await?;
+        if location == &self.trigger_history_key
+            && self
+                .published
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.inner
+                .put(
+                    &self.trigger_history_key,
+                    PutPayload::from(self.concurrent_history.clone()),
+                )
+                .await?;
+            self.inner
+                .put(
+                    &self.manifest_key,
+                    PutPayload::from(self.concurrent_manifest.clone()),
+                )
+                .await?;
+        }
+        Ok(result)
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        if location == &self.manifest_key && self.published.load(Ordering::SeqCst) {
+            let read = self
+                .manifest_reads_after_publish
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            if self.remove_history_on_second_manifest_read
+                && read == 2
+                && self
+                    .history_removed
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.inner.delete(&self.trigger_history_key).await?;
+            }
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
         self.inner.delete(location).await
     }
 
@@ -1394,7 +1548,7 @@ async fn gc_runner_history_memo_tracks_etags_and_lifecycle() {
         &counter,
     )
     .await;
-    assert_eq!(counter.gets_matching(&history_prefix), 3);
+    assert_eq!(counter.gets_matching(&history_prefix), 2);
     for version in 1..=3 {
         assert_eq!(
             counter.gets_matching(&Manifest::history_key(&namespace, version)),
@@ -1404,8 +1558,8 @@ async fn gc_runner_history_memo_tracks_etags_and_lifecycle() {
     }
     assert_eq!(
         counter.gets_matching(&Manifest::history_key(&namespace, 4)),
-        3,
-        "a newly listed generation must be read in every authority phase"
+        2,
+        "a newly listed generation must be read during prune and final sweep"
     );
 
     run_counted_gc_cycle(
@@ -1425,10 +1579,10 @@ async fn gc_runner_history_memo_tracks_etags_and_lifecycle() {
         &counter,
     )
     .await;
-    assert_eq!(counter.gets_matching(&history_prefix), 3);
+    assert_eq!(counter.gets_matching(&history_prefix), 2);
     assert_eq!(
         counter.gets_matching(&Manifest::history_key(&namespace, 4)),
-        3,
+        2,
         "a changed ETag must invalidate the exact cached generation"
     );
     for version in 1..=3 {
@@ -1472,6 +1626,716 @@ async fn gc_runner_history_memo_tracks_etags_and_lifecycle() {
 }
 
 #[tokio::test]
+async fn gc_runner_warm_empty_pending_reuses_prune_history_roots() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-prune-roots-empty-pending");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    seed_manifest_history(&store, &namespace, 3).await;
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, history_prefix.clone());
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut gc = memo_gc();
+    let mut runner = GcRunner::new(counted_store, gc.clone());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    let now = Utc::now();
+
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+
+    // Keep the retained-history policy identical while forcing a warm full
+    // cycle. The prune phase has already decoded the exact retained roots, and
+    // an empty pending-delete queue cannot issue a DELETE, so the pre-drain
+    // history refresh is redundant. The final sweep refresh remains required.
+    gc.compaction_upload_window_secs += 1;
+    runner.update_config(gc);
+    let report = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+
+    assert_eq!(report.pending_deletes_deleted, 0);
+    assert_eq!(report.pending_deletes_pruned, 0);
+    assert_eq!(report.pending_deletes_retained, 0);
+    let listed_history_prefix = Path::parse(&history_prefix)
+        .expect("history prefix must be a valid object path")
+        .to_string();
+    assert_eq!(
+        counter.list_calls_for_prefix(&listed_history_prefix),
+        2,
+        "warm empty-pending GC needs only the prune and final-sweep history LISTs"
+    );
+    assert_eq!(
+        counter.gets_matching(&history_prefix),
+        0,
+        "unchanged retained generation bodies must remain memoized"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_warm_all_young_pending_reuses_prune_history_roots() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-prune-roots-young-pending");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    let now = Utc::now();
+    seed_manifest_history(&store, &namespace, 3).await;
+
+    let pending_id = ulid_at(now, 201);
+    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    store
+        .put(&pending_key, Bytes::from_static(b"young pending delete"))
+        .await
+        .unwrap();
+    let (mut current, etag) = Manifest::read_versioned(&store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    current.pending_deletes.push(pending_key.clone());
+    current.updated_at = now;
+    current
+        .write_conditional(&store, &namespace, &etag)
+        .await
+        .unwrap();
+    store
+        .delete(&Manifest::history_key(&namespace, current.version()))
+        .await
+        .unwrap();
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, history_prefix.clone());
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut gc = GcConfig {
+        manifest_history_keep_count: 64,
+        pitr_retention_secs: 0,
+        ..unsafe_short_gc(60)
+    };
+    let mut runner = GcRunner::new(counted_store, gc.clone());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+
+    let cold = run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    assert_eq!(cold.pending_deletes_retained, 1);
+
+    gc.compaction_upload_window_secs += 1;
+    runner.update_config(gc);
+    let warm = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+
+    assert_eq!(warm.pending_deletes_deleted, 0);
+    assert_eq!(warm.pending_deletes_pruned, 0);
+    assert_eq!(warm.pending_deletes_retained, 1);
+    assert_s3_object_exists(&store, &pending_key).await;
+    let listed_history_prefix = Path::parse(&history_prefix)
+        .expect("history prefix must be a valid object path")
+        .to_string();
+    assert_eq!(
+        counter.list_calls_for_prefix(&listed_history_prefix),
+        2,
+        "when every pending artifact is too young, no pre-drain history refresh can affect a DELETE decision"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_warm_prune_roots_protect_every_pending_delete_without_refresh() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-prune-roots-protected-pending");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    let now = Utc::now();
+    let pending_id = ulid_at(now - chrono::Duration::seconds(60), 202);
+    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    store
+        .put(
+            &pending_key,
+            Bytes::from_static(b"history-protected pending delete"),
+        )
+        .await
+        .unwrap();
+
+    let mut retained = Manifest::new_at(now - chrono::Duration::seconds(30));
+    retained.add_fragment(FragmentRef {
+        id: pending_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 32,
+    });
+    retained.write(&store, &namespace).await.unwrap();
+    let (mut current, etag) = Manifest::read_versioned(&store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    current.fragments.clear();
+    current.pending_deletes.push(pending_key.clone());
+    current.updated_at = now;
+    current
+        .write_conditional(&store, &namespace, &etag)
+        .await
+        .unwrap();
+
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, history_prefix.clone());
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut gc = memo_gc();
+    let mut runner = GcRunner::new(counted_store, gc.clone());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+
+    let cold = run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+    assert_eq!(cold.pending_deletes_retained, 1);
+
+    gc.compaction_upload_window_secs += 1;
+    runner.update_config(gc);
+    let warm = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+
+    assert_eq!(warm.pending_deletes_deleted, 0);
+    assert_eq!(warm.pending_deletes_pruned, 0);
+    assert_eq!(warm.pending_deletes_retained, 1);
+    assert_s3_object_exists(&store, &pending_key).await;
+    let listed_history_prefix = Path::parse(&history_prefix)
+        .expect("history prefix must be a valid object path")
+        .to_string();
+    assert_eq!(
+        counter.list_calls_for_prefix(&listed_history_prefix),
+        2,
+        "prune-decoded roots that protect every pending key make the pre-drain refresh redundant"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_warm_eligible_pending_refresh_sees_new_history_root_before_delete() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-eligible-pending-history-race");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    let now = Utc::now();
+    let pending_id = ulid_at(now - chrono::Duration::seconds(60), 203);
+    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    seed_manifest_history(&store, &namespace, 2).await;
+
+    let mut injected_history = Manifest::new_at(now);
+    injected_history.add_fragment(FragmentRef {
+        id: pending_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 29,
+    });
+    let (injecting_store, injection) = PutOnNthDeleteStore::wrap(
+        store.inner(),
+        Manifest::history_key(&namespace, 1),
+        Manifest::history_key(&namespace, 4),
+        manifest_json_bytes_with_version(&injected_history, 4),
+        1,
+    );
+    let injecting_store = ZeppelinStore::new(Arc::new(injecting_store));
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&injecting_store, history_prefix.clone());
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(
+        counted_store,
+        GcConfig {
+            manifest_history_keep_count: 2,
+            pitr_retention_secs: 0,
+            ..unsafe_short_gc(0)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+
+    store
+        .put(
+            &pending_key,
+            Bytes::from_static(b"eligible pending history race"),
+        )
+        .await
+        .unwrap();
+    let (mut current, etag) = Manifest::read_versioned(&store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    current.pending_deletes.push(pending_key.clone());
+    current.updated_at = now;
+    current
+        .write_conditional(&store, &namespace, &etag)
+        .await
+        .unwrap();
+    store
+        .delete(&Manifest::history_key(&namespace, current.version()))
+        .await
+        .unwrap();
+
+    runner.update_config(GcConfig {
+        manifest_history_keep_count: 1,
+        pitr_retention_secs: 0,
+        ..unsafe_short_gc(0)
+    });
+    let raced = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+
+    assert_eq!(
+        injection.puts_injected(),
+        1,
+        "the fixture must publish a retained root after prune and before the pending-delete decision"
+    );
+    assert_eq!(raced.pending_deletes_deleted, 0);
+    assert_eq!(raced.pending_deletes_pruned, 0);
+    assert_eq!(raced.pending_deletes_retained, 1);
+    assert_s3_object_exists(&store, &pending_key).await;
+    assert_eq!(
+        Manifest::read(&store, &namespace)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_deletes,
+        vec![pending_key.clone()]
+    );
+    let listed_history_prefix = Path::parse(&history_prefix)
+        .expect("history prefix must be a valid object path")
+        .to_string();
+    assert_eq!(
+        counter.list_calls_for_prefix(&listed_history_prefix),
+        3,
+        "a possibly eligible pending DELETE requires a fresh history scan in addition to prune and sweep"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_warm_prune_root_reuse_keeps_final_sweep_history_fresh() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-prune-roots-fresh-sweep");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    let now = Utc::now();
+    let orphan_id = ulid_at(now - chrono::Duration::seconds(60), 204);
+    let orphan_key = WalFragment::s3_key(&namespace, &orphan_id);
+    seed_manifest_history(&store, &namespace, 1).await;
+
+    let mut injected_history = Manifest::new_at(now);
+    injected_history.add_fragment(FragmentRef {
+        id: orphan_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 26,
+    });
+    let (injecting_store, injection) = PutOnNthManifestReadStore::wrap(
+        store.inner(),
+        Manifest::s3_key(&namespace),
+        Manifest::history_key(&namespace, 2),
+        manifest_json_bytes_with_version(&injected_history, 2),
+        6,
+    );
+    let injecting_store = ZeppelinStore::new(Arc::new(injecting_store));
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&injecting_store, history_prefix.clone());
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(counted_store, memo_gc());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+
+    store
+        .put(&orphan_key, Bytes::from_static(b"fresh sweep history race"))
+        .await
+        .unwrap();
+    let raced = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+
+    assert_eq!(
+        injection.puts_injected(),
+        1,
+        "the fixture must publish retained history between mark and the final sweep scan"
+    );
+    assert_eq!(
+        raced.objects_deleted, 0,
+        "the final sweep history refresh must protect a newly rooted candidate"
+    );
+    assert_s3_object_exists(&store, &orphan_key).await;
+    assert!(
+        load_gc_candidates(&store, &namespace)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.key == orphan_key),
+        "a candidate that becomes reachable at sweep remains recorded for later reconciliation"
+    );
+    let listed_history_prefix = Path::parse(&history_prefix)
+        .expect("history prefix must be a valid object path")
+        .to_string();
+    assert_eq!(
+        counter.list_calls_for_prefix(&listed_history_prefix),
+        2,
+        "reuse may remove only the pre-drain refresh; prune and final sweep must both LIST history"
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_failed_eligible_pending_history_refresh_cannot_authorize_idle() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-pending-refresh-failure");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    let now = Utc::now();
+    let pending_id = ulid_at(now - chrono::Duration::seconds(60), 205);
+    let pending_key = WalFragment::s3_key(&namespace, &pending_id);
+    seed_manifest_history(&store, &namespace, 2).await;
+
+    let mut injected_history = Manifest::new_at(now);
+    injected_history.add_fragment(FragmentRef {
+        id: pending_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 30,
+    });
+    let injected_history_key = Manifest::history_key(&namespace, 4);
+    let (injecting_store, injection) = PutOnNthDeleteStore::wrap(
+        store.inner(),
+        Manifest::history_key(&namespace, 1),
+        injected_history_key.clone(),
+        manifest_json_bytes_with_version(&injected_history, 4),
+        1,
+    );
+    let injecting_store = ZeppelinStore::new(Arc::new(injecting_store));
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&injecting_store, history_prefix.clone());
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(
+        counted_store,
+        GcConfig {
+            manifest_history_keep_count: 2,
+            pitr_retention_secs: 0,
+            ..unsafe_short_gc(0)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+
+    store
+        .put(&pending_key, Bytes::from_static(b"pending refresh failure"))
+        .await
+        .unwrap();
+    let (mut current, etag) = Manifest::read_versioned(&store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    current.pending_deletes.push(pending_key.clone());
+    current.updated_at = now;
+    current
+        .write_conditional(&store, &namespace, &etag)
+        .await
+        .unwrap();
+    store
+        .delete(&Manifest::history_key(&namespace, current.version()))
+        .await
+        .unwrap();
+
+    control.fail_next_get(injected_history_key);
+    runner.update_config(GcConfig {
+        manifest_history_keep_count: 1,
+        pitr_retention_secs: 0,
+        ..unsafe_short_gc(0)
+    });
+    let failed = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+    assert_eq!(injection.puts_injected(), 1);
+    assert_eq!(failed, GcCycleReport::default());
+    assert_s3_object_exists(&store, &pending_key).await;
+
+    let retry = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(2),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        control.list_calls() > 1,
+        "a partial required refresh must force a full retry rather than authorize the one-LIST idle gate"
+    );
+    assert!(
+        counter.total_gets() > 0,
+        "the retry must reload the history generation whose prior refresh failed"
+    );
+    assert_eq!(retry.pending_deletes_deleted, 0);
+    assert_eq!(retry.pending_deletes_pruned, 0);
+    assert_eq!(retry.pending_deletes_retained, 1);
+    assert_s3_object_exists(&store, &pending_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_pending_cas_retry_refreshes_history_and_invalidates_idle_on_transient_root() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-pending-cas-retry-root");
+    let store = harness.store.clone();
+    let history_prefix = Manifest::history_prefix(&namespace);
+    let now = Utc::now();
+    let first_id = ulid_at(now - chrono::Duration::seconds(120), 206);
+    let first_key = WalFragment::s3_key(&namespace, &first_id);
+    let concurrent_id = ulid_at(now - chrono::Duration::seconds(120), 207);
+    let concurrent_key = WalFragment::s3_key(&namespace, &concurrent_id);
+    seed_manifest_history(&store, &namespace, 2).await;
+
+    let mut concurrent = Manifest::new_at(now);
+    concurrent.pending_deletes.push(concurrent_key.clone());
+    let concurrent_body = manifest_json_bytes_with_version(&concurrent, 4);
+    let history_four = Manifest::history_key(&namespace, 4);
+    let (publishing_store, publication) = PublishManifestOnHistoryWriteStore::wrap(
+        store.inner(),
+        history_four,
+        Manifest::s3_key(&namespace),
+        concurrent_body.clone(),
+        concurrent_body,
+        true,
+    );
+    let publishing_store = ZeppelinStore::new(Arc::new(publishing_store));
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&publishing_store, history_prefix.clone());
+    let (counted_store, counter) = counting_store(&controlled_store);
+    let mut runner = GcRunner::new(counted_store, memo_gc());
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+    run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+
+    store
+        .put(&first_key, Bytes::from_static(b"first pending CAS delete"))
+        .await
+        .unwrap();
+    store
+        .put(
+            &concurrent_key,
+            Bytes::from_static(b"concurrently protected pending delete"),
+        )
+        .await
+        .unwrap();
+    let (mut current, etag) = Manifest::read_versioned(&store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    current.pending_deletes.push(first_key.clone());
+    current.updated_at = now;
+    current
+        .write_conditional(&store, &namespace, &etag)
+        .await
+        .unwrap();
+    store
+        .delete(&Manifest::history_key(&namespace, current.version()))
+        .await
+        .unwrap();
+
+    let raced = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(1),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        publication.published(),
+        "the fixture must replace live manifest authority after the first physical DELETE and before its stale CAS"
+    );
+    assert!(
+        publication.history_removed(),
+        "the retry-only retained root must disappear before the final sweep scan"
+    );
+    assert_eq!(raced.pending_deletes_deleted, 1);
+    assert_eq!(raced.pending_deletes_pruned, 0);
+    assert_eq!(raced.pending_deletes_retained, 1);
+    assert_s3_object_not_exists(&store, &first_key).await;
+    assert_s3_object_exists(&store, &concurrent_key).await;
+    assert_eq!(
+        Manifest::read(&store, &namespace)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_deletes,
+        vec![concurrent_key.clone()],
+        "the CAS retry must preserve the new queue published by the concurrent writer"
+    );
+    let listed_history_prefix = Path::parse(&history_prefix)
+        .expect("history prefix must be a valid object path")
+        .to_string();
+    assert_eq!(
+        counter.list_calls_for_prefix(&listed_history_prefix),
+        4,
+        "an eligible CAS retry must add one fresh history scan before deciding on the new queue"
+    );
+
+    let retry = run_observed_gc_cycle(
+        &mut runner,
+        &incarnation,
+        now + chrono::Duration::seconds(2),
+        &counter,
+        &control,
+    )
+    .await;
+    assert!(
+        control.list_calls() > 1,
+        "history observed only by a CAS retry must invalidate the next one-LIST idle admission"
+    );
+    assert_eq!(retry.pending_deletes_deleted, 1);
+    assert_s3_object_not_exists(&store, &concurrent_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_runner_pending_cas_retry_skips_history_refresh_for_empty_or_young_queue() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let now = Utc::now();
+
+    for (suffix, publish_young, entropy) in [("empty", false, 208), ("young", true, 209)] {
+        let namespace = harness.key(&format!("storage-gc-runner-pending-cas-{suffix}"));
+        let history_prefix = Manifest::history_prefix(&namespace);
+        let first_id = ulid_at(now - chrono::Duration::seconds(120), entropy);
+        let first_key = WalFragment::s3_key(&namespace, &first_id);
+        let young_key = WalFragment::s3_key(&namespace, &ulid_at(now, entropy + 10));
+        seed_manifest_history(&store, &namespace, 2).await;
+
+        let mut concurrent = Manifest::new_at(now);
+        if publish_young {
+            concurrent.pending_deletes.push(young_key.clone());
+        }
+        let concurrent_body = manifest_json_bytes_with_version(&concurrent, 4);
+        let (publishing_store, publication) = PublishManifestOnHistoryWriteStore::wrap(
+            store.inner(),
+            Manifest::history_key(&namespace, 4),
+            Manifest::s3_key(&namespace),
+            concurrent_body.clone(),
+            concurrent_body,
+            false,
+        );
+        let publishing_store = ZeppelinStore::new(Arc::new(publishing_store));
+        let (controlled_store, control) =
+            HistoryMetadataControlStore::wrap(&publishing_store, history_prefix.clone());
+        let (counted_store, counter) = counting_store(&controlled_store);
+        let mut runner = GcRunner::new(
+            counted_store,
+            GcConfig {
+                manifest_history_keep_count: 64,
+                pitr_retention_secs: 0,
+                ..unsafe_short_gc(60)
+            },
+        );
+        let incarnation = GcNamespaceIncarnation::new(namespace.clone(), Utc::now());
+        run_observed_gc_cycle(&mut runner, &incarnation, now, &counter, &control).await;
+
+        store
+            .put(&first_key, Bytes::from_static(b"first pending CAS delete"))
+            .await
+            .unwrap();
+        if publish_young {
+            store
+                .put(&young_key, Bytes::from_static(b"young concurrent pending"))
+                .await
+                .unwrap();
+        }
+        let (mut current, etag) = Manifest::read_versioned(&store, &namespace)
+            .await
+            .unwrap()
+            .unwrap();
+        current.pending_deletes.push(first_key.clone());
+        current.updated_at = now;
+        current
+            .write_conditional(&store, &namespace, &etag)
+            .await
+            .unwrap();
+        store
+            .delete(&Manifest::history_key(&namespace, current.version()))
+            .await
+            .unwrap();
+
+        let raced = run_observed_gc_cycle(
+            &mut runner,
+            &incarnation,
+            now + chrono::Duration::seconds(1),
+            &counter,
+            &control,
+        )
+        .await;
+        assert!(publication.published());
+        assert_eq!(raced.pending_deletes_deleted, 1);
+        assert_s3_object_not_exists(&store, &first_key).await;
+        if publish_young {
+            assert_eq!(raced.pending_deletes_retained, 1);
+            assert_s3_object_exists(&store, &young_key).await;
+        } else {
+            assert_eq!(raced.pending_deletes_retained, 0);
+        }
+        assert_eq!(
+            Manifest::read(&store, &namespace)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_deletes,
+            if publish_young {
+                vec![young_key]
+            } else {
+                Vec::new()
+            }
+        );
+        let listed_history_prefix = Path::parse(&history_prefix)
+            .expect("history prefix must be a valid object path")
+            .to_string();
+        assert_eq!(
+            counter.list_calls_for_prefix(&listed_history_prefix),
+            3,
+            "a CAS retry with an empty or entirely too-young queue must not add a history refresh"
+        );
+    }
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn gc_runner_missing_history_etag_is_never_cacheable() {
     let harness = TestHarness::new().await;
     let namespace = harness.key("storage-gc-runner-history-unversioned");
@@ -1500,8 +2364,8 @@ async fn gc_runner_missing_history_etag_is_never_cacheable() {
     .await;
     assert_eq!(
         counter.gets_matching(&history_prefix),
-        9,
-        "history with no LIST ETag/backend version must be reread every cycle"
+        6,
+        "uncacheable history must be reread during prune and final sweep on every warm cycle"
     );
 
     harness.cleanup().await;
@@ -1562,11 +2426,11 @@ async fn gc_runner_failed_refresh_does_not_commit_partial_memo() {
     .await;
     assert_eq!(
         counter.gets_matching(&history_prefix),
-        6,
+        4,
         "retry must reload both changed entries; no partial failed refresh may commit"
     );
-    assert_eq!(counter.gets_matching(&first_key), 3);
-    assert_eq!(counter.gets_matching(&second_key), 3);
+    assert_eq!(counter.gets_matching(&first_key), 2);
+    assert_eq!(counter.gets_matching(&second_key), 2);
     assert_eq!(counter.gets_matching(&third_key), 0);
 
     run_counted_gc_cycle(

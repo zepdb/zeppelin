@@ -122,7 +122,7 @@ use crate::storage::{ListedObject, StorageVersion, ZeppelinStore};
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
     Manifest, ManifestHistoryObservation, ManifestHistoryPruneResult, ManifestHistoryRetention,
-    NamedSnapshot, NamedSnapshotObservation,
+    ManifestVersion, NamedSnapshot, NamedSnapshotObservation,
 };
 use crate::wal::Lease;
 
@@ -428,6 +428,22 @@ pub fn staging_key(namespace: &str, fencing_token: u64) -> String {
 #[must_use]
 pub fn reachable_keys(namespace: &str, manifest: &Manifest) -> BTreeSet<String> {
     reachable_keys_with_staging(namespace, manifest, &BTreeSet::new())
+}
+
+/// Unions immutable artifact roots from already-decoded retained manifests.
+///
+/// The helper performs no storage I/O. Garbage collection uses it immediately
+/// after the retention pass so mark planning and conservative pending-delete
+/// checks do not re-list and re-download the same history bodies. A caller must
+/// still take a fresh history observation before any physical deletion whose
+/// safety depends on retained history.
+#[must_use]
+fn reachable_keys_from_manifests(namespace: &str, manifests: &[Manifest]) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for manifest in manifests {
+        keys.extend(reachable_keys(namespace, manifest));
+    }
+    keys
 }
 
 /// Unions one manifest's references with caller-validated staged uploads.
@@ -772,6 +788,11 @@ struct PendingDeleteDrainOutcome {
     observed_pending_deletes: Option<Vec<String>>,
 }
 
+struct PreparedPendingDeleteDrain {
+    outcome: PendingDeleteDrainOutcome,
+    refreshed_history: Vec<HistorySnapshot>,
+}
+
 impl PendingDeleteDrainOutcome {
     fn new(
         report: PendingDeleteDrainReport,
@@ -1074,10 +1095,12 @@ async fn save_gc_candidates_with_version(
 ///
 /// # Performance
 ///
-/// History discovery costs one LIST plus one GET per retained generation. Each
-/// CAS attempt costs one manifest GET, up to one DELETE per pending key, and at
-/// most one manifest history write plus conditional live-manifest PUT inside
-/// [`Manifest::write_conditional`].
+/// Initial history discovery costs one LIST plus one GET per retained
+/// generation. Each CAS attempt costs one manifest GET and up to one DELETE per
+/// pending key. After a CAS conflict, an attempt that could delete refreshes
+/// history again before its first DELETE. A successful pruning attempt also
+/// writes one manifest-history object and conditionally updates the live
+/// manifest inside [`Manifest::write_conditional`].
 ///
 /// # Examples
 ///
@@ -1109,9 +1132,10 @@ pub async fn drain_pending_deletes_at(
 
 /// Drains pending deletes using a retained-history union already loaded by the caller.
 ///
-/// This is the retrying implementation behind [`drain_pending_deletes`].
-/// Supplying the set avoids repeating history LIST/GET work inside each manifest
-/// CAS attempt.
+/// This is the retrying implementation behind [`drain_pending_deletes`]. The
+/// supplied set serves the first attempt. A later CAS attempt refreshes history
+/// before deleting when its newly read queue contains a potentially eligible
+/// key.
 ///
 /// # Parameters
 ///
@@ -1142,32 +1166,79 @@ async fn drain_pending_deletes_with_retained_history(
     retained_history: &BTreeSet<String>,
     now: DateTime<Utc>,
 ) -> Result<PendingDeleteDrainOutcome> {
+    drain_pending_deletes_with_retained_history_from(
+        store,
+        namespace,
+        gc,
+        retained_history,
+        now,
+        None,
+        None,
+    )
+    .await
+    .map(|(outcome, _)| outcome)
+}
+
+async fn drain_pending_deletes_with_retained_history_from(
+    store: &ZeppelinStore,
+    namespace: &str,
+    gc: &GcConfig,
+    retained_history: &BTreeSet<String>,
+    now: DateTime<Utc>,
+    mut initial_manifest: Option<(Manifest, ManifestVersion)>,
+    retry_history: Option<&BTreeMap<String, CachedHistory>>,
+) -> Result<(PendingDeleteDrainOutcome, Vec<HistorySnapshot>)> {
     let mut deleted_keys = BTreeSet::new();
     let mut complete = true;
+    let mut refreshed_history = Vec::new();
 
     for attempt in 0..GC_MANIFEST_CAS_RETRIES {
-        let Some((mut manifest, version)) = Manifest::read_versioned(store, namespace).await?
-        else {
-            return Ok(PendingDeleteDrainOutcome::new(
-                PendingDeleteDrainReport {
-                    objects_deleted: deleted_keys.len(),
-                    ..PendingDeleteDrainReport::default()
-                },
-                complete,
-                None,
+        let observed = match initial_manifest.take() {
+            Some(observed) => Some(observed),
+            None => Manifest::read_versioned(store, namespace).await?,
+        };
+        let Some((mut manifest, version)) = observed else {
+            return Ok((
+                PendingDeleteDrainOutcome::new(
+                    PendingDeleteDrainReport {
+                        objects_deleted: deleted_keys.len(),
+                        ..PendingDeleteDrainReport::default()
+                    },
+                    complete,
+                    None,
+                ),
+                refreshed_history,
             ));
         };
 
         if manifest.pending_deletes.is_empty() {
-            return Ok(PendingDeleteDrainOutcome::new(
-                PendingDeleteDrainReport {
-                    objects_deleted: deleted_keys.len(),
-                    ..PendingDeleteDrainReport::default()
-                },
-                complete,
-                Some(Vec::new()),
+            return Ok((
+                PendingDeleteDrainOutcome::new(
+                    PendingDeleteDrainReport {
+                        objects_deleted: deleted_keys.len(),
+                        ..PendingDeleteDrainReport::default()
+                    },
+                    complete,
+                    Some(Vec::new()),
+                ),
+                refreshed_history,
             ));
         }
+
+        let retry_may_delete = attempt > 0
+            && manifest.pending_deletes.iter().any(|key| {
+                !retained_history.contains(key)
+                    && pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs)
+            });
+        let retry_roots = if retry_may_delete {
+            let snapshot = load_history_snapshot(store, namespace, retry_history).await?;
+            let roots = history_snapshot_reachable_keys(namespace, &snapshot);
+            refreshed_history.push(snapshot);
+            Some(roots)
+        } else {
+            None
+        };
+        let retained_history = retry_roots.as_ref().unwrap_or(retained_history);
 
         let pending = manifest.pending_deletes.clone();
         let mut confirmed_absent = BTreeSet::new();
@@ -1215,14 +1286,17 @@ async fn drain_pending_deletes_with_retained_history(
         }
 
         if confirmed_absent.is_empty() {
-            return Ok(PendingDeleteDrainOutcome::new(
-                PendingDeleteDrainReport {
-                    objects_deleted: deleted_keys.len(),
-                    entries_pruned: 0,
-                    entries_retained: retained.len(),
-                },
-                complete,
-                Some(manifest.pending_deletes),
+            return Ok((
+                PendingDeleteDrainOutcome::new(
+                    PendingDeleteDrainReport {
+                        objects_deleted: deleted_keys.len(),
+                        entries_pruned: 0,
+                        entries_retained: retained.len(),
+                    },
+                    complete,
+                    Some(manifest.pending_deletes),
+                ),
+                refreshed_history,
             ));
         }
 
@@ -1233,14 +1307,17 @@ async fn drain_pending_deletes_with_retained_history(
 
         match manifest.write_conditional(store, namespace, &version).await {
             Ok(()) => {
-                return Ok(PendingDeleteDrainOutcome::new(
-                    PendingDeleteDrainReport {
-                        objects_deleted: deleted_keys.len(),
-                        entries_pruned: confirmed_absent.len(),
-                        entries_retained: retained.len(),
-                    },
-                    complete,
-                    Some(manifest.pending_deletes),
+                return Ok((
+                    PendingDeleteDrainOutcome::new(
+                        PendingDeleteDrainReport {
+                            objects_deleted: deleted_keys.len(),
+                            entries_pruned: confirmed_absent.len(),
+                            entries_retained: retained.len(),
+                        },
+                        complete,
+                        Some(manifest.pending_deletes),
+                    ),
+                    refreshed_history,
                 ));
             }
             Err(crate::error::ZeppelinError::ManifestConflict { .. }) => {
@@ -1255,6 +1332,69 @@ async fn drain_pending_deletes_with_retained_history(
 
     Err(crate::error::ZeppelinError::ManifestConflict {
         namespace: namespace.to_string(),
+    })
+}
+
+async fn prepare_warm_pending_delete_drain(
+    store: &ZeppelinStore,
+    namespace: &str,
+    gc: &GcConfig,
+    prune_reachable: &BTreeSet<String>,
+    prior_history: &BTreeMap<String, CachedHistory>,
+    now: DateTime<Utc>,
+) -> Result<PreparedPendingDeleteDrain> {
+    let Some((manifest, version)) = Manifest::read_versioned(store, namespace).await? else {
+        return Ok(PreparedPendingDeleteDrain {
+            outcome: PendingDeleteDrainOutcome::new(
+                PendingDeleteDrainReport::default(),
+                true,
+                None,
+            ),
+            refreshed_history: Vec::new(),
+        });
+    };
+
+    let requires_history_refresh = manifest.pending_deletes.iter().any(|key| {
+        !prune_reachable.contains(key)
+            && pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs)
+    });
+    if !requires_history_refresh {
+        let retained = manifest
+            .pending_deletes
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len();
+        return Ok(PreparedPendingDeleteDrain {
+            outcome: PendingDeleteDrainOutcome::new(
+                PendingDeleteDrainReport {
+                    objects_deleted: 0,
+                    entries_pruned: 0,
+                    entries_retained: retained,
+                },
+                true,
+                Some(manifest.pending_deletes),
+            ),
+            refreshed_history: Vec::new(),
+        });
+    }
+
+    let history = load_history_snapshot(store, namespace, Some(prior_history)).await?;
+    let retained_history = history_snapshot_reachable_keys(namespace, &history);
+    let (outcome, mut retry_history) = drain_pending_deletes_with_retained_history_from(
+        store,
+        namespace,
+        gc,
+        &retained_history,
+        now,
+        Some((manifest, version)),
+        Some(prior_history),
+    )
+    .await?;
+    let mut refreshed_history = vec![history];
+    refreshed_history.append(&mut retry_history);
+    Ok(PreparedPendingDeleteDrain {
+        outcome,
+        refreshed_history,
     })
 }
 
@@ -1461,11 +1601,13 @@ pub fn mark_gc_candidates(
 
 /// Runs one complete history-prune, pending-drain, mark, and sweep cycle.
 ///
-/// The cycle first prunes unretained manifest history, rebuilds the retained
-/// history root set, and drains explicit `pending_deletes`. It then lists the
-/// namespace once, persists newly unreachable known artifacts, and re-reads the
-/// live manifest, active staging, and retained history before attempting any
-/// candidate DELETE.
+/// The cycle first prunes unretained manifest history and drains explicit
+/// `pending_deletes`. A warm runner reuses the prune result for non-destructive
+/// reachability decisions and refreshes history only when a pending entry could
+/// be physically deleted; a stateless cold cycle retains the original complete
+/// post-prune refresh. It then lists the namespace once, persists newly
+/// unreachable known artifacts, and re-reads the live manifest, active staging,
+/// and retained history before attempting any candidate DELETE.
 ///
 /// ```text
 /// prune unretained history
@@ -1533,13 +1675,14 @@ pub fn mark_gc_candidates(
 ///
 /// # Performance
 ///
-/// One cycle includes history and snapshot LIST/GET/DELETE work, one namespace
-/// LIST materialized in memory, candidate-ledger GET plus one or two full PUTs,
-/// at least two live-manifest GETs for mark and sweep plus any pending-drain CAS
-/// attempts, two active-staging scans, another retained-history scan for the
-/// sweep, and sequential artifact DELETEs. Network roundtrips grow with retained
-/// generations, staging records, pending entries, and mature candidates;
-/// candidates are not deleted concurrently.
+/// A cold cycle includes the retention scan, a complete post-prune history
+/// refresh, and the final sweep refresh. A warm runner omits the middle refresh
+/// when its pending queue is empty, young, or already protected by prune roots.
+/// Both paths also perform one namespace LIST, candidate-ledger GET plus one or
+/// two full PUTs, at least two live-manifest GETs for mark and sweep, two
+/// active-staging scans, and sequential artifact DELETEs. Network roundtrips
+/// grow with retained generations, staging records, pending entries, and mature
+/// candidates; candidates are not deleted concurrently.
 ///
 /// # Examples
 ///
@@ -1809,13 +1952,6 @@ fn history_snapshot_reachable_keys(
     keys
 }
 
-fn same_history_observations(left: &HistorySnapshot, right: &HistorySnapshot) -> bool {
-    left.entries
-        .iter()
-        .map(|(observation, _)| observation)
-        .eq(right.entries.iter().map(|(observation, _)| observation))
-}
-
 fn history_observations_match_snapshot(
     expected: &[ManifestHistoryObservation],
     actual: &HistorySnapshot,
@@ -1948,8 +2084,39 @@ async fn run_gc_cycle_at_inner(
         snapshot_observations: prune_snapshot_observations,
     } = history_prune;
     let manifest_history_pruned = history_prune.pruned;
-    let retained_history_snapshot =
-        match load_history_snapshot(store, namespace, prior_entries).await {
+    let prune_reachable =
+        reachable_keys_from_manifests(namespace, &history_prune.retained_manifests);
+    let (retained_history, pending_outcome, pending_history_snapshots) = if let Some(
+        prior_entries,
+    ) = prior_entries
+    {
+        let prepared = match prepare_warm_pending_delete_drain(
+            store,
+            namespace,
+            gc,
+            &prune_reachable,
+            prior_entries,
+            now,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                warn!(
+                    namespace,
+                    error = %e,
+                    "gc pending-delete preparation failed; aborting cycle"
+                );
+                return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
+            }
+        };
+        (
+            prune_reachable,
+            prepared.outcome,
+            prepared.refreshed_history,
+        )
+    } else {
+        let retained_history_snapshot = match load_history_snapshot(store, namespace, None).await {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 warn!(
@@ -1960,25 +2127,33 @@ async fn run_gc_cycle_at_inner(
                 return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
             }
         };
-    let retained_history = history_snapshot_reachable_keys(namespace, &retained_history_snapshot);
-    let pending_outcome = match drain_pending_deletes_with_retained_history(
-        store,
-        namespace,
-        gc,
-        &retained_history,
-        now,
-    )
-    .await
-    {
-        Ok(report) => report,
-        Err(e) => {
-            warn!(
+        let retained_history =
+            history_snapshot_reachable_keys(namespace, &retained_history_snapshot);
+        let (pending_outcome, mut retry_history_snapshots) =
+            match drain_pending_deletes_with_retained_history_from(
+                store,
                 namespace,
-                error = %e,
-                "gc pending-delete drain failed; aborting cycle"
-            );
-            return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
-        }
+                gc,
+                &retained_history,
+                now,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    warn!(
+                        namespace,
+                        error = %e,
+                        "gc pending-delete drain failed; aborting cycle"
+                    );
+                    return Ok(GcCycleOutcome::incomplete(GcCycleReport::default()));
+                }
+            };
+        let mut pending_history_snapshots = vec![retained_history_snapshot];
+        pending_history_snapshots.append(&mut retry_history_snapshots);
+        (retained_history, pending_outcome, pending_history_snapshots)
     };
     let PendingDeleteDrainOutcome {
         report: pending_report,
@@ -2210,14 +2385,14 @@ async fn run_gc_cycle_at_inner(
         }
     }
 
-    let history_inputs_stable =
-        history_observations_match_snapshot(
-            &prune_history_observations,
-            &retained_history_snapshot,
-        ) && history_observations_match_snapshot(
+    let pending_history_stable = pending_history_snapshots
+        .iter()
+        .all(|snapshot| history_observations_match_snapshot(&prune_history_observations, snapshot));
+    let history_inputs_stable = pending_history_stable
+        && history_observations_match_snapshot(
             &prune_history_observations,
             &sweep_history_snapshot,
-        ) && same_history_observations(&retained_history_snapshot, &sweep_history_snapshot);
+        );
     let snapshot_prefix = NamedSnapshot::prefix(namespace);
     let snapshot_inputs_stable = completed_inventory.as_ref().is_some_and(|inventory| {
         inventory.matches_listed_prefix(

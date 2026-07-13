@@ -1179,6 +1179,44 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
         ideal_case("gc.idle_prior_partial_failure"),
     ),
     path(
+        "catalog.gc.prune_reuse_empty_pending_uncacheable",
+        "src/compaction/gc.rs:GcRunner::run_cycle_at",
+        &[
+            StoreMethod::Get,
+            StoreMethod::GetWithMeta,
+            StoreMethod::ListPrefixMeta,
+            StoreMethod::Put,
+        ],
+        &[
+            PhysicalVariant::GetFull,
+            PhysicalVariant::ListRecursive,
+            PhysicalVariant::PutOverwrite,
+        ],
+        ideal_case("gc.prune_reuse_empty_pending_uncacheable"),
+    ),
+    path(
+        "catalog.gc.prune_reuse_eligible_pending_refresh",
+        "src/compaction/gc.rs:GcRunner::run_cycle_at",
+        &[
+            StoreMethod::Get,
+            StoreMethod::GetWithMeta,
+            StoreMethod::ListPrefixMeta,
+            StoreMethod::Put,
+            StoreMethod::PutIfMatch,
+            StoreMethod::PutIfNotExists,
+            StoreMethod::Delete,
+        ],
+        &[
+            PhysicalVariant::GetFull,
+            PhysicalVariant::ListRecursive,
+            PhysicalVariant::PutOverwrite,
+            PhysicalVariant::PutUpdate,
+            PhysicalVariant::PutCreate,
+            PhysicalVariant::Delete,
+        ],
+        ideal_case("gc.prune_reuse_eligible_pending_refresh"),
+    ),
+    path(
         "catalog.gc.history_memo_new_generation",
         "src/compaction/gc.rs:GcRunner::run_cycle_at",
         &[
