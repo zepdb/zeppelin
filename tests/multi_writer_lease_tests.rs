@@ -418,6 +418,13 @@ async fn test_lease_renewed_during_long_compaction() {
     let ns = harness.key("lease-renew-long-compaction");
     let store = harness.store.clone();
 
+    common::write_active_namespace_metadata(
+        &store,
+        &ns,
+        16,
+        zeppelin::types::DistanceMetric::Euclidean,
+    )
+    .await;
     Manifest::new().write(&store, &ns).await.unwrap();
     let writer = WalWriter::new(store.clone());
     writer
@@ -512,6 +519,13 @@ async fn test_stolen_lease_aborts_compaction_before_cas() {
     let ns = harness.key("lease-stolen-abort");
     let store = harness.store.clone();
 
+    common::write_active_namespace_metadata(
+        &store,
+        &ns,
+        16,
+        zeppelin::types::DistanceMetric::Euclidean,
+    )
+    .await;
     Manifest::new().write(&store, &ns).await.unwrap();
     let writer = WalWriter::new(store.clone());
     let (frag, _) = writer

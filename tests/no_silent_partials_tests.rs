@@ -193,6 +193,13 @@ async fn test_wal_fragment_notfound_tolerated_only_after_manifest_reread_and_met
 
     let harness = common::harness::TestHarness::new().await;
     let ns = harness.key("wal-gc-race");
+    common::write_active_namespace_metadata(
+        &harness.store,
+        &ns,
+        DIM,
+        zeppelin::types::DistanceMetric::Euclidean,
+    )
+    .await;
     Manifest::new().write(&harness.store, &ns).await.unwrap();
 
     let writer = WalWriter::new(harness.store.clone());

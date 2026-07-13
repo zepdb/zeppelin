@@ -108,6 +108,8 @@ async fn compacted_fixture(label: &str) -> BenchFixture {
     let namespace = harness.key(label);
     let writer = WalWriter::new(store.clone());
 
+    common::write_active_namespace_metadata(&store, &namespace, DIM, DistanceMetric::Euclidean)
+        .await;
     Manifest::new().write(&store, &namespace).await.unwrap();
     let vectors = bench_vectors();
     let query = vectors[0].values.clone();

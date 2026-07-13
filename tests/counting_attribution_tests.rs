@@ -89,6 +89,7 @@ async fn test_query_class_breakdown_is_sane() {
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
+    common::write_active_namespace_metadata(&store, &ns, 16, DistanceMetric::Euclidean).await;
     Manifest::new().write(&store, &ns).await.unwrap();
     let vecs = random_vectors(100, 16);
     let query_vec = vecs[0].values.clone();

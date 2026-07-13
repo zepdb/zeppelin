@@ -60,6 +60,7 @@ async fn compact_baseline_and_cache_manifest(
     namespace: &str,
     manifest_cache: &Arc<ManifestCache>,
 ) {
+    common::write_active_namespace_metadata(store, namespace, DIM, DistanceMetric::Euclidean).await;
     Manifest::new().write(store, namespace).await.unwrap();
 
     let writer = WalWriter::new(store.clone());
@@ -295,6 +296,8 @@ async fn strong_wal_update_outside_topk_still_overrides_stale_segment_vector() {
     let harness = TestHarness::new().await;
     let namespace = harness.key("strong-wal-topk-overrides-segment");
     let store = &harness.store;
+    common::write_active_namespace_metadata(store, &namespace, DIM, DistanceMetric::Euclidean)
+        .await;
     Manifest::new().write(store, &namespace).await.unwrap();
 
     let writer = WalWriter::new(store.clone());
@@ -334,6 +337,8 @@ async fn strong_filtered_wal_update_still_overrides_stale_segment_attrs() {
     let harness = TestHarness::new().await;
     let namespace = harness.key("strong-wal-filter-overrides-segment");
     let store = &harness.store;
+    common::write_active_namespace_metadata(store, &namespace, DIM, DistanceMetric::Euclidean)
+        .await;
     Manifest::new().write(store, &namespace).await.unwrap();
 
     let writer = WalWriter::new(store.clone());

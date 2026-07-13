@@ -1,18 +1,21 @@
 mod common;
 
+use std::collections::HashMap;
+
 use common::counting::counting_store;
 use common::harness::TestHarness;
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 
-use zeppelin::compaction::background::CompactionLoopOptions;
+use zeppelin::compaction::background::{compact_namespace_under_lease, CompactionLoopOptions};
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, IndexingConfig};
 use zeppelin::index::ivf_flat::build::build_ivf_flat;
+use zeppelin::namespace::manager::NamespaceMetadata;
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
 use zeppelin::wal::fragment::WalFragment;
 use zeppelin::wal::manifest::{Manifest, SegmentRef};
-use zeppelin::wal::{WalReader, WalWriter};
+use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
 
 use common::assertions::*;
 
@@ -47,6 +50,7 @@ async fn test_compact_single_fragment() {
     // Create namespace manifest
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     // Append 1 fragment with 50 vectors
     let vecs = random_vectors(50, 16);
@@ -83,6 +87,7 @@ async fn test_compact_multiple_fragments() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     // Append 3 fragments with unique IDs
     let vecs1: Vec<VectorEntry> = (0..20)
@@ -150,6 +155,7 @@ async fn test_compact_with_deletes() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     // Append 10 vectors
     let vecs = random_vectors(10, 16);
@@ -182,6 +188,7 @@ async fn test_compact_deduplication() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     // Append vec id="dup" with values=[1,0,0,...,0]
     let mut v1 = vec![0.0f32; 16];
@@ -259,6 +266,7 @@ async fn test_compact_updates_manifest() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     // Append 2 fragments
     let (f1, _) = writer
@@ -294,6 +302,7 @@ async fn test_compact_cleans_up_fragments() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     // Append 3 fragments, record their S3 keys
     let (f1, _) = writer
@@ -349,6 +358,7 @@ async fn test_compact_preserves_new_fragments() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     // Append A, compact
     let (frag_a, _) = writer
@@ -415,6 +425,7 @@ async fn test_compact_with_existing_segment() {
         membership: None,
     });
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     // Append 20 new vecs via WAL
     // Use different IDs to avoid collision with existing vec_0..vec_49
@@ -466,6 +477,7 @@ async fn test_query_after_compaction() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Cosine).await;
 
     // Append 100 vecs
     let vecs = random_vectors(100, 16);
@@ -564,6 +576,7 @@ async fn test_delete_after_compaction_not_returned_strong() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Cosine).await;
 
     // Upsert 50 vectors and compact them into a segment
     let vecs = random_vectors(50, 16);
@@ -667,6 +680,7 @@ async fn test_compact_empty_namespace() {
     // Create manifest with no fragments
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     let compactor = test_compactor(store);
     let result = compactor.compact(&ns).await.unwrap();
@@ -692,6 +706,7 @@ async fn test_compact_trigger_by_fragment_count() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     let compactor = test_compactor(store); // max_wal_fragments_before_compact: 3
 
@@ -781,6 +796,61 @@ async fn test_compact_rejects_missing_manifest_for_active_namespace() {
     harness.cleanup().await;
 }
 
+#[tokio::test]
+async fn test_leased_compaction_rejects_missing_authoritative_metadata() {
+    let harness = TestHarness::new().await;
+    let ns = format!("{}-missing-compaction-metadata", harness.prefix);
+    let manager = zeppelin::namespace::NamespaceManager::new(harness.store.clone());
+    manager
+        .create(&ns, 16, DistanceMetric::Euclidean)
+        .await
+        .unwrap();
+    WalWriter::new(harness.store.clone())
+        .append(&ns, random_vectors(8, 16), Vec::new())
+        .await
+        .unwrap();
+    let before = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    harness
+        .store
+        .delete(&NamespaceMetadata::s3_key(&ns))
+        .await
+        .unwrap();
+    let lease_manager = Arc::new(LeaseManager::new(
+        harness.store.clone(),
+        format!("test-{}", uuid::Uuid::new_v4()),
+        Duration::from_secs(30),
+    ));
+
+    let error = compact_namespace_under_lease(
+        &test_compactor(&harness.store),
+        &lease_manager,
+        &ns,
+        &HashMap::new(),
+    )
+    .await
+    .expect_err("missing authoritative metadata must stop leased compaction");
+    assert!(
+        matches!(
+            error,
+            zeppelin::error::ZeppelinError::NamespaceNotFound { ref namespace }
+                if namespace == &ns
+        ),
+        "missing metadata must remain a namespace error, got {error:?}"
+    );
+
+    let after = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(after.version(), before.version());
+    assert_eq!(after.active_segment, before.active_segment);
+    assert_eq!(after.fragments, before.fragments);
+
+    harness
+        .store
+        .delete_prefix(&format!("{ns}/"))
+        .await
+        .unwrap();
+    harness.cleanup().await;
+}
+
 /// I1: a quiet namespace with a small number of uncompacted fragments must
 /// converge to a compacted state within a bounded time window via the
 /// age-based trigger — regardless of the fragment-count threshold.
@@ -797,6 +867,7 @@ async fn test_age_trigger_compacts_quiet_namespace() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     // 2 fragments — far below the count threshold of 100.
     writer
@@ -870,6 +941,7 @@ async fn test_idle_namespace_untouched_across_intervals() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     let manifest_key = Manifest::s3_key(&ns);
     let etag_before = store.head(&manifest_key).await.unwrap().e_tag;
@@ -978,6 +1050,7 @@ async fn test_compaction_populates_cluster_object_size_bytes() {
     let writer = WalWriter::new(store.clone());
 
     Manifest::new().write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 32, DistanceMetric::Euclidean).await;
     writer
         .append(&ns, random_vectors(256, 32), vec![])
         .await
@@ -1070,6 +1143,7 @@ async fn test_repeat_query_zero_centroid_gets() {
     let wal_reader = WalReader::new(store.clone());
 
     Manifest::new().write(&store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(&store, &ns, 16, DistanceMetric::Euclidean).await;
     let vecs = random_vectors(100, 16);
     let query_vec = vecs[0].values.clone();
     writer.append(&ns, vecs, vec![]).await.unwrap();
@@ -1132,6 +1206,7 @@ async fn test_new_segment_never_serves_stale_centroids() {
     let wal_reader = WalReader::new(store.clone());
 
     Manifest::new().write(&store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(&store, &ns, 16, DistanceMetric::Euclidean).await;
     // random_vectors is fixed-seed: generate ONE pool and split it so the
     // two batches have disjoint values (identical values ⇒ distance ties ⇒
     // arbitrary winner).
@@ -1224,6 +1299,7 @@ async fn test_pinned_centroids_survive_eviction_pressure() {
     let wal_reader = WalReader::new(store.clone());
 
     Manifest::new().write(&store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(&store, &ns, 16, DistanceMetric::Euclidean).await;
     let vecs = random_vectors(100, 16);
     let query_vec = vecs[0].values.clone();
     writer.append(&ns, vecs, vec![]).await.unwrap();
@@ -1806,6 +1882,7 @@ async fn test_query_path_stays_fail_loud_with_cache() {
     let wal_reader = WalReader::new(store.clone());
 
     Manifest::new().write(&store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(&store, &ns, 16, DistanceMetric::Euclidean).await;
     writer
         .append(&ns, random_vectors(50, 16), vec![])
         .await
@@ -1856,6 +1933,7 @@ async fn test_compaction_skips_non_finite_prefix_data() {
     let writer = WalWriter::new(store.clone());
 
     Manifest::new().write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
 
     // 50 good vectors + 1 NaN vector + 1 inf vector, direct to the WAL
     // (pre-fix data path; the API boundary now rejects these).
@@ -1948,6 +2026,7 @@ async fn test_compact_attributes_preserved() {
 
     let mut manifest = Manifest::new();
     manifest.write(store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Cosine).await;
 
     // Append vecs with simple_attributes
     let vecs = with_attributes(random_vectors(30, 16), simple_attributes);

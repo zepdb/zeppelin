@@ -296,6 +296,7 @@ async fn test_eventual_query_gets_only_delete_fragments_not_vector_wal_fragments
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
+    common::write_active_namespace_metadata(&store, &ns, 4, DistanceMetric::Cosine).await;
     Manifest::new().write(&store, &ns).await.unwrap();
 
     let target_id = "delete_me";
@@ -418,6 +419,7 @@ async fn test_eventual_tombstone_ordering_across_fragments() {
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
+    common::write_active_namespace_metadata(&store, &ns, 4, DistanceMetric::Cosine).await;
     Manifest::new().write(&store, &ns).await.unwrap();
 
     // Segment contains x, z, and fillers.
@@ -538,6 +540,7 @@ async fn test_eventual_query_may_return_stale_updated_segment_vector() {
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
+    common::write_active_namespace_metadata(&store, &ns, 4, DistanceMetric::Cosine).await;
     Manifest::new().write(&store, &ns).await.unwrap();
 
     let target_id = "update_me";

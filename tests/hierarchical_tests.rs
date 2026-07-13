@@ -14,6 +14,7 @@ use zeppelin::index::hierarchical::tree_meta_key;
 use zeppelin::index::HierarchicalIndex;
 use zeppelin::index::VectorIndex;
 use zeppelin::query::{execute_query, QueryParams};
+use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, VectorEntry};
 use zeppelin::wal::manifest::Manifest;
 use zeppelin::wal::{WalReader, WalWriter};
@@ -27,6 +28,12 @@ fn hierarchical_test_config() -> IndexingConfig {
         leaf_size: Some(10),
         ..Default::default()
     }
+}
+
+/// Seeds the manifest and authoritative metadata required by compaction.
+async fn seed_active_namespace(store: &ZeppelinStore, namespace: &str) {
+    Manifest::new().write(store, namespace).await.unwrap();
+    common::write_active_namespace_metadata(store, namespace, 16, DistanceMetric::Euclidean).await;
 }
 
 // ─── Test 1: Build hierarchical basic ───
@@ -411,8 +418,7 @@ async fn test_compact_hierarchical() {
     let writer = WalWriter::new(store.clone());
 
     // Create namespace manifest.
-    let mut manifest = Manifest::new();
-    manifest.write(store, &ns).await.unwrap();
+    seed_active_namespace(store, &ns).await;
 
     // Append 2 WAL fragments with unique ID prefixes.
     // Use clustered_vectors for proper diversity (avoids degenerate k-means).
@@ -486,8 +492,7 @@ async fn test_query_hierarchical_detection() {
     let writer = WalWriter::new(store.clone());
 
     // Create namespace manifest.
-    let mut manifest = Manifest::new();
-    manifest.write(store, &ns).await.unwrap();
+    seed_active_namespace(store, &ns).await;
 
     // Append vectors.
     let (vectors, centroids) = clustered_vectors(4, 25, 16, 0.05);
@@ -560,7 +565,7 @@ async fn test_repeat_query_zero_tree_meta_gets() {
     let writer = WalWriter::new(store.clone());
     let wal_reader = WalReader::new(store.clone());
 
-    Manifest::new().write(&store, &ns).await.unwrap();
+    seed_active_namespace(&store, &ns).await;
     let (vectors, centroids) = clustered_vectors(4, 25, 16, 0.1);
     writer.append(&ns, vectors, vec![]).await.unwrap();
 

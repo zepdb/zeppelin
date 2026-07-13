@@ -469,6 +469,13 @@ async fn test_compaction_io_metrics_registered_and_incremented() {
     let ns = harness.key("obs-compaction-io");
     let writer = WalWriter::new(harness.store.clone());
 
+    common::write_active_namespace_metadata(
+        &harness.store,
+        &ns,
+        16,
+        zeppelin::types::DistanceMetric::Euclidean,
+    )
+    .await;
     Manifest::new().write(&harness.store, &ns).await.unwrap();
     let (seed_vecs, _) = clustered_vectors(6, 20, 16, 0.01);
     writer.append(&ns, seed_vecs.clone(), vec![]).await.unwrap();

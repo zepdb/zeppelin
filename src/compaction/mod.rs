@@ -649,13 +649,15 @@ impl Compactor {
     /// # Returns
     ///
     /// An owned, validated [`IndexingConfig`]. If metadata has no index overlay,
-    /// or the metadata object is absent, the process defaults are cloned.
+    /// the process defaults are cloned.
     ///
     /// # Errors
     ///
-    /// Returns [`ZeppelinError::NamespaceDeleting`] when metadata marks the
-    /// namespace as deleting. Storage, decoding, and per-dimension validation
-    /// failures also propagate; no malformed overlay is silently ignored.
+    /// Returns [`ZeppelinError::NamespaceNotFound`] when the authoritative
+    /// metadata object is absent and [`ZeppelinError::NamespaceDeleting`] when
+    /// metadata marks the namespace as deleting. Storage, decoding, and
+    /// per-dimension validation failures also propagate; no malformed overlay
+    /// is silently ignored.
     ///
     /// # Consistency
     ///
@@ -675,10 +677,9 @@ impl Compactor {
     ///
     /// # Rust Notes for Java/C Engineers
     ///
-    /// Exhaustive `match` distinguishes a deliberately handled `NotFound` from
-    /// every other error. The `?` operator returns unexpected failures without
-    /// converting them into defaults, similar to checked-exception propagation
-    /// in Java or an immediate error-code branch in C.
+    /// Exhaustive `match` converts a missing authoritative metadata object into
+    /// the namespace-domain error while preserving every other failure. No
+    /// process default can authorize a build after `meta.json` disappears.
     async fn effective_indexing_config(&self, namespace: &str) -> Result<IndexingConfig> {
         let key = NamespaceMetadata::s3_key(namespace);
         match self.store.get(&key).await {
@@ -703,7 +704,9 @@ impl Compactor {
                 }
                 Ok(self.indexing_config.clone())
             }
-            Err(ZeppelinError::NotFound { .. }) => Ok(self.indexing_config.clone()),
+            Err(ZeppelinError::NotFound { .. }) => Err(ZeppelinError::NamespaceNotFound {
+                namespace: namespace.to_string(),
+            }),
             Err(e) => Err(e),
         }
     }

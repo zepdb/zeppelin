@@ -313,6 +313,13 @@ async fn wall_clock_jump_does_not_expire_compaction_upload_window() {
     let test_clock = Arc::new(adversarial::faults::clock::TestClock::default());
     let source: Arc<dyn TimeSource> = test_clock.clone();
     let clock = Clock::from_source(source);
+    common::write_active_namespace_metadata(
+        &harness.store,
+        &namespace,
+        4,
+        zeppelin::types::DistanceMetric::Euclidean,
+    )
+    .await;
     let mut manifest = zeppelin::wal::Manifest::new_at(clock.now());
     manifest.write(&harness.store, &namespace).await.unwrap();
     let writer = zeppelin::wal::WalWriter::with_clock(harness.store.clone(), clock.clone());

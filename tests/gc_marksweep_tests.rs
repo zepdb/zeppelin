@@ -106,6 +106,13 @@ async fn gc_reclaims_orphaned_segment_objects_only_after_horizon() {
     let harness = TestHarness::new().await;
     let ns = harness.key("gc-19d-orphan-segment");
     let store = harness.store.clone();
+    common::write_active_namespace_metadata(
+        &store,
+        &ns,
+        16,
+        zeppelin::types::DistanceMetric::Euclidean,
+    )
+    .await;
     Manifest::new().write(&store, &ns).await.unwrap();
     WalWriter::new(store.clone())
         .append(&ns, prefixed_vectors("segment_orphan", 24, 16), vec![])
@@ -143,6 +150,13 @@ async fn gc_reclaims_full_segment_orphan_after_compaction_manifest_bump() {
     let harness = TestHarness::new().await;
     let ns = harness.key("gc-19d-compaction-bump");
     let store = harness.store.clone();
+    common::write_active_namespace_metadata(
+        &store,
+        &ns,
+        16,
+        zeppelin::types::DistanceMetric::Euclidean,
+    )
+    .await;
     Manifest::new().write(&store, &ns).await.unwrap();
     WalWriter::new(store.clone())
         .append(&ns, prefixed_vectors("manifest_bump", 24, 16), vec![])

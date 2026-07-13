@@ -131,6 +131,7 @@ async fn test_query_read_consistency_deferred_deletion() {
     let writer = WalWriter::new(store.clone());
 
     // 1. Initialize namespace and append 3 fragments
+    common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;
     Manifest::new().write(store, &ns).await.unwrap();
 
     for i in 0..3 {

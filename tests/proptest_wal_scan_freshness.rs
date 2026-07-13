@@ -237,6 +237,7 @@ async fn write_case(
     namespace: &str,
     case: &WalFreshnessCase,
 ) -> Result<(), String> {
+    common::write_active_namespace_metadata(store, namespace, DIM, DistanceMetric::Euclidean).await;
     Manifest::new()
         .write(store, namespace)
         .await

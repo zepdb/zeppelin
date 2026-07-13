@@ -89,6 +89,19 @@ async fn hydration_fixture_with(
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
     let namespace = harness.key(name);
+    let dimensions = vectors
+        .first()
+        .expect("hydration fixture requires at least one vector")
+        .values
+        .len();
+    common::write_active_namespace_metadata_with_fts(
+        &store,
+        &namespace,
+        dimensions,
+        DistanceMetric::Euclidean,
+        fts_configs.clone(),
+    )
+    .await;
     Manifest::new().write(&store, &namespace).await.unwrap();
 
     let query = vectors[0].values.clone();
