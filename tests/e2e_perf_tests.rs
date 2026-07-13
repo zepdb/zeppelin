@@ -218,14 +218,16 @@ async fn test_e2e_background_compaction_triggers() {
         "background compaction did not trigger within 30s"
     );
 
-    // Query to verify (eventual = segment only)
+    // Query strongly so the authoritative compacted manifest observed above,
+    // rather than a still-valid pre-compaction eventual cache entry, defines
+    // the verification boundary.
     let query_vec: Vec<f32> = (0..16).map(|_| 0.5).collect();
     let resp = client
         .post(format!("{base_url}/v1/namespaces/{ns}/query"))
         .json(&serde_json::json!({
             "vector": query_vec,
             "top_k": 10,
-            "consistency": "eventual",
+            "consistency": "strong",
         }))
         .send()
         .await
