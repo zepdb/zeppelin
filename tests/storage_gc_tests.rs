@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
@@ -21,8 +21,9 @@ use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{compaction_loop, CompactionLoopOptions};
 use zeppelin::compaction::gc::{
-    load_gc_candidates, run_gc_cycle, run_gc_cycle_at, save_gc_candidates,
-    write_compaction_staging, GcCandidate, GcCycleReport, GcNamespaceIncarnation, GcRunner,
+    drain_pending_deletes_at, load_gc_candidates, run_gc_cycle, run_gc_cycle_at,
+    save_gc_candidates, write_compaction_staging, GcCandidate, GcCycleReport,
+    GcNamespaceIncarnation, GcRunner,
 };
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{CompactionConfig, GcConfig, IndexingConfig};
@@ -155,6 +156,13 @@ impl ObjectStore for PutOnNthManifestReadStore {
         self.inner.delete(location).await
     }
 
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
         self.inner.list(prefix)
     }
@@ -219,6 +227,26 @@ impl PutOnNthDeleteStore {
             handle,
         )
     }
+
+    async fn inject_before_delete(&self, location: &Path) -> OsResult<()> {
+        if location.as_ref() != self.delete_key {
+            return Ok(());
+        }
+        let delete = self.deletes_seen.fetch_add(1, Ordering::SeqCst) + 1;
+        if delete != self.trigger_delete {
+            return Ok(());
+        }
+        let put_path =
+            Path::parse(&self.put_key).map_err(|error| object_store::Error::Generic {
+                store: "put_on_nth_delete",
+                source: Box::new(error),
+            })?;
+        self.inner
+            .put(&put_path, PutPayload::from(self.put_body.clone()))
+            .await?;
+        self.puts_injected.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 impl fmt::Display for PutOnNthDeleteStore {
@@ -255,21 +283,26 @@ impl ObjectStore for PutOnNthDeleteStore {
     }
 
     async fn delete(&self, location: &Path) -> OsResult<()> {
-        if location.as_ref() == self.delete_key {
-            let delete = self.deletes_seen.fetch_add(1, Ordering::SeqCst) + 1;
-            if delete == self.trigger_delete {
-                let put_path =
-                    Path::parse(&self.put_key).map_err(|error| object_store::Error::Generic {
-                        store: "put_on_nth_delete",
-                        source: Box::new(error),
-                    })?;
-                self.inner
-                    .put(&put_path, PutPayload::from(self.put_body.clone()))
-                    .await?;
-                self.puts_injected.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        self.inject_before_delete(location).await?;
         self.inner.delete(location).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        let locations = locations
+            .then(move |result| async move {
+                match result {
+                    Ok(location) => {
+                        self.inject_before_delete(&location).await?;
+                        Ok(location)
+                    }
+                    Err(error) => Err(error),
+                }
+            })
+            .boxed();
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
@@ -426,6 +459,13 @@ impl ObjectStore for PublishManifestOnHistoryWriteStore {
         self.inner.delete(location).await
     }
 
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
         self.inner.list(prefix)
     }
@@ -468,6 +508,19 @@ struct FailNthPut {
     remaining_key_matches: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DeleteBatchFault {
+    MatchingNotFound { member: usize },
+    PerKeyErrorAfterApply { member: usize },
+    OverallResponseLostAfterApply,
+}
+
+#[derive(Debug)]
+struct FailNthDeleteBatch {
+    remaining_calls: usize,
+    fault: DeleteBatchFault,
+}
+
 #[derive(Debug)]
 enum LateListOperation {
     Put { key: Path, body: Bytes },
@@ -502,6 +555,8 @@ struct HistoryMetadataControlStore {
     fail_nth_put: Arc<Mutex<Option<FailNthPut>>>,
     late_list_mutation: Arc<Mutex<Option<LateListMutation>>>,
     late_get_mutation: Arc<Mutex<Option<LateGetMutation>>>,
+    fail_nth_delete_batch: Arc<Mutex<Option<FailNthDeleteBatch>>>,
+    delete_batches: Arc<Mutex<Vec<Vec<String>>>>,
     list_calls: Arc<AtomicUsize>,
     delete_calls: Arc<AtomicUsize>,
 }
@@ -516,6 +571,8 @@ struct HistoryMetadataControlHandle {
     fail_nth_put: Arc<Mutex<Option<FailNthPut>>>,
     late_list_mutation: Arc<Mutex<Option<LateListMutation>>>,
     late_get_mutation: Arc<Mutex<Option<LateGetMutation>>>,
+    fail_nth_delete_batch: Arc<Mutex<Option<FailNthDeleteBatch>>>,
+    delete_batches: Arc<Mutex<Vec<Vec<String>>>>,
     list_calls: Arc<AtomicUsize>,
     delete_calls: Arc<AtomicUsize>,
 }
@@ -638,9 +695,34 @@ impl HistoryMetadataControlHandle {
         });
     }
 
+    fn fault_nth_delete_batch(&self, nth: usize, fault: DeleteBatchFault) {
+        assert!(
+            nth > 0,
+            "controlled DELETE batch occurrence must be nonzero"
+        );
+        *self
+            .fail_nth_delete_batch
+            .lock()
+            .expect("DELETE batch fault mutex poisoned") = Some(FailNthDeleteBatch {
+            remaining_calls: nth - 1,
+            fault,
+        });
+    }
+
+    fn delete_batches(&self) -> Vec<Vec<String>> {
+        self.delete_batches
+            .lock()
+            .expect("DELETE batch observation mutex poisoned")
+            .clone()
+    }
+
     fn reset_observed_operations(&self) {
         self.list_calls.store(0, Ordering::SeqCst);
         self.delete_calls.store(0, Ordering::SeqCst);
+        self.delete_batches
+            .lock()
+            .expect("DELETE batch observation mutex poisoned")
+            .clear();
     }
 
     fn list_calls(&self) -> usize {
@@ -666,6 +748,8 @@ impl HistoryMetadataControlStore {
         let fail_nth_put = Arc::new(Mutex::new(None));
         let late_list_mutation = Arc::new(Mutex::new(None));
         let late_get_mutation = Arc::new(Mutex::new(None));
+        let fail_nth_delete_batch = Arc::new(Mutex::new(None));
+        let delete_batches = Arc::new(Mutex::new(Vec::new()));
         let list_calls = Arc::new(AtomicUsize::new(0));
         let delete_calls = Arc::new(AtomicUsize::new(0));
         let handle = HistoryMetadataControlHandle {
@@ -677,6 +761,8 @@ impl HistoryMetadataControlStore {
             fail_nth_put: Arc::clone(&fail_nth_put),
             late_list_mutation: Arc::clone(&late_list_mutation),
             late_get_mutation: Arc::clone(&late_get_mutation),
+            fail_nth_delete_batch: Arc::clone(&fail_nth_delete_batch),
+            delete_batches: Arc::clone(&delete_batches),
             list_calls: Arc::clone(&list_calls),
             delete_calls: Arc::clone(&delete_calls),
         };
@@ -689,6 +775,8 @@ impl HistoryMetadataControlStore {
             fail_nth_put,
             late_list_mutation,
             late_get_mutation,
+            fail_nth_delete_batch,
+            delete_batches,
             list_calls,
             delete_calls,
         };
@@ -827,7 +915,89 @@ impl ObjectStore for HistoryMetadataControlStore {
         locations: BoxStream<'a, OsResult<Path>>,
     ) -> BoxStream<'a, OsResult<Path>> {
         self.delete_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.delete_stream(locations)
+        let batch_index = {
+            let mut batches = self
+                .delete_batches
+                .lock()
+                .expect("DELETE batch observation mutex poisoned");
+            batches.push(Vec::new());
+            batches.len() - 1
+        };
+        let observed_batches = Arc::clone(&self.delete_batches);
+        let locations = locations
+            .inspect(move |result| {
+                if let Ok(location) = result {
+                    observed_batches
+                        .lock()
+                        .expect("DELETE batch observation mutex poisoned")[batch_index]
+                        .push(location.to_string());
+                }
+            })
+            .boxed();
+        let fault = {
+            let mut pending = self
+                .fail_nth_delete_batch
+                .lock()
+                .expect("DELETE batch fault mutex poisoned");
+            match pending.as_ref() {
+                Some(armed) if armed.remaining_calls == 0 => {
+                    pending.take().map(|pending| pending.fault)
+                }
+                Some(armed) => {
+                    let remaining = armed.remaining_calls - 1;
+                    pending
+                        .as_mut()
+                        .expect("DELETE batch fault must remain armed")
+                        .remaining_calls = remaining;
+                    None
+                }
+                None => None,
+            }
+        };
+        let results = self.inner.delete_stream(locations);
+        match fault {
+            None => results,
+            Some(DeleteBatchFault::MatchingNotFound { member }) => results
+                .enumerate()
+                .map(move |(index, result)| {
+                    if index != member {
+                        return result;
+                    }
+                    result.and_then(|path| {
+                        Err(object_store::Error::NotFound {
+                            path: path.to_string(),
+                            source: "injected matching NotFound".into(),
+                        })
+                    })
+                })
+                .boxed(),
+            Some(DeleteBatchFault::PerKeyErrorAfterApply { member }) => results
+                .enumerate()
+                .map(move |(index, result)| {
+                    if index != member {
+                        return result;
+                    }
+                    result.and_then(|_| {
+                        Err(object_store::Error::Generic {
+                            store: "history_metadata_control",
+                            source: Box::new(std::io::Error::other(
+                                "injected per-key DELETE failure after apply",
+                            )),
+                        })
+                    })
+                })
+                .boxed(),
+            Some(DeleteBatchFault::OverallResponseLostAfterApply) => stream::once(async move {
+                let _applied_results = results.collect::<Vec<_>>().await;
+                Err(object_store::Error::Generic {
+                    store: "history_metadata_control",
+                    source: Box::new(std::io::Error::other(
+                        "injected DELETE response loss after apply",
+                    )),
+                })
+            })
+            .boxed(),
+        }
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
@@ -942,6 +1112,44 @@ async fn seed_manifest_history(store: &ZeppelinStore, namespace: &str, generatio
             .await
             .unwrap();
     }
+}
+
+async fn seed_pending_delete_manifest(
+    store: &ZeppelinStore,
+    namespace: &str,
+    count: usize,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    Manifest::new_at(now).write(store, namespace).await.unwrap();
+    let keys = (0..count)
+        .map(|index| {
+            WalFragment::s3_key(
+                namespace,
+                &ulid_at(
+                    now - chrono::Duration::seconds(120),
+                    u128::try_from(index + 1).expect("fixture index must fit ULID entropy"),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return keys;
+    }
+    let (mut manifest, version) = Manifest::read_versioned(store, namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    manifest.pending_deletes = keys.clone();
+    manifest.updated_at = now;
+    manifest
+        .write_conditional(store, namespace, &version)
+        .await
+        .unwrap();
+    store
+        .delete(&Manifest::history_key(namespace, manifest.version()))
+        .await
+        .unwrap();
+    keys
 }
 
 async fn put_history_revision(store: &ZeppelinStore, namespace: &str, version: u64, revision: i64) {
@@ -1138,6 +1346,344 @@ async fn gc_cycle_retains_pending_deletes_inside_horizon() {
     assert_s3_object_exists(&store, &pending_key).await;
     let manifest = Manifest::read(&store, &ns).await.unwrap().unwrap();
     assert_eq!(manifest.pending_deletes, vec![pending_key]);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn pending_delete_drain_chunks_zero_one_thousand_and_one_thousand_one() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let now = Utc::now();
+
+    for count in [0usize, 1, 1_000, 1_001] {
+        let namespace = harness.key(&format!("storage-gc-pending-batch-{count}"));
+        let keys = seed_pending_delete_manifest(&store, &namespace, count, now).await;
+        let (controlled_store, control) =
+            HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+
+        let report =
+            drain_pending_deletes_at(&controlled_store, &namespace, &unsafe_short_gc(0), now)
+                .await
+                .unwrap();
+
+        let expected_batch_lengths = match count {
+            0 => Vec::new(),
+            1 => vec![1],
+            1_000 => vec![1_000],
+            1_001 => vec![1_000, 1],
+            _ => unreachable!("fixture cardinality is closed"),
+        };
+        assert_eq!(
+            control
+                .delete_batches()
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            expected_batch_lengths,
+            "pending-delete cardinality {count} must use deterministic S3-sized batches"
+        );
+        assert_eq!(report.objects_deleted, count);
+        assert_eq!(report.entries_pruned, count);
+        assert_eq!(report.entries_retained, 0);
+        assert_eq!(
+            Manifest::read(&store, &namespace)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_deletes,
+            Vec::<String>::new()
+        );
+        assert_eq!(keys.len(), count);
+    }
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn pending_delete_drain_1001_retains_only_the_uncertain_batch() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let now = Utc::now();
+    let namespace = harness.key("storage-gc-pending-batch-partial-progress");
+    let keys = seed_pending_delete_manifest(&store, &namespace, 1_001, now).await;
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    control.fault_nth_delete_batch(1, DeleteBatchFault::PerKeyErrorAfterApply { member: 999 });
+
+    let partial = drain_pending_deletes_at(&controlled_store, &namespace, &unsafe_short_gc(0), now)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        control
+            .delete_batches()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+        vec![1_000, 1]
+    );
+    assert_eq!(partial.objects_deleted, 1);
+    assert_eq!(partial.entries_pruned, 1);
+    assert_eq!(partial.entries_retained, 1_000);
+    let after_partial = Manifest::read(&store, &namespace).await.unwrap().unwrap();
+    assert_eq!(
+        after_partial.pending_deletes,
+        keys[..1_000],
+        "only the later confirmed batch may advance manifest metadata"
+    );
+    store
+        .delete(&Manifest::history_key(&namespace, after_partial.version()))
+        .await
+        .unwrap();
+
+    control.reset_observed_operations();
+    let retry = drain_pending_deletes_at(
+        &controlled_store,
+        &namespace,
+        &unsafe_short_gc(0),
+        now + chrono::Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        control
+            .delete_batches()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
+        vec![1_000]
+    );
+    assert_eq!(retry.objects_deleted, 1_000);
+    assert_eq!(retry.entries_pruned, 1_000);
+    assert_eq!(retry.entries_retained, 0);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn pending_delete_drain_accepts_matching_not_found_batch_members() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let now = Utc::now();
+    let namespace = harness.key("storage-gc-pending-batch-not-found");
+    let keys = seed_pending_delete_manifest(&store, &namespace, 2, now).await;
+    for key in &keys {
+        store
+            .put(key, Bytes::from_static(b"pending batch not-found fixture"))
+            .await
+            .unwrap();
+    }
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    control.fault_nth_delete_batch(1, DeleteBatchFault::MatchingNotFound { member: 0 });
+
+    let report = drain_pending_deletes_at(&controlled_store, &namespace, &unsafe_short_gc(0), now)
+        .await
+        .unwrap();
+
+    assert_eq!(control.delete_batches(), vec![keys.clone()]);
+    assert_eq!(report.objects_deleted, 2);
+    assert_eq!(report.entries_pruned, 2);
+    assert_eq!(report.entries_retained, 0);
+    assert!(Manifest::read(&store, &namespace)
+        .await
+        .unwrap()
+        .unwrap()
+        .pending_deletes
+        .is_empty());
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn pending_delete_drain_retains_every_member_of_uncertain_batches() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let now = Utc::now();
+
+    for (suffix, fault) in [
+        (
+            "per-key",
+            DeleteBatchFault::PerKeyErrorAfterApply { member: 1 },
+        ),
+        (
+            "response-lost",
+            DeleteBatchFault::OverallResponseLostAfterApply,
+        ),
+    ] {
+        let namespace = harness.key(&format!("storage-gc-pending-batch-{suffix}"));
+        let keys = seed_pending_delete_manifest(&store, &namespace, 3, now).await;
+        for key in &keys {
+            store
+                .put(key, Bytes::from_static(b"pending uncertain batch fixture"))
+                .await
+                .unwrap();
+        }
+        let (controlled_store, control) =
+            HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+        control.fault_nth_delete_batch(1, fault);
+
+        let uncertain =
+            drain_pending_deletes_at(&controlled_store, &namespace, &unsafe_short_gc(0), now)
+                .await
+                .unwrap();
+
+        assert_eq!(control.delete_batches(), vec![keys.clone()]);
+        assert_eq!(uncertain.objects_deleted, 0);
+        assert_eq!(uncertain.entries_pruned, 0);
+        assert_eq!(uncertain.entries_retained, keys.len());
+        assert_eq!(
+            Manifest::read(&store, &namespace)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_deletes,
+            keys,
+            "an uncertain response cannot authorize manifest pruning"
+        );
+
+        control.reset_observed_operations();
+        let retry = drain_pending_deletes_at(
+            &controlled_store,
+            &namespace,
+            &unsafe_short_gc(0),
+            now + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(control.delete_batches().len(), 1);
+        assert_eq!(retry.objects_deleted, 3);
+        assert_eq!(retry.entries_pruned, 3);
+        assert_eq!(retry.entries_retained, 0);
+    }
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn standalone_pending_delete_validates_every_live_overlap_before_batching() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let namespace = harness.key("storage-gc-standalone-pending-live-overlap-barrier");
+    let now = Utc::now();
+    let safe_id = ulid_at(now - chrono::Duration::seconds(120), 1);
+    let live_id = ulid_at(now - chrono::Duration::seconds(120), 2);
+    let safe_key = WalFragment::s3_key(&namespace, &safe_id);
+    let live_key = WalFragment::s3_key(&namespace, &live_id);
+
+    Manifest::new_at(now)
+        .write(&store, &namespace)
+        .await
+        .unwrap();
+    for key in [&safe_key, &live_key] {
+        store
+            .put(key, Bytes::from_static(b"pending live-overlap fixture"))
+            .await
+            .unwrap();
+    }
+    let (mut manifest, version) = Manifest::read_versioned(&store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    manifest.add_fragment(FragmentRef {
+        id: live_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 28,
+    });
+    manifest.pending_deletes = vec![safe_key.clone(), live_key.clone()];
+    manifest.updated_at = now;
+    manifest
+        .write_conditional(&store, &namespace, &version)
+        .await
+        .unwrap();
+    store
+        .delete(&Manifest::history_key(&namespace, manifest.version()))
+        .await
+        .unwrap();
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+
+    let error = drain_pending_deletes_at(&controlled_store, &namespace, &unsafe_short_gc(0), now)
+        .await
+        .expect_err("a live pending-delete overlap must fail before any batch starts");
+
+    assert!(error.to_string().contains(&live_key));
+    assert!(control.delete_batches().is_empty());
+    assert_eq!(control.delete_calls(), 0);
+    assert_s3_object_exists(&store, &safe_key).await;
+    assert_s3_object_exists(&store, &live_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn warm_pending_delete_validates_every_live_overlap_before_batching() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let namespace = harness.key("storage-gc-pending-live-overlap-barrier");
+    let now = Utc::now();
+    let safe_id = ulid_at(now - chrono::Duration::seconds(120), 1);
+    let live_id = ulid_at(now - chrono::Duration::seconds(120), 2);
+    let safe_key = WalFragment::s3_key(&namespace, &safe_id);
+    let live_key = WalFragment::s3_key(&namespace, &live_id);
+
+    Manifest::new_at(now)
+        .write(&store, &namespace)
+        .await
+        .unwrap();
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), now);
+    let mut runner = GcRunner::new(controlled_store, memo_gc());
+    runner.run_cycle_at(incarnation.clone(), now).await.unwrap();
+
+    store
+        .put(
+            &safe_key,
+            Bytes::from_static(b"eligible earlier pending key"),
+        )
+        .await
+        .unwrap();
+    store
+        .put(&live_key, Bytes::from_static(b"still-live pending key"))
+        .await
+        .unwrap();
+    let (mut manifest, version) = Manifest::read_versioned(&store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    manifest.add_fragment(FragmentRef {
+        id: live_id,
+        vector_count: 1,
+        delete_count: 0,
+        sequence_number: 0,
+        size_bytes: 22,
+    });
+    manifest.pending_deletes = vec![safe_key.clone(), live_key.clone()];
+    manifest.updated_at = now + chrono::Duration::seconds(1);
+    manifest
+        .write_conditional(&store, &namespace, &version)
+        .await
+        .unwrap();
+    store
+        .delete(&Manifest::history_key(&namespace, manifest.version()))
+        .await
+        .unwrap();
+
+    control.reset_observed_operations();
+    let report = runner
+        .run_cycle_at(incarnation, now + chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+
+    assert_eq!(report, GcCycleReport::default());
+    assert!(control.delete_batches().is_empty());
+    assert_eq!(control.delete_calls(), 0);
+    assert_s3_object_exists(&store, &safe_key).await;
+    assert_s3_object_exists(&store, &live_key).await;
 
     harness.cleanup().await;
 }
@@ -2391,6 +2937,11 @@ async fn gc_runner_pending_cas_retry_refreshes_history_and_invalidates_idle_on_t
         vec![concurrent_key.clone()],
         "the CAS retry must preserve the new queue published by the concurrent writer"
     );
+    assert_eq!(
+        control.delete_batches(),
+        vec![vec![first_key.clone()]],
+        "a confirmed batch must not be reissued after the manifest CAS conflict"
+    );
     assert_at_most_two_full_namespace_inventory_lists(&namespace, &counter);
 
     store.delete(&history_four).await.unwrap();
@@ -2725,6 +3276,203 @@ async fn gc_runner_warm_missing_history_aborts_before_any_prune_delete() {
 }
 
 #[tokio::test]
+async fn manifest_history_prune_batches_only_after_every_body_validates() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let namespace = harness.key("storage-gc-direct-history-batch");
+    seed_manifest_history(&store, &namespace, 3).await;
+    let old_keys = vec![
+        Manifest::history_key(&namespace, 1),
+        Manifest::history_key(&namespace, 2),
+    ];
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    control.fault_nth_delete_batch(1, DeleteBatchFault::MatchingNotFound { member: 0 });
+
+    let pruned = Manifest::prune_history(&controlled_store, &namespace, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(pruned, 2);
+    assert_eq!(control.delete_batches(), vec![old_keys.clone()]);
+    for key in old_keys {
+        assert_s3_object_not_exists(&store, &key).await;
+    }
+    assert_s3_object_exists(&store, &Manifest::history_key(&namespace, 3)).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn manifest_history_prune_corrupt_late_body_prevents_every_batch() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let namespace = harness.key("storage-gc-direct-history-validation-barrier");
+    seed_manifest_history(&store, &namespace, 3).await;
+    let history_keys = (1..=3)
+        .map(|version| Manifest::history_key(&namespace, version))
+        .collect::<Vec<_>>();
+    store
+        .put(
+            &history_keys[2],
+            Bytes::from_static(b"corrupt newest retained history"),
+        )
+        .await
+        .unwrap();
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+
+    Manifest::prune_history(&controlled_store, &namespace, 1)
+        .await
+        .expect_err("every history body must validate before the first DELETE batch");
+
+    assert!(control.delete_batches().is_empty());
+    assert_eq!(control.delete_calls(), 0);
+    for key in history_keys {
+        assert_s3_object_exists(&store, &key).await;
+    }
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn stateless_gc_history_prune_corrupt_late_body_prevents_every_batch() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let namespace = harness.key("storage-gc-stateless-history-validation-barrier");
+    seed_manifest_history(&store, &namespace, 3).await;
+    let history_keys = (1..=3)
+        .map(|version| Manifest::history_key(&namespace, version))
+        .collect::<Vec<_>>();
+    store
+        .put(
+            &history_keys[2],
+            Bytes::from_static(b"corrupt newest retained history"),
+        )
+        .await
+        .unwrap();
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+
+    let report = run_gc_cycle_at(
+        &controlled_store,
+        &namespace,
+        &GcConfig {
+            manifest_history_keep_count: 1,
+            ..unsafe_short_gc(0)
+        },
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report, GcCycleReport::default());
+    assert!(control.delete_batches().is_empty());
+    assert_eq!(control.delete_calls(), 0);
+    for key in history_keys {
+        assert_s3_object_exists(&store, &key).await;
+    }
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn manifest_history_prune_fails_loud_on_uncertain_delete_batches() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+
+    for (suffix, fault) in [
+        (
+            "per-key",
+            DeleteBatchFault::PerKeyErrorAfterApply { member: 1 },
+        ),
+        (
+            "response-lost",
+            DeleteBatchFault::OverallResponseLostAfterApply,
+        ),
+    ] {
+        let namespace = harness.key(&format!("storage-gc-direct-history-{suffix}"));
+        seed_manifest_history(&store, &namespace, 3).await;
+        let old_keys = vec![
+            Manifest::history_key(&namespace, 1),
+            Manifest::history_key(&namespace, 2),
+        ];
+        let (controlled_store, control) =
+            HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+        control.fault_nth_delete_batch(1, fault);
+
+        Manifest::prune_history(&controlled_store, &namespace, 1)
+            .await
+            .expect_err("an uncertain history batch cannot return a successful prune result");
+        assert_eq!(control.delete_batches(), vec![old_keys.clone()]);
+        for key in &old_keys {
+            assert_s3_object_not_exists(&store, key).await;
+        }
+
+        control.reset_observed_operations();
+        assert_eq!(
+            Manifest::prune_history(&controlled_store, &namespace, 1)
+                .await
+                .unwrap(),
+            0,
+            "retry must reconcile the already-applied ambiguous batch from S3 authority"
+        );
+        assert!(control.delete_batches().is_empty());
+    }
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn stateless_and_warm_gc_history_prune_use_one_bounded_batch() {
+    let harness = TestHarness::new().await;
+    let store = harness.store.clone();
+    let now = Utc::now();
+    let pruning_gc = GcConfig {
+        manifest_history_keep_count: 1,
+        ..unsafe_short_gc(0)
+    };
+
+    let stateless_namespace = harness.key("storage-gc-stateless-history-batch");
+    seed_manifest_history(&store, &stateless_namespace, 3).await;
+    let (stateless_store, stateless_control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&stateless_namespace));
+    run_gc_cycle_at(&stateless_store, &stateless_namespace, &pruning_gc, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        stateless_control.delete_batches(),
+        vec![vec![
+            Manifest::history_key(&stateless_namespace, 1),
+            Manifest::history_key(&stateless_namespace, 2),
+        ]]
+    );
+
+    let warm_namespace = harness.key("storage-gc-warm-history-batch");
+    seed_manifest_history(&store, &warm_namespace, 3).await;
+    let (warm_store, warm_control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&warm_namespace));
+    let incarnation = GcNamespaceIncarnation::new(warm_namespace.clone(), now);
+    let mut runner = GcRunner::new(warm_store, memo_gc());
+    runner.run_cycle_at(incarnation.clone(), now).await.unwrap();
+    warm_control.reset_observed_operations();
+    runner.update_config(pruning_gc);
+    runner
+        .run_cycle_at(incarnation, now + chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        warm_control.delete_batches(),
+        vec![vec![
+            Manifest::history_key(&warm_namespace, 1),
+            Manifest::history_key(&warm_namespace, 2),
+        ]]
+    );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn gc_runner_idle_gate_skips_unchanged_and_wakes_on_inventory_change() {
     let harness = TestHarness::new().await;
     let namespace = harness.key("storage-gc-runner-idle-inventory");
@@ -2931,6 +3679,83 @@ async fn gc_runner_mature_candidate_delete_uses_two_full_namespace_inventories()
             .is_empty(),
         "the cleanup PUT must durably remove the deleted candidate"
     );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn gc_sweep_retains_every_candidate_when_batch_response_is_lost() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("storage-gc-runner-sweep-batch-response-lost");
+    let store = harness.store.clone();
+    let now = Utc::now();
+    let orphan_keys = (0..3)
+        .map(|index| {
+            WalFragment::s3_key(
+                &namespace,
+                &ulid_at(now - chrono::Duration::seconds(60), 400 + index),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Manifest::new_at(now)
+        .write(&store, &namespace)
+        .await
+        .unwrap();
+    for key in &orphan_keys {
+        store
+            .put(key, Bytes::from_static(b"uncertain sweep candidate"))
+            .await
+            .unwrap();
+    }
+    let (controlled_store, control) =
+        HistoryMetadataControlStore::wrap(&store, Manifest::history_prefix(&namespace));
+    let mut runner = GcRunner::new(
+        controlled_store,
+        GcConfig {
+            manifest_history_keep_count: 64,
+            ..unsafe_short_gc(10)
+        },
+    );
+    let incarnation = GcNamespaceIncarnation::new(namespace.clone(), now);
+    let marked = runner.run_cycle_at(incarnation.clone(), now).await.unwrap();
+    assert_eq!(marked.candidates_marked, orphan_keys.len());
+
+    control.reset_observed_operations();
+    control.fault_nth_delete_batch(1, DeleteBatchFault::OverallResponseLostAfterApply);
+    let uncertain = runner
+        .run_cycle_at(incarnation.clone(), now + chrono::Duration::seconds(11))
+        .await
+        .unwrap();
+
+    assert_eq!(control.delete_batches(), vec![orphan_keys.clone()]);
+    assert_eq!(uncertain.objects_deleted, 0);
+    assert!(
+        uncertain.candidates_skipped >= orphan_keys.len(),
+        "every uncertain member must contribute a delete-failed skip"
+    );
+    assert_eq!(
+        load_gc_candidates(&store, &namespace)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.key)
+            .collect::<Vec<_>>(),
+        orphan_keys,
+        "an uncertain batch must remain durably retryable as a whole"
+    );
+
+    control.reset_observed_operations();
+    let reconciled = runner
+        .run_cycle_at(incarnation, now + chrono::Duration::seconds(12))
+        .await
+        .unwrap();
+    assert_eq!(reconciled.objects_deleted, 0);
+    assert!(control.delete_batches().is_empty());
+    assert!(load_gc_candidates(&store, &namespace)
+        .await
+        .unwrap()
+        .is_empty());
 
     harness.cleanup().await;
 }

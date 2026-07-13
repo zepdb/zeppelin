@@ -134,6 +134,7 @@ use std::ops::Range;
 use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
+use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{ListedObject, StorageVersion, ZeppelinStore};
 
 /// Prefix byte identifying Zeppelin's current MessagePack manifest encoding.
@@ -1677,8 +1678,8 @@ impl Manifest {
     /// # Errors
     ///
     /// Propagates validation, list, read, decode, snapshot-list, and delete
-    /// failures from [`Manifest::prune_history_with_retention`]. Earlier deletes
-    /// may already have succeeded if a later delete fails.
+    /// failures from [`Manifest::prune_history_with_retention`]. Earlier batches
+    /// may already have succeeded if a later batch fails.
     ///
     /// # Examples
     ///
@@ -1729,8 +1730,10 @@ impl Manifest {
     ///
     /// Returns a configuration error for a zero count. Propagates listing,
     /// decoding, malformed-key, missing-between-list-and-read, and deletion
-    /// failures. Deletion is sequential and not transactional: earlier old
-    /// generations may already be gone when a later operation fails.
+    /// failures. All retention bodies validate before deletion starts. Deletion
+    /// is not transactional across 1,000-key batches: earlier batches may
+    /// already be gone when a later batch fails, and a failed batch is
+    /// conservatively treated as uncertain.
     ///
     /// # Side Effects
     ///
@@ -1749,7 +1752,8 @@ impl Manifest {
     /// # Performance
     ///
     /// Performs one history LIST, one snapshot LIST plus a GET per pin, one GET
-    /// per history entry, and one DELETE per pruned generation.
+    /// per history entry, and at most one DELETE request per 1,000 pruned
+    /// generations.
     ///
     /// # Examples
     ///
@@ -1780,7 +1784,7 @@ impl Manifest {
         let keep_from = history.len().saturating_sub(retention.keep_count);
         let pinned_generations = NamedSnapshot::pinned_generations(store, namespace).await?;
         let mut retained_manifests = Vec::new();
-        let mut pruned = 0usize;
+        let mut prunable = Vec::new();
         for (index, entry) in history.iter().enumerate() {
             let manifest = Self::read_history(store, namespace, entry.version)
                 .await?
@@ -1798,12 +1802,14 @@ impl Manifest {
             if keep_by_count || keep_by_time || keep_by_pin {
                 retained_manifests.push(manifest);
             } else {
-                store.delete(&entry.key).await?;
-                pruned += 1;
+                prunable.push(entry.key.clone());
             }
         }
+        for batch in prunable.chunks(DELETE_MANY_MAX_KEYS) {
+            store.delete_many(batch.to_vec()).await?;
+        }
         Ok(ManifestHistoryPruneResult {
-            pruned,
+            pruned: prunable.len(),
             retained_manifests,
         })
     }

@@ -1097,7 +1097,7 @@ async fn execute_idle_pitr_expiry(case: &IdealCase) -> IdealSample {
         .expect("ideal idle PITR-expiry cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 1, 0, 17, 3);
+    assert_full_gc_census(&sample, 0, 6, 1, 0, 1, 3);
     let histories = Manifest::list_history(&world.harness.store, &namespace)
         .await
         .expect("ideal idle PITR-expiry history oracle failed");
@@ -1317,7 +1317,7 @@ async fn execute_idle_shorter_retention_config(case: &IdealCase) -> IdealSample 
         .expect("ideal idle shorter-retention cycle failed");
     assert_eq!(report.objects_deleted, 0);
     let sample = world.snapshot(case).await;
-    assert_full_gc_census(&sample, 0, 6, 1, 0, 17, 3);
+    assert_full_gc_census(&sample, 0, 6, 1, 0, 1, 3);
     let histories = Manifest::list_history(&world.harness.store, &namespace)
         .await
         .expect("ideal idle shorter-retention history oracle failed");
@@ -2058,6 +2058,8 @@ fn assert_full_gc_census(
         get_depth,
     );
     assert_eq!(physical_verb_ops(sample, "delete"), deletes);
+    assert_eq!(physical_mode_ops(sample, "delete"), 0);
+    assert_eq!(physical_mode_ops(sample, "delete_batch"), deletes);
 }
 
 fn physical_verb_ops(sample: &IdealSample, verb: &str) -> u64 {
@@ -2125,7 +2127,11 @@ async fn execute_pending_delete(case: &IdealCase, shape: PendingShape) -> IdealS
             assert_eq!(report.entries_pruned, 1);
         }
     }
-    world.finish(case).await
+    let sample = world.finish(case).await;
+    let expected_batches = u64::from(matches!(shape, PendingShape::Eligible));
+    assert_eq!(physical_mode_ops(&sample, "delete"), 0);
+    assert_eq!(physical_mode_ops(&sample, "delete_batch"), expected_batches);
+    sample
 }
 
 async fn execute_orphan_mark(case: &IdealCase) -> IdealSample {
@@ -2146,7 +2152,10 @@ async fn execute_orphan_mark(case: &IdealCase) -> IdealSample {
         .expect("ideal orphan mark cycle failed");
     assert_eq!(report.candidates_marked, 1);
     assert_eq!(report.objects_deleted, 0);
-    world.finish(case).await
+    let sample = world.finish(case).await;
+    assert_eq!(physical_mode_ops(&sample, "delete"), 0);
+    assert_eq!(physical_mode_ops(&sample, "delete_batch"), 0);
+    sample
 }
 
 async fn execute_orphan_sweep(case: &IdealCase) -> IdealSample {
@@ -2182,7 +2191,10 @@ async fn execute_orphan_sweep(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal orphan sweep cycle failed");
     assert_eq!(report.objects_deleted, 1);
-    world.finish(case).await
+    let sample = world.finish(case).await;
+    assert_eq!(physical_mode_ops(&sample, "delete"), 0);
+    assert_eq!(physical_mode_ops(&sample, "delete_batch"), 1);
+    sample
 }
 
 async fn execute_history_prune(case: &IdealCase) -> IdealSample {
@@ -2201,7 +2213,10 @@ async fn execute_history_prune(case: &IdealCase) -> IdealSample {
         .await
         .expect("ideal manifest-history prune failed");
     assert_eq!(pruned, 2);
-    world.finish(case).await
+    let sample = world.finish(case).await;
+    assert_eq!(physical_mode_ops(&sample, "delete"), 0);
+    assert_eq!(physical_mode_ops(&sample, "delete_batch"), 1);
+    sample
 }
 
 async fn execute_staging_write(case: &IdealCase) -> IdealSample {

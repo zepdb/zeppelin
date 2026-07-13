@@ -100,6 +100,9 @@ use tracing::{debug, instrument};
 use crate::config::StorageConfig;
 use crate::error::{Result, ZeppelinError};
 
+/// Maximum number of exact keys accepted by one S3 DeleteObjects request.
+pub(crate) const DELETE_MANY_MAX_KEYS: usize = 1_000;
+
 /// Shared object-storage gateway used by every Zeppelin domain layer.
 ///
 /// Cloning this value clones the [`Arc`] handle, not the backend or its data.
@@ -1298,11 +1301,9 @@ impl ZeppelinStore {
     /// storage error rather than silent partial completion.
     #[instrument(skip(self, keys), fields(count = keys.len()))]
     pub async fn delete_many(&self, keys: Vec<String>) -> Result<usize> {
-        const MAX_DELETE_BATCH: usize = 1_000;
-
-        if keys.len() > MAX_DELETE_BATCH {
+        if keys.len() > DELETE_MANY_MAX_KEYS {
             return Err(ZeppelinError::Validation(format!(
-                "delete_many accepts at most {MAX_DELETE_BATCH} keys, got {}",
+                "delete_many accepts at most {DELETE_MANY_MAX_KEYS} keys, got {}",
                 keys.len()
             )));
         }

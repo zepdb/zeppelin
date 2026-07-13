@@ -43,7 +43,7 @@
 //!    [`drain_pending_deletes`][crate::compaction::gc::drain_pending_deletes]
 //!    for manifest-owned deferred deletion.
 //! 5. Finish with [`run_gc_cycle`][crate::compaction::gc::run_gc_cycle] for
-//!    history pruning, mark persistence, fresh revalidation, and the sequential
+//!    history pruning, mark persistence, fresh revalidation, and the batched
 //!    sweep.
 //!
 //! ## Authority and deletion flow
@@ -66,10 +66,11 @@
 //!
 //! History pruning precedes artifact deletion. A generation protected by the
 //! count window, PITR window, or a named snapshot therefore continues to pin
-//! every object it references. Deletes are sequential and not transactional:
-//! a later failure can follow earlier successful deletes. Candidate and
-//! `pending_deletes` state retain retryable work, and `NotFound` is treated as
-//! an idempotent completion where the relevant path explicitly says so.
+//! every object it references. Deletes use deterministic batches of at most
+//! 1,000 keys and are not transactional across batches: a later failure can
+//! follow earlier successful batches. Candidate and `pending_deletes` state
+//! retain every member of an uncertain batch, and absence is an idempotent
+//! completion.
 //!
 //! ## Invariants
 //!
@@ -120,6 +121,7 @@ use crate::index::ivf_flat::build::{attrs_key, centroids_key, cluster_key};
 use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
 use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
 use crate::index::quantization::QuantizationType;
+use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{ListedObject, StorageVersion, ZeppelinStore};
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
@@ -993,10 +995,11 @@ pub struct GcCycleReport {
     pub candidates_marked: usize,
     /// Number of candidate and pending-delete removals accepted as complete.
     ///
-    /// Candidate `NotFound` outcomes count here as idempotent completion;
-    /// pending-delete `NotFound` outcomes are pruned but not counted deleted.
+    /// S3 reports both deletion and prior absence as successful DeleteObjects
+    /// members, so this is an accepted-completion count rather than proof that
+    /// every key had bytes immediately before the request.
     pub objects_deleted: usize,
-    /// Number of pending-delete objects physically deleted by this cycle.
+    /// Number of pending-delete members accepted as deleted or already absent.
     pub pending_deletes_deleted: usize,
     /// Number of manifest pending-delete entries pruned after confirmed delete/absence.
     pub pending_deletes_pruned: usize,
@@ -1017,12 +1020,12 @@ pub struct GcCycleReport {
 ///
 /// # Examples
 ///
-/// If one object is deleted, one was already absent, and one DELETE failed, the
-/// report contains one deleted object, two pruned entries, and one retained
+/// If one two-key batch is accepted and a later one-key batch is uncertain, the
+/// report contains two completed objects, two pruned entries, and one retained
 /// entry.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingDeleteDrainReport {
-    /// Number of pending-delete objects physically deleted from storage.
+    /// Number of pending-delete members accepted as deleted or already absent.
     pub objects_deleted: usize,
     /// Entries removed after successful DELETE or confirmed prior absence.
     pub entries_pruned: usize,
@@ -1330,7 +1333,7 @@ async fn save_gc_candidates_with_version(
 ///
 /// # Returns
 ///
-/// Counts of successful physical deletes, entries pruned after delete or prior
+/// Counts of accepted delete completions, entries pruned after delete or prior
 /// absence, and entries retained in the successful pass. A missing manifest or
 /// empty queue returns a zero/default report (plus any deletes accumulated
 /// across an earlier CAS retry).
@@ -1345,9 +1348,10 @@ async fn save_gc_candidates_with_version(
 ///
 /// # Side Effects
 ///
-/// Lists and GETs retained manifest history, issues at most one sequential
-/// DELETE per eligible queue entry per attempt, updates deletion metrics, and
-/// conditionally publishes a manifest with confirmed entries removed.
+/// Lists and GETs retained manifest history, classifies the complete queue, then
+/// issues deterministic DeleteObjects batches of at most 1,000 unique eligible
+/// keys. It updates deletion metrics and conditionally publishes a manifest
+/// with only confirmed batches removed.
 ///
 /// # Consistency
 ///
@@ -1360,11 +1364,11 @@ async fn save_gc_candidates_with_version(
 /// # Performance
 ///
 /// Initial history discovery costs one LIST plus one GET per retained
-/// generation. Each CAS attempt costs one manifest GET and up to one DELETE per
-/// pending key. After a CAS conflict, an attempt that could delete refreshes
-/// history again before its first DELETE. A successful pruning attempt also
-/// writes one manifest-history object and conditionally updates the live
-/// manifest inside [`Manifest::write_conditional`].
+/// generation. Each CAS attempt costs one manifest GET and at most one DELETE
+/// request per 1,000 eligible keys. After a CAS conflict, an attempt that could
+/// delete refreshes history again before its first batch. A successful pruning
+/// attempt also writes one manifest-history object and conditionally updates
+/// the live manifest inside [`Manifest::write_conditional`].
 ///
 /// # Examples
 ///
@@ -1507,6 +1511,10 @@ async fn drain_pending_deletes_with_retained_history_from(
         let pending = manifest.pending_deletes.clone();
         let mut confirmed_absent = BTreeSet::new();
         let mut retained = BTreeSet::new();
+        let mut eligible = BTreeSet::new();
+        let mut live = manifest.clone();
+        live.pending_deletes.clear();
+        let live_reachable = reachable_keys(namespace, &live);
 
         for key in &pending {
             if retained_history.contains(key) {
@@ -1518,32 +1526,38 @@ async fn drain_pending_deletes_with_retained_history_from(
                 retained.insert(key.clone());
                 continue;
             }
+            if live_reachable.contains(key) {
+                return Err(ZeppelinError::Serialization(format!(
+                    "pending-delete key {key} is also reachable from the live manifest"
+                )));
+            }
+            eligible.insert(key.clone());
+        }
 
-            match store.delete(key).await {
-                Ok(()) => {
-                    deleted_keys.insert(key.clone());
-                    confirmed_absent.insert(key.clone());
-                    crate::metrics::GC_OBJECTS_DELETED_TOTAL
-                        .with_label_values(&[namespace])
-                        .inc();
-                    info!(
-                        namespace,
-                        key = %key,
-                        "gc deleted pending-delete object"
-                    );
+        let eligible = eligible.into_iter().collect::<Vec<_>>();
+        for batch in eligible.chunks(DELETE_MANY_MAX_KEYS) {
+            let batch = batch.to_vec();
+            match store.delete_many(batch.clone()).await {
+                Ok(deleted) => {
+                    debug_assert_eq!(deleted, batch.len());
+                    for key in batch {
+                        confirmed_absent.insert(key.clone());
+                        if deleted_keys.insert(key.clone()) {
+                            crate::metrics::GC_OBJECTS_DELETED_TOTAL
+                                .with_label_values(&[namespace])
+                                .inc();
+                            info!(namespace, key = %key, "gc accepted pending-delete completion");
+                        }
+                    }
                 }
-                Err(crate::error::ZeppelinError::NotFound { .. }) => {
-                    confirmed_absent.insert(key.clone());
-                    debug_pending_delete_absent(namespace, key);
-                }
-                Err(e) => {
+                Err(error) => {
                     complete = false;
-                    retained.insert(key.clone());
+                    retained.extend(batch.iter().cloned());
                     warn!(
                         namespace,
-                        key = %key,
-                        error = %e,
-                        "gc pending-delete failed; retaining manifest entry"
+                        batch_size = batch.len(),
+                        error = %error,
+                        "gc pending-delete batch uncertain; retaining every manifest entry"
                     );
                 }
             }
@@ -1643,6 +1657,7 @@ async fn drain_pending_deletes_with_inventory_authority_from(
             let mut live = manifest.clone();
             live.pending_deletes.clear();
             let live_reachable = reachable_keys(namespace, &live);
+            let mut eligible = BTreeSet::new();
             for key in &manifest.pending_deletes {
                 if retained_history.contains(key)
                     || !pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs)
@@ -1654,26 +1669,31 @@ async fn drain_pending_deletes_with_inventory_authority_from(
                         "pending-delete key {key} is also reachable from the live manifest"
                     )));
                 }
-                match store.delete(key).await {
-                    Ok(()) => {
-                        deleted_keys.insert(key.clone());
-                        confirmed_absent.insert(key.clone());
-                        crate::metrics::GC_OBJECTS_DELETED_TOTAL
-                            .with_label_values(&[namespace])
-                            .inc();
-                        info!(namespace, key = %key, "gc deleted pending-delete object");
+                eligible.insert(key.clone());
+            }
+            let eligible = eligible.into_iter().collect::<Vec<_>>();
+            for batch in eligible.chunks(DELETE_MANY_MAX_KEYS) {
+                let batch = batch.to_vec();
+                match store.delete_many(batch.clone()).await {
+                    Ok(deleted) => {
+                        debug_assert_eq!(deleted, batch.len());
+                        for key in batch {
+                            confirmed_absent.insert(key.clone());
+                            if deleted_keys.insert(key.clone()) {
+                                crate::metrics::GC_OBJECTS_DELETED_TOTAL
+                                    .with_label_values(&[namespace])
+                                    .inc();
+                                info!(namespace, key = %key, "gc accepted pending-delete completion");
+                            }
+                        }
                     }
-                    Err(ZeppelinError::NotFound { .. }) => {
-                        confirmed_absent.insert(key.clone());
-                        debug_pending_delete_absent(namespace, key);
-                    }
-                    Err(e) => {
+                    Err(error) => {
                         complete = false;
                         warn!(
                             namespace,
-                            key = %key,
-                            error = %e,
-                            "gc pending-delete failed; retaining manifest entry"
+                            batch_size = batch.len(),
+                            error = %error,
+                            "gc pending-delete batch uncertain; retaining every manifest entry"
                         );
                     }
                 }
@@ -1890,29 +1910,6 @@ fn pending_delete_horizon_satisfied(
     ulid_age_secs >= horizon_secs
 }
 
-/// Records that an already-absent deferred object can be pruned idempotently.
-///
-/// # Parameters
-///
-/// - `namespace`: Namespace label attached to the structured debug event.
-/// - `key`: Exact pending-delete key confirmed absent by the store.
-///
-/// # Side Effects
-///
-/// Emits one structured debug log and performs no storage operation.
-///
-/// # Examples
-///
-/// A retry after an earlier successful DELETE logs absence before the manifest
-/// entry is removed by CAS.
-fn debug_pending_delete_absent(namespace: &str, key: &str) {
-    tracing::debug!(
-        namespace,
-        key,
-        "gc pending-delete object already absent; pruning manifest entry"
-    );
-}
-
 /// Decodes empty, versioned, or legacy candidate-ledger JSON.
 ///
 /// # Parameters
@@ -2078,7 +2075,7 @@ pub fn mark_gc_candidates(
 /// re-read sweep roots (manifest, history, active staging)
 ///          |
 ///          +-- safety predicate fails --> keep candidate
-///          `-- all predicates pass ----> DELETE sequentially
+///          `-- all predicates pass ----> DELETE in <=1,000-key batches
 /// ```
 ///
 /// This maintenance operation is best-effort. Most storage and decoding
@@ -2143,8 +2140,8 @@ pub fn mark_gc_candidates(
 /// order. The one-shot path keeps its original request sequence and two ledger
 /// PUTs. A warm cycle performs zero PUTs when the canonical ledger is unchanged,
 /// one when only mark or cleanup changes it, and two when a newly durable mark
-/// is also cleaned in the same cycle. Artifact DELETEs remain sequential; those
-/// writes are not part of the read fan-out.
+/// is also cleaned in the same cycle. Artifact DELETEs use deterministic
+/// all-or-uncertain batches; those writes are not part of the read fan-out.
 ///
 /// # Examples
 ///
@@ -2479,7 +2476,7 @@ async fn prune_history_with_memo_at(
         .saturating_add(retention.skew_slop_secs);
     let mut retained_manifests = Vec::new();
     let mut retained_history_observations = Vec::new();
-    let mut pruned = 0usize;
+    let mut prunable = Vec::new();
 
     for (index, observation) in observations.into_iter().enumerate() {
         let (manifest, _) = load_history_observation(store, namespace, &observation, prior).await?;
@@ -2492,14 +2489,17 @@ async fn prune_history_with_memo_at(
             retained_history_observations.push(observation.clone());
             retained_manifests.push(manifest.clone());
         } else {
-            store.delete(&observation.history.key).await?;
-            pruned += 1;
+            prunable.push(observation.history.key);
         }
+    }
+
+    for batch in prunable.chunks(DELETE_MANY_MAX_KEYS) {
+        store.delete_many(batch.to_vec()).await?;
     }
 
     Ok(MemoizedHistoryPruneResult {
         result: ManifestHistoryPruneResult {
-            pruned,
+            pruned: prunable.len(),
             retained_manifests,
         },
         retained_history_observations,
@@ -2609,10 +2609,12 @@ async fn prune_history_with_memo_parallel_from_observations(
         }
     }
 
-    for key in &prunable {
-        store.delete(key).await?;
+    for batch in prunable.chunks(DELETE_MANY_MAX_KEYS) {
+        store.delete_many(batch.to_vec()).await?;
         if let Some(inventory) = inventory.as_deref_mut() {
-            inventory.remove(key);
+            for key in batch {
+                inventory.remove(key);
+            }
         }
     }
 
@@ -3627,13 +3629,14 @@ async fn run_gc_cycle_at_inner(
         .as_ref()
         .map_or_else(|| listed_keys.clone(), NamespaceInventory::all_keys);
 
-    let mut retained = Vec::new();
+    let mut retained_with_order = Vec::new();
+    let mut deletable = Vec::new();
     let mut objects_deleted = pending_report.objects_deleted;
     let mut bytes_reclaimed = 0u64;
     let mut candidates_skipped = unknown_shape_skips;
     let mut cycle_complete = pending_complete;
 
-    for candidate in marked_candidates {
+    for (order, candidate) in marked_candidates.into_iter().enumerate() {
         if !listed_keys.contains(&candidate.key) {
             log_gc_skip(namespace, &candidate.key, SkipReason::NotListedThisCycle);
             candidates_skipped += 1;
@@ -3658,11 +3661,14 @@ async fn run_gc_cycle_at_inner(
             cycle_complete = false;
             log_gc_skip(namespace, &candidate.key, SkipReason::ObjectIdentityChanged);
             candidates_skipped += 1;
-            retained.push(GcCandidate {
-                key: candidate.key,
-                first_seen_unreachable_at: now,
-                unreachable_since_manifest_version: sweep_manifest.version(),
-            });
+            retained_with_order.push((
+                order,
+                GcCandidate {
+                    key: candidate.key,
+                    first_seen_unreachable_at: now,
+                    unreachable_since_manifest_version: sweep_manifest.version(),
+                },
+            ));
             continue;
         }
         match should_delete_candidate(
@@ -3691,10 +3697,26 @@ async fn run_gc_cycle_at_inner(
                     SkipReason::ObjectModifiedTooRecently,
                 );
                 candidates_skipped += 1;
-                retained.push(candidate);
+                retained_with_order.push((order, candidate));
             }
-            DeleteDecision::Delete => match store.delete(&candidate.key).await {
-                Ok(()) | Err(crate::error::ZeppelinError::NotFound { .. }) => {
+            DeleteDecision::Delete => deletable.push((order, candidate)),
+            DeleteDecision::Skip(reason) => {
+                log_gc_skip(namespace, &candidate.key, reason);
+                candidates_skipped += 1;
+                retained_with_order.push((order, candidate));
+            }
+        }
+    }
+
+    for batch in deletable.chunks(DELETE_MANY_MAX_KEYS) {
+        let keys = batch
+            .iter()
+            .map(|(_, candidate)| candidate.key.clone())
+            .collect::<Vec<_>>();
+        match store.delete_many(keys).await {
+            Ok(deleted) => {
+                debug_assert_eq!(deleted, batch.len());
+                for (_, candidate) in batch {
                     if let Some(inventory) = completed_inventory.as_mut() {
                         inventory.remove(&candidate.key);
                     }
@@ -3711,29 +3733,31 @@ async fn run_gc_cycle_at_inner(
                         namespace,
                         key = %candidate.key,
                         reclaimed_bytes = reclaimed,
-                        "gc deleted unreachable object"
+                        "gc accepted unreachable-object delete completion"
                     );
                 }
-                Err(e) => {
-                    cycle_complete = false;
+            }
+            Err(error) => {
+                cycle_complete = false;
+                warn!(
+                    namespace,
+                    batch_size = batch.len(),
+                    error = %error,
+                    "gc sweep batch uncertain; retaining every candidate"
+                );
+                for (order, candidate) in batch {
                     log_gc_skip(namespace, &candidate.key, SkipReason::DeleteFailed);
-                    warn!(
-                        namespace,
-                        key = %candidate.key,
-                        error = %e,
-                        "gc delete failed; retaining candidate"
-                    );
                     candidates_skipped += 1;
-                    retained.push(candidate);
+                    retained_with_order.push((*order, candidate.clone()));
                 }
-            },
-            DeleteDecision::Skip(reason) => {
-                log_gc_skip(namespace, &candidate.key, reason);
-                candidates_skipped += 1;
-                retained.push(candidate);
             }
         }
     }
+    retained_with_order.sort_by_key(|(order, _)| *order);
+    let retained = retained_with_order
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect::<Vec<_>>();
 
     let cleanup_put_required = !read_mode.is_bounded() || retained != durable_mark;
     if cleanup_put_required {
