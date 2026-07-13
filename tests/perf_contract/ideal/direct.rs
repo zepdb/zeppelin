@@ -10,7 +10,7 @@ use zeppelin::error::ZeppelinError;
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::{LeaseManager, Manifest};
 
-use crate::common::counting::{counting_store, ClassStats, GetCounter};
+use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
 use crate::perf_contract::depth::{
     depth_store, DepthTracker, PhysicalRequest, SpanKind, SpanOutcome,
@@ -58,7 +58,7 @@ impl DirectWorld {
     async fn new() -> Self {
         let harness = TestHarness::new().await;
         let (depth_wrapped, tracker) = depth_store(&harness.store);
-        let (store, counter) = counting_store(&depth_wrapped);
+        let (store, counter) = perf_counting_store(&depth_wrapped);
         Self {
             harness,
             store,

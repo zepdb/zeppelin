@@ -52,7 +52,7 @@ struct InjectionStore {
 /// operation is measured like a production operation.
 #[must_use]
 pub fn inject_store(store: &ZeppelinStore, injection: Injection) -> ZeppelinStore {
-    ZeppelinStore::new(Arc::new(InjectionStore {
+    ZeppelinStore::new_with_native_batch_delete(Arc::new(InjectionStore {
         inner: store.inner(),
         injection,
         cluster_get: tokio::sync::Mutex::new(()),
@@ -137,6 +137,13 @@ impl ObjectStore for InjectionStore {
 
     async fn delete(&self, location: &Path) -> OsResult<()> {
         self.inner.delete(location).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        self.inner.delete_stream(locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {

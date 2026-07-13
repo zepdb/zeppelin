@@ -234,7 +234,7 @@ pub async fn run_ideal_analysis_entry() -> IdealRunSummary {
 }
 
 fn missing_required_physical_modes(samples: &[IdealSample]) -> Vec<(&'static str, &'static str)> {
-    const REQUIRED: [(&str, &str); 10] = [
+    const REQUIRED: [(&str, &str); 11] = [
         ("get", "get_full"),
         ("get", "get_range"),
         ("get", "get_conditional"),
@@ -245,6 +245,7 @@ fn missing_required_physical_modes(samples: &[IdealSample]) -> Vec<(&'static str
         ("list", "list_delimiter"),
         ("copy", "copy_if_absent"),
         ("delete", "delete"),
+        ("delete", "delete_batch"),
     ];
     let observed = samples
         .iter()
@@ -732,6 +733,7 @@ mod tests {
                 ("list", "list_delimiter"),
                 ("copy", "copy_if_absent"),
                 ("delete", "delete"),
+                ("delete", "delete_batch"),
             ]
             .into_iter()
             .map(|(verb, mode)| PhysicalModeTotal {

@@ -2,6 +2,7 @@ mod common;
 
 use bytes::Bytes;
 use common::harness::TestHarness;
+use futures::StreamExt;
 use std::time::Duration;
 use zeppelin::config::{StorageBackend, StorageConfig};
 use zeppelin::storage::ZeppelinStore;
@@ -193,6 +194,107 @@ async fn test_s3_delete_prefix() {
         .await
         .expect("list should work");
     assert!(keys_after.is_empty(), "prefix should be empty after delete");
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_delete_many_handles_one_full_s3_batch() {
+    let harness = TestHarness::new().await;
+    let prefix = harness.key("delete-many/");
+    let keys = (0..1_000)
+        .map(|index| format!("{prefix}object_{index:04}.bin"))
+        .collect::<Vec<_>>();
+
+    let puts = futures::stream::iter(keys.iter().cloned())
+        .map(|key| {
+            let store = harness.store.clone();
+            async move { store.put(&key, Bytes::from_static(b"delete-many")).await }
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+    for result in puts {
+        result.expect("delete-many fixture PUT failed");
+    }
+
+    assert_eq!(harness.store.delete_many(keys).await.unwrap(), 1_000);
+    assert!(harness.store.list_prefix(&prefix).await.unwrap().is_empty());
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_delete_many_parses_every_key_before_deleting() {
+    let harness = TestHarness::new().await;
+    let protected = harness.key("delete-many-validate/protected.bin");
+    harness
+        .store
+        .put(&protected, Bytes::from_static(b"must remain"))
+        .await
+        .unwrap();
+    let malformed = format!("{}//malformed.bin", harness.prefix);
+
+    assert!(harness
+        .store
+        .delete_many(vec![protected.clone(), malformed])
+        .await
+        .is_err());
+    assert!(harness.store.exists(&protected).await.unwrap());
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_delete_many_rejects_more_than_one_s3_batch_before_deleting() {
+    let harness = TestHarness::new().await;
+    let protected = harness.key("delete-many-limit/protected.bin");
+    harness
+        .store
+        .put(&protected, Bytes::from_static(b"must remain"))
+        .await
+        .unwrap();
+    let mut keys = vec![protected.clone()];
+    keys.extend((0..1_000).map(|index| harness.key(&format!("absent/{index}.bin"))));
+
+    assert!(harness.store.delete_many(keys).await.is_err());
+    assert!(harness.store.exists(&protected).await.unwrap());
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_delete_many_rejects_duplicate_keys_before_deleting() {
+    let harness = TestHarness::new().await;
+    let protected = harness.key("delete-many-duplicate/protected.bin");
+    harness
+        .store
+        .put(&protected, Bytes::from_static(b"must remain"))
+        .await
+        .unwrap();
+
+    let error = harness
+        .store
+        .delete_many(vec![protected.clone(), protected.clone()])
+        .await
+        .expect_err("duplicate delete keys must fail before object-store I/O");
+    assert!(
+        matches!(&error, zeppelin::error::ZeppelinError::Validation(message)
+            if message.contains("unique object keys")),
+        "unexpected duplicate-key error: {error}"
+    );
+    assert!(harness.store.exists(&protected).await.unwrap());
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_delete_many_is_idempotent_for_absent_keys_and_empty_batches() {
+    let harness = TestHarness::new().await;
+    let absent = harness.key("delete-many-absent/object.bin");
+
+    assert_eq!(harness.store.delete_many(vec![absent]).await.unwrap(), 1);
+    assert_eq!(harness.store.delete_many(Vec::new()).await.unwrap(), 0);
 
     harness.cleanup().await;
 }

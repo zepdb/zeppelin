@@ -226,7 +226,10 @@ pub fn latency_profile_store(
         params,
         ledger: ledger.clone(),
     };
-    (ZeppelinStore::new(Arc::new(latency)), ledger)
+    (
+        ZeppelinStore::new_with_native_batch_delete(Arc::new(latency)),
+        ledger,
+    )
 }
 
 impl LatencyProfileStore {
@@ -330,6 +333,34 @@ impl ObjectStore for LatencyProfileStore {
     async fn delete(&self, location: &Path) -> OsResult<()> {
         let _ = self.ttfb("delete", location.as_ref()).await;
         self.inner.delete(location).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        if !self.ledger.state.enabled.load(Ordering::SeqCst) {
+            return self.inner.delete_stream(locations);
+        }
+        let micros = self
+            .ledger
+            .next_sample("delete_batch", "<delete-batch>", self.params.ttfb);
+        let ledger = self.ledger.clone();
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let delayed_locations = locations
+            .then(move |result| {
+                let ledger = ledger.clone();
+                let first = Arc::clone(&first);
+                async move {
+                    if first.swap(false, Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_micros(micros)).await;
+                        ledger.record_sleep(micros);
+                    }
+                    result
+                }
+            })
+            .boxed();
+        self.inner.delete_stream(delayed_locations)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {

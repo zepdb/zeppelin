@@ -14,9 +14,9 @@ use zeppelin::time::{Clock, TimeSource};
 use zeppelin::types::DistanceMetric;
 use zeppelin::wal::Manifest;
 
-use crate::common::counting::{counting_store, ClassStats, GetCounter};
+use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
-use crate::perf_contract::depth::{depth_store, DepthTracker, OpSpan, SpanKind};
+use crate::perf_contract::depth::{depth_store, DepthTracker, OpSpan, PhysicalRequest, SpanKind};
 use crate::perf_contract::scenario::RepeatCounters;
 
 use super::artifacts::IdealSample;
@@ -106,7 +106,7 @@ impl NamespaceWorld {
     async fn new() -> Self {
         let harness = TestHarness::new().await;
         let (depth_wrapped, tracker) = depth_store(&harness.store);
-        let (store, counter) = counting_store(&depth_wrapped);
+        let (store, counter) = perf_counting_store(&depth_wrapped);
         Self {
             harness,
             store,
@@ -370,11 +370,13 @@ async fn execute_delete_cleanup(case: &IdealCase, complete: bool) -> IdealSample
         1,
         0,
         if complete { 2 } else { 1 },
-        if complete {
-            (COMPLETE_DELETE_OBJECTS + 1) as u64
-        } else {
-            1_000
-        },
+        if complete { 2 } else { 1 },
+    );
+    assert_eq!(request_ops(&sample, PhysicalRequest::DeleteBatch), 1);
+    assert_eq!(
+        request_ops(&sample, PhysicalRequest::Delete),
+        u64::from(complete),
+        "only completed cleanup deletes meta.json separately"
     );
 
     let remaining = world
@@ -455,6 +457,14 @@ fn mode_ops(sample: &IdealSample, verb: &str) -> u64 {
         .filter(|total| total.verb == verb)
         .map(|total| total.ops)
         .sum()
+}
+
+fn request_ops(sample: &IdealSample, request: PhysicalRequest) -> u64 {
+    sample
+        .physical_operations
+        .iter()
+        .filter(|operation| operation.request == request)
+        .count() as u64
 }
 
 async fn await_tracker_idle(tracker: &DepthTracker) {

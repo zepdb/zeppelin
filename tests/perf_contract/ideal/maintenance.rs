@@ -23,9 +23,9 @@ use zeppelin::time::{Clock, TimeSource};
 use zeppelin::types::{AttributeValue, DistanceMetric, VectorEntry};
 use zeppelin::wal::{LeaseManager, Manifest, WalReader, WalWriter};
 
-use crate::common::counting::{counting_store, ClassStats, GetCounter};
+use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
-use crate::perf_contract::depth::{depth_store, DepthTracker, SpanKind};
+use crate::perf_contract::depth::{depth_store, DepthTracker, PhysicalRequest, SpanKind};
 use crate::perf_contract::scenario::RepeatCounters;
 
 use super::artifacts::IdealSample;
@@ -114,7 +114,7 @@ impl MaintenanceWorld {
     async fn new() -> Self {
         let harness = TestHarness::new().await;
         let (depth_wrapped, tracker) = depth_store(&harness.store);
-        let (store, counter) = counting_store(&depth_wrapped);
+        let (store, counter) = perf_counting_store(&depth_wrapped);
         let now = DateTime::from_timestamp(1_800_000_000, 123_000_000)
             .expect("ideal maintenance fixed clock must be representable");
         Self {
@@ -571,7 +571,20 @@ async fn execute_resume_delete(case: &IdealCase) -> IdealSample {
         .expect("ideal resumed-delete tick failed");
     assert!(outcome.complete);
     assert_eq!(outcome.deleted, 2);
-    world.finish(case).await
+    let sample = world.snapshot(case).await;
+    assert_eq!(sample.total_get_ops, 1);
+    assert_eq!(physical_mode_ops(&sample, "list_recursive"), 2);
+    assert_eq!(physical_mode_ops(&sample, "delete_batch"), 1);
+    assert_eq!(physical_mode_ops(&sample, "delete"), 1);
+    assert_eq!(
+        sample
+            .physical_operations
+            .iter()
+            .filter(|operation| operation.request == PhysicalRequest::DeleteBatch)
+            .count(),
+        1
+    );
+    world.cleanup(sample).await
 }
 
 async fn execute_tick_lease_held(case: &IdealCase) -> IdealSample {
@@ -1145,6 +1158,15 @@ fn snapshot_repeat(counter: &GetCounter, tracker: &DepthTracker) -> RepeatCounte
         wall_elapsed_us: 0,
         response_cutoff_us: cutoff_us,
     }
+}
+
+fn physical_mode_ops(sample: &IdealSample, mode: &str) -> u64 {
+    sample
+        .physical_verb_mode_totals
+        .iter()
+        .filter(|total| total.mode == mode)
+        .map(|total| total.ops)
+        .sum()
 }
 
 #[cfg(test)]

@@ -32,6 +32,21 @@ pub(crate) struct PhysicalModeTotal {
     pub bytes: u64,
 }
 
+/// Member attribution for one physical batch request.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct BatchAttribution {
+    pub member_count: u64,
+    pub member_distribution: Vec<BatchMemberTotal>,
+}
+
+/// Deterministic member count for one artifact class and normalized key pattern.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct BatchMemberTotal {
+    pub class: ArtifactClass,
+    pub key_pattern: String,
+    pub members: u64,
+}
+
 /// One normalized ObjectStore adapter invocation, including non-critical work.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct PhysicalOperation {
@@ -45,6 +60,8 @@ pub(crate) struct PhysicalOperation {
     pub start_seq: u64,
     pub end_seq: u64,
     pub outcome: SpanOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchAttribution>,
 }
 
 /// Deterministic aggregate for every measured sample of one scenario.
@@ -91,6 +108,8 @@ pub(crate) struct NormalizedPhysicalOperation {
     pub key: String,
     pub successful_bytes: u64,
     pub outcome: SpanOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchAttribution>,
 }
 
 impl IdealSample {
@@ -328,6 +347,7 @@ fn normalized_scenario_cost(sample: &IdealSample) -> NormalizedScenarioCost {
             key: operation.key.clone(),
             successful_bytes: operation.successful_bytes,
             outcome: operation.outcome,
+            batch: operation.batch.clone(),
         })
         .collect::<Vec<_>>();
     physical_operations.sort_by(|left, right| {
@@ -345,6 +365,7 @@ fn normalized_scenario_cost(sample: &IdealSample) -> NormalizedScenarioCost {
             .then_with(|| left.key.cmp(&right.key))
             .then_with(|| left.successful_bytes.cmp(&right.successful_bytes))
             .then_with(|| format!("{:?}", left.outcome).cmp(&format!("{:?}", right.outcome)))
+            .then_with(|| left.batch.cmp(&right.batch))
     });
     NormalizedScenarioCost {
         scenario_id: sample.scenario_id.clone(),
@@ -388,8 +409,60 @@ fn physical_operations(spans: &[OpSpan]) -> Vec<PhysicalOperation> {
             start_seq: span.start_seq,
             end_seq: span.end_seq,
             outcome: span.outcome,
+            batch: batch_attribution(span),
         })
         .collect()
+}
+
+fn batch_attribution(span: &OpSpan) -> Option<BatchAttribution> {
+    if span.request != PhysicalRequest::DeleteBatch {
+        assert!(
+            span.batch_members.is_empty(),
+            "non-batch physical operation carried batch-member attribution"
+        );
+        return None;
+    }
+
+    let mut distribution = BTreeMap::<(ArtifactClass, String), u64>::new();
+    for member in &span.batch_members {
+        let total = distribution
+            .entry((member.class, stable_batch_member_key(&member.key)))
+            .or_default();
+        *total = total
+            .checked_add(1)
+            .expect("ideal-analysis batch-member count overflowed u64");
+    }
+    Some(BatchAttribution {
+        member_count: u64::try_from(span.batch_members.len())
+            .expect("ideal-analysis batch-member count overflowed u64"),
+        member_distribution: distribution
+            .into_iter()
+            .map(|((class, key_pattern), members)| BatchMemberTotal {
+                class,
+                key_pattern,
+                members,
+            })
+            .collect(),
+    })
+}
+
+fn stable_batch_member_key(key: &str) -> String {
+    let normalized = stable_ideal_key(key);
+    let Some((stem, extension)) = normalized.rsplit_once('.') else {
+        return normalized;
+    };
+    if !stem.is_empty() && stem.bytes().all(|byte| byte.is_ascii_digit()) {
+        return format!("<index>.{extension}");
+    }
+    if let Some((prefix, index)) = stem.rsplit_once('_') {
+        if !prefix.is_empty()
+            && !index.is_empty()
+            && index.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return format!("{prefix}_<index>.{extension}");
+        }
+    }
+    normalized
 }
 
 fn physical_mode_totals(spans: &[OpSpan]) -> Vec<PhysicalModeTotal> {
@@ -452,6 +525,7 @@ fn mode_name(request: PhysicalRequest) -> &'static str {
         PhysicalRequest::CopyOverwrite => "copy_overwrite",
         PhysicalRequest::CopyIfAbsent => "copy_if_absent",
         PhysicalRequest::Delete => "delete",
+        PhysicalRequest::DeleteBatch => "delete_batch",
     }
 }
 
@@ -535,6 +609,7 @@ mod tests {
             wall_start_us: start_seq * 10,
             wall_end_us: end_seq * 10,
             outcome: SpanOutcome::Success,
+            batch_members: Vec::new(),
         }
     }
 
@@ -701,6 +776,150 @@ mod tests {
     }
 
     #[test]
+    fn delete_batch_attribution_aggregates_mixed_members_deterministically() {
+        use crate::perf_contract::depth::BatchMember;
+
+        let members = vec![
+            BatchMember {
+                class: ArtifactClass::Other,
+                key: "ns/delete-fixture/0002.bin".to_string(),
+            },
+            BatchMember {
+                class: ArtifactClass::Wal,
+                key: "ns/wal/01ARZ3NDEKTSV4RRFFQ69G5FAV.wal".to_string(),
+            },
+            BatchMember {
+                class: ArtifactClass::Attrs,
+                key: "ns/segments/seg/attrs_7.bin".to_string(),
+            },
+            BatchMember {
+                class: ArtifactClass::Other,
+                key: "ns/manifests/123.msgpack".to_string(),
+            },
+            BatchMember {
+                class: ArtifactClass::Other,
+                key: "ns/delete-fixture/0001.bin".to_string(),
+            },
+        ];
+        let mut left_span = span(
+            SpanKind::Delete,
+            PhysicalRequest::DeleteBatch,
+            "<delete-batch:5>",
+            0,
+            1,
+            0,
+        );
+        left_span.batch_members.clone_from(&members);
+        let mut right_span = left_span.clone();
+        right_span.batch_members.reverse();
+
+        let left = IdealSample::from_repeat("batch", &repeat(vec![left_span], 0, 0));
+        let right = IdealSample::from_repeat("batch", &repeat(vec![right_span], 0, 0));
+        let operation = left
+            .physical_operations
+            .first()
+            .expect("one physical delete-batch request");
+        let batch = operation
+            .batch
+            .as_ref()
+            .expect("delete-batch member attribution");
+
+        assert_eq!(left.physical_operations.len(), 1);
+        assert_eq!(left.physical_verb_mode_totals.len(), 1);
+        assert_eq!(left.physical_verb_mode_totals[0].ops, 1);
+        assert_eq!(batch.member_count, 5);
+        assert_eq!(
+            batch.member_distribution,
+            vec![
+                BatchMemberTotal {
+                    class: ArtifactClass::Attrs,
+                    key_pattern: "attrs_<index>.bin".to_string(),
+                    members: 1,
+                },
+                BatchMemberTotal {
+                    class: ArtifactClass::Wal,
+                    key_pattern: "<wal>.wal".to_string(),
+                    members: 1,
+                },
+                BatchMemberTotal {
+                    class: ArtifactClass::Other,
+                    key_pattern: "<generation>.msgpack".to_string(),
+                    members: 1,
+                },
+                BatchMemberTotal {
+                    class: ArtifactClass::Other,
+                    key_pattern: "<index>.bin".to_string(),
+                    members: 2,
+                },
+            ]
+        );
+        assert_eq!(
+            normalized_scenario_cost(&left),
+            normalized_scenario_cost(&right),
+            "batch member observation order must not affect normalized costs"
+        );
+    }
+
+    #[test]
+    fn non_batch_physical_json_omits_empty_batch_metadata() {
+        let sample = IdealSample::from_repeat(
+            "non-batch",
+            &repeat(
+                vec![span(
+                    SpanKind::Put,
+                    PhysicalRequest::PutCreate,
+                    "ns/meta.json",
+                    0,
+                    1,
+                    7,
+                )],
+                0,
+                0,
+            ),
+        );
+        let sample_json = serde_json::to_value(&sample).expect("serialize ideal sample");
+        let normalized_json = serde_json::to_value(normalized_scenario_cost(&sample))
+            .expect("serialize normalized ideal cost");
+
+        assert!(sample_json["physical_operations"][0].get("batch").is_none());
+        assert!(normalized_json["physical_operations"][0]
+            .get("batch")
+            .is_none());
+    }
+
+    #[test]
+    fn large_indexed_batch_collapses_to_one_trace_safe_pattern() {
+        use crate::perf_contract::depth::BatchMember;
+
+        let mut batch = span(
+            SpanKind::Delete,
+            PhysicalRequest::DeleteBatch,
+            "<delete-batch:1000>",
+            0,
+            1,
+            0,
+        );
+        batch.batch_members = (0..1_000)
+            .map(|index| BatchMember {
+                class: ArtifactClass::Other,
+                key: format!("ns/delete-fixture/object_{index:04}.bin"),
+            })
+            .collect();
+
+        let attribution = batch_attribution(&batch).expect("delete-batch attribution");
+
+        assert_eq!(attribution.member_count, 1_000);
+        assert_eq!(
+            attribution.member_distribution,
+            vec![BatchMemberTotal {
+                class: ArtifactClass::Other,
+                key_pattern: "object_<index>.bin".to_string(),
+                members: 1_000,
+            }]
+        );
+    }
+
+    #[test]
     fn rank_comparator_is_total_for_distinct_scenario_ids() {
         let left = sample("a", 1, 2, 3);
         let right = sample("b", 1, 2, 3);
@@ -794,6 +1013,7 @@ mod tests {
                 start_seq: 0,
                 end_seq: 3,
                 outcome: SpanOutcome::Success,
+                batch: None,
             },
             PhysicalOperation {
                 invocation_ordinal: 2,
@@ -809,6 +1029,7 @@ mod tests {
                 start_seq: 1,
                 end_seq: 2,
                 outcome: SpanOutcome::Success,
+                batch: None,
             },
         ];
         let mut right = left.clone();

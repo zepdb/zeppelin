@@ -90,6 +90,7 @@ use object_store::{
     BackoffConfig, ClientOptions, GetOptions, ObjectStore, PutMode, PutOptions, PutPayload,
     RetryConfig, UpdateVersion,
 };
+use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
 use std::sync::Arc;
@@ -116,6 +117,14 @@ use crate::error::{Result, ZeppelinError};
 pub struct ZeppelinStore {
     /// Runtime-selected backend shared by all clones of this gateway.
     inner: Arc<dyn ObjectStore>,
+    /// Prefix-cleanup behavior selected when the backend is constructed.
+    prefix_delete_mode: PrefixDeleteMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixDeleteMode {
+    LegacyPerKeyUnordered32,
+    NativeBatch,
 }
 
 /// Progress made by one bounded recursive prefix-deletion pass.
@@ -328,7 +337,15 @@ impl ZeppelinStore {
                 }
             };
 
-        Ok(Self { inner: store })
+        let prefix_delete_mode = if config.backend == crate::config::StorageBackend::S3 {
+            PrefixDeleteMode::NativeBatch
+        } else {
+            PrefixDeleteMode::LegacyPerKeyUnordered32
+        };
+        Ok(Self {
+            inner: store,
+            prefix_delete_mode,
+        })
     }
 
     /// Fails startup early when an explicit S3-compatible endpoint is not reachable.
@@ -464,7 +481,24 @@ impl ZeppelinStore {
     /// implementation and pass its `Arc<dyn ObjectStore>` here. Production code
     /// normally uses [`Self::from_config`] instead.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { inner: store }
+        Self {
+            inner: store,
+            prefix_delete_mode: PrefixDeleteMode::LegacyPerKeyUnordered32,
+        }
+    }
+
+    /// Wraps an instrumented backend whose `delete_stream` preserves native S3 batches.
+    ///
+    /// This constructor exists for the dedicated performance harness. Generic
+    /// fault decorators use [`Self::new`] so their established per-key failure
+    /// scheduling remains unchanged; the perf harness explicitly opts into this
+    /// constructor after installing transparent forwarding decorators.
+    #[doc(hidden)]
+    pub fn new_with_native_batch_delete(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner: store,
+            prefix_delete_mode: PrefixDeleteMode::NativeBatch,
+        }
     }
 
     /// Returns a shared handle to the raw backend for test instrumentation.
@@ -1235,6 +1269,111 @@ impl ZeppelinStore {
         Ok(())
     }
 
+    /// Deletes one bounded batch of exact object keys.
+    ///
+    /// Every key is parsed and the batch is checked for duplicates before the
+    /// backend sees any input. The 1,000-key limit matches one S3 DeleteObjects
+    /// request in the pinned object-store backend; callers with more work must
+    /// split it into explicit batches so retry and progress semantics remain
+    /// visible.
+    ///
+    /// The result is successful only after the backend returns one successful
+    /// or matching `NotFound` outcome for every unique input key, in input
+    /// order. Any other per-key or request error is returned after the stream is
+    /// drained. A short, long, reordered, or wrong-key result stream is a
+    /// storage error rather than silent partial completion.
+    #[instrument(skip(self, keys), fields(count = keys.len()))]
+    pub async fn delete_many(&self, keys: Vec<String>) -> Result<usize> {
+        const MAX_DELETE_BATCH: usize = 1_000;
+
+        if keys.len() > MAX_DELETE_BATCH {
+            return Err(ZeppelinError::Validation(format!(
+                "delete_many accepts at most {MAX_DELETE_BATCH} keys, got {}",
+                keys.len()
+            )));
+        }
+
+        let paths = keys
+            .iter()
+            .map(Path::parse)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let unique = paths.iter().cloned().collect::<BTreeSet<_>>();
+        if unique.len() != paths.len() {
+            return Err(ZeppelinError::Validation(
+                "delete_many requires unique object keys".to_string(),
+            ));
+        }
+        let expected = paths.len();
+        if expected == 0 {
+            return Ok(0);
+        }
+
+        let start = std::time::Instant::now();
+        use futures::StreamExt;
+        let input = futures::stream::iter(paths.iter().cloned().map(Ok)).boxed();
+        let mut results = self.inner.delete_stream(input);
+        let mut observed = 0usize;
+        let mut first_error = None;
+        while let Some(result) = results.next().await {
+            let expected_path = paths.get(observed);
+            match result {
+                Ok(actual) if expected_path == Some(&actual) => {}
+                Ok(actual) => {
+                    first_error.get_or_insert_with(|| object_store::Error::Generic {
+                        store: "ZeppelinStore",
+                        source: Box::new(std::io::Error::other(format!(
+                            "delete_many result {observed} returned unexpected key {actual}"
+                        ))),
+                    });
+                }
+                Err(object_store::Error::NotFound { path, .. })
+                    if expected_path.is_some_and(|expected| expected.as_ref() == path) => {}
+                Err(object_store::Error::NotFound { path, source }) => {
+                    first_error.get_or_insert(object_store::Error::NotFound { path, source });
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+            if let Some(next_observed) = observed.checked_add(1) {
+                observed = next_observed;
+            } else if first_error.is_none() {
+                first_error = Some(object_store::Error::Generic {
+                    store: "ZeppelinStore",
+                    source: Box::new(std::io::Error::other(
+                        "delete_many result count overflowed usize",
+                    )),
+                });
+            }
+        }
+
+        if observed != expected && first_error.is_none() {
+            first_error = Some(object_store::Error::Generic {
+                store: "ZeppelinStore",
+                source: Box::new(std::io::Error::other(format!(
+                    "delete_many returned {observed} results for {expected} keys"
+                ))),
+            });
+        }
+
+        let elapsed = start.elapsed();
+        debug!(
+            elapsed_ms = elapsed.as_millis(),
+            count = expected,
+            "s3 delete_many"
+        );
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["delete_many"])
+            .observe(elapsed.as_secs_f64());
+        if let Some(error) = first_error {
+            crate::metrics::S3_ERRORS_TOTAL
+                .with_label_values(&["delete_many"])
+                .inc();
+            return Err(ZeppelinError::Storage(error));
+        }
+
+        Ok(expected)
+    }
+
     /// Lists every object recursively beneath a non-empty prefix.
     ///
     /// The complete listing is materialized before return. Namespace discovery
@@ -1548,8 +1687,8 @@ impl ZeppelinStore {
     ///
     /// # Side Effects
     ///
-    /// Lists and deletes all matching objects with bounded delete concurrency but
-    /// no overall time budget.
+    /// Lists and deletes all matching objects in bounded backend batches with no
+    /// overall time budget.
     ///
     /// # Consistency
     ///
@@ -1573,9 +1712,11 @@ impl ZeppelinStore {
     /// Deletes a bounded amount of a prefix without materializing its full key list.
     ///
     /// The listing is streamed, exact excluded keys are skipped, and selected
-    /// objects are deleted in chunks of 1,000 with at most 32 delete futures in
-    /// flight. The time budget is checked after each full chunk, so it is a
-    /// coarse stopping signal rather than a deadline: a pass can exceed the
+    /// objects are deleted in chunks of at most 1,000. Configured S3 stores and
+    /// the dedicated perf harness use [`Self::delete_many`]; generic decorated
+    /// stores retain the original 32-way per-key path so fault semantics do not
+    /// silently change. The time budget is checked after each full chunk, so it
+    /// is a coarse stopping signal rather than a deadline: a pass can exceed the
     /// budget while finishing a chunk. A final partial chunk is deleted only
     /// when the listing reaches its end.
     ///
@@ -1585,7 +1726,8 @@ impl ZeppelinStore {
     ///          +-- exact excluded key --> keep it
     ///          |
     ///          v
-    /// collect 1,000 keys --> delete with concurrency 32
+    /// collect 1,000 keys --> configured S3: one delete_many batch
+    ///                    \-> generic decorator: 32-way per-key deletes
     ///          |                         |
     ///          | budget exhausted       | delete error
     ///          v                         v
@@ -1640,8 +1782,8 @@ impl ZeppelinStore {
     /// # Performance
     ///
     /// Memory is bounded to one 1,000-key chunk plus backend listing buffers.
-    /// Deletes within a chunk use concurrency 32; chunks themselves run
-    /// sequentially so the budget can be checked between them.
+    /// Chunks run sequentially so the budget can be checked between them. The
+    /// configured S3 adapter maps each chunk to one DeleteObjects request.
     ///
     /// # Examples
     ///
@@ -1691,7 +1833,7 @@ impl ZeppelinStore {
             }
             chunk.push(key);
             if chunk.len() == 1000 {
-                deleted += self.delete_key_chunk(std::mem::take(&mut chunk)).await?;
+                deleted += self.delete_prefix_chunk(std::mem::take(&mut chunk)).await?;
                 if start.elapsed() >= budget {
                     complete = false;
                     break;
@@ -1700,7 +1842,7 @@ impl ZeppelinStore {
         }
 
         if complete && !chunk.is_empty() {
-            deleted += self.delete_key_chunk(chunk).await?;
+            deleted += self.delete_prefix_chunk(chunk).await?;
         }
 
         let elapsed = start.elapsed();
@@ -1716,45 +1858,20 @@ impl ZeppelinStore {
         Ok(DeletePrefixOutcome { deleted, complete })
     }
 
-    /// Deletes one owned key chunk with bounded, unordered concurrency.
+    async fn delete_prefix_chunk(&self, keys: Vec<String>) -> Result<usize> {
+        match self.prefix_delete_mode {
+            PrefixDeleteMode::NativeBatch => self.delete_many(keys).await,
+            PrefixDeleteMode::LegacyPerKeyUnordered32 => self.delete_key_chunk(keys).await,
+        }
+    }
+
+    /// Preserves the established behavior of generic fault-instrumented stores.
     ///
-    /// # Parameters
-    ///
-    /// - `keys`: Owned keys selected by [`Self::delete_prefix_paged`]. Ownership
-    ///   moves into the delete futures so each future has a stable key.
-    ///
-    /// # Returns
-    ///
-    /// The input key count after every deletion succeeds or reports `NotFound`.
-    ///
-    /// # Errors
-    ///
-    /// Invalid object paths and backend errors other than `NotFound` stop result
-    /// collection. Other futures may already have deleted objects, so failure is
-    /// not atomic and the caller must be prepared to relist and resume.
-    ///
-    /// # Side Effects
-    ///
-    /// Runs up to 32 individual DELETE operations concurrently. Already absent
-    /// keys are accepted as successful idempotent cleanup.
-    ///
-    /// # Performance
-    ///
-    /// Concurrency is bounded independently of chunk size; completion order does
-    /// not affect the returned count.
-    ///
-    /// # Examples
-    ///
-    /// For 1,000 keys, at most 32 deletes are active simultaneously. If ten keys
-    /// vanished after listing, all 1,000 still count as cleaned up.
-    ///
-    /// # Rust Notes for Java/C Engineers
-    ///
-    /// `async move` gives each future ownership of its key, while cloning the
-    /// `Arc` only increments the backend's reference count. `buffer_unordered(32)`
-    /// is similar to a fixed-width Java completion service; unlike manual C task
-    /// records, the compiler prevents a future from borrowing a loop-local key
-    /// that could disappear before the delete completes.
+    /// Instrumentation layers created through [`Self::new`] may attach
+    /// independent semantics to every per-key DELETE. They therefore retain the
+    /// original 32-way unordered scheduling and first-error cancellation path.
+    /// Configured S3 and the dedicated perf harness instead select
+    /// [`PrefixDeleteMode::NativeBatch`].
     async fn delete_key_chunk(&self, keys: Vec<String>) -> Result<usize> {
         use futures::StreamExt;
 
@@ -1766,7 +1883,7 @@ impl ZeppelinStore {
                 let path = Path::parse(&key)?;
                 match inner.delete(&path).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                    Err(e) => return Err(ZeppelinError::Storage(e)),
+                    Err(error) => return Err(ZeppelinError::Storage(error)),
                 }
                 Ok::<_, ZeppelinError>(())
             }

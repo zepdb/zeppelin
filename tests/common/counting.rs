@@ -382,6 +382,20 @@ pub fn counting_store(store: &ZeppelinStore) -> (ZeppelinStore, GetCounter) {
     (ZeppelinStore::new(Arc::new(counting)), counter)
 }
 
+/// Wrap a dedicated performance-harness store while preserving native bulk DELETEs.
+///
+/// General tests intentionally use [`counting_store`], whose `ZeppelinStore`
+/// keeps legacy prefix-cleanup scheduling. Perf scenarios use this constructor
+/// so the gateway selects native batching and the forwarded
+/// `ObjectStore::delete_stream` reaches the real S3 adapter as one request.
+pub fn perf_counting_store(store: &ZeppelinStore) -> (ZeppelinStore, GetCounter) {
+    let (counting, counter) = CountingStore::wrap(store.inner());
+    (
+        ZeppelinStore::new_with_native_batch_delete(Arc::new(counting)),
+        counter,
+    )
+}
+
 impl fmt::Display for CountingStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CountingStore({})", self.inner)
@@ -448,6 +462,13 @@ impl ObjectStore for CountingStore {
         self.inner.delete(location).await
     }
 
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
         let key = prefix.map(ToString::to_string).unwrap_or_default();
         self.counter
@@ -474,5 +495,146 @@ impl ObjectStore for CountingStore {
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
         self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use futures::stream::BoxStream;
+    use futures::StreamExt;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
+    };
+
+    use super::{counting_store, perf_counting_store};
+    use zeppelin::storage::ZeppelinStore;
+
+    #[derive(Debug)]
+    struct DeleteStreamProbe {
+        inner: Arc<dyn ObjectStore>,
+        native_stream_calls: AtomicUsize,
+    }
+
+    impl DeleteStreamProbe {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(InMemory::new()),
+                native_stream_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl std::fmt::Display for DeleteStreamProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("DeleteStreamProbe")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for DeleteStreamProbe {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OsResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOpts,
+        ) -> OsResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &Path) -> OsResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn delete_stream<'a>(
+            &'a self,
+            locations: BoxStream<'a, OsResult<Path>>,
+        ) -> BoxStream<'a, OsResult<Path>> {
+            self.native_stream_calls.fetch_add(1, Ordering::SeqCst);
+            locations
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn counting_delete_stream_forwards_once_and_preserves_input_order() {
+        let probe = Arc::new(DeleteStreamProbe::new());
+        let base = ZeppelinStore::new(probe.clone());
+        let (counted, _counter) = counting_store(&base);
+        let backend = counted.inner();
+        let expected = (0..33)
+            .map(|index| Path::from(format!("object-{index:04}")))
+            .collect::<Vec<_>>();
+        let input = futures::stream::iter(expected.iter().cloned().map(Ok)).boxed();
+
+        let results = backend.delete_stream(input).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            results
+                .into_iter()
+                .collect::<OsResult<Vec<_>>>()
+                .expect("counting delete stream failed"),
+            expected
+        );
+        assert_eq!(probe.native_stream_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dedicated_perf_delete_stream_forwards_one_native_batch() {
+        let probe = Arc::new(DeleteStreamProbe::new());
+        let base = ZeppelinStore::new(probe.clone());
+        let (counted, _counter) = perf_counting_store(&base);
+        let backend = counted.inner();
+        let expected = (0..3)
+            .map(|index| Path::from(format!("object-{index:04}")))
+            .collect::<Vec<_>>();
+        let input = futures::stream::iter(expected.iter().cloned().map(Ok)).boxed();
+
+        let results = backend.delete_stream(input).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            results
+                .into_iter()
+                .collect::<OsResult<Vec<_>>>()
+                .expect("native delete stream failed"),
+            expected
+        );
+        assert_eq!(probe.native_stream_calls.load(Ordering::SeqCst), 1);
     }
 }

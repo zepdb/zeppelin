@@ -16,7 +16,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
@@ -60,6 +60,7 @@ pub enum PhysicalRequest {
     CopyOverwrite,
     CopyIfAbsent,
     Delete,
+    DeleteBatch,
 }
 
 /// Typed completion state for one observed object-store operation.
@@ -135,6 +136,13 @@ impl PhysicalRequest {
     }
 }
 
+/// One input member consumed by a batch object-store invocation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BatchMember {
+    pub class: ArtifactClass,
+    pub key: String,
+}
+
 /// One observed object-store operation.
 #[derive(Debug, Clone, Serialize)]
 pub struct OpSpan {
@@ -150,6 +158,12 @@ pub struct OpSpan {
     pub ok: bool,
     pub wall_start_us: u64,
     pub wall_end_us: u64,
+    /// Input members consumed by a batch adapter invocation.
+    ///
+    /// Empty metadata is omitted so existing non-batch span JSON remains
+    /// byte-for-byte compatible.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub batch_members: Vec<BatchMember>,
 }
 
 /// A maximal chain under the interval order used for roundtrip depth.
@@ -325,6 +339,74 @@ impl Drop for ListSpanStream<'_> {
     }
 }
 
+struct DeleteBatchSpanStream<'a> {
+    inner: BoxStream<'a, OsResult<Path>>,
+    tracker: DepthTracker,
+    pending: Option<PendingSpan>,
+    failure: Option<SpanOutcome>,
+    members: Arc<Mutex<Vec<BatchMember>>>,
+}
+
+impl<'a> DeleteBatchSpanStream<'a> {
+    fn new(
+        inner: BoxStream<'a, OsResult<Path>>,
+        tracker: DepthTracker,
+        pending: PendingSpan,
+        members: Arc<Mutex<Vec<BatchMember>>>,
+    ) -> Self {
+        Self {
+            inner,
+            tracker,
+            pending: Some(pending),
+            failure: None,
+            members,
+        }
+    }
+
+    fn close(&mut self, default: SpanOutcome) {
+        if let Some(pending) = self.pending.take() {
+            let members = self
+                .members
+                .lock()
+                .expect("depth tracker batch-members mutex poisoned")
+                .clone();
+            self.tracker
+                .finish_batch(pending, self.failure.unwrap_or(default), members);
+        }
+    }
+}
+
+impl Stream for DeleteBatchSpanStream<'_> {
+    type Item = OsResult<Path>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(path))) => Poll::Ready(Some(Ok(path))),
+            Poll::Ready(Some(Err(error))) => {
+                if self.failure.is_none() {
+                    self.failure = Some(SpanOutcome::from_error(&error));
+                }
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.close(SpanOutcome::Success);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for DeleteBatchSpanStream<'_> {
+    fn drop(&mut self) {
+        self.close(SpanOutcome::Cancelled);
+    }
+}
+
 impl DepthTracker {
     fn new() -> Self {
         Self {
@@ -378,6 +460,31 @@ impl DepthTracker {
     }
 
     fn finish(&self, pending: PendingSpan, outcome: SpanOutcome, bytes: Option<u64>) {
+        self.finish_inner(pending, outcome, bytes, Vec::new());
+    }
+
+    fn finish_batch(
+        &self,
+        mut pending: PendingSpan,
+        outcome: SpanOutcome,
+        members: Vec<BatchMember>,
+    ) {
+        pending.class = members
+            .first()
+            .map(|first| first.class)
+            .filter(|class| members.iter().all(|member| member.class == *class))
+            .unwrap_or(ArtifactClass::Other);
+        pending.key = format!("<delete-batch:{}>", members.len());
+        self.finish_inner(pending, outcome, None, members);
+    }
+
+    fn finish_inner(
+        &self,
+        pending: PendingSpan,
+        outcome: SpanOutcome,
+        bytes: Option<u64>,
+        batch_members: Vec<BatchMember>,
+    ) {
         let end_seq = self
             .state
             .counter
@@ -396,6 +503,7 @@ impl DepthTracker {
             ok: outcome == SpanOutcome::Success,
             wall_start_us: pending.wall_start_us,
             wall_end_us: self.elapsed_us(),
+            batch_members,
         };
         self.state
             .spans
@@ -575,7 +683,10 @@ pub fn depth_store(store: &ZeppelinStore) -> (ZeppelinStore, DepthTracker) {
         inner: store.inner(),
         tracker: tracker.clone(),
     };
-    (ZeppelinStore::new(Arc::new(depth)), tracker)
+    (
+        ZeppelinStore::new_with_native_batch_delete(Arc::new(depth)),
+        tracker,
+    )
 }
 
 impl fmt::Display for DepthStore {
@@ -677,6 +788,41 @@ impl ObjectStore for DepthStore {
         result
     }
 
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        let members = Arc::new(Mutex::new(Vec::new()));
+        let observed_members = Arc::clone(&members);
+        let locations = locations
+            .map(move |result| {
+                if let Ok(path) = &result {
+                    observed_members
+                        .lock()
+                        .expect("depth tracker batch-members mutex poisoned")
+                        .push(BatchMember {
+                            class: classify(path.as_ref()),
+                            key: path.to_string(),
+                        });
+                }
+                result
+            })
+            .boxed();
+        let pending = self.tracker.begin(
+            SpanKind::Delete,
+            PhysicalRequest::DeleteBatch,
+            ArtifactClass::Other,
+            "<delete-batch>".to_string(),
+            0,
+        );
+        Box::pin(DeleteBatchSpanStream::new(
+            self.inner.delete_stream(locations),
+            self.tracker.clone(),
+            pending,
+            members,
+        ))
+    }
+
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
         let key = prefix.map(ToString::to_string).unwrap_or_default();
         let pending = self.tracker.begin(
@@ -740,7 +886,7 @@ impl ObjectStore for DepthStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
+    use futures::{StreamExt, TryStreamExt};
     use object_store::memory::InMemory;
     use object_store::{GetRange, PutMode, UpdateVersion};
 
@@ -774,6 +920,7 @@ mod tests {
             ok: true,
             wall_start_us: start_seq,
             wall_end_us: end_seq,
+            batch_members: Vec::new(),
         }
     }
 
@@ -789,6 +936,14 @@ mod tests {
 
         assert_eq!(path.depth, 1);
         assert_eq!(path.chain.len(), 1);
+    }
+
+    #[test]
+    fn non_batch_span_json_omits_empty_batch_metadata() {
+        let json = serde_json::to_value(span("manifest.json", 0, 1))
+            .expect("serialize non-batch depth span");
+
+        assert!(json.get("batch_members").is_none());
     }
 
     #[test]
@@ -995,6 +1150,145 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].outcome, SpanOutcome::Failure);
         assert!(!spans[0].ok);
+    }
+
+    #[tokio::test]
+    async fn delete_stream_records_one_batch_span_with_mixed_members() {
+        let locations = [
+            Path::from("ns/segments/seg/attrs_7.bin"),
+            Path::from("ns/wal/01ARZ3NDEKTSV4RRFFQ69G5FAV.wal"),
+            Path::from("ns/manifests/123.msgpack"),
+            Path::from("ns/delete-fixture/0001.bin"),
+            Path::from("ns/delete-fixture/0002.bin"),
+        ];
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for location in &locations {
+            inner
+                .put(location, PutPayload::from_static(b"delete me"))
+                .await
+                .expect("seed batch-delete object");
+        }
+        let store = ZeppelinStore::new(inner);
+        let (store, tracker) = depth_store(&store);
+        let backend = store.inner();
+        let input = futures::stream::iter(locations.iter().cloned().map(Ok)).boxed();
+
+        let deleted = backend
+            .delete_stream(input)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("batch delete should succeed");
+
+        assert_eq!(deleted, locations);
+        let spans = tracker.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].kind, SpanKind::Delete);
+        assert_eq!(spans[0].request, PhysicalRequest::DeleteBatch);
+        assert_eq!(spans[0].class, ArtifactClass::Other);
+        assert_eq!(spans[0].key, "<delete-batch:5>");
+        assert_eq!(spans[0].outcome, SpanOutcome::Success);
+        assert_eq!(spans[0].batch_members.len(), locations.len());
+        assert_eq!(
+            spans[0]
+                .batch_members
+                .iter()
+                .map(|member| (member.class, member.key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ArtifactClass::Attrs, locations[0].as_ref()),
+                (ArtifactClass::Wal, locations[1].as_ref()),
+                (ArtifactClass::Other, locations[2].as_ref()),
+                (ArtifactClass::Other, locations[3].as_ref()),
+                (ArtifactClass::Other, locations[4].as_ref()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_stream_error_records_failure_once() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = ZeppelinStore::new(inner);
+        let (store, tracker) = depth_store(&store);
+        let backend = store.inner();
+        let error = object_store::Error::Generic {
+            store: "depth_test",
+            source: Box::new(std::io::Error::other("injected batch error")),
+        };
+        let attempted = Path::from("ns/wal/attempted.wal");
+        let input = futures::stream::iter(vec![Ok(attempted.clone()), Err(error)]).boxed();
+        let deleted = backend.delete_stream(input).collect::<Vec<_>>().await;
+
+        assert_eq!(deleted.len(), 2);
+        assert!(deleted[0].is_ok());
+        assert!(deleted[1].is_err());
+
+        let spans = tracker.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].request, PhysicalRequest::DeleteBatch);
+        assert_eq!(spans[0].outcome, SpanOutcome::Failure);
+        assert_eq!(spans[0].class, ArtifactClass::Wal);
+        assert_eq!(spans[0].key, "<delete-batch:1>");
+        assert_eq!(spans[0].batch_members.len(), 1);
+        assert_eq!(spans[0].batch_members[0].class, ArtifactClass::Wal);
+        assert_eq!(spans[0].batch_members[0].key, attempted.as_ref());
+    }
+
+    #[tokio::test]
+    async fn empty_delete_stream_records_other_zero_member_batch() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = ZeppelinStore::new(inner);
+        let (store, tracker) = depth_store(&store);
+        let deleted = store
+            .inner()
+            .delete_stream(futures::stream::empty().boxed())
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(deleted.is_empty());
+        let spans = tracker.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].request, PhysicalRequest::DeleteBatch);
+        assert_eq!(spans[0].class, ArtifactClass::Other);
+        assert_eq!(spans[0].key, "<delete-batch:0>");
+        assert_eq!(spans[0].outcome, SpanOutcome::Success);
+        assert!(spans[0].batch_members.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_delete_stream_records_cancelled_once() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = ZeppelinStore::new(inner);
+        let (store, tracker) = depth_store(&store);
+        let backend = store.inner();
+        let attempted = Path::from("ns/manifests/456.msgpack");
+        let input = futures::stream::once({
+            let attempted = attempted.clone();
+            async move { Ok(attempted) }
+        })
+        .chain(futures::stream::pending::<OsResult<Path>>())
+        .boxed();
+        let mut deleted = backend.delete_stream(input);
+
+        assert_eq!(tracker.active_operations(), 1);
+        assert_eq!(
+            deleted
+                .next()
+                .await
+                .expect("first batch-delete result")
+                .expect("first batch-delete member succeeds"),
+            attempted
+        );
+        drop(deleted);
+
+        let spans = tracker.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].request, PhysicalRequest::DeleteBatch);
+        assert_eq!(spans[0].outcome, SpanOutcome::Cancelled);
+        assert_eq!(spans[0].class, ArtifactClass::Other);
+        assert_eq!(spans[0].key, "<delete-batch:1>");
+        assert_eq!(spans[0].batch_members.len(), 1);
+        assert_eq!(spans[0].batch_members[0].class, ArtifactClass::Other);
+        assert_eq!(spans[0].batch_members[0].key, attempted.as_ref());
     }
 
     #[tokio::test]

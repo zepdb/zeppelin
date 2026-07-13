@@ -10,7 +10,7 @@ use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::manager::{NamespaceMetadata, NamespaceState};
 use zeppelin::wal::Manifest;
 
-use crate::common::counting::{counting_store, ClassStats, GetCounter};
+use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
 use crate::common::server::{api_ns, start_test_server_full, FullTestServer};
 use crate::perf_contract::depth::{depth_store, DepthTracker, OpSpan, SpanKind};
@@ -35,7 +35,7 @@ pub(crate) async fn execute(case: &IdealCase) -> Option<IdealSample> {
     let operation = SupportedOperation::from_case(case)?;
     let harness = TestHarness::new().await;
     let (depth_wrapped, tracker) = depth_store(&harness.store);
-    let (instrumented_store, counter) = counting_store(&depth_wrapped);
+    let (instrumented_store, counter) = perf_counting_store(&depth_wrapped);
     let server = start_test_server_full(
         instrumented_store,
         Some(harness.prefix.clone()),

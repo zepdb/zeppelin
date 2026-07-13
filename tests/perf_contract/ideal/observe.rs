@@ -178,6 +178,7 @@ mod tests {
             wall_start_us: start_seq * 10,
             wall_end_us: end_seq * 10,
             outcome: SpanOutcome::Success,
+            batch_members: Vec::new(),
         }
     }
 

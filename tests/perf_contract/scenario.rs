@@ -22,7 +22,7 @@ use zeppelin::time::{Clock, TimeSource};
 use zeppelin::wal::manifest::SegmentRef;
 use zeppelin::wal::Manifest;
 
-use crate::common::counting::{counting_store, ClassStats, GetCounter};
+use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
 use crate::common::server::{api_ns, start_test_server_full, FullTestServer};
 use zeppelin::storage::ZeppelinStore;
@@ -679,7 +679,7 @@ async fn run_scenario_inner(
     let config = scenario_config(spec);
     let clock = stable_width_perf_clock();
     let (depth_wrapped, tracker) = depth_store(&harness.store);
-    let (instrumented_store, counter) = counting_store(&depth_wrapped);
+    let (instrumented_store, counter) = perf_counting_store(&depth_wrapped);
     let decorated_store = decorator.map_or_else(
         || instrumented_store.clone(),
         |decorate| decorate(&instrumented_store),
@@ -910,7 +910,7 @@ pub(crate) async fn run_closed_loop_scenario(
     // instead of queueing when this semaphore is exhausted.
     config.server.max_concurrent_queries = clients;
     let (depth_wrapped, tracker) = depth_store(&harness.store);
-    let (instrumented_store, counter) = counting_store(&depth_wrapped);
+    let (instrumented_store, counter) = perf_counting_store(&depth_wrapped);
     let decorated_store = decorator(&instrumented_store);
     let setup_server = start_test_server_full(
         decorated_store.clone(),

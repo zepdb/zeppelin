@@ -29,6 +29,7 @@ pub(crate) enum StoreMethod {
     PutIfNotExists,
     CopyIfNotExists,
     Delete,
+    DeleteMany,
     ListPrefix,
     ListPrefixMeta,
     ListCommonPrefixes,
@@ -56,6 +57,7 @@ const STORAGE_METHOD_INVENTORY: &[StorageMethodInventory] = &[
     object_store_method(StoreMethod::PutIfNotExists, "put_if_not_exists"),
     object_store_method(StoreMethod::CopyIfNotExists, "copy_if_not_exists"),
     object_store_method(StoreMethod::Delete, "delete"),
+    object_store_method(StoreMethod::DeleteMany, "delete_many"),
     object_store_method(StoreMethod::ListPrefix, "list_prefix"),
     object_store_method(StoreMethod::ListPrefixMeta, "list_prefix_meta"),
     object_store_method(StoreMethod::ListCommonPrefixes, "list_common_prefixes"),
@@ -114,6 +116,7 @@ pub(crate) enum PhysicalVariant {
     ListRecursive,
     ListDelimiter,
     Delete,
+    DeleteBatch,
     CopyIfAbsent,
     CopyOverwrite,
 }
@@ -393,10 +396,15 @@ const PRODUCTION_PATHS: &[ProductionPath] = &[
         "src/namespace/manager.rs:NamespaceManager::finish_delete",
         &[
             StoreMethod::DeletePrefixPaged,
+            StoreMethod::DeleteMany,
             StoreMethod::ListPrefix,
             StoreMethod::Delete,
         ],
-        &[PhysicalVariant::ListRecursive, PhysicalVariant::Delete],
+        &[
+            PhysicalVariant::ListRecursive,
+            PhysicalVariant::DeleteBatch,
+            PhysicalVariant::Delete,
+        ],
         PathCoverage::IdealScenario {
             scenario: "namespace.delete_cleanup_complete",
         },
@@ -679,11 +687,13 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
             StoreMethod::Get,
             StoreMethod::ListPrefix,
             StoreMethod::DeletePrefixPaged,
+            StoreMethod::DeleteMany,
             StoreMethod::Delete,
         ],
         &[
             PhysicalVariant::GetFull,
             PhysicalVariant::ListRecursive,
+            PhysicalVariant::DeleteBatch,
             PhysicalVariant::Delete,
         ],
         ideal_case("background.tick_resume_delete"),
@@ -1195,10 +1205,15 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
         "src/namespace/manager.rs:NamespaceManager::finish_delete",
         &[
             StoreMethod::DeletePrefixPaged,
+            StoreMethod::DeleteMany,
             StoreMethod::ListPrefix,
             StoreMethod::Delete,
         ],
-        &[PhysicalVariant::ListRecursive, PhysicalVariant::Delete],
+        &[
+            PhysicalVariant::ListRecursive,
+            PhysicalVariant::DeleteBatch,
+            PhysicalVariant::Delete,
+        ],
         ideal_case("namespace.delete_cleanup_incomplete"),
     ),
     path(
@@ -1823,6 +1838,7 @@ mod tests {
             PhysicalVariant::ListRecursive,
             PhysicalVariant::ListDelimiter,
             PhysicalVariant::Delete,
+            PhysicalVariant::DeleteBatch,
             PhysicalVariant::CopyIfAbsent,
             PhysicalVariant::CopyOverwrite,
         ];

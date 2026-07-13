@@ -20,7 +20,7 @@ use zeppelin::types::{AttributeValue, DistanceMetric, VectorEntry};
 use zeppelin::wal::manifest::SegmentRef;
 use zeppelin::wal::{Manifest, WalReader, WalWriter};
 
-use crate::common::counting::{counting_store, ClassStats, GetCounter};
+use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
 use crate::perf_contract::depth::{depth_store, DepthTracker, SpanKind};
 use crate::perf_contract::scenario::RepeatCounters;
@@ -98,7 +98,7 @@ impl VariantWorld {
     async fn new() -> Self {
         let harness = TestHarness::new().await;
         let (depth_wrapped, tracker) = depth_store(&harness.store);
-        let (store, counter) = counting_store(&depth_wrapped);
+        let (store, counter) = perf_counting_store(&depth_wrapped);
         let now = DateTime::from_timestamp(1_800_000_000, 456_000_000)
             .expect("ideal variant-compaction fixed clock must be representable");
         Self {
