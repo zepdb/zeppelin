@@ -64,10 +64,13 @@
 //! makes every early failure path part of the function's type.
 
 use chrono::{DateTime, Utc};
+use futures::{stream, StreamExt};
 
 use crate::error::ZeppelinError;
 use crate::storage::ZeppelinStore;
 use crate::wal::manifest::{Manifest, NamedSnapshot};
+
+const TIMESTAMP_HISTORY_GET_CONCURRENCY: usize = 16;
 
 /// Resolves a generation, timestamp, or named snapshot to retained history.
 ///
@@ -239,7 +242,8 @@ async fn read_retained_history_generation(
 /// # Performance
 ///
 /// Performs one live GET, one prefix LIST, and one history GET per listed
-/// generation up to live. Work is linear in retained history count.
+/// generation up to live. History GETs use bounded concurrency; total work is
+/// linear in retained history count.
 ///
 /// # Examples
 ///
@@ -252,14 +256,23 @@ async fn resolve_history_at_or_before_timestamp(
     target: &str,
 ) -> Result<Manifest, ZeppelinError> {
     let live_version = live_manifest_version(store, namespace).await?;
+    let history = Manifest::list_history(store, namespace).await?;
+    let reads = stream::iter(
+        history
+            .into_iter()
+            .take_while(|entry| entry.version <= live_version)
+            .map(|entry| async move {
+                Manifest::read_history(store, namespace, entry.version)
+                    .await?
+                    .ok_or_else(|| ZeppelinError::NotFound { key: entry.key })
+            }),
+    )
+    .buffered(TIMESTAMP_HISTORY_GET_CONCURRENCY);
+    tokio::pin!(reads);
+
     let mut selected = None;
-    for entry in Manifest::list_history(store, namespace).await? {
-        if entry.version > live_version {
-            break;
-        }
-        let manifest = Manifest::read_history(store, namespace, entry.version)
-            .await?
-            .ok_or_else(|| ZeppelinError::NotFound { key: entry.key })?;
+    while let Some(manifest) = reads.next().await {
+        let manifest = manifest?;
         if manifest.updated_at <= timestamp {
             selected = Some(manifest);
         }

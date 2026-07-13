@@ -1136,6 +1136,65 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "requires MinIO for timestamp history GET overlap measurement"]
+    async fn timestamp_as_of_history_reads_overlap_without_changing_census() {
+        crate::perf_contract::require_minio();
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "query.as_of_timestamp")
+            .expect("ideal timestamp as-of query case missing from catalog");
+        let sample = execute(case)
+            .await
+            .expect("ideal timestamp as-of query executor rejected its catalog case");
+
+        assert_eq!(sample.total_get_ops, 7);
+        assert_eq!(sample.total_get_bytes, 3_572);
+        assert_eq!(sample.serial_get_chain.depth, 4);
+        assert_eq!(
+            sample
+                .serial_get_chain
+                .links
+                .iter()
+                .map(|link| link.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "manifest.json",
+                "<generation>.msgpack",
+                "bootstrap.bin",
+                "cluster_group_<index>.bin",
+            ]
+        );
+
+        let history = sample
+            .physical_operations
+            .iter()
+            .filter(|operation| operation.verb == "get" && operation.key == "<generation>.msgpack")
+            .collect::<Vec<_>>();
+        assert_eq!(history.len(), 4);
+        assert_eq!(
+            history
+                .iter()
+                .map(|operation| operation.successful_bytes)
+                .sum::<u64>(),
+            1_782
+        );
+        let last_start = history
+            .iter()
+            .map(|operation| operation.start_seq)
+            .max()
+            .expect("timestamp history GET fixture must not be empty");
+        let first_finish = history
+            .iter()
+            .map(|operation| operation.end_seq)
+            .min()
+            .expect("timestamp history GET fixture must not be empty");
+        assert!(
+            last_start < first_finish,
+            "all timestamp history GETs must start before the first completes: {history:#?}"
+        );
+    }
+
     #[test]
     fn deterministic_vector_fixture_has_unique_ids_and_attributes() {
         let vectors = base_vectors();
