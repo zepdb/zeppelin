@@ -830,6 +830,14 @@ async fn run_scenario_inner(
                     panic!("failed to invalidate measured cache key {key}: {error}")
                 });
         }
+        if measure_mutates(&spec.measure) {
+            // The checked-in write contracts are frozen cold writer rounds:
+            // each repeat historically starts with one authoritative manifest
+            // GET. Make that pre-state explicit now that production retains a
+            // disposable post-CAS memo. The ignored ideal-analysis catalog owns
+            // the separate warm 0-GET group-commit scenario.
+            measured_server.reset_wal_writer_state(measured_namespace);
+        }
         let started = Instant::now();
         let mut measured = execute_measure_once(
             &client,

@@ -514,6 +514,7 @@ pub struct FullTestServer {
     pub compactor: Arc<Compactor>,
     pub lease_manager: Arc<LeaseManager>,
     pub manifest_cache: Arc<ManifestCache>,
+    wal_writer: Arc<WalWriter>,
     pub shutdown_compaction: Option<tokio::sync::watch::Sender<bool>>,
     pub compaction_loop_task: Option<JoinHandle<()>>,
     pub server_task: JoinHandle<()>,
@@ -521,6 +522,11 @@ pub struct FullTestServer {
 }
 
 impl FullTestServer {
+    /// Drop disposable per-namespace writer state between measured test rounds.
+    pub fn reset_wal_writer_state(&self, namespace: &str) {
+        self.wal_writer.remove_lock(namespace);
+    }
+
     /// Abort the HTTP server and compaction loop without draining in-flight work.
     pub fn abort(&mut self) {
         self.server_task.abort();
@@ -635,12 +641,13 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let hydrator = maybe_hydrator(&config, &store, &cache);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
+    let wal_writer = Arc::new(WalWriter::with_clock(store.clone(), clock.clone()));
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
         namespace_manager,
         namespace_name_prefix,
-        wal_writer: Arc::new(WalWriter::with_clock(store.clone(), clock.clone())),
+        wal_writer: wal_writer.clone(),
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),
         lease_manager: lease_manager.clone(),
@@ -683,6 +690,7 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
         compactor,
         lease_manager,
         manifest_cache,
+        wal_writer,
         shutdown_compaction,
         compaction_loop_task,
         server_task,

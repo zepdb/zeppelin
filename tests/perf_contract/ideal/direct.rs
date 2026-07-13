@@ -8,7 +8,8 @@ use std::time::Duration;
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::error::ZeppelinError;
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::wal::{Lease, LeaseManager, Manifest};
+use zeppelin::types::VectorEntry;
+use zeppelin::wal::{Lease, LeaseManager, Manifest, WalWriter};
 
 use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
@@ -16,13 +17,15 @@ use crate::perf_contract::depth::{
     depth_store, DepthTracker, PhysicalRequest, SpanKind, SpanOutcome,
 };
 use crate::perf_contract::injection::{
-    inject_lease_retry_conflict, inject_missing_lease_put_etag, LeaseRetryConflictHandle,
-    MissingLeasePutEtagHandle,
+    inject_lease_retry_conflict, inject_missing_lease_put_etag, inject_missing_manifest_put_etag,
+    LeaseRetryConflictHandle, MissingLeasePutEtagHandle, MissingManifestPutEtagHandle,
 };
 use crate::perf_contract::scenario::RepeatCounters;
 
 use super::artifacts::IdealSample;
-use super::catalog::{IdealCase, IdealOperation, LeaseCase, ManifestCacheCase, OperationalCase};
+use super::catalog::{
+    IdealCase, IdealOperation, LeaseCase, ManifestCacheCase, OperationalCase, VectorWriteCase,
+};
 
 /// Execute one safe direct-domain catalog case.
 ///
@@ -35,6 +38,11 @@ pub(crate) fn supports(case: &IdealCase) -> bool {
         IdealOperation::Operational(OperationalCase::StartupStorageProbe)
             | IdealOperation::Lease(_)
             | IdealOperation::ManifestCache(_)
+            | IdealOperation::VectorWrite(
+                VectorWriteCase::GroupCommitConflict
+                    | VectorWriteCase::GroupCommitMissingPutEtag
+                    | VectorWriteCase::GroupCommitWarm
+            )
     )
 }
 
@@ -47,6 +55,11 @@ pub(crate) async fn execute(case: &IdealCase) -> Option<IdealSample> {
         IdealOperation::ManifestCache(operation) => {
             Some(execute_manifest_cache(case, operation).await)
         }
+        IdealOperation::VectorWrite(
+            operation @ (VectorWriteCase::GroupCommitConflict
+            | VectorWriteCase::GroupCommitMissingPutEtag
+            | VectorWriteCase::GroupCommitWarm),
+        ) => Some(execute_group_commit(case, operation).await),
         _ => None,
     }
 }
@@ -74,6 +87,12 @@ impl DirectWorld {
     async fn with_missing_lease_put_etag() -> (Self, MissingLeasePutEtagHandle) {
         let harness = TestHarness::new().await;
         let (store, handle) = inject_missing_lease_put_etag(&harness.store);
+        (Self::from_store(harness, &store), handle)
+    }
+
+    async fn with_missing_manifest_put_etag() -> (Self, MissingManifestPutEtagHandle) {
+        let harness = TestHarness::new().await;
+        let (store, handle) = inject_missing_manifest_put_etag(&harness.store);
         (Self::from_store(harness, &store), handle)
     }
 
@@ -135,6 +154,255 @@ async fn execute_operational(case: &IdealCase, operation: OperationalCase) -> Id
         }
     }
     world.finish(case).await
+}
+
+async fn execute_group_commit(case: &IdealCase, operation: VectorWriteCase) -> IdealSample {
+    if operation == VectorWriteCase::GroupCommitMissingPutEtag {
+        return execute_group_commit_missing_put_etag(case).await;
+    }
+
+    let world = DirectWorld::new().await;
+    let namespace = world.namespace(case.id.as_str());
+    Manifest::new()
+        .write(&world.store, &namespace)
+        .await
+        .expect("ideal warm group-commit manifest setup failed");
+    let writer = WalWriter::new(world.store.clone());
+    writer
+        .append(
+            &namespace,
+            vec![VectorEntry {
+                id: "group-commit-prime".to_string(),
+                values: vec![0.0, 1.0, 0.0, 1.0],
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .expect("ideal warm group-commit prime failed");
+
+    if operation == VectorWriteCase::GroupCommitConflict {
+        let (mut external, version) = Manifest::read_versioned(&world.store, &namespace)
+            .await
+            .expect("ideal group-commit conflict setup read failed")
+            .expect("ideal group-commit conflict setup manifest missing");
+        external.fencing_token = 41;
+        external
+            .write_conditional(&world.store, &namespace, &version)
+            .await
+            .expect("ideal group-commit conflict setup publication failed");
+    }
+
+    world.begin_measurement().await;
+    writer
+        .append(
+            &namespace,
+            vec![VectorEntry {
+                id: "group-commit-measured".to_string(),
+                values: vec![1.0, 0.0, 1.0, 0.0],
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .expect("ideal warm group-commit append failed");
+
+    let sample = world.snapshot(case).await;
+    match operation {
+        VectorWriteCase::GroupCommitConflict => assert_group_commit_conflict_shape(&sample),
+        VectorWriteCase::GroupCommitWarm => assert_group_commit_warm_shape(&sample),
+        _ => unreachable!("missing-ETag group commit has a dedicated world"),
+    }
+    world.cleanup(sample).await
+}
+
+async fn execute_group_commit_missing_put_etag(case: &IdealCase) -> IdealSample {
+    let (world, injection) = DirectWorld::with_missing_manifest_put_etag().await;
+    let namespace = world.namespace(case.id.as_str());
+    Manifest::new()
+        .write(&world.store, &namespace)
+        .await
+        .expect("ideal missing-ETag group-commit manifest setup failed");
+    let writer = WalWriter::new(world.store.clone());
+    writer
+        .append(
+            &namespace,
+            vec![VectorEntry {
+                id: "group-commit-missing-etag-prime".to_string(),
+                values: vec![0.0, 1.0, 0.0, 1.0],
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .expect("ideal missing-ETag group-commit prime failed");
+
+    world.begin_measurement().await;
+    writer
+        .append(
+            &namespace,
+            vec![VectorEntry {
+                id: "group-commit-missing-etag-measured".to_string(),
+                values: vec![1.0, 0.0, 1.0, 0.0],
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .expect("ideal missing-ETag group-commit append failed");
+
+    let sample = world.snapshot(case).await;
+    assert_group_commit_missing_put_etag_shape(&sample);
+    assert_eq!(
+        injection.stripped(),
+        2,
+        "both successful group-commit CAS responses must omit their ETags"
+    );
+    world.cleanup(sample).await
+}
+
+fn assert_group_commit_warm_shape(sample: &IdealSample) {
+    assert_eq!(
+        sample.total_get_ops, 0,
+        "a warm group-commit round must issue no manifest GET"
+    );
+    assert_eq!(sample.total_get_bytes, 0);
+    assert_eq!(
+        sample.physical_operations.len(),
+        3,
+        "warm group commit must write one WAL, one history, and one live manifest: {:?}",
+        sample.physical_operations
+    );
+    let expected = [
+        (
+            "put",
+            PhysicalRequest::PutOverwrite,
+            SpanOutcome::Success,
+            "<wal>.wal",
+        ),
+        (
+            "put",
+            PhysicalRequest::PutCreate,
+            SpanOutcome::Success,
+            "<generation>.msgpack",
+        ),
+        (
+            "put",
+            PhysicalRequest::PutUpdate,
+            SpanOutcome::Success,
+            "manifest.json",
+        ),
+    ];
+    for (operation, (verb, request, outcome, key)) in
+        sample.physical_operations.iter().zip(expected)
+    {
+        assert_eq!(operation.verb, verb);
+        assert_eq!(operation.request, request);
+        assert_eq!(operation.outcome, outcome);
+        assert_eq!(operation.key, key);
+    }
+}
+
+fn assert_group_commit_conflict_shape(sample: &IdealSample) {
+    assert_eq!(
+        sample.total_get_ops, 3,
+        "a stale group-commit memo must validate history and rebuild from S3"
+    );
+    assert_eq!(sample.physical_operations.len(), 7);
+    let expected = [
+        (
+            "put",
+            PhysicalRequest::PutOverwrite,
+            SpanOutcome::Success,
+            "<wal>.wal",
+        ),
+        (
+            "put",
+            PhysicalRequest::PutCreate,
+            SpanOutcome::Precondition,
+            "<generation>.msgpack",
+        ),
+        (
+            "get",
+            PhysicalRequest::GetFull,
+            SpanOutcome::Success,
+            "<generation>.msgpack",
+        ),
+        (
+            "get",
+            PhysicalRequest::GetFull,
+            SpanOutcome::Success,
+            "manifest.json",
+        ),
+        (
+            "get",
+            PhysicalRequest::GetFull,
+            SpanOutcome::Success,
+            "manifest.json",
+        ),
+        (
+            "put",
+            PhysicalRequest::PutCreate,
+            SpanOutcome::Success,
+            "<generation>.msgpack",
+        ),
+        (
+            "put",
+            PhysicalRequest::PutUpdate,
+            SpanOutcome::Success,
+            "manifest.json",
+        ),
+    ];
+    for (operation, (verb, request, outcome, key)) in
+        sample.physical_operations.iter().zip(expected)
+    {
+        assert_eq!(operation.verb, verb);
+        assert_eq!(operation.request, request);
+        assert_eq!(operation.outcome, outcome);
+        assert_eq!(operation.key, key);
+    }
+}
+
+fn assert_group_commit_missing_put_etag_shape(sample: &IdealSample) {
+    assert_eq!(
+        sample.total_get_ops, 1,
+        "a missing prior CAS ETag must keep the next group commit cold"
+    );
+    assert_eq!(sample.physical_operations.len(), 4);
+    let expected = [
+        (
+            "put",
+            PhysicalRequest::PutOverwrite,
+            SpanOutcome::Success,
+            "<wal>.wal",
+        ),
+        (
+            "get",
+            PhysicalRequest::GetFull,
+            SpanOutcome::Success,
+            "manifest.json",
+        ),
+        (
+            "put",
+            PhysicalRequest::PutCreate,
+            SpanOutcome::Success,
+            "<generation>.msgpack",
+        ),
+        (
+            "put",
+            PhysicalRequest::PutUpdate,
+            SpanOutcome::Success,
+            "manifest.json",
+        ),
+    ];
+    for (operation, (verb, request, outcome, key)) in
+        sample.physical_operations.iter().zip(expected)
+    {
+        assert_eq!(operation.verb, verb);
+        assert_eq!(operation.request, request);
+        assert_eq!(operation.outcome, outcome);
+        assert_eq!(operation.key, key);
+    }
 }
 
 fn assert_warm_lease_renewal_shape(sample: &IdealSample) {
@@ -819,6 +1087,51 @@ mod tests {
             .physical_verb_mode_totals
             .iter()
             .any(|total| total.verb == "list" && total.mode == "list_delimiter"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn warm_group_commit_is_three_puts_without_manifest_get() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "writer.group_commit_warm")
+            .expect("warm group-commit direct case must exist");
+
+        let sample = execute(case)
+            .await
+            .expect("warm group-commit case must have a direct executor");
+
+        assert_group_commit_warm_shape(&sample);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn stale_group_commit_memo_rebuilds_after_history_conflict() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "writer.group_commit_conflict")
+            .expect("conflicting group-commit direct case must exist");
+
+        let sample = execute(case)
+            .await
+            .expect("conflicting group-commit case must have a direct executor");
+
+        assert_group_commit_conflict_shape(&sample);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio"]
+    async fn missing_manifest_put_etag_keeps_next_group_commit_cold() {
+        let case = catalog::all()
+            .iter()
+            .find(|case| case.id.as_str() == "writer.group_commit_missing_put_etag")
+            .expect("missing-ETag group-commit direct case must exist");
+
+        let sample = execute(case)
+            .await
+            .expect("missing-ETag group-commit case must have a direct executor");
+
+        assert_group_commit_missing_put_etag_shape(&sample);
     }
 
     #[tokio::test]

@@ -107,6 +107,9 @@ pub(crate) enum VectorWriteCase {
     UpsertIntoEmpty,
     UpsertIntoCompacted,
     DeleteBatch,
+    GroupCommitConflict,
+    GroupCommitMissingPutEtag,
+    GroupCommitWarm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -393,6 +396,21 @@ pub(crate) const IDEAL_CASES: &[IdealCase] = &[
         "vector.delete_batch",
         IdealCaseGroup::VectorWrite,
         IdealOperation::VectorWrite(VectorWriteCase::DeleteBatch),
+    ),
+    ideal_case(
+        "writer.group_commit_conflict",
+        IdealCaseGroup::VectorWrite,
+        IdealOperation::VectorWrite(VectorWriteCase::GroupCommitConflict),
+    ),
+    ideal_case(
+        "writer.group_commit_missing_put_etag",
+        IdealCaseGroup::VectorWrite,
+        IdealOperation::VectorWrite(VectorWriteCase::GroupCommitMissingPutEtag),
+    ),
+    ideal_case(
+        "writer.group_commit_warm",
+        IdealCaseGroup::VectorWrite,
+        IdealOperation::VectorWrite(VectorWriteCase::GroupCommitWarm),
     ),
     ideal_case(
         "query.ann_strong_wal_only",

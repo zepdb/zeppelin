@@ -16,7 +16,7 @@ use zeppelin::error::ZeppelinError;
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
 use zeppelin::types::ConsistencyLevel;
-use zeppelin::wal::{Lease, LeaseManager, Manifest};
+use zeppelin::wal::{Lease, LeaseManager, Manifest, WalReader};
 
 use crate::common::counting::{counting_store, ArtifactClass, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
@@ -8740,7 +8740,7 @@ mod outcome_tests {
     }
 
     #[tokio::test]
-    async fn acknowledged_torn_manifest_put_skips_generation_and_fails_loudly() {
+    async fn acknowledged_torn_manifest_put_fails_reads_until_memo_cas_repairs_it() {
         let harness = TestHarness::new().await;
         let prefix = harness.prefix.clone();
         let namespace = format!("{prefix}-acknowledged-torn-manifest");
@@ -8833,6 +8833,49 @@ mod outcome_tests {
         assert_eq!(timeline[0].semantics, FaultSemantics::PostCommit);
         assert_eq!(timeline[0].observed, ObservedResult::Corrupted);
 
+        // TornWrite violates provider assumption A1: the backend acknowledged
+        // a different body than the caller supplied. The same writer may still
+        // repair that object safely: its returned ETag identifies the corrupt
+        // live object, while its memo retains the fully published history
+        // candidate. A conditional replacement must preserve both acknowledged
+        // fragments; reads before that replacement remain fail-loud.
+        let repair = client
+            .post(format!(
+                "{}/v1/namespaces/{namespace}/vectors",
+                server.base_url
+            ))
+            .json(&json!({
+                "vectors": [{ "id": "two", "values": [0.0, 1.0] }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(repair.status(), StatusCode::OK);
+
+        let repaired = Manifest::read(&harness.store, &namespace)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.fragments.len(), 2);
+        let visible_ids = WalReader::new(harness.store.clone())
+            .read_uncompacted_fragments(&namespace)
+            .await
+            .unwrap()
+            .into_iter()
+            .flat_map(|fragment| fragment.vectors.into_iter().map(|vector| vector.id))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            visible_ids,
+            BTreeSet::from(["one".to_string(), "two".to_string()])
+        );
+        let repaired_get = client
+            .get(format!("{}/v1/namespaces/{namespace}", server.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(repaired_get.status(), StatusCode::OK);
+        assert_eq!(scheduler.timeline().len(), 1);
+
         server.shutdown().await;
         harness.cleanup().await;
     }
@@ -8896,8 +8939,11 @@ mod outcome_tests {
             .expect("torn live-manifest key must contain its namespace")
             .to_string();
 
-        // Read-time integrity stays authoritative: every later direct
-        // data-path op on the durably corrupted namespace fails loudly.
+        // Read-time integrity stays authoritative until a writer holding the
+        // exact acknowledged candidate repairs the provider-abuse write with
+        // an ETag-guarded CAS. Before that repair every data-path operation
+        // fails loudly; the repair itself must be a successful mutation, after
+        // which reads may succeed again.
         let records = read_ops(&seed_dir);
         let later: Vec<_> = records
             .iter()
@@ -8919,15 +8965,38 @@ mod outcome_tests {
             "seed 127 must keep exercising the corrupted namespace, saw {}",
             later.len()
         );
-        for record in later {
+        let repair_index = later
+            .iter()
+            .position(|record| record.status < 500)
+            .expect("the same writer must eventually repair the torn manifest");
+        for record in &later[..repair_index] {
             assert!(
                 record.status >= 500,
-                "op {} ({}) on the durably corrupted namespace must fail loudly, got {}",
+                "op {} ({}) before manifest repair must fail loudly, got {}",
                 record.index,
                 record.op.kind(),
                 record.status
             );
         }
+        let repair = later[repair_index];
+        assert!(
+            matches!(repair.op, Op::Upsert { .. } | Op::DeleteVectors { .. }),
+            "only a manifest mutation may repair the torn live object: {repair:?}"
+        );
+        assert!(
+            (200..300).contains(&repair.status),
+            "manifest repair must complete successfully: {repair:?}"
+        );
+        assert!(
+            later[repair_index + 1..].iter().any(|record| {
+                (200..300).contains(&record.status)
+                    && matches!(
+                        record.op,
+                        Op::Query { .. } | Op::FetchVectors { .. } | Op::GetNamespace { .. }
+                    )
+            }),
+            "seed 127 must prove that a read succeeds after the memo CAS repair"
+        );
     }
 
     #[tokio::test]
@@ -11374,21 +11443,24 @@ mod outcome_tests {
         assert!(!source_outcome.failed, "{:?}", source_outcome.violations);
 
         let source_records = read_ops(&source_dir);
-        let expected_workload_indices = (0..11).collect::<Vec<_>>();
-        let expected_drain_indices = (11..20).collect::<Vec<_>>();
+        // The warm delete at op 10 now validates its writer memo through the
+        // manifest CAS and issues no manifest GET. The pinned HoldCall remains
+        // pending until the fetch at op 11 performs the next matching GET.
+        let expected_workload_indices = (0..12).collect::<Vec<_>>();
+        let expected_drain_indices = (12..20).collect::<Vec<_>>();
         assert_eq!(
             source_records
                 .iter()
                 .filter(|record| record.execution.phase == ExecutionPhase::Workload)
                 .count(),
-            11
+            12
         );
         assert_eq!(
             source_records
                 .iter()
                 .filter(|record| record.execution.phase == ExecutionPhase::DeferredDrain)
                 .count(),
-            9
+            8
         );
         assert_eq!(
             phase_indices(&source_records, ExecutionPhase::Workload),
@@ -11405,14 +11477,14 @@ mod outcome_tests {
             .iter()
             .find(|record| record.execution.hold.is_some())
             .expect("pinned seed 3 must record one held foreground op");
-        assert_eq!(held.index, 10);
+        assert_eq!(held.index, 11);
         assert_eq!(
             held.execution.hold,
             Some(HeldExecutionMetadata {
                 event_id: "sched-01".to_string(),
-                window_op: 10,
-                scheduled_release_op: Some(14),
-                actual_join_op: 11,
+                window_op: 11,
+                scheduled_release_op: Some(15),
+                actual_join_op: 12,
                 release_cause: HoldReleaseCause::Quiesce,
             })
         );

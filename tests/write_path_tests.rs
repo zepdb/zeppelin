@@ -12,15 +12,44 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use common::counting::counting_store;
 use common::harness::TestHarness;
 use common::vectors::random_vectors;
 
 use zeppelin::error::ZeppelinError;
+use zeppelin::time::{Clock, TimeSource};
 use zeppelin::types::VectorEntry;
-use zeppelin::wal::{Manifest, WalWriter};
+use zeppelin::wal::{LeaseManager, Manifest, WalWriter};
+
+#[derive(Debug)]
+struct AdjustableTimeSource {
+    now_ms: AtomicI64,
+}
+
+impl AdjustableTimeSource {
+    fn new(now: DateTime<Utc>) -> Self {
+        Self {
+            now_ms: AtomicI64::new(now.timestamp_millis()),
+        }
+    }
+
+    fn jump(&self, delta: chrono::Duration) {
+        self.now_ms
+            .fetch_add(delta.num_milliseconds(), Ordering::SeqCst);
+    }
+}
+
+impl TimeSource for AdjustableTimeSource {
+    fn now(&self) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(self.now_ms.load(Ordering::SeqCst))
+            .expect("adjustable write-path timestamp must be representable")
+    }
+}
 
 /// Count fragment objects under a namespace's wal/ prefix.
 async fn wal_fragment_count(store: &zeppelin::storage::ZeppelinStore, ns: &str) -> usize {
@@ -314,6 +343,309 @@ async fn test_single_append_roundtrip_unchanged() {
         1,
         "the append needs one manifest CAS-base GET and no post-PUT verification GET"
     );
+
+    harness.cleanup().await;
+}
+
+/// A single writer should carry the manifest and ETag returned by its first
+/// successful CAS into later group-commit rounds. S3 still validates every
+/// round through the conditional PUT; only the redundant base GET disappears.
+#[tokio::test]
+async fn test_sequential_group_commit_reuses_committed_manifest_etag() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("group-commit-manifest-memo");
+    let (store, counter) = counting_store(&harness.store);
+    Manifest::new().write(&store, &ns).await.unwrap();
+    counter.reset();
+
+    let writer = WalWriter::new(store);
+    let rounds = 4;
+    for round in 0..rounds {
+        let vectors = vec![VectorEntry {
+            id: format!("memo_round_{round}"),
+            values: random_vectors(1, 8)[0].values.clone(),
+            attributes: None,
+        }];
+        writer.append(&ns, vectors, vec![]).await.unwrap();
+    }
+
+    assert_eq!(
+        counter.gets_matching("/manifest.json"),
+        1,
+        "only the cold group-commit round may read the manifest"
+    );
+    assert_eq!(
+        counter.puts_matching("/manifest.json"),
+        rounds,
+        "every group-commit round must remain an authoritative manifest CAS"
+    );
+
+    let authoritative = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(authoritative.fragments.len(), rounds as usize);
+
+    harness.cleanup().await;
+}
+
+/// An out-of-band manifest publication invalidates the writer's optimistic
+/// memo. The failed conditional publication must clear it and retry without
+/// dropping either writer's change. The slow path uses one live GET to prove
+/// the colliding immutable history generation is referenced, then one
+/// versioned live GET to seed the retry.
+#[tokio::test]
+async fn test_group_commit_manifest_memo_conflict_rebuilds_from_authority() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("group-commit-manifest-conflict");
+    let (store, counter) = counting_store(&harness.store);
+    Manifest::new().write(&store, &ns).await.unwrap();
+
+    let writer = WalWriter::new(store);
+    writer
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "memo_before_conflict".to_string(),
+                values: random_vectors(1, 8)[0].values.clone(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    let (mut external, version) = Manifest::read_versioned(&harness.store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    external.fencing_token = 17;
+    external
+        .write_conditional(&harness.store, &ns, &version)
+        .await
+        .unwrap();
+
+    counter.reset();
+    let (_, committed) = writer
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "memo_after_conflict".to_string(),
+                values: random_vectors(1, 8)[0].values.clone(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        counter.gets_matching("/manifest.json"),
+        2,
+        "history-conflict classification and CAS retry each require one live GET"
+    );
+    assert_eq!(committed.fencing_token, 17);
+    assert_eq!(committed.fragments.len(), 2);
+
+    let authoritative = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(authoritative.version(), committed.version());
+    assert_eq!(authoritative.fencing_token, committed.fencing_token);
+    assert_eq!(
+        authoritative
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>(),
+        committed
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>()
+    );
+
+    harness.cleanup().await;
+}
+
+/// A stale leaseholder may pass the fencing check against its memo, but it may
+/// not publish: the intervening holder changed the manifest ETag. After the
+/// conflict, the authoritative reread must expose the new fencing token and
+/// reject the zombie while cleaning its uploaded fragment.
+#[tokio::test]
+async fn test_group_commit_manifest_memo_preserves_fencing_after_takeover() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("group-commit-manifest-fencing");
+    let (store, counter) = counting_store(&harness.store);
+    Manifest::new().write(&store, &ns).await.unwrap();
+
+    let source = Arc::new(AdjustableTimeSource::new(Utc::now()));
+    let clock = Clock::from_source(source.clone());
+    let holder_a = LeaseManager::with_clock(
+        harness.store.clone(),
+        "writer-a".to_string(),
+        Duration::from_secs(10),
+        clock.clone(),
+    );
+    let holder_b = LeaseManager::with_clock(
+        harness.store.clone(),
+        "writer-b".to_string(),
+        Duration::from_secs(10),
+        clock,
+    );
+
+    let lease_a = holder_a.acquire(&ns).await.unwrap();
+    let writer_a = WalWriter::new(store);
+    writer_a
+        .append_with_lease(
+            &ns,
+            vec![VectorEntry {
+                id: "holder_a_visible".to_string(),
+                values: random_vectors(1, 8)[0].values.clone(),
+                attributes: None,
+            }],
+            vec![],
+            Some(lease_a.fencing_token),
+        )
+        .await
+        .unwrap();
+
+    source.jump(chrono::Duration::seconds(11));
+    let lease_b = holder_b.acquire(&ns).await.unwrap();
+    let writer_b = WalWriter::new(harness.store.clone());
+    writer_b
+        .append_with_lease(
+            &ns,
+            vec![VectorEntry {
+                id: "holder_b_visible".to_string(),
+                values: random_vectors(1, 8)[0].values.clone(),
+                attributes: None,
+            }],
+            vec![],
+            Some(lease_b.fencing_token),
+        )
+        .await
+        .unwrap();
+
+    counter.reset();
+    let zombie = writer_a
+        .append_with_lease(
+            &ns,
+            vec![VectorEntry {
+                id: "holder_a_zombie".to_string(),
+                values: random_vectors(1, 8)[0].values.clone(),
+                attributes: None,
+            }],
+            vec![],
+            Some(lease_a.fencing_token),
+        )
+        .await;
+
+    assert!(matches!(
+        zombie,
+        Err(ZeppelinError::FencingTokenStale {
+            our_token,
+            manifest_token,
+            ..
+        }) if our_token == lease_a.fencing_token && manifest_token == lease_b.fencing_token
+    ));
+    assert_eq!(
+        counter.gets_matching("/manifest.json"),
+        2,
+        "history authority and the retry ETag require two live manifest reads"
+    );
+
+    let authoritative = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(authoritative.fencing_token, lease_b.fencing_token);
+    assert_eq!(authoritative.fragments.len(), 2);
+    assert_eq!(wal_fragment_count(&harness.store, &ns).await, 2);
+
+    harness.cleanup().await;
+}
+
+/// A new writer process has no local group state and must seed itself from S3.
+#[tokio::test]
+async fn test_group_commit_manifest_memo_restart_is_cold() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("group-commit-manifest-restart");
+    let (store, counter) = counting_store(&harness.store);
+    Manifest::new().write(&store, &ns).await.unwrap();
+
+    WalWriter::new(store.clone())
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "before_restart".to_string(),
+                values: random_vectors(1, 8)[0].values.clone(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    counter.reset();
+    WalWriter::new(store)
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "after_restart".to_string(),
+                values: random_vectors(1, 8)[0].values.clone(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(counter.gets_matching("/manifest.json"), 1);
+    harness.cleanup().await;
+}
+
+/// Namespace deletion drops the per-namespace group state. Recreating the same
+/// name must therefore start cold and never reuse the deleted incarnation's
+/// manifest or ETag.
+#[tokio::test]
+async fn test_group_commit_manifest_memo_namespace_recreate_is_cold() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("group-commit-manifest-recreate");
+    let (store, counter) = counting_store(&harness.store);
+    Manifest::new().write(&store, &ns).await.unwrap();
+
+    let writer = WalWriter::new(store);
+    writer
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "old_incarnation".to_string(),
+                values: random_vectors(1, 8)[0].values.clone(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    writer.remove_lock(&ns);
+    harness
+        .store
+        .delete_prefix(&format!("{ns}/"))
+        .await
+        .unwrap();
+    Manifest::new().write(&harness.store, &ns).await.unwrap();
+
+    counter.reset();
+    writer
+        .append(
+            &ns,
+            vec![VectorEntry {
+                id: "new_incarnation".to_string(),
+                values: random_vectors(1, 8)[0].values.clone(),
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(counter.gets_matching("/manifest.json"), 1);
+    let authoritative = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(authoritative.fragments.len(), 1);
 
     harness.cleanup().await;
 }

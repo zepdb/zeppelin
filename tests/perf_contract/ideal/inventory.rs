@@ -1871,6 +1871,56 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
         ideal_case("vector.upsert_into_empty"),
     ),
     path(
+        "catalog.writer.group_commit_conflict",
+        "src/wal/writer.rs:WalWriter::commit_pending_group",
+        &[
+            StoreMethod::Put,
+            StoreMethod::Get,
+            StoreMethod::GetWithMeta,
+            StoreMethod::PutIfNotExists,
+            StoreMethod::PutIfMatch,
+        ],
+        &[
+            PhysicalVariant::PutOverwrite,
+            PhysicalVariant::GetFull,
+            PhysicalVariant::PutCreate,
+            PhysicalVariant::PutUpdate,
+        ],
+        ideal_case("writer.group_commit_conflict"),
+    ),
+    path(
+        "catalog.writer.group_commit_missing_put_etag",
+        "src/wal/writer.rs:WalWriter::commit_pending_group",
+        &[
+            StoreMethod::Put,
+            StoreMethod::GetWithMeta,
+            StoreMethod::PutIfNotExists,
+            StoreMethod::PutIfMatch,
+        ],
+        &[
+            PhysicalVariant::PutOverwrite,
+            PhysicalVariant::GetFull,
+            PhysicalVariant::PutCreate,
+            PhysicalVariant::PutUpdate,
+        ],
+        ideal_case("writer.group_commit_missing_put_etag"),
+    ),
+    path(
+        "catalog.writer.group_commit_warm",
+        "src/wal/writer.rs:WalWriter::commit_pending_group",
+        &[
+            StoreMethod::Put,
+            StoreMethod::PutIfNotExists,
+            StoreMethod::PutIfMatch,
+        ],
+        &[
+            PhysicalVariant::PutOverwrite,
+            PhysicalVariant::PutCreate,
+            PhysicalVariant::PutUpdate,
+        ],
+        ideal_case("writer.group_commit_warm"),
+    ),
+    path(
         "catalog.warm_query_eventual",
         "src/server/handlers/query.rs:query_namespace",
         &[StoreMethod::Get, StoreMethod::GetRange],

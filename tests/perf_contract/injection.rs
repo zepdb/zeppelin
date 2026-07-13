@@ -235,6 +235,110 @@ pub(crate) fn inject_missing_lease_put_etag(
     )
 }
 
+/// Proof handle for a backend response that omits manifest-CAS ETags.
+#[derive(Clone, Debug)]
+pub(crate) struct MissingManifestPutEtagHandle {
+    stripped: Arc<AtomicUsize>,
+}
+
+impl MissingManifestPutEtagHandle {
+    #[must_use]
+    pub(crate) fn stripped(&self) -> usize {
+        self.stripped.load(Ordering::SeqCst)
+    }
+}
+
+/// Real-store decorator that preserves successful live-manifest CAS writes but
+/// removes their response ETags. The writer must commit successfully while
+/// declining to populate its process-local memo.
+#[derive(Debug)]
+struct MissingManifestPutEtagStore {
+    inner: Arc<dyn ObjectStore>,
+    stripped: Arc<AtomicUsize>,
+}
+
+pub(crate) fn inject_missing_manifest_put_etag(
+    store: &ZeppelinStore,
+) -> (ZeppelinStore, MissingManifestPutEtagHandle) {
+    let stripped = Arc::new(AtomicUsize::new(0));
+    let wrapped = MissingManifestPutEtagStore {
+        inner: store.inner(),
+        stripped: Arc::clone(&stripped),
+    };
+    (
+        ZeppelinStore::new_with_native_batch_delete(Arc::new(wrapped)),
+        MissingManifestPutEtagHandle { stripped },
+    )
+}
+
+impl fmt::Display for MissingManifestPutEtagStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MissingManifestPutEtagStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for MissingManifestPutEtagStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        let omit_etag =
+            location.as_ref().ends_with("manifest.json") && matches!(opts.mode, PutMode::Update(_));
+        let mut result = self.inner.put_opts(location, payload, opts).await?;
+        if omit_etag {
+            result.e_tag = None;
+            self.stripped.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(result)
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
 impl fmt::Display for MissingLeasePutEtagStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "MissingLeasePutEtagStore({})", self.inner)

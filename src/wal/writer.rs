@@ -23,7 +23,8 @@
 //!          one async commit leader
 //!                     |
 //!                     v
-//!       read manifest + ETag from S3
+//!       use last committed manifest + ETag
+//!       (cold start reads the pair from S3)
 //!                     |
 //!          fencing check rejects zombie
 //!                     |
@@ -58,6 +59,14 @@
 //!   are equal; mixing generations would let stale work ride with current work.
 //! - Fencing and CAS are both required. A token check alone has a time-of-check /
 //!   time-of-use race; CAS alone does not identify a zombie based on old work.
+//! - The last successful manifest/ETag pair is only an optimistic CAS base. Any
+//!   conflict or error discards it, and the retry rebuilds from S3 before
+//!   rechecking fencing. A backend that omits the new ETag keeps the next round
+//!   cold.
+//! - Memo safety relies on the S3 contract that a successful conditional PUT
+//!   atomically stores the submitted body. If a provider acknowledges different
+//!   bytes, the returned ETag can name that corrupt object; this is classified
+//!   as provider-contract abuse rather than a supported-v1 storage outcome.
 //! - A successful append reply includes a manifest that references that append's
 //!   fragment. Definite manifest/fencing failures handled by the leader attempt
 //!   exact-object cleanup. An ambiguous manifest-write error first re-reads S3;
@@ -92,7 +101,7 @@ use crate::time::Clock;
 use crate::types::{VectorEntry, VectorId};
 
 use super::fragment::WalFragment;
-use super::manifest::{FragmentRef, Manifest};
+use super::manifest::{FragmentRef, Manifest, ManifestVersion};
 
 /// Maximum number of manifest CAS attempts made for one commit batch.
 ///
@@ -171,6 +180,33 @@ struct GroupCommitState {
     pending: std::sync::Mutex<Vec<PendingCommit>>,
     /// Elects one task to serialize manifest CAS rounds for this namespace.
     commit_lock: Mutex<()>,
+    /// Last manifest this process committed, paired with that CAS PUT's ETag.
+    ///
+    /// This is disposable optimistic state: only a successful conditional
+    /// publication with a backend-provided ETag may populate it. Every
+    /// conflict, terminal error, or missing ETag clears it. The mutex is never
+    /// held across `.await`.
+    committed: std::sync::Mutex<Option<(Manifest, ManifestVersion)>>,
+}
+
+impl GroupCommitState {
+    fn committed_snapshot(&self) -> Option<(Manifest, ManifestVersion)> {
+        self.committed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn replace_committed(&self, value: Option<(Manifest, ManifestVersion)>) {
+        *self
+            .committed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = value;
+    }
+
+    fn clear_committed(&self) {
+        self.replace_committed(None);
+    }
 }
 
 /// Writes immutable fragments and group-commits their manifest references.
@@ -581,18 +617,22 @@ impl WalWriter {
     ///
     /// # Consistency
     ///
-    /// Every retry starts from a fresh manifest/ETag pair and repeats the fencing
-    /// check before CAS. Same-token grouping prevents one lease generation from
-    /// gaining visibility under another generation's successful check. Deferred
-    /// items remain queued while the caller retains leadership, avoiding the
+    /// The first attempt may use the last manifest/ETag pair this process
+    /// successfully committed. CAS remains authoritative: a conflict clears the
+    /// memo, and every retry reads a fresh pair before repeating the fencing
+    /// check. Same-token grouping prevents one lease generation from gaining
+    /// visibility under another generation's successful check. Deferred items
+    /// remain queued while the caller retains leadership, avoiding the
     /// self-deadlock where a leader waits for a reply only it can produce.
     ///
     /// # Performance
     ///
-    /// Queue partitioning is linear in pending waiters. Each attempt performs one
-    /// manifest GET; success adds one history/publication sequence through
-    /// [`Manifest::write_conditional`]. Cloning [`Manifest`] for every reply can
-    /// allocate in proportion to manifest size and batch length.
+    /// Queue partitioning is linear in pending waiters. A cold attempt performs
+    /// one manifest GET; consecutive successful rounds reuse the prior CAS
+    /// result and perform no manifest GET. Success adds one history/publication
+    /// sequence through [`Manifest::write_conditional`]. Cloning [`Manifest`]
+    /// for the memo and every reply can allocate in proportion to manifest size
+    /// and batch length.
     ///
     /// # Examples
     ///
@@ -643,10 +683,17 @@ impl WalWriter {
         // proof: the conditional PUT may have committed before its reply was
         // lost, so that path re-reads S3 before deciding whether cleanup is safe.
         for attempt in 0..MAX_CAS_RETRIES {
-            let (mut manifest, version) =
-                match Manifest::read_versioned(&self.store, namespace).await {
+            let memo = if attempt == 0 {
+                group.committed_snapshot()
+            } else {
+                None
+            };
+            let (mut manifest, version) = match memo {
+                Some(pair) => pair,
+                None => match Manifest::read_versioned(&self.store, namespace).await {
                     Ok(Some(pair)) => pair,
                     Ok(None) => {
+                        group.clear_committed();
                         self.fail_batch(namespace, batch, |_| ZeppelinError::ManifestNotFound {
                             namespace: namespace.to_string(),
                         })
@@ -654,6 +701,7 @@ impl WalWriter {
                         return true;
                     }
                     Err(e) => {
+                        group.clear_committed();
                         let msg = e.to_string();
                         self.fail_batch(namespace, batch, |_| {
                             ZeppelinError::Index(format!("manifest read failed: {msg}"))
@@ -661,11 +709,13 @@ impl WalWriter {
                         .await;
                         return true;
                     }
-                };
+                },
+            };
 
             // Layer 1: Fencing check — reject zombie writers before committing.
             if let Some(token) = fencing_token {
                 if manifest.fencing_token > token {
+                    group.clear_committed();
                     let mtoken = manifest.fencing_token;
                     self.fail_batch(namespace, batch, |_| ZeppelinError::FencingTokenStale {
                         namespace: namespace.to_string(),
@@ -689,7 +739,13 @@ impl WalWriter {
                 .write_conditional(&self.store, namespace, &version)
                 .await
             {
-                Ok(_) => {
+                Ok(new_version) => {
+                    let next_memo = if new_version.0.is_some() {
+                        Some((manifest.clone(), new_version))
+                    } else {
+                        None
+                    };
+                    group.replace_committed(next_memo);
                     debug!(
                         batched = batch.len(),
                         fragment_count = manifest.fragments.len(),
@@ -702,6 +758,7 @@ impl WalWriter {
                     return true;
                 }
                 Err(ZeppelinError::ManifestConflict { .. }) => {
+                    group.clear_committed();
                     warn!(
                         attempt,
                         namespace,
@@ -712,6 +769,7 @@ impl WalWriter {
                     continue;
                 }
                 Err(e) => {
+                    group.clear_committed();
                     let write_error = e.to_string();
                     match Manifest::read(&self.store, namespace).await {
                         Ok(Some(authoritative)) => {
@@ -800,6 +858,7 @@ impl WalWriter {
         // Retries exhausted under sustained contention: the only terminal error
         // reachable here is a persistent CAS conflict (other errors return
         // early above). Orphan every batched fragment and fail all waiters 409.
+        group.clear_committed();
         self.fail_batch(namespace, batch, |_| ZeppelinError::ManifestConflict {
             namespace: namespace.to_string(),
         })
