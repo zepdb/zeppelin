@@ -62,6 +62,8 @@ pub enum Resource {
     System,
     /// Live runtime query configuration.
     RuntimeConfig,
+    /// S3-authoritative security principals, credentials, grants, and policy.
+    SecurityPolicy,
     /// Namespace data or lifecycle state.
     Namespace(NamespaceId),
     /// One named snapshot within a namespace.
@@ -74,7 +76,23 @@ impl Resource {
     pub fn namespace(&self) -> Option<&NamespaceId> {
         match self {
             Self::Namespace(namespace) | Self::Snapshot(namespace, _) => Some(namespace),
-            Self::System | Self::RuntimeConfig => None,
+            Self::System | Self::RuntimeConfig | Self::SecurityPolicy => None,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::Resource;
+
+    #[test]
+    fn security_policy_resource_is_global_and_round_trips() {
+        let encoded = r#""SecurityPolicy""#;
+        let resource: Resource = serde_json::from_str(encoded)
+            .expect("SecurityPolicy must be a recognized authorization resource");
+
+        assert_eq!(resource.namespace(), None);
+        assert_eq!(serde_json::to_string(&resource).unwrap(), encoded);
     }
 }

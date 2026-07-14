@@ -1,0 +1,20 @@
+{
+  "policy_version": 2,
+  "principals": [
+    {
+      "display_name": "contract-service",
+      "kind": "service",
+      "principal_id": "service:contract"
+    },
+    {
+      "display_name": "contract-forbidden",
+      "kind": "service",
+      "principal_id": "zpk1_contract_forbidden"
+    },
+    {
+      "display_name": "test-admin",
+      "kind": "service",
+      "principal_id": "zpk1_test_admin"
+    }
+  ]
+}

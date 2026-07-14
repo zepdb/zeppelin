@@ -24,7 +24,7 @@ pub struct RouteAction {
     pub class: RouteClass,
 }
 
-/// Complete phase-1 route/action inventory in router declaration order.
+/// Complete phase-3 route/action inventory in router declaration order.
 pub static ROUTE_ACTIONS: &[RouteAction] = &[
     RouteAction {
         method: Method::GET,
@@ -61,6 +61,56 @@ pub static ROUTE_ACTIONS: &[RouteAction] = &[
         method: Method::PUT,
         path: "/v1/config/query",
         class: RouteClass::Protected(Action::RuntimeConfigWrite),
+    },
+    RouteAction {
+        method: Method::GET,
+        path: "/v1/security/principals",
+        class: RouteClass::Protected(Action::SecurityAdminRead),
+    },
+    RouteAction {
+        method: Method::POST,
+        path: "/v1/security/principals",
+        class: RouteClass::Protected(Action::SecurityAdminWrite),
+    },
+    RouteAction {
+        method: Method::GET,
+        path: "/v1/security/keys",
+        class: RouteClass::Protected(Action::SecurityAdminRead),
+    },
+    RouteAction {
+        method: Method::POST,
+        path: "/v1/security/keys",
+        class: RouteClass::Protected(Action::SecurityAdminWrite),
+    },
+    RouteAction {
+        method: Method::POST,
+        path: "/v1/security/keys/:key_id/rotate",
+        class: RouteClass::Protected(Action::SecurityAdminWrite),
+    },
+    RouteAction {
+        method: Method::DELETE,
+        path: "/v1/security/keys/:key_id",
+        class: RouteClass::Protected(Action::SecurityAdminWrite),
+    },
+    RouteAction {
+        method: Method::GET,
+        path: "/v1/security/grants",
+        class: RouteClass::Protected(Action::SecurityAdminRead),
+    },
+    RouteAction {
+        method: Method::POST,
+        path: "/v1/security/grants",
+        class: RouteClass::Protected(Action::SecurityAdminWrite),
+    },
+    RouteAction {
+        method: Method::DELETE,
+        path: "/v1/security/grants",
+        class: RouteClass::Protected(Action::SecurityAdminWrite),
+    },
+    RouteAction {
+        method: Method::GET,
+        path: "/v1/security/policy",
+        class: RouteClass::Protected(Action::SecurityAdminRead),
     },
     RouteAction {
         method: Method::POST,
@@ -199,6 +249,40 @@ mod tests {
         assert_eq!(
             classify_route(&axum::http::Method::GET, "/readyz", true),
             Some(RouteClass::Public)
+        );
+    }
+
+    #[test]
+    fn phase_three_security_route_inventory_is_exact() {
+        let routes = ROUTE_ACTIONS
+            .iter()
+            .filter(|entry| entry.path.starts_with("/v1/security"))
+            .map(|entry| {
+                let RouteClass::Protected(action) = entry.class else {
+                    panic!("security administration routes must never be public");
+                };
+                (entry.method.as_str(), entry.path, action.as_str())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            routes,
+            vec![
+                ("GET", "/v1/security/principals", "SecurityAdminRead"),
+                ("POST", "/v1/security/principals", "SecurityAdminWrite"),
+                ("GET", "/v1/security/keys", "SecurityAdminRead"),
+                ("POST", "/v1/security/keys", "SecurityAdminWrite"),
+                (
+                    "POST",
+                    "/v1/security/keys/:key_id/rotate",
+                    "SecurityAdminWrite"
+                ),
+                ("DELETE", "/v1/security/keys/:key_id", "SecurityAdminWrite"),
+                ("GET", "/v1/security/grants", "SecurityAdminRead"),
+                ("POST", "/v1/security/grants", "SecurityAdminWrite"),
+                ("DELETE", "/v1/security/grants", "SecurityAdminWrite"),
+                ("GET", "/v1/security/policy", "SecurityAdminRead"),
+            ]
         );
     }
 

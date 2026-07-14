@@ -27,6 +27,86 @@
       "response": "readyz_gated_401.resp.json"
     },
     {
+      "name": "security_create_principal",
+      "method": "POST",
+      "path": "/v1/security/principals",
+      "status": 201,
+      "request": "security_create_principal.req.json",
+      "response": "security_create_principal.resp.json"
+    },
+    {
+      "name": "security_list_principals",
+      "method": "GET",
+      "path": "/v1/security/principals",
+      "status": 200,
+      "request": "security_list_principals.req.json",
+      "response": "security_list_principals.resp.json"
+    },
+    {
+      "name": "security_create_key",
+      "method": "POST",
+      "path": "/v1/security/keys",
+      "status": 201,
+      "request": "security_create_key.req.json",
+      "response": "security_create_key.resp.json"
+    },
+    {
+      "name": "security_rotate_key",
+      "method": "POST",
+      "path": "/v1/security/keys/zpk1_contract_primary/rotate",
+      "status": 201,
+      "request": "security_rotate_key.req.json",
+      "response": "security_rotate_key.resp.json"
+    },
+    {
+      "name": "security_revoke_key",
+      "method": "DELETE",
+      "path": "/v1/security/keys/zpk1_contract_rotated",
+      "status": 200,
+      "request": "security_revoke_key.req.json",
+      "response": "security_revoke_key.resp.json"
+    },
+    {
+      "name": "security_list_keys",
+      "method": "GET",
+      "path": "/v1/security/keys",
+      "status": 200,
+      "request": "security_list_keys.req.json",
+      "response": "security_list_keys.resp.json"
+    },
+    {
+      "name": "security_create_grant",
+      "method": "POST",
+      "path": "/v1/security/grants",
+      "status": 201,
+      "request": "security_create_grant.req.json",
+      "response": "security_create_grant.resp.json"
+    },
+    {
+      "name": "security_list_grants",
+      "method": "GET",
+      "path": "/v1/security/grants",
+      "status": 200,
+      "request": "security_list_grants.req.json",
+      "response": "security_list_grants.resp.json"
+    },
+    {
+      "name": "security_delete_grant",
+      "method": "DELETE",
+      "path": "/v1/security/grants",
+      "status": 200,
+      "request": "security_delete_grant.req.json",
+      "response": "security_delete_grant.resp.json"
+    },
+    {
+      "name": "security_get_policy",
+      "method": "GET",
+      "path": "/v1/security/policy",
+      "status": 200,
+      "request": "security_get_policy.req.json",
+      "response": "security_get_policy.resp.json"
+    },
+    {
       "name": "create_namespace",
       "method": "POST",
       "path": "/v1/namespaces",

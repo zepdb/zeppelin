@@ -11,6 +11,9 @@ mod authn;
 mod context;
 mod decision;
 mod kernel;
+mod policy;
+mod policy_cache;
+mod policy_store;
 mod principal;
 mod resource;
 mod route_map;
@@ -21,13 +24,18 @@ pub use audit::{
     RuntimeConfigValues, MAX_AUDITED_VECTOR_IDS,
 };
 pub use audit_sink::{AuditClient, AuditRuntime, AuditSinkError};
-pub use authn::{ApiKeyAdapter, AuthnFailure, CredentialAdapter};
+pub use authn::{ApiKeyAdapter, AuthenticationOutcome, AuthnFailure, CredentialAdapter};
 pub use context::RequestContext;
 pub use decision::{
     AllowDecision, Decision, DecisionId, DenyDecision, DenyReason, FieldMask, Obligation,
     PolicyVersion, WriteConstraints,
 };
 pub use kernel::SecurityKernel;
+pub use policy::{
+    ApiKeyId, GrantActions, GrantScope, IssuedApiKey, KeyState, PolicyGrant, PolicyHead, PolicyKey,
+    PolicyPrincipal, PolicySnapshot,
+};
+pub use policy_store::{LoadedPolicy, PolicyStore};
 pub use principal::{AuthStrength, Principal, PrincipalId, PrincipalKind};
 pub use resource::{NamespaceId, Resource, SnapshotName};
 pub use route_map::{classify_route, RouteAction, RouteClass, ROUTE_ACTIONS};
@@ -76,6 +84,108 @@ pub enum SecurityError {
     /// A required mutation completed without durable audit acknowledgement.
     #[error("durable security audit evidence is unavailable")]
     AuditUnavailable,
+    /// An authoritative policy object violates its strict schema or invariants.
+    #[error("invalid security policy: {0}")]
+    InvalidPolicy(String),
+    /// A policy checksum does not match its canonical content.
+    #[error("security policy checksum mismatch")]
+    PolicyChecksumMismatch,
+    /// A persisted policy head lacks the ETag required for later CAS updates.
+    #[error("security policy head did not provide an ETag")]
+    PolicyHeadMissingEtag,
+    /// No authoritative policy exists and boot config cannot create one.
+    #[error("no authoritative security policy and no usable bootstrap credentials")]
+    MissingBootstrapCredentials,
+    /// An immutable policy artifact collided with an existing object key.
+    #[error("immutable security policy object already exists")]
+    PolicyObjectCollision,
+    /// The monotonic persisted policy version cannot advance further.
+    #[error("security policy version overflow")]
+    PolicyVersionOverflow,
+    /// A security-policy mutation request is structurally invalid.
+    #[error("invalid security policy request: {0}")]
+    InvalidPolicyRequest(String),
+    /// A bounded policy-head CAS retry loop could not publish its mutation.
+    #[error("security policy changed concurrently; retry")]
+    PolicyConflict,
+    /// A requested principal, key, or grant already exists.
+    #[error("security policy entity already exists")]
+    PolicyEntityAlreadyExists,
+    /// A requested principal, key, or grant does not exist.
+    #[error("security policy entity not found")]
+    PolicyEntityNotFound,
+}
+
+/// Security administration failure paired with the exact decision already evaluated.
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub struct SecurityOperationError {
+    decision: Option<Box<Decision>>,
+    #[source]
+    error: Box<crate::error::ZeppelinError>,
+}
+
+/// Result of a security administration operation that preserves audit context.
+pub type SecurityOperationResult<T> = std::result::Result<T, SecurityOperationError>;
+
+impl SecurityOperationError {
+    pub(crate) fn denied(decision: DenyDecision) -> Self {
+        let reason = decision.reason;
+        Self {
+            decision: Some(Box::new(Decision::Deny(decision))),
+            error: Box::new(SecurityError::Authorization(reason).into()),
+        }
+    }
+
+    pub(crate) fn after_allow(error: crate::error::ZeppelinError, decision: AllowDecision) -> Self {
+        Self {
+            decision: Some(Box::new(Decision::Allow(decision))),
+            error: Box::new(error),
+        }
+    }
+
+    pub(crate) fn with_fallback_allow(self, decision: Option<AllowDecision>) -> Self {
+        if self.decision.is_some() {
+            self
+        } else if let Some(decision) = decision {
+            Self::after_allow(*self.error, decision)
+        } else {
+            self
+        }
+    }
+
+    /// Borrow the exact decision evaluated before the operation failed, if any.
+    #[must_use]
+    pub fn decision(&self) -> Option<&Decision> {
+        self.decision.as_deref()
+    }
+
+    /// Split the audit decision from the canonical Zeppelin failure.
+    #[must_use]
+    pub fn into_parts(self) -> (Option<Decision>, crate::error::ZeppelinError) {
+        (self.decision.map(|decision| *decision), *self.error)
+    }
+
+    /// Discard decision context at a caller that has no audit responsibility.
+    #[must_use]
+    pub fn into_error(self) -> crate::error::ZeppelinError {
+        *self.error
+    }
+}
+
+impl From<crate::error::ZeppelinError> for SecurityOperationError {
+    fn from(error: crate::error::ZeppelinError) -> Self {
+        Self {
+            decision: None,
+            error: Box::new(error),
+        }
+    }
+}
+
+impl From<SecurityError> for SecurityOperationError {
+    fn from(error: SecurityError) -> Self {
+        crate::error::ZeppelinError::from(error).into()
+    }
 }
 
 impl SecurityError {
@@ -91,6 +201,9 @@ impl SecurityError {
             ) => 401,
             Self::Authorization(_) => 403,
             Self::InvalidNamespaceId | Self::InvalidSnapshotName => 400,
+            Self::InvalidPolicyRequest(_) => 400,
+            Self::PolicyConflict | Self::PolicyEntityAlreadyExists => 409,
+            Self::PolicyEntityNotFound => 404,
             Self::UnknownAction(_)
             | Self::InvalidPrincipalId
             | Self::DuplicatePrincipal
@@ -99,7 +212,13 @@ impl SecurityError {
             | Self::MissingPrincipal
             | Self::MissingRequestContext
             | Self::MissingSourceIp
-            | Self::AuditUnavailable => 500,
+            | Self::AuditUnavailable
+            | Self::InvalidPolicy(_)
+            | Self::PolicyChecksumMismatch
+            | Self::PolicyHeadMissingEtag
+            | Self::MissingBootstrapCredentials
+            | Self::PolicyObjectCollision
+            | Self::PolicyVersionOverflow => 500,
         }
     }
 
@@ -112,6 +231,10 @@ impl SecurityError {
             Self::Authorization(reason) => reason.code(),
             Self::InvalidNamespaceId => "invalid_namespace",
             Self::InvalidSnapshotName => "invalid_snapshot",
+            Self::InvalidPolicyRequest(_) => "invalid_security_request",
+            Self::PolicyConflict => "security_conflict",
+            Self::PolicyEntityAlreadyExists => "security_entity_exists",
+            Self::PolicyEntityNotFound => "security_entity_not_found",
             Self::AuditUnavailable => "audit_unavailable",
             Self::UnmappedRoute => "unmapped_route",
             Self::UnknownAction(_)
@@ -120,7 +243,13 @@ impl SecurityError {
             | Self::InvalidApiKeyDigest
             | Self::MissingPrincipal
             | Self::MissingRequestContext
-            | Self::MissingSourceIp => "security_internal",
+            | Self::MissingSourceIp
+            | Self::InvalidPolicy(_)
+            | Self::PolicyChecksumMismatch
+            | Self::PolicyHeadMissingEtag
+            | Self::MissingBootstrapCredentials
+            | Self::PolicyObjectCollision
+            | Self::PolicyVersionOverflow => "security_internal",
         }
     }
 
@@ -137,6 +266,10 @@ impl SecurityError {
             Self::Authorization(_) => "access forbidden".to_string(),
             Self::InvalidNamespaceId => "invalid namespace name".to_string(),
             Self::InvalidSnapshotName => "invalid snapshot name".to_string(),
+            Self::InvalidPolicyRequest(_) => "invalid security request".to_string(),
+            Self::PolicyConflict => "security policy changed concurrently; retry".to_string(),
+            Self::PolicyEntityAlreadyExists => "security policy entity already exists".to_string(),
+            Self::PolicyEntityNotFound => "security policy entity not found".to_string(),
             Self::AuditUnavailable => {
                 "operation may have completed, but durable audit evidence is unavailable"
                     .to_string()
@@ -148,7 +281,13 @@ impl SecurityError {
             | Self::UnmappedRoute
             | Self::MissingPrincipal
             | Self::MissingRequestContext
-            | Self::MissingSourceIp => "an internal security error occurred".to_string(),
+            | Self::MissingSourceIp
+            | Self::InvalidPolicy(_)
+            | Self::PolicyChecksumMismatch
+            | Self::PolicyHeadMissingEtag
+            | Self::MissingBootstrapCredentials
+            | Self::PolicyObjectCollision
+            | Self::PolicyVersionOverflow => "an internal security error occurred".to_string(),
         }
     }
 }

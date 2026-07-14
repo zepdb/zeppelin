@@ -6,6 +6,8 @@ use std::time::Duration;
 use axum::Router;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dashmap::DashMap;
+use object_store::path::Path;
+use object_store::prefix::PrefixStore;
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
@@ -23,7 +25,9 @@ use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
 use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use zeppelin::security::{ApiKeyAdapter, AuditClient, AuditRecord, AuditRuntime, SecurityKernel};
+use zeppelin::security::{
+    ApiKeyAdapter, AuditClient, AuditRecord, AuditRuntime, CredentialAdapter, SecurityKernel,
+};
 use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
@@ -78,6 +82,17 @@ fn configure_test_server_limits(config: &mut Config) {
     config.server.rate_limit_burst = 1_000_000;
     config.server.write_rate_limit_rps = 1_000_000;
     config.server.write_rate_limit_burst = 1_000_000;
+    config.server.principal_rate_limit_rps = 1_000_000;
+    config.server.principal_rate_limit_burst = 1_000_000;
+    config.server.principal_write_rate_limit_rps = 1_000_000;
+    config.server.principal_write_rate_limit_burst = 1_000_000;
+}
+
+pub fn scoped_test_security_store(store: &ZeppelinStore, scope: &str) -> ZeppelinStore {
+    ZeppelinStore::new(Arc::new(PrefixStore::new(
+        store.inner(),
+        Path::from(scope.to_string()),
+    )))
 }
 
 pub fn start_test_audit(
@@ -160,17 +175,36 @@ pub fn client_with_bearer(bearer: &str) -> reqwest::Client {
         .expect("failed to build authenticated test client")
 }
 
-/// Inject a freshly generated administrator into an enforced test config.
-pub fn test_security_runtime(
+/// Inject a freshly generated administrator and build the store-backed test runtime.
+pub async fn test_security_runtime(
+    store: &ZeppelinStore,
     config: &mut Config,
+    clock: &Clock,
 ) -> (Arc<SecurityKernel>, Arc<ApiKeyAdapter>, String) {
-    test_security_runtime_with_admin_bearer(config, None)
+    test_security_runtime_with_admin_bearer(store, config, clock, None).await
 }
 
-fn test_security_runtime_with_admin_bearer(
+/// Inject a freshly generated administrator into an enforced test config.
+#[must_use]
+pub fn test_admin_bearer(config: &mut Config) -> String {
+    inject_test_admin(config, None)
+}
+
+async fn test_security_runtime_with_admin_bearer(
+    store: &ZeppelinStore,
     config: &mut Config,
+    clock: &Clock,
     existing_admin_bearer: Option<&str>,
 ) -> (Arc<SecurityKernel>, Arc<ApiKeyAdapter>, String) {
+    let admin_bearer = inject_test_admin(config, existing_admin_bearer);
+    let (security, credential_adapter) =
+        SecurityKernel::from_store(store.clone(), &config.security, clock.clone())
+            .await
+            .expect("test security policy must load or bootstrap");
+    (security, credential_adapter, admin_bearer)
+}
+
+fn inject_test_admin(config: &mut Config, existing_admin_bearer: Option<&str>) -> String {
     let secret = match existing_admin_bearer {
         Some(bearer) => {
             let secret = bearer
@@ -212,11 +246,7 @@ fn test_security_runtime_with_admin_bearer(
             expires_at: None,
         });
     }
-    (
-        Arc::new(SecurityKernel::from_config(&config.security).unwrap()),
-        Arc::new(ApiKeyAdapter::from_config(&config.security).unwrap()),
-        admin_bearer,
-    )
+    admin_bearer
 }
 
 fn runtime_query_state(config: &Config) -> (Arc<RuntimeQueryConfig>, QueryKnobBounds) {
@@ -323,8 +353,10 @@ async fn start_test_server_with_config_inner(
     if override_rate_limits {
         configure_test_server_limits(&mut config);
     }
-    let (security, credential_adapter, admin_bearer) = test_security_runtime(&mut config);
     let clock = Clock::system();
+    let security_store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let (security, credential_adapter, admin_bearer) =
+        test_security_runtime(&security_store, &mut config, &clock).await;
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -386,8 +418,13 @@ pub async fn start_test_server_on_store(
 
     let mut config = Config::default();
     configure_test_server_limits(&mut config);
-    let (security, credential_adapter, admin_bearer) = test_security_runtime(&mut config);
     let clock = Clock::system();
+    let security_store = namespace_name_prefix.as_deref().map_or_else(
+        || store.clone(),
+        |scope| scoped_test_security_store(&store, scope),
+    );
+    let (security, credential_adapter, admin_bearer) =
+        test_security_runtime(&security_store, &mut config, &clock).await;
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -453,8 +490,10 @@ pub async fn start_test_server_with_compactor(
     let harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_default();
     configure_test_server_limits(&mut config);
-    let (security, credential_adapter, admin_bearer) = test_security_runtime(&mut config);
     let clock = Clock::system();
+    let security_store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let (security, credential_adapter, admin_bearer) =
+        test_security_runtime(&security_store, &mut config, &clock).await;
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -523,8 +562,10 @@ pub async fn start_test_server_with_compaction(
     let harness = TestHarness::new().await;
     let mut config = config_override.unwrap_or_default();
     configure_test_server_limits(&mut config);
-    let (security, credential_adapter, admin_bearer) = test_security_runtime(&mut config);
     let clock = Clock::system();
+    let security_store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let (security, credential_adapter, admin_bearer) =
+        test_security_runtime(&security_store, &mut config, &clock).await;
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -851,6 +892,8 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
         clock,
         disk_cache_max_bytes,
         None,
+        None,
+        true,
     )
     .await
 }
@@ -877,6 +920,49 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
         clock,
         disk_cache_max_bytes,
         Some(admin_bearer),
+        None,
+        true,
+    )
+    .await
+}
+
+/// Starts a full test server with an explicit credential adapter test double.
+pub async fn start_test_server_full_with_credential_adapter(
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+    config: Config,
+    credential_adapter: Arc<dyn CredentialAdapter>,
+) -> FullTestServer {
+    start_test_server_full_with_disk_cache_max_bytes_inner(
+        store,
+        namespace_name_prefix,
+        config,
+        false,
+        None,
+        100 * 1024 * 1024,
+        None,
+        Some(credential_adapter),
+        true,
+    )
+    .await
+}
+
+/// Starts a full test server without replacing the supplied rate-limit settings.
+pub async fn start_test_server_full_without_rate_limit_override(
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+    config: Config,
+) -> FullTestServer {
+    start_test_server_full_with_disk_cache_max_bytes_inner(
+        store,
+        namespace_name_prefix,
+        config,
+        false,
+        None,
+        100 * 1024 * 1024,
+        None,
+        None,
+        false,
     )
     .await
 }
@@ -890,12 +976,27 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     clock: Option<Clock>,
     disk_cache_max_bytes: u64,
     existing_admin_bearer: Option<&str>,
+    credential_adapter_override: Option<Arc<dyn CredentialAdapter>>,
+    override_rate_limits: bool,
 ) -> FullTestServer {
     zeppelin::metrics::init();
-    configure_test_server_limits(&mut config);
-    let (security, credential_adapter, admin_bearer) =
-        test_security_runtime_with_admin_bearer(&mut config, existing_admin_bearer);
+    if override_rate_limits {
+        configure_test_server_limits(&mut config);
+    }
     let clock = clock.unwrap_or_else(Clock::system);
+    let security_store = namespace_name_prefix.as_deref().map_or_else(
+        || store.clone(),
+        |scope| scoped_test_security_store(&store, scope),
+    );
+    let (security, credential_adapter, admin_bearer) = test_security_runtime_with_admin_bearer(
+        &security_store,
+        &mut config,
+        &clock,
+        existing_admin_bearer,
+    )
+    .await;
+    let credential_adapter: Arc<dyn CredentialAdapter> =
+        credential_adapter_override.unwrap_or(credential_adapter);
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(

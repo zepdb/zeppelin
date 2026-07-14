@@ -1,0 +1,5 @@
+{
+  "display_name": "contract-service",
+  "kind": "service",
+  "principal_id": "service:contract"
+}

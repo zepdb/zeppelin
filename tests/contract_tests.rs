@@ -19,6 +19,12 @@ use zeppelin::wal::Manifest;
 const FIXTURE_VERSION: &str = "v0.3.0";
 const CONTRACT_FORBIDDEN_BEARER: &str =
     "zpk1_contract_forbidden.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+const CONTRACT_PRIMARY_KEY_ID: &str = "zpk1_contract_primary";
+const CONTRACT_PRIMARY_API_KEY: &str =
+    "zpk1_contract_primary.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+const CONTRACT_ROTATED_KEY_ID: &str = "zpk1_contract_rotated";
+const CONTRACT_ROTATED_API_KEY: &str =
+    "zpk1_contract_rotated.AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
 
 const ROUTED_OPERATIONS: &[(&str, &str)] = &[
     ("get", "/healthz"),
@@ -27,6 +33,16 @@ const ROUTED_OPERATIONS: &[(&str, &str)] = &[
     ("get", "/v1/config/query"),
     ("put", "/v1/config/query"),
     ("patch", "/v1/config/query"),
+    ("get", "/v1/security/principals"),
+    ("post", "/v1/security/principals"),
+    ("get", "/v1/security/keys"),
+    ("post", "/v1/security/keys"),
+    ("post", "/v1/security/keys/{key_id}/rotate"),
+    ("delete", "/v1/security/keys/{key_id}"),
+    ("get", "/v1/security/grants"),
+    ("post", "/v1/security/grants"),
+    ("delete", "/v1/security/grants"),
+    ("get", "/v1/security/policy"),
     ("post", "/v1/namespaces"),
     ("get", "/v1/namespaces/{ns}"),
     ("delete", "/v1/namespaces/{ns}"),
@@ -54,6 +70,16 @@ const FIXTURE_CASES: &[&str] = &[
     "unauthenticated_401",
     "forbidden_403",
     "readyz_gated_401",
+    "security_create_principal",
+    "security_list_principals",
+    "security_create_key",
+    "security_rotate_key",
+    "security_revoke_key",
+    "security_list_keys",
+    "security_create_grant",
+    "security_list_grants",
+    "security_delete_grant",
+    "security_get_policy",
     "create_namespace",
     "get_namespace",
     "patch_index_config",
@@ -198,6 +224,79 @@ fn openapi_documents_bearer_security_for_every_protected_operation() {
 }
 
 #[test]
+fn openapi_security_admin_contract_is_exact_and_redacted() {
+    let api = include_str!("../api/zeppelin-api.yaml");
+    let expected_statuses: &[(&str, &str, &[u16])] = &[
+        ("get", "/v1/security/principals", &[200, 401, 403, 429]),
+        (
+            "post",
+            "/v1/security/principals",
+            &[201, 400, 401, 403, 409, 415, 422, 429],
+        ),
+        ("get", "/v1/security/keys", &[200, 401, 403, 429]),
+        (
+            "post",
+            "/v1/security/keys",
+            &[201, 400, 401, 403, 404, 409, 415, 422, 429],
+        ),
+        (
+            "post",
+            "/v1/security/keys/{key_id}/rotate",
+            &[201, 400, 401, 403, 404, 409, 415, 422, 429],
+        ),
+        (
+            "delete",
+            "/v1/security/keys/{key_id}",
+            &[200, 400, 401, 403, 404, 409, 429],
+        ),
+        ("get", "/v1/security/grants", &[200, 401, 403, 429]),
+        (
+            "post",
+            "/v1/security/grants",
+            &[201, 400, 401, 403, 404, 409, 415, 422, 429],
+        ),
+        (
+            "delete",
+            "/v1/security/grants",
+            &[200, 400, 401, 403, 404, 409, 415, 422, 429],
+        ),
+        ("get", "/v1/security/policy", &[200, 401, 403, 429]),
+    ];
+    for (method, path, expected) in expected_statuses {
+        let actual = documented_statuses(api, method, path);
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "unexpected statuses for {method} {path}");
+    }
+
+    let key_view = component_schema_block(api, "SecurityKeyView");
+    assert!(key_view.contains("additionalProperties: false"));
+    assert!(!key_view.contains("sha256_hex"));
+    assert!(!key_view.contains("api_key"));
+
+    for schema in [
+        "SecurityGlobalGrantScope",
+        "SecurityNamespaceGrantScope",
+        "SecurityAllGrantActions",
+        "SecuritySelectedGrantActions",
+    ] {
+        let block = component_schema_block(api, schema);
+        assert!(
+            block.contains("additionalProperties: false"),
+            "{schema} must reject unknown fields"
+        );
+        assert!(
+            block.contains("const:"),
+            "{schema} must carry an exact serde-compatible tag"
+        );
+    }
+
+    let issue = component_schema_block(api, "IssueSecurityKeyResponse");
+    let rotate = component_schema_block(api, "RotateSecurityKeyResponse");
+    assert!(issue.contains("api_key:"));
+    assert!(rotate.contains("api_key:"));
+}
+
+#[test]
 fn contract_fixture_inventory_is_complete() {
     if std::env::var("UPDATE_CONTRACT_FIXTURES").as_deref() == Ok("1") {
         return;
@@ -243,6 +342,21 @@ async fn contract_fixtures_match_real_engine_output() {
         .collect::<BTreeSet<_>>();
     let expected = FIXTURE_CASES.iter().copied().collect::<BTreeSet<_>>();
     assert_eq!(names, expected, "fixture builder missed a curated case");
+
+    let fixture_security_operations = fixtures
+        .iter()
+        .filter(|fixture| fixture.name.starts_with("security_"))
+        .map(|fixture| (fixture.method.to_string(), fixture.openapi_path()))
+        .collect::<BTreeSet<_>>();
+    let routed_security_operations = ROUTED_OPERATIONS
+        .iter()
+        .filter(|(_, path)| path.starts_with("/v1/security/"))
+        .map(|(method, path)| ((*method).to_string(), (*path).to_string()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fixture_security_operations, routed_security_operations,
+        "security-admin fixtures must cover every routed operation exactly once"
+    );
 
     let api = include_str!("../api/zeppelin-api.yaml");
     for fixture in &fixtures {
@@ -337,6 +451,7 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
 
     let mut fixtures =
         security_error_fixtures(&unauthenticated_client, &forbidden_client, &base_url).await;
+    fixtures.extend(security_admin_fixtures(&client, &base_url).await);
 
     fixtures.push(
         capture_json(
@@ -697,6 +812,268 @@ async fn security_error_fixtures(
         )
         .await,
     ]
+}
+
+async fn security_admin_fixtures(client: &reqwest::Client, base_url: &str) -> Vec<Fixture> {
+    let mut fixtures = Vec::new();
+
+    let principal_request = json!({
+        "principal_id": "service:contract",
+        "kind": "service",
+        "display_name": "contract-service"
+    });
+    fixtures.push(
+        capture_json(
+            client,
+            base_url,
+            "security_create_principal",
+            "post",
+            "/v1/security/principals",
+            "/v1/security/principals",
+            201,
+            principal_request.clone(),
+            principal_request,
+            &[],
+            &[],
+        )
+        .await,
+    );
+    fixtures.push(
+        capture_json(
+            client,
+            base_url,
+            "security_list_principals",
+            "get",
+            "/v1/security/principals",
+            "/v1/security/principals",
+            200,
+            Value::Null,
+            Value::Null,
+            &[],
+            &[],
+        )
+        .await,
+    );
+
+    let create_key_request = json!({
+        "principal_id": "service:contract",
+        "name": "contract-primary"
+    });
+    let (status, create_key_response) = send_json(
+        client,
+        base_url,
+        "post",
+        "/v1/security/keys",
+        "security_create_key",
+        create_key_request.clone(),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "fixture security_create_key expected status 201, got {status}: {create_key_response}"
+    );
+    let primary_key_id = response_string(&create_key_response, "key_id", "security_create_key");
+    let primary_api_key = response_string(&create_key_response, "api_key", "security_create_key");
+    let mut security_replacements = vec![
+        (primary_api_key, CONTRACT_PRIMARY_API_KEY.to_string()),
+        (primary_key_id.clone(), CONTRACT_PRIMARY_KEY_ID.to_string()),
+    ];
+    fixtures.push(fixture_from_response(
+        "security_create_key",
+        "post",
+        "/v1/security/keys",
+        201,
+        create_key_request,
+        create_key_response,
+        &security_replacements,
+    ));
+
+    let rotate_request = json!({"overlap_secs": 0});
+    let rotate_path = format!("/v1/security/keys/{primary_key_id}/rotate");
+    let (status, rotate_response) = send_json(
+        client,
+        base_url,
+        "post",
+        &rotate_path,
+        "security_rotate_key",
+        rotate_request.clone(),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "fixture security_rotate_key expected status 201, got {status}: {rotate_response}"
+    );
+    let rotated_key_id = response_string(&rotate_response, "key_id", "security_rotate_key");
+    let rotated_api_key = response_string(&rotate_response, "api_key", "security_rotate_key");
+    security_replacements.splice(
+        0..0,
+        [
+            (rotated_api_key, CONTRACT_ROTATED_API_KEY.to_string()),
+            (rotated_key_id.clone(), CONTRACT_ROTATED_KEY_ID.to_string()),
+        ],
+    );
+    fixtures.push(fixture_from_response(
+        "security_rotate_key",
+        "post",
+        &format!("/v1/security/keys/{CONTRACT_PRIMARY_KEY_ID}/rotate"),
+        201,
+        rotate_request,
+        rotate_response,
+        &security_replacements,
+    ));
+
+    let revoke_path = format!("/v1/security/keys/{rotated_key_id}");
+    fixtures.push(
+        capture_json(
+            client,
+            base_url,
+            "security_revoke_key",
+            "delete",
+            &revoke_path,
+            &format!("/v1/security/keys/{CONTRACT_ROTATED_KEY_ID}"),
+            200,
+            Value::Null,
+            Value::Null,
+            &security_replacements,
+            &[],
+        )
+        .await,
+    );
+    fixtures.push(
+        capture_json(
+            client,
+            base_url,
+            "security_list_keys",
+            "get",
+            "/v1/security/keys",
+            "/v1/security/keys",
+            200,
+            Value::Null,
+            Value::Null,
+            &security_replacements,
+            &[],
+        )
+        .await,
+    );
+
+    let grant_request = json!({
+        "principal_id": "service:contract",
+        "scope": {"kind": "namespace", "namespace": "contract-main"},
+        "actions": {"kind": "selected", "actions": ["NamespaceRead", "Query"]}
+    });
+    fixtures.push(
+        capture_json(
+            client,
+            base_url,
+            "security_create_grant",
+            "post",
+            "/v1/security/grants",
+            "/v1/security/grants",
+            201,
+            grant_request.clone(),
+            grant_request.clone(),
+            &security_replacements,
+            &[],
+        )
+        .await,
+    );
+    fixtures.push(
+        capture_json(
+            client,
+            base_url,
+            "security_list_grants",
+            "get",
+            "/v1/security/grants",
+            "/v1/security/grants",
+            200,
+            Value::Null,
+            Value::Null,
+            &security_replacements,
+            &[],
+        )
+        .await,
+    );
+    fixtures.push(
+        capture_json(
+            client,
+            base_url,
+            "security_delete_grant",
+            "delete",
+            "/v1/security/grants",
+            "/v1/security/grants",
+            200,
+            grant_request.clone(),
+            grant_request,
+            &security_replacements,
+            &[],
+        )
+        .await,
+    );
+
+    let (status, policy_response) = send_json(
+        client,
+        base_url,
+        "get",
+        "/v1/security/policy",
+        "security_get_policy",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "fixture security_get_policy expected status 200, got {status}: {policy_response}"
+    );
+    let object_key = response_string(&policy_response, "object_key", "security_get_policy");
+    let checksum = response_string(&policy_response, "checksum", "security_get_policy");
+    security_replacements.splice(
+        0..0,
+        [
+            (
+                object_key,
+                "_security/policies/contract-policy.json".to_string(),
+            ),
+            (checksum, "0".repeat(64)),
+        ],
+    );
+    fixtures.push(fixture_from_response(
+        "security_get_policy",
+        "get",
+        "/v1/security/policy",
+        200,
+        Value::Null,
+        policy_response,
+        &security_replacements,
+    ));
+
+    fixtures
+}
+
+fn response_string(response: &Value, field: &str, fixture: &str) -> String {
+    response[field]
+        .as_str()
+        .unwrap_or_else(|| panic!("fixture {fixture} response missing string field {field}"))
+        .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixture_from_response(
+    name: &'static str,
+    method: &'static str,
+    path: &str,
+    status: u16,
+    request: Value,
+    mut response: Value,
+    replacements: &[(String, String)],
+) -> Fixture {
+    normalize_contract_value(&mut response, replacements, &[]);
+    Fixture {
+        name,
+        method,
+        path: path.to_string(),
+        status,
+        request,
+        response,
+    }
 }
 
 async fn query_fixtures(
@@ -1328,7 +1705,7 @@ fn normalize_contract_value(
         Value::Object(object) => {
             for (key, child) in object {
                 match key.as_str() {
-                    "created_at" | "updated_at" => {
+                    "created_at" | "updated_at" | "revokes_at" => {
                         if child.is_string() {
                             *child = json!("2026-01-01T00:00:00+00:00");
                         }
@@ -1576,6 +1953,73 @@ fn assert_response_contract_shape(fixture: &Fixture) {
             );
         }
     }
+    if fixture.name.starts_with("security_") {
+        assert_security_admin_contract(fixture);
+    }
+}
+
+fn assert_security_admin_contract(fixture: &Fixture) {
+    assert!(
+        fixture.response["policy_version"].is_u64(),
+        "{} must expose its authoritative policy version",
+        fixture.name
+    );
+
+    let serialized = serde_json::to_string(&fixture.response).unwrap();
+    assert!(
+        !serialized.contains("sha256_hex"),
+        "{} must never expose a stored credential digest",
+        fixture.name
+    );
+    if matches!(fixture.name, "security_create_key" | "security_rotate_key") {
+        assert!(
+            fixture.response["api_key"].as_str().is_some(),
+            "{} must carry its one-time API-key secret",
+            fixture.name
+        );
+    } else {
+        assert!(
+            !serialized.contains("api_key"),
+            "{} must not expose an API-key secret",
+            fixture.name
+        );
+    }
+
+    if fixture.name == "security_list_keys" {
+        let keys = fixture.response["keys"]
+            .as_array()
+            .expect("security_list_keys must return a key array");
+        assert!(
+            keys.iter().any(|key| key["rotated_from"].is_string()),
+            "redacted key inventory must retain rotation lineage"
+        );
+        assert!(
+            keys.iter().any(|key| key["state"] == "revoked"),
+            "redacted key inventory must retain lifecycle state"
+        );
+    }
+
+    if matches!(
+        fixture.name,
+        "security_create_grant" | "security_delete_grant"
+    ) {
+        assert!(
+            matches!(
+                fixture.request["scope"]["kind"].as_str(),
+                Some("global" | "namespace")
+            ),
+            "{} request must use a tagged grant scope",
+            fixture.name
+        );
+        assert!(
+            matches!(
+                fixture.request["actions"]["kind"].as_str(),
+                Some("all" | "selected")
+            ),
+            "{} request must use a tagged grant action set",
+            fixture.name
+        );
+    }
 }
 
 fn assert_query_response(response: &Value, name: &str) {
@@ -1676,9 +2120,32 @@ fn operation_block<'a>(api: &'a str, method: &str, path: &str) -> &'a str {
     &operation[..end]
 }
 
+fn component_schema_block<'a>(api: &'a str, schema: &str) -> &'a str {
+    let marker = format!("    {schema}:\n");
+    let start = api
+        .find(&marker)
+        .unwrap_or_else(|| panic!("OpenAPI schema is missing: {schema}"));
+    let body = &api[start + marker.len()..];
+    let end = body
+        .lines()
+        .scan(0_usize, |offset, line| {
+            let start = *offset;
+            *offset += line.len() + 1;
+            Some((start, line))
+        })
+        .find_map(|(offset, line)| {
+            (line.starts_with("    ") && !line.starts_with("      ") && line.ends_with(':'))
+                .then_some(offset)
+        })
+        .unwrap_or(body.len());
+    &body[..end]
+}
+
 impl Fixture {
     fn openapi_path(&self) -> String {
         self.path
+            .replace(CONTRACT_PRIMARY_KEY_ID, "{key_id}")
+            .replace(CONTRACT_ROTATED_KEY_ID, "{key_id}")
             .replace("contract-main", "{ns}")
             .replace("contract-compact", "{ns}")
             .replace("contract-delete", "{ns}")

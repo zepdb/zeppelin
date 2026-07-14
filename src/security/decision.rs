@@ -35,13 +35,32 @@ impl Default for DecisionId {
 }
 
 /// Monotonic security-policy version attached to every decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PolicyVersion(u64);
 
 impl PolicyVersion {
     /// Boot-config policy version used until S3 policy lands in phase 3.
     pub const BOOT: Self = Self(0);
+
+    /// Construct a persisted nonzero policy version.
+    pub fn persisted(value: u64) -> Result<Self, super::SecurityError> {
+        if value == 0 {
+            Err(super::SecurityError::InvalidPolicy(
+                "persisted policy version must be greater than zero".to_string(),
+            ))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Return the next persisted version, failing loudly on overflow.
+    pub fn checked_next(self) -> Result<Self, super::SecurityError> {
+        self.0
+            .checked_add(1)
+            .ok_or(super::SecurityError::PolicyVersionOverflow)
+            .and_then(Self::persisted)
+    }
 
     /// Return the numeric policy version.
     #[must_use]
@@ -167,6 +186,12 @@ impl AllowDecision {
     /// kernel's decision remains the single source of pre-success work.
     #[must_use]
     pub fn boot(action: Action) -> Self {
+        Self::for_policy(action, PolicyVersion::BOOT)
+    }
+
+    /// Construct a full-shaped allow from one authoritative policy version.
+    #[must_use]
+    pub fn for_policy(action: Action, policy_version: PolicyVersion) -> Self {
         let obligations = if matches!(
             action,
             Action::RuntimeConfigWrite
@@ -174,6 +199,8 @@ impl AllowDecision {
                 | Action::SnapshotDelete
                 | Action::IndexConfigWrite
                 | Action::VectorDelete
+                | Action::SecurityAdminRead
+                | Action::SecurityAdminWrite
         ) {
             vec![Obligation::DurableAudit]
         } else {
@@ -181,7 +208,7 @@ impl AllowDecision {
         };
         Self {
             decision_id: DecisionId::new(),
-            policy_version: PolicyVersion::BOOT,
+            policy_version,
             mandatory_filter: None,
             field_mask: None,
             write_constraints: WriteConstraints::none(),
@@ -214,6 +241,8 @@ mod tests {
                 Action::SnapshotDelete,
                 Action::IndexConfigWrite,
                 Action::VectorDelete,
+                Action::SecurityAdminRead,
+                Action::SecurityAdminWrite,
             ]
         );
     }
@@ -234,9 +263,15 @@ impl DenyDecision {
     /// Construct a boot-policy denial with a fresh decision identity.
     #[must_use]
     pub fn boot(reason: DenyReason) -> Self {
+        Self::for_policy(reason, PolicyVersion::BOOT)
+    }
+
+    /// Construct a denial tied to one authoritative policy version.
+    #[must_use]
+    pub fn for_policy(reason: DenyReason, policy_version: PolicyVersion) -> Self {
         Self {
             decision_id: DecisionId::new(),
-            policy_version: PolicyVersion::BOOT,
+            policy_version,
             reason,
         }
     }

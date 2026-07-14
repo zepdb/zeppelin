@@ -1,0 +1,17 @@
+{
+  "grant": {
+    "actions": {
+      "actions": [
+        "NamespaceRead",
+        "Query"
+      ],
+      "kind": "selected"
+    },
+    "principal_id": "service:contract",
+    "scope": {
+      "kind": "namespace",
+      "namespace": "contract-main"
+    }
+  },
+  "policy_version": 7
+}

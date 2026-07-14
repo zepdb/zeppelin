@@ -50,15 +50,21 @@ struct CountingApiServer {
 
 async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
     zeppelin::metrics::init();
-    let (security, credential_adapter, admin_bearer) =
-        common::server::test_security_runtime(&mut config);
     config.server.rate_limit_rps = 1_000_000;
     config.server.rate_limit_burst = 1_000_000;
     config.server.write_rate_limit_rps = 1_000_000;
     config.server.write_rate_limit_burst = 1_000_000;
+    config.server.principal_rate_limit_rps = 1_000_000;
+    config.server.principal_rate_limit_burst = 1_000_000;
+    config.server.principal_write_rate_limit_rps = 1_000_000;
+    config.server.principal_write_rate_limit_burst = 1_000_000;
 
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
+    let clock = zeppelin::time::Clock::system();
+    let security_store = common::server::scoped_test_security_store(&store, &harness.prefix);
+    let (security, credential_adapter, admin_bearer) =
+        common::server::test_security_runtime(&security_store, &mut config, &clock).await;
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
         DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 100 * 1024 * 1024).unwrap(),
@@ -90,7 +96,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
 
     let app = build_router(AppState {
         store: store.clone(),
-        clock: zeppelin::time::Clock::system(),
+        clock: clock.clone(),
         security,
         audit,
         credential_adapter,

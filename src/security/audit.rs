@@ -35,6 +35,8 @@ pub enum ResourceRef {
     System,
     /// Live runtime query configuration.
     RuntimeConfig,
+    /// S3-authoritative security principals, credentials, grants, and policy.
+    SecurityPolicy,
     /// Namespace-scoped data or lifecycle state.
     Namespace {
         /// Validated namespace identifier.
@@ -62,6 +64,7 @@ impl From<&Resource> for ResourceRef {
         match resource {
             Resource::System => Self::System,
             Resource::RuntimeConfig => Self::RuntimeConfig,
+            Resource::SecurityPolicy => Self::SecurityPolicy,
             Resource::Namespace(namespace) => Self::Namespace {
                 namespace: namespace.clone(),
             },
@@ -78,6 +81,7 @@ impl From<Resource> for ResourceRef {
         match resource {
             Resource::System => Self::System,
             Resource::RuntimeConfig => Self::RuntimeConfig,
+            Resource::SecurityPolicy => Self::SecurityPolicy,
             Resource::Namespace(namespace) => Self::Namespace { namespace },
             Resource::Snapshot(namespace, snapshot) => Self::Snapshot {
                 namespace,
@@ -309,6 +313,18 @@ pub enum AuditParams {
         /// IDs only when `count` is at most [`MAX_AUDITED_VECTOR_IDS`].
         ids: Option<AuditedVectorIds>,
     },
+    /// Security policy metadata was read through an administrative route.
+    SecurityPolicyRead {
+        /// Authoritative version returned to the caller.
+        version: PolicyVersion,
+    },
+    /// A CAS-published policy mutation advanced the authoritative version.
+    SecurityPolicyChange {
+        /// Version on which the mutation was based.
+        old_version: PolicyVersion,
+        /// Newly published authoritative version.
+        new_version: PolicyVersion,
+    },
     /// The process booted with explicit unsafe-open security mode.
     OpenUnsafeBoot,
 }
@@ -426,6 +442,36 @@ impl AuditRecord {
         )
     }
 
+    /// Build a buffered record for a security-admin admission rejection.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rate_limit_rejection(
+        ts: DateTime<Utc>,
+        request_id: impl Into<String>,
+        principal: &Principal,
+        action: Action,
+        resource: ResourceRef,
+        policy_version: PolicyVersion,
+        source_ip: IpAddr,
+        node_id: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            ts,
+            request_id,
+            None,
+            principal,
+            action,
+            resource,
+            policy_version,
+            source_ip,
+            AuditOutcome::Error {
+                code: "RATE_LIMITED".to_string(),
+            },
+            AuditParams::None,
+            node_id,
+        )
+    }
+
     /// Build a record for an explicit central-authorization denial.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
@@ -515,6 +561,7 @@ impl AuditRecord {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -526,7 +573,8 @@ mod tests {
         MAX_AUDITED_VECTOR_IDS,
     };
     use crate::security::{
-        Action, AuthnFailure, DecisionId, NamespaceId, PolicyVersion, Principal, PrincipalId,
+        Action, ApiKeyId, AuthnFailure, DecisionId, NamespaceId, PolicyVersion, Principal,
+        PrincipalId, Resource,
     };
 
     fn namespace(value: &str) -> NamespaceId {
@@ -541,7 +589,12 @@ mod tests {
             Ok(id) => id,
             Err(error) => panic!("test principal must be valid: {error}"),
         };
-        Principal::api_key(id, "Audit Test".to_string(), None)
+        Principal::api_key(
+            id,
+            ApiKeyId::new("zpk1_audit_test").unwrap(),
+            "Audit Test".to_string(),
+            None,
+        )
     }
 
     fn runtime_values(default_top_k: usize) -> RuntimeConfigValues {
@@ -552,6 +605,17 @@ mod tests {
             bm25_max_full_scan_clusters: 128,
             bm25_max_full_scan_vectors: 100_000,
         }
+    }
+
+    #[test]
+    fn security_policy_resource_uses_typed_redacted_audit_vocabulary() {
+        let resource = ResourceRef::from(&Resource::SecurityPolicy);
+
+        assert_eq!(resource, ResourceRef::SecurityPolicy);
+        assert_eq!(
+            serde_json::to_value(resource).unwrap(),
+            json!("security_policy")
+        );
     }
 
     fn record() -> AuditRecord {

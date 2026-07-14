@@ -1,0 +1,40 @@
+{
+  "grants": [
+    {
+      "actions": {
+        "actions": [
+          "NamespaceRead",
+          "Query"
+        ],
+        "kind": "selected"
+      },
+      "principal_id": "service:contract",
+      "scope": {
+        "kind": "namespace",
+        "namespace": "contract-main"
+      }
+    },
+    {
+      "actions": {
+        "actions": [
+          "SystemRead"
+        ],
+        "kind": "selected"
+      },
+      "principal_id": "zpk1_contract_forbidden",
+      "scope": {
+        "kind": "global"
+      }
+    },
+    {
+      "actions": {
+        "kind": "all"
+      },
+      "principal_id": "zpk1_test_admin",
+      "scope": {
+        "kind": "global"
+      }
+    }
+  ],
+  "policy_version": 6
+}

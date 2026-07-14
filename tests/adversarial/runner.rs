@@ -3692,6 +3692,7 @@ struct PendingHeldOp {
     release_cause: HoldReleaseCause,
     op_index: u64,
     namespace: String,
+    holds_query_admission: bool,
     task: JoinHandle<RawRecordedOp>,
 }
 
@@ -4030,6 +4031,39 @@ fn op_can_run_while_hold_is_pending(op: &Op, held_namespace: &str) -> bool {
     !op.is_mutating() && !op_conflicts_with_held_namespace(op, held_namespace)
 }
 
+fn op_uses_query_admission(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Query { .. } | Op::BatchQuery { .. } | Op::PaginateAll { .. }
+    ) || matches!(
+        op,
+        Op::InvalidProbe {
+            probe: InvalidProbe::NanVector
+                | InvalidProbe::OversizedBatch
+                | InvalidProbe::UnknownField
+                | InvalidProbe::BadCursorToken
+                | InvalidProbe::GroupingPlusCursor
+                | InvalidProbe::WeightsLenMismatch
+                | InvalidProbe::AsOfGenZero
+                | InvalidProbe::AsOfGenFuture,
+            ..
+        }
+    )
+}
+
+fn op_requires_exact_query_error(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Query {
+            q: GeneratedQuery {
+                class: QueryOracleClass::ExpectError { .. },
+                ..
+            },
+            ..
+        }
+    ) || matches!(op, Op::InvalidProbe { .. }) && op_uses_query_admission(op)
+}
+
 fn foreground_hold_for_op(
     scheduler: Option<&FaultScheduler>,
     op: &Op,
@@ -4058,6 +4092,7 @@ fn op_conflicts_with_pending_hold(
     pending: &PendingHeldOp,
 ) -> bool {
     !op_can_run_while_hold_is_pending(op, &pending.namespace)
+        || pending.holds_query_admission && op_requires_exact_query_error(op)
         || foreground_hold_for_op_excluding(scheduler, op, op_index, Some(&pending.event_id))
             .is_some()
 }
@@ -4480,6 +4515,7 @@ async fn execute_hold_candidate(
         unresolved_create_allows_missing_manifest_bookkeeping(model, &provisional_op);
     let event_id = hold.event_id.clone();
     let namespace = op.namespace().to_string();
+    let holds_query_admission = op_uses_query_admission(&op);
     let armed_scheduler = scheduler.clone();
     let armed_event_id = event_id.clone();
     let mut task = tokio::spawn(async move {
@@ -4530,6 +4566,7 @@ async fn execute_hold_candidate(
                 release_cause: HoldReleaseCause::LogicalOp,
                 op_index: index,
                 namespace,
+                holds_query_admission,
                 task,
             })
         }
@@ -9297,6 +9334,79 @@ mod outcome_tests {
         assert!(!op_can_run_while_hold_is_pending(&other_mutation, "held"));
     }
 
+    #[tokio::test]
+    async fn pending_query_hold_defers_exact_error_probe_but_not_ordinary_query() {
+        let exact_error = Op::InvalidProbe {
+            ns: "other".to_string(),
+            probe: InvalidProbe::WeightsLenMismatch,
+        };
+        let ordinary_query = Op::Query {
+            ns: "other".to_string(),
+            q: GeneratedQuery {
+                body: json!({}),
+                class: QueryOracleClass::Membership {
+                    consistency: ConsistencyLevel::Strong,
+                },
+                pattern_tags: Vec::new(),
+            },
+            as_of: None,
+        };
+        let exact_error_query = Op::Query {
+            ns: "other".to_string(),
+            q: GeneratedQuery {
+                body: json!({}),
+                class: QueryOracleClass::ExpectError {
+                    status: 400,
+                    code: "DIMENSION_MISMATCH".to_string(),
+                },
+                pattern_tags: Vec::new(),
+            },
+            as_of: None,
+        };
+        let non_query_probe = Op::InvalidProbe {
+            ns: "other".to_string(),
+            probe: InvalidProbe::WrongDims,
+        };
+        let pending = PendingHeldOp {
+            event_id: "held-query".to_string(),
+            window_op: 5,
+            scheduled_release_op: 12,
+            release_op: 12,
+            release_cause: HoldReleaseCause::LogicalOp,
+            op_index: 5,
+            namespace: "held".to_string(),
+            holds_query_admission: true,
+            task: tokio::spawn(std::future::pending()),
+        };
+
+        assert!(op_conflicts_with_pending_hold(
+            &exact_error,
+            6,
+            None,
+            &pending
+        ));
+        assert!(!op_conflicts_with_pending_hold(
+            &ordinary_query,
+            6,
+            None,
+            &pending
+        ));
+        assert!(op_conflicts_with_pending_hold(
+            &exact_error_query,
+            6,
+            None,
+            &pending
+        ));
+        assert!(!op_conflicts_with_pending_hold(
+            &non_query_probe,
+            6,
+            None,
+            &pending
+        ));
+
+        pending.task.abort();
+    }
+
     #[test]
     fn sched_fifo_deferral_preserves_every_baseline_generated_operation() {
         fn upsert(ns: &str, id: &str) -> Op {
@@ -10796,8 +10906,7 @@ mod outcome_tests {
         let harness = TestHarness::new().await;
         let prefix = harness.prefix.clone();
         let mut config = deterministic_config();
-        let (_security, _adapter, admin_bearer) =
-            crate::common::server::test_security_runtime(&mut config);
+        let admin_bearer = crate::common::server::test_admin_bearer(&mut config);
         let scheduler = FaultScheduler::from_schedule(FaultSchedule {
             profile: FaultProfile::SupportedFull,
             events: vec![FaultEvent {

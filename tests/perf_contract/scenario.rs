@@ -24,7 +24,10 @@ use zeppelin::wal::Manifest;
 
 use crate::common::counting::{perf_counting_store, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
-use crate::common::server::{api_ns, start_test_server_full, FullTestServer};
+use crate::common::server::{
+    api_ns, start_test_server_full,
+    start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer, FullTestServer,
+};
 use zeppelin::storage::ZeppelinStore;
 
 use super::contract::{
@@ -722,12 +725,14 @@ async fn run_scenario_inner(
                 "cold scenario setup issued a query before fresh-server boot"
             );
             cold_server = Some(
-                start_test_server_full(
+                start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
                     server_store.clone(),
                     Some(harness.prefix.clone()),
                     config.clone(),
                     false,
                     Some(clock.clone()),
+                    100 * 1024 * 1024,
+                    &setup_server.admin_bearer,
                 )
                 .await,
             );
@@ -761,12 +766,14 @@ async fn run_scenario_inner(
         }
         CacheState::WarmHydrated => {
             cold_server = Some(
-                start_test_server_full(
+                start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
                     server_store.clone(),
                     Some(harness.prefix.clone()),
                     config.clone(),
                     false,
                     Some(clock.clone()),
+                    100 * 1024 * 1024,
+                    &setup_server.admin_bearer,
                 )
                 .await,
             );
@@ -808,12 +815,14 @@ async fn run_scenario_inner(
         let fresh_server =
             if repeat_cold && repeat > 0 && matches!(&spec.cache_state, CacheState::Cold) {
                 Some(
-                    start_test_server_full(
+                    start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
                         server_store.clone(),
                         Some(harness.prefix.clone()),
                         config.clone(),
                         false,
                         Some(clock.clone()),
+                        100 * 1024 * 1024,
+                        &setup_server.admin_bearer,
                     )
                     .await,
                 )
@@ -990,12 +999,14 @@ pub(crate) async fn run_closed_loop_scenario(
                 "cold closed-loop setup issued a query before fresh-server boot"
             );
             cold_server = Some(
-                start_test_server_full(
+                start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
                     decorated_store.clone(),
                     Some(harness.prefix.clone()),
                     config,
                     false,
                     Some(clock),
+                    100 * 1024 * 1024,
+                    &setup_server.admin_bearer,
                 )
                 .await,
             );

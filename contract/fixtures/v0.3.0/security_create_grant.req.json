@@ -1,0 +1,14 @@
+{
+  "actions": {
+    "actions": [
+      "NamespaceRead",
+      "Query"
+    ],
+    "kind": "selected"
+  },
+  "principal_id": "service:contract",
+  "scope": {
+    "kind": "namespace",
+    "namespace": "contract-main"
+  }
+}

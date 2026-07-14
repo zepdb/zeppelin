@@ -1,7 +1,11 @@
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::HeaderMap;
+use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -9,12 +13,16 @@ use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
 use zeppelin::metrics::{
     AUDIT_FLUSH_FAILURES_TOTAL, AUDIT_RECORDS_TOTAL, AUTHZ_DENIALS_TOTAL, AUTH_FAILURES_TOTAL,
 };
+use zeppelin::security::{AuthenticationOutcome, AuthnFailure, CredentialAdapter, PolicyVersion};
 use zeppelin::storage::ZeppelinStore;
 
 use common::counting::counting_store;
 use common::fault_injection::{delay_delete_matching, fail_put_once_matching};
 use common::harness::TestHarness;
-use common::server::{client_with_bearer, create_ns_api, start_test_server_full};
+use common::server::{
+    client_with_bearer, create_ns_api, start_test_server_full,
+    start_test_server_full_with_credential_adapter,
+};
 
 const READER_KEY_ID: &str = "zpk1_audit_reader";
 const READER_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -38,6 +46,54 @@ fn audit_config() -> Config {
 
 fn reader_bearer() -> String {
     format!("{READER_KEY_ID}.{READER_SECRET}")
+}
+
+struct AdvancingFailureAdapter {
+    advanced: AtomicBool,
+}
+
+struct BecomesStaleDuringAuthenticationAdapter;
+
+impl CredentialAdapter for BecomesStaleDuringAuthenticationAdapter {
+    fn authenticate_with_policy(
+        &self,
+        _headers: &HeaderMap,
+        _now: DateTime<Utc>,
+    ) -> AuthenticationOutcome {
+        AuthenticationOutcome {
+            result: Err(AuthnFailure::CredentialUnknown),
+            policy_version: PolicyVersion::persisted(2).unwrap(),
+            policy_fresh: false,
+        }
+    }
+
+    fn policy_freshness(&self) -> (PolicyVersion, bool) {
+        (PolicyVersion::persisted(1).unwrap(), true)
+    }
+}
+
+impl CredentialAdapter for AdvancingFailureAdapter {
+    fn authenticate_with_policy(
+        &self,
+        _headers: &HeaderMap,
+        _now: DateTime<Utc>,
+    ) -> AuthenticationOutcome {
+        self.advanced.store(true, Ordering::SeqCst);
+        AuthenticationOutcome {
+            result: Err(AuthnFailure::CredentialUnknown),
+            policy_version: PolicyVersion::persisted(1).unwrap(),
+            policy_fresh: true,
+        }
+    }
+
+    fn policy_freshness(&self) -> (PolicyVersion, bool) {
+        let version = if self.advanced.load(Ordering::SeqCst) {
+            2
+        } else {
+            1
+        };
+        (PolicyVersion::persisted(version).unwrap(), true)
+    }
 }
 
 async fn read_audit_objects(store: &ZeppelinStore, node_id: &str) -> Vec<(String, String)> {
@@ -107,7 +163,7 @@ async fn denial_writes_audit_record() {
     assert_eq!(record["principal_id"], READER_KEY_ID);
     assert_eq!(record["principal_kind"], "service");
     assert_eq!(record["action"], "NamespaceDelete");
-    assert_eq!(record["policy_version"], 0);
+    assert_eq!(record["policy_version"], 1);
     assert_eq!(record["outcome"]["denied"]["reason"], "action_not_granted");
     assert!(record["decision_id"].is_string());
     assert!(record["source_ip"].is_string());
@@ -150,6 +206,74 @@ async fn authn_failure_writes_audit_record() {
     );
     assert!(record["decision_id"].is_null());
     assert!(record["prev_hash"].is_null());
+
+    server.shutdown().await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn authn_failure_audits_the_snapshot_evaluated_before_policy_advances() {
+    let harness = TestHarness::new().await;
+    let adapter = Arc::new(AdvancingFailureAdapter {
+        advanced: AtomicBool::new(false),
+    });
+    let server = start_test_server_full_with_credential_adapter(
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+        Config::default(),
+        adapter,
+    )
+    .await;
+    let request_id = "audit-authn-evaluated-version";
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/security/policy", server.base_url))
+        .bearer_auth("zpk1_missing.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+        .header("x-request-id", request_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+
+    server.flush_audit().await;
+    let records = read_audit_records(&harness.store, &server.audit_node_id).await;
+    let record = record_for_request(&records, request_id);
+    assert_eq!(record["policy_version"], 1);
+    assert_eq!(
+        record["outcome"]["authn_failed"]["reason"],
+        "credential_unknown"
+    );
+
+    server.shutdown().await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn authentication_fails_closed_when_the_evaluated_snapshot_is_stale() {
+    let harness = TestHarness::new().await;
+    let server = start_test_server_full_with_credential_adapter(
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+        Config::default(),
+        Arc::new(BecomesStaleDuringAuthenticationAdapter),
+    )
+    .await;
+    let request_id = "audit-authn-atomic-staleness";
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/security/policy", server.base_url))
+        .bearer_auth("zpk1_missing.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+        .header("x-request-id", request_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+
+    server.flush_audit().await;
+    let records = read_audit_records(&harness.store, &server.audit_node_id).await;
+    let record = record_for_request(&records, request_id);
+    assert_eq!(record["policy_version"], 2);
+    assert_eq!(record["outcome"]["denied"]["reason"], "security_stale");
 
     server.shutdown().await;
     harness.cleanup().await;

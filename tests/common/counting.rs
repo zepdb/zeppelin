@@ -9,22 +9,23 @@
 //! (cluster_/attrs_/bootstrap/sq_/bitmap_/coarse_sketch/fts/wal/manifest) with BOTH
 //! operation counts and byte counts per bucket. GET bytes are the actual
 //! returned payload size (`GetResult::range`), PUT bytes the actual request
-//! body size (`PutPayload::content_length`). Security audit objects remain
-//! visible through the per-key counters but are excluded from the frozen
+//! body size (`PutPayload::content_length`). Security policy and audit objects
+//! remain visible through the per-key counters but are excluded from the frozen
 //! domain-artifact totals.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result as OsResult,
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
 };
 use serde::Serialize;
 use zeppelin::storage::ZeppelinStore;
@@ -150,7 +151,20 @@ pub fn classify(key: &str) -> ArtifactClass {
 /// namespace's frozen domain-artifact cost model.
 #[must_use]
 pub fn is_audit_key(key: &str) -> bool {
-    key == "_audit" || key.starts_with("_audit/")
+    key.split('/').any(|segment| segment == "_audit")
+}
+
+/// Whether `key` belongs to the security-policy control plane rather than a
+/// namespace's frozen domain-artifact cost model.
+#[must_use]
+pub fn is_security_key(key: &str) -> bool {
+    key.split('/').any(|segment| segment == "_security")
+}
+
+/// Whether `key` is control-plane state excluded from frozen domain totals.
+#[must_use]
+pub fn is_control_plane_key(key: &str) -> bool {
+    is_audit_key(key) || is_security_key(key)
 }
 
 /// Ops + bytes recorded for a single artifact class.
@@ -211,6 +225,9 @@ impl ClassCounters {
 pub struct GetCounter {
     gets: Arc<DashMap<String, u64>>,
     puts: Arc<DashMap<String, u64>>,
+    create_puts: Arc<DashMap<String, u64>>,
+    update_puts: Arc<DashMap<String, u64>>,
+    conditional_gets: Arc<Mutex<Vec<(String, Instant)>>>,
     heads: Arc<DashMap<String, u64>>,
     lists: Arc<DashMap<String, u64>>,
     delimiter_lists: Arc<DashMap<String, u64>>,
@@ -227,6 +244,12 @@ impl GetCounter {
             .sum()
     }
 
+    /// Total number of observed GETs across domain and control-plane keys.
+    #[must_use]
+    pub fn total_observed_gets(&self) -> u64 {
+        self.gets.iter().map(|record| *record.value()).sum()
+    }
+
     /// Total number of PUTs whose key contains `substr`.
     pub fn puts_matching(&self, substr: &str) -> u64 {
         self.puts
@@ -234,6 +257,60 @@ impl GetCounter {
             .filter(|r| r.key().contains(substr))
             .map(|r| *r.value())
             .sum()
+    }
+
+    /// Total number of observed PUTs across domain and control-plane keys.
+    #[must_use]
+    pub fn total_observed_puts(&self) -> u64 {
+        self.puts.iter().map(|record| *record.value()).sum()
+    }
+
+    /// Total number of create-only PUTs whose key contains `substr`.
+    #[must_use]
+    pub fn create_puts_matching(&self, substr: &str) -> u64 {
+        self.create_puts
+            .iter()
+            .filter(|record| record.key().contains(substr))
+            .map(|record| *record.value())
+            .sum()
+    }
+
+    /// Total number of ETag-conditional update PUTs whose key contains `substr`.
+    #[must_use]
+    pub fn update_puts_matching(&self, substr: &str) -> u64 {
+        self.update_puts
+            .iter()
+            .filter(|record| record.key().contains(substr))
+            .map(|record| *record.value())
+            .sum()
+    }
+
+    /// Total number of If-None-Match GETs whose key contains `substr`.
+    #[must_use]
+    pub fn conditional_gets_matching(&self, substr: &str) -> usize {
+        self.conditional_gets
+            .lock()
+            .unwrap_or_else(|_| panic!("conditional GET counter lock poisoned"))
+            .iter()
+            .filter(|(key, _)| key.contains(substr))
+            .count()
+    }
+
+    /// Monotonic gaps between matching If-None-Match GET attempts.
+    #[must_use]
+    pub fn conditional_get_gaps_matching(&self, substr: &str) -> Vec<Duration> {
+        let observations = self
+            .conditional_gets
+            .lock()
+            .unwrap_or_else(|_| panic!("conditional GET counter lock poisoned"));
+        let instants = observations
+            .iter()
+            .filter_map(|(key, observed_at)| key.contains(substr).then_some(*observed_at))
+            .collect::<Vec<_>>();
+        instants
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]))
+            .collect()
     }
 
     /// Total number of HEADs whose key contains `substr`.
@@ -356,6 +433,12 @@ impl GetCounter {
     pub fn reset(&self) {
         self.gets.clear();
         self.puts.clear();
+        self.create_puts.clear();
+        self.update_puts.clear();
+        self.conditional_gets
+            .lock()
+            .unwrap_or_else(|_| panic!("conditional GET counter lock poisoned"))
+            .clear();
         self.heads.clear();
         self.lists.clear();
         self.delimiter_lists.clear();
@@ -424,7 +507,18 @@ impl ObjectStore for CountingStore {
             .entry(location.to_string())
             .and_modify(|v| *v += 1)
             .or_insert(1);
-        if !is_audit_key(location.as_ref()) {
+        let mode_counter = match &opts.mode {
+            PutMode::Create => Some(&self.counter.create_puts),
+            PutMode::Update(_) => Some(&self.counter.update_puts),
+            PutMode::Overwrite => None,
+        };
+        if let Some(mode_counter) = mode_counter {
+            mode_counter
+                .entry(location.to_string())
+                .and_modify(|value| *value += 1)
+                .or_insert(1);
+        }
+        if !is_control_plane_key(location.as_ref()) {
             self.counter
                 .classes
                 .record_put(classify(location.as_ref()), payload.content_length() as u64);
@@ -444,22 +538,29 @@ impl ObjectStore for CountingStore {
     // `get_range`, and `get_ranges` default impls delegate here).
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
         let class = classify(location.as_ref());
-        let is_audit = is_audit_key(location.as_ref());
+        let is_control_plane = is_control_plane_key(location.as_ref());
         self.counter
             .gets
             .entry(location.to_string())
             .and_modify(|v| *v += 1)
             .or_insert(1);
+        if options.if_none_match.is_some() {
+            self.counter
+                .conditional_gets
+                .lock()
+                .unwrap_or_else(|_| panic!("conditional GET counter lock poisoned"))
+                .push((location.to_string(), Instant::now()));
+        }
         // Count attempts before the backend returns so conditional 304-style
         // freshness checks are visible as GET ops with zero returned bytes.
-        if !is_audit {
+        if !is_control_plane {
             self.counter.classes.record_get_attempt(class);
         }
         let result = self.inner.get_opts(location, options).await?;
         // `GetResult::range` is the byte range actually returned (the whole
         // object for plain GETs, the requested slice for range GETs).
         let bytes = (result.range.end - result.range.start) as u64;
-        if !is_audit {
+        if !is_control_plane {
             self.counter.classes.record_get_bytes(class, bytes);
         }
         Ok(result)
@@ -528,7 +629,10 @@ mod tests {
         PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
     };
 
-    use super::{counting_store, is_audit_key, perf_counting_store, ArtifactClass};
+    use super::{
+        counting_store, is_audit_key, is_control_plane_key, is_security_key, perf_counting_store,
+        ArtifactClass,
+    };
     use zeppelin::storage::ZeppelinStore;
 
     #[derive(Debug)]
@@ -655,7 +759,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_puts_remain_key_visible_but_do_not_change_domain_totals() {
+    async fn control_plane_io_remains_key_visible_but_does_not_change_domain_totals() {
         let base = ZeppelinStore::new(Arc::new(InMemory::new()));
         let (counted, counter) = perf_counting_store(&base);
         let backend = counted.inner();
@@ -674,10 +778,34 @@ mod tests {
             )
             .await
             .expect("write audit object");
+        backend
+            .put(
+                &Path::from("_security/heads/policy.json"),
+                PutPayload::from_static(b"policy"),
+            )
+            .await
+            .expect("write security object");
+        backend
+            .get(&Path::from("namespace/meta.json"))
+            .await
+            .expect("read domain object");
+        backend
+            .get(&Path::from("_audit/2026-07-13/node/record.jsonl"))
+            .await
+            .expect("read audit object");
+        backend
+            .get(&Path::from("_security/heads/policy.json"))
+            .await
+            .expect("read security object");
 
         assert_eq!(counter.puts_matching("_audit/"), 1);
+        assert_eq!(counter.puts_matching("_security/"), 1);
+        assert_eq!(counter.gets_matching("_audit/"), 1);
+        assert_eq!(counter.gets_matching("_security/"), 1);
         assert_eq!(counter.puts_for(ArtifactClass::Other), 1);
         assert_eq!(counter.put_bytes_for(ArtifactClass::Other), 6);
+        assert_eq!(counter.gets_for(ArtifactClass::Other), 1);
+        assert_eq!(counter.get_bytes_for(ArtifactClass::Other), 6);
         assert_eq!(
             counter
                 .class_breakdown()
@@ -695,7 +823,25 @@ mod tests {
             6
         );
         assert!(is_audit_key("_audit/day/node/object.jsonl"));
-        assert!(!is_audit_key("tenant/_audit/object.jsonl"));
+        assert!(is_audit_key("tenant/_audit/object.jsonl"));
         assert!(!is_audit_key("_audit2/object.jsonl"));
+        assert!(is_security_key("_security/heads/policy.json"));
+        assert!(is_security_key("tenant/_security/policy.json"));
+        assert!(!is_security_key("_security2/policy.json"));
+        assert!(is_control_plane_key("_audit/day/node/object.jsonl"));
+        assert!(is_control_plane_key("_security/policies/version.json"));
+        assert!(!is_control_plane_key("namespace/meta.json"));
+    }
+
+    #[test]
+    fn scoped_control_plane_keys_remain_outside_domain_cost_totals() {
+        assert!(is_audit_key("test-scope/_audit/day/node/object.jsonl"));
+        assert!(is_security_key("test-scope/_security/heads/policy.json"));
+        assert!(is_control_plane_key(
+            "test-scope/_security/policies/version.json"
+        ));
+        assert!(!is_control_plane_key(
+            "test-scope/ordinary-namespace/meta.json"
+        ));
     }
 }

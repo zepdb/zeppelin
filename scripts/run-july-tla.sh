@@ -75,6 +75,8 @@ run_tlc TwoPassGcSafety TwoPassGcSafety.cfg TwoPassGcSafety.tlc.log
 run_tlc RestoreCloneSafety RestoreCloneSafety.cfg RestoreCloneSafety.tlc.log
 run_tlc IncrementalArtifactClosure IncrementalArtifactClosure.cfg IncrementalArtifactClosure.tlc.log
 run_tlc GroupCommitWalWriter GroupCommitWalWriter.cfg GroupCommitWalWriter.tlc.log
+run_tlc MultiWriterLease MultiWriterLease.cfg MultiWriterLease.tlc.log
+run_tlc SecurityPolicy SecurityPolicy.cfg SecurityPolicy.tlc.log
 
 run_negative_tlc PitrHistoryRetention PitrHistoryRetention.bug.cfg PitrHistoryRetention.bug.tlc.log
 run_negative_tlc TwoPassGcSafety TwoPassGcSafety.no-revalidate.cfg TwoPassGcSafety.no-revalidate.tlc.log
@@ -82,5 +84,7 @@ run_negative_tlc TwoPassGcSafety TwoPassGcSafety.stale-history.cfg TwoPassGcSafe
 run_negative_tlc RestoreCloneSafety RestoreCloneSafety.bug.cfg RestoreCloneSafety.bug.tlc.log
 run_negative_tlc IncrementalArtifactClosure IncrementalArtifactClosure.bug.cfg IncrementalArtifactClosure.bug.tlc.log
 run_negative_tlc GroupCommitWalWriter GroupCommitWalWriter.bug.cfg GroupCommitWalWriter.bug.tlc.log
+run_negative_tlc SecurityPolicy SecurityPolicy.no-cas.cfg SecurityPolicy.no-cas.tlc.log
+run_negative_tlc SecurityPolicy SecurityPolicy.stale-open.cfg SecurityPolicy.stale-open.tlc.log
 
 echo "All July TLA checks matched their expected result."

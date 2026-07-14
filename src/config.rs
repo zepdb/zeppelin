@@ -238,7 +238,7 @@ pub struct SecurityConfig {
     /// Optional signed-license path used by the later entitlement phase.
     #[serde(default)]
     pub license_path: String,
-    /// Named bootstrap credentials available before S3 policy is introduced.
+    /// Named credentials used only to bootstrap or recover S3 policy authority.
     #[serde(default)]
     pub api_keys: Vec<ApiKeyConfig>,
 }
@@ -276,7 +276,7 @@ pub struct ApiKeyConfig {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Returns the policy-head refresh interval used until phase 3 activates it.
+/// Returns the interval between authoritative policy-head refresh attempts.
 const fn default_security_policy_refresh_secs() -> u64 {
     5
 }
@@ -510,6 +510,10 @@ mod tests {
                 "ZEPPELIN_RATE_LIMIT_BURST",
                 "ZEPPELIN_WRITE_RATE_LIMIT_RPS",
                 "ZEPPELIN_WRITE_RATE_LIMIT_BURST",
+                "ZEPPELIN_PRINCIPAL_RATE_LIMIT_RPS",
+                "ZEPPELIN_PRINCIPAL_RATE_LIMIT_BURST",
+                "ZEPPELIN_PRINCIPAL_WRITE_RATE_LIMIT_RPS",
+                "ZEPPELIN_PRINCIPAL_WRITE_RATE_LIMIT_BURST",
                 "ZEPPELIN_RATE_LIMIT_IDLE_TTL_SECS",
                 "ZEPPELIN_TRUSTED_PROXIES",
                 "STORAGE_BACKEND",
@@ -731,6 +735,22 @@ mod tests {
                     config.server.write_rate_limit_burst = 0;
                 }),
                 vec!["server.write_rate_limit_burst"],
+            ),
+            (
+                "principal read rate limit burst must be nonzero when rps is enabled",
+                Box::new(|config| {
+                    config.server.principal_rate_limit_rps = 10;
+                    config.server.principal_rate_limit_burst = 0;
+                }),
+                vec!["server.principal_rate_limit_burst"],
+            ),
+            (
+                "principal write rate limit burst must be nonzero when rps is enabled",
+                Box::new(|config| {
+                    config.server.principal_write_rate_limit_rps = 10;
+                    config.server.principal_write_rate_limit_burst = 0;
+                }),
+                vec!["server.principal_write_rate_limit_burst"],
             ),
             (
                 "rate limiter idle ttl must be nonzero",
@@ -1016,6 +1036,43 @@ mod tests {
         assert_eq!(config.effective_rerank_coalesce_gap_bytes(), 0);
     }
 
+    #[test]
+    fn principal_rate_limits_default_and_obey_toml_and_environment() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let defaults = load_toml("").unwrap();
+        assert_eq!(defaults.server.principal_rate_limit_rps, 100);
+        assert_eq!(defaults.server.principal_rate_limit_burst, 200);
+        assert_eq!(defaults.server.principal_write_rate_limit_rps, 50);
+        assert_eq!(defaults.server.principal_write_rate_limit_burst, 100);
+
+        let configured = load_toml(
+            r#"
+            [server]
+            principal_rate_limit_rps = 11
+            principal_rate_limit_burst = 12
+            principal_write_rate_limit_rps = 13
+            principal_write_rate_limit_burst = 14
+            "#,
+        )
+        .unwrap();
+        assert_eq!(configured.server.principal_rate_limit_rps, 11);
+        assert_eq!(configured.server.principal_rate_limit_burst, 12);
+        assert_eq!(configured.server.principal_write_rate_limit_rps, 13);
+        assert_eq!(configured.server.principal_write_rate_limit_burst, 14);
+
+        std::env::set_var("ZEPPELIN_PRINCIPAL_RATE_LIMIT_RPS", "21");
+        std::env::set_var("ZEPPELIN_PRINCIPAL_RATE_LIMIT_BURST", "22");
+        std::env::set_var("ZEPPELIN_PRINCIPAL_WRITE_RATE_LIMIT_RPS", "23");
+        std::env::set_var("ZEPPELIN_PRINCIPAL_WRITE_RATE_LIMIT_BURST", "24");
+        let overridden = load_toml("").unwrap();
+        assert_eq!(overridden.server.principal_rate_limit_rps, 21);
+        assert_eq!(overridden.server.principal_rate_limit_burst, 22);
+        assert_eq!(overridden.server.principal_write_rate_limit_rps, 23);
+        assert_eq!(overridden.server.principal_write_rate_limit_burst, 24);
+    }
+
     /// Verifies that an unknown hydration policy name fails during deserialization.
     #[test]
     fn test_unknown_policy_name_fails_boot() {
@@ -1295,18 +1352,30 @@ pub struct ServerConfig {
     /// Default `top_k` when the client omits it. Default: `10`.
     #[serde(default = "default_top_k")]
     pub default_top_k: usize,
-    /// Maximum sustained read/query requests per second per client. Default: `100`.
+    /// Maximum sustained read/query requests per second per trusted client IP. Default: `100`.
     #[serde(default = "default_rate_limit_rps")]
     pub rate_limit_rps: u32,
-    /// Maximum read/query burst capacity per client. Default: `200`.
+    /// Maximum read/query burst capacity per trusted client IP. Default: `200`.
     #[serde(default = "default_rate_limit_burst")]
     pub rate_limit_burst: u32,
-    /// Maximum sustained write/admin requests per second per client. Default: `50`.
+    /// Maximum sustained write/admin requests per second per trusted client IP. Default: `50`.
     #[serde(default = "default_write_rate_limit_rps")]
     pub write_rate_limit_rps: u32,
-    /// Maximum write/admin burst capacity per client. Default: `100`.
+    /// Maximum write/admin burst capacity per trusted client IP. Default: `100`.
     #[serde(default = "default_write_rate_limit_burst")]
     pub write_rate_limit_burst: u32,
+    /// Maximum sustained read/query requests per second per authenticated principal. Default: `100`.
+    #[serde(default = "default_principal_rate_limit_rps")]
+    pub principal_rate_limit_rps: u32,
+    /// Maximum read/query burst capacity per authenticated principal. Default: `200`.
+    #[serde(default = "default_principal_rate_limit_burst")]
+    pub principal_rate_limit_burst: u32,
+    /// Maximum sustained write/admin requests per second per authenticated principal. Default: `50`.
+    #[serde(default = "default_principal_write_rate_limit_rps")]
+    pub principal_write_rate_limit_rps: u32,
+    /// Maximum write/admin burst capacity per authenticated principal. Default: `100`.
+    #[serde(default = "default_principal_write_rate_limit_burst")]
+    pub principal_write_rate_limit_burst: u32,
     /// Idle token-bucket TTL in seconds. Default: `600`.
     #[serde(default = "default_rate_limit_idle_ttl_secs")]
     pub rate_limit_idle_ttl_secs: u64,
@@ -1334,6 +1403,22 @@ fn default_write_rate_limit_rps() -> u32 {
 /// Returns the default write/admin token-bucket burst capacity per client.
 fn default_write_rate_limit_burst() -> u32 {
     100
+}
+/// Returns the default sustained query/read request rate per authenticated principal.
+fn default_principal_rate_limit_rps() -> u32 {
+    default_rate_limit_rps()
+}
+/// Returns the default query/read token-bucket burst capacity per authenticated principal.
+fn default_principal_rate_limit_burst() -> u32 {
+    default_rate_limit_burst()
+}
+/// Returns the default sustained write/admin request rate per authenticated principal.
+fn default_principal_write_rate_limit_rps() -> u32 {
+    default_write_rate_limit_rps()
+}
+/// Returns the default write/admin token-bucket burst capacity per authenticated principal.
+fn default_principal_write_rate_limit_burst() -> u32 {
+    default_write_rate_limit_burst()
 }
 /// Returns the default lifetime, in seconds, of an idle client rate-limit bucket.
 fn default_rate_limit_idle_ttl_secs() -> u64 {
@@ -2045,6 +2130,10 @@ impl Default for ServerConfig {
             rate_limit_burst: default_rate_limit_burst(),
             write_rate_limit_rps: default_write_rate_limit_rps(),
             write_rate_limit_burst: default_write_rate_limit_burst(),
+            principal_rate_limit_rps: default_principal_rate_limit_rps(),
+            principal_rate_limit_burst: default_principal_rate_limit_burst(),
+            principal_write_rate_limit_rps: default_principal_write_rate_limit_rps(),
+            principal_write_rate_limit_burst: default_principal_write_rate_limit_burst(),
             rate_limit_idle_ttl_secs: default_rate_limit_idle_ttl_secs(),
             trusted_proxies: Vec::new(),
         }
@@ -2390,22 +2479,6 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         let mut violations = Vec::new();
 
-        if self.security.mode == SecurityMode::Enforced && self.security.api_keys.is_empty() {
-            violations.push(
-                "security.api_keys must contain at least one usable key when security.mode is enforced"
-                    .to_string(),
-            );
-        } else if self.security.mode == SecurityMode::Enforced
-            && self.security.api_keys.iter().all(|key| {
-                key.expires_at
-                    .is_some_and(|expires_at| expires_at <= chrono::Utc::now())
-            })
-        {
-            violations.push(
-                "security.api_keys must contain at least one unexpired key when security.mode is enforced"
-                    .to_string(),
-            );
-        }
         if self.security.policy_refresh_secs == 0 {
             violations.push("security.policy_refresh_secs must be greater than zero".to_string());
         }
@@ -2489,6 +2562,20 @@ impl Config {
         if self.server.write_rate_limit_rps > 0 && self.server.write_rate_limit_burst == 0 {
             violations.push(
                 "server.write_rate_limit_burst must be at least 1 when write rate limiting is enabled"
+                    .to_string(),
+            );
+        }
+        if self.server.principal_rate_limit_rps > 0 && self.server.principal_rate_limit_burst == 0 {
+            violations.push(
+                "server.principal_rate_limit_burst must be at least 1 when principal rate limiting is enabled"
+                    .to_string(),
+            );
+        }
+        if self.server.principal_write_rate_limit_rps > 0
+            && self.server.principal_write_rate_limit_burst == 0
+        {
+            violations.push(
+                "server.principal_write_rate_limit_burst must be at least 1 when principal write rate limiting is enabled"
                     .to_string(),
             );
         }
@@ -2930,6 +3017,18 @@ impl Config {
         }
         if let Some(v) = env_override("ZEPPELIN_WRITE_RATE_LIMIT_BURST")? {
             self.server.write_rate_limit_burst = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_PRINCIPAL_RATE_LIMIT_RPS")? {
+            self.server.principal_rate_limit_rps = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_PRINCIPAL_RATE_LIMIT_BURST")? {
+            self.server.principal_rate_limit_burst = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_PRINCIPAL_WRITE_RATE_LIMIT_RPS")? {
+            self.server.principal_write_rate_limit_rps = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_PRINCIPAL_WRITE_RATE_LIMIT_BURST")? {
+            self.server.principal_write_rate_limit_burst = v;
         }
         if let Some(v) = env_override("ZEPPELIN_RATE_LIMIT_IDLE_TTL_SECS")? {
             self.server.rate_limit_idle_ttl_secs = v;

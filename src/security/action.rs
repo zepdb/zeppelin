@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::SecurityError;
 
 /// One independently grantable Zeppelin operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Action {
     /// Inspect readiness and other protected system state.
     SystemRead,
@@ -47,13 +47,15 @@ pub enum Action {
     VectorDelete,
     /// Execute a single or batched retrieval query.
     Query,
-    /// Administer security principals, credentials, and policy.
-    SecurityAdmin,
+    /// Inspect security principals, credentials, grants, and active policy metadata.
+    SecurityAdminRead,
+    /// Create or change security principals, credentials, grants, and policy.
+    SecurityAdminWrite,
 }
 
 impl Action {
     /// Every action in declaration order for completeness tests and wildcards.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::SystemRead,
         Self::MetricsRead,
         Self::RuntimeConfigRead,
@@ -73,7 +75,8 @@ impl Action {
         Self::VectorUpsert,
         Self::VectorDelete,
         Self::Query,
-        Self::SecurityAdmin,
+        Self::SecurityAdminRead,
+        Self::SecurityAdminWrite,
     ];
 
     /// Stable configuration and audit spelling for this action.
@@ -99,7 +102,8 @@ impl Action {
             Self::VectorUpsert => "VectorUpsert",
             Self::VectorDelete => "VectorDelete",
             Self::Query => "Query",
-            Self::SecurityAdmin => "SecurityAdmin",
+            Self::SecurityAdminRead => "SecurityAdminRead",
+            Self::SecurityAdminWrite => "SecurityAdminWrite",
         }
     }
 }
@@ -120,7 +124,34 @@ mod tests {
     use super::Action;
 
     #[test]
-    fn action_inventory_has_twenty_variants() {
-        assert_eq!(Action::ALL.len(), 20);
+    fn action_inventory_has_exact_phase_three_variants() {
+        let names = Action::ALL.map(Action::as_str).to_vec();
+
+        assert_eq!(
+            names,
+            vec![
+                "SystemRead",
+                "MetricsRead",
+                "RuntimeConfigRead",
+                "RuntimeConfigWrite",
+                "NamespaceCreate",
+                "NamespaceRead",
+                "NamespaceDelete",
+                "SnapshotRead",
+                "SnapshotWrite",
+                "SnapshotDelete",
+                "NamespaceClone",
+                "IndexConfigWrite",
+                "CompactionTrigger",
+                "CompactionStatusRead",
+                "HydrationTrigger",
+                "VectorFetch",
+                "VectorUpsert",
+                "VectorDelete",
+                "Query",
+                "SecurityAdminRead",
+                "SecurityAdminWrite",
+            ]
+        );
     }
 }

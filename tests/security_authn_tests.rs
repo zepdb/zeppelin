@@ -53,6 +53,23 @@ fn wrong_secret_right_key_id_is_unknown() {
 }
 
 #[test]
+fn authentication_failure_carries_the_exact_evaluated_policy_version() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer zpk1_reader.BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    );
+
+    let outcome = adapter().authenticate_with_policy(&headers, Utc::now());
+
+    assert_eq!(
+        outcome.policy_version,
+        zeppelin::security::PolicyVersion::BOOT
+    );
+    assert_eq!(outcome.result.unwrap_err(), AuthnFailure::CredentialUnknown);
+}
+
+#[test]
 fn malformed_bearer_is_unknown() {
     let mut headers = HeaderMap::new();
     headers.insert(

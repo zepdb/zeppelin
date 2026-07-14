@@ -77,7 +77,6 @@
 /// HTTP handlers and shared response helpers for every API endpoint.
 pub mod handlers;
 
-use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -86,7 +85,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, State};
 use axum::http::{Method, Request};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post, MethodRouter};
+use axum::routing::{delete, get, patch, post, MethodRouter};
 use axum::Router;
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -109,14 +108,16 @@ use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::security::{
     classify_route, Action, AllowDecision, AuditClient, AuditOutcome, AuditParams, AuditRecord,
-    CredentialAdapter, Decision, DenyDecision, NamespaceId, PolicyVersion, Principal,
+    CredentialAdapter, Decision, DenyDecision, DenyReason, NamespaceId, Principal, PrincipalId,
     RequestContext, Resource, ResourceRef, RouteClass, SecurityError, SecurityKernel, SnapshotName,
 };
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
 use crate::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
-use self::handlers::{config as config_handler, namespace, query, vectors, ApiError};
+use self::handlers::{
+    config as config_handler, namespace, query, security as security_handler, vectors, ApiError,
+};
 
 tokio::task_local! {
     /// Correlation ID scoped to the currently executing request future.
@@ -187,45 +188,52 @@ impl RateLimitClass {
 /// [`rate_limit`] inserts this value into request extensions after applying
 /// trusted-proxy rules. Batch query handling reuses it to charge additional
 /// entries to the same bucket instead of reparsing headers.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateLimitIdentity {
     /// Socket peer or rightmost untrusted forwarded address selected by policy.
     pub ip: IpAddr,
+    /// Primary bucket owner: IP before authentication, principal after authentication.
+    subject: Subject,
 }
 
-/// Identifies one client's read or write token bucket.
-///
-/// The same IP owns two independent entries, one for each [`RateLimitClass`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RateLimitKey {
-    /// Trusted client address used to partition rate-limit state.
-    ip: IpAddr,
-    /// Independent read or write budget associated with the address.
-    class: RateLimitClass,
-}
+impl RateLimitIdentity {
+    fn for_ip(ip: IpAddr) -> Self {
+        Self {
+            ip,
+            subject: Subject::Ip(ip),
+        }
+    }
 
-impl Hash for RateLimitKey {
-    /// Feeds both identity components into a hash-map hasher.
-    ///
-    /// # Parameters
-    ///
-    /// - `state`: Hasher selected by the surrounding [`DashMap`].
-    ///
-    /// # Side Effects
-    ///
-    /// Mutates only the hasher state; the key remains unchanged.
-    ///
-    /// # Examples
-    ///
-    /// `203.0.113.7/read` and `203.0.113.7/write` hash as distinct keys even
-    /// though they share the same client address.
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.ip.hash(state);
-        self.class.hash(state);
+    fn for_principal(&self, principal_id: PrincipalId) -> Self {
+        Self {
+            ip: self.ip,
+            subject: Subject::Principal(principal_id),
+        }
     }
 }
 
-/// Stores the mutable state for one client's token bucket.
+/// Stable owner of one read or write token bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Subject {
+    /// Authenticated policy principal, shared by all of its credentials.
+    Principal(PrincipalId),
+    /// Trusted client address for anonymous traffic and the secondary IP cap.
+    Ip(IpAddr),
+}
+
+/// Identifies one subject's read or write token bucket.
+///
+/// The same subject owns two independent entries, one for each
+/// [`RateLimitClass`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RateLimitKey {
+    /// Authenticated principal or trusted client address owning the bucket.
+    subject: Subject,
+    /// Independent read or write budget associated with the subject.
+    class: RateLimitClass,
+}
+
+/// Stores the mutable state for one principal or IP token bucket.
 ///
 /// Buckets begin with the configured burst capacity. Refills use elapsed
 /// monotonic time, and `consume_rate_limit` updates `last_seen` so idle state
@@ -314,7 +322,7 @@ pub struct AppState {
     pub decoded_artifact_cache: Arc<DecodedArtifactCache>,
     /// Non-blocking admission semaphore for in-flight query handlers.
     pub query_semaphore: Arc<Semaphore>,
-    /// Concurrent, process-local token buckets keyed by client and traffic class.
+    /// Concurrent, process-local token buckets keyed by subject and traffic class.
     pub rate_limiters: Arc<DashMap<RateLimitKey, RateLimitBucket>>,
 }
 
@@ -375,7 +383,7 @@ impl AuditRequest {
             .params = params;
     }
 
-    fn set_allow(&self, action: Action, resource: ResourceRef, decision: AllowDecision) {
+    pub(crate) fn set_allow(&self, action: Action, resource: ResourceRef, decision: AllowDecision) {
         let mut state = self
             .inner
             .lock()
@@ -674,7 +682,7 @@ pub async fn authenticate(
         Err(error) => return ApiError(error.into()).into_response(),
     };
     let context = RequestContext::at(request_id, state.clock.now());
-    let Some(source) = request.extensions().get::<RateLimitIdentity>().copied() else {
+    let Some(source) = request.extensions().get::<RateLimitIdentity>().cloned() else {
         return ApiError(SecurityError::MissingSourceIp.into()).into_response();
     };
 
@@ -684,11 +692,48 @@ pub async fn authenticate(
         return next.run(request).await;
     }
 
-    match state
+    let authentication = state
         .credential_adapter
-        .authenticate(request.headers(), context.now)
-    {
+        .authenticate_with_policy(request.headers(), context.now);
+    let authentication_policy_version = authentication.policy_version;
+    if !authentication.policy_fresh {
+        let action = match class {
+            RouteClass::Protected(action) => action,
+            RouteClass::Public => unreachable!("public route returned before authentication"),
+        };
+        let resource = match route_resource(matched_path.as_str(), request.uri().path()) {
+            Ok(resource) => resource,
+            Err(error) => return ApiError(error.into()).into_response(),
+        };
+        let principal = Principal::anonymous();
+        let deny =
+            DenyDecision::for_policy(DenyReason::SecurityStale, authentication_policy_version);
+        emit_authorization_denial(
+            &state, &principal, action, &resource, &context, source.ip, &deny,
+        );
+        return ApiError(SecurityError::Authorization(DenyReason::SecurityStale).into())
+            .into_response();
+    }
+    match authentication.result {
         Ok(principal) => {
+            let authenticated_source = source.for_principal(principal.id.clone());
+            if let Some(rate_class) = rate_limit_class(request.method(), request.uri().path()) {
+                if let Err(error) =
+                    consume_primary_rate_limit(&state, &authenticated_source.subject, rate_class, 1)
+                {
+                    if let Err(audit_error) = emit_security_rate_limit_rejection(
+                        &state,
+                        &request,
+                        &principal,
+                        authentication_policy_version,
+                        source.ip,
+                    ) {
+                        return ApiError(audit_error.into()).into_response();
+                    }
+                    return ApiError(error).into_response();
+                }
+            }
+            request.extensions_mut().insert(authenticated_source);
             request.extensions_mut().insert(principal);
             request.extensions_mut().insert(context);
             next.run(request).await
@@ -712,7 +757,7 @@ pub async fn authenticate(
                 context.request_id.clone(),
                 action,
                 resource,
-                PolicyVersion::BOOT,
+                authentication_policy_version,
                 source.ip,
                 failure,
                 state.audit.node_id(),
@@ -741,6 +786,8 @@ fn audited_action(action: Action) -> bool {
             | Action::CompactionTrigger
             | Action::HydrationTrigger
             | Action::VectorDelete
+            | Action::SecurityAdminRead
+            | Action::SecurityAdminWrite
     )
 }
 
@@ -784,6 +831,41 @@ fn submit_buffered_audit(client: &AuditClient, record: AuditRecord) {
             "security audit record could not be queued"
         );
     }
+}
+
+fn emit_security_rate_limit_rejection(
+    state: &AppState,
+    request: &Request<axum::body::Body>,
+    principal: &Principal,
+    policy_version: crate::security::PolicyVersion,
+    source_ip: IpAddr,
+) -> Result<(), SecurityError> {
+    if !request.uri().path().starts_with("/v1/security/") {
+        return Ok(());
+    }
+    let matched_path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .ok_or(SecurityError::UnmappedRoute)?;
+    let Some(RouteClass::Protected(action)) = classify_route(
+        request.method(),
+        matched_path.as_str(),
+        state.config.security.readyz_public,
+    ) else {
+        return Err(SecurityError::UnmappedRoute);
+    };
+    let record = AuditRecord::rate_limit_rejection(
+        state.clock.now(),
+        required_security_request_id()?,
+        principal,
+        action,
+        ResourceRef::SecurityPolicy,
+        policy_version,
+        source_ip,
+        state.audit.node_id(),
+    );
+    submit_buffered_audit(&state.audit, record);
+    Ok(())
 }
 
 fn emit_authorization_denial(
@@ -956,14 +1038,20 @@ pub async fn authorize(
     let Some(context) = request.extensions().get::<RequestContext>().cloned() else {
         return ApiError(SecurityError::MissingRequestContext.into()).into_response();
     };
-    let Some(source) = request.extensions().get::<RateLimitIdentity>().copied() else {
+    let Some(source) = request.extensions().get::<RateLimitIdentity>().cloned() else {
         return ApiError(SecurityError::MissingSourceIp.into()).into_response();
     };
 
-    let allow = match state
-        .security
-        .authorize(&principal, action, &resource, &context)
-    {
+    let decision = if action == Action::NamespaceCreate && matched_path == "/v1/namespaces" {
+        state
+            .security
+            .authorize_action(&principal, action, &context)
+    } else {
+        state
+            .security
+            .authorize(&principal, action, &resource, &context)
+    };
+    let allow = match decision {
         Decision::Allow(allow) => allow,
         Decision::Deny(deny) => {
             emit_authorization_denial(
@@ -974,26 +1062,37 @@ pub async fn authorize(
     };
 
     if action == Action::NamespaceClone {
-        for (required_action, required_resource) in [
-            (Action::NamespaceRead, resource.clone()),
-            (Action::NamespaceCreate, Resource::System),
-        ] {
-            if let Decision::Deny(deny) =
-                state
-                    .security
-                    .authorize(&principal, required_action, &required_resource, &context)
-            {
-                emit_authorization_denial(
-                    &state,
-                    &principal,
-                    required_action,
-                    &required_resource,
-                    &context,
-                    source.ip,
-                    &deny,
-                );
-                return ApiError(SecurityError::Authorization(deny.reason).into()).into_response();
-            }
+        if let Decision::Deny(deny) =
+            state
+                .security
+                .authorize(&principal, Action::NamespaceRead, &resource, &context)
+        {
+            emit_authorization_denial(
+                &state,
+                &principal,
+                Action::NamespaceRead,
+                &resource,
+                &context,
+                source.ip,
+                &deny,
+            );
+            return ApiError(SecurityError::Authorization(deny.reason).into()).into_response();
+        }
+        if let Decision::Deny(deny) =
+            state
+                .security
+                .authorize_action(&principal, Action::NamespaceCreate, &context)
+        {
+            emit_authorization_denial(
+                &state,
+                &principal,
+                Action::NamespaceCreate,
+                &Resource::System,
+                &context,
+                source.ip,
+                &deny,
+            );
+            return ApiError(SecurityError::Authorization(deny.reason).into()).into_response();
         }
     }
 
@@ -1029,6 +1128,9 @@ pub async fn authorize(
 fn route_resource(matched_path: &str, request_path: &str) -> Result<Resource, SecurityError> {
     if matched_path == "/v1/config/query" {
         return Ok(Resource::RuntimeConfig);
+    }
+    if matched_path.starts_with("/v1/security/") {
+        return Ok(Resource::SecurityPolicy);
     }
     if matched_path == "/v1/namespaces" {
         return Ok(Resource::System);
@@ -1410,21 +1512,23 @@ fn ipv6_in_prefix(ip: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
     (ip & mask) == (network & mask)
 }
 
-/// Applies the route-level, per-client token-bucket admission policy.
+/// Applies the route-level secondary IP token-bucket admission policy.
 ///
 /// The function classifies the request, resolves a spoof-resistant identity,
-/// stores that identity in request extensions, and charges one token. Read and
-/// write traffic use independent buckets. Health, readiness, and metrics return
+/// stores that identity in request extensions, and charges one IP token. After
+/// successful authentication, [`authenticate`] replaces the primary subject
+/// with the principal and charges its independent bucket. Anonymous traffic
+/// retains the IP as its only subject. Health, readiness, and metrics return
 /// `None` from route classification and pass through without a bucket.
 ///
 /// ```text
 /// method + path ----> exempt ------------------------------> handler
 ///       |
 ///       v
-/// peer + trusted XFF -> client IP -> read/write bucket -> token available?
-///                                                    | yes       | no
-///                                                    v           v
-///                                                 handler    JSON 429
+/// peer + trusted XFF -> client IP cap -> authentication -> principal bucket
+///                              | no                         | no
+///                              v                            v
+///                          JSON 429                     JSON 429
 /// ```
 ///
 /// # Parameters
@@ -1478,30 +1582,48 @@ pub async fn rate_limit(
         Ok(ip) => ip,
         Err(err) => return ApiError(err).into_response(),
     };
-    request.extensions_mut().insert(RateLimitIdentity { ip });
+    let identity = RateLimitIdentity::for_ip(ip);
+    request.extensions_mut().insert(identity.clone());
 
     let Some(class) = class else {
         return next.run(request).await;
     };
 
-    match consume_rate_limit(&state, ip, class, 1) {
+    match consume_rate_limit(&state, &identity, class, 1) {
         Ok(()) => next.run(request).await,
-        Err(err) => ApiError(err).into_response(),
+        Err(err) => {
+            if request.uri().path().starts_with("/v1/security/") {
+                let policy_version = state.credential_adapter.policy_freshness().0;
+                if let Err(audit_error) = emit_security_rate_limit_rejection(
+                    &state,
+                    &request,
+                    &Principal::anonymous(),
+                    policy_version,
+                    identity.ip,
+                ) {
+                    return ApiError(audit_error.into()).into_response();
+                }
+            }
+            ApiError(err).into_response()
+        }
     }
 }
 
-/// Atomically charges one client's selected rate-limit bucket.
+/// Charges one request identity's selected rate-limit buckets.
 ///
-/// Buckets start full, refill in whole tokens according to monotonic elapsed
-/// time, and never exceed the configured burst. The charge is all-or-nothing.
-/// Batch query invokes this after deserialization so a request with `N` entries
-/// costs `N` tokens: [`rate_limit`] already charged one, and the handler charges
+/// Each bucket starts full, refills in whole tokens according to monotonic
+/// elapsed time, and never exceeds its configured burst. Authenticated
+/// identities charge the secondary IP bucket followed by the primary principal
+/// bucket; anonymous identities charge the IP bucket once. Batch query invokes
+/// this after deserialization so a request with `N` entries costs `N` tokens in
+/// both dimensions: the middleware already charged one, and the handler charges
 /// `N - 1` here.
 ///
 /// # Parameters
 ///
 /// - `state`: Shared configuration and concurrent bucket map.
-/// - `ip`: Trusted client identity established by middleware.
+/// - `identity`: Authenticated principal and trusted client address established
+///   by middleware.
 /// - `class`: Independent read or write budget to charge.
 /// - `tokens_to_consume`: Additional whole tokens required by the operation.
 ///
@@ -1512,26 +1634,30 @@ pub async fn rate_limit(
 ///
 /// # Errors
 ///
-/// Returns [`ZeppelinError::RateLimitExceeded`] when the bucket lacks the full
-/// requested amount. No tokens are deducted on that failure. The error carries
-/// the computed whole-second retry hint.
+/// Returns [`ZeppelinError::RateLimitExceeded`] when either required bucket
+/// lacks the full requested amount. The rejected bucket is not partially
+/// charged. Because the two dimensions are intentionally independent, an IP
+/// charge completed before a principal rejection remains consumed. The error
+/// carries the computed whole-second retry hint.
 ///
 /// # Side Effects
 ///
-/// Scans out idle buckets, then creates or mutates one [`DashMap`] entry. A
-/// rejection increments `RATE_LIMITED_TOTAL` and emits a structured warning.
+/// Scans out idle buckets, then creates or mutates one or two [`DashMap`]
+/// entries. A rejection increments `RATE_LIMITED_TOTAL` and emits a structured
+/// warning.
 ///
 /// # Performance
 ///
-/// Charging one bucket is expected constant time, but idle eviction calls
+/// Charging each bucket is expected constant time, but idle eviction calls
 /// `DashMap::retain` and therefore scans all current buckets on every nonzero,
-/// enabled charge. No network or object-store request occurs.
+/// enabled per-subject charge. No network or object-store request occurs.
 ///
 /// # Examples
 ///
-/// If a read bucket has 10 tokens and a batch needs 4 additional tokens, the
-/// function succeeds and leaves 6. If it needs 11, the function returns 429
-/// metadata and leaves all 10 available.
+/// If both authenticated read buckets have 10 tokens and a batch needs four
+/// additional tokens, the function succeeds and leaves six in each. If the IP
+/// bucket lacks four tokens, the function returns 429 before charging the
+/// principal bucket.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
@@ -1541,7 +1667,19 @@ pub async fn rate_limit(
 /// hazard that would need manual discipline with a C hash table and lock.
 pub(crate) fn consume_rate_limit(
     state: &AppState,
-    ip: IpAddr,
+    identity: &RateLimitIdentity,
+    class: RateLimitClass,
+    tokens_to_consume: u64,
+) -> Result<(), ZeppelinError> {
+    if matches!(&identity.subject, Subject::Principal(_)) {
+        consume_primary_rate_limit(state, &Subject::Ip(identity.ip), class, tokens_to_consume)?;
+    }
+    consume_primary_rate_limit(state, &identity.subject, class, tokens_to_consume)
+}
+
+fn consume_primary_rate_limit(
+    state: &AppState,
+    subject: &Subject,
     class: RateLimitClass,
     tokens_to_consume: u64,
 ) -> Result<(), ZeppelinError> {
@@ -1549,7 +1687,7 @@ pub(crate) fn consume_rate_limit(
         return Ok(());
     }
 
-    let (rps, burst) = rate_limit_settings(&state.config, class);
+    let (rps, burst) = rate_limit_settings(&state.config, subject, class);
     if rps == 0 {
         return Ok(());
     }
@@ -1559,12 +1697,15 @@ pub(crate) fn consume_rate_limit(
         now,
         Duration::from_secs(state.config.server.rate_limit_idle_ttl_secs),
     );
-    let key = RateLimitKey { ip, class };
+    let key = RateLimitKey {
+        subject: subject.clone(),
+        class,
+    };
 
     let allowed = {
         let mut entry = state
             .rate_limiters
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| RateLimitBucket {
                 tokens: burst,
                 last_refill: now,
@@ -1605,7 +1746,7 @@ pub(crate) fn consume_rate_limit(
             .with_label_values(&[class.as_str()])
             .inc();
         tracing::warn!(
-            ip = %ip,
+            subject = ?subject,
             class = class.as_str(),
             requested_tokens = tokens_to_consume,
             "rate limit exceeded"
@@ -1619,6 +1760,7 @@ pub(crate) fn consume_rate_limit(
 /// # Parameters
 ///
 /// - `config`: Borrowed immutable boot configuration.
+/// - `subject`: Principal or IP dimension selecting the matching knobs.
 /// - `class`: Read or write budget selector.
 ///
 /// # Returns
@@ -1627,16 +1769,24 @@ pub(crate) fn consume_rate_limit(
 ///
 /// # Examples
 ///
-/// With read settings `100/200`, [`RateLimitClass::Read`] returns `(100, 200)`.
-fn rate_limit_settings(config: &Config, class: RateLimitClass) -> (u64, u64) {
-    match class {
-        RateLimitClass::Read => (
+/// With IP read settings `100/200`, an IP/read pair returns `(100, 200)`.
+fn rate_limit_settings(config: &Config, subject: &Subject, class: RateLimitClass) -> (u64, u64) {
+    match (subject, class) {
+        (Subject::Ip(_), RateLimitClass::Read) => (
             config.server.rate_limit_rps as u64,
             config.server.rate_limit_burst as u64,
         ),
-        RateLimitClass::Write => (
+        (Subject::Ip(_), RateLimitClass::Write) => (
             config.server.write_rate_limit_rps as u64,
             config.server.write_rate_limit_burst as u64,
+        ),
+        (Subject::Principal(_), RateLimitClass::Read) => (
+            config.server.principal_rate_limit_rps as u64,
+            config.server.principal_rate_limit_burst as u64,
+        ),
+        (Subject::Principal(_), RateLimitClass::Write) => (
+            config.server.principal_write_rate_limit_rps as u64,
+            config.server.principal_write_rate_limit_burst as u64,
         ),
     }
 }
@@ -1886,6 +2036,41 @@ pub fn build_router(state: AppState) -> Router {
             ),
         )
         .route(
+            "/v1/security/principals",
+            secure_route(
+                get(security_handler::list_principals).post(security_handler::create_principal),
+                &state,
+            ),
+        )
+        .route(
+            "/v1/security/keys",
+            secure_route(
+                get(security_handler::list_keys).post(security_handler::create_key),
+                &state,
+            ),
+        )
+        .route(
+            "/v1/security/keys/:key_id",
+            secure_route(delete(security_handler::revoke_key), &state),
+        )
+        .route(
+            "/v1/security/keys/:key_id/rotate",
+            secure_route(post(security_handler::rotate_key), &state),
+        )
+        .route(
+            "/v1/security/grants",
+            secure_route(
+                get(security_handler::list_grants)
+                    .post(security_handler::create_grant)
+                    .delete(security_handler::delete_grant),
+                &state,
+            ),
+        )
+        .route(
+            "/v1/security/policy",
+            secure_route(get(security_handler::get_policy), &state),
+        )
+        .route(
             "/v1/namespaces",
             secure_route(post(namespace::create_namespace), &state),
         )
@@ -1970,6 +2155,7 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     //! Unit tests for server-local admission helpers that need no storage backend.
 
@@ -1985,15 +2171,17 @@ mod tests {
         let buckets = DashMap::new();
         let now = Instant::now();
         let old_key = RateLimitKey {
-            ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            subject: Subject::Ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
             class: RateLimitClass::Read,
         };
         let fresh_key = RateLimitKey {
-            ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)),
+            subject: Subject::Principal(
+                PrincipalId::new("service:fresh").expect("principal ID must be valid"),
+            ),
             class: RateLimitClass::Write,
         };
         buckets.insert(
-            old_key,
+            old_key.clone(),
             RateLimitBucket {
                 tokens: 1,
                 last_refill: now - Duration::from_secs(60),
@@ -2001,7 +2189,7 @@ mod tests {
             },
         );
         buckets.insert(
-            fresh_key,
+            fresh_key.clone(),
             RateLimitBucket {
                 tokens: 1,
                 last_refill: now,
@@ -2044,6 +2232,8 @@ mod tests {
                 Action::CompactionTrigger,
                 Action::HydrationTrigger,
                 Action::VectorDelete,
+                Action::SecurityAdminRead,
+                Action::SecurityAdminWrite,
             ]
         );
     }
@@ -2067,6 +2257,8 @@ mod tests {
                 Action::SnapshotDelete,
                 Action::IndexConfigWrite,
                 Action::VectorDelete,
+                Action::SecurityAdminRead,
+                Action::SecurityAdminWrite,
             ]
         );
         assert!(must_audit.into_iter().all(audited_action));

@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use zeppelin::config::Config;
 use zeppelin::security::{
-    Action, Decision, DenyReason, NamespaceId, Principal, PrincipalId, RequestContext, Resource,
-    SecurityKernel,
+    Action, ApiKeyId, Decision, DenyReason, NamespaceId, Principal, PrincipalId, RequestContext,
+    Resource, SecurityKernel,
 };
 
 fn reader_config() -> Config {
@@ -28,6 +28,7 @@ fn configured_grant_produces_full_shaped_allow_decision() {
     let kernel = SecurityKernel::from_config(&reader_config().security).unwrap();
     let principal = Principal::api_key(
         PrincipalId::new("zpk1_reader").unwrap(),
+        ApiKeyId::new("zpk1_reader").unwrap(),
         "reader".to_string(),
         None,
     );
@@ -55,6 +56,7 @@ fn configured_namespace_scope_denies_cross_namespace() {
     let kernel = SecurityKernel::from_config(&reader_config().security).unwrap();
     let principal = Principal::api_key(
         PrincipalId::new("zpk1_reader").unwrap(),
+        ApiKeyId::new("zpk1_reader").unwrap(),
         "reader".to_string(),
         None,
     );

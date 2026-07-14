@@ -17,14 +17,11 @@ fn boot_fails_without_mode() {
 }
 
 #[test]
-fn boot_fails_enforced_no_keys() {
-    let error = Config::from_str("[security]\nmode = \"enforced\"\n")
-        .expect_err("enforced mode without a usable key must fail closed");
+fn enforced_config_allows_no_bootstrap_keys_pending_s3_authority_check() {
+    let config = Config::from_str("[security]\nmode = \"enforced\"\n")
+        .expect("credential availability is decided after checking S3 policy authority");
 
-    assert_eq!(
-        error.to_string(),
-        "config error: invalid configuration:\n- security.api_keys must contain at least one usable key when security.mode is enforced"
-    );
+    assert!(config.security.api_keys.is_empty());
 }
 
 #[test]
@@ -252,7 +249,7 @@ policy_refresh_secs = 0
 }
 
 #[test]
-fn boot_fails_enforced_with_only_expired_keys() {
+fn enforced_config_allows_expired_recovery_key_pending_s3_authority_check() {
     let source = format!(
         r#"
 [security]
@@ -267,13 +264,13 @@ namespaces = ["*"]
 expires_at = "2000-01-01T00:00:00Z"
 "#
     );
-    let error =
-        Config::from_str(&source).expect_err("enforced mode must have a credential usable at boot");
+    let config = Config::from_str(&source)
+        .expect("S3 may already contain an authoritative policy with usable credentials");
 
-    assert_eq!(
-        error.to_string(),
-        "config error: invalid configuration:\n- security.api_keys must contain at least one unexpired key when security.mode is enforced"
-    );
+    assert_eq!(config.security.api_keys.len(), 1);
+    assert!(config.security.api_keys[0]
+        .expires_at
+        .is_some_and(|expires_at| expires_at < chrono::Utc::now()));
 }
 
 #[test]

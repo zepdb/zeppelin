@@ -1,0 +1,45 @@
+{
+  "keys": [
+    {
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "expires_at": null,
+      "key_id": "zpk1_contract_primary",
+      "name": "contract-primary",
+      "principal_id": "service:contract",
+      "revokes_at": null,
+      "rotated_from": null,
+      "state": "revoked"
+    },
+    {
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "expires_at": null,
+      "key_id": "zpk1_contract_rotated",
+      "name": "contract-primary",
+      "principal_id": "service:contract",
+      "revokes_at": null,
+      "rotated_from": "zpk1_contract_primary",
+      "state": "revoked"
+    },
+    {
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "expires_at": null,
+      "key_id": "zpk1_contract_forbidden",
+      "name": "contract-forbidden",
+      "principal_id": "zpk1_contract_forbidden",
+      "revokes_at": null,
+      "rotated_from": null,
+      "state": "active"
+    },
+    {
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "expires_at": null,
+      "key_id": "zpk1_test_admin",
+      "name": "test-admin",
+      "principal_id": "zpk1_test_admin",
+      "revokes_at": null,
+      "rotated_from": null,
+      "state": "active"
+    }
+  ],
+  "policy_version": 5
+}

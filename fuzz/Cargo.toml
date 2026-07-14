@@ -62,3 +62,8 @@ doc = false
 name = "bearer_parse"
 path = "fuzz_targets/bearer_parse.rs"
 doc = false
+
+[[bin]]
+name = "policy_json"
+path = "fuzz_targets/policy_json.rs"
+doc = false

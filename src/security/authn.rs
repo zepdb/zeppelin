@@ -1,6 +1,7 @@
 //! Credential adapters that resolve transport headers to typed principals.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -11,7 +12,10 @@ use thiserror::Error;
 
 use crate::config::SecurityConfig;
 
-use super::{Principal, PrincipalId, SecurityError};
+use super::{
+    policy_cache::PolicyCache, ApiKeyId, KeyState, PolicyVersion, Principal, PrincipalId,
+    SecurityError,
+};
 
 const SECRET_LEN: usize = 43;
 const SECRET_BYTES: usize = 32;
@@ -52,14 +56,42 @@ impl AuthnFailure {
     }
 }
 
+/// Authentication result paired with the exact policy snapshot evaluated.
+#[derive(Debug, Clone)]
+pub struct AuthenticationOutcome {
+    /// Resolved principal or stable redacted failure family.
+    pub result: Result<Principal, AuthnFailure>,
+    /// Authoritative policy version used by this authentication attempt.
+    pub policy_version: PolicyVersion,
+    /// Whether the evaluated policy snapshot remains inside the fail-closed bound.
+    pub policy_fresh: bool,
+}
+
 /// Adapter boundary shared by API keys and future identity mechanisms.
 pub trait CredentialAdapter: Send + Sync {
+    /// Authenticate transport headers and retain the exact evaluated policy version.
+    fn authenticate_with_policy(
+        &self,
+        headers: &HeaderMap,
+        now: DateTime<Utc>,
+    ) -> AuthenticationOutcome;
+
     /// Authenticate transport headers at a trusted server-derived instant.
     fn authenticate(
         &self,
         headers: &HeaderMap,
         now: DateTime<Utc>,
-    ) -> Result<Principal, AuthnFailure>;
+    ) -> Result<Principal, AuthnFailure> {
+        self.authenticate_with_policy(headers, now).result
+    }
+
+    /// Return the exact policy version used for current credential lookup.
+    fn policy_version(&self) -> PolicyVersion {
+        self.policy_freshness().0
+    }
+
+    /// Return one atomic policy-version/freshness observation for pre-auth fail-closed checks.
+    fn policy_freshness(&self) -> (PolicyVersion, bool);
 }
 
 #[derive(Debug)]
@@ -68,10 +100,14 @@ struct StoredApiKey {
     digest: [u8; 32],
 }
 
-/// Named API-key adapter backed only by hashed boot configuration.
-#[derive(Debug)]
+enum ApiKeySource {
+    Bootstrap(HashMap<String, StoredApiKey>),
+    Policy(Arc<PolicyCache>),
+}
+
+/// Named API-key adapter backed only by hashed credential material.
 pub struct ApiKeyAdapter {
-    keys: HashMap<String, StoredApiKey>,
+    source: ApiKeySource,
 }
 
 impl ApiKeyAdapter {
@@ -81,6 +117,7 @@ impl ApiKeyAdapter {
         for key in &config.api_keys {
             let principal = Principal::api_key(
                 PrincipalId::new(key.key_id.clone())?,
+                ApiKeyId::new(key.key_id.clone())?,
                 key.name.clone(),
                 key.expires_at,
             );
@@ -92,7 +129,15 @@ impl ApiKeyAdapter {
                 return Err(SecurityError::DuplicatePrincipal);
             }
         }
-        Ok(Self { keys })
+        Ok(Self {
+            source: ApiKeySource::Bootstrap(keys),
+        })
+    }
+
+    pub(crate) fn from_policy_cache(cache: Arc<PolicyCache>) -> Self {
+        Self {
+            source: ApiKeySource::Policy(cache),
+        }
     }
 
     /// Authenticate one already-decoded Authorization header value.
@@ -105,55 +150,118 @@ impl ApiKeyAdapter {
         authorization: &str,
         now: DateTime<Utc>,
     ) -> Result<Principal, AuthnFailure> {
+        self.authenticate_bearer_with_policy(authorization, now)
+            .result
+    }
+
+    /// Authenticate a decoded bearer and retain the exact evaluated policy version.
+    #[must_use]
+    pub fn authenticate_bearer_with_policy(
+        &self,
+        authorization: &str,
+        now: DateTime<Utc>,
+    ) -> AuthenticationOutcome {
         let candidate = credential_candidate(authorization);
         let digest: [u8; 32] = Sha256::digest(candidate.secret.as_bytes()).into();
-        let stored = self.keys.get(candidate.key_id);
-        let expected = stored.map_or(&DUMMY_DIGEST, |key| &key.digest);
         let decoded = URL_SAFE_NO_PAD.decode(candidate.secret);
-        let digest_matches: bool = digest.ct_eq(expected).into();
         let canonical_secret = decoded.is_ok_and(|decoded| decoded.len() == SECRET_BYTES);
-        if !candidate.syntactically_valid
-            || stored.is_none()
-            || !canonical_secret
-            || !digest_matches
-        {
-            return Err(AuthnFailure::CredentialUnknown);
-        }
 
-        let Some(stored) = stored else {
-            return Err(AuthnFailure::CredentialUnknown);
-        };
-        if stored
-            .principal
-            .expires_at
-            .is_some_and(|expires_at| expires_at <= now)
-        {
-            return Err(AuthnFailure::CredentialExpired);
+        match &self.source {
+            ApiKeySource::Bootstrap(keys) => {
+                let stored = keys.get(candidate.key_id);
+                let expected = stored.map_or(&DUMMY_DIGEST, |key| &key.digest);
+                let digest_matches: bool = digest.ct_eq(expected).into();
+                let result = if !candidate.syntactically_valid
+                    || stored.is_none()
+                    || !canonical_secret
+                    || !digest_matches
+                {
+                    Err(AuthnFailure::CredentialUnknown)
+                } else if let Some(stored) = stored {
+                    if stored
+                        .principal
+                        .expires_at
+                        .is_some_and(|expires_at| expires_at <= now)
+                    {
+                        Err(AuthnFailure::CredentialExpired)
+                    } else {
+                        Ok(stored.principal.clone())
+                    }
+                } else {
+                    Err(AuthnFailure::CredentialUnknown)
+                };
+                AuthenticationOutcome {
+                    result,
+                    policy_version: PolicyVersion::BOOT,
+                    policy_fresh: true,
+                }
+            }
+            ApiKeySource::Policy(cache) => {
+                let cached = cache.current();
+                let policy_version = cached.policy.version();
+                let stored = cached.policy.key(candidate.key_id);
+                let expected = stored.map_or(&DUMMY_DIGEST, |key| &key.digest);
+                let digest_matches: bool = digest.ct_eq(expected).into();
+                let result = if !candidate.syntactically_valid
+                    || stored.is_none()
+                    || !canonical_secret
+                    || !digest_matches
+                {
+                    Err(AuthnFailure::CredentialUnknown)
+                } else if let Some(stored) = stored {
+                    if stored.state == KeyState::Revoked
+                        && stored.revokes_at.is_none_or(|revokes_at| revokes_at <= now)
+                    {
+                        Err(AuthnFailure::CredentialUnknown)
+                    } else if stored.state == KeyState::Expired
+                        || stored
+                            .expires_at
+                            .is_some_and(|expires_at| expires_at <= now)
+                    {
+                        Err(AuthnFailure::CredentialExpired)
+                    } else {
+                        Ok(stored.principal.clone())
+                    }
+                } else {
+                    Err(AuthnFailure::CredentialUnknown)
+                };
+                AuthenticationOutcome {
+                    result,
+                    policy_version,
+                    policy_fresh: cache.is_fresh(&cached),
+                }
+            }
         }
-        Ok(stored.principal.clone())
     }
 }
 
 impl CredentialAdapter for ApiKeyAdapter {
-    fn authenticate(
+    fn authenticate_with_policy(
         &self,
         headers: &HeaderMap,
         now: DateTime<Utc>,
-    ) -> Result<Principal, AuthnFailure> {
+    ) -> AuthenticationOutcome {
         let values = headers.get_all(AUTHORIZATION);
         let mut values = values.iter();
         let Some(value) = values.next() else {
-            return Err(AuthnFailure::Unauthenticated);
+            let mut outcome = self.authenticate_bearer_with_policy("not a bearer", now);
+            outcome.result = Err(AuthnFailure::Unauthenticated);
+            return outcome;
         };
         if values.next().is_some() {
-            consume_unknown_profile(self, now);
-            return Err(AuthnFailure::CredentialUnknown);
+            return consume_unknown_profile(self, now);
         }
         let Ok(value) = value.to_str() else {
-            consume_unknown_profile(self, now);
-            return Err(AuthnFailure::CredentialUnknown);
+            return consume_unknown_profile(self, now);
         };
-        self.authenticate_bearer(value, now)
+        self.authenticate_bearer_with_policy(value, now)
+    }
+
+    fn policy_freshness(&self) -> (PolicyVersion, bool) {
+        match &self.source {
+            ApiKeySource::Bootstrap(_) => (PolicyVersion::BOOT, true),
+            ApiKeySource::Policy(cache) => cache.freshness(),
+        }
     }
 }
 
@@ -198,8 +306,8 @@ fn parse_bearer(value: &str) -> Option<(&str, &str)> {
     Some((key_id, secret))
 }
 
-fn consume_unknown_profile(adapter: &ApiKeyAdapter, now: DateTime<Utc>) {
-    let _ = std::hint::black_box(adapter.authenticate_bearer("not a bearer", now));
+fn consume_unknown_profile(adapter: &ApiKeyAdapter, now: DateTime<Utc>) -> AuthenticationOutcome {
+    std::hint::black_box(adapter.authenticate_bearer_with_policy("not a bearer", now))
 }
 
 fn decode_digest(value: &str) -> Result<[u8; 32], SecurityError> {

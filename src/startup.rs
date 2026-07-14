@@ -120,7 +120,7 @@ use crate::error::{Result as ZeppelinResult, ZeppelinError};
 use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use crate::security::{ApiKeyAdapter, AuditRecord, AuditRuntime, SecurityKernel};
+use crate::security::{AuditRecord, AuditRuntime, SecurityKernel};
 use crate::server::build_router;
 use crate::server::AppState;
 use crate::storage::ZeppelinStore;
@@ -387,6 +387,8 @@ pub async fn build_app(
     }
 
     let clock = Clock::system();
+    let (security, credential_adapter) =
+        SecurityKernel::from_store(store.clone(), &config.security, clock.clone()).await?;
     let node_id = format!("zeppelin-{}", uuid::Uuid::new_v4());
     let (audit, audit_runtime) = if config.security.audit_s3 {
         AuditRuntime::start(
@@ -567,9 +569,7 @@ pub async fn build_app(
     let trusted_proxies = Arc::from(crate::server::parse_trusted_proxies(
         &config.server.trusted_proxies,
     )?);
-    let security = Arc::new(SecurityKernel::from_config(&config.security)?);
-    let credential_adapter: Arc<dyn crate::security::CredentialAdapter> =
-        Arc::new(ApiKeyAdapter::from_config(&config.security)?);
+    let credential_adapter: Arc<dyn crate::security::CredentialAdapter> = credential_adapter;
     let state = AppState {
         store,
         clock,

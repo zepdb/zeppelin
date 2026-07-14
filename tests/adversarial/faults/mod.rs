@@ -2236,7 +2236,62 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
             }
         }
     }
+    relocate_node_starts_outside_global_read_partitions(&mut events);
     FaultSchedule { profile, events }
+}
+
+fn relocate_node_starts_outside_global_read_partitions(events: &mut [FaultEvent]) {
+    let node_windows = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event.kind {
+            FaultKind::StartSecondNode { for_ops } | FaultKind::StartReadOnlyNode { for_ops } => {
+                Some((index, for_ops))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    for (index, for_ops) in node_windows {
+        let mut start_op = events[index].start_op;
+        loop {
+            let blocking_end = events
+                .iter()
+                .filter(|event| {
+                    event.boundary == Boundary::ObjectStore
+                        && event.target.store_op.is_none()
+                        && event.target.key_substring.is_none()
+                        && event_is_active(event, start_op)
+                        && matches!(
+                            event.kind,
+                            FaultKind::Partition {
+                                direction: Direction::All | Direction::ReadsFail,
+                            }
+                        )
+                })
+                .map(|event| {
+                    event
+                        .end_op
+                        .expect("global read partitions in generated campaigns must be bounded")
+                })
+                .max();
+            let Some(end_op) = blocking_end else {
+                break;
+            };
+            assert!(
+                end_op > start_op,
+                "an active global read partition must end after the node-start boundary"
+            );
+            start_op = end_op;
+        }
+
+        events[index].start_op = start_op;
+        events[index].end_op = Some(
+            start_op
+                .checked_add(for_ops)
+                .expect("relocated node window must fit the logical-op range"),
+        );
+    }
 }
 
 fn first_event_for_class(seed: u64, profile: FaultProfile, class: ContractClass) -> FaultEvent {
@@ -3025,6 +3080,27 @@ mod tests {
                 event.contract_class() == ContractClass::FutureArchitecture
                     && event.violated_assumptions() == [ProtectedAssumption::A3]
             }));
+        }
+    }
+
+    #[test]
+    fn composite_node_starts_avoid_global_read_partitions() {
+        for profile in [FaultProfile::SupportedFull, FaultProfile::Full] {
+            for seed in 0..100 {
+                let scheduler = FaultScheduler::for_seed(seed, profile);
+                for start_op in scheduler.schedule().events.iter().filter_map(|event| {
+                    matches!(
+                        event.kind,
+                        FaultKind::StartReadOnlyNode { .. } | FaultKind::StartSecondNode { .. }
+                    )
+                    .then_some(event.start_op)
+                }) {
+                    assert!(
+                        !scheduler.global_read_partition_active(start_op),
+                        "profile={profile:?} seed={seed} start_op={start_op}"
+                    );
+                }
+            }
         }
     }
 

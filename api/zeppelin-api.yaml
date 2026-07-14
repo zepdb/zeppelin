@@ -223,6 +223,315 @@ paths:
         "422":
           $ref: "#/components/responses/UnprocessableEntity"
 
+  /v1/security/principals:
+    get:
+      operationId: listSecurityPrincipals
+      summary: List security principals
+      description: |
+        Returns the principals in one authoritative policy snapshot. Principal
+        metadata is redaction-safe and never includes credential material.
+      tags: [Security]
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "200":
+          description: Principal inventory and its policy version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListSecurityPrincipalsResponse"
+
+    post:
+      operationId: createSecurityPrincipal
+      summary: Create a security principal
+      description: |
+        CAS-publishes a new stable principal in the next immutable policy
+        snapshot. A principal does not authenticate until it has a key and does
+        not authorize requests until it has an explicit grant.
+      tags: [Security]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSecurityPrincipalRequest"
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "201":
+          description: Principal created in a new policy version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateSecurityPrincipalResponse"
+        "400":
+          $ref: "#/components/responses/SecurityRequestError"
+        "409":
+          $ref: "#/components/responses/SecurityPolicyConflict"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /v1/security/keys:
+    get:
+      operationId: listSecurityKeys
+      summary: List redacted API-key metadata
+      description: |
+        Returns credential lifecycle metadata from one policy snapshot. The
+        response deliberately excludes both plaintext API-key secrets and stored
+        SHA-256 digests.
+      tags: [Security]
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "200":
+          description: Redacted key inventory and its policy version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListSecurityKeysResponse"
+
+    post:
+      operationId: createSecurityKey
+      summary: Issue an API key
+      description: |
+        Generates a high-entropy API key for an existing principal and
+        CAS-publishes only its SHA-256 digest. `api_key` is returned exactly once
+        in this response and cannot be recovered from later list operations.
+      tags: [Security]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSecurityKeyRequest"
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "201":
+          description: Key digest published; plaintext credential returned once
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueSecurityKeyResponse"
+        "400":
+          $ref: "#/components/responses/SecurityRequestError"
+        "404":
+          $ref: "#/components/responses/SecurityEntityNotFound"
+        "409":
+          $ref: "#/components/responses/SecurityPolicyConflict"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /v1/security/keys/{key_id}:
+    parameters:
+      - $ref: "#/components/parameters/SecurityKeyPath"
+
+    delete:
+      operationId: revokeSecurityKey
+      summary: Revoke an API key
+      description: |
+        CAS-publishes a revoked state and writes the new policy through to the
+        mutating node immediately. Other nodes enforce it within twice the
+        configured policy refresh interval.
+      tags: [Security]
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "200":
+          description: Key revoked in a new policy version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevokeSecurityKeyResponse"
+        "400":
+          $ref: "#/components/responses/SecurityRequestError"
+        "404":
+          $ref: "#/components/responses/SecurityEntityNotFound"
+        "409":
+          $ref: "#/components/responses/SecurityPolicyConflict"
+
+  /v1/security/keys/{key_id}/rotate:
+    parameters:
+      - $ref: "#/components/parameters/SecurityKeyPath"
+
+    post:
+      operationId: rotateSecurityKey
+      summary: Rotate an API key
+      description: |
+        Issues a replacement credential and marks its predecessor revoked at the
+        requested overlap deadline. The replacement `api_key` is returned exactly
+        once; subsequent reads expose only redacted lifecycle metadata.
+      tags: [Security]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RotateSecurityKeyRequest"
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "201":
+          description: Replacement key published and plaintext returned once
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RotateSecurityKeyResponse"
+        "400":
+          $ref: "#/components/responses/SecurityRequestError"
+        "404":
+          $ref: "#/components/responses/SecurityEntityNotFound"
+        "409":
+          $ref: "#/components/responses/SecurityPolicyConflict"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /v1/security/grants:
+    get:
+      operationId: listSecurityGrants
+      summary: List security grants
+      description: Returns every exact principal, tagged scope, and tagged action set in one policy snapshot.
+      tags: [Security]
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "200":
+          description: Grant inventory and its policy version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListSecurityGrantsResponse"
+
+    post:
+      operationId: createSecurityGrant
+      summary: Create a security grant
+      description: |
+        CAS-publishes one exact grant. Scope and actions are strict tagged
+        objects; unknown fields, empty selected action sets, and duplicate
+        selected actions are rejected.
+      tags: [Security]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecurityGrantMutationRequest"
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "201":
+          description: Grant published in a new policy version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecurityGrantMutationResponse"
+        "400":
+          $ref: "#/components/responses/SecurityRequestError"
+        "404":
+          $ref: "#/components/responses/SecurityEntityNotFound"
+        "409":
+          $ref: "#/components/responses/SecurityPolicyConflict"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+    delete:
+      operationId: deleteSecurityGrant
+      summary: Remove a security grant
+      description: CAS-removes the grant that exactly matches the supplied principal, scope, and actions.
+      tags: [Security]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecurityGrantMutationRequest"
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "200":
+          description: Grant removed in a new policy version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecurityGrantMutationResponse"
+        "400":
+          $ref: "#/components/responses/SecurityRequestError"
+        "404":
+          $ref: "#/components/responses/SecurityEntityNotFound"
+        "409":
+          $ref: "#/components/responses/SecurityPolicyConflict"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /v1/security/policy:
+    get:
+      operationId: getSecurityPolicy
+      summary: Get active security policy metadata
+      description: |
+        Returns the active S3 head and redaction-safe snapshot metadata. The
+        response includes the immutable object key and checksum but not key
+        digests or plaintext credentials.
+      tags: [Security]
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "200":
+          description: Active policy head and snapshot metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecurityPolicyMetadataResponse"
+
   /v1/namespaces:
     post:
       operationId: createNamespace
@@ -856,6 +1165,13 @@ components:
       schema:
         type: string
       description: Namespace name
+    SecurityKeyPath:
+      name: key_id
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/SecurityKeyId"
+      description: Stable public API-key identifier; never includes the secret suffix.
 
   responses:
     UnauthorizedError:
@@ -871,6 +1187,38 @@ components:
       description: |
         The authenticated principal is not authorized for the requested action or
         resource (403). The canonical error envelope carries a stable denial code.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    SecurityRequestError:
+      description: |
+        The requested security-policy mutation is invalid (400). The canonical
+        error envelope uses code `invalid_security_request` and does not echo
+        credential or storage material.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    SecurityEntityNotFound:
+      description: |
+        The requested principal, key, or exact grant does not exist (404). The
+        canonical error envelope uses code `security_entity_not_found`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    SecurityPolicyConflict:
+      description: |
+        The entity already exists (`security_entity_exists`, not retryable), or
+        bounded policy-head CAS retries were exhausted (`security_conflict`,
+        retryable). Retryable responses carry `Retry-After`.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+          description: Seconds to wait when `retryable` is true.
       content:
         application/json:
           schema:
@@ -956,7 +1304,7 @@ components:
     UnsupportedMediaType:
       description: |
         Missing or non-JSON Content-Type header (415), for endpoints that use
-        the JSON extractor (namespace create). Plain-text body.
+        the JSON extractor. Plain-text body.
       content:
         text/plain:
           schema:
@@ -964,10 +1312,11 @@ components:
             example: "Expected request with `Content-Type: application/json`"
     UnprocessableEntity:
       description: |
-        Body is valid JSON but fails deserialization on the namespace-create
-        endpoint (422). Plain-text body. NOTE: the vectors upsert/delete and
-        query endpoints instead return 400 with the canonical error envelope
-        (code VALIDATION_ERROR) for malformed bodies.
+        Body is valid JSON but fails strict handler deserialization (422), for
+        example because a required field is missing or an unknown field is
+        present. Plain-text body. NOTE: the vectors upsert/delete and query
+        endpoints instead return 400 with the canonical error envelope (code
+        VALIDATION_ERROR) for malformed bodies.
       content:
         text/plain:
           schema:
@@ -993,6 +1342,15 @@ components:
             - namespace_not_granted
             - security_stale
             - obligation_unsatisfied
+            - invalid_namespace
+            - invalid_snapshot
+            - invalid_security_request
+            - security_conflict
+            - security_entity_exists
+            - security_entity_not_found
+            - audit_unavailable
+            - unmapped_route
+            - security_internal
             - VALIDATION_ERROR
             - DIMENSION_MISMATCH
             - NAMESPACE_NOT_FOUND
@@ -1041,6 +1399,385 @@ components:
         status: 404
         retryable: false
         request_id: "b3f1c2e4-..."
+
+    SecurityPrincipalId:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9._:-]+$"
+      description: Stable principal identifier.
+
+    SecurityKeyId:
+      type: string
+      minLength: 6
+      maxLength: 128
+      pattern: "^zpk1_[A-Za-z0-9_-]+$"
+      description: Public credential identifier without its secret suffix.
+
+    SecurityApiKey:
+      type: string
+      pattern: "^zpk1_[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"
+      description: |
+        Complete bearer credential. This value is secret and appears only in a
+        successful create-key or rotate-key response.
+      x-zeppelin-secret-once: true
+
+    SecurityPrincipalKind:
+      type: string
+      enum: [human, service, agent, internal, anonymous]
+
+    SecurityPrincipal:
+      type: object
+      additionalProperties: false
+      required: [principal_id, kind, display_name]
+      properties:
+        principal_id:
+          $ref: "#/components/schemas/SecurityPrincipalId"
+        kind:
+          $ref: "#/components/schemas/SecurityPrincipalKind"
+        display_name:
+          type: string
+          minLength: 1
+
+    CreateSecurityPrincipalRequest:
+      type: object
+      additionalProperties: false
+      required: [principal_id, kind, display_name]
+      properties:
+        principal_id:
+          $ref: "#/components/schemas/SecurityPrincipalId"
+        kind:
+          $ref: "#/components/schemas/SecurityPrincipalKind"
+        display_name:
+          type: string
+          minLength: 1
+
+    CreateSecurityPrincipalResponse:
+      type: object
+      additionalProperties: false
+      required: [policy_version, principal]
+      properties:
+        policy_version:
+          type: integer
+          format: uint64
+          minimum: 1
+        principal:
+          $ref: "#/components/schemas/SecurityPrincipal"
+
+    ListSecurityPrincipalsResponse:
+      type: object
+      additionalProperties: false
+      required: [policy_version, principals]
+      properties:
+        policy_version:
+          type: integer
+          format: uint64
+          minimum: 1
+        principals:
+          type: array
+          items:
+            $ref: "#/components/schemas/SecurityPrincipal"
+
+    CreateSecurityKeyRequest:
+      type: object
+      additionalProperties: false
+      required: [principal_id, name]
+      properties:
+        principal_id:
+          $ref: "#/components/schemas/SecurityPrincipalId"
+        name:
+          type: string
+          minLength: 1
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+          default: null
+
+    IssueSecurityKeyResponse:
+      type: object
+      additionalProperties: false
+      required: [policy_version, key_id, api_key]
+      properties:
+        policy_version:
+          type: integer
+          format: uint64
+          minimum: 1
+        key_id:
+          $ref: "#/components/schemas/SecurityKeyId"
+        api_key:
+          $ref: "#/components/schemas/SecurityApiKey"
+
+    RotateSecurityKeyRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        overlap_secs:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 0
+
+    RotateSecurityKeyResponse:
+      type: object
+      additionalProperties: false
+      required: [policy_version, key_id, api_key, rotated_from]
+      properties:
+        policy_version:
+          type: integer
+          format: uint64
+          minimum: 1
+        key_id:
+          $ref: "#/components/schemas/SecurityKeyId"
+        api_key:
+          $ref: "#/components/schemas/SecurityApiKey"
+        rotated_from:
+          $ref: "#/components/schemas/SecurityKeyId"
+
+    RevokeSecurityKeyResponse:
+      type: object
+      additionalProperties: false
+      required: [policy_version, key_id]
+      properties:
+        policy_version:
+          type: integer
+          format: uint64
+          minimum: 1
+        key_id:
+          $ref: "#/components/schemas/SecurityKeyId"
+
+    SecurityKeyState:
+      type: string
+      enum: [active, revoked, expired]
+
+    SecurityKeyView:
+      type: object
+      additionalProperties: false
+      description: Redacted lifecycle metadata; digest and plaintext secret are intentionally absent.
+      required:
+        - key_id
+        - name
+        - principal_id
+        - state
+        - expires_at
+        - created_at
+        - rotated_from
+        - revokes_at
+      properties:
+        key_id:
+          $ref: "#/components/schemas/SecurityKeyId"
+        name:
+          type: string
+          minLength: 1
+        principal_id:
+          $ref: "#/components/schemas/SecurityPrincipalId"
+        state:
+          $ref: "#/components/schemas/SecurityKeyState"
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        rotated_from:
+          oneOf:
+            - $ref: "#/components/schemas/SecurityKeyId"
+            - type: "null"
+        revokes_at:
+          type: [string, "null"]
+          format: date-time
+
+    ListSecurityKeysResponse:
+      type: object
+      additionalProperties: false
+      required: [policy_version, keys]
+      properties:
+        policy_version:
+          type: integer
+          format: uint64
+          minimum: 1
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/SecurityKeyView"
+
+    SecurityAction:
+      type: string
+      enum:
+        - SystemRead
+        - MetricsRead
+        - RuntimeConfigRead
+        - RuntimeConfigWrite
+        - NamespaceCreate
+        - NamespaceRead
+        - NamespaceDelete
+        - SnapshotRead
+        - SnapshotWrite
+        - SnapshotDelete
+        - NamespaceClone
+        - IndexConfigWrite
+        - CompactionTrigger
+        - CompactionStatusRead
+        - HydrationTrigger
+        - VectorFetch
+        - VectorUpsert
+        - VectorDelete
+        - Query
+        - SecurityAdminRead
+        - SecurityAdminWrite
+
+    SecurityGrantScope:
+      oneOf:
+        - $ref: "#/components/schemas/SecurityGlobalGrantScope"
+        - $ref: "#/components/schemas/SecurityNamespaceGrantScope"
+      discriminator:
+        propertyName: kind
+        mapping:
+          global: "#/components/schemas/SecurityGlobalGrantScope"
+          namespace: "#/components/schemas/SecurityNamespaceGrantScope"
+
+    SecurityGlobalGrantScope:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          const: global
+
+    SecurityNamespaceGrantScope:
+      type: object
+      additionalProperties: false
+      required: [kind, namespace]
+      properties:
+        kind:
+          const: namespace
+        namespace:
+          type: string
+          minLength: 1
+          maxLength: 255
+
+    SecurityGrantActions:
+      oneOf:
+        - $ref: "#/components/schemas/SecurityAllGrantActions"
+        - $ref: "#/components/schemas/SecuritySelectedGrantActions"
+      discriminator:
+        propertyName: kind
+        mapping:
+          all: "#/components/schemas/SecurityAllGrantActions"
+          selected: "#/components/schemas/SecuritySelectedGrantActions"
+
+    SecurityAllGrantActions:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          const: all
+
+    SecuritySelectedGrantActions:
+      type: object
+      additionalProperties: false
+      required: [kind, actions]
+      properties:
+        kind:
+          const: selected
+        actions:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/SecurityAction"
+
+    SecurityGrant:
+      type: object
+      additionalProperties: false
+      required: [principal_id, scope, actions]
+      properties:
+        principal_id:
+          $ref: "#/components/schemas/SecurityPrincipalId"
+        scope:
+          $ref: "#/components/schemas/SecurityGrantScope"
+        actions:
+          $ref: "#/components/schemas/SecurityGrantActions"
+
+    SecurityGrantMutationRequest:
+      type: object
+      additionalProperties: false
+      required: [principal_id, scope, actions]
+      properties:
+        principal_id:
+          $ref: "#/components/schemas/SecurityPrincipalId"
+        scope:
+          $ref: "#/components/schemas/SecurityGrantScope"
+        actions:
+          $ref: "#/components/schemas/SecurityGrantActions"
+
+    SecurityGrantMutationResponse:
+      type: object
+      additionalProperties: false
+      required: [policy_version, grant]
+      properties:
+        policy_version:
+          type: integer
+          format: uint64
+          minimum: 1
+        grant:
+          $ref: "#/components/schemas/SecurityGrant"
+
+    ListSecurityGrantsResponse:
+      type: object
+      additionalProperties: false
+      required: [policy_version, grants]
+      properties:
+        policy_version:
+          type: integer
+          format: uint64
+          minimum: 1
+        grants:
+          type: array
+          items:
+            $ref: "#/components/schemas/SecurityGrant"
+
+    SecurityPolicyMetadataResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - policy_version
+        - object_key
+        - checksum
+        - created_at
+        - created_by
+        - principals
+        - keys
+        - grants
+      properties:
+        policy_version:
+          type: integer
+          format: uint64
+          minimum: 1
+        object_key:
+          type: string
+          description: Exact immutable S3 policy object key selected by the active head.
+        checksum:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Canonical SHA-256 checksum of the active snapshot.
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          $ref: "#/components/schemas/SecurityPrincipalId"
+        principals:
+          type: integer
+          format: uint64
+          minimum: 0
+        keys:
+          type: integer
+          format: uint64
+          minimum: 0
+        grants:
+          type: integer
+          format: uint64
+          minimum: 0
 
     DistanceMetric:
       type: string

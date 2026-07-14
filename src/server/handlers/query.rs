@@ -947,7 +947,7 @@ pub async fn batch_query_namespace(
 
     crate::server::consume_rate_limit(
         &state,
-        rate_limit_identity.ip,
+        &rate_limit_identity,
         RateLimitClass::Read,
         req.queries.len().saturating_sub(1) as u64,
     )

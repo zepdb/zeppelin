@@ -719,7 +719,7 @@ fn parse_registered_routes(source: &str) -> std::collections::HashSet<(String, S
             ("post(", "POST"),
             ("patch(", "PATCH"),
             (".put(", "PUT"),
-            (".delete(", "DELETE"),
+            ("delete(", "DELETE"),
         ] {
             if call.contains(needle) {
                 routes.insert((method.to_string(), path.to_string()));

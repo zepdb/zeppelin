@@ -150,6 +150,34 @@ pub struct DeletePrefixOutcome {
     pub complete: bool,
 }
 
+/// Result of one atomic create-only object-store PUT.
+///
+/// Higher-level control-plane protocols use this neutral outcome instead of
+/// inspecting backend-specific `object_store` errors outside the storage
+/// boundary. A collision never overwrites the existing object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateOnlyOutcome {
+    /// This caller created the object. The backend may omit its ETag.
+    Created {
+        /// Backend-provided identity for the newly created object.
+        e_tag: Option<String>,
+    },
+    /// The destination already existed and remains unchanged.
+    AlreadyExists,
+}
+
+/// Result of one domain-neutral ETag compare-and-swap PUT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalPutOutcome {
+    /// The observed ETag matched and the replacement became authoritative.
+    Updated {
+        /// Backend-provided identity for the replacement object.
+        e_tag: Option<String>,
+    },
+    /// Another writer changed the object first; no replacement occurred.
+    Conflict,
+}
+
 /// One non-empty opaque backend identity observed for an object-store object.
 ///
 /// ETag takes precedence when a backend supplies both forms because S3 exposes
@@ -701,6 +729,44 @@ impl ZeppelinStore {
         Ok(())
     }
 
+    /// Atomically creates an object and classifies an existing destination.
+    ///
+    /// This is the domain-neutral create primitive for authoritative
+    /// control-plane heads and immutable artifacts. It performs exactly one
+    /// `PutMode::Create` request and never translates a collision into a
+    /// namespace-specific error.
+    #[instrument(skip(self, data), fields(key = key, size = data.len()))]
+    pub async fn put_create_outcome(&self, key: &str, data: Bytes) -> Result<CreateOnlyOutcome> {
+        let start = std::time::Instant::now();
+        let path = Path::parse(key)?;
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        let outcome = match self
+            .inner
+            .put_opts(&path, PutPayload::from(data), options)
+            .await
+        {
+            Ok(result) => CreateOnlyOutcome::Created {
+                e_tag: result.e_tag,
+            },
+            Err(object_store::Error::AlreadyExists { .. }) => CreateOnlyOutcome::AlreadyExists,
+            Err(error) => {
+                crate::metrics::S3_ERRORS_TOTAL
+                    .with_label_values(&["put"])
+                    .inc();
+                return Err(ZeppelinError::Storage(error));
+            }
+        };
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), "s3 put_create_outcome");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["put"])
+            .observe(elapsed.as_secs_f64());
+        Ok(outcome)
+    }
+
     /// Writes one object and preserves the backend identity returned by PUT.
     ///
     /// This crate-visible variant performs the same single physical request and
@@ -1218,6 +1284,48 @@ impl ZeppelinStore {
     ) -> Result<Option<String>> {
         self.put_if_match_with_user_metadata(key, data, etag, namespace, &ObjectUserMetadata::new())
             .await
+    }
+
+    /// Replace an object only when its current ETag matches, without attaching
+    /// namespace-manifest semantics to a precondition loss.
+    #[instrument(skip(self, data), fields(key = key))]
+    pub async fn put_if_match_outcome(
+        &self,
+        key: &str,
+        data: Bytes,
+        etag: &str,
+    ) -> Result<ConditionalPutOutcome> {
+        let start = std::time::Instant::now();
+        let path = Path::parse(key)?;
+        let options = PutOptions {
+            mode: PutMode::Update(UpdateVersion {
+                e_tag: Some(etag.to_string()),
+                version: None,
+            }),
+            ..PutOptions::default()
+        };
+        let outcome = match self
+            .inner
+            .put_opts(&path, PutPayload::from(data), options)
+            .await
+        {
+            Ok(result) => ConditionalPutOutcome::Updated {
+                e_tag: result.e_tag,
+            },
+            Err(object_store::Error::Precondition { .. }) => ConditionalPutOutcome::Conflict,
+            Err(error) => {
+                crate::metrics::S3_ERRORS_TOTAL
+                    .with_label_values(&["put"])
+                    .inc();
+                return Err(ZeppelinError::Storage(error));
+            }
+        };
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), "s3 put_if_match_outcome");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["put"])
+            .observe(elapsed.as_secs_f64());
+        Ok(outcome)
     }
 
     /// Conditionally replaces an object while publishing user metadata.

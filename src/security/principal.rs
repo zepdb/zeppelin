@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::SecurityError;
+use super::{ApiKeyId, SecurityError};
 
 /// Stable, validated identifier for a security principal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -72,6 +72,8 @@ pub struct Principal {
     pub auth_strength: AuthStrength,
     /// Credential expiry, if the adapter supplied one.
     pub expires_at: Option<DateTime<Utc>>,
+    /// Exact API-key identifier whose proof established this request identity.
+    pub api_key_id: Option<ApiKeyId>,
     /// Parent identity for delegated credentials.
     pub delegation_parent: Option<PrincipalId>,
 }
@@ -81,15 +83,33 @@ impl Principal {
     #[must_use]
     pub fn api_key(
         id: PrincipalId,
+        api_key_id: ApiKeyId,
+        display_name: String,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self::authenticated_api_key(
+            id,
+            api_key_id,
+            PrincipalKind::Service,
+            display_name,
+            expires_at,
+        )
+    }
+
+    pub(crate) fn authenticated_api_key(
+        id: PrincipalId,
+        api_key_id: ApiKeyId,
+        kind: PrincipalKind,
         display_name: String,
         expires_at: Option<DateTime<Utc>>,
     ) -> Self {
         Self {
             id,
-            kind: PrincipalKind::Service,
+            kind,
             display_name,
             auth_strength: AuthStrength::ApiKey,
             expires_at,
+            api_key_id: Some(api_key_id),
             delegation_parent: None,
         }
     }
@@ -103,6 +123,7 @@ impl Principal {
             display_name: "anonymous".to_string(),
             auth_strength: AuthStrength::Anonymous,
             expires_at: None,
+            api_key_id: None,
             delegation_parent: None,
         }
     }
