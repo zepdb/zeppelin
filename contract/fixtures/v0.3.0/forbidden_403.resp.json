@@ -1,0 +1,7 @@
+{
+  "code": "forbidden",
+  "error": "access forbidden",
+  "request_id": "contract-forbidden_403",
+  "retryable": false,
+  "status": 403
+}

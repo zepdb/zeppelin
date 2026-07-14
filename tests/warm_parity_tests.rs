@@ -30,6 +30,7 @@ use zeppelin::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 struct ParityServer {
     base_url: String,
+    admin_bearer: String,
     harness: TestHarness,
     store: ZeppelinStore,
     counter: GetCounter,
@@ -72,8 +73,10 @@ fn parity_config(num_centroids: usize) -> Config {
     config
 }
 
-async fn start_parity_server(config: Config) -> ParityServer {
+async fn start_parity_server(mut config: Config) -> ParityServer {
     zeppelin::metrics::init();
+    let (security, credential_adapter, admin_bearer) =
+        common::server::test_security_runtime(&mut config);
 
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
@@ -106,6 +109,8 @@ async fn start_parity_server(config: Config) -> ParityServer {
     let state = AppState {
         store: store.clone(),
         clock: zeppelin::time::Clock::system(),
+        security,
+        credential_adapter,
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(store.clone())),
@@ -145,6 +150,7 @@ async fn start_parity_server(config: Config) -> ParityServer {
 
     ParityServer {
         base_url,
+        admin_bearer,
         harness,
         store,
         counter,
@@ -160,7 +166,7 @@ async fn create_compacted_namespace(
     mut vectors: Vec<VectorEntry>,
     query_count: usize,
 ) -> NamespaceFixture {
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let dimensions = vectors[0].values.len();
     let queries = vectors
         .iter()
@@ -215,7 +221,7 @@ async fn active_segment(store: &ZeppelinStore, namespace: &str) -> SegmentRef {
 }
 
 async fn post_hydrate(server: &ParityServer, namespace: &str) {
-    let body: serde_json::Value = reqwest::Client::new()
+    let body: serde_json::Value = crate::common::server::client_with_bearer(&server.admin_bearer)
         .post(format!(
             "{}/v1/namespaces/{namespace}/hydrate",
             server.base_url

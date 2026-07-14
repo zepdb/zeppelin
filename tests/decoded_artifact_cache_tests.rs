@@ -5,7 +5,7 @@ use common::harness::TestHarness;
 use common::server::{cleanup_ns, create_ns_api_fts, start_test_server_full, FullTestServer};
 use std::collections::HashMap;
 use zeppelin::cache::decoded_cache::DecodedArtifactCache;
-use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
+use zeppelin::config::{CacheConfig, CompactionConfig, Config, IndexingConfig};
 use zeppelin::fts::global_index::global_fts_key;
 use zeppelin::fts::rank_by::RankBy;
 use zeppelin::fts::FtsFieldConfig;
@@ -14,23 +14,27 @@ use zeppelin::types::{AttributeValue, VectorEntry};
 use zeppelin::wal::{Manifest, WalReader};
 
 fn fts_config() -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        max_wal_fragments_before_compact: 1,
+    Config {
+        compaction: CompactionConfig {
+            max_wal_fragments_before_compact: 1,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            fts_index: true,
+            bitmap_index: false,
+            bm25_max_full_scan_clusters: 64,
+            bm25_max_full_scan_vectors: 10_000,
+            ..Default::default()
+        },
+        cache: CacheConfig {
+            manifest_cache_ttl_ms: 0,
+            decoded_artifact_cache_max_mb: 64,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: 4,
-        kmeans_max_iterations: 10,
-        fts_index: true,
-        bitmap_index: false,
-        bm25_max_full_scan_clusters: 64,
-        bm25_max_full_scan_vectors: 10_000,
-        ..Default::default()
-    };
-    config.cache.manifest_cache_ttl_ms = 0;
-    config.cache.decoded_artifact_cache_max_mb = 64;
-    config
+    }
 }
 
 fn fts_fields() -> HashMap<String, FtsFieldConfig> {
@@ -124,7 +128,7 @@ async fn compacted_fixture(
         None,
     )
     .await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let namespace = create_ns_api_fts(
         &client,
         &server.base_url,
@@ -264,10 +268,11 @@ async fn global_fts_decode_is_reused_and_cache_clear_preserves_results() {
         None,
     )
     .await;
-    let disabled_bm25 = query(&client, &disabled_server.base_url, &namespace).await;
+    let disabled_client = crate::common::server::client_with_bearer(&disabled_server.admin_bearer);
+    let disabled_bm25 = query(&disabled_client, &disabled_server.base_url, &namespace).await;
     assert_eq!(disabled_bm25, cold);
     let disabled_hybrid = query_body(
-        &client,
+        &disabled_client,
         &disabled_server.base_url,
         &namespace,
         hybrid_body(),

@@ -69,8 +69,8 @@ fn group_ids(body: &Value, group_index: usize) -> Vec<String> {
 
 #[tokio::test]
 async fn field_grouping_limits_members_and_top_k_groups() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -143,8 +143,8 @@ async fn field_grouping_limits_members_and_top_k_groups() {
 
 #[tokio::test]
 async fn grouping_and_cursor_are_rejected_together() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -198,8 +198,8 @@ async fn grouping_and_cursor_are_rejected_together() {
 
 #[tokio::test]
 async fn field_grouping_keeps_missing_field_hits_as_singletons() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(

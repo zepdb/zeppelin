@@ -467,6 +467,7 @@ pub async fn run_latency_validate_entry() {
             let single = ScenarioOutcome {
                 per_repeat: vec![repeat.clone()],
                 expected: serial.expected.clone(),
+                security: serial.security.clone(),
             };
             let violations = check_contract(&contract, &single);
             injected_depth_deviations += violations

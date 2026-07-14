@@ -821,9 +821,9 @@ async fn test_query_handler_triggers_hydration_when_enabled() {
     config.indexing.kmeans_max_iterations = 10;
     config.compaction.max_wal_fragments_before_compact = 1;
 
-    let (base_url, harness, cache, _cache_dir, compactor) =
+    let (base_url, harness, cache, _cache_dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let create: serde_json::Value = client
         .post(format!("{base_url}/v1/namespaces"))
         .json(&json!({"dimensions": 32, "distance_metric": "euclidean"}))
@@ -890,9 +890,9 @@ async fn test_bm25_query_handler_triggers_hydration_when_enabled() {
     config.indexing.fts_index = true;
     config.compaction.max_wal_fragments_before_compact = 1;
 
-    let (base_url, harness, cache, _cache_dir, compactor) =
+    let (base_url, harness, cache, _cache_dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let namespace = create_ns_api_fts(
         &client,
         &base_url,

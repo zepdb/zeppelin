@@ -24,6 +24,7 @@ use zeppelin::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 struct BatchApiServer {
     base_url: String,
+    admin_bearer: String,
     harness: TestHarness,
     store: ZeppelinStore,
     counter: Option<GetCounter>,
@@ -31,8 +32,10 @@ struct BatchApiServer {
     _cache_dir: tempfile::TempDir,
 }
 
-async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
+async fn start_batch_server(mut config: Config, counted: bool) -> BatchApiServer {
     zeppelin::metrics::init();
+    let (security, credential_adapter, admin_bearer) =
+        common::server::test_security_runtime(&mut config);
 
     let harness = TestHarness::new().await;
     let (store, counter) = if counted {
@@ -68,6 +71,8 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
     let app = build_router(AppState {
         store: store.clone(),
         clock: zeppelin::time::Clock::system(),
+        security,
+        credential_adapter,
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(store.clone())),
@@ -106,6 +111,7 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
 
     BatchApiServer {
         base_url,
+        admin_bearer,
         harness,
         store,
         counter,
@@ -115,7 +121,7 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
 }
 
 fn batch_fixture_config() -> Config {
-    let mut config = Config::load(None).unwrap();
+    let mut config = Config::default();
     config.server.rate_limit_rps = 1_000_000;
     config.server.rate_limit_burst = 1_000_000;
     config.server.write_rate_limit_rps = 1_000_000;
@@ -177,7 +183,7 @@ fn batch_entry_ids(entry: &Value) -> Vec<String> {
 #[tokio::test]
 async fn batch_query_returns_positional_successes_and_errors() {
     let server = start_batch_server(batch_fixture_config(), false).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &server.base_url,
@@ -242,7 +248,7 @@ async fn batch_query_returns_positional_successes_and_errors() {
 #[tokio::test]
 async fn batch_query_size_cap_returns_413() {
     let server = start_batch_server(batch_fixture_config(), false).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let queries: Vec<Value> = (0..257)
         .map(|_| json!({"vector": [0.0, 0.0, 0.0, 0.0]}))
         .collect();
@@ -267,7 +273,7 @@ async fn batch_query_size_cap_returns_413() {
 async fn batch_query_reuses_segment_setup_gets() {
     let server = start_batch_server(batch_fixture_config(), true).await;
     let counter = server.counter.as_ref().unwrap();
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &server.base_url,
@@ -356,7 +362,7 @@ async fn batch_query_rate_limit_counts_entries() {
     config.server.rate_limit_rps = 1;
     config.server.rate_limit_burst = 3;
     let server = start_batch_server(config, false).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
 
     let resp = client
         .post(format!(

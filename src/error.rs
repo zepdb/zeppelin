@@ -312,6 +312,10 @@ pub enum ZeppelinError {
     #[error("config error: {0}")]
     Config(String),
 
+    /// Authentication, authorization, or security-state construction failed.
+    #[error("security error: {0}")]
+    Security(#[from] crate::security::SecurityError),
+
     // IO errors
     /// A local filesystem I/O error.
     #[error("io error: {0}")]
@@ -478,6 +482,8 @@ impl ZeppelinError {
 
             ZeppelinError::RateLimitExceeded { .. } => 429,
 
+            ZeppelinError::Security(error) => error.status_code(),
+
             // Internal S3 key miss = data-integrity failure, not a 404.
             ZeppelinError::NotFound { .. } => 500,
 
@@ -487,9 +493,11 @@ impl ZeppelinError {
 
     /// Returns the stable, machine-readable code for this error variant.
     ///
-    /// Every variant maps to exactly one `SCREAMING_SNAKE_CASE` code. Clients
-    /// should branch on this code rather than parsing the human message or
-    /// assuming every condition with the same HTTP status has the same meaning.
+    /// Every variant maps to exactly one stable code. Existing domain codes use
+    /// `SCREAMING_SNAKE_CASE`; security-envelope codes use the plan's canonical
+    /// `snake_case` vocabulary. Clients should branch on this code rather than
+    /// parsing the human message or assuming every condition with the same HTTP
+    /// status has the same meaning.
     ///
     /// # Returns
     ///
@@ -543,6 +551,7 @@ impl ZeppelinError {
             ZeppelinError::PayloadTooLarge { .. } => "PAYLOAD_TOO_LARGE",
             ZeppelinError::NotImplemented { .. } => "NOT_IMPLEMENTED",
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
+            ZeppelinError::Security(error) => error.code(),
             ZeppelinError::Io(_) => "INTERNAL_ERROR",
             ZeppelinError::Cache(_) => "INTERNAL_ERROR",
             ZeppelinError::HydrationDisabled => "HYDRATION_DISABLED",
@@ -665,6 +674,7 @@ impl ZeppelinError {
             | ZeppelinError::NamespaceDeleteIncomplete { .. } => {
                 "an internal error occurred".to_string()
             }
+            ZeppelinError::Security(error) => error.client_message(),
             ZeppelinError::ChecksumMismatch { .. } => {
                 "stored data failed an integrity check; this is a server-side error".to_string()
             }
@@ -829,7 +839,7 @@ mod tests {
         assert!(msg.contains("222"));
     }
 
-    /// Verifies representative variants yield non-empty uppercase-snake stable codes.
+    /// Verifies representative variants yield non-empty stable wire codes.
     ///
     /// Exhaustiveness comes from the wildcard-free match in [`ZeppelinError::error_code`]:
     /// a new variant cannot compile until it receives a code. This test separately
@@ -928,14 +938,24 @@ mod tests {
             ZeppelinError::RateLimitExceeded {
                 retry_after_secs: 1,
             },
+            ZeppelinError::Security(crate::security::SecurityError::Authentication(
+                crate::security::AuthnFailure::Unauthenticated,
+            )),
         ];
         for e in &variants {
             let code = e.error_code();
             assert!(!code.is_empty(), "empty code for {e:?}");
-            assert!(
-                code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
-                "code {code} for {e:?} is not SCREAMING_SNAKE_CASE"
-            );
+            if matches!(e, ZeppelinError::Security(_)) {
+                assert!(
+                    code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                    "security code {code} for {e:?} is not snake_case"
+                );
+            } else {
+                assert!(
+                    code.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                    "code {code} for {e:?} is not SCREAMING_SNAKE_CASE"
+                );
+            }
         }
     }
 

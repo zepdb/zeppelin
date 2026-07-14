@@ -13,8 +13,8 @@ use zeppelin::wal::{WalReader, WalWriter};
 
 #[tokio::test]
 async fn test_http_request_metrics_incremented() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     // Make a request to a known endpoint
     let resp = client
@@ -43,8 +43,8 @@ async fn test_http_request_metrics_incremented() {
 
 #[tokio::test]
 async fn test_s3_metrics_after_operations() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Upsert vectors (triggers S3 operations)
@@ -87,8 +87,8 @@ async fn test_s3_metrics_after_operations() {
 
 #[tokio::test]
 async fn test_active_queries_returns_to_zero() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Upsert a vector
@@ -145,8 +145,8 @@ async fn test_active_queries_returns_to_zero() {
 
 #[tokio::test]
 async fn test_request_id_header_returned() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .get(format!("{base_url}/healthz"))
@@ -172,8 +172,8 @@ async fn test_request_id_header_returned() {
 
 #[tokio::test]
 async fn test_request_id_passthrough() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let custom_id = "custom-request-123";
     let resp = client
@@ -202,8 +202,8 @@ async fn test_request_id_passthrough() {
 
 #[tokio::test]
 async fn test_query_request_id_header_returned_and_echoed() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let upsert = client
@@ -271,8 +271,8 @@ async fn test_query_request_id_header_returned_and_echoed() {
 
 #[tokio::test]
 async fn test_query_debug_block_is_opt_in() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let upsert = client
@@ -379,8 +379,8 @@ async fn test_query_debug_block_is_opt_in() {
 
 #[tokio::test]
 async fn test_compaction_duration_metric() {
-    let (base_url, harness, _cache, _dir) = start_test_server_with_config(None).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, _dir, admin_bearer) = start_test_server_with_config(None).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 8).await;
 
     // Upsert vectors
@@ -452,7 +452,7 @@ fn assert_metric_gt_zero(body: &str, family: &str, labels: &[String]) {
 /// fallback path.
 #[tokio::test]
 async fn test_compaction_io_metrics_registered_and_incremented() {
-    let mut config = zeppelin::config::Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.compaction.max_wal_fragments_before_compact = 1;
     config.compaction.retrain_imbalance_threshold = 1000.0;
     config.indexing.default_num_centroids = 6;
@@ -463,9 +463,9 @@ async fn test_compaction_io_metrics_registered_and_incremented() {
     config.indexing.fts_index = false;
     config.indexing.hierarchical = false;
 
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = harness.key("obs-compaction-io");
     let writer = WalWriter::new(harness.store.clone());
 
@@ -629,6 +629,7 @@ async fn test_all_metrics_registered() {
     HYDRATION_REFUSAL_LOGS_TOTAL
         .with_label_values(&["__test__", "capacity"])
         .inc();
+    SECURITY_MODE.with_label_values(&["enforced"]).set(1);
 
     let families = prometheus::gather();
     let names: Vec<String> = families.iter().map(|f| f.name().to_string()).collect();
@@ -650,6 +651,7 @@ async fn test_all_metrics_registered() {
         "zeppelin_hydration_refused",
         "zeppelin_hydration_required_bytes",
         "zeppelin_hydration_refusal_logs_total",
+        "zeppelin_security_mode",
         "zeppelin_cache_entries",
         "zeppelin_cache_evictions_total",
         "zeppelin_active_queries",

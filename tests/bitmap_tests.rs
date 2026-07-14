@@ -15,18 +15,19 @@ use zeppelin::wal::Manifest;
 // ---------------------------------------------------------------------------
 
 fn bitmap_test_config(bitmap_enabled: bool) -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        max_wal_fragments_before_compact: 1,
+    Config {
+        compaction: CompactionConfig {
+            max_wal_fragments_before_compact: 1,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            bitmap_index: bitmap_enabled,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: 4,
-        kmeans_max_iterations: 10,
-        bitmap_index: bitmap_enabled,
-        ..Default::default()
-    };
-    config
+    }
 }
 
 fn bitmap_test_config_hierarchical(bitmap_enabled: bool) -> Config {
@@ -98,9 +99,9 @@ fn tagged_vectors(prefix: &str, n: usize, dims: usize) -> Vec<VectorEntry> {
 #[tokio::test]
 async fn test_bitmap_ivf_flat_eq_filter() {
     let config = bitmap_test_config(true);
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -194,9 +195,9 @@ async fn test_bitmap_ivf_flat_eq_filter() {
 #[tokio::test]
 async fn test_bitmap_hierarchical_eq_filter() {
     let config = bitmap_test_config_hierarchical(true);
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -258,9 +259,9 @@ async fn test_bitmap_hierarchical_eq_filter() {
 #[tokio::test]
 async fn test_bitmap_backward_compat() {
     let config = bitmap_test_config(false); // bitmap disabled
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -345,9 +346,9 @@ async fn test_bitmap_backward_compat() {
 #[tokio::test]
 async fn test_bitmap_low_selectivity() {
     let config = bitmap_test_config(true);
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -409,9 +410,9 @@ async fn test_bitmap_low_selectivity() {
 #[tokio::test]
 async fn test_bitmap_range_filter() {
     let config = bitmap_test_config(true);
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -481,9 +482,9 @@ async fn test_bitmap_range_filter() {
 #[tokio::test]
 async fn test_bitmap_compound_filter() {
     let config = bitmap_test_config(true);
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -563,9 +564,9 @@ async fn test_bitmap_compound_filter() {
 #[tokio::test]
 async fn test_bitmap_list_contains() {
     let config = bitmap_test_config(true);
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,

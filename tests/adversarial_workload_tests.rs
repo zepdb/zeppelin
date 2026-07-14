@@ -59,6 +59,7 @@ fn tag_coverage_required(mode: adversarial::RunMode, tag: &str) -> bool {
 #[ignore]
 async fn smoke() {
     let env = adversarial::RunnerEnv::from_env();
+    let configured_seed_count = env.seeds.len() as u64;
     let mode = if env.profile.is_some() {
         adversarial::RunMode::Chaos
     } else {
@@ -72,9 +73,12 @@ async fn smoke() {
         summary.failed_seeds
     );
     assert!(
-        summary.seeds_run >= 3,
-        "expected at least 3 seeds, ran {}",
-        summary.seeds_run
+        configured_seed_count >= 2,
+        "adversarial smoke requires at least 2 configured seeds, got {configured_seed_count}"
+    );
+    assert_eq!(
+        summary.seeds_run, configured_seed_count,
+        "runner did not execute every configured smoke seed"
     );
     assert!(
         summary.ops_total >= 200,
@@ -227,7 +231,7 @@ async fn restartable_server_exposes_hard_abort() {
     let harness = common::harness::TestHarness::new().await;
     let prefix = harness.prefix.clone();
     let namespace = format!("{prefix}-restart");
-    let config = zeppelin::config::Config::load(None).unwrap();
+    let config = zeppelin::config::Config::default();
     let mut server = common::server::start_test_server_full(
         harness.store.clone(),
         Some(prefix.clone()),
@@ -236,7 +240,8 @@ async fn restartable_server_exposes_hard_abort() {
         None,
     )
     .await;
-    let client = reqwest::Client::new();
+    let admin_bearer = server.admin_bearer.clone();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let create = client
         .post(format!("{}/v1/namespaces", server.base_url))
         .json(&serde_json::json!({
@@ -271,14 +276,17 @@ async fn restartable_server_exposes_hard_abort() {
 
     server.abort();
     drop(server);
-    let mut replacement = common::server::start_test_server_full(
-        harness.store.clone(),
-        Some(prefix),
-        config,
-        false,
-        None,
-    )
-    .await;
+    let mut replacement =
+        common::server::start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
+            harness.store.clone(),
+            Some(prefix),
+            config,
+            false,
+            None,
+            100 * 1024 * 1024,
+            &admin_bearer,
+        )
+        .await;
     let fetched = client
         .post(format!(
             "{}/v1/namespaces/{namespace}/vectors/get",
@@ -332,7 +340,7 @@ async fn wall_clock_jump_does_not_expire_compaction_upload_window() {
         .await
         .unwrap();
 
-    let mut config = zeppelin::config::Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.indexing.default_num_centroids = 4;
     config.indexing.default_nprobe = 4;
     let mut compactor = zeppelin::compaction::Compactor::with_clock(

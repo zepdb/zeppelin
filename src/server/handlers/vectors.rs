@@ -135,7 +135,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::Json;
 use serde::de::{self, SeqAccess, Visitor};
@@ -148,6 +148,7 @@ use crate::index::ivf_flat::build::{
 };
 use crate::index::ivf_flat::membership::deserialize_membership;
 use crate::query;
+use crate::security::AllowDecision;
 use crate::server::AppState;
 use crate::types::{AttributeValue, ConsistencyLevel, VectorEntry, VectorId};
 use crate::wal::manifest::SegmentRef;
@@ -435,9 +436,10 @@ fn default_true() -> bool {
 /// references here; C would require an explicit ownership-transfer convention.
 /// The `?`-style conversions are written with `map_err` where the boundary must
 /// wrap a domain error as [`ApiError`].
-#[instrument(skip(state, body), fields(namespace = %ns))]
+#[instrument(skip(state, _decision, body), fields(namespace = %ns))]
 pub async fn upsert_vectors(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
     headers: HeaderMap,
     body: bytes::Bytes,
@@ -955,9 +957,10 @@ where
 /// fragment without cloning every string. Rust prevents this handler from using
 /// that vector afterward. Java has no compiler-enforced move; C would need an
 /// explicit “callee now owns this allocation” rule.
-#[instrument(skip(state, body), fields(namespace = %ns))]
+#[instrument(skip(state, _decision, body), fields(namespace = %ns))]
 pub async fn delete_vectors(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
     body: bytes::Bytes,
 ) -> Result<StatusCode, ApiError> {
@@ -1069,9 +1072,10 @@ pub async fn delete_vectors(
 /// the resolver, guaranteeing one stable snapshot across awaits; Java would
 /// rely on convention not to swap a shared object, while C would require
 /// explicit lifetime management.
-#[instrument(skip(state, body), fields(namespace = %ns))]
+#[instrument(skip(state, _decision, body), fields(namespace = %ns))]
 pub async fn get_vectors(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
     body: bytes::Bytes,
 ) -> Result<Json<GetVectorsResponse>, ApiError> {

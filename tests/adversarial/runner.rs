@@ -22,7 +22,7 @@ use crate::common::counting::{counting_store, ArtifactClass, ClassStats, GetCoun
 use crate::common::harness::TestHarness;
 use crate::common::server::{
     cleanup_ns, start_test_server_full, start_test_server_full_with_disk_cache_max_bytes,
-    FullTestServer,
+    start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer, FullTestServer,
 };
 
 use super::artifacts::{
@@ -120,6 +120,7 @@ struct NodeCommandContext<'a> {
     require_compaction_evidence: bool,
     prefix: &'a str,
     config: &'a Config,
+    admin_bearer: &'a str,
     disk_cache_max_bytes: u64,
     op_index: u64,
 }
@@ -233,6 +234,7 @@ impl OperationalState {
             require_compaction_evidence,
             prefix,
             config,
+            admin_bearer,
             disk_cache_max_bytes,
             op_index,
         } = context;
@@ -254,13 +256,14 @@ impl OperationalState {
                         |observer| operational_store_proxy(store, observer.clone(), 1),
                     );
                     self.second_node = Some(
-                        start_test_server_full_with_disk_cache_max_bytes(
+                        start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
                             second_node_store,
                             Some(prefix.to_string()),
                             config.clone(),
                             true,
                             shared_clock.clone(),
                             disk_cache_max_bytes,
+                            admin_bearer,
                         )
                         .await,
                     );
@@ -339,13 +342,14 @@ impl OperationalState {
                         |observer| operational_store_proxy(store, observer.clone(), 1),
                     );
                     self.second_node = Some(
-                        start_test_server_full_with_disk_cache_max_bytes(
+                        start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
                             second_node_store,
                             Some(prefix.to_string()),
                             config.clone(),
                             false,
                             shared_clock.clone(),
                             disk_cache_max_bytes,
+                            admin_bearer,
                         )
                         .await,
                     );
@@ -1058,7 +1062,7 @@ pub async fn inspect_from_env() {
         "inspect target {target:?} did not resolve to any namespaces"
     );
     let server =
-        start_test_server_full(store.clone(), None, deterministic_config(), false, None).await;
+        start_test_server_full(store.clone(), None, inspection_config(), false, None).await;
     println!("inspect server: {}", server.base_url);
     for ns in &namespaces {
         print_namespace_inspection(&store, ns).await;
@@ -1178,7 +1182,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                 direct_base_url: server.base_url.clone(),
                 proxy_base_url: injector.base_url(),
             });
-    let client = adversarial_client();
+    let client = adversarial_client(&server);
     let mut model = Model::default();
     let mut coverage = Coverage::default();
     let mut s3_tracker = S3Tracker::default();
@@ -1297,6 +1301,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                     require_compaction_evidence,
                     prefix: &prefix,
                     config: &config,
+                    admin_bearer: &server.admin_bearer,
                     disk_cache_max_bytes,
                     op_index: source.index,
                 },
@@ -1723,7 +1728,17 @@ struct ReplaySeedConfig {
 }
 
 fn replay_seed_config(path: &Path) -> ReplaySeedConfig {
-    serde_json::from_value(read_seed_config(path))
+    let mut artifact = read_seed_config(path);
+    if let Some(config) = artifact
+        .get_mut("config")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        config.entry("security").or_insert_with(|| {
+            serde_json::to_value(zeppelin::config::SecurityConfig::default())
+                .expect("default replay security config must serialize")
+        });
+    }
+    serde_json::from_value(artifact)
         .unwrap_or_else(|error| panic!("failed to parse replay seed config: {error}"))
 }
 
@@ -2146,11 +2161,20 @@ fn advance_scheduled_faults(
     operational
 }
 
-fn adversarial_client() -> Client {
+fn adversarial_client(server: &FullTestServer) -> Client {
     Client::builder()
+        .default_headers(crate::common::server::bearer_headers(&server.admin_bearer))
         .timeout(Duration::from_secs(5))
         .build()
         .expect("failed to build adversarial reqwest client")
+}
+
+#[cfg(test)]
+fn raw_adversarial_client() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("failed to build raw adversarial reqwest client")
 }
 
 async fn start_http_fault_injector(base_url: &str) -> Arc<HttpFaultInjector> {
@@ -2195,16 +2219,19 @@ async fn restart_after_crash(
 ) -> Vec<Violation> {
     *http_fault_context = None;
     let clock = server.clock.clone();
+    let admin_bearer = server.admin_bearer.clone();
     server.abort();
     controller.park_token.cancel();
     shutdown_http_fault_injector(injector).await;
 
-    *server = start_test_server_full(
+    *server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
         server_store.clone(),
         Some(prefix.to_string()),
         config.clone(),
         spawn_compaction_loop,
         Some(clock),
+        100 * 1024 * 1024,
+        &admin_bearer,
     )
     .await;
     wait_for_health(client, &server.base_url).await;
@@ -2979,7 +3006,7 @@ async fn run_seed(
                 direct_base_url: server.base_url.clone(),
                 proxy_base_url: injector.base_url(),
             });
-    let client = adversarial_client();
+    let client = adversarial_client(&server);
     let mut model = Model::default();
     let mut coverage = Coverage::default();
     let mut created_namespaces = Vec::new();
@@ -3070,6 +3097,7 @@ async fn run_seed(
                     require_compaction_evidence,
                     prefix: &prefix,
                     config: &config,
+                    admin_bearer: &server.admin_bearer,
                     disk_cache_max_bytes,
                     op_index,
                 },
@@ -3320,6 +3348,7 @@ async fn run_seed(
                             require_compaction_evidence,
                             prefix: &prefix,
                             config: &config,
+                            admin_bearer: &server.admin_bearer,
                             disk_cache_max_bytes,
                             op_index,
                         },
@@ -6727,15 +6756,17 @@ impl QuietPeriod<'_> {
         let restarted = if self.server.server_task.is_finished() {
             let store = self.server.store.clone();
             let clock = self.server.clock.clone();
+            let admin_bearer = self.server.admin_bearer.clone();
             let spawn_compaction_loop = self.server.shutdown_compaction.is_some();
             self.server.abort();
-            *self.server = start_test_server_full_with_disk_cache_max_bytes(
+            *self.server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
                 store,
                 Some(self.prefix.to_string()),
                 self.config.clone(),
                 spawn_compaction_loop,
                 Some(clock),
                 self.disk_cache_max_bytes,
+                &admin_bearer,
             )
             .await;
             true
@@ -7914,7 +7945,7 @@ fn selftest_probe_op(
 }
 
 fn deterministic_config() -> Config {
-    let mut config = Config::load(None).expect("failed to load base Config");
+    let mut config = Config::default();
     config.cache.manifest_cache_ttl_ms = 0;
     config.cache.namespace_registry_ttl_ms = 0;
     config.cache.hydration_enabled = false;
@@ -7931,6 +7962,12 @@ fn deterministic_config() -> Config {
     config.server.rate_limit_burst = 1_000_000;
     config.server.write_rate_limit_rps = 1_000_000;
     config.server.write_rate_limit_burst = 1_000_000;
+    config
+}
+
+fn inspection_config() -> Config {
+    let mut config = deterministic_config();
+    config.security.mode = zeppelin::config::SecurityMode::OpenUnsafe;
     config
 }
 
@@ -8078,6 +8115,30 @@ mod outcome_tests {
                         i64::try_from(config.compaction.lease_duration_secs).unwrap(),
                     )
         );
+    }
+
+    #[test]
+    fn inspection_server_is_explicitly_open_unsafe() {
+        assert_eq!(
+            inspection_config().security.mode,
+            zeppelin::config::SecurityMode::OpenUnsafe
+        );
+    }
+
+    #[test]
+    fn legacy_replay_config_without_security_decodes_with_implicit_admin() {
+        let fixture = include_bytes!("fixtures/legacy_pre_security_config.json");
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("config.json"), fixture).unwrap();
+
+        let replay = replay_seed_config(dir.path());
+
+        assert_eq!(replay.seed, 83);
+        assert_eq!(
+            replay.config.security.mode,
+            zeppelin::config::SecurityMode::Enforced
+        );
+        assert!(replay.config.security.api_keys.is_empty());
     }
 
     #[test]
@@ -8288,7 +8349,7 @@ mod outcome_tests {
             None,
         )
         .await;
-        let client = adversarial_client();
+        let client = adversarial_client(&server);
         let (create_status, _) = request_json(
             &client,
             Method::POST,
@@ -8752,7 +8813,6 @@ mod outcome_tests {
             fts_fields: Vec::new(),
             bitmap: false,
         };
-        let client = adversarial_client();
         let setup_server = start_test_server_full(
             harness.store.clone(),
             Some(prefix.clone()),
@@ -8761,6 +8821,8 @@ mod outcome_tests {
             None,
         )
         .await;
+        let admin_bearer = setup_server.admin_bearer.clone();
+        let client = adversarial_client(&setup_server);
         let create = client
             .post(format!("{}/v1/namespaces", setup_server.base_url))
             .json(&spec.create_body(&namespace))
@@ -8787,12 +8849,14 @@ mod outcome_tests {
             }],
         });
         let faulted_store = store_fault_proxy(&harness.store, scheduler.clone());
-        let server = start_test_server_full(
+        let server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
             faulted_store,
             Some(prefix),
             deterministic_config(),
             false,
             None,
+            100 * 1024 * 1024,
+            &admin_bearer,
         )
         .await;
         assert!(scheduler.advance_to(1).is_empty());
@@ -9529,7 +9593,7 @@ mod outcome_tests {
         let exact_manifest = BTreeSet::from([Manifest::s3_key("ns")]);
 
         let status = quiescent_s3_oracle_status(
-            &adversarial_client(),
+            &raw_adversarial_client(),
             &format!("http://{address}"),
             "ns",
             Some(&exact_manifest),
@@ -9568,7 +9632,7 @@ mod outcome_tests {
         });
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         Manifest::new().write(&store, "ns").await.unwrap();
-        let client = adversarial_client();
+        let client = raw_adversarial_client();
         let base_url = format!("http://{address}");
         let strict = tokio::spawn(async move {
             periodic_server_lineage_status(&client, &store, &base_url, "ns", &BTreeSet::new()).await
@@ -9841,7 +9905,7 @@ mod outcome_tests {
         });
 
         let outcome = request_outcome(
-            &adversarial_client(),
+            &raw_adversarial_client(),
             Method::POST,
             &format!("http://{address}/v1/namespaces/test/vectors"),
             Some(json!({ "vectors": [] })),
@@ -9889,7 +9953,7 @@ mod outcome_tests {
                 REQUEST_IS_MUTATION.scope(
                     false,
                     request_outcome(
-                        &adversarial_client(),
+                        &raw_adversarial_client(),
                         Method::POST,
                         &format!("{direct_base_url}/pass"),
                         None,
@@ -10025,7 +10089,7 @@ mod outcome_tests {
             None,
         )
         .await;
-        let client = adversarial_client();
+        let client = adversarial_client(&primary);
         let spec = NamespaceSpec {
             dims: 2,
             metric: DistanceMetric::Cosine,
@@ -10059,6 +10123,7 @@ mod outcome_tests {
                     require_compaction_evidence: true,
                     prefix: &prefix,
                     config: &config,
+                    admin_bearer: &primary.admin_bearer,
                     disk_cache_max_bytes: 2 * 1024 * 1024,
                     op_index: 40,
                 },
@@ -10126,6 +10191,7 @@ mod outcome_tests {
                     require_compaction_evidence: true,
                     prefix: &prefix,
                     config: &config,
+                    admin_bearer: &primary.admin_bearer,
                     disk_cache_max_bytes: 2 * 1024 * 1024,
                     op_index: 60,
                 },
@@ -10168,7 +10234,7 @@ mod outcome_tests {
             disk_cache_max_bytes,
         )
         .await;
-        let client = adversarial_client();
+        let client = adversarial_client(&server);
         let spec = NamespaceSpec {
             dims: 2,
             metric: DistanceMetric::Cosine,
@@ -10212,6 +10278,7 @@ mod outcome_tests {
                     require_compaction_evidence: false,
                     prefix: &prefix,
                     config: &config,
+                    admin_bearer: &server.admin_bearer,
                     disk_cache_max_bytes,
                     op_index: 8,
                 },
@@ -10287,7 +10354,7 @@ mod outcome_tests {
             None,
         )
         .await;
-        let client = adversarial_client();
+        let client = adversarial_client(&server);
         let spec = NamespaceSpec {
             dims: 2,
             metric: DistanceMetric::Cosine,
@@ -10370,7 +10437,7 @@ mod outcome_tests {
             None,
         )
         .await;
-        let client = adversarial_client();
+        let client = adversarial_client(&server);
         let create = client
             .post(format!("{}/v1/namespaces", server.base_url))
             .json(&spec.create_body(&namespace))
@@ -10594,7 +10661,7 @@ mod outcome_tests {
             None,
         )
         .await;
-        let client = adversarial_client();
+        let client = adversarial_client(&server);
         let create = client
             .post(format!("{}/v1/namespaces", server.base_url))
             .json(&spec.create_body(&namespace))
@@ -10728,7 +10795,9 @@ mod outcome_tests {
     async fn supported_read_only_node_has_no_background_writer_and_rejects_mutation_routing() {
         let harness = TestHarness::new().await;
         let prefix = harness.prefix.clone();
-        let config = deterministic_config();
+        let mut config = deterministic_config();
+        let (_security, _adapter, admin_bearer) =
+            crate::common::server::test_security_runtime(&mut config);
         let scheduler = FaultScheduler::from_schedule(FaultSchedule {
             profile: FaultProfile::SupportedFull,
             events: vec![FaultEvent {
@@ -10753,6 +10822,7 @@ mod outcome_tests {
                     require_compaction_evidence: false,
                     prefix: &prefix,
                     config: &config,
+                    admin_bearer: &admin_bearer,
                     disk_cache_max_bytes: 4 * 1024 * 1024,
                     op_index: 0,
                 },
@@ -10788,6 +10858,7 @@ mod outcome_tests {
                     require_compaction_evidence: false,
                     prefix: &prefix,
                     config: &config,
+                    admin_bearer: &admin_bearer,
                     disk_cache_max_bytes: 4 * 1024 * 1024,
                     op_index: 20,
                 },
@@ -10881,7 +10952,7 @@ mod outcome_tests {
             None,
             Some(scheduler.schedule()),
         );
-        let client = adversarial_client();
+        let client = adversarial_client(&server);
         let started = Instant::now();
         let mut model = Model::default();
         let mut coverage = Coverage::default();
@@ -11573,7 +11644,7 @@ mod outcome_tests {
             None,
         )
         .await;
-        let client = adversarial_client();
+        let client = adversarial_client(&server);
         let create = client
             .post(format!("{}/v1/namespaces", server.base_url))
             .json(&spec.create_body(&ns))
@@ -11671,7 +11742,6 @@ mod outcome_tests {
             fts_fields: Vec::new(),
             bitmap: false,
         };
-        let client = adversarial_client();
         let setup_server = start_test_server_full(
             harness.store.clone(),
             Some(prefix.clone()),
@@ -11680,6 +11750,8 @@ mod outcome_tests {
             None,
         )
         .await;
+        let admin_bearer = setup_server.admin_bearer.clone();
+        let client = adversarial_client(&setup_server);
         let create = client
             .post(format!("{}/v1/namespaces", setup_server.base_url))
             .json(&spec.create_body(&source))
@@ -11723,12 +11795,14 @@ mod outcome_tests {
             }],
         });
         let faulted_store = store_fault_proxy(&harness.store, scheduler.clone());
-        let server = start_test_server_full(
+        let server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
             faulted_store,
             Some(prefix),
             deterministic_config(),
             false,
             None,
+            100 * 1024 * 1024,
+            &admin_bearer,
         )
         .await;
 

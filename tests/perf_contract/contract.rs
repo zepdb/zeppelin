@@ -170,6 +170,9 @@ pub struct BaselineSpec {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AssertionSpec {
+    /// CPU and object-store parity budget for a secured HTTP scenario.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityAssertionSpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub depth: BTreeMap<String, DepthAssertion>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -190,6 +193,20 @@ pub struct AssertionSpec {
     pub labeled_gets: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labeled_gets_le: BTreeMap<String, String>,
+}
+
+/// Frozen security overhead and storage-parity requirements.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityAssertionSpec {
+    /// Existing unsecured-shape contract used as the object-store census.
+    pub baseline_scenario: String,
+    /// Maximum median CPU cost of production authn plus authz per request.
+    pub authn_authz_p50_delta_ns_max: u64,
+    /// Exact GET-count delta against `baseline_scenario`.
+    pub added_get_ops: i64,
+    /// Exact PUT-count delta against `baseline_scenario`.
+    pub added_put_ops: i64,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -308,6 +325,11 @@ pub enum CostViolation {
     BaselineDrift {
         field: String,
         detail: String,
+    },
+    SecurityBudget {
+        metric: String,
+        expected: String,
+        actual: String,
     },
 }
 
@@ -471,6 +493,36 @@ fn validate_contract(scenario: &str, contract: &ContractSpec) -> Result<(), Stri
         validate_byte_bound(name, bound)?;
     }
 
+    match (&contract.scenario[..], &contract.assertions.security) {
+        ("secured_query", Some(security)) => {
+            if security.baseline_scenario != "warm_query_strong" {
+                return Err(
+                    "secured_query security baseline_scenario must be warm_query_strong"
+                        .to_string(),
+                );
+            }
+            if security.authn_authz_p50_delta_ns_max == 0
+                || security.authn_authz_p50_delta_ns_max > 10_000
+            {
+                return Err(
+                    "secured_query authn_authz_p50_delta_ns_max must be in 1..=10000".to_string(),
+                );
+            }
+            if security.added_get_ops != 0 || security.added_put_ops != 0 {
+                return Err(
+                    "secured_query must freeze zero added object-store GETs and PUTs".to_string(),
+                );
+            }
+        }
+        ("secured_query", None) => {
+            return Err("secured_query requires assert.security".to_string());
+        }
+        (_, Some(_)) => {
+            return Err("assert.security is currently reserved for secured_query".to_string());
+        }
+        (_, None) => {}
+    }
+
     Ok(())
 }
 
@@ -538,6 +590,7 @@ pub fn check_contract(contract: &ContractSpec, outcome: &ScenarioOutcome) -> Vec
     }
 
     check_repeat_identity(contract, outcome, &mut violations);
+    check_security_budget(contract, outcome, &mut violations);
     for (repeat_index, repeat) in outcome.per_repeat.iter().enumerate() {
         check_op_counts(
             repeat_index,
@@ -605,6 +658,56 @@ pub fn check_contract(contract: &ContractSpec, outcome: &ScenarioOutcome) -> Vec
     }
 
     violations
+}
+
+fn check_security_budget(
+    contract: &ContractSpec,
+    outcome: &ScenarioOutcome,
+    violations: &mut Vec<CostViolation>,
+) {
+    match (&contract.assertions.security, &outcome.security) {
+        (None, None) => {}
+        (Some(_), None) => violations.push(CostViolation::SecurityBudget {
+            metric: "measurement".to_string(),
+            expected: "present".to_string(),
+            actual: "missing".to_string(),
+        }),
+        (None, Some(_)) => violations.push(CostViolation::SecurityBudget {
+            metric: "measurement".to_string(),
+            expected: "absent".to_string(),
+            actual: "unexpectedly present".to_string(),
+        }),
+        (Some(expected), Some(actual)) => {
+            if actual.baseline_scenario != expected.baseline_scenario {
+                violations.push(CostViolation::SecurityBudget {
+                    metric: "baseline_scenario".to_string(),
+                    expected: expected.baseline_scenario.clone(),
+                    actual: actual.baseline_scenario.clone(),
+                });
+            }
+            if actual.authn_authz_p50_delta_ns > expected.authn_authz_p50_delta_ns_max {
+                violations.push(CostViolation::SecurityBudget {
+                    metric: "authn_authz_p50_delta_ns".to_string(),
+                    expected: format!("<= {}", expected.authn_authz_p50_delta_ns_max),
+                    actual: actual.authn_authz_p50_delta_ns.to_string(),
+                });
+            }
+            if actual.added_get_ops != expected.added_get_ops {
+                violations.push(CostViolation::SecurityBudget {
+                    metric: "added_get_ops".to_string(),
+                    expected: expected.added_get_ops.to_string(),
+                    actual: actual.added_get_ops.to_string(),
+                });
+            }
+            if actual.added_put_ops != expected.added_put_ops {
+                violations.push(CostViolation::SecurityBudget {
+                    metric: "added_put_ops".to_string(),
+                    expected: expected.added_put_ops.to_string(),
+                    actual: actual.added_put_ops.to_string(),
+                });
+            }
+        }
+    }
 }
 
 fn check_repeat_identity(
@@ -1053,6 +1156,7 @@ pub fn capture_contract(
             reason: String::new(),
         },
         assertions: AssertionSpec {
+            security: source.assertions.security.clone(),
             depth,
             gets,
             puts,
@@ -1424,6 +1528,7 @@ total = { exact = 0 }
                 fts_vocab_words: None,
                 fts_doc_len: None,
             },
+            security: None,
         }
     }
 
@@ -1628,5 +1733,36 @@ total = { exact = 0 }
         set_get_bytes(&mut second, "cluster", 12);
         let measured = outcome(vec![first, second]);
         let _ = capture_contract(&source, &measured, "new-rev", "now");
+    }
+
+    #[test]
+    fn security_budget_checker_rejects_p50_overrun() {
+        let mut contract = parsed_contract();
+        contract.assertions.security = Some(SecurityAssertionSpec {
+            baseline_scenario: "warm_query_strong".to_string(),
+            authn_authz_p50_delta_ns_max: 10_000,
+            added_get_ops: 0,
+            added_put_ops: 0,
+        });
+        let mut measured = outcome(vec![repeat(0, 4)]);
+        measured.security = Some(super::super::security::SecurityMeasurement {
+            security_mode: "enforced",
+            credential_kind: "api_key",
+            baseline_scenario: "warm_query_strong".to_string(),
+            samples: 101,
+            operations_per_sample: 1_024,
+            baseline_loop_p50_ns: 1,
+            authn_authz_p50_ns: 10_002,
+            authn_authz_p50_delta_ns: 10_001,
+            added_get_ops: 0,
+            added_put_ops: 0,
+        });
+
+        let violations = check_contract(&contract, &measured);
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            CostViolation::SecurityBudget { metric, .. }
+                if metric == "authn_authz_p50_delta_ns"
+        )));
     }
 }

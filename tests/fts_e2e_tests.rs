@@ -10,19 +10,20 @@ use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
 // ---------------------------------------------------------------------------
 
 fn fts_e2e_config() -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        max_wal_fragments_before_compact: 1,
+    Config {
+        compaction: CompactionConfig {
+            max_wal_fragments_before_compact: 1,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: 2,
+            kmeans_max_iterations: 10,
+            fts_index: true,
+            bitmap_index: false,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: 2,
-        kmeans_max_iterations: 10,
-        fts_index: true,
-        bitmap_index: false,
-        ..Default::default()
-    };
-    config
+    }
 }
 
 fn fts_configs() -> HashMap<String, zeppelin::fts::FtsFieldConfig> {
@@ -51,9 +52,9 @@ fn fts_json() -> serde_json::Value {
 #[tokio::test]
 async fn test_fts_e2e_full_lifecycle() {
     let config = fts_e2e_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     // Upsert documents
@@ -131,9 +132,9 @@ async fn test_fts_e2e_full_lifecycle() {
 #[tokio::test]
 async fn test_fts_e2e_strong_consistency_during_compaction() {
     let config = fts_e2e_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     // Batch 1: upsert + compact
@@ -205,9 +206,9 @@ async fn test_fts_e2e_strong_consistency_during_compaction() {
 #[tokio::test]
 async fn test_fts_e2e_delete_and_requery() {
     let config = fts_e2e_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     client
@@ -263,9 +264,9 @@ async fn test_fts_e2e_delete_and_requery() {
 #[tokio::test]
 async fn test_fts_e2e_multi_field_with_compaction() {
     let config = fts_e2e_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let mut fts = HashMap::new();
     fts.insert(
@@ -340,9 +341,9 @@ async fn test_fts_e2e_multi_field_with_compaction() {
 #[tokio::test]
 async fn test_fts_e2e_prefix_search() {
     let config = fts_e2e_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     client
@@ -384,9 +385,9 @@ async fn test_fts_e2e_prefix_search() {
 #[tokio::test]
 async fn test_fts_e2e_stemming() {
     let config = fts_e2e_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -439,9 +440,9 @@ async fn test_fts_e2e_stemming() {
 #[tokio::test]
 async fn test_fts_e2e_incremental_compaction() {
     let config = fts_e2e_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     // Batch 1
@@ -505,9 +506,9 @@ async fn test_fts_e2e_incremental_compaction() {
 #[tokio::test]
 async fn test_fts_e2e_eventual_vs_strong() {
     let config = fts_e2e_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
 
     client

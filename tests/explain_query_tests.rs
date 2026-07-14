@@ -98,8 +98,8 @@ fn strip_explain(mut body: Value) -> Value {
 
 #[tokio::test]
 async fn explain_true_returns_plan_without_changing_results() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_hybrid_namespace(&client, &base_url).await;
     seed_fixture(&client, &base_url, &ns).await;
 
@@ -140,8 +140,8 @@ async fn explain_true_returns_plan_without_changing_results() {
 
 #[tokio::test]
 async fn explain_full_includes_source_and_rerank_provenance() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_hybrid_namespace(&client, &base_url).await;
     seed_fixture(&client, &base_url, &ns).await;
 
@@ -187,8 +187,8 @@ async fn explain_full_includes_source_and_rerank_provenance() {
 
 #[tokio::test]
 async fn explain_false_and_none_are_omitted() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_hybrid_namespace(&client, &base_url).await;
     seed_fixture(&client, &base_url, &ns).await;
 

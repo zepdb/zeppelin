@@ -5,11 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
-use common::server::{cleanup_ns, start_test_server_with_config};
+use common::server::{cleanup_ns, client_with_bearer, start_test_server_with_config};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use zeppelin::config::Config;
+use zeppelin::config::{ApiKeyConfig, Config};
 use zeppelin::namespace::manager::{
     CompactionHealth, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
 };
@@ -17,6 +17,8 @@ use zeppelin::types::{DistanceMetric, IndexType};
 use zeppelin::wal::Manifest;
 
 const FIXTURE_VERSION: &str = "v0.3.0";
+const CONTRACT_FORBIDDEN_BEARER: &str =
+    "zpk1_contract_forbidden.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
 const ROUTED_OPERATIONS: &[(&str, &str)] = &[
     ("get", "/healthz"),
@@ -44,7 +46,14 @@ const ROUTED_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/v1/namespaces/{ns}/query/batch"),
 ];
 
+// OpenAPI describes this build-time optional route even when the current test
+// binary does not enable the `profiling` feature.
+const FEATURE_GATED_ROUTED_OPERATIONS: &[(&str, &str)] = &[("get", "/debug/pprof/cpu")];
+
 const FIXTURE_CASES: &[&str] = &[
+    "unauthenticated_401",
+    "forbidden_403",
+    "readyz_gated_401",
     "create_namespace",
     "get_namespace",
     "patch_index_config",
@@ -110,6 +119,7 @@ fn openapi_documents_exact_routed_surface() {
     let documented = documented_operations(include_str!("../api/zeppelin-api.yaml"));
     let routed = ROUTED_OPERATIONS
         .iter()
+        .chain(FEATURE_GATED_ROUTED_OPERATIONS.iter())
         .map(|(method, path)| ((*method).to_string(), (*path).to_string()))
         .collect::<BTreeSet<_>>();
 
@@ -119,6 +129,71 @@ fn openapi_documents_exact_routed_surface() {
     assert!(
         missing.is_empty() && undocumented.is_empty(),
         "OpenAPI route drift\nmissing from api.yaml: {missing:#?}\nnot routed: {undocumented:#?}"
+    );
+}
+
+#[test]
+fn openapi_documents_bearer_security_for_every_protected_operation() {
+    let api = include_str!("../api/zeppelin-api.yaml");
+    assert!(
+        api.contains("\nsecurity:\n  - bearerAuth: []\n"),
+        "OpenAPI must make bearerAuth the default security requirement"
+    );
+    assert!(
+        api.contains(
+            "  securitySchemes:\n    bearerAuth:\n      type: http\n      scheme: bearer\n"
+        ),
+        "OpenAPI must define bearerAuth as an HTTP bearer scheme"
+    );
+
+    for (method, path) in ROUTED_OPERATIONS
+        .iter()
+        .chain(FEATURE_GATED_ROUTED_OPERATIONS.iter())
+    {
+        let statuses = documented_statuses(api, method, path);
+        if *path == "/healthz" {
+            let operation = operation_block(api, method, path);
+            assert!(
+                operation.contains("      security: []"),
+                "GET /healthz must explicitly override global authentication"
+            );
+            assert!(!statuses.contains(&401));
+            assert!(!statuses.contains(&403));
+            continue;
+        }
+
+        assert!(statuses.contains(&401), "{method} {path} must document 401");
+        assert!(statuses.contains(&403), "{method} {path} must document 403");
+        let operation = operation_block(api, method, path);
+        assert!(
+            operation.contains(
+                "        \"401\":\n          $ref: \"#/components/responses/UnauthorizedError\""
+            ),
+            "{method} {path} must use the canonical 401 response"
+        );
+        assert!(
+            operation.contains(
+                "        \"403\":\n          $ref: \"#/components/responses/ForbiddenError\""
+            ),
+            "{method} {path} must use the canonical 403 response"
+        );
+    }
+
+    let readiness = operation_block(api, "get", "/readyz");
+    assert!(
+        readiness.contains("readyz_public"),
+        "readiness docs must describe the explicit public-readiness override"
+    );
+    assert!(
+        readiness.contains("protected by default"),
+        "readiness docs must describe its default gated semantics"
+    );
+
+    let profiling = operation_block(api, "get", "/debug/pprof/cpu");
+    assert!(
+        profiling.contains("x-zeppelin-feature: profiling")
+            && profiling.contains("available only when Zeppelin is built"),
+        "profiling docs must identify the build-time feature gate"
     );
 }
 
@@ -219,16 +294,30 @@ fn documented_operations(api: &str) -> BTreeSet<(String, String)> {
 }
 
 async fn build_contract_fixtures() -> Vec<Fixture> {
-    let mut config = Config::load(None).unwrap();
+    let mut config = Config::default();
     config.indexing.default_num_centroids = 4;
     config.indexing.default_nprobe = 4;
     config.indexing.max_nprobe = 32;
     config.server.default_top_k = 3;
     config.server.max_top_k = 100;
     config.server.max_query_batch_size = 2;
+    config.security.api_keys.push(ApiKeyConfig {
+        key_id: "zpk1_contract_forbidden".to_string(),
+        name: "contract-forbidden".to_string(),
+        sha256_hex: "56d5fa7333f6d747db42c239407e5da4c32f4c79f35d092b134fd35a402d9c5c".to_string(),
+        actions: vec!["SystemRead".to_string()],
+        namespaces: vec!["*".to_string()],
+        expires_at: None,
+    });
+    config
+        .validate()
+        .expect("contract fixture security config must satisfy the boot contract");
 
-    let (base_url, harness, _cache, cache_dir) = start_test_server_with_config(Some(config)).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, cache_dir, admin_bearer) =
+        start_test_server_with_config(Some(config)).await;
+    let client = client_with_bearer(&admin_bearer);
+    let unauthenticated_client = reqwest::Client::new();
+    let forbidden_client = client_with_bearer(CONTRACT_FORBIDDEN_BEARER);
 
     let main_ns = format!("{}-contract-main", harness.prefix);
     let compact_ns = format!("{}-contract-compact", harness.prefix);
@@ -246,7 +335,8 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
         (missing_ns.clone(), "contract-missing".to_string()),
     ];
 
-    let mut fixtures = Vec::new();
+    let mut fixtures =
+        security_error_fixtures(&unauthenticated_client, &forbidden_client, &base_url).await;
 
     fixtures.push(
         capture_json(
@@ -550,6 +640,63 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
     drop(cache_dir);
 
     fixtures
+}
+
+async fn security_error_fixtures(
+    unauthenticated_client: &reqwest::Client,
+    forbidden_client: &reqwest::Client,
+    base_url: &str,
+) -> Vec<Fixture> {
+    vec![
+        capture_json(
+            unauthenticated_client,
+            base_url,
+            "unauthenticated_401",
+            "post",
+            "/v1/namespaces/contract-main/query",
+            "/v1/namespaces/contract-main/query",
+            401,
+            json!({
+                "sources": [{"type": "ann", "vector": [0.0, 0.0]}],
+                "top_k": 1
+            }),
+            json!({
+                "sources": [{"type": "ann", "vector": [0.0, 0.0]}],
+                "top_k": 1
+            }),
+            &[],
+            &[],
+        )
+        .await,
+        capture_json(
+            forbidden_client,
+            base_url,
+            "forbidden_403",
+            "get",
+            "/v1/config/query",
+            "/v1/config/query",
+            403,
+            Value::Null,
+            Value::Null,
+            &[],
+            &[],
+        )
+        .await,
+        capture_json(
+            unauthenticated_client,
+            base_url,
+            "readyz_gated_401",
+            "get",
+            "/readyz",
+            "/readyz",
+            401,
+            Value::Null,
+            Value::Null,
+            &[],
+            &[],
+        )
+        .await,
+    ]
 }
 
 async fn query_fixtures(
@@ -1390,6 +1537,19 @@ fn assert_response_contract_shape(fixture: &Fixture) {
     }
     if fixture.status >= 400 {
         assert_error_envelope(&fixture.response, fixture.status, fixture.name);
+        match fixture.name {
+            "unauthenticated_401" | "readyz_gated_401" => {
+                assert_eq!(fixture.response["code"], "unauthenticated");
+                assert_eq!(fixture.response["error"], "authentication required");
+                assert_eq!(fixture.response["retryable"], false);
+            }
+            "forbidden_403" => {
+                assert_eq!(fixture.response["code"], "forbidden");
+                assert_eq!(fixture.response["error"], "access forbidden");
+                assert_eq!(fixture.response["retryable"], false);
+            }
+            _ => {}
+        }
         return;
     }
     if fixture.name.starts_with("query_") {
@@ -1487,6 +1647,33 @@ fn documented_statuses(api: &str, method: &str, path: &str) -> BTreeSet<u16> {
     }
 
     statuses
+}
+
+fn operation_block<'a>(api: &'a str, method: &str, path: &str) -> &'a str {
+    let path_marker = format!("  {path}:\n");
+    let path_start = api
+        .find(&path_marker)
+        .unwrap_or_else(|| panic!("OpenAPI path is missing: {path}"));
+    let path_body = &api[path_start + path_marker.len()..];
+    let method_marker = format!("    {method}:\n");
+    let method_start = path_body
+        .find(&method_marker)
+        .unwrap_or_else(|| panic!("OpenAPI operation is missing: {method} {path}"));
+    let operation = &path_body[method_start + method_marker.len()..];
+    let end = operation
+        .lines()
+        .scan(0_usize, |offset, line| {
+            let start = *offset;
+            *offset += line.len() + 1;
+            Some((start, line))
+        })
+        .find_map(|(offset, line)| {
+            (line.starts_with("  /")
+                || (line.starts_with("    ") && !line.starts_with("      ") && line.ends_with(':')))
+            .then_some(offset)
+        })
+        .unwrap_or(operation.len());
+    &operation[..end]
 }
 
 impl Fixture {

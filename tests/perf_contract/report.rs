@@ -15,6 +15,7 @@ use crate::common::counting::ClassStats;
 use super::contract::CostViolation;
 use super::depth::{CriticalPath, DepthStage, DepthTracker, OpSpan, SpanKind};
 use super::scenario::{RepeatCounters, ScenarioOutcome};
+use super::security::SecurityMeasurement;
 use super::PerfEnv;
 
 const SOUNDNESS_PRECONDITION: &str =
@@ -122,6 +123,7 @@ struct ScenarioReport {
     configuration_error: Option<String>,
     violations: Vec<CostViolation>,
     repeats: Vec<ReportRepeat>,
+    security: Option<SecurityMeasurement>,
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +277,9 @@ impl RunArtifacts {
         let depth = depth_artifact(&outcome.per_repeat);
         write_json(scenario_dir.join("depth.json"), &depth);
         write_json(scenario_dir.join("expected.json"), &outcome.expected);
+        if let Some(security) = &outcome.security {
+            write_json(scenario_dir.join("security.json"), security);
+        }
         if !violations.is_empty() {
             write_json(scenario_dir.join("violations.json"), violations);
         }
@@ -286,6 +291,7 @@ impl RunArtifacts {
                 configuration_error: None,
                 violations: violations.to_vec(),
                 repeats: report_repeats(&outcome.per_repeat),
+                security: outcome.security.clone(),
             },
         );
     }
@@ -309,6 +315,7 @@ impl RunArtifacts {
                 configuration_error: Some(error),
                 violations: Vec::new(),
                 repeats: Vec::new(),
+                security: None,
             },
         );
     }
@@ -651,9 +658,22 @@ fn build_report(artifacts: &RunArtifacts, scenarios: &BTreeMap<String, ScenarioR
             format_depth(&first.put_get)
         ));
         out.push_str(&format!(
-            "- delta vs baseline: {}\n\n",
+            "- delta vs baseline: {}\n",
             format_violation_deltas(&scenario.violations)
         ));
+        if let Some(security) = &scenario.security {
+            out.push_str(&format!(
+                "- authn+authz p50 delta: {} ns\n",
+                security.authn_authz_p50_delta_ns
+            ));
+            out.push_str(&format!(
+                "- object-store delta vs `{}`: GET {:+}, PUT {:+}\n",
+                markdown_cell(&security.baseline_scenario),
+                security.added_get_ops,
+                security.added_put_ops
+            ));
+        }
+        out.push('\n');
         out.push_str("### Object-Store Totals\n\n");
         out.push_str("| class | get_ops | get_bytes | put_ops | put_bytes |\n");
         out.push_str("| --- | ---: | ---: | ---: | ---: |\n");
@@ -791,6 +811,11 @@ fn format_violation_deltas(violations: &[CostViolation]) -> String {
                 format!("repeat {repeat}: {detail}")
             }
             CostViolation::BaselineDrift { field, detail } => format!("{field}: {detail}"),
+            CostViolation::SecurityBudget {
+                metric,
+                expected,
+                actual,
+            } => format!("security.{metric}: {expected}->{actual}"),
         })
         .collect::<Vec<_>>()
         .join("; ");

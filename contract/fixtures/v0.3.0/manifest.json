@@ -3,6 +3,30 @@
   "generated_by": "cargo test --test contract_tests contract_fixtures_match_real_engine_output",
   "cases": [
     {
+      "name": "unauthenticated_401",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 401,
+      "request": "unauthenticated_401.req.json",
+      "response": "unauthenticated_401.resp.json"
+    },
+    {
+      "name": "forbidden_403",
+      "method": "GET",
+      "path": "/v1/config/query",
+      "status": 403,
+      "request": "forbidden_403.req.json",
+      "response": "forbidden_403.resp.json"
+    },
+    {
+      "name": "readyz_gated_401",
+      "method": "GET",
+      "path": "/readyz",
+      "status": 401,
+      "request": "readyz_gated_401.req.json",
+      "response": "readyz_gated_401.resp.json"
+    },
+    {
       "name": "create_namespace",
       "method": "POST",
       "path": "/v1/namespaces",

@@ -7,7 +7,6 @@ use common::server::{
 };
 use serde_json::{json, Value};
 use ulid::Ulid;
-use zeppelin::config::Config;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::manifest::FragmentRef;
@@ -95,8 +94,8 @@ fn fragment(id: u128) -> FragmentRef {
 
 #[tokio::test]
 async fn query_as_of_generation_timestamp_and_snapshot_read_historical_manifest() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -165,8 +164,8 @@ async fn query_as_of_generation_timestamp_and_snapshot_read_historical_manifest(
 
 #[tokio::test]
 async fn query_as_of_timestamp_scans_full_history_under_clock_skew() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -199,8 +198,8 @@ async fn query_as_of_timestamp_scans_full_history_under_clock_skew() {
 
 #[tokio::test]
 async fn query_rejects_unknown_as_of_query_param() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -232,7 +231,7 @@ async fn query_rejects_unknown_as_of_query_param() {
 
 #[tokio::test]
 async fn query_as_of_eventual_reads_historical_compacted_manifest() {
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.indexing.default_num_centroids = 2;
     config.indexing.default_nprobe = 2;
     config.indexing.max_nprobe = 8;
@@ -240,9 +239,9 @@ async fn query_as_of_eventual_reads_historical_compacted_manifest() {
     config.indexing.bitmap_index = false;
     config.indexing.fts_index = false;
 
-    let (base_url, harness, _cache, _cache_dir, compactor) =
+    let (base_url, harness, _cache, _cache_dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -290,8 +289,8 @@ async fn query_as_of_eventual_reads_historical_compacted_manifest() {
 
 #[tokio::test]
 async fn query_as_of_ignores_history_generation_ahead_of_live_manifest() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,

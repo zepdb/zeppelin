@@ -1950,6 +1950,13 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
         frozen_case("warm_query_eventual"),
     ),
     path(
+        "catalog.secured_query",
+        "src/server/handlers/query.rs:query_namespace",
+        &[StoreMethod::Get, StoreMethod::GetRange],
+        &[PhysicalVariant::GetFull, PhysicalVariant::GetRange],
+        frozen_case("secured_query"),
+    ),
+    path(
         "catalog.query.flat_none_filtered_no_bitmap",
         "src/index/ivf_flat/search.rs:search_ivf_flat",
         &[StoreMethod::Get],

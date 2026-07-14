@@ -5,8 +5,8 @@ use serde_json::json;
 
 #[tokio::test]
 async fn test_empty_body_upsert() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -38,8 +38,8 @@ async fn test_empty_body_upsert() {
 
 #[tokio::test]
 async fn test_empty_vectors_array() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -65,8 +65,8 @@ async fn test_empty_vectors_array() {
 
 #[tokio::test]
 async fn test_empty_delete_ids_array() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -92,8 +92,8 @@ async fn test_empty_delete_ids_array() {
 
 #[tokio::test]
 async fn test_wrong_type_vector_values() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -127,8 +127,8 @@ async fn test_wrong_type_vector_values() {
 
 #[tokio::test]
 async fn test_query_both_vector_and_rank_by() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -157,8 +157,8 @@ async fn test_query_both_vector_and_rank_by() {
 
 #[tokio::test]
 async fn test_query_rejects_unknown_top_level_field() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces/missing/query"))
@@ -179,8 +179,8 @@ async fn test_query_rejects_unknown_top_level_field() {
 
 #[tokio::test]
 async fn test_query_rejects_legacy_vector_with_algebra_sources() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces/missing/query"))
@@ -208,8 +208,8 @@ async fn test_query_rejects_legacy_vector_with_algebra_sources() {
 
 #[tokio::test]
 async fn test_query_rejects_rrf_fusion_with_single_source() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces/missing/query"))
@@ -237,8 +237,8 @@ async fn test_query_rejects_rrf_fusion_with_single_source() {
 
 #[tokio::test]
 async fn test_query_reserved_projection_paths_return_not_implemented() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ann_source = json!({
         "type": "ann",
         "vector": [1.0, 2.0, 3.0, 4.0]
@@ -273,8 +273,8 @@ async fn test_query_reserved_projection_paths_return_not_implemented() {
 
 #[tokio::test]
 async fn test_query_neither_vector_nor_rank_by() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -300,8 +300,8 @@ async fn test_query_neither_vector_nor_rank_by() {
 
 #[tokio::test]
 async fn test_invalid_vector_id_characters() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -332,8 +332,8 @@ async fn test_invalid_vector_id_characters() {
 
 #[tokio::test]
 async fn test_default_config_allows_nprobe_at_default_centroid_count() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -365,8 +365,8 @@ async fn test_default_config_allows_nprobe_at_default_centroid_count() {
 
 #[tokio::test]
 async fn test_nprobe_exceeds_max() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -416,8 +416,8 @@ async fn test_nprobe_exceeds_max() {
 
 #[tokio::test]
 async fn test_upsert_inf_rejected_nothing_durable() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -476,8 +476,8 @@ async fn test_upsert_inf_rejected_nothing_durable() {
 
 #[tokio::test]
 async fn test_upsert_neg_inf_rejected_nothing_durable() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -528,8 +528,8 @@ async fn test_upsert_neg_inf_rejected_nothing_durable() {
 
 #[tokio::test]
 async fn test_query_inf_rejected() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -571,8 +571,8 @@ async fn test_query_inf_rejected() {
 
 #[tokio::test]
 async fn test_top_k_zero() {
-    let (base_url, harness) = common::server::start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = common::server::start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,

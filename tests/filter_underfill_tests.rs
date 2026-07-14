@@ -45,7 +45,7 @@ const TOP_K: usize = 50; // << MATCHING, so top_k is always fillable
 /// shortfall is truncation, not IVF recall loss) and NO bitmap indexes (so the
 /// filter goes through the attribute post-filter path under test).
 fn adversarial_config() -> Config {
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.indexing.default_num_centroids = NCLUSTERS;
     config.indexing.bitmap_index = false;
     config
@@ -166,9 +166,9 @@ fn assert_full_hot_top_k(body: &Value, path: &str) {
 /// results. Post-fix: exactly TOP_K results, all `hot_`.
 #[tokio::test]
 async fn test_sq8_filtered_query_fills_top_k() {
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(adversarial_config())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_euclidean_ns(&client, &base_url).await;
     seed_adversarial_ns(&client, &base_url, &ns, &compactor).await;
 
@@ -183,9 +183,9 @@ async fn test_sq8_filtered_query_fills_top_k() {
 /// only for rerank-cost control and must not change unfiltered results).
 #[tokio::test]
 async fn test_sq8_unfiltered_query_unchanged() {
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(adversarial_config())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_euclidean_ns(&client, &base_url).await;
     seed_adversarial_ns(&client, &base_url, &ns, &compactor).await;
 
@@ -228,9 +228,9 @@ async fn test_sq8_unfiltered_query_unchanged() {
 async fn test_pq_filtered_query_fills_top_k() {
     let mut config = adversarial_config();
     config.indexing.quantization = QuantizationType::Product;
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_euclidean_ns(&client, &base_url).await;
     seed_adversarial_ns(&client, &base_url, &ns, &compactor).await;
 
@@ -251,9 +251,9 @@ async fn test_hierarchical_sq8_filtered_query_fills_top_k() {
     let mut config = adversarial_config();
     config.indexing.hierarchical = true;
     config.indexing.leaf_size = Some(NEAR_DECOYS + MATCHING + 100);
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_euclidean_ns(&client, &base_url).await;
     seed_adversarial_ns(&client, &base_url, &ns, &compactor).await;
 
@@ -271,9 +271,9 @@ async fn test_hierarchical_sq8_filtered_query_fills_top_k() {
 async fn test_bitmap_filtered_query_unaffected() {
     let mut config = adversarial_config();
     config.indexing.bitmap_index = true;
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_euclidean_ns(&client, &base_url).await;
     seed_adversarial_ns(&client, &base_url, &ns, &compactor).await;
 

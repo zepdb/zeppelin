@@ -40,18 +40,19 @@ fn prefixed_vectors_with_attrs(prefix: &str, n: usize, dims: usize) -> Vec<Vecto
 /// Explicitly sets quantization to None since these tests focus on
 /// compaction/query lifecycle, not quantization behavior.
 fn e2e_test_config() -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        max_wal_fragments_before_compact: 3,
+    Config {
+        compaction: CompactionConfig {
+            max_wal_fragments_before_compact: 3,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            quantization: zeppelin::index::quantization::QuantizationType::None,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: 4,
-        kmeans_max_iterations: 10,
-        quantization: zeppelin::index::quantization::QuantizationType::None,
-        ..Default::default()
-    };
-    config
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -62,9 +63,9 @@ fn e2e_test_config() -> Config {
 async fn test_e2e_write_compact_query_lifecycle() {
     let total_start = Instant::now();
     let config = e2e_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -163,21 +164,23 @@ async fn test_e2e_background_compaction_triggers() {
     let total_start = Instant::now();
 
     // Config: fast compaction interval, low fragment threshold
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        interval_secs: 2,
-        max_wal_fragments_before_compact: 3,
-        ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: 4,
-        kmeans_max_iterations: 10,
+    let config = Config {
+        compaction: CompactionConfig {
+            interval_secs: 2,
+            max_wal_fragments_before_compact: 3,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
-    let (base_url, harness, _cache, _dir, shutdown_tx) =
+    let (base_url, harness, _cache, _dir, shutdown_tx, admin_bearer) =
         start_test_server_with_compaction(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -258,9 +261,9 @@ async fn test_e2e_background_compaction_triggers() {
 async fn test_e2e_incremental_compaction() {
     let total_start = Instant::now();
     let config = e2e_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -365,9 +368,9 @@ async fn test_e2e_incremental_compaction() {
 async fn test_e2e_filtered_query_after_compaction() {
     let total_start = Instant::now();
     let config = e2e_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -506,9 +509,9 @@ async fn test_e2e_filtered_query_after_compaction() {
 async fn test_e2e_delete_compact_verify_gone() {
     let total_start = Instant::now();
     let config = e2e_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -625,9 +628,9 @@ async fn test_e2e_delete_compact_verify_gone() {
 async fn test_e2e_strong_vs_eventual_consistency() {
     let total_start = Instant::now();
     let config = e2e_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,

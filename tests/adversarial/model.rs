@@ -937,9 +937,7 @@ pub fn model_distance(metric: DistanceMetric, query: &[f32], values: &[f32]) -> 
 
 #[cfg(test)]
 mod tests {
-    use reqwest::Client;
     use serde_json::json;
-    use zeppelin::config::Config;
     use zeppelin::index::quantization::QuantizationType;
     use zeppelin::types::{AttributeValue, DistanceMetric};
 
@@ -1459,12 +1457,12 @@ mod tests {
             DistanceMetric::DotProduct,
         ];
         for metric in metrics {
-            let mut config = Config::load(None).unwrap();
+            let mut config = zeppelin::config::Config::default();
             config.cache.manifest_cache_ttl_ms = 0;
             config.indexing.default_num_centroids = 1;
-            let (base_url, harness, _cache, _cache_dir, _compactor) =
+            let (base_url, harness, _cache, _cache_dir, _compactor, admin_bearer) =
                 start_test_server_with_compactor(Some(config)).await;
-            let client = Client::new();
+            let client = crate::common::server::client_with_bearer(&admin_bearer);
             let ns = format!("{}-distance-{}", harness.prefix, metric);
             let create = client
                 .post(format!("{base_url}/v1/namespaces"))

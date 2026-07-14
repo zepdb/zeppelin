@@ -3,6 +3,24 @@
 # Environment variables (shown in comments) take precedence over file values.
 # Set ZEPPELIN_CONFIG to point to a custom config file path.
 
+[security]
+# REQUIRED: choose exactly one explicit process posture. `enforced` refuses to
+# boot until at least one unexpired, usable API key is configured below.
+mode = "enforced"                    # "enforced" or "open_unsafe"
+# readyz_public = false              # false keeps /readyz capability-gated
+# policy_refresh_secs = 5            # must be > 0; phase 3 uses this freshness bound
+# license_path = ""                  # phase 6 signed-license path; empty = community
+
+# Generate one 43-character base64url secret and its SHA-256 digest:
+# openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | tee /dev/stderr | shasum -a 256
+# Store only the digest here; send the printed secret as part of the bearer.
+# [[security.api_keys]]
+# key_id = "zpk1_admin"
+# name = "bootstrap-admin"
+# sha256_hex = "replace-with-the-64-hex-character-digest"
+# actions = ["*"]
+# namespaces = ["*"]
+
 [server]
 # host = "0.0.0.0"                   # ZEPPELIN_HOST
 # port = 8080                        # ZEPPELIN_PORT; must be > 0

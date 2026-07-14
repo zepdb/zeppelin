@@ -243,6 +243,8 @@ pub mod query;
 /// one immutable [`runtime_config::QueryKnobs`] snapshot, preventing a request
 /// from mixing old and new tuning values mid-execution.
 pub mod runtime_config;
+/// Typed principals, exhaustive actions, credential adapters, and central authorization.
+pub mod security;
 /// Axum application state, routing, middleware, rate limiting, and HTTP handlers.
 ///
 /// [`server::AppState`] shares initialized services with request futures and

@@ -3460,6 +3460,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "bincode",
  "bytes",
  "chrono",
@@ -3479,6 +3480,8 @@ dependencies = [
  "rust-stemmers",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",

@@ -728,7 +728,7 @@ async fn run() -> Result<()> {
     let top_k = cli.top_k.unwrap_or(seed_file.queries.top_k);
     validate_top_k(top_k, &seed_file)?;
 
-    let config = Config::load(None)?;
+    let config = recall_eval_config()?;
     if config.indexing.quantization != QuantizationType::Scalar {
         return Err(RecallEvalError::Config(format!(
             "recall_eval must measure the production SQ8 path; resolved quantization was {:?}",
@@ -812,6 +812,21 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Build validated production indexing defaults for this non-server evaluator.
+///
+/// [`Config::load`] deliberately requires an operator-selected security mode
+/// because it is the server boot boundary. This binary never opens an HTTP
+/// listener or authenticates requests, so it selects `open_unsafe` explicitly
+/// in code and validates the remaining production compaction/indexing defaults.
+/// Keeping that distinction local prevents an offline quality gate from
+/// weakening the fail-closed server configuration contract.
+fn recall_eval_config() -> Result<Config> {
+    let mut config = Config::default();
+    config.security.mode = zeppelin::config::SecurityMode::OpenUnsafe;
+    config.validate()?;
+    Ok(config)
 }
 
 /// Parses command-line tokens with deterministic defaults and no external CLI framework.
@@ -3209,6 +3224,18 @@ mod tests {
     use zeppelin::wal::manifest::{ClusterDataObjectRef, Manifest, SegmentRef};
 
     use super::*;
+
+    #[test]
+    fn offline_evaluator_config_does_not_require_server_credentials() {
+        let config = recall_eval_config().expect("offline evaluator defaults must validate");
+
+        assert_eq!(
+            config.security.mode,
+            zeppelin::config::SecurityMode::OpenUnsafe
+        );
+        assert!(config.security.api_keys.is_empty());
+        config.validate().unwrap();
+    }
 
     /// Proves grouped cluster metadata and a valid v4 SQ child satisfy verification.
     ///

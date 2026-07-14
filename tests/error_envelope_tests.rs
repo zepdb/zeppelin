@@ -14,7 +14,6 @@ use common::server::{
 use common::vectors::random_vectors;
 
 use serde_json::Value;
-use zeppelin::config::Config;
 
 /// Assert a JSON body is a well-formed error envelope with the expected code
 /// and status, and that `retryable` is a bool.
@@ -40,8 +39,8 @@ fn assert_envelope(body: &Value, expected_code: &str, expected_status: u16) {
 /// I1: namespace-not-found returns the canonical envelope with a stable code.
 #[tokio::test]
 async fn test_envelope_namespace_not_found() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .get(format!("{base_url}/v1/namespaces/does-not-exist-xyz"))
@@ -58,8 +57,8 @@ async fn test_envelope_namespace_not_found() {
 /// I1: validation error (empty batch) returns the envelope, not retryable.
 #[tokio::test]
 async fn test_envelope_validation() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let resp = client
@@ -81,8 +80,8 @@ async fn test_envelope_validation() {
 /// 422 plain-text.
 #[tokio::test]
 async fn test_envelope_malformed_upsert_body() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let resp = client
@@ -104,8 +103,8 @@ async fn test_envelope_malformed_upsert_body() {
 /// not an empty body.
 #[tokio::test]
 async fn test_envelope_unmatched_route() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .get(format!("{base_url}/v1/this/route/does/not/exist"))
@@ -123,8 +122,8 @@ async fn test_envelope_unmatched_route() {
 /// the canonical envelope via the normalize layer, not axum's empty body.
 #[tokio::test]
 async fn test_envelope_method_not_allowed() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/healthz"))
@@ -144,8 +143,8 @@ async fn test_envelope_method_not_allowed() {
 /// no URL scheme ever appears in the body regardless of status.
 #[tokio::test]
 async fn test_readyz_never_leaks_storage_detail() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .get(format!("{base_url}/readyz"))
@@ -171,10 +170,11 @@ async fn test_readyz_never_leaks_storage_detail() {
 #[tokio::test]
 async fn test_envelope_body_too_large() {
     // Tiny 1 MB body limit so a modest payload trips RequestBodyLimitLayer.
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.server.max_request_body_mb = 1;
-    let (base_url, harness, _cache, _dir) = start_test_server_with_config(Some(config)).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, _dir, admin_bearer) =
+        start_test_server_with_config(Some(config)).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let big = "x".repeat(4 * 1024 * 1024); // 4 MB > 1 MB limit
@@ -207,8 +207,8 @@ async fn test_envelope_body_too_large() {
 /// (for routes that carry the request_id middleware — namespace routes do).
 #[tokio::test]
 async fn test_envelope_carries_request_id() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .get(format!("{base_url}/v1/namespaces/nope-xyz"))
@@ -236,8 +236,9 @@ async fn test_envelope_carries_request_id() {
 /// and the raw S3 key never appears in the client body.
 #[tokio::test]
 async fn test_internal_data_missing_is_500_no_key_leak() {
-    let (base_url, harness, _cache, _dir, compactor) = start_test_server_with_compactor(None).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
+        start_test_server_with_compactor(None).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 8).await;
 
     // Upsert enough vectors to build a real segment, then compact.

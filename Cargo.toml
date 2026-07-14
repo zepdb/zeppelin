@@ -57,6 +57,9 @@ bytes = "1"
 
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+sha2 = "0.10"
+subtle = "2"
+base64 = "0.22"
 
 # Metrics
 prometheus = { version = "0.14", default-features = false }

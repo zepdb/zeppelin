@@ -7,11 +7,10 @@ use common::server::{
     start_test_server_on_store, start_test_server_with_compactor,
 };
 use common::vectors::random_vectors;
-use zeppelin::config::Config;
 
 #[tokio::test]
 async fn test_health_check() {
-    let (base_url, harness) = start_test_server().await;
+    let (base_url, harness, _admin_bearer) = start_test_server().await;
 
     let resp = reqwest::get(format!("{base_url}/healthz")).await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -24,8 +23,8 @@ async fn test_health_check() {
 
 #[tokio::test]
 async fn test_create_namespace_returns_uuid_and_warning() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces"))
@@ -61,8 +60,8 @@ async fn test_create_namespace_returns_uuid_and_warning() {
 
 #[tokio::test]
 async fn test_list_namespaces_disabled() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .get(format!("{base_url}/v1/namespaces"))
@@ -77,8 +76,8 @@ async fn test_list_namespaces_disabled() {
 
 #[tokio::test]
 async fn test_namespace_crud() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 64).await;
 
     // Get
@@ -122,8 +121,8 @@ async fn test_namespace_crud() {
 
 #[tokio::test]
 async fn test_snapshot_crud_pins_current_generation() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 8).await;
 
     let created = client
@@ -204,8 +203,8 @@ async fn test_snapshot_crud_pins_current_generation() {
 
 #[tokio::test]
 async fn test_vector_upsert() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 16).await;
 
     // Upsert vectors
@@ -227,14 +226,14 @@ async fn test_vector_upsert() {
 
 #[tokio::test]
 async fn test_nprobe_above_cluster_count_matches_probe_all() {
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.indexing.default_num_centroids = 4;
     config.indexing.default_nprobe = 1;
     config.indexing.max_nprobe = 256;
 
-    let (base_url, harness, _cache, cache_dir, compactor) =
+    let (base_url, harness, _cache, cache_dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -300,9 +299,9 @@ async fn test_nprobe_above_cluster_count_matches_probe_all() {
 async fn test_get_namespace_reports_manifest_stats_after_upsert() {
     let harness = TestHarness::new().await;
     let (store, _counter) = counting_store(&harness.store);
-    let (base_url, _cache, cache_dir) =
+    let (base_url, _cache, cache_dir, admin_bearer) =
         start_test_server_on_store(store, Some(harness.prefix.clone())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 16).await;
 
     let vectors = random_vectors(7, 16);
@@ -346,9 +345,9 @@ async fn test_get_namespace_reports_manifest_stats_after_upsert() {
 async fn test_get_namespace_stats_reuses_manifest_freshness_get_without_listing_or_head() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let (base_url, _cache, cache_dir) =
+    let (base_url, _cache, cache_dir, admin_bearer) =
         start_test_server_on_store(store, Some(harness.prefix.clone())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 8).await;
 
     let vectors = random_vectors(3, 8);
@@ -413,8 +412,8 @@ async fn test_get_namespace_stats_reuses_manifest_freshness_get_without_listing_
 
 #[tokio::test]
 async fn test_dimension_mismatch_400() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 16).await;
 
     // Upsert with wrong dimension (32 instead of 16)
@@ -433,8 +432,8 @@ async fn test_dimension_mismatch_400() {
 
 #[tokio::test]
 async fn test_query_basic_wal_scan() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 8).await;
 
     // Upsert 10 vectors
@@ -472,8 +471,8 @@ async fn test_query_basic_wal_scan() {
 
 #[tokio::test]
 async fn test_query_algebra_single_ann_source_matches_legacy() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 8).await;
 
     let vectors = random_vectors(10, 8);
@@ -525,8 +524,8 @@ async fn test_query_algebra_single_ann_source_matches_legacy() {
 
 #[tokio::test]
 async fn test_query_algebra_ann_source_can_use_stored_seed_id() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -630,8 +629,8 @@ async fn test_query_algebra_ann_source_can_use_stored_seed_id() {
 
 #[tokio::test]
 async fn test_query_algebra_ann_seed_id_missing_or_deleted_is_404() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -689,8 +688,8 @@ async fn test_query_algebra_ann_seed_id_missing_or_deleted_is_404() {
 
 #[tokio::test]
 async fn test_query_algebra_ann_source_rejects_id_and_vector_together() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces/missing/query"))
@@ -719,8 +718,8 @@ async fn test_query_algebra_ann_source_rejects_id_and_vector_together() {
 
 #[tokio::test]
 async fn test_query_algebra_single_bm25_source_matches_legacy() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -797,8 +796,8 @@ async fn test_query_algebra_single_bm25_source_matches_legacy() {
 
 #[tokio::test]
 async fn test_query_with_filter() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Upsert vectors with attributes
@@ -843,8 +842,8 @@ async fn test_query_with_filter() {
 
 #[tokio::test]
 async fn test_query_empty_namespace() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Query empty namespace
@@ -869,8 +868,8 @@ async fn test_query_empty_namespace() {
 
 #[tokio::test]
 async fn test_query_dimension_mismatch() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Query with wrong dimension

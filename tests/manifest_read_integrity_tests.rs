@@ -291,8 +291,8 @@ async fn lifecycle_strong_read_accepts_deleted_manifest_after_warm_cache() {
 
 #[tokio::test]
 async fn active_namespace_missing_manifest_fails_fetch_loudly() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let namespace = create_ns_api_with(
         &client,
         &base_url,
@@ -348,8 +348,8 @@ async fn active_namespace_missing_manifest_fails_fetch_loudly() {
 
 #[tokio::test]
 async fn active_namespace_missing_manifest_fails_pitr_boundary_loudly() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let namespace = create_ns_api_with(
         &client,
         &base_url,
@@ -391,9 +391,9 @@ async fn active_namespace_missing_manifest_fails_pitr_boundary_loudly() {
 async fn active_namespace_stale_manifest_body_fails_fetch_loudly() {
     let harness = TestHarness::new().await;
     let (store, stale_manifest) = StaleManifestOnceStore::wrap(&harness.store);
-    let (base_url, _cache, _cache_dir) =
+    let (base_url, _cache, _cache_dir, admin_bearer) =
         start_test_server_on_store(store, Some(harness.prefix.clone())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let namespace = create_ns_api_with(
         &client,
         &base_url,

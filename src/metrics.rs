@@ -228,6 +228,13 @@ mod inner {
             &["class"]
         ).unwrap();
 
+        /// Active process security posture, with exactly one mode label set to one.
+        pub static ref SECURITY_MODE: IntGaugeVec = register_int_gauge_vec!(
+            "zeppelin_security_mode",
+            "Active Zeppelin process security mode",
+            &["mode"]
+        ).unwrap();
+
         /// Durable non-finite vectors skipped defensively during compaction.
         ///
         /// This records legacy or corrupt S3 data containing NaN or infinity;
@@ -393,6 +400,7 @@ pub fn init() {
     lazy_static::initialize(&FTS_INDEX_BUILD_DURATION);
     lazy_static::initialize(&FTS_QUERIES_TOTAL);
     lazy_static::initialize(&RATE_LIMITED_TOTAL);
+    lazy_static::initialize(&SECURITY_MODE);
     lazy_static::initialize(&NON_FINITE_VECTORS_SKIPPED_TOTAL);
     lazy_static::initialize(&COMPACTION_LEASE_RENEWALS_TOTAL);
     lazy_static::initialize(&COMPACTION_LEASE_LOST_TOTAL);

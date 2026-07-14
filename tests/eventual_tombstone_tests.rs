@@ -17,19 +17,20 @@ use zeppelin::wal::manifest::Manifest;
 use zeppelin::wal::{WalReader, WalWriter};
 
 fn test_config(fts_index: bool) -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        max_wal_fragments_before_compact: 3,
+    Config {
+        compaction: CompactionConfig {
+            max_wal_fragments_before_compact: 3,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            fts_index,
+            bitmap_index: false,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: 4,
-        kmeans_max_iterations: 10,
-        fts_index,
-        bitmap_index: false,
-        ..Default::default()
-    };
-    config
+    }
 }
 
 fn test_compactor(store: &zeppelin::storage::ZeppelinStore, fts_index: bool) -> Compactor {
@@ -159,9 +160,9 @@ fn result_ids(body: &serde_json::Value) -> Vec<String> {
 #[tokio::test]
 async fn test_eventual_vector_query_filters_deleted_compacted_vector() {
     let config = test_config(false);
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let target_id = "delete_me";
@@ -225,9 +226,9 @@ async fn test_eventual_vector_query_filters_deleted_compacted_vector() {
 #[tokio::test]
 async fn test_eventual_bm25_query_filters_deleted_compacted_doc() {
     let config = test_config(true);
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(&client, &base_url, 4, content_fts_json()).await;
 
     let target_id = "delete_me";

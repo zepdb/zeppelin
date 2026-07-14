@@ -63,8 +63,8 @@ fn ids(body: &Value) -> Vec<String> {
 
 #[tokio::test]
 async fn vector_rerank_orders_candidates_by_rerank_vector() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -120,8 +120,8 @@ async fn vector_rerank_orders_candidates_by_rerank_vector() {
 
 #[tokio::test]
 async fn bm25_rerank_orders_candidates_by_expression_score() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -176,8 +176,8 @@ async fn bm25_rerank_orders_candidates_by_expression_score() {
 
 #[tokio::test]
 async fn rerank_uses_candidate_k_frontier_and_preserves_filtering() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -247,8 +247,8 @@ async fn rerank_uses_candidate_k_frontier_and_preserves_filtering() {
 
 #[tokio::test]
 async fn default_and_none_rerank_are_byte_identical_noops() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(

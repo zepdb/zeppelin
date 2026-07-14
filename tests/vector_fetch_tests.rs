@@ -58,20 +58,21 @@ async fn fetch(
 }
 
 fn compact_fetch_config() -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.indexing = IndexingConfig {
-        default_num_centroids: 4,
-        kmeans_max_iterations: 10,
-        bitmap_index: false,
+    Config {
+        indexing: IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            bitmap_index: false,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config
+    }
 }
 
 #[tokio::test]
 async fn test_vector_get_strong_returns_requested_missing_and_deleted_ids() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -140,7 +141,7 @@ async fn test_vector_get_strong_returns_requested_missing_and_deleted_ids() {
 async fn test_vector_get_projection_avoids_omitted_segment_reads() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
-    let (base_url, _cache, _cache_dir) =
+    let (base_url, _cache, _cache_dir, admin_bearer) =
         start_test_server_on_store(store.clone(), Some(harness.prefix.clone())).await;
     let config = compact_fetch_config();
     let compactor = Compactor::new(
@@ -150,7 +151,7 @@ async fn test_vector_get_projection_avoids_omitted_segment_reads() {
         config.indexing.clone(),
         common::default_gc_upload_window(),
     );
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -222,7 +223,7 @@ async fn test_vector_get_projection_avoids_omitted_segment_reads() {
 async fn test_vector_get_missing_requested_segment_artifact_fails_loud() {
     let harness = TestHarness::new().await;
     let (store, _counter) = counting_store(&harness.store);
-    let (base_url, _cache, _cache_dir) =
+    let (base_url, _cache, _cache_dir, admin_bearer) =
         start_test_server_on_store(store.clone(), Some(harness.prefix.clone())).await;
     let config = compact_fetch_config();
     let compactor = Compactor::new(
@@ -232,7 +233,7 @@ async fn test_vector_get_missing_requested_segment_artifact_fails_loud() {
         config.indexing.clone(),
         common::default_gc_upload_window(),
     );
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(

@@ -306,6 +306,7 @@ pub(crate) const IDEAL_CASES: &[IdealCase] = &[
     frozen("delete_single", IdealCaseGroup::VectorWrite),
     frozen("gc_cycle", IdealCaseGroup::GarbageCollection),
     frozen("cold_query_sketch_adc", IdealCaseGroup::Query),
+    frozen("secured_query", IdealCaseGroup::Query),
     // Operational and namespace control plane.
     ideal_case(
         "operational.startup_storage_probe",

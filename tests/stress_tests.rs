@@ -36,17 +36,18 @@ fn prefixed_vectors(prefix: &str, n: usize, dims: usize) -> Vec<VectorEntry> {
 
 /// Test config with small centroids for fast compaction.
 fn stress_test_config() -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        max_wal_fragments_before_compact: 3,
+    Config {
+        compaction: CompactionConfig {
+            max_wal_fragments_before_compact: 3,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: 4,
-        kmeans_max_iterations: 10,
-        ..Default::default()
-    };
-    config
+    }
 }
 
 fn squared_l2_to_origin(values: &[f32]) -> f32 {
@@ -155,8 +156,8 @@ async fn test_stress_large_uncompacted_wal_backlog_exact_topk() {
 #[tokio::test]
 async fn test_stress_concurrent_writers_same_namespace() {
     let start = Instant::now();
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -239,8 +240,8 @@ async fn test_stress_concurrent_writers_same_namespace() {
 #[tokio::test]
 async fn test_stress_concurrent_readers_during_writes() {
     let start = Instant::now();
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -342,10 +343,11 @@ async fn test_stress_concurrent_readers_during_writes() {
 async fn test_stress_large_batch_upsert() {
     let start = Instant::now();
     // Use explicit config with large body limit for 10k vector payload
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.server.max_request_body_mb = 100;
-    let (base_url, harness, _cache, _dir) = start_test_server_with_config(Some(config)).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, _dir, admin_bearer) =
+        start_test_server_with_config(Some(config)).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -426,8 +428,8 @@ async fn test_stress_large_batch_upsert() {
 #[tokio::test]
 async fn test_stress_rapid_namespace_create_delete() {
     let start = Instant::now();
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let ns_count = 20;
 
@@ -513,9 +515,9 @@ async fn test_stress_rapid_namespace_create_delete() {
 async fn test_stress_high_query_concurrency() {
     let start = Instant::now();
     let config = stress_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -611,8 +613,8 @@ async fn test_stress_high_query_concurrency() {
 #[tokio::test]
 async fn test_stress_concurrent_upsert_and_delete() {
     let start = Instant::now();
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,

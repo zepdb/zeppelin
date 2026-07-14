@@ -17,7 +17,7 @@ use zeppelin::wal::{FragmentCachePolicy, WalReader, WalWriter};
 const DIM: usize = 4;
 
 fn one_cluster_flat_config() -> Config {
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.indexing.default_num_centroids = 1;
     config.indexing.default_nprobe = 1;
     config.indexing.quantization = QuantizationType::None;
@@ -78,9 +78,9 @@ fn attrs_key(ns: &str, segment_id: &str, cluster_idx: usize) -> String {
 /// results.
 #[tokio::test]
 async fn test_missing_cluster_blob_fails_query() {
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(one_cluster_flat_config())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -123,9 +123,9 @@ async fn test_missing_cluster_blob_fails_query() {
 /// an empty 200.
 #[tokio::test]
 async fn test_missing_attrs_blob_fails_filtered_query() {
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(one_cluster_flat_config())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,

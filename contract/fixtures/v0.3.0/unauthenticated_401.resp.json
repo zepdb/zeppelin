@@ -1,0 +1,7 @@
+{
+  "code": "unauthenticated",
+  "error": "authentication required",
+  "request_id": "contract-unauthenticated_401",
+  "retryable": false,
+  "status": 401
+}

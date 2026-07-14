@@ -7,19 +7,20 @@ use std::sync::Arc;
 use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
 
 fn fts_stress_config() -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        max_wal_fragments_before_compact: 5,
+    Config {
+        compaction: CompactionConfig {
+            max_wal_fragments_before_compact: 5,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            fts_index: true,
+            bitmap_index: false,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: 4,
-        kmeans_max_iterations: 10,
-        fts_index: true,
-        bitmap_index: false,
-        ..Default::default()
-    };
-    config
+    }
 }
 
 fn fts_configs() -> HashMap<String, zeppelin::fts::FtsFieldConfig> {
@@ -42,9 +43,9 @@ fn fts_configs() -> HashMap<String, zeppelin::fts::FtsFieldConfig> {
 #[tokio::test]
 async fn test_fts_stress_concurrent_writers_readers() {
     let config = fts_stress_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = Arc::new(reqwest::Client::new());
+    let client = Arc::new(crate::common::server::client_with_bearer(&admin_bearer));
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -139,9 +140,9 @@ async fn test_fts_stress_concurrent_writers_readers() {
 #[tokio::test]
 async fn test_fts_stress_large_batch() {
     let config = fts_stress_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -223,9 +224,9 @@ async fn test_fts_stress_large_batch() {
 #[tokio::test]
 async fn test_fts_stress_query_concurrency() {
     let config = fts_stress_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = Arc::new(reqwest::Client::new());
+    let client = Arc::new(crate::common::server::client_with_bearer(&admin_bearer));
     let ns = create_ns_api_fts(
         &client,
         &base_url,

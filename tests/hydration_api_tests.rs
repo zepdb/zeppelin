@@ -30,6 +30,7 @@ use zeppelin::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 struct ApiServer {
     base_url: String,
+    admin_bearer: String,
     harness: TestHarness,
     store: ZeppelinStore,
     counter: GetCounter,
@@ -71,8 +72,10 @@ fn hydration_api_config() -> Config {
     config
 }
 
-async fn start_api_server(config: Config) -> ApiServer {
+async fn start_api_server(mut config: Config) -> ApiServer {
     zeppelin::metrics::init();
+    let (security, credential_adapter, admin_bearer) =
+        common::server::test_security_runtime(&mut config);
 
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
@@ -115,6 +118,8 @@ async fn start_api_server(config: Config) -> ApiServer {
     let state = AppState {
         store: store.clone(),
         clock: zeppelin::time::Clock::system(),
+        security,
+        credential_adapter,
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(store.clone())),
@@ -152,6 +157,7 @@ async fn start_api_server(config: Config) -> ApiServer {
 
     ApiServer {
         base_url,
+        admin_bearer,
         harness,
         store,
         counter,
@@ -167,7 +173,7 @@ async fn create_compacted_namespace(
     vector_count: usize,
     dimensions: usize,
 ) -> CompactedNamespace {
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let create: serde_json::Value = client
         .post(format!("{}/v1/namespaces", server.base_url))
         .json(&json!({
@@ -264,7 +270,7 @@ async fn post_hydrate(
 async fn test_admin_hydrate_endpoint_hydrates_namespace() {
     let server = start_api_server(hydration_api_config()).await;
     let fixture = create_compacted_namespace(&server, 256, 32).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
 
     let resp = post_hydrate(&client, &server.base_url, &fixture.namespace).await;
     assert_eq!(resp.status(), 202);
@@ -307,7 +313,7 @@ async fn test_admin_hydrate_endpoint_hydrates_namespace() {
 #[tokio::test]
 async fn test_admin_hydrate_unknown_namespace_404() {
     let server = start_api_server(hydration_api_config()).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let missing = "missing-admin-hydrate-ns";
 
     let resp = post_hydrate(&client, &server.base_url, missing).await;
@@ -332,7 +338,7 @@ async fn test_admin_hydrate_disabled_config_errors() {
     let mut config = hydration_api_config();
     config.cache.hydration_enabled = false;
     let server = start_api_server(config).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let create: serde_json::Value = client
         .post(format!("{}/v1/namespaces", server.base_url))
         .json(&json!({"dimensions": 8, "distance_metric": "euclidean"}))
@@ -383,7 +389,7 @@ async fn test_admin_hydrate_does_not_block() {
     config.indexing.default_num_centroids = 64;
     let server = start_api_server(config).await;
     let fixture = create_compacted_namespace(&server, 1024, 32).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
 
     let start = Instant::now();
     let resp = post_hydrate(&client, &server.base_url, &fixture.namespace).await;
@@ -406,7 +412,7 @@ async fn test_admin_hydrate_does_not_block() {
 async fn test_admin_hydrate_job_uses_admin_trigger_label() {
     let server = start_api_server(hydration_api_config()).await;
     let fixture = create_compacted_namespace(&server, 256, 32).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
 
     let _guard = admin_request_lock().lock().await;
     let before_admin = hydration_jobs_total("admin");

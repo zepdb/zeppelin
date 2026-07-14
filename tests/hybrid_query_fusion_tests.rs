@@ -30,15 +30,16 @@ fn fts_field_configs() -> HashMap<String, FtsFieldConfig> {
 }
 
 fn hybrid_compaction_config() -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.indexing = IndexingConfig {
-        default_num_centroids: 4,
-        kmeans_max_iterations: 10,
-        fts_index: true,
-        bitmap_index: false,
+    Config {
+        indexing: IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            fts_index: true,
+            bitmap_index: false,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config
+    }
 }
 
 async fn create_hybrid_namespace(
@@ -134,8 +135,8 @@ async fn seed_wal_fixture(client: &reqwest::Client, base_url: &str, ns: &str) {
 
 #[tokio::test]
 async fn test_hybrid_rrf_fuses_ann_and_bm25_deterministically() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_hybrid_namespace(&client, &base_url, 2).await;
     seed_wal_fixture(&client, &base_url, &ns).await;
 
@@ -176,8 +177,8 @@ async fn test_hybrid_rrf_fuses_ann_and_bm25_deterministically() {
 
 #[tokio::test]
 async fn test_hybrid_weighted_fusion_uses_normalized_source_scores() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_hybrid_namespace(&client, &base_url, 2).await;
     seed_wal_fixture(&client, &base_url, &ns).await;
 
@@ -219,8 +220,8 @@ async fn test_hybrid_weighted_fusion_uses_normalized_source_scores() {
 
 #[tokio::test]
 async fn test_hybrid_candidate_k_bounds_each_source_before_fusion() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_hybrid_namespace(&client, &base_url, 2).await;
     seed_wal_fixture(&client, &base_url, &ns).await;
 
@@ -247,8 +248,8 @@ async fn test_hybrid_candidate_k_bounds_each_source_before_fusion() {
 
 #[tokio::test]
 async fn test_hybrid_query_by_id_excludes_seed_after_fusion() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_hybrid_namespace(&client, &base_url, 2).await;
 
     upsert(
@@ -307,9 +308,9 @@ async fn test_hybrid_query_by_id_excludes_seed_after_fusion() {
 
 #[tokio::test]
 async fn test_hybrid_fusion_includes_wal_and_segment_candidates() {
-    let (base_url, harness, _cache, _cache_dir, compactor) =
+    let (base_url, harness, _cache, _cache_dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(hybrid_compaction_config())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_hybrid_namespace(&client, &base_url, 2).await;
 
     upsert(

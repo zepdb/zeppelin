@@ -41,7 +41,7 @@ async fn query(client: &reqwest::Client, base_url: &str, ns: &str, body: Value) 
 }
 
 fn fts_config() -> Config {
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.indexing.fts_index = true;
     config
 }
@@ -96,8 +96,9 @@ fn bm25_docs() -> Value {
 
 #[tokio::test]
 async fn ann_segment_order_pin() {
-    let (base_url, harness, _cache, _dir, compactor) = start_test_server_with_compactor(None).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
+        start_test_server_with_compactor(None).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -132,8 +133,8 @@ async fn ann_segment_order_pin() {
 
 #[tokio::test]
 async fn ann_strong_wal_order_pin() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -166,9 +167,9 @@ async fn ann_strong_wal_order_pin() {
 
 #[tokio::test]
 async fn bm25_segment_order_pin() {
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(fts_config())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
     upsert(&client, &base_url, &ns, bm25_docs()).await;
 
@@ -200,9 +201,9 @@ async fn bm25_segment_order_pin() {
 
 #[tokio::test]
 async fn bm25_wal_order_pin() {
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(fts_config())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(&client, &base_url, 4, fts_json()).await;
     upsert(&client, &base_url, &ns, bm25_docs()).await;
 

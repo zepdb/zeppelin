@@ -10,18 +10,19 @@ use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
 use zeppelin::fts::FtsFieldConfig;
 
 fn fts_perf_config() -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        max_wal_fragments_before_compact: 10,
+    Config {
+        compaction: CompactionConfig {
+            max_wal_fragments_before_compact: 10,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: 8,
+            kmeans_max_iterations: 20,
+            fts_index: true,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: 8,
-        kmeans_max_iterations: 20,
-        fts_index: true,
-        ..Default::default()
-    };
-    config
+    }
 }
 
 fn default_fts_config() -> HashMap<String, FtsFieldConfig> {
@@ -103,9 +104,9 @@ fn make_doc(id: &str, text: &str, dims: usize, rng: &mut StdRng) -> serde_json::
 #[tokio::test]
 async fn test_fts_perf_index_build_time() {
     let config = fts_perf_config();
-    let (base_url, _harness, _cache, _dir, compactor) =
+    let (base_url, _harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let fts_config = default_fts_config();
 
     // Create namespace
@@ -168,9 +169,9 @@ async fn test_fts_perf_index_build_time() {
 #[tokio::test]
 async fn test_fts_perf_query_latency() {
     let config = fts_perf_config();
-    let (base_url, _harness, _cache, _dir, compactor) =
+    let (base_url, _harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let fts_config = default_fts_config();
 
     // Create and populate
@@ -261,9 +262,9 @@ async fn test_fts_perf_query_latency() {
 #[tokio::test]
 async fn test_fts_perf_wal_vs_segment() {
     let config = fts_perf_config();
-    let (base_url, _harness, _cache, _dir, compactor) =
+    let (base_url, _harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let fts_config = default_fts_config();
 
     // Create and populate

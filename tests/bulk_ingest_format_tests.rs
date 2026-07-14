@@ -81,8 +81,8 @@ fn vector(id: &str, values: &[f32]) -> VectorEntry {
 
 #[tokio::test]
 async fn test_msgpack_row_upsert_same_logical_schema_is_queryable() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let body = row_msgpack(vec![
@@ -112,8 +112,8 @@ async fn test_msgpack_row_upsert_same_logical_schema_is_queryable() {
 
 #[tokio::test]
 async fn test_msgpack_errors_match_json_for_wrong_dimensions() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let vectors = vec![vector("short-2", &[1.0, 0.0])];
@@ -137,8 +137,8 @@ async fn test_msgpack_errors_match_json_for_wrong_dimensions() {
 
 #[tokio::test]
 async fn test_msgpack_errors_match_json_for_non_finite_values() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let json_body = br#"{"vectors":[
@@ -165,8 +165,8 @@ async fn test_msgpack_errors_match_json_for_non_finite_values() {
 
 #[tokio::test]
 async fn test_msgpack_columnar_upsert_is_queryable() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let body = columnar_msgpack(

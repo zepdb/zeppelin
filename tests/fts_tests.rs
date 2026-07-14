@@ -16,20 +16,21 @@ use zeppelin::wal::Manifest;
 
 /// Test config with small centroids for fast compaction and FTS indexing enabled.
 fn fts_test_config() -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        max_wal_fragments_before_compact: 3,
+    Config {
+        compaction: CompactionConfig {
+            max_wal_fragments_before_compact: 3,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: 4,
+            kmeans_max_iterations: 10,
+            fts_index: true,
+            bitmap_index: false,
+            bm25_max_full_scan_vectors: 10_000,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: 4,
-        kmeans_max_iterations: 10,
-        fts_index: true,
-        bitmap_index: false,
-        bm25_max_full_scan_vectors: 10_000,
-        ..Default::default()
-    };
-    config
+    }
 }
 
 /// Create a VectorEntry with a single "content" text attribute.
@@ -219,9 +220,9 @@ fn result_ids(body: &serde_json::Value) -> Vec<String> {
 #[tokio::test]
 async fn test_fts_wal_scan_basic() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -293,9 +294,9 @@ async fn test_fts_wal_scan_basic() {
 #[tokio::test]
 async fn test_fts_strong_wal_update_suppresses_stale_segment_doc_outside_topk() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -353,9 +354,9 @@ async fn test_fts_strong_wal_update_suppresses_stale_segment_doc_outside_topk() 
 #[tokio::test]
 async fn test_fts_strong_filtered_wal_update_suppresses_stale_segment_doc() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -415,9 +416,9 @@ async fn test_fts_strong_filtered_wal_update_suppresses_stale_segment_doc() {
 #[tokio::test]
 async fn test_fts_wal_filter_before_topk_avoids_underfill() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -471,9 +472,9 @@ async fn test_fts_wal_filter_before_topk_avoids_underfill() {
 #[tokio::test]
 async fn test_fts_wal_scan_with_deletes() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -526,9 +527,9 @@ async fn test_fts_wal_scan_with_deletes() {
 #[tokio::test]
 async fn test_fts_segment_search_after_compaction() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -635,9 +636,9 @@ async fn test_bm25_missing_global_fts_over_cap_returns_index_unavailable() {
     let mut config = fts_test_config();
     config.indexing.bm25_max_full_scan_clusters = 1;
     config.indexing.bm25_max_full_scan_vectors = 10_000;
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -704,9 +705,9 @@ async fn test_bm25_missing_global_fts_over_cap_returns_index_unavailable() {
 #[tokio::test]
 async fn test_bm25_segment_without_fts_fields_returns_index_unavailable() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -764,9 +765,9 @@ async fn test_bm25_segment_without_fts_fields_returns_index_unavailable() {
 #[tokio::test]
 async fn test_fts_strong_consistency_wal_plus_segment() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -854,9 +855,9 @@ async fn test_fts_strong_consistency_wal_plus_segment() {
 #[tokio::test]
 async fn test_fts_eventual_consistency() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, compactor) =
+    let (base_url, harness, _cache, _dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -928,9 +929,9 @@ async fn test_fts_eventual_consistency() {
 #[tokio::test]
 async fn test_fts_multi_field_sum() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -1018,9 +1019,9 @@ async fn test_fts_multi_field_sum() {
 #[tokio::test]
 async fn test_fts_product_weighted() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -1088,9 +1089,9 @@ async fn test_fts_product_weighted() {
 #[tokio::test]
 async fn test_fts_last_as_prefix() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     // Use stemming=false so we can test exact prefix matching without stemmer interference
     let ns = create_ns_api_fts(
         &client,
@@ -1172,9 +1173,9 @@ async fn test_fts_last_as_prefix() {
 #[tokio::test]
 async fn test_fts_contains_all_tokens_filter() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -1237,9 +1238,9 @@ async fn test_fts_contains_all_tokens_filter() {
 #[tokio::test]
 async fn test_fts_contains_token_sequence_filter() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -1302,9 +1303,9 @@ async fn test_fts_contains_token_sequence_filter() {
 #[tokio::test]
 async fn test_fts_empty_query() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &base_url,
@@ -1352,9 +1353,9 @@ async fn test_fts_empty_query() {
 #[tokio::test]
 async fn test_fts_field_not_configured_error() {
     let config = fts_test_config();
-    let (base_url, harness, _cache, _dir, _compactor) =
+    let (base_url, harness, _cache, _dir, _compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     // Create namespace with FTS only on "content" — NOT on "title"
     let ns = create_ns_api_fts(
         &client,

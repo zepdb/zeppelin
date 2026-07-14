@@ -115,11 +115,12 @@ use crate::cache::{
 };
 use crate::compaction::background::{start_compaction_thread, CompactionThreadOptions};
 use crate::compaction::Compactor;
-use crate::config::{Config, CpuBudget};
+use crate::config::{Config, CpuBudget, SecurityMode};
 use crate::error::{Result as ZeppelinResult, ZeppelinError};
 use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
+use crate::security::{ApiKeyAdapter, SecurityKernel};
 use crate::server::build_router;
 use crate::server::AppState;
 use crate::storage::ZeppelinStore;
@@ -132,9 +133,10 @@ const STORAGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Resolves the optional configuration file path from process context.
 ///
 /// Priority is `ZEPPELIN_CONFIG`, then `./zeppelin.toml` in the current working
-/// directory, then no path so [`Config::load`] uses defaults/environment
-/// overrides. The environment value is returned verbatim, including an empty or
-/// nonexistent path; validation/opening belongs to the loader.
+/// directory, then no path so [`Config::load`] fails closed on the missing
+/// explicit `[security]` contract. The environment value is returned verbatim,
+/// including an empty or nonexistent path; validation/opening belongs to the
+/// loader.
 ///
 /// # Returns
 ///
@@ -149,7 +151,8 @@ const STORAGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// # Examples
 ///
 /// `ZEPPELIN_CONFIG=/etc/zeppelin.toml` wins even when `./zeppelin.toml`
-/// exists. With neither input, the caller receives `None` and loads defaults.
+/// exists. With neither input, the caller receives `None`; loading then fails
+/// the required explicit `[security]` contract.
 pub fn resolve_config_path() -> Option<String> {
     std::env::var("ZEPPELIN_CONFIG").ok().or_else(|| {
         let default = "zeppelin.toml";
@@ -312,6 +315,17 @@ pub async fn build_app(
 
     // Initialize metrics
     crate::metrics::init();
+    for mode in [SecurityMode::Enforced, SecurityMode::OpenUnsafe] {
+        crate::metrics::SECURITY_MODE
+            .with_label_values(&[mode.as_str()])
+            .set(if mode == config.security.mode { 1 } else { 0 });
+    }
+    if config.security.mode == SecurityMode::OpenUnsafe {
+        tracing::warn!(
+            security_mode = config.security.mode.as_str(),
+            "!!! ZEPPELIN SECURITY IS OPEN_UNSAFE: AUTHENTICATION AND AUTHORIZATION ARE DISABLED !!!"
+        );
+    }
 
     let mut storage_available = true;
     match ZeppelinStore::probe_configured_endpoint(&config.storage, STORAGE_STARTUP_TIMEOUT).await {
@@ -529,9 +543,14 @@ pub async fn build_app(
     let trusted_proxies = Arc::from(crate::server::parse_trusted_proxies(
         &config.server.trusted_proxies,
     )?);
+    let security = Arc::new(SecurityKernel::from_config(&config.security)?);
+    let credential_adapter: Arc<dyn crate::security::CredentialAdapter> =
+        Arc::new(ApiKeyAdapter::from_config(&config.security)?);
     let state = AppState {
         store,
         clock,
+        security,
+        credential_adapter,
         namespace_manager,
         namespace_name_prefix: None,
         wal_writer,
@@ -668,12 +687,14 @@ mod tests {
     //! Local-storage startup tests for configuration discovery and thread cleanup.
     //!
     //! The two configuration-path tests mutate process-global environment and
-    //! current-directory state. They are not safe to run concurrently with each
-    //! other; execute this module with `--test-threads=1`. Each test restores the
-    //! previous values for later tests.
+    //! current-directory state. A shared mutex serializes them, and each test
+    //! restores the previous values for later tests.
 
     use super::*;
     use crate::config::StorageBackend;
+    use std::sync::Mutex;
+
+    static PROCESS_CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
     /// Builds a local-backend fixture whose compactor stays idle during a test.
     ///
@@ -688,6 +709,7 @@ mod tests {
     /// with a long compaction interval.
     fn test_config(tmp: &tempfile::TempDir) -> Config {
         let mut config = Config::default();
+        config.security.mode = SecurityMode::OpenUnsafe;
         config.storage.backend = StorageBackend::Local;
         config.storage.bucket = tmp.path().join("storage").to_string_lossy().to_string();
         config.cache.dir = tmp.path().join("cache");
@@ -699,6 +721,7 @@ mod tests {
     /// Gives `ZEPPELIN_CONFIG` priority and restores its prior process value.
     #[test]
     fn test_resolve_config_path_from_env() {
+        let _lock = PROCESS_CONFIG_LOCK.lock().unwrap();
         // Save original value
         let original = std::env::var("ZEPPELIN_CONFIG").ok();
 
@@ -719,6 +742,7 @@ mod tests {
     /// The test restores both process-global inputs before asserting.
     #[test]
     fn test_resolve_config_path_none() {
+        let _lock = PROCESS_CONFIG_LOCK.lock().unwrap();
         // Save original values
         let original_env = std::env::var("ZEPPELIN_CONFIG").ok();
         let original_dir = std::env::current_dir().unwrap();

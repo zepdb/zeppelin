@@ -6,8 +6,8 @@ use common::server::{cleanup_ns, create_ns_api, start_test_server};
 
 #[tokio::test]
 async fn test_dimensions_too_large_rejected() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces"))
@@ -27,8 +27,8 @@ async fn test_dimensions_too_large_rejected() {
 
 #[tokio::test]
 async fn test_dimensions_zero_rejected() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces"))
@@ -46,8 +46,8 @@ async fn test_dimensions_zero_rejected() {
 
 #[tokio::test]
 async fn test_create_namespace_rejects_invalid_fts_field_config() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces"))
@@ -86,8 +86,8 @@ async fn test_create_namespace_rejects_invalid_fts_field_config() {
 
 #[tokio::test]
 async fn test_vector_id_too_long_rejected() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let long_id = "x".repeat(1025);
@@ -112,8 +112,8 @@ async fn test_vector_id_too_long_rejected() {
 
 #[tokio::test]
 async fn test_vector_id_empty_rejected() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let resp = client
@@ -137,8 +137,8 @@ async fn test_vector_id_empty_rejected() {
 
 #[tokio::test]
 async fn test_dimension_mismatch_names_vector_id() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Second vector in the batch has the wrong dimension — the error must
@@ -174,8 +174,8 @@ async fn test_dimension_mismatch_names_vector_id() {
 
 #[tokio::test]
 async fn test_vector_id_at_max_length_accepted() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let max_id = "x".repeat(1024);
@@ -200,8 +200,8 @@ async fn test_vector_id_at_max_length_accepted() {
 /// clusters and returns an empty 200).
 #[tokio::test]
 async fn test_nprobe_zero_rejected() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let resp = client
@@ -240,8 +240,8 @@ async fn test_nprobe_zero_rejected() {
 /// `nprobe: 0` on a namespace that does not exist.
 #[tokio::test]
 async fn test_invalid_request_missing_namespace_is_400_not_404() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces/does-not-exist-xyz/query"))
@@ -269,8 +269,8 @@ async fn test_invalid_request_missing_namespace_is_400_not_404() {
 /// namespace to exist.)
 #[tokio::test]
 async fn test_top_k_zero_rejected_before_namespace() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces/nope-xyz/query"))

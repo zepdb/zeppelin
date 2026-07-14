@@ -14,7 +14,6 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use ulid::Ulid;
 use zeppelin::compaction::gc::reachable_keys;
-use zeppelin::config::Config;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::wal::manifest::{FragmentRef, NamedSnapshot};
@@ -126,8 +125,8 @@ async fn rewrite_history_updated_at(
 
 #[tokio::test]
 async fn clone_as_of_ignores_history_generation_ahead_of_live_manifest() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
         &client,
         &base_url,
@@ -185,8 +184,8 @@ async fn clone_as_of_ignores_history_generation_ahead_of_live_manifest() {
 
 #[tokio::test]
 async fn clone_as_of_timestamp_scans_full_history_under_clock_skew() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
         &client,
         &base_url,
@@ -260,7 +259,7 @@ async fn clone_as_of_timestamp_scans_full_history_under_clock_skew() {
 
 #[tokio::test]
 async fn clone_compacted_generation_is_writable_and_survives_source_delete() {
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.indexing.default_num_centroids = 2;
     config.indexing.default_nprobe = 2;
     config.indexing.max_nprobe = 8;
@@ -268,9 +267,9 @@ async fn clone_compacted_generation_is_writable_and_survives_source_delete() {
     config.indexing.bitmap_index = false;
     config.indexing.fts_index = false;
 
-    let (base_url, harness, _cache, _cache_dir, compactor) =
+    let (base_url, harness, _cache, _cache_dir, compactor, admin_bearer) =
         start_test_server_with_compactor(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
         &client,
         &base_url,
@@ -379,8 +378,8 @@ async fn clone_compacted_generation_is_writable_and_survives_source_delete() {
 
 #[tokio::test]
 async fn clone_target_exists_returns_409() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
         &client,
         &base_url,
@@ -414,8 +413,8 @@ async fn clone_target_exists_returns_409() {
 
 #[tokio::test]
 async fn clone_pruned_generation_returns_410_without_creating_target() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
         &client,
         &base_url,
@@ -452,8 +451,9 @@ async fn clone_pruned_generation_returns_410_without_creating_target() {
 async fn clone_copy_failure_cleans_target_and_allows_retry() {
     let harness = common::harness::TestHarness::new().await;
     let (failing_store, failures) = fail_copy_once_matching(&harness.store, "/wal/");
-    let (base_url, _cache, _cache_dir) = start_test_server_on_store(failing_store, None).await;
-    let client = reqwest::Client::new();
+    let (base_url, _cache, _cache_dir, admin_bearer) =
+        start_test_server_on_store(failing_store, None).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
         &client,
         &base_url,
@@ -522,8 +522,8 @@ async fn clone_copy_failure_cleans_target_and_allows_retry() {
 
 #[tokio::test]
 async fn clone_copy_collision_surfaces_storage_error_and_cleans_target() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
         &client,
         &base_url,
@@ -591,8 +591,9 @@ async fn clone_copy_collision_surfaces_storage_error_and_cleans_target() {
 async fn clone_holds_internal_source_pin_while_copying() {
     let harness = common::harness::TestHarness::new().await;
     let (asserting_store, snapshot_observer) = assert_snapshot_on_copy(&harness.store);
-    let (base_url, _cache, _cache_dir) = start_test_server_on_store(asserting_store, None).await;
-    let client = reqwest::Client::new();
+    let (base_url, _cache, _cache_dir, admin_bearer) =
+        start_test_server_on_store(asserting_store, None).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
         &client,
         &base_url,

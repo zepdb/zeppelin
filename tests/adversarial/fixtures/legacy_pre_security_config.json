@@ -1,0 +1,122 @@
+{
+  "chaos_plan": null,
+  "config": {
+    "cache": {
+      "dir": "/var/cache/zeppelin",
+      "hydration_enabled": false,
+      "hydration_heat_queries": 3,
+      "hydration_heat_window_secs": 60,
+      "hydration_max_segment_fraction": 0.5,
+      "hydration_parallelism": 4,
+      "hydration_policy": "session_window",
+      "manifest_cache_ttl_ms": 0,
+      "max_size_gb": 50,
+      "memory_cache_max_mb": 256,
+      "namespace_registry_ttl_ms": 0
+    },
+    "compaction": {
+      "interval_secs": 30,
+      "lease_duration_secs": 300,
+      "max_old_segments": 10,
+      "max_pending_deletes": 1000,
+      "max_wal_age_before_compact_secs": 300,
+      "max_wal_bytes_before_compact": 67108864,
+      "max_wal_fragments_before_compact": 2,
+      "retrain_imbalance_threshold": 5.0
+    },
+    "gc": {
+      "allow_unsafe_short_horizon": true,
+      "compaction_upload_window_secs": 300,
+      "horizon_secs": 0,
+      "manifest_history_keep_count": 8,
+      "pitr_retention_secs": 0,
+      "skew_slop_secs": 0
+    },
+    "indexing": {
+      "balance_max_ratio": 4.0,
+      "balance_repair_rounds": 8,
+      "bitmap_index": true,
+      "bm25_max_full_scan_clusters": 500,
+      "bm25_max_full_scan_vectors": 100000,
+      "default_nprobe": 4,
+      "default_num_centroids": 4,
+      "default_probe_fraction": 0.1875,
+      "fts_index": false,
+      "hierarchical": false,
+      "kmeans_convergence_epsilon": 0.0001,
+      "kmeans_max_iterations": 25,
+      "leaf_size": null,
+      "max_nprobe": 64,
+      "max_num_centroids": 4096,
+      "oversample_factor": 3,
+      "pq_m": 8,
+      "quantization": "scalar",
+      "target_rows_per_cluster": 3000
+    },
+    "logging": {
+      "format": "json",
+      "level": "info"
+    },
+    "query": {
+      "cost_latency_profile": null,
+      "rerank_coalesce_gap_bytes": 1048576
+    },
+    "server": {
+      "default_top_k": 10,
+      "host": "0.0.0.0",
+      "max_batch_size": 50000,
+      "max_concurrent_queries": 64,
+      "max_dimensions": 65536,
+      "max_query_batch_size": 256,
+      "max_request_body_mb": 512,
+      "max_top_k": 10000,
+      "max_vector_id_length": 1024,
+      "port": 8080,
+      "rate_limit_burst": 1000000,
+      "rate_limit_idle_ttl_secs": 600,
+      "rate_limit_rps": 1000000,
+      "request_timeout_secs": 30,
+      "shutdown_timeout_secs": 30,
+      "trusted_proxies": [],
+      "write_rate_limit_burst": 1000000,
+      "write_rate_limit_rps": 1000000
+    },
+    "storage": {
+      "backend": "s3",
+      "bucket": "zeppelin",
+      "fail_fast": true,
+      "s3_access_key_id": null,
+      "s3_allow_http": false,
+      "s3_endpoint": null,
+      "s3_region": null,
+      "s3_secret_access_key": null
+    },
+    "wal": {}
+  },
+  "fault_contracts": [],
+  "fault_plan": null,
+  "fault_schedule": null,
+  "mode": "deterministic",
+  "namespace_specs": {
+    "legacy-prefix-adv-83-0": {
+      "bitmap": false,
+      "dims": 8,
+      "fts_fields": [],
+      "metric": "cosine",
+      "num_centroids": 4,
+      "quantization": "none"
+    },
+    "legacy-prefix-adv-83-1": {
+      "bitmap": true,
+      "dims": 4,
+      "fts_fields": [
+        "body"
+      ],
+      "metric": "cosine",
+      "num_centroids": 4,
+      "quantization": "product"
+    }
+  },
+  "seed": 83,
+  "selftest_probe": null
+}

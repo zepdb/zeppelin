@@ -86,7 +86,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, State};
 use axum::http::{Method, Request};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, MethodRouter};
 use axum::Router;
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -107,6 +107,10 @@ use crate::fts::wal_cache::WalFtsCache;
 use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL};
 use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
+use crate::security::{
+    classify_route, Action, AllowDecision, CredentialAdapter, Decision, NamespaceId, Principal,
+    RequestContext, Resource, RouteClass, SecurityError, SecurityKernel, SnapshotName,
+};
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
 use crate::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
@@ -266,6 +270,10 @@ pub struct AppState {
     pub store: ZeppelinStore,
     /// Shared wall clock for all correctness-sensitive request paths.
     pub clock: Clock,
+    /// Central pure-CPU authorization kernel compiled at startup.
+    pub security: Arc<SecurityKernel>,
+    /// Transport credential boundary; phase 1 installs the named API-key adapter.
+    pub credential_adapter: Arc<dyn CredentialAdapter>,
     /// Domain service for namespace CRUD and authoritative metadata changes.
     pub namespace_manager: Arc<NamespaceManager>,
     /// Optional prefix for server-generated namespace names.
@@ -555,6 +563,167 @@ pub async fn normalize_error_responses(request: Request<axum::body::Body>, next:
         .map(String::from)
         .or(req_id_hdr);
     handlers::render_status_envelope(status, rid)
+}
+
+/// Resolve a credential or explicit anonymous identity before authorization.
+pub async fn authenticate(
+    State(state): State<AppState>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let Some(matched_path) = request.extensions().get::<MatchedPath>() else {
+        return ApiError(SecurityError::UnmappedRoute.into()).into_response();
+    };
+    let Some(class) = classify_route(
+        request.method(),
+        matched_path.as_str(),
+        state.config.security.readyz_public,
+    ) else {
+        return ApiError(SecurityError::UnmappedRoute.into()).into_response();
+    };
+
+    if class == RouteClass::Public {
+        request.extensions_mut().insert(Principal::anonymous());
+        return next.run(request).await;
+    }
+
+    let request_id = match required_security_request_id() {
+        Ok(request_id) => request_id,
+        Err(error) => return ApiError(error.into()).into_response(),
+    };
+    let context = RequestContext::at(request_id, state.clock.now());
+
+    if state.config.security.mode == crate::config::SecurityMode::OpenUnsafe {
+        request.extensions_mut().insert(Principal::anonymous());
+        request.extensions_mut().insert(context);
+        return next.run(request).await;
+    }
+
+    match state
+        .credential_adapter
+        .authenticate(request.headers(), context.now)
+    {
+        Ok(principal) => {
+            request.extensions_mut().insert(principal);
+            request.extensions_mut().insert(context);
+            next.run(request).await
+        }
+        Err(failure) => ApiError(SecurityError::Authentication(failure).into()).into_response(),
+    }
+}
+
+fn required_security_request_id() -> Result<String, SecurityError> {
+    current_request_id().ok_or(SecurityError::MissingRequestContext)
+}
+
+/// Invoke the central route map and kernel before any protected handler.
+pub async fn authorize(
+    State(state): State<AppState>,
+    mut request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let Some(matched_path) = request.extensions().get::<MatchedPath>() else {
+        return ApiError(SecurityError::UnmappedRoute.into()).into_response();
+    };
+    let matched_path = matched_path.as_str().to_string();
+    let Some(class) = classify_route(
+        request.method(),
+        &matched_path,
+        state.config.security.readyz_public,
+    ) else {
+        return ApiError(SecurityError::UnmappedRoute.into()).into_response();
+    };
+    let RouteClass::Protected(action) = class else {
+        return next.run(request).await;
+    };
+    let Some(principal) = request.extensions().get::<Principal>().cloned() else {
+        return ApiError(SecurityError::MissingPrincipal.into()).into_response();
+    };
+    let resource = match route_resource(&matched_path, request.uri().path()) {
+        Ok(resource) => resource,
+        Err(error) => return ApiError(error.into()).into_response(),
+    };
+    let Some(context) = request.extensions().get::<RequestContext>().cloned() else {
+        return ApiError(SecurityError::MissingRequestContext.into()).into_response();
+    };
+
+    let allow = match state
+        .security
+        .authorize(&principal, action, &resource, &context)
+    {
+        Decision::Allow(allow) => allow,
+        Decision::Deny(deny) => {
+            return ApiError(SecurityError::Authorization(deny.reason).into()).into_response();
+        }
+    };
+
+    if action == Action::NamespaceClone {
+        for (required_action, required_resource) in [
+            (Action::NamespaceRead, resource.clone()),
+            (Action::NamespaceCreate, Resource::System),
+        ] {
+            if let Decision::Deny(deny) =
+                state
+                    .security
+                    .authorize(&principal, required_action, &required_resource, &context)
+            {
+                return ApiError(SecurityError::Authorization(deny.reason).into()).into_response();
+            }
+        }
+    }
+
+    request.extensions_mut().insert::<AllowDecision>(allow);
+    next.run(request).await
+}
+
+fn route_resource(matched_path: &str, request_path: &str) -> Result<Resource, SecurityError> {
+    if matched_path == "/v1/config/query" {
+        return Ok(Resource::RuntimeConfig);
+    }
+    if matched_path == "/v1/namespaces" {
+        return Ok(Resource::System);
+    }
+    if !matched_path.starts_with("/v1/namespaces/:ns") {
+        return Ok(Resource::System);
+    }
+
+    let segments: Vec<_> = request_path.trim_matches('/').split('/').collect();
+    let namespace = segments
+        .get(2)
+        .ok_or(SecurityError::InvalidNamespaceId)
+        .and_then(|namespace| NamespaceId::new((*namespace).to_string()))?;
+    if matched_path == "/v1/namespaces/:ns/snapshots/:name" {
+        let snapshot = segments
+            .get(4)
+            .ok_or(SecurityError::InvalidSnapshotName)
+            .and_then(|name| SnapshotName::new((*name).to_string()))?;
+        Ok(Resource::Snapshot(namespace, snapshot))
+    } else {
+        Ok(Resource::Namespace(namespace))
+    }
+}
+
+/// Authorize a body-derived namespace target before any domain or storage I/O.
+///
+/// Create and clone targets live in JSON rather than the matched URL, so route
+/// middleware can prove the action grant but cannot apply the namespace scope.
+/// Their handlers call this same central kernel immediately after extraction
+/// and before touching the namespace manager or object store.
+pub(crate) fn authorize_namespace_action(
+    state: &AppState,
+    principal: &Principal,
+    context: &RequestContext,
+    action: Action,
+    namespace: &str,
+) -> Result<AllowDecision, SecurityError> {
+    let resource = Resource::Namespace(NamespaceId::new(namespace.to_string())?);
+    match state
+        .security
+        .authorize(principal, action, &resource, context)
+    {
+        Decision::Allow(allow) => Ok(allow),
+        Decision::Deny(deny) => Err(SecurityError::Authorization(deny.reason)),
+    }
 }
 
 /// Rejects a declared oversized request while continuing to drain its body.
@@ -1198,6 +1367,24 @@ fn evict_idle_rate_limiters(
     rate_limiters.retain(|_, bucket| now.duration_since(bucket.last_seen) < idle_ttl);
 }
 
+/// Apply authentication and central authorization only to registered methods.
+///
+/// `MethodRouter::route_layer` deliberately leaves Axum's method-not-allowed
+/// fallback unwrapped. That preserves canonical 405 responses while ensuring
+/// every actual handler, including Axum's implicit HEAD dispatch for GET, runs
+/// through the same route map before domain code.
+fn secure_route(methods: MethodRouter<AppState>, state: &AppState) -> MethodRouter<AppState> {
+    methods
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            authorize,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            authenticate,
+        ))
+}
+
 /// Builds the complete Axum service from initialized Zeppelin dependencies.
 ///
 /// Query routes and all other routes are composed separately, then merged.
@@ -1211,11 +1398,13 @@ fn evict_idle_rate_limiters(
 /// ```text
 /// query:
 /// normalize -> query ID -> body limits -> timeout -> rate limit
-///           -> HTTP metrics -> concurrency permit -> query handler
+///           -> HTTP metrics -> authn -> authz -> concurrency permit
+///           -> query handler
 ///
 /// other:
 /// normalize -> request ID -> TraceLayer -> body limits -> timeout
-///           -> rate limit -> HTTP metrics -> endpoint handler
+///           -> rate limit -> HTTP metrics -> authn -> authz
+///           -> endpoint handler
 /// ```
 ///
 /// # Parameters
@@ -1266,17 +1455,23 @@ pub fn build_router(state: AppState) -> Router {
     let query_routes = Router::new()
         .route(
             "/v1/namespaces/:ns/query",
-            post(query::query_namespace).layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                concurrency_limit,
-            )),
+            secure_route(
+                post(query::query_namespace).layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency_limit,
+                )),
+                &state,
+            ),
         )
         .route(
             "/v1/namespaces/:ns/query/batch",
-            post(query::batch_query_namespace).layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                concurrency_limit,
-            )),
+            secure_route(
+                post(query::batch_query_namespace).layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency_limit,
+                )),
+                &state,
+            ),
         )
         .layer(axum::middleware::from_fn(http_metrics))
         .layer(axum::middleware::from_fn_with_state(
@@ -1295,58 +1490,91 @@ pub fn build_router(state: AppState) -> Router {
     // All other routes: full middleware stack with request tracing.
     #[allow(unused_mut)]
     let mut other_routes = Router::new()
-        .route("/healthz", get(handlers::health_check))
-        .route("/readyz", get(handlers::readiness_check))
-        .route("/metrics", get(handlers::metrics_handler));
+        .route(
+            "/healthz",
+            secure_route(get(handlers::health_check), &state),
+        )
+        .route(
+            "/readyz",
+            secure_route(get(handlers::readiness_check), &state),
+        )
+        .route(
+            "/metrics",
+            secure_route(get(handlers::metrics_handler), &state),
+        );
 
     #[cfg(feature = "profiling")]
     {
-        other_routes = other_routes.route("/debug/pprof/cpu", get(handlers::cpu_profile));
+        other_routes = other_routes.route(
+            "/debug/pprof/cpu",
+            secure_route(get(handlers::cpu_profile), &state),
+        );
     }
 
     other_routes = other_routes
         .route(
             "/v1/config/query",
-            get(config_handler::get_query_config)
-                .patch(config_handler::update_query_config)
-                .put(config_handler::update_query_config),
+            secure_route(
+                get(config_handler::get_query_config)
+                    .patch(config_handler::update_query_config)
+                    .put(config_handler::update_query_config),
+                &state,
+            ),
         )
-        .route("/v1/namespaces", post(namespace::create_namespace))
+        .route(
+            "/v1/namespaces",
+            secure_route(post(namespace::create_namespace), &state),
+        )
         .route(
             "/v1/namespaces/:ns",
-            get(namespace::get_namespace).delete(namespace::delete_namespace),
+            secure_route(
+                get(namespace::get_namespace).delete(namespace::delete_namespace),
+                &state,
+            ),
         )
         .route(
             "/v1/namespaces/:ns/snapshots",
-            get(namespace::list_snapshots),
+            secure_route(get(namespace::list_snapshots), &state),
         )
         .route(
             "/v1/namespaces/:ns/snapshots/:name",
-            get(namespace::get_snapshot)
-                .put(namespace::put_snapshot)
-                .delete(namespace::delete_snapshot),
+            secure_route(
+                get(namespace::get_snapshot)
+                    .put(namespace::put_snapshot)
+                    .delete(namespace::delete_snapshot),
+                &state,
+            ),
         )
-        .route("/v1/namespaces/:ns/clone", post(namespace::clone_namespace))
+        .route(
+            "/v1/namespaces/:ns/clone",
+            secure_route(post(namespace::clone_namespace), &state),
+        )
         .route(
             "/v1/namespaces/:ns/index_config",
-            patch(namespace::patch_index_config),
+            secure_route(patch(namespace::patch_index_config), &state),
         )
         .route(
             "/v1/namespaces/:ns/compact",
-            post(namespace::compact_namespace),
+            secure_route(post(namespace::compact_namespace), &state),
         )
         .route(
             "/v1/namespaces/:ns/compact/status",
-            get(namespace::get_compaction_status),
+            secure_route(get(namespace::get_compaction_status), &state),
         )
         .route(
             "/v1/namespaces/:ns/hydrate",
-            post(namespace::trigger_hydration),
+            secure_route(post(namespace::trigger_hydration), &state),
         )
-        .route("/v1/namespaces/:ns/vectors/get", post(vectors::get_vectors))
+        .route(
+            "/v1/namespaces/:ns/vectors/get",
+            secure_route(post(vectors::get_vectors), &state),
+        )
         .route(
             "/v1/namespaces/:ns/vectors",
-            post(vectors::upsert_vectors).delete(vectors::delete_vectors),
+            secure_route(
+                post(vectors::upsert_vectors).delete(vectors::delete_vectors),
+                &state,
+            ),
         )
         .layer(axum::middleware::from_fn(http_metrics))
         .layer(axum::middleware::from_fn_with_state(
@@ -1422,5 +1650,13 @@ mod tests {
 
         assert!(!buckets.contains_key(&old_key));
         assert!(buckets.contains_key(&fresh_key));
+    }
+
+    #[test]
+    fn security_request_context_never_defaults_a_missing_request_id() {
+        assert!(matches!(
+            required_security_request_id(),
+            Err(SecurityError::MissingRequestContext)
+        ));
     }
 }

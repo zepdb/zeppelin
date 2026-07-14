@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use tokio::net::TcpListener;
-use zeppelin::config::{Config, StorageBackend};
+use zeppelin::config::{Config, SecurityMode, StorageBackend};
 use zeppelin::startup::{build_app, shutdown_background_tasks};
 
 async fn closed_loopback_endpoint() -> String {
@@ -13,6 +13,7 @@ async fn closed_loopback_endpoint() -> String {
 
 fn dead_s3_config(endpoint: String, cache_dir: &tempfile::TempDir) -> Config {
     let mut config = Config::default();
+    config.security.mode = SecurityMode::OpenUnsafe;
     config.storage.backend = StorageBackend::S3;
     config.storage.bucket = "zeppelin-task18-dead-endpoint".to_string();
     config.storage.s3_region = Some("us-east-1".to_string());
@@ -27,6 +28,7 @@ fn dead_s3_config(endpoint: String, cache_dir: &tempfile::TempDir) -> Config {
 
 fn local_config(storage_dir: &tempfile::TempDir, cache_dir: &tempfile::TempDir) -> Config {
     let mut config = Config::default();
+    config.security.mode = SecurityMode::OpenUnsafe;
     config.storage.backend = StorageBackend::Local;
     config.storage.bucket = storage_dir
         .path()

@@ -30,6 +30,9 @@ pub fn build(contract: &ContractSpec, env_repeats: usize) -> ScenarioSpec {
         env_repeats > 0,
         "performance-contract repeats must be greater than zero"
     );
+    if let Some(security) = &contract.assertions.security {
+        assert_security_baseline_shape(contract, &security.baseline_scenario);
+    }
 
     let measure = measure_op(&contract.run.measure);
     let setup = setup_plan(&contract.scenario, &measure);
@@ -106,7 +109,34 @@ pub fn build(contract: &ContractSpec, env_repeats: usize) -> ScenarioSpec {
         cache_state,
         measure,
         repeats,
+        security_assertion: contract.assertions.security.clone(),
     }
+}
+
+fn assert_security_baseline_shape(contract: &ContractSpec, baseline_name: &str) {
+    let baseline = super::contract::load_contract(baseline_name).unwrap_or_else(|error| {
+        panic!("failed to load secured performance baseline {baseline_name:?}: {error}")
+    });
+    assert_eq!(
+        contract.dataset, baseline.dataset,
+        "secured scenario must preserve its baseline dataset"
+    );
+    assert_eq!(
+        contract.ns_config, baseline.ns_config,
+        "secured scenario must preserve its baseline namespace config"
+    );
+    assert_eq!(
+        contract.server_config, baseline.server_config,
+        "secured scenario must preserve its baseline server config"
+    );
+    assert_eq!(
+        contract.run.cache_state, baseline.run.cache_state,
+        "secured scenario must preserve its baseline cache state"
+    );
+    assert_eq!(
+        contract.run.measure, baseline.run.measure,
+        "secured scenario must preserve its baseline operation"
+    );
 }
 
 /// Build the warm strong-query lifecycle for a standard shape measurement.

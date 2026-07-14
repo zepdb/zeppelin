@@ -43,6 +43,7 @@ const NPROBE_ALL: usize = 4;
 
 struct CountingApiServer {
     base_url: String,
+    admin_bearer: String,
     harness: TestHarness,
     counter: GetCounter,
     compactor: Arc<Compactor>,
@@ -66,6 +67,8 @@ async fn spawn_router(app: Router) -> String {
 
 async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
     zeppelin::metrics::init();
+    let (security, credential_adapter, admin_bearer) =
+        common::server::test_security_runtime(&mut config);
     config.server.rate_limit_rps = 1_000_000;
     config.server.rate_limit_burst = 1_000_000;
     config.server.write_rate_limit_rps = 1_000_000;
@@ -103,6 +106,8 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
     let app = build_router(AppState {
         store: store.clone(),
         clock: zeppelin::time::Clock::system(),
+        security,
+        credential_adapter,
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::new(store.clone())),
@@ -128,6 +133,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
 
     CountingApiServer {
         base_url,
+        admin_bearer,
         harness,
         counter,
         compactor,
@@ -137,21 +143,22 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
 }
 
 fn api_projection_config(quantization: QuantizationType) -> Config {
-    let mut config = Config::load(None).unwrap();
-    config.compaction = CompactionConfig {
-        max_wal_fragments_before_compact: 1,
+    Config {
+        compaction: CompactionConfig {
+            max_wal_fragments_before_compact: 1,
+            ..Default::default()
+        },
+        indexing: IndexingConfig {
+            default_num_centroids: NPROBE_ALL,
+            default_nprobe: NPROBE_ALL,
+            max_nprobe: NPROBE_ALL,
+            kmeans_max_iterations: 10,
+            quantization,
+            bitmap_index: false,
+            ..Default::default()
+        },
         ..Default::default()
-    };
-    config.indexing = IndexingConfig {
-        default_num_centroids: NPROBE_ALL,
-        default_nprobe: NPROBE_ALL,
-        max_nprobe: NPROBE_ALL,
-        kmeans_max_iterations: 10,
-        quantization,
-        bitmap_index: false,
-        ..Default::default()
-    };
-    config
+    }
 }
 
 fn api_fts_config() -> Config {
@@ -531,7 +538,7 @@ async fn hierarchical_flat_unfiltered_attrs_are_lazy_but_enrichment_is_identical
 #[tokio::test]
 async fn api_include_attributes_absent_matches_explicit_true_response_bytes() {
     let server = start_counting_api_server(api_projection_config(QuantizationType::None)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &server.base_url,
@@ -573,7 +580,7 @@ async fn api_include_attributes_absent_matches_explicit_true_response_bytes() {
 #[tokio::test]
 async fn api_include_attributes_false_strips_wal_response_attributes() {
     let server = start_counting_api_server(api_projection_config(QuantizationType::None)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &server.base_url,
@@ -620,7 +627,7 @@ async fn api_include_attributes_false_strips_wal_response_attributes() {
 #[tokio::test]
 async fn api_unfiltered_ann_false_skips_final_attrs_fetches() {
     let server = start_counting_api_server(api_projection_config(QuantizationType::None)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &server.base_url,
@@ -661,7 +668,7 @@ async fn api_unfiltered_ann_false_skips_final_attrs_fetches() {
 #[tokio::test]
 async fn api_filtered_ann_false_keeps_filtering_but_strips_attributes() {
     let server = start_counting_api_server(api_projection_config(QuantizationType::Scalar)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &server.base_url,
@@ -727,7 +734,7 @@ async fn api_filtered_ann_false_keeps_filtering_but_strips_attributes() {
 #[tokio::test]
 async fn api_bm25_unfiltered_false_skips_attrs_gets_and_reuses_cluster_id_reads() {
     let server = start_counting_api_server(api_fts_config()).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &server.base_url,
@@ -796,7 +803,7 @@ async fn api_bm25_unfiltered_false_skips_attrs_gets_and_reuses_cluster_id_reads(
 #[tokio::test]
 async fn api_bm25_filtered_wal_false_keeps_filtering_but_strips_attributes() {
     let server = start_counting_api_server(api_fts_config()).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &server.base_url,
@@ -840,7 +847,7 @@ async fn api_bm25_filtered_wal_false_keeps_filtering_but_strips_attributes() {
 #[tokio::test]
 async fn api_bm25_filtered_false_keeps_filtering_but_strips_attributes() {
     let server = start_counting_api_server(api_fts_config()).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let ns = create_ns_api_fts(
         &client,
         &server.base_url,

@@ -51,7 +51,7 @@ pub(crate) async fn execute(case: &IdealCase) -> Option<IdealSample> {
         None,
     )
     .await;
-    let client = Client::new();
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
     let namespace = api_ns(&harness, "ideal-variant-query");
     let vectors = fixture_vectors(spec);
 
@@ -274,7 +274,7 @@ impl CaseSpec {
 }
 
 fn query_config(spec: CaseSpec) -> Config {
-    let mut config = Config::load(None).expect("failed to load variant-query config");
+    let mut config = Config::default();
     config.cache.namespace_registry_ttl_ms = 3_600_000;
     config.cache.manifest_cache_ttl_ms = 3_600_000;
     config.cache.hydration_enabled = false;

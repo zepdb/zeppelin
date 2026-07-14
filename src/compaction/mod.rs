@@ -4106,7 +4106,7 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::*;
-    use crate::config::{Config, GcConfig};
+    use crate::config::{Config, GcConfig, SecurityMode};
     use crate::namespace::manager::{CompactionHealth, NamespaceIndexConfig};
     use crate::time::TimeSource;
     use crate::types::{DistanceMetric, IndexType};
@@ -4239,6 +4239,7 @@ mod tests {
     #[test]
     fn gc_upload_window_drives_horizon_floor_and_compactor_abort_window() {
         let mut config = Config::default();
+        config.security.mode = SecurityMode::OpenUnsafe;
         config.cache.manifest_cache_ttl_ms = 2_500;
         config.server.request_timeout_secs = 30;
         config.gc.compaction_upload_window_secs = 42;

@@ -73,6 +73,7 @@
 
 use crate::error::{Result, ZeppelinError};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -180,6 +181,114 @@ pub struct Config {
     /// Garbage-collection safety horizons, history retention, and unsafe override.
     #[serde(default)]
     pub gc: GcConfig,
+    /// Authentication mode, bootstrap API keys, and security refresh settings.
+    pub security: SecurityConfig,
+}
+
+impl FromStr for Config {
+    type Err = ZeppelinError;
+
+    fn from_str(source: &str) -> Result<Self> {
+        let mut config = Self::parse_explicit_security(source)?;
+        config.resolve_query_config()?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+/// Explicit process security posture selected by the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityMode {
+    /// Require a valid credential and authorization decision on protected routes.
+    Enforced,
+    /// Deliberately permit anonymous access for local development only.
+    OpenUnsafe,
+}
+
+impl SecurityMode {
+    /// Stable configuration and Prometheus label spelling for this mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforced => "enforced",
+            Self::OpenUnsafe => "open_unsafe",
+        }
+    }
+}
+
+/// Boot-time security configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// Required operator-selected security posture.
+    pub mode: SecurityMode,
+    /// Whether readiness is part of the explicit public-route allowlist.
+    #[serde(default)]
+    pub readyz_public: bool,
+    /// Maximum interval between authoritative policy-head refreshes.
+    #[serde(default = "default_security_policy_refresh_secs")]
+    pub policy_refresh_secs: u64,
+    /// Optional signed-license path used by the later entitlement phase.
+    #[serde(default)]
+    pub license_path: String,
+    /// Named bootstrap credentials available before S3 policy is introduced.
+    #[serde(default)]
+    pub api_keys: Vec<ApiKeyConfig>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: SecurityMode::Enforced,
+            readyz_public: false,
+            policy_refresh_secs: default_security_policy_refresh_secs(),
+            license_path: String::new(),
+            api_keys: Vec::new(),
+        }
+    }
+}
+
+/// One named, hashed API key and its phase-1 bootstrap grants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiKeyConfig {
+    /// Stable public key identifier included before the bearer secret.
+    pub key_id: String,
+    /// Human-readable identity used by decisions and audit records.
+    pub name: String,
+    /// Lower- or upper-case hexadecimal SHA-256 digest of the secret.
+    pub sha256_hex: String,
+    /// Exhaustive action names or the `*` wildcard.
+    pub actions: Vec<String>,
+    /// Exact namespace names or the `*` wildcard.
+    pub namespaces: Vec<String>,
+    /// Optional wall-clock credential expiry.
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Returns the policy-head refresh interval used until phase 3 activates it.
+const fn default_security_policy_refresh_secs() -> u64 {
+    5
+}
+
+fn missing_security_section_error() -> ZeppelinError {
+    ZeppelinError::Config(
+        "missing required [security] section; set security.mode to \"enforced\" or \"open_unsafe\""
+            .to_string(),
+    )
+}
+
+fn is_canonical_api_key_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("zpk1_") else {
+        return false;
+    };
+    !suffix.is_empty()
+        && value.len() <= 128
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// Safety and retention controls for deleting unreachable immutable objects.
@@ -472,8 +581,11 @@ mod tests {
     ///
     /// Passing `"[server]\nport = 9000"` exercises file parsing, overrides,
     /// derived-value resolution, and validation rather than bypassing startup.
+    /// The helper appends explicit `open_unsafe` security because these focused
+    /// tests predate authentication and are not testing the mandatory section.
     fn load_toml(contents: &str) -> Result<Config> {
         let file = tempfile::NamedTempFile::new().unwrap();
+        let contents = format!("{contents}\n[security]\nmode = \"open_unsafe\"\n");
         std::fs::write(file.path(), contents).unwrap();
         Config::load(Some(file.path().to_str().unwrap()))
     }
@@ -980,6 +1092,7 @@ mod tests {
     #[test]
     fn gc_horizon_override_accepts_short_horizon_and_warns() {
         let mut config = Config::default();
+        config.security.mode = SecurityMode::OpenUnsafe;
         config.cache.manifest_cache_ttl_ms = 1_000;
         config.server.request_timeout_secs = 30;
         config.gc.compaction_upload_window_secs = 20;
@@ -996,7 +1109,8 @@ mod tests {
     /// Protects the invariant that compiled GC defaults satisfy their own safety floor.
     #[test]
     fn default_gc_horizon_passes_floor() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.security.mode = SecurityMode::OpenUnsafe;
 
         config.validate().unwrap();
         assert!(config.gc.horizon_secs >= config.gc_horizon_floor_secs().unwrap());
@@ -2091,16 +2205,16 @@ impl CpuBudget {
 impl Config {
     /// Loads, resolves, and validates the process configuration before startup.
     ///
-    /// When `path` is present, Serde starts from that TOML document and uses
-    /// each nested struct's defaults for omitted fields. With no path, loading
-    /// starts from [`Config::default`]. Environment variables then replace file
-    /// or default values, derived query choices are resolved, and cross-field
-    /// validation runs last.
+    /// The path must name a TOML document with an explicit `[security]` section
+    /// and `mode`. Each nested struct still supplies defaults for unrelated
+    /// omitted fields. Environment variables then replace file values, derived
+    /// query choices are resolved, and cross-field validation runs last.
     ///
     /// # Parameters
     ///
-    /// - `path`: Optional borrowed UTF-8 path to a TOML file. `None` means use
-    ///   compiled defaults before applying environment overrides.
+    /// - `path`: Optional borrowed UTF-8 path to a TOML file. `None` fails
+    ///   closed because there is no document in which the operator explicitly
+    ///   selected a security mode.
     ///
     /// # Returns
     ///
@@ -2137,20 +2251,38 @@ impl Config {
     /// exceptions with deterministic resource cleanup in Java and explicit
     /// error forwarding plus cleanup in C.
     pub fn load(path: Option<&str>) -> Result<Self> {
-        let mut config = match path {
-            Some(p) => {
-                let content = std::fs::read_to_string(p).map_err(|e| {
-                    ZeppelinError::Config(format!("failed to read config file {p}: {e}"))
-                })?;
-                toml::from_str(&content)
-                    .map_err(|e| ZeppelinError::Config(format!("failed to parse config: {e}")))?
-            }
-            None => Config::default(),
+        let Some(path) = path else {
+            return Err(missing_security_section_error());
         };
+        let content = std::fs::read_to_string(path).map_err(|error| {
+            ZeppelinError::Config(format!("failed to read config file {path}: {error}"))
+        })?;
+        let mut config = Self::parse_explicit_security(&content)?;
         config.apply_env_overrides()?;
         config.resolve_query_config()?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Parse one TOML document after proving the explicit security contract.
+    fn parse_explicit_security(source: &str) -> Result<Self> {
+        let document: toml::Value = toml::from_str(source)
+            .map_err(|error| ZeppelinError::Config(format!("failed to parse config: {error}")))?;
+        let Some(security) = document.get("security") else {
+            return Err(missing_security_section_error());
+        };
+        if security
+            .as_table()
+            .is_some_and(|table| !table.contains_key("mode"))
+        {
+            return Err(ZeppelinError::Config(
+                "missing required security.mode in [security]; set it to \"enforced\" or \"open_unsafe\""
+                    .to_string(),
+            ));
+        }
+
+        toml::from_str(source)
+            .map_err(|error| ZeppelinError::Config(format!("failed to parse config: {error}")))
     }
 
     /// Validates all independent boot-time invariants and reports them together.
@@ -2197,6 +2329,80 @@ impl Config {
     /// diagnostic.
     pub fn validate(&self) -> Result<()> {
         let mut violations = Vec::new();
+
+        if self.security.mode == SecurityMode::Enforced && self.security.api_keys.is_empty() {
+            violations.push(
+                "security.api_keys must contain at least one usable key when security.mode is enforced"
+                    .to_string(),
+            );
+        } else if self.security.mode == SecurityMode::Enforced
+            && self.security.api_keys.iter().all(|key| {
+                key.expires_at
+                    .is_some_and(|expires_at| expires_at <= chrono::Utc::now())
+            })
+        {
+            violations.push(
+                "security.api_keys must contain at least one unexpired key when security.mode is enforced"
+                    .to_string(),
+            );
+        }
+        if self.security.policy_refresh_secs == 0 {
+            violations.push("security.policy_refresh_secs must be greater than zero".to_string());
+        }
+        let mut key_ids = HashSet::new();
+        for (index, key) in self.security.api_keys.iter().enumerate() {
+            if !is_canonical_api_key_id(&key.key_id) {
+                violations.push(format!(
+                    "security.api_keys[{index}].key_id must start with \"zpk1_\", contain a nonempty alphanumeric, '-' or '_' suffix, and be at most 128 characters"
+                ));
+            }
+            if !key_ids.insert(key.key_id.as_str()) {
+                violations.push(format!(
+                    "security.api_keys contains duplicate key_id {:?}",
+                    key.key_id
+                ));
+            }
+            if key.name.trim().is_empty() {
+                violations.push(format!(
+                    "security.api_keys[{index}].name must not be empty or whitespace"
+                ));
+            }
+            if key.sha256_hex.len() != 64
+                || !key.sha256_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                violations.push(format!(
+                    "security.api_keys[{index}].sha256_hex must contain exactly 64 hexadecimal characters"
+                ));
+            }
+            if key.actions.is_empty() {
+                violations.push(format!(
+                    "security.api_keys[{index}].actions must contain at least one Action name or \"*\""
+                ));
+            } else {
+                for action in &key.actions {
+                    if action != "*" && crate::security::Action::from_str(action).is_err() {
+                        violations.push(format!(
+                            "security.api_keys[{index}].actions contains unknown action {action:?}"
+                        ));
+                    }
+                }
+            }
+            if key.namespaces.is_empty() {
+                violations.push(format!(
+                    "security.api_keys[{index}].namespaces must contain at least one namespace name or \"*\""
+                ));
+            } else {
+                for namespace in &key.namespaces {
+                    if namespace != "*"
+                        && crate::security::NamespaceId::new(namespace.clone()).is_err()
+                    {
+                        violations.push(format!(
+                            "security.api_keys[{index}].namespaces contains invalid namespace {namespace:?}"
+                        ));
+                    }
+                }
+            }
+        }
 
         if self.server.port == 0 {
             violations.push("server.port must be greater than zero".to_string());

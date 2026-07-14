@@ -134,7 +134,7 @@
 //! garbage-collected references; C would require an explicit ownership
 //! protocol. Rust checks those lifetimes at compile time.
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use futures::{StreamExt, TryStreamExt};
@@ -153,6 +153,7 @@ use crate::namespace::manager::{
     CreateNamespaceOutcome, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
     COMPACTION_DEGRADED_FAILURE_THRESHOLD,
 };
+use crate::security::{Action, AllowDecision, Principal, RequestContext};
 use crate::server::AppState;
 use crate::types::{DistanceMetric, IndexType};
 use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
@@ -703,9 +704,10 @@ impl NamespaceResponse {
 /// PUT `.../snapshots/before-migration` at generation 12 creates a pin. A
 /// repeated PUT at generation 12 returns the same timestamp. If an upsert has
 /// advanced the live manifest to 13, the same PUT returns 409.
-#[instrument(skip(state), fields(namespace = %ns, snapshot = %name))]
+#[instrument(skip(state, _decision), fields(namespace = %ns, snapshot = %name))]
 pub async fn put_snapshot(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path((ns, name)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<SnapshotResponse>), ApiError> {
     state
@@ -768,9 +770,10 @@ pub async fn put_snapshot(
 ///
 /// Pins named `weekly` and `daily` are returned as `daily`, then `weekly`,
 /// regardless of S3 listing order.
-#[instrument(skip(state), fields(namespace = %ns))]
+#[instrument(skip(state, _decision), fields(namespace = %ns))]
 pub async fn list_snapshots(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<Json<ListSnapshotsResponse>, ApiError> {
     state
@@ -813,9 +816,10 @@ pub async fn list_snapshots(
 ///
 /// GET `.../snapshots/daily` returns the generation protected by `daily`.
 /// GET of a valid but unknown name returns `SNAPSHOT_NOT_FOUND` with HTTP 404.
-#[instrument(skip(state), fields(namespace = %ns, snapshot = %name))]
+#[instrument(skip(state, _decision), fields(namespace = %ns, snapshot = %name))]
 pub async fn get_snapshot(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path((ns, name)): Path<(String, String)>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
     state
@@ -874,9 +878,10 @@ pub async fn get_snapshot(
 ///
 /// Removing `before-migration` returns 204. A later GET returns 404, while the
 /// previously pinned generation can remain readable until retention pruning.
-#[instrument(skip(state), fields(namespace = %ns, snapshot = %name))]
+#[instrument(skip(state, _decision), fields(namespace = %ns, snapshot = %name))]
 pub async fn delete_snapshot(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path((ns, name)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     state
@@ -999,9 +1004,12 @@ impl CompactNamespaceResponse {
 /// persisted metadata from borrowing request memory. The `match` on
 /// [`CreateNamespaceOutcome`] is exhaustive: adding a new domain outcome forces
 /// this handler to decide its HTTP meaning at compile time.
-#[instrument(skip(state), fields(dimensions = req.dimensions))]
+#[instrument(skip(state, _decision, principal, context), fields(dimensions = req.dimensions))]
 pub async fn create_namespace(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
+    Extension(principal): Extension<Principal>,
+    Extension(context): Extension<RequestContext>,
     Json(req): Json<CreateNamespaceRequest>,
 ) -> Result<(StatusCode, Json<CreateNamespaceResponse>), ApiError> {
     if req.dimensions == 0 || req.dimensions > state.config.server.max_dimensions {
@@ -1018,6 +1026,15 @@ pub async fn create_namespace(
     .map_err(ApiError::from)?;
 
     if let Some(name) = req.name {
+        crate::server::authorize_namespace_action(
+            &state,
+            &principal,
+            &context,
+            Action::NamespaceCreate,
+            &name,
+        )
+        .map_err(ZeppelinError::from)
+        .map_err(ApiError::from)?;
         info!(namespace = %name, dimensions = req.dimensions, "creating namespace by client name");
         let outcome = state
             .namespace_manager
@@ -1056,6 +1073,15 @@ pub async fn create_namespace(
     }
 
     let name = generated_namespace_name(state.namespace_name_prefix.as_deref());
+    crate::server::authorize_namespace_action(
+        &state,
+        &principal,
+        &context,
+        Action::NamespaceCreate,
+        &name,
+    )
+    .map_err(ZeppelinError::from)
+    .map_err(ApiError::from)?;
     info!(namespace = %name, dimensions = req.dimensions, "creating generated namespace");
     let meta = state
         .namespace_manager
@@ -1159,9 +1185,12 @@ pub async fn create_namespace(
 /// path must explicitly release the temporary pin. Java would commonly encode
 /// this with `try/finally`; C would use cleanup labels. Rust has RAII for local
 /// memory, but remote S3 objects still require explicit asynchronous cleanup.
-#[instrument(skip(state, req), fields(source = %source))]
+#[instrument(skip(state, _decision, principal, context, req), fields(source = %source))]
 pub async fn clone_namespace(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
+    Extension(principal): Extension<Principal>,
+    Extension(context): Extension<RequestContext>,
     Path(source): Path<String>,
     Json(req): Json<CloneNamespaceRequest>,
 ) -> Result<(StatusCode, Json<CloneNamespaceResponse>), ApiError> {
@@ -1172,6 +1201,15 @@ pub async fn clone_namespace(
             "clone target must differ from source namespace".into(),
         )));
     }
+    crate::server::authorize_namespace_action(
+        &state,
+        &principal,
+        &context,
+        Action::NamespaceCreate,
+        &target,
+    )
+    .map_err(ZeppelinError::from)
+    .map_err(ApiError::from)?;
 
     let source_meta = state
         .namespace_manager
@@ -1803,9 +1841,10 @@ pub async fn list_namespaces(
 /// After an upsert publishes one seven-vector WAL fragment, GET reports seven
 /// vectors and one uncompacted fragment. During deletion it may briefly report
 /// `deleting` with zero counts; after tombstone removal the same GET returns 404.
-#[instrument(skip(state), fields(namespace = %ns))]
+#[instrument(skip(state, _decision), fields(namespace = %ns))]
 pub async fn get_namespace(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<Json<NamespaceResponse>, ApiError> {
     let meta = state
@@ -1874,9 +1913,10 @@ pub async fn get_namespace(
 /// A manifest with two fragments returns `ready = false`. After a successful
 /// compaction publishes a segment and removes both references, a later poll
 /// returns a newer generation with `ready = true`.
-#[instrument(skip(state), fields(namespace = %ns))]
+#[instrument(skip(state, _decision), fields(namespace = %ns))]
 pub async fn get_compaction_status(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<Json<CompactionStatusResponse>, ApiError> {
     state
@@ -1971,9 +2011,10 @@ pub async fn get_compaction_status(
 /// namespace string, FTS map, and lease move into the task. Java relies on heap
 /// reachability for similar callbacks; C requires explicit reference counting
 /// and cleanup. Rust verifies the task cannot retain borrowed request locals.
-#[instrument(skip(state), fields(namespace = %ns))]
+#[instrument(skip(state, _decision), fields(namespace = %ns))]
 pub async fn compact_namespace(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<(StatusCode, Json<CompactNamespaceResponse>), ApiError> {
     let meta = state
@@ -2105,9 +2146,10 @@ pub async fn compact_namespace(
 /// PATCH `{"nlist":256}` returns 202 immediately. The active segment keeps its
 /// old cluster count until a later compaction publishes a replacement built
 /// with 256 centroids.
-#[instrument(skip(state), fields(namespace = %ns))]
+#[instrument(skip(state, _decision), fields(namespace = %ns))]
 pub async fn patch_index_config(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
     Json(req): Json<PatchNamespaceIndexConfigRequest>,
 ) -> Result<(StatusCode, Json<UpdateIndexConfigResponse>), ApiError> {
@@ -2218,9 +2260,10 @@ pub async fn patch_index_config(
 /// borrowed stack pointer to become invalid. Remote cleanup is not covered by
 /// Rust RAII, so the tombstone is the durable equivalent of a resumable cleanup
 /// record after process cancellation or crash.
-#[instrument(skip(state), fields(namespace = %ns))]
+#[instrument(skip(state, _decision), fields(namespace = %ns))]
 pub async fn delete_namespace(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<(StatusCode, Json<DeleteNamespaceResponse>), ApiError> {
     info!(namespace = %ns, "deleting namespace");
@@ -2324,9 +2367,10 @@ pub async fn delete_namespace(
 /// POST `/hydrate` after compaction returns 202 with `segment_id = "s42"` in
 /// well under the time needed to download that segment. A later query can hit
 /// disk cache after the worker completes. An empty namespace returns 400.
-#[instrument(skip(state), fields(namespace = %ns))]
+#[instrument(skip(state, _decision), fields(namespace = %ns))]
 pub async fn trigger_hydration(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<(StatusCode, Json<HydrateNamespaceResponse>), ApiError> {
     let hydrator = state

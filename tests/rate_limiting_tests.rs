@@ -57,9 +57,9 @@ async fn trusted_proxy_xff_clients_have_independent_write_buckets() {
     config.server.rate_limit_rps = 1_000;
     config.server.rate_limit_burst = 1_000;
 
-    let (base_url, harness, _cache, _dir) =
+    let (base_url, harness, _cache, _dir, admin_bearer) =
         start_test_server_with_config_no_limit_override(Some(config)).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let first = client
         .post(format!("{base_url}/v1/namespaces"))
@@ -93,9 +93,9 @@ async fn trusted_proxy_xff_clients_have_independent_write_buckets() {
 
 #[tokio::test]
 async fn production_default_write_burst_allows_bulk_shape() {
-    let (base_url, harness, _cache, _dir) =
+    let (base_url, harness, _cache, _dir, admin_bearer) =
         start_test_server_with_config_no_limit_override(Some(Config::default())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     for _ in 0..30 {
         let resp = client
@@ -112,9 +112,9 @@ async fn production_default_write_burst_allows_bulk_shape() {
 
 #[tokio::test]
 async fn production_default_read_limit_returns_json_429() {
-    let (base_url, harness, _cache, _dir) =
+    let (base_url, harness, _cache, _dir, admin_bearer) =
         start_test_server_with_config_no_limit_override(Some(Config::default())).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let queries: Vec<_> = (0..201)
         .map(|_| json!({"vector": [0.0, 0.0, 0.0, 0.0], "top_k": 1}))
         .collect();

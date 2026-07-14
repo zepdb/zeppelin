@@ -12,6 +12,7 @@ pub mod profiles;
 pub mod report;
 pub mod scenario;
 pub mod scenarios;
+mod security;
 
 use std::path::PathBuf;
 
@@ -43,8 +44,11 @@ pub const PHASE2_SCENARIOS: [&str; 14] = [
     "hydration",
 ];
 
+/// Security Phase-1 scenarios measured and frozen after central auth lands.
+pub const SECURITY_PHASE1_SCENARIOS: [&str; 1] = ["secured_query"];
+
 /// Complete Tier-1 catalog run by default and in gating CI.
-pub const ALL_SCENARIOS: [&str; 18] = [
+pub const ALL_SCENARIOS: [&str; 19] = [
     "warm_query_strong",
     "cold_query_strong",
     "upsert_single",
@@ -63,6 +67,7 @@ pub const ALL_SCENARIOS: [&str; 18] = [
     "gc_cycle",
     "hydration",
     "cold_query_sketch_adc",
+    "secured_query",
 ];
 
 /// Process-level runner configuration parsed from `ZEPPELIN_PERF_*`.
@@ -202,7 +207,12 @@ mod tests {
         let phase2_start = PHASE1_SCENARIOS.len();
         let phase2_end = phase2_start + PHASE2_SCENARIOS.len();
         assert_eq!(&ALL_SCENARIOS[phase2_start..phase2_end], &PHASE2_SCENARIOS);
-        assert_eq!(&ALL_SCENARIOS[phase2_end..], &["cold_query_sketch_adc"]);
+        assert_eq!(ALL_SCENARIOS[phase2_end], "cold_query_sketch_adc");
+        assert_eq!(&ALL_SCENARIOS[phase2_end + 1..], &SECURITY_PHASE1_SCENARIOS);
+        assert!(
+            ALL_SCENARIOS.contains(&"secured_query"),
+            "the Phase 1 security gate requires a frozen secured_query scenario"
+        );
     }
 
     #[test]
@@ -213,5 +223,19 @@ mod tests {
             "performance contracts require ZEPPELIN_MAX_CLUSTERS_PER_OBJECT \
              to be unset, got \"4\""
         );
+    }
+
+    #[test]
+    fn secured_query_contract_freezes_phase1_security_budget() {
+        let contract = contract::load_contract("secured_query")
+            .expect("secured_query must have a valid checked-in contract");
+        let security = contract
+            .assertions
+            .security
+            .expect("secured_query must freeze security assertions");
+        assert_eq!(security.baseline_scenario, "warm_query_strong");
+        assert_eq!(security.authn_authz_p50_delta_ns_max, 10_000);
+        assert_eq!(security.added_get_ops, 0);
+        assert_eq!(security.added_put_ops, 0);
     }
 }

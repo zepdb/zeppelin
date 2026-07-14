@@ -42,10 +42,11 @@
 //! would pass shared object references; C would need explicit reference
 //! counting and response ownership.
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::Json;
 
 use crate::runtime_config::{QueryKnobs, QueryKnobsPatch};
+use crate::security::AllowDecision;
 use crate::server::AppState;
 
 use super::ApiError;
@@ -80,7 +81,10 @@ use super::ApiError;
 /// If the current defaults are `top_k = 10` and the nprobe floor is 32, GET
 /// returns both values even while an older in-flight query retains a previous
 /// snapshot. Flat segments may resolve an omitted nprobe above that floor.
-pub async fn get_query_config(State(state): State<AppState>) -> Json<QueryKnobs> {
+pub async fn get_query_config(
+    State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
+) -> Json<QueryKnobs> {
     Json(state.runtime_query_config.snapshot().as_ref().clone())
 }
 
@@ -135,6 +139,7 @@ pub async fn get_query_config(State(state): State<AppState>) -> Json<QueryKnobs>
 /// HTTP boundary as [`ApiError`] while successful control flow stays linear.
 pub async fn update_query_config(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Json(patch): Json<QueryKnobsPatch>,
 ) -> Result<Json<QueryKnobs>, ApiError> {
     let updated = state

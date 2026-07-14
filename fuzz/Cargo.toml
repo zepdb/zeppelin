@@ -57,3 +57,8 @@ doc = false
 name = "fuzz_tree_node"
 path = "fuzz_targets/fuzz_tree_node.rs"
 doc = false
+
+[[bin]]
+name = "bearer_parse"
+path = "fuzz_targets/bearer_parse.rs"
+doc = false

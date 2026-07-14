@@ -10,6 +10,9 @@ servers:
   - url: http://localhost:8080
     description: Local development server
 
+security:
+  - bearerAuth: []
+
 paths:
   /healthz:
     get:
@@ -17,6 +20,7 @@ paths:
       summary: Health check
       description: Returns server health status. Always returns 200 if the process is running.
       tags: [Health]
+      security: []
       responses:
         "200":
           description: Server is healthy
@@ -34,9 +38,18 @@ paths:
     get:
       operationId: readinessCheck
       summary: Readiness check
-      description: Verifies S3 connectivity. Returns 503 if the storage backend is unreachable.
+      description: |
+        Verifies S3 connectivity after authorization. Readiness is protected by default:
+        anonymous requests receive 401 and authenticated principals without `SystemRead`
+        receive 403. Operators may explicitly make only this route public with
+        `[security].readyz_public = true`. An authorized request returns 503 if the
+        storage backend is unreachable.
       tags: [Health]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Server is ready
           content:
@@ -75,8 +88,52 @@ paths:
       description: Returns Prometheus-formatted metrics.
       tags: [Health]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Prometheus metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /debug/pprof/cpu:
+    get:
+      operationId: captureCpuProfile
+      summary: Capture a CPU flamegraph
+      description: |
+        Samples process-wide CPU activity and returns an SVG flamegraph. This
+        route is available only when Zeppelin is built with the `profiling`
+        feature and requires the same `MetricsRead` grant as `/metrics`.
+        `seconds` is clamped to the inclusive range 1–300.
+      tags: [Health]
+      x-zeppelin-feature: profiling
+      parameters:
+        - name: seconds
+          in: query
+          required: false
+          description: Sampling duration in seconds.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 300
+            default: 30
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "200":
+          description: SVG CPU flamegraph
+          content:
+            image/svg+xml:
+              schema:
+                type: string
+                contentMediaType: image/svg+xml
+        "500":
+          description: Profiling setup, rendering, or worker failure
           content:
             text/plain:
               schema:
@@ -92,6 +149,10 @@ paths:
         updates the snapshot.
       tags: [Config]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Current runtime query configuration
           content:
@@ -114,6 +175,10 @@ paths:
             schema:
               $ref: "#/components/schemas/QueryKnobsPatch"
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Updated runtime query configuration
           content:
@@ -141,6 +206,10 @@ paths:
             schema:
               $ref: "#/components/schemas/QueryKnobsPatch"
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Updated runtime query configuration
           content:
@@ -178,6 +247,10 @@ paths:
             schema:
               $ref: "#/components/schemas/CreateNamespaceRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Existing namespace returned for idempotent create-by-name with identical configuration
           content:
@@ -209,6 +282,10 @@ paths:
       description: Returns metadata for a single namespace.
       tags: [Namespaces]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Namespace metadata
           content:
@@ -227,6 +304,10 @@ paths:
         cleanup finishes, the namespace returns 404.
       tags: [Namespaces]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "202":
           description: Namespace deletion accepted
           content:
@@ -249,6 +330,10 @@ paths:
         history snapshot and all artifacts reachable from it.
       tags: [Namespaces]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Named snapshot pins
           content:
@@ -281,6 +366,10 @@ paths:
         `SNAPSHOT_ALREADY_EXISTS`.
       tags: [Namespaces]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "201":
           description: Snapshot pin created or already existed for this generation
           content:
@@ -302,6 +391,10 @@ paths:
       description: Returns one named point-in-time snapshot pin.
       tags: [Namespaces]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Named snapshot pin
           content:
@@ -321,6 +414,10 @@ paths:
         back to the normal count and time-based PITR retention rules.
       tags: [Namespaces]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "204":
           description: Snapshot pin released
         "404":
@@ -349,6 +446,10 @@ paths:
             schema:
               $ref: "#/components/schemas/CloneNamespaceRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "201":
           description: Clone materialized into a fresh namespace
           content:
@@ -388,6 +489,10 @@ paths:
             schema:
               $ref: "#/components/schemas/PatchNamespaceIndexConfigRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "202":
           description: Index config update accepted
           content:
@@ -423,6 +528,10 @@ paths:
         until `uncompacted_fragments` reaches zero.
       tags: [Namespaces]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: No compaction was needed
           content:
@@ -455,6 +564,10 @@ paths:
         results.
       tags: [Namespaces]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Manifest-derived compaction status
           content:
@@ -485,6 +598,10 @@ paths:
         `zeppelin_hydration_required_bytes`.
       tags: [Namespaces]
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "202":
           description: Hydration request accepted
           content:
@@ -523,6 +640,10 @@ paths:
             schema:
               $ref: "#/components/schemas/MessagePackUpsertRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Vectors upserted
           content:
@@ -555,6 +676,10 @@ paths:
             schema:
               $ref: "#/components/schemas/DeleteVectorsRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "204":
           description: Vectors deleted
         "400":
@@ -590,6 +715,10 @@ paths:
             schema:
               $ref: "#/components/schemas/GetVectorsRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Fetched records and explicit missing IDs
           content:
@@ -638,6 +767,10 @@ paths:
             schema:
               $ref: "#/components/schemas/QueryRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Query results
           headers:
@@ -681,6 +814,10 @@ paths:
             schema:
               $ref: "#/components/schemas/BatchQueryRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
         "200":
           description: Positional batch query results
           headers:
@@ -702,6 +839,15 @@ paths:
           $ref: "#/components/responses/NotImplemented"
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Zeppelin API key
+      description: |
+        Named Zeppelin API key in canonical `zpk1_<key-id>.<secret>` form.
+        Send it as `Authorization: Bearer <api-key>`.
+
   parameters:
     NamespacePath:
       name: ns
@@ -712,6 +858,23 @@ components:
       description: Namespace name
 
   responses:
+    UnauthorizedError:
+      description: |
+        Authentication required or the supplied credential is unknown, malformed,
+        or expired (401). The canonical error envelope carries a stable security
+        reason code and never exposes credential material.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ForbiddenError:
+      description: |
+        The authenticated principal is not authorized for the requested action or
+        resource (403). The canonical error envelope carries a stable denial code.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
     ValidationError:
       description: Validation error (400)
       content:
@@ -823,6 +986,13 @@ components:
             never on `error` (human text) or `status` alone. Every code is
             enumerated below and is guaranteed stable across releases.
           enum:
+            - unauthenticated
+            - credential_unknown
+            - credential_expired
+            - forbidden
+            - namespace_not_granted
+            - security_stale
+            - obligation_unsatisfied
             - VALIDATION_ERROR
             - DIMENSION_MISMATCH
             - NAMESPACE_NOT_FOUND

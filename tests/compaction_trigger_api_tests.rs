@@ -30,8 +30,9 @@ async fn get_compaction_status(client: &reqwest::Client, base_url: &str, ns: &st
 
 #[tokio::test]
 async fn test_post_compact_reaches_quiescence_without_query_polling() {
-    let (base_url, harness, _cache, cache_dir) = start_test_server_with_config(None).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, cache_dir, admin_bearer) =
+        start_test_server_with_config(None).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 16).await;
 
     upsert_vectors(&client, &base_url, &ns, 64).await;
@@ -79,8 +80,9 @@ async fn test_post_compact_reaches_quiescence_without_query_polling() {
 
 #[tokio::test]
 async fn test_post_compact_returns_409_when_lease_is_held() {
-    let (base_url, harness, _cache, cache_dir) = start_test_server_with_config(None).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, cache_dir, admin_bearer) =
+        start_test_server_with_config(None).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 16).await;
 
     upsert_vectors(&client, &base_url, &ns, 32).await;
@@ -124,8 +126,9 @@ async fn test_post_compact_returns_409_when_lease_is_held() {
 
 #[tokio::test]
 async fn test_post_compact_empty_namespace_is_noop() {
-    let (base_url, harness, _cache, cache_dir) = start_test_server_with_config(None).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, cache_dir, admin_bearer) =
+        start_test_server_with_config(None).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 16).await;
 
     let before = get_compaction_status(&client, &base_url, &ns).await;

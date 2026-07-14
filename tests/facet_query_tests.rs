@@ -43,8 +43,8 @@ async fn query(client: &reqwest::Client, base_url: &str, ns: &str, body: Value) 
 
 #[tokio::test]
 async fn facets_count_filtered_candidate_frontier_not_top_k() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -149,8 +149,8 @@ async fn facets_count_filtered_candidate_frontier_not_top_k() {
 
 #[tokio::test]
 async fn facets_are_omitted_when_not_requested() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(

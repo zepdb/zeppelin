@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env
     let _ = dotenvy::dotenv();
 
-    // Load config (priority: ZEPPELIN_CONFIG env var > ./zeppelin.toml > defaults)
+    // Load config (priority: ZEPPELIN_CONFIG env var > ./zeppelin.toml; no file fails closed)
     let config = Config::load(resolve_config_path().as_deref())?;
 
     // Initialize logging

@@ -6,18 +6,18 @@ use common::server::{
 };
 use common::vectors::random_vectors;
 
-use zeppelin::config::Config;
 use zeppelin::wal::Manifest;
 
 // --- Test 1: Oversized batch returns 413 without durable side effects ---
 
 #[tokio::test]
 async fn test_oversized_upsert_batch_413_without_wal_refs() {
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.server.max_batch_size = 10;
 
-    let (base_url, harness, _cache, _dir) = start_test_server_with_config(Some(config)).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, _dir, admin_bearer) =
+        start_test_server_with_config(Some(config)).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
     let before = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
 
@@ -56,11 +56,12 @@ async fn test_oversized_upsert_batch_413_without_wal_refs() {
 
 #[tokio::test]
 async fn test_max_sized_upsert_batch_writes_one_bounded_wal_fragment() {
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.server.max_batch_size = 3;
 
-    let (base_url, harness, _cache, _dir) = start_test_server_with_config(Some(config)).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, _dir, admin_bearer) =
+        start_test_server_with_config(Some(config)).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let vectors: Vec<serde_json::Value> = (0..3)
@@ -102,8 +103,8 @@ async fn test_max_sized_upsert_batch_writes_one_bounded_wal_fragment() {
 
 #[tokio::test]
 async fn test_empty_batch_400() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let resp = client
@@ -126,8 +127,8 @@ async fn test_empty_batch_400() {
 
 #[tokio::test]
 async fn test_top_k_too_large_400() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let resp = client
@@ -153,8 +154,8 @@ async fn test_top_k_too_large_400() {
 
 #[tokio::test]
 async fn test_top_k_zero_400() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     let resp = client
@@ -180,9 +181,13 @@ async fn test_top_k_zero_400() {
 
 #[tokio::test]
 async fn test_readyz_endpoint() {
-    let (base_url, harness) = start_test_server().await;
+    let (base_url, harness, admin_bearer) = start_test_server().await;
 
-    let resp = reqwest::get(format!("{base_url}/readyz")).await.unwrap();
+    let resp = crate::common::server::client_with_bearer(&admin_bearer)
+        .get(format!("{base_url}/readyz"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.unwrap();
@@ -195,7 +200,7 @@ async fn test_readyz_endpoint() {
 
 #[tokio::test]
 async fn test_healthz_still_works() {
-    let (base_url, harness) = start_test_server().await;
+    let (base_url, harness, _admin_bearer) = start_test_server().await;
 
     let resp = reqwest::get(format!("{base_url}/healthz")).await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -210,14 +215,18 @@ async fn test_healthz_still_works() {
 
 #[tokio::test]
 async fn test_metrics_endpoint() {
-    let (base_url, harness) = start_test_server().await;
+    let (base_url, harness, admin_bearer) = start_test_server().await;
 
     // Touch a metric to ensure there's output
     zeppelin::metrics::QUERIES_TOTAL
         .with_label_values(&["__test__"])
         .inc();
 
-    let resp = reqwest::get(format!("{base_url}/metrics")).await.unwrap();
+    let resp = crate::common::server::client_with_bearer(&admin_bearer)
+        .get(format!("{base_url}/metrics"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let content_type = resp
@@ -246,8 +255,8 @@ async fn test_metrics_endpoint() {
 
 #[tokio::test]
 async fn test_metrics_increment_after_query() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Upsert vectors
@@ -271,7 +280,11 @@ async fn test_metrics_increment_after_query() {
         .unwrap();
 
     // Check metrics
-    let resp = reqwest::get(format!("{base_url}/metrics")).await.unwrap();
+    let resp = client
+        .get(format!("{base_url}/metrics"))
+        .send()
+        .await
+        .unwrap();
     let body = resp.text().await.unwrap();
     assert!(
         body.contains("zeppelin_queries_total"),
@@ -287,11 +300,12 @@ async fn test_metrics_increment_after_query() {
 
 #[tokio::test]
 async fn test_request_timeout_applied() {
-    let mut config = Config::load(None).unwrap();
+    let mut config = zeppelin::config::Config::default();
     config.server.request_timeout_secs = 30;
 
-    let (base_url, harness, _cache, _dir) = start_test_server_with_config(Some(config)).await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, _cache, _dir, admin_bearer) =
+        start_test_server_with_config(Some(config)).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 4).await;
 
     // Normal query should complete successfully (validates middleware is wired)
@@ -322,9 +336,9 @@ async fn test_request_timeout_applied() {
 
 #[tokio::test]
 async fn test_cache_populated_after_segment_query() {
-    let (base_url, harness, cache, _cache_dir, compactor) =
+    let (base_url, harness, cache, _cache_dir, compactor, admin_bearer) =
         start_test_server_with_compactor(None).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 8).await;
 
     // Upsert vectors

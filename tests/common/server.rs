@@ -3,7 +3,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dashmap::DashMap;
+use rand::{rngs::OsRng, RngCore};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -15,10 +18,11 @@ use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::background::{compaction_loop, CompactionLoopOptions};
 use zeppelin::compaction::Compactor;
-use zeppelin::config::Config;
+use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
 use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
+use zeppelin::security::{ApiKeyAdapter, SecurityKernel};
 use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
@@ -73,6 +77,86 @@ fn configure_test_server_limits(config: &mut Config) {
     config.server.rate_limit_burst = 1_000_000;
     config.server.write_rate_limit_rps = 1_000_000;
     config.server.write_rate_limit_burst = 1_000_000;
+}
+
+const TEST_ADMIN_KEY_ID: &str = "zpk1_test_admin";
+
+/// Build default headers for a test client authenticated as the test admin.
+#[must_use]
+pub fn bearer_headers(bearer: &str) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {bearer}"))
+        .expect("test bearer must be a valid Authorization header value");
+    headers.insert(reqwest::header::AUTHORIZATION, authorization);
+    headers
+}
+
+/// Build a reqwest client that authenticates every request as `bearer`.
+#[must_use]
+pub fn client_with_bearer(bearer: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .default_headers(bearer_headers(bearer))
+        .build()
+        .expect("failed to build authenticated test client")
+}
+
+/// Inject a freshly generated administrator into an enforced test config.
+pub fn test_security_runtime(
+    config: &mut Config,
+) -> (Arc<SecurityKernel>, Arc<ApiKeyAdapter>, String) {
+    test_security_runtime_with_admin_bearer(config, None)
+}
+
+fn test_security_runtime_with_admin_bearer(
+    config: &mut Config,
+    existing_admin_bearer: Option<&str>,
+) -> (Arc<SecurityKernel>, Arc<ApiKeyAdapter>, String) {
+    let secret = match existing_admin_bearer {
+        Some(bearer) => {
+            let secret = bearer
+                .strip_prefix(&format!("{TEST_ADMIN_KEY_ID}."))
+                .expect("reused test admin bearer must use the test admin key id");
+            let decoded = URL_SAFE_NO_PAD
+                .decode(secret)
+                .expect("reused test admin secret must be canonical base64url");
+            assert_eq!(
+                decoded.len(),
+                32,
+                "reused test admin secret must decode to exactly 32 bytes"
+            );
+            secret.to_string()
+        }
+        None => {
+            let mut secret_bytes = [0_u8; 32];
+            OsRng.fill_bytes(&mut secret_bytes);
+            URL_SAFE_NO_PAD.encode(secret_bytes)
+        }
+    };
+    let digest = Sha256::digest(secret.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let admin_bearer = format!("{TEST_ADMIN_KEY_ID}.{secret}");
+
+    if config.security.mode == SecurityMode::Enforced {
+        config
+            .security
+            .api_keys
+            .retain(|key| key.key_id != TEST_ADMIN_KEY_ID);
+        config.security.api_keys.push(ApiKeyConfig {
+            key_id: TEST_ADMIN_KEY_ID.to_string(),
+            name: "test-admin".to_string(),
+            sha256_hex: digest,
+            actions: vec!["*".to_string()],
+            namespaces: vec!["*".to_string()],
+            expires_at: None,
+        });
+    }
+    (
+        Arc::new(SecurityKernel::from_config(&config.security).unwrap()),
+        Arc::new(ApiKeyAdapter::from_config(&config.security).unwrap()),
+        admin_bearer,
+    )
 }
 
 fn runtime_query_state(config: &Config) -> (Arc<RuntimeQueryConfig>, QueryKnobBounds) {
@@ -132,33 +216,54 @@ fn maybe_hydrator(
     ))
 }
 
-/// Start a test server with optional config override, returning (base_url, harness, cache, _cache_dir).
-/// The TempDir must be kept alive for the cache to function.
+/// Start a test server with optional config override.
+///
+/// Returns `(base_url, harness, cache, cache_dir, admin_bearer)`. The TempDir
+/// and bearer must be retained for the lifetime of the server and its client.
 pub async fn start_test_server_with_config(
     config_override: Option<Config>,
-) -> (String, TestHarness, Arc<DiskCache>, tempfile::TempDir) {
+) -> (
+    String,
+    TestHarness,
+    Arc<DiskCache>,
+    tempfile::TempDir,
+    String,
+) {
     start_test_server_with_config_inner(config_override, true).await
 }
 
 /// Start a test server without overriding rate-limit settings.
 pub async fn start_test_server_with_config_no_limit_override(
     config_override: Option<Config>,
-) -> (String, TestHarness, Arc<DiskCache>, tempfile::TempDir) {
+) -> (
+    String,
+    TestHarness,
+    Arc<DiskCache>,
+    tempfile::TempDir,
+    String,
+) {
     start_test_server_with_config_inner(config_override, false).await
 }
 
 async fn start_test_server_with_config_inner(
     config_override: Option<Config>,
     override_rate_limits: bool,
-) -> (String, TestHarness, Arc<DiskCache>, tempfile::TempDir) {
+) -> (
+    String,
+    TestHarness,
+    Arc<DiskCache>,
+    tempfile::TempDir,
+    String,
+) {
     // Ensure metrics are registered (idempotent)
     zeppelin::metrics::init();
 
     let harness = TestHarness::new().await;
-    let mut config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
+    let mut config = config_override.unwrap_or_default();
     if override_rate_limits {
         configure_test_server_limits(&mut config);
     }
+    let (security, credential_adapter, admin_bearer) = test_security_runtime(&mut config);
     let clock = Clock::system();
 
     let cache_dir = tempfile::TempDir::new().unwrap();
@@ -177,6 +282,8 @@ async fn start_test_server_with_config_inner(
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
+        security,
+        credential_adapter,
         namespace_manager: namespace_manager(&config, &harness.store, &clock),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
@@ -211,7 +318,7 @@ async fn start_test_server_with_config_inner(
         .unwrap();
     });
 
-    (base_url, harness, cache, cache_dir)
+    (base_url, harness, cache, cache_dir, admin_bearer)
 }
 
 /// Start a test server on an already-constructed store.
@@ -221,11 +328,12 @@ async fn start_test_server_with_config_inner(
 pub async fn start_test_server_on_store(
     store: ZeppelinStore,
     namespace_name_prefix: Option<String>,
-) -> (String, Arc<DiskCache>, tempfile::TempDir) {
+) -> (String, Arc<DiskCache>, tempfile::TempDir, String) {
     zeppelin::metrics::init();
 
-    let mut config = Config::load(None).unwrap();
+    let mut config = Config::default();
     configure_test_server_limits(&mut config);
+    let (security, credential_adapter, admin_bearer) = test_security_runtime(&mut config);
     let clock = Clock::system();
 
     let cache_dir = tempfile::TempDir::new().unwrap();
@@ -244,6 +352,8 @@ pub async fn start_test_server_on_store(
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
+        security,
+        credential_adapter,
         namespace_manager: namespace_manager(&config, &store, &clock),
         namespace_name_prefix,
         wal_writer: Arc::new(WalWriter::with_clock(store.clone(), clock)),
@@ -278,7 +388,7 @@ pub async fn start_test_server_on_store(
         .unwrap();
     });
 
-    (base_url, cache, cache_dir)
+    (base_url, cache, cache_dir, admin_bearer)
 }
 
 /// Start a test server that also returns the `Arc<Compactor>` for manual compaction triggering.
@@ -291,12 +401,14 @@ pub async fn start_test_server_with_compactor(
     Arc<DiskCache>,
     tempfile::TempDir,
     Arc<Compactor>,
+    String,
 ) {
     zeppelin::metrics::init();
 
     let harness = TestHarness::new().await;
-    let mut config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
+    let mut config = config_override.unwrap_or_default();
     configure_test_server_limits(&mut config);
+    let (security, credential_adapter, admin_bearer) = test_security_runtime(&mut config);
     let clock = Clock::system();
 
     let cache_dir = tempfile::TempDir::new().unwrap();
@@ -317,6 +429,8 @@ pub async fn start_test_server_with_compactor(
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
+        security,
+        credential_adapter,
         namespace_manager: namespace_manager(&config, &harness.store, &clock),
         namespace_name_prefix: None,
         wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
@@ -351,7 +465,7 @@ pub async fn start_test_server_with_compactor(
         .unwrap();
     });
 
-    (base_url, harness, cache, cache_dir, compactor)
+    (base_url, harness, cache, cache_dir, compactor, admin_bearer)
 }
 
 /// Start a test server with the real background compaction loop spawned,
@@ -365,12 +479,14 @@ pub async fn start_test_server_with_compaction(
     Arc<DiskCache>,
     tempfile::TempDir,
     tokio::sync::watch::Sender<bool>,
+    String,
 ) {
     zeppelin::metrics::init();
 
     let harness = TestHarness::new().await;
-    let mut config = config_override.unwrap_or_else(|| Config::load(None).unwrap());
+    let mut config = config_override.unwrap_or_default();
     configure_test_server_limits(&mut config);
+    let (security, credential_adapter, admin_bearer) = test_security_runtime(&mut config);
     let clock = Clock::system();
 
     let cache_dir = tempfile::TempDir::new().unwrap();
@@ -420,6 +536,8 @@ pub async fn start_test_server_with_compaction(
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
+        security,
+        credential_adapter,
         namespace_manager,
         namespace_name_prefix: Some(harness.prefix.clone()),
         wal_writer: Arc::new(WalWriter::with_clock(harness.store.clone(), clock)),
@@ -454,18 +572,35 @@ pub async fn start_test_server_with_compaction(
         .unwrap();
     });
 
-    (base_url, harness, cache, cache_dir, shutdown_tx)
+    (
+        base_url,
+        harness,
+        cache,
+        cache_dir,
+        shutdown_tx,
+        admin_bearer,
+    )
 }
 
-/// Start a test server with default config, returning (base_url, harness).
-pub async fn start_test_server() -> (String, TestHarness) {
-    let (url, harness, _cache, dir) = start_test_server_with_config(None).await;
+/// Start an enforced test server with a freshly generated administrator credential.
+pub async fn start_test_server() -> (String, TestHarness, String) {
+    let (url, harness, _cache, dir, admin_bearer) = start_test_server_with_config(None).await;
     // The DiskCache lives in `dir`. This helper's caller does not receive the
     // TempDir handle, so if we let it drop here the cache directory is deleted
     // out from under the still-running server — every cache write then fails
     // (learnings rule 6: keep TempDir alive for the lifetime of anything using
     // its path). Disarm the auto-delete so the dir survives for the test
     // process; the OS reclaims the temp space afterwards.
+    let _ = dir.keep();
+    (url, harness, admin_bearer)
+}
+
+/// Start the explicit anonymous-access test server variant.
+pub async fn start_test_server_open_unsafe() -> (String, TestHarness) {
+    let mut config = Config::default();
+    config.security.mode = SecurityMode::OpenUnsafe;
+    let (url, harness, _cache, dir, _unused_bearer) =
+        start_test_server_with_config(Some(config)).await;
     let _ = dir.keep();
     (url, harness)
 }
@@ -534,6 +669,7 @@ pub async fn cleanup_ns(store: &ZeppelinStore, ns: &str) {
 
 pub struct FullTestServer {
     pub base_url: String,
+    pub admin_bearer: String,
     pub store: ZeppelinStore,
     pub clock: Clock,
     pub cache: Arc<DiskCache>,
@@ -642,13 +778,63 @@ pub async fn start_test_server_full(
 pub async fn start_test_server_full_with_disk_cache_max_bytes(
     store: ZeppelinStore,
     namespace_name_prefix: Option<String>,
-    mut config: Config,
+    config: Config,
     spawn_compaction_loop: bool,
     clock: Option<Clock>,
     disk_cache_max_bytes: u64,
 ) -> FullTestServer {
+    start_test_server_full_with_disk_cache_max_bytes_inner(
+        store,
+        namespace_name_prefix,
+        config,
+        spawn_compaction_loop,
+        clock,
+        disk_cache_max_bytes,
+        None,
+    )
+    .await
+}
+
+/// Starts a full test server that reuses an existing generated administrator.
+///
+/// Adversarial second nodes and restarts use this seam so one workload actor
+/// retains the same credential while server-local runtime state is replaced.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+    config: Config,
+    spawn_compaction_loop: bool,
+    clock: Option<Clock>,
+    disk_cache_max_bytes: u64,
+    admin_bearer: &str,
+) -> FullTestServer {
+    start_test_server_full_with_disk_cache_max_bytes_inner(
+        store,
+        namespace_name_prefix,
+        config,
+        spawn_compaction_loop,
+        clock,
+        disk_cache_max_bytes,
+        Some(admin_bearer),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_test_server_full_with_disk_cache_max_bytes_inner(
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+    mut config: Config,
+    spawn_compaction_loop: bool,
+    clock: Option<Clock>,
+    disk_cache_max_bytes: u64,
+    existing_admin_bearer: Option<&str>,
+) -> FullTestServer {
     zeppelin::metrics::init();
     configure_test_server_limits(&mut config);
+    let (security, credential_adapter, admin_bearer) =
+        test_security_runtime_with_admin_bearer(&mut config, existing_admin_bearer);
     let clock = clock.unwrap_or_else(Clock::system);
 
     let cache_dir = tempfile::TempDir::new().unwrap();
@@ -710,6 +896,8 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
+        security,
+        credential_adapter,
         namespace_manager,
         namespace_name_prefix,
         wal_writer: wal_writer.clone(),
@@ -750,6 +938,7 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
 
     FullTestServer {
         base_url,
+        admin_bearer,
         store,
         clock,
         cache,

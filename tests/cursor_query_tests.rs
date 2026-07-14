@@ -108,8 +108,8 @@ fn same_fingerprint_token_for_id(template: &str, id: &str) -> String {
 
 #[tokio::test]
 async fn malformed_cursor_token_is_validation_error() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -150,8 +150,8 @@ async fn malformed_cursor_token_is_validation_error() {
 
 #[tokio::test]
 async fn cursor_pages_continue_without_overlap_or_gaps() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -213,8 +213,8 @@ async fn cursor_pages_continue_without_overlap_or_gaps() {
 
 #[tokio::test]
 async fn cursor_ignores_non_result_response_options() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -265,8 +265,8 @@ async fn cursor_ignores_non_result_response_options() {
 
 #[tokio::test]
 async fn cursor_pages_are_bounded_by_candidate_k_frontier() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -310,8 +310,8 @@ async fn cursor_pages_are_bounded_by_candidate_k_frontier() {
 
 #[tokio::test]
 async fn cursor_preserves_vector_rerank_distance_order() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -373,8 +373,8 @@ async fn cursor_preserves_vector_rerank_distance_order() {
 
 #[tokio::test]
 async fn cursor_preserves_bm25_rerank_score_order() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_fts_namespace(&client, &base_url).await;
 
     upsert(
@@ -448,8 +448,8 @@ async fn cursor_preserves_bm25_rerank_score_order() {
 
 #[tokio::test]
 async fn cursor_rejects_tokens_from_different_query_shape() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(
@@ -499,8 +499,8 @@ async fn cursor_rejects_tokens_from_different_query_shape() {
 
 #[tokio::test]
 async fn cursor_after_last_result_returns_empty_page() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_namespace(&client, &base_url).await;
 
     upsert(

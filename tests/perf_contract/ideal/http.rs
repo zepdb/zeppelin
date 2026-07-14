@@ -54,7 +54,6 @@ pub(crate) async fn execute(case: &IdealCase) -> Option<IdealSample> {
     let (instrumented_store, counter) = perf_counting_store(&depth_wrapped);
     let config = ideal_http_config();
     let namespace = api_ns(&harness, "ideal-http");
-    let client = Client::new();
     let clock = ideal_http_clock();
     let mut server = start_test_server_full(
         instrumented_store.clone(),
@@ -64,6 +63,7 @@ pub(crate) async fn execute(case: &IdealCase) -> Option<IdealSample> {
         Some(clock.clone()),
     )
     .await;
+    let mut client = crate::common::server::client_with_bearer(&server.admin_bearer);
 
     prepare_world(operation, &client, &server, &namespace).await;
     if operation == SupportedOperation::GetMetadataCold {
@@ -76,6 +76,7 @@ pub(crate) async fn execute(case: &IdealCase) -> Option<IdealSample> {
             Some(clock),
         )
         .await;
+        client = crate::common::server::client_with_bearer(&server.admin_bearer);
     }
     if operation == SupportedOperation::GetMetadataResident {
         assert_request(
@@ -171,7 +172,7 @@ impl SupportedOperation {
 }
 
 fn ideal_http_config() -> Config {
-    let mut config = Config::load(None).expect("failed to load ideal HTTP config");
+    let mut config = Config::default();
     config.cache.namespace_registry_ttl_ms = 3_600_000;
     config.cache.manifest_cache_ttl_ms = 3_600_000;
     config.cache.hydration_enabled = false;

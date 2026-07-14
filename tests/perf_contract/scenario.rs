@@ -29,6 +29,7 @@ use zeppelin::storage::ZeppelinStore;
 
 use super::contract::{
     capture_contract, check_contract, load_contract, ContractSpec, CostViolation, DepthMode,
+    SecurityAssertionSpec,
 };
 use super::dataset::{generate, DatasetExpectations, DatasetSpec, GenVector, GeneratedDataset};
 use super::depth::{depth_store, CriticalPath, DepthTracker, OpSpan, SpanKind};
@@ -190,6 +191,7 @@ pub struct ScenarioSpec {
     pub cache_state: CacheState,
     pub measure: MeasureOp,
     pub repeats: usize,
+    pub security_assertion: Option<SecurityAssertionSpec>,
 }
 
 /// Deterministic counters and diagnostic spans for one measured operation.
@@ -313,6 +315,7 @@ impl Drop for NamespaceCleanupGuard {
 pub struct ScenarioOutcome {
     pub per_repeat: Vec<RepeatCounters>,
     pub expected: DatasetExpectations,
+    pub security: Option<super::security::SecurityMeasurement>,
 }
 
 /// Advisory closed-loop timing output. Depth is intentionally not asserted
@@ -599,6 +602,7 @@ async fn stability_outcome(spec: &ScenarioSpec) -> ScenarioOutcome {
 async fn run_stability_worlds(worlds: impl IntoIterator<Item = ScenarioSpec>) -> ScenarioOutcome {
     let mut expected = None;
     let mut per_repeat = Vec::new();
+    let mut security = None;
     for (world_index, world) in worlds.into_iter().enumerate() {
         let outcome = run_scenario(&world, None).await;
         match &expected {
@@ -607,6 +611,9 @@ async fn run_stability_worlds(worlds: impl IntoIterator<Item = ScenarioSpec>) ->
                 "stability world changed closed-form dataset expectations"
             ),
             None => expected = Some(outcome.expected.clone()),
+        }
+        if security.is_none() {
+            security = outcome.security;
         }
         per_repeat.extend(outcome.per_repeat);
         println!(
@@ -619,6 +626,7 @@ async fn run_stability_worlds(worlds: impl IntoIterator<Item = ScenarioSpec>) ->
     ScenarioOutcome {
         per_repeat,
         expected: expected.expect("stability study produced no worlds"),
+        security,
     }
 }
 
@@ -696,7 +704,7 @@ async fn run_scenario_inner(
         Some(clock.clone()),
     )
     .await;
-    let client = Client::new();
+    let client = crate::common::server::client_with_bearer(&setup_server.admin_bearer);
     let namespace = api_ns(&harness, &spec.name);
     let mut cleanup_guard =
         NamespaceCleanupGuard::new(instrumented_store.clone(), namespace.clone());
@@ -816,6 +824,8 @@ async fn run_scenario_inner(
             .as_ref()
             .or(cold_server.as_ref())
             .unwrap_or(&setup_server);
+        let measured_client =
+            crate::common::server::client_with_bearer(&measured_server.admin_bearer);
         let measured_namespace = measured_namespaces.get(repeat).unwrap_or(&namespace);
         if !world.eventual_wal_keys.is_empty() {
             // This frozen scenario explicitly invalidates the immutable WAL
@@ -855,7 +865,7 @@ async fn run_scenario_inner(
         }
         let started = Instant::now();
         let mut measured = execute_measure_once(
-            &client,
+            &measured_client,
             measured_server,
             measured_namespace,
             &generated,
@@ -882,12 +892,32 @@ async fn run_scenario_inner(
     }
 
     assert_fragment_window(final_server, &namespace, spec).await;
+    let security = spec.security_assertion.as_ref().map(|assertions| {
+        let measured = super::security::measure(
+            &config,
+            &setup_server.admin_bearer,
+            &namespace,
+            &per_repeat,
+            assertions,
+        );
+        println!(
+            "secured_query security budget: mode={} credential={} p50_delta_ns={} added_get_ops={} added_put_ops={}",
+            measured.security_mode,
+            measured.credential_kind,
+            measured.authn_authz_p50_delta_ns,
+            measured.added_get_ops,
+            measured.added_put_ops
+        );
+        measured
+    });
+
     cleanup_guard.cleanup().await;
     harness.cleanup().await;
 
     ScenarioOutcome {
         per_repeat,
         expected: generated.expected,
+        security,
     }
 }
 
@@ -943,7 +973,7 @@ pub(crate) async fn run_closed_loop_scenario(
         Some(clock.clone()),
     )
     .await;
-    let client = Client::new();
+    let client = crate::common::server::client_with_bearer(&setup_server.admin_bearer);
     let namespace = api_ns(&harness, &spec.name);
     let cleanup_guard = NamespaceCleanupGuard::new(instrumented_store.clone(), namespace.clone());
     create_namespace(&client, &setup_server, &namespace, spec).await;
@@ -1012,6 +1042,7 @@ pub(crate) async fn run_closed_loop_scenario(
     )
     .await;
     let measured_server = cold_server.as_ref().unwrap_or(&setup_server);
+    let measured_client = crate::common::server::client_with_bearer(&measured_server.admin_bearer);
 
     before_measure();
     counter.reset();
@@ -1019,7 +1050,7 @@ pub(crate) async fn run_closed_loop_scenario(
     let next = AtomicUsize::new(0);
     let started = Instant::now();
     let workers = futures::future::join_all((0..clients).map(|_| {
-        let client = client.clone();
+        let client = measured_client.clone();
         let next = &next;
         let server = measured_server;
         let namespace = &namespace;
@@ -1680,7 +1711,7 @@ async fn verify_cluster_balance(
 }
 
 fn scenario_config(spec: &ScenarioSpec) -> Config {
-    let mut config = Config::load(None).expect("failed to load base Config");
+    let mut config = Config::default();
     config.cache.manifest_cache_ttl_ms = spec.server_config.manifest_cache_ttl_ms;
     config.cache.namespace_registry_ttl_ms = 3_600_000;
     config.cache.memory_cache_max_mb = spec.server_config.memory_cache_max_mb;

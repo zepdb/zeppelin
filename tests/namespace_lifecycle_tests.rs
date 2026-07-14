@@ -243,8 +243,8 @@ async fn test_create_same_name_blocked_until_deleting_tombstone_removed() {
 
 #[tokio::test]
 async fn test_api_deleting_namespace_status_and_ops_410() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let name = format!("{}-api-deleting", harness.prefix);
 
     write_deleting_meta(&harness, &name).await;
@@ -284,8 +284,8 @@ async fn test_api_deleting_namespace_status_and_ops_410() {
 
 #[tokio::test]
 async fn test_api_delete_returns_202_and_eventually_leaves_zero_keys() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let create_resp = client
         .post(format!("{base_url}/v1/namespaces"))

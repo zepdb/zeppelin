@@ -168,6 +168,7 @@ use crate::query::{
     QueryExplainSource, QueryExplainSourceKind, QueryFacets, QueryResponse, QueryResultGroup,
 };
 use crate::runtime_config::QueryKnobs;
+use crate::security::AllowDecision;
 use crate::server::{AppState, RateLimitClass, RateLimitIdentity};
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, SearchResult};
 use crate::wal::manifest::SegmentRef;
@@ -787,9 +788,10 @@ impl BatchQueryError {
 /// handle into the async future. `?`-style conversions preserve typed failures;
 /// RAII guards decrement the active gauge and observe duration even when an
 /// awaited operation returns early.
-#[instrument(skip(state, body), fields(namespace = %ns))]
+#[instrument(skip(state, _decision, body), fields(namespace = %ns))]
 pub async fn query_namespace(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
     Query(params): Query<QueryRouteParams>,
     body: bytes::Bytes,
@@ -917,9 +919,10 @@ pub async fn query_namespace(
 /// responses and one 400-class error envelope in their original positions. If
 /// namespace lookup fails, all shape-valid entries receive that error while an
 /// independently malformed entry retains its more specific validation error.
-#[instrument(skip(state, body), fields(namespace = %ns))]
+#[instrument(skip(state, _decision, body), fields(namespace = %ns))]
 pub async fn batch_query_namespace(
     State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
     Extension(rate_limit_identity): Extension<RateLimitIdentity>,
     Path(ns): Path<String>,
     body: bytes::Bytes,

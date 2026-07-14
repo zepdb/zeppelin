@@ -8,8 +8,8 @@ use zeppelin::wal::Manifest;
 
 #[tokio::test]
 async fn test_create_rejects_invalid_pq_params_before_compaction() {
-    let (base_url, harness) = start_test_server().await;
-    let client = reqwest::Client::new();
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let resp = client
         .post(format!("{base_url}/v1/namespaces"))
@@ -36,9 +36,9 @@ async fn test_create_rejects_invalid_pq_params_before_compaction() {
 
 #[tokio::test]
 async fn test_namespace_nlist_override_controls_compacted_cluster_count() {
-    let (base_url, harness, _cache, _cache_dir, compactor) =
+    let (base_url, harness, _cache, _cache_dir, compactor, admin_bearer) =
         start_test_server_with_compactor(None).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -100,9 +100,9 @@ async fn test_namespace_nlist_override_controls_compacted_cluster_count() {
 
 #[tokio::test]
 async fn test_patch_index_config_forces_next_compaction_rewrite() {
-    let (base_url, harness, _cache, _cache_dir, compactor) =
+    let (base_url, harness, _cache, _cache_dir, compactor, admin_bearer) =
         start_test_server_with_compactor(None).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
@@ -181,9 +181,9 @@ async fn test_patch_index_config_forces_next_compaction_rewrite() {
 
 #[tokio::test]
 async fn test_stale_layout_trigger_cannot_override_fresh_compaction_metadata() {
-    let (base_url, harness, _cache, _cache_dir, compactor) =
+    let (base_url, harness, _cache, _cache_dir, compactor, admin_bearer) =
         start_test_server_with_compactor(None).await;
-    let client = reqwest::Client::new();
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
         &client,
         &base_url,
