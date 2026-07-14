@@ -14,7 +14,7 @@ async fn recreated_namespace_recovers_after_initial_manifest_publish_failure() {
     let harness = TestHarness::new().await;
     let name = api_ns(&harness, "recreate-manifest-crash");
     let (initial_url, _initial_cache, _initial_cache_dir, admin_bearer) =
-        start_test_server_on_store(harness.store.clone(), None).await;
+        start_test_server_on_store(&harness, harness.store.clone(), None).await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);
 
     let created = client
@@ -63,7 +63,7 @@ async fn recreated_namespace_recovers_after_initial_manifest_publish_failure() {
     let (failing_store, failure) =
         fail_put_once_matching(&harness.store, format!("{name}/manifest.json"));
     let (failing_url, _failing_cache, _failing_cache_dir, failing_admin_bearer) =
-        start_test_server_on_store(failing_store, None).await;
+        start_test_server_on_store(&harness, failing_store, None).await;
     let failing_client = crate::common::server::client_with_bearer(&failing_admin_bearer);
     let interrupted = failing_client
         .post(format!("{failing_url}/v1/namespaces"))
@@ -79,7 +79,7 @@ async fn recreated_namespace_recovers_after_initial_manifest_publish_failure() {
     assert_eq!(failure.failures_injected(), 1);
 
     let (restarted_url, _restarted_cache, _restarted_cache_dir, restarted_admin_bearer) =
-        start_test_server_on_store(harness.store.clone(), None).await;
+        start_test_server_on_store(&harness, harness.store.clone(), None).await;
     let restarted_client = crate::common::server::client_with_bearer(&restarted_admin_bearer);
     let recovered = restarted_client
         .get(format!("{restarted_url}/v1/namespaces/{name}"))

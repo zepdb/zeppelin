@@ -78,7 +78,7 @@ impl SecurityKernel {
         context: &RequestContext,
     ) -> Decision {
         if self.mode == SecurityMode::OpenUnsafe && principal.is_anonymous() {
-            return Decision::Allow(AllowDecision::boot());
+            return Decision::Allow(AllowDecision::boot(action));
         }
         if principal.is_anonymous() {
             return Decision::Deny(DenyDecision::boot(DenyReason::Unauthenticated));
@@ -102,6 +102,6 @@ impl SecurityKernel {
             }
         }
 
-        Decision::Allow(AllowDecision::boot())
+        Decision::Allow(AllowDecision::boot(action))
     }
 }

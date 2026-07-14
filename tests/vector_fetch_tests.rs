@@ -142,7 +142,7 @@ async fn test_vector_get_projection_avoids_omitted_segment_reads() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
     let (base_url, _cache, _cache_dir, admin_bearer) =
-        start_test_server_on_store(store.clone(), Some(harness.prefix.clone())).await;
+        start_test_server_on_store(&harness, store.clone(), Some(harness.prefix.clone())).await;
     let config = compact_fetch_config();
     let compactor = Compactor::new(
         store.clone(),
@@ -224,7 +224,7 @@ async fn test_vector_get_missing_requested_segment_artifact_fails_loud() {
     let harness = TestHarness::new().await;
     let (store, _counter) = counting_store(&harness.store);
     let (base_url, _cache, _cache_dir, admin_bearer) =
-        start_test_server_on_store(store.clone(), Some(harness.prefix.clone())).await;
+        start_test_server_on_store(&harness, store.clone(), Some(harness.prefix.clone())).await;
     let config = compact_fetch_config();
     let compactor = Compactor::new(
         store.clone(),

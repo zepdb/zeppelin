@@ -46,7 +46,8 @@
 //!    query-path reads.
 //! 3. Read [`crate::storage::store::ZeppelinStore::get_with_meta`],
 //!    [`crate::storage::store::ZeppelinStore::get_if_none_match`],
-//!    [`crate::storage::store::ZeppelinStore::put_if_match`], and
+//!    [`crate::storage::store::ZeppelinStore::put_if_match`],
+//!    [`crate::storage::store::ZeppelinStore::put_create`], and
 //!    [`crate::storage::store::ZeppelinStore::put_if_not_exists`] for conditional
 //!    consistency operations.
 //! 4. Finish with [`crate::storage::store::ZeppelinStore::delete_prefix_paged`]
@@ -637,6 +638,67 @@ impl ZeppelinStore {
     #[instrument(skip(self, data), fields(key = key, size = data.len()))]
     pub async fn put(&self, key: &str, data: Bytes) -> Result<Option<String>> {
         self.put_result(key, data).await.map(|result| result.e_tag)
+    }
+
+    /// Creates an immutable object and refuses to replace an existing key.
+    ///
+    /// Unlike [`Self::put_if_not_exists`], this primitive is not coupled to
+    /// namespace creation and therefore does not translate a collision into
+    /// [`ZeppelinError::NamespaceAlreadyExists`]. Audit batches and other
+    /// write-once control artifacts can inspect the original
+    /// [`object_store::Error::AlreadyExists`] through
+    /// [`ZeppelinError::Storage`] without inventing namespace context.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: Destination object key, which must not already exist.
+    /// - `data`: Complete immutable payload to create.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` only after the backend accepts the create-only PUT.
+    ///
+    /// # Errors
+    ///
+    /// Invalid keys remain [`ZeppelinError::StoragePath`]. Every backend
+    /// failure remains [`ZeppelinError::Storage`], including an
+    /// [`object_store::Error::AlreadyExists`] collision. No collision is
+    /// reported as success and the existing bytes are never overwritten.
+    ///
+    /// # Side Effects
+    ///
+    /// Performs exactly one create-only PUT. A backend failure increments the
+    /// PUT error counter; success records PUT latency.
+    ///
+    /// # Consistency
+    ///
+    /// `PutMode::Create` is an atomic backend precondition, not a racy HEAD
+    /// followed by an unconditional PUT. S3 implements it with
+    /// `If-None-Match: *` because conditional PUT support is enabled when the
+    /// client is constructed.
+    #[instrument(skip(self, data), fields(key = key, size = data.len()))]
+    pub async fn put_create(&self, key: &str, data: Bytes) -> Result<()> {
+        let start = std::time::Instant::now();
+        let path = Path::parse(key)?;
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
+        self.inner
+            .put_opts(&path, PutPayload::from(data), options)
+            .await
+            .map_err(|error| {
+                crate::metrics::S3_ERRORS_TOTAL
+                    .with_label_values(&["put"])
+                    .inc();
+                ZeppelinError::Storage(error)
+            })?;
+        let elapsed = start.elapsed();
+        debug!(elapsed_ms = elapsed.as_millis(), "s3 put_create");
+        crate::metrics::S3_OPERATION_DURATION
+            .with_label_values(&["put"])
+            .observe(elapsed.as_secs_f64());
+        Ok(())
     }
 
     /// Writes one object and preserves the backend identity returned by PUT.
@@ -2134,4 +2196,35 @@ fn endpoint_host_port(endpoint: &str) -> Result<(String, u16)> {
 fn parse_endpoint_port(port: &str) -> Result<u16> {
     port.parse::<u16>()
         .map_err(|error| ZeppelinError::Config(format!("invalid S3 endpoint port {port}: {error}")))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    /// A create-only write reports the original collision and preserves the first body.
+    #[tokio::test]
+    async fn put_create_is_immutable_and_keeps_generic_storage_error() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let key = "_audit/2026-07-13/node/batch.jsonl";
+
+        store
+            .put_create(key, Bytes::from_static(b"first\n"))
+            .await
+            .unwrap();
+        let collision = store.put_create(key, Bytes::from_static(b"second\n")).await;
+
+        assert!(matches!(
+            collision,
+            Err(ZeppelinError::Storage(
+                object_store::Error::AlreadyExists { .. }
+            ))
+        ));
+        assert_eq!(
+            store.get(key).await.unwrap(),
+            Bytes::from_static(b"first\n")
+        );
+    }
 }

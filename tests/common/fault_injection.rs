@@ -3,6 +3,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -74,6 +75,38 @@ pub fn fail_put_once_matching(
 ) -> (ZeppelinStore, PutFailureHandle) {
     let (failing, handle) = FailPutOnceStore::wrap(store.inner(), needle);
     (ZeppelinStore::new(Arc::new(failing)), handle)
+}
+
+/// `ObjectStore` decorator that delays every DELETE whose key contains `needle`.
+#[derive(Debug)]
+pub struct DelayDeleteStore {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    delay: Duration,
+}
+
+impl DelayDeleteStore {
+    /// Wrap an existing store, delaying matching DELETEs before they begin.
+    pub fn wrap(inner: Arc<dyn ObjectStore>, needle: impl Into<String>, delay: Duration) -> Self {
+        Self {
+            inner,
+            needle: needle.into(),
+            delay,
+        }
+    }
+}
+
+/// Wrap a `ZeppelinStore` in a matching-DELETE delay layer.
+pub fn delay_delete_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+    delay: Duration,
+) -> ZeppelinStore {
+    ZeppelinStore::new(Arc::new(DelayDeleteStore::wrap(
+        store.inner(),
+        needle,
+        delay,
+    )))
 }
 
 /// `ObjectStore` decorator that reports one matching PUT as failed only after
@@ -459,6 +492,12 @@ impl fmt::Display for FailPutOnceStore {
     }
 }
 
+impl fmt::Display for DelayDeleteStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DelayDeleteStore({})", self.inner)
+    }
+}
+
 impl fmt::Display for FailAfterPutOnceStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "FailAfterPutOnceStore({})", self.inner)
@@ -624,6 +663,57 @@ impl ObjectStore for FailPutOnceStore {
     }
 
     async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for DelayDeleteStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        if location.as_ref().contains(&self.needle) {
+            tokio::time::sleep(self.delay).await;
+        }
         self.inner.delete(location).await
     }
 

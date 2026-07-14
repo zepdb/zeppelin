@@ -46,8 +46,8 @@ use axum::extract::{Extension, State};
 use axum::Json;
 
 use crate::runtime_config::{QueryKnobs, QueryKnobsPatch};
-use crate::security::AllowDecision;
-use crate::server::AppState;
+use crate::security::{AllowDecision, AuditParams, RuntimeConfigValues};
+use crate::server::{AppState, AuditRequest};
 
 use super::ApiError;
 
@@ -84,8 +84,13 @@ use super::ApiError;
 pub async fn get_query_config(
     State(state): State<AppState>,
     Extension(_decision): Extension<AllowDecision>,
+    Extension(audit): Extension<AuditRequest>,
 ) -> Json<QueryKnobs> {
-    Json(state.runtime_query_config.snapshot().as_ref().clone())
+    let current = state.runtime_query_config.snapshot();
+    audit.set_params(AuditParams::RuntimeConfigRead {
+        current: RuntimeConfigValues::from(current.as_ref()),
+    });
+    Json(current.as_ref().clone())
 }
 
 /// Validates and atomically publishes a partial runtime query update.
@@ -140,12 +145,17 @@ pub async fn get_query_config(
 pub async fn update_query_config(
     State(state): State<AppState>,
     Extension(_decision): Extension<AllowDecision>,
+    Extension(audit): Extension<AuditRequest>,
     Json(patch): Json<QueryKnobsPatch>,
 ) -> Result<Json<QueryKnobs>, ApiError> {
     let updated = state
         .runtime_query_config
         .update(patch, &state.query_knob_bounds)
         .map_err(ApiError::from)?;
+    audit.set_params(AuditParams::RuntimeConfigUpdate {
+        old: RuntimeConfigValues::from(updated.old.as_ref()),
+        new: RuntimeConfigValues::from(updated.new.as_ref()),
+    });
 
-    Ok(Json(updated.as_ref().clone()))
+    Ok(Json(updated.new.as_ref().clone()))
 }

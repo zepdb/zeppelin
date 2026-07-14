@@ -1,6 +1,9 @@
 mod common;
 
-use common::server::{cleanup_ns, create_ns_api, start_test_server};
+use common::counting::counting_store;
+use common::harness::TestHarness;
+use common::server::{cleanup_ns, create_ns_api, start_test_server, start_test_server_full};
+use zeppelin::config::Config;
 
 // --- Test 1: Dimensions too large rejected ---
 
@@ -106,6 +109,73 @@ async fn test_vector_id_too_long_rejected() {
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_vector_delete_rejects_untrusted_ids_before_wal_and_audit() {
+    let harness = TestHarness::new().await;
+    let (counted_store, counter) = counting_store(&harness.store);
+    let config = Config::default();
+    let max_vector_id_length = config.server.max_vector_id_length;
+    let server = start_test_server_full(
+        counted_store,
+        Some(harness.prefix.clone()),
+        config,
+        false,
+        None,
+    )
+    .await;
+    let client = crate::common::server::client_with_bearer(&server.admin_bearer);
+    let namespace = create_ns_api(&client, &server.base_url, 4).await;
+    counter.reset();
+
+    let arbitrary_marker = format!("delete-payload-marker-{}", harness.prefix);
+    let arbitrary_id = format!(r#"{arbitrary_marker}/{{"secret":"do-not-audit"}}"#);
+    let oversized_marker = format!("delete-oversized-marker-{}", harness.prefix);
+    let oversized_id = format!(
+        "{oversized_marker}-{}",
+        "x".repeat(max_vector_id_length + 1)
+    );
+
+    let arbitrary_response = client
+        .delete(format!(
+            "{}/v1/namespaces/{namespace}/vectors",
+            server.base_url
+        ))
+        .json(&serde_json::json!({ "ids": [arbitrary_id] }))
+        .send()
+        .await
+        .unwrap();
+    let oversized_response = client
+        .delete(format!(
+            "{}/v1/namespaces/{namespace}/vectors",
+            server.base_url
+        ))
+        .json(&serde_json::json!({ "ids": [oversized_id] }))
+        .send()
+        .await
+        .unwrap();
+
+    server.flush_audit().await;
+    let mut audit_keys = harness.store.list_prefix("_audit/").await.unwrap();
+    audit_keys.retain(|key| key.contains(&format!("/{}/", server.audit_node_id)));
+    let mut leaked_untrusted_id = false;
+    for key in audit_keys {
+        let body = harness.store.get(&key).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        leaked_untrusted_id |= body.contains(&arbitrary_marker) || body.contains(&oversized_marker);
+    }
+    let observed = (
+        arbitrary_response.status().as_u16(),
+        oversized_response.status().as_u16(),
+        counter.puts_matching("/wal/"),
+        leaked_untrusted_id,
+    );
+
+    server.shutdown().await;
+    harness.cleanup().await;
+
+    assert_eq!(observed, (400, 400, 0, false));
 }
 
 // --- Test 4: Vector ID empty rejected ---

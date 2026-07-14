@@ -112,6 +112,10 @@ pub struct ApiError(
     pub ZeppelinError,
 );
 
+/// Stable machine code retained internally for response-side audit middleware.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AuditErrorCode(pub &'static str);
+
 /// Finds the first non-finite component in a decoded vector.
 ///
 /// JSON cannot spell NaN or infinity directly, but a finite JSON number such as
@@ -249,6 +253,9 @@ pub fn error_response(err: &ZeppelinError) -> Response {
     }
 
     let mut response = (status_code, axum::Json(body)).into_response();
+    response
+        .extensions_mut()
+        .insert(AuditErrorCode(err.error_code()));
     if let Some(secs) = err.retry_after_secs() {
         if let Ok(val) = secs.to_string().parse() {
             response.headers_mut().insert("retry-after", val);

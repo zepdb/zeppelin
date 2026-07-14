@@ -140,7 +140,6 @@ use axum::Json;
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::time::Duration;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
@@ -153,8 +152,10 @@ use crate::namespace::manager::{
     CreateNamespaceOutcome, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
     COMPACTION_DEGRADED_FAILURE_THRESHOLD,
 };
-use crate::security::{Action, AllowDecision, Principal, RequestContext};
-use crate::server::AppState;
+use crate::security::{
+    Action, AllowDecision, AuditParams, IndexConfigValues, NamespaceId, Principal, RequestContext,
+};
+use crate::server::{AppState, AuditRequest};
 use crate::types::{DistanceMetric, IndexType};
 use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
 use crate::wal::{FragmentCachePolicy, Manifest};
@@ -1004,12 +1005,13 @@ impl CompactNamespaceResponse {
 /// persisted metadata from borrowing request memory. The `match` on
 /// [`CreateNamespaceOutcome`] is exhaustive: adding a new domain outcome forces
 /// this handler to decide its HTTP meaning at compile time.
-#[instrument(skip(state, _decision, principal, context), fields(dimensions = req.dimensions))]
+#[instrument(skip(state, _decision, principal, context, audit), fields(dimensions = req.dimensions))]
 pub async fn create_namespace(
     State(state): State<AppState>,
     Extension(_decision): Extension<AllowDecision>,
     Extension(principal): Extension<Principal>,
     Extension(context): Extension<RequestContext>,
+    Extension(audit): Extension<AuditRequest>,
     Json(req): Json<CreateNamespaceRequest>,
 ) -> Result<(StatusCode, Json<CreateNamespaceResponse>), ApiError> {
     if req.dimensions == 0 || req.dimensions > state.config.server.max_dimensions {
@@ -1030,11 +1032,15 @@ pub async fn create_namespace(
             &state,
             &principal,
             &context,
+            &audit,
             Action::NamespaceCreate,
             &name,
         )
         .map_err(ZeppelinError::from)
         .map_err(ApiError::from)?;
+        audit.set_params(AuditParams::NamespaceCreate {
+            namespace: NamespaceId::new(name.clone()).map_err(ZeppelinError::from)?,
+        });
         info!(namespace = %name, dimensions = req.dimensions, "creating namespace by client name");
         let outcome = state
             .namespace_manager
@@ -1077,11 +1083,15 @@ pub async fn create_namespace(
         &state,
         &principal,
         &context,
+        &audit,
         Action::NamespaceCreate,
         &name,
     )
     .map_err(ZeppelinError::from)
     .map_err(ApiError::from)?;
+    audit.set_params(AuditParams::NamespaceCreate {
+        namespace: NamespaceId::new(name.clone()).map_err(ZeppelinError::from)?,
+    });
     info!(namespace = %name, dimensions = req.dimensions, "creating generated namespace");
     let meta = state
         .namespace_manager
@@ -1185,12 +1195,13 @@ pub async fn create_namespace(
 /// path must explicitly release the temporary pin. Java would commonly encode
 /// this with `try/finally`; C would use cleanup labels. Rust has RAII for local
 /// memory, but remote S3 objects still require explicit asynchronous cleanup.
-#[instrument(skip(state, _decision, principal, context, req), fields(source = %source))]
+#[instrument(skip(state, _decision, principal, context, audit, req), fields(source = %source))]
 pub async fn clone_namespace(
     State(state): State<AppState>,
     Extension(_decision): Extension<AllowDecision>,
     Extension(principal): Extension<Principal>,
     Extension(context): Extension<RequestContext>,
+    Extension(audit): Extension<AuditRequest>,
     Path(source): Path<String>,
     Json(req): Json<CloneNamespaceRequest>,
 ) -> Result<(StatusCode, Json<CloneNamespaceResponse>), ApiError> {
@@ -1205,11 +1216,16 @@ pub async fn clone_namespace(
         &state,
         &principal,
         &context,
+        &audit,
         Action::NamespaceCreate,
         &target,
     )
     .map_err(ZeppelinError::from)
     .map_err(ApiError::from)?;
+    audit.set_params(AuditParams::NamespaceClone {
+        source: NamespaceId::new(source.clone()).map_err(ZeppelinError::from)?,
+        target: NamespaceId::new(target.clone()).map_err(ZeppelinError::from)?,
+    });
 
     let source_meta = state
         .namespace_manager
@@ -2146,10 +2162,11 @@ pub async fn compact_namespace(
 /// PATCH `{"nlist":256}` returns 202 immediately. The active segment keeps its
 /// old cluster count until a later compaction publishes a replacement built
 /// with 256 centroids.
-#[instrument(skip(state, _decision), fields(namespace = %ns))]
+#[instrument(skip(state, _decision, audit), fields(namespace = %ns))]
 pub async fn patch_index_config(
     State(state): State<AppState>,
     Extension(_decision): Extension<AllowDecision>,
+    Extension(audit): Extension<AuditRequest>,
     Path(ns): Path<String>,
     Json(req): Json<PatchNamespaceIndexConfigRequest>,
 ) -> Result<(StatusCode, Json<UpdateIndexConfigResponse>), ApiError> {
@@ -2167,8 +2184,14 @@ pub async fn patch_index_config(
         .index_config
         .clone()
         .unwrap_or_else(|| NamespaceIndexConfig::from_indexing_config(&state.config.indexing));
+    let old_for_audit = IndexConfigValues::from(&current);
     let next = apply_namespace_index_config_patch(current, &req, meta.dimensions)
         .map_err(ApiError::from)?;
+    audit.set_params(AuditParams::IndexConfigPatch {
+        namespace: NamespaceId::new(ns.clone()).map_err(ZeppelinError::from)?,
+        old: old_for_audit,
+        new: IndexConfigValues::from(&next),
+    });
     let updated = state
         .namespace_manager
         .update_index_config(&ns, next)
@@ -2277,38 +2300,6 @@ pub async fn delete_namespace(
     // safe to discard disposable process state that could retain the namespace.
     state.wal_writer.remove_lock(&ns);
     state.manifest_cache.invalidate_at(&ns, state.clock.now());
-
-    let namespace_manager = state.namespace_manager.clone();
-    let ns_for_task = ns.clone();
-    tokio::spawn(async move {
-        match namespace_manager
-            .finish_delete(&ns_for_task, Duration::from_secs(25))
-            .await
-        {
-            Ok(outcome) => {
-                if outcome.complete {
-                    tracing::info!(
-                        namespace = %ns_for_task,
-                        objects_deleted = outcome.deleted,
-                        "namespace background delete completed"
-                    );
-                } else {
-                    tracing::warn!(
-                        namespace = %ns_for_task,
-                        objects_deleted = outcome.deleted,
-                        "namespace background delete budget exhausted; retry DELETE to resume"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    namespace = %ns_for_task,
-                    error = %e,
-                    "namespace background delete failed; retry DELETE to resume"
-                );
-            }
-        }
-    });
 
     info!(namespace = %ns, state = "deleting", "namespace delete accepted");
     Ok((

@@ -5,6 +5,8 @@
 //! returns an explicit decision before domain work can begin.
 
 mod action;
+mod audit;
+mod audit_sink;
 mod authn;
 mod context;
 mod decision;
@@ -14,6 +16,11 @@ mod resource;
 mod route_map;
 
 pub use action::Action;
+pub use audit::{
+    AuditOutcome, AuditParams, AuditRecord, AuditedVectorIds, IndexConfigValues, ResourceRef,
+    RuntimeConfigValues, MAX_AUDITED_VECTOR_IDS,
+};
+pub use audit_sink::{AuditClient, AuditRuntime, AuditSinkError};
 pub use authn::{ApiKeyAdapter, AuthnFailure, CredentialAdapter};
 pub use context::RequestContext;
 pub use decision::{
@@ -63,6 +70,12 @@ pub enum SecurityError {
     /// Authorization ran without the server-derived request context.
     #[error("security request context missing from request extensions")]
     MissingRequestContext,
+    /// Trusted-proxy client identity was not established by outer middleware.
+    #[error("trusted source address missing from request extensions")]
+    MissingSourceIp,
+    /// A required mutation completed without durable audit acknowledgement.
+    #[error("durable security audit evidence is unavailable")]
+    AuditUnavailable,
 }
 
 impl SecurityError {
@@ -84,7 +97,9 @@ impl SecurityError {
             | Self::InvalidApiKeyDigest
             | Self::UnmappedRoute
             | Self::MissingPrincipal
-            | Self::MissingRequestContext => 500,
+            | Self::MissingRequestContext
+            | Self::MissingSourceIp
+            | Self::AuditUnavailable => 500,
         }
     }
 
@@ -97,13 +112,15 @@ impl SecurityError {
             Self::Authorization(reason) => reason.code(),
             Self::InvalidNamespaceId => "invalid_namespace",
             Self::InvalidSnapshotName => "invalid_snapshot",
+            Self::AuditUnavailable => "audit_unavailable",
             Self::UnmappedRoute => "unmapped_route",
             Self::UnknownAction(_)
             | Self::InvalidPrincipalId
             | Self::DuplicatePrincipal
             | Self::InvalidApiKeyDigest
             | Self::MissingPrincipal
-            | Self::MissingRequestContext => "security_internal",
+            | Self::MissingRequestContext
+            | Self::MissingSourceIp => "security_internal",
         }
     }
 
@@ -120,13 +137,18 @@ impl SecurityError {
             Self::Authorization(_) => "access forbidden".to_string(),
             Self::InvalidNamespaceId => "invalid namespace name".to_string(),
             Self::InvalidSnapshotName => "invalid snapshot name".to_string(),
+            Self::AuditUnavailable => {
+                "operation may have completed, but durable audit evidence is unavailable"
+                    .to_string()
+            }
             Self::UnknownAction(_)
             | Self::InvalidPrincipalId
             | Self::DuplicatePrincipal
             | Self::InvalidApiKeyDigest
             | Self::UnmappedRoute
             | Self::MissingPrincipal
-            | Self::MissingRequestContext => "an internal security error occurred".to_string(),
+            | Self::MissingRequestContext
+            | Self::MissingSourceIp => "an internal security error occurred".to_string(),
         }
     }
 }

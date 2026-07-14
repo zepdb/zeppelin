@@ -1730,6 +1730,9 @@ fn scenario_config(spec: &ScenarioSpec) -> Config {
     config.query.cost_latency_profile = None;
     config.compaction.max_wal_fragments_before_compact =
         spec.server_config.max_wal_fragments_before_compact;
+    // Keep asynchronous setup audit traffic outside each deterministic
+    // measured window. Destructive barriers still force exactly one batch.
+    config.security.audit_flush_secs = 60;
     config
 }
 
@@ -1810,6 +1813,13 @@ async fn execute_measure_once(
             )
             .await;
             await_tracker_idle(tracker).await;
+            if matches!(measure, MeasureOp::Delete { .. }) {
+                assert_eq!(
+                    counter.puts_matching("_audit/"),
+                    1,
+                    "each destructive measured request must durably flush one audit batch"
+                );
+            }
             snapshot_repeat(counter, tracker, cutoff_us, Vec::new())
         }
     }

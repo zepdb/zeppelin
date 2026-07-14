@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dashmap::DashMap;
 use rand::{rngs::OsRng, RngCore};
@@ -10,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-use super::harness::TestHarness;
+use super::harness::{TestHarness, TestServerRuntime};
 
 use zeppelin::cache::decoded_cache::DecodedArtifactCache;
 use zeppelin::cache::hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator};
@@ -22,7 +23,7 @@ use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
 use zeppelin::fts::wal_cache::WalFtsCache;
 use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use zeppelin::security::{ApiKeyAdapter, SecurityKernel};
+use zeppelin::security::{ApiKeyAdapter, AuditClient, AuditRecord, AuditRuntime, SecurityKernel};
 use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
@@ -77,6 +78,65 @@ fn configure_test_server_limits(config: &mut Config) {
     config.server.rate_limit_burst = 1_000_000;
     config.server.write_rate_limit_rps = 1_000_000;
     config.server.write_rate_limit_burst = 1_000_000;
+}
+
+pub fn start_test_audit(
+    config: &Config,
+    store: &ZeppelinStore,
+    cleanup_scope: Option<&str>,
+) -> (AuditClient, AuditRuntime, String) {
+    let node_id = match cleanup_scope {
+        Some(scope) => format!("test-node-{scope}-{}", uuid::Uuid::new_v4()),
+        None => format!("test-node-{}", uuid::Uuid::new_v4()),
+    };
+    let (client, runtime) = if config.security.audit_s3 {
+        AuditRuntime::start(
+            store.clone(),
+            node_id.clone(),
+            Duration::from_secs(config.security.audit_flush_secs),
+        )
+        .expect("test audit runtime must start")
+    } else {
+        AuditRuntime::tracing_only(node_id.clone())
+            .expect("test tracing-only audit runtime must start")
+    };
+    if config.security.mode == SecurityMode::OpenUnsafe {
+        client
+            .submit_buffered(AuditRecord::open_unsafe_boot(
+                Clock::system().now(),
+                client.node_id(),
+            ))
+            .expect("open_unsafe test boot audit must be accepted");
+    }
+    (client, runtime, node_id)
+}
+
+/// Spawn one HTTP server and register its HTTP/audit lifecycle with the harness.
+pub async fn spawn_test_router(
+    harness: &TestHarness,
+    app: Router,
+    audit_runtime: AuditRuntime,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_http, mut shutdown_http_rx) = tokio::sync::watch::channel(false);
+    let server_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_http_rx.changed().await;
+        })
+        .await
+        .unwrap();
+    });
+    harness.register_test_server(TestServerRuntime::new(
+        shutdown_http,
+        server_task,
+        audit_runtime,
+    ));
+    format!("http://{addr}")
 }
 
 const TEST_ADMIN_KEY_ID: &str = "zpk1_test_admin";
@@ -279,10 +339,13 @@ async fn start_test_server_with_config_inner(
     let compactor = compactor(&config, &harness.store, &clock);
     let lease_manager = lease_manager(&config, &harness.store, &clock);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
+    let (audit, audit_runtime, _audit_node_id) =
+        start_test_audit(&config, &harness.store, Some(&harness.prefix));
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
         security,
+        audit,
         credential_adapter,
         namespace_manager: namespace_manager(&config, &harness.store, &clock),
         namespace_name_prefix: None,
@@ -305,18 +368,7 @@ async fn start_test_server_with_config_inner(
     };
 
     let app = build_router(state);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
+    let base_url = spawn_test_router(&harness, app, audit_runtime).await;
 
     (base_url, harness, cache, cache_dir, admin_bearer)
 }
@@ -326,6 +378,7 @@ async fn start_test_server_with_config_inner(
 /// Used by tests that wrap the harness store with instrumentation while still
 /// relying on the harness's random prefix and cleanup.
 pub async fn start_test_server_on_store(
+    harness: &TestHarness,
     store: ZeppelinStore,
     namespace_name_prefix: Option<String>,
 ) -> (String, Arc<DiskCache>, tempfile::TempDir, String) {
@@ -349,10 +402,13 @@ pub async fn start_test_server_on_store(
     let compactor = compactor(&config, &store, &clock);
     let lease_manager = lease_manager(&config, &store, &clock);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
+    let (audit, audit_runtime, _audit_node_id) =
+        start_test_audit(&config, &store, Some(&harness.prefix));
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
         security,
+        audit,
         credential_adapter,
         namespace_manager: namespace_manager(&config, &store, &clock),
         namespace_name_prefix,
@@ -375,18 +431,7 @@ pub async fn start_test_server_on_store(
     };
 
     let app = build_router(state);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
+    let base_url = spawn_test_router(harness, app, audit_runtime).await;
 
     (base_url, cache, cache_dir, admin_bearer)
 }
@@ -426,10 +471,13 @@ pub async fn start_test_server_with_compactor(
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
+    let (audit, audit_runtime, _audit_node_id) =
+        start_test_audit(&config, &harness.store, Some(&harness.prefix));
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
         security,
+        audit,
         credential_adapter,
         namespace_manager: namespace_manager(&config, &harness.store, &clock),
         namespace_name_prefix: None,
@@ -452,18 +500,7 @@ pub async fn start_test_server_with_compactor(
     };
 
     let app = build_router(state);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
+    let base_url = spawn_test_router(&harness, app, audit_runtime).await;
 
     (base_url, harness, cache, cache_dir, compactor, admin_bearer)
 }
@@ -533,10 +570,13 @@ pub async fn start_test_server_with_compaction(
     let (runtime_query_config, query_knob_bounds) = runtime_query_state(&config);
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
+    let (audit, audit_runtime, _audit_node_id) =
+        start_test_audit(&config, &harness.store, Some(&harness.prefix));
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
         security,
+        audit,
         credential_adapter,
         namespace_manager,
         namespace_name_prefix: Some(harness.prefix.clone()),
@@ -559,18 +599,7 @@ pub async fn start_test_server_with_compaction(
     };
 
     let app = build_router(state);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
+    let base_url = spawn_test_router(&harness, app, audit_runtime).await;
 
     (
         base_url,
@@ -677,6 +706,9 @@ pub struct FullTestServer {
     pub compactor: Arc<Compactor>,
     pub lease_manager: Arc<LeaseManager>,
     pub manifest_cache: Arc<ManifestCache>,
+    pub audit: AuditClient,
+    pub audit_node_id: String,
+    audit_runtime: Option<AuditRuntime>,
     fragment_cache: Arc<WalFragmentCache>,
     decoded_artifact_cache: Arc<DecodedArtifactCache>,
     wal_writer: Arc<WalWriter>,
@@ -687,6 +719,14 @@ pub struct FullTestServer {
 }
 
 impl FullTestServer {
+    /// Force all audit records accepted before this call to durable storage.
+    pub async fn flush_audit(&self) {
+        self.audit
+            .flush()
+            .await
+            .expect("test audit flush must succeed");
+    }
+
     /// Drop disposable decoded WAL state between isolated measured rounds.
     pub fn clear_wal_fragment_cache(&self) {
         self.fragment_cache.clear();
@@ -740,13 +780,33 @@ impl FullTestServer {
         if let Some(shutdown) = self.shutdown_compaction.take() {
             let _ = shutdown.send(true);
         }
-        if let Some(task) = self.compaction_loop_task.take() {
-            task.await
-                .unwrap_or_else(|error| panic!("test compaction loop failed: {error}"));
-        }
-        self.server_task
+        let compaction_result = match self.compaction_loop_task.take() {
+            Some(task) => task
+                .await
+                .map_err(|error| format!("test compaction loop failed: {error}")),
+            None => Ok(()),
+        };
+        let server_result = self
+            .server_task
             .await
-            .unwrap_or_else(|error| panic!("test HTTP server failed: {error}"));
+            .map_err(|error| format!("test HTTP server failed: {error}"));
+        let audit_result = match self.audit_runtime.take() {
+            Some(runtime) => runtime
+                .shutdown()
+                .await
+                .map_err(|error| format!("test audit runtime failed: {error}")),
+            None => Ok(()),
+        };
+
+        let errors = [compaction_result, server_result, audit_result]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "test server shutdown failed: {}",
+            errors.join("; ")
+        );
     }
 }
 
@@ -893,10 +953,13 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let wal_writer = Arc::new(WalWriter::with_clock(store.clone(), clock.clone()));
     let fragment_cache = test_fragment_cache(&config);
     let decoded_artifact_cache = test_decoded_artifact_cache(&config);
+    let (audit, audit_runtime, audit_node_id) =
+        start_test_audit(&config, &store, namespace_name_prefix.as_deref());
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
         security,
+        audit: audit.clone(),
         credential_adapter,
         namespace_manager,
         namespace_name_prefix,
@@ -946,6 +1009,9 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         compactor,
         lease_manager,
         manifest_cache,
+        audit,
+        audit_node_id,
+        audit_runtime: Some(audit_runtime),
         fragment_cache,
         decoded_artifact_cache,
         wal_writer,

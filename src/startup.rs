@@ -120,7 +120,7 @@ use crate::error::{Result as ZeppelinResult, ZeppelinError};
 use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
-use crate::security::{ApiKeyAdapter, SecurityKernel};
+use crate::security::{ApiKeyAdapter, AuditRecord, AuditRuntime, SecurityKernel};
 use crate::server::build_router;
 use crate::server::AppState;
 use crate::storage::ZeppelinStore;
@@ -225,9 +225,10 @@ pub fn init_logging(config: &Config) {
 /// # Returns
 ///
 /// A ready [`Router`], a [`watch::Sender`] used to request compaction shutdown,
-/// and the owned OS-thread join handle required by
-/// [`shutdown_background_tasks`]. The caller must bind/serve the router and
-/// eventually signal/join the thread.
+/// the owned OS-thread join handle required by [`shutdown_background_tasks`],
+/// and the owned [`AuditRuntime`] that must drain after HTTP stops accepting
+/// work. The caller must bind/serve the router, drain audit, and eventually
+/// signal/join the thread.
 ///
 /// # Errors
 ///
@@ -265,21 +266,30 @@ pub fn init_logging(config: &Config) {
 ///
 /// # Examples
 ///
-/// A local-storage test receives a router, shutdown sender, and compaction
-/// handle without S3. With a dead S3 endpoint and fail-fast enabled, startup
-/// returns before serving; with fail-fast disabled, it logs the outage, skips
-/// discovery, and returns a router whose storage-dependent requests may fail.
+/// A local-storage test receives a router, shutdown sender, compaction handle,
+/// and audit runtime without S3. With a dead S3 endpoint and fail-fast enabled,
+/// startup returns before serving; with fail-fast disabled, it logs the outage,
+/// skips discovery, and returns a router whose storage-dependent requests may
+/// fail.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
 /// `config` is moved into this function and ultimately into an `Arc` inside
 /// state. Service handles are cloned explicitly when several owners need them.
-/// The tuple return transfers unique responsibility for the shutdown sender and
-/// thread handle to `main`; Rust prevents accidentally joining the handle twice.
+/// The tuple return transfers unique responsibility for the audit runtime,
+/// shutdown sender, and thread handle to `main`; Rust prevents draining or
+/// joining either owner twice.
 pub async fn build_app(
     config: Config,
-) -> Result<(Router, watch::Sender<bool>, std::thread::JoinHandle<()>), Box<dyn std::error::Error>>
-{
+) -> Result<
+    (
+        Router,
+        watch::Sender<bool>,
+        std::thread::JoinHandle<()>,
+        AuditRuntime,
+    ),
+    Box<dyn std::error::Error>,
+> {
     if let Err(error) = config.validate() {
         tracing::error!(error = %error, "invalid configuration; refusing to boot");
         return Err(Box::new(error));
@@ -377,6 +387,20 @@ pub async fn build_app(
     }
 
     let clock = Clock::system();
+    let node_id = format!("zeppelin-{}", uuid::Uuid::new_v4());
+    let (audit, audit_runtime) = if config.security.audit_s3 {
+        AuditRuntime::start(
+            store.clone(),
+            node_id.clone(),
+            Duration::from_secs(config.security.audit_flush_secs),
+        )?
+    } else {
+        AuditRuntime::tracing_only(node_id.clone())?
+    };
+    if config.security.mode == SecurityMode::OpenUnsafe {
+        let record = AuditRecord::open_unsafe_boot(clock.now(), audit.node_id());
+        audit.submit_buffered(record)?;
+    }
 
     // Initialize namespace manager and scan existing namespaces
     let namespace_manager = Arc::new(NamespaceManager::with_clock(
@@ -474,7 +498,7 @@ pub async fn build_app(
     // lease is threaded into every compaction commit.
     let lease_manager = Arc::new(LeaseManager::with_clock(
         store.clone(),
-        format!("zeppelin-{}", uuid::Uuid::new_v4()),
+        node_id,
         Duration::from_secs(config.compaction.lease_duration_secs),
         clock.clone(),
     ));
@@ -550,6 +574,7 @@ pub async fn build_app(
         store,
         clock,
         security,
+        audit,
         credential_adapter,
         namespace_manager,
         namespace_name_prefix: None,
@@ -574,7 +599,7 @@ pub async fn build_app(
     // Build router
     let app = build_router(state);
 
-    Ok((app, shutdown_tx, compaction_handle))
+    Ok((app, shutdown_tx, compaction_handle, audit_runtime))
 }
 
 /// Verifies a constructed store by listing top-level common prefixes.
@@ -772,8 +797,9 @@ mod tests {
         let result = build_app(config).await;
         assert!(result.is_ok());
 
-        let (_router, shutdown_tx, compaction_handle) = result.unwrap();
+        let (_router, shutdown_tx, compaction_handle, audit_runtime) = result.unwrap();
 
+        audit_runtime.shutdown().await.unwrap();
         shutdown_background_tasks(shutdown_tx, compaction_handle, Duration::from_secs(1))
             .await
             .unwrap();
@@ -789,7 +815,8 @@ mod tests {
         let result = build_app(config).await;
         assert!(result.is_ok());
 
-        let (_router, shutdown_tx, compaction_handle) = result.unwrap();
+        let (_router, shutdown_tx, compaction_handle, audit_runtime) = result.unwrap();
+        audit_runtime.shutdown().await.unwrap();
         shutdown_background_tasks(shutdown_tx, compaction_handle, Duration::from_secs(1))
             .await
             .unwrap();
@@ -801,9 +828,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = test_config(&tmp);
 
-        let (router, shutdown_tx, compaction_handle) = build_app(config).await.unwrap();
+        let (router, shutdown_tx, compaction_handle, audit_runtime) =
+            build_app(config).await.unwrap();
 
         // Send shutdown signal
+        audit_runtime.shutdown().await.unwrap();
         shutdown_background_tasks(shutdown_tx, compaction_handle, Duration::from_secs(1))
             .await
             .unwrap();

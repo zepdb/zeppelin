@@ -1,9 +1,63 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use object_store::memory::InMemory;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeppelin::config::{StorageBackend, StorageConfig};
+use zeppelin::security::AuditRuntime;
 use zeppelin::storage::ZeppelinStore;
+
+/// HTTP and audit tasks that must stop before one harness deletes remote state.
+pub(crate) struct TestServerRuntime {
+    shutdown_http: watch::Sender<bool>,
+    server_task: JoinHandle<()>,
+    audit_runtime: Option<AuditRuntime>,
+}
+
+impl TestServerRuntime {
+    pub(crate) fn new(
+        shutdown_http: watch::Sender<bool>,
+        server_task: JoinHandle<()>,
+        audit_runtime: AuditRuntime,
+    ) -> Self {
+        Self {
+            shutdown_http,
+            server_task,
+            audit_runtime: Some(audit_runtime),
+        }
+    }
+
+    async fn shutdown(mut self) -> Result<(), String> {
+        let _ = self.shutdown_http.send(true);
+        let server_result = self
+            .server_task
+            .await
+            .map_err(|error| format!("test HTTP server failed: {error}"));
+        let audit_result = match self.audit_runtime.take() {
+            Some(runtime) => runtime
+                .shutdown()
+                .await
+                .map_err(|error| format!("test audit runtime failed: {error}")),
+            None => Ok(()),
+        };
+
+        match (server_result, audit_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(server_error), Ok(())) => Err(server_error),
+            (Ok(()), Err(audit_error)) => Err(audit_error),
+            (Err(server_error), Err(audit_error)) => Err(format!(
+                "{server_error}; secondary shutdown failure: {audit_error}"
+            )),
+        }
+    }
+
+    fn abort(mut self) {
+        self.server_task.abort();
+        // AuditRuntime::drop aborts the writer before fallback object cleanup.
+        drop(self.audit_runtime.take());
+    }
+}
 
 /// Test harness that connects to in-memory storage, local storage, real S3, or MinIO,
 /// isolates each test under a random prefix, and cleans up on drop.
@@ -12,6 +66,7 @@ pub struct TestHarness {
     pub prefix: String,
     bucket: String,
     _temp_dir: Option<tempfile::TempDir>,
+    test_servers: Mutex<Vec<TestServerRuntime>>,
 }
 
 impl TestHarness {
@@ -94,7 +149,16 @@ impl TestHarness {
             prefix,
             bucket,
             _temp_dir: temp_dir,
+            test_servers: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register a server whose HTTP and audit tasks share this harness's store.
+    pub(crate) fn register_test_server(&self, runtime: TestServerRuntime) {
+        self.test_servers
+            .lock()
+            .unwrap_or_else(|_| panic!("test server registry lock poisoned"))
+            .push(runtime);
     }
 
     /// Get a namespaced key under this test's random prefix.
@@ -105,6 +169,20 @@ impl TestHarness {
 
     /// Clean up all objects under this test's prefix.
     pub async fn cleanup(&self) {
+        let runtimes = {
+            let mut registered = self
+                .test_servers
+                .lock()
+                .unwrap_or_else(|_| panic!("test server registry lock poisoned"));
+            std::mem::take(&mut *registered)
+        };
+        let mut cleanup_errors = Vec::new();
+        for runtime in runtimes {
+            if let Err(error) = runtime.shutdown().await {
+                cleanup_errors.push(error);
+            }
+        }
+
         let prefix = format!("{}/", self.prefix);
         match self.store.delete_prefix(&prefix).await {
             Ok(count) => {
@@ -113,14 +191,56 @@ impl TestHarness {
                 }
             }
             Err(e) => {
-                eprintln!("[test harness] warning: cleanup failed: {e}");
+                cleanup_errors.push(format!("domain prefix cleanup failed for {prefix}: {e}"));
             }
         }
+        if let Err(error) = cleanup_audit_scope(&self.store, &self.prefix).await {
+            cleanup_errors.push(error);
+        }
+        assert!(
+            cleanup_errors.is_empty(),
+            "test harness cleanup failed: {cleanup_errors:?}"
+        );
+    }
+}
+
+async fn cleanup_audit_scope(store: &ZeppelinStore, scope: &str) -> Result<usize, String> {
+    let marker = format!("/test-node-{scope}-");
+    let keys = store
+        .list_prefix("_audit/")
+        .await
+        .map_err(|error| format!("audit prefix LIST failed for scope {scope}: {error}"))?;
+    let mut deleted = 0usize;
+    let mut delete_errors = Vec::new();
+    for key in keys.into_iter().filter(|key| key.contains(&marker)) {
+        match store.delete(&key).await {
+            Ok(()) => deleted += 1,
+            Err(error) => delete_errors.push(format!("{key}: {error}")),
+        }
+    }
+    if deleted > 0 {
+        eprintln!("[test harness] cleaned up {deleted} audit objects for {scope}");
+    }
+    if delete_errors.is_empty() {
+        Ok(deleted)
+    } else {
+        Err(format!(
+            "audit object cleanup failed for scope {scope}: {}",
+            delete_errors.join("; ")
+        ))
     }
 }
 
 impl Drop for TestHarness {
     fn drop(&mut self) {
+        let runtimes = self
+            .test_servers
+            .get_mut()
+            .unwrap_or_else(|_| panic!("test server registry lock poisoned"));
+        for runtime in std::mem::take(runtimes) {
+            runtime.abort();
+        }
+
         // We can't do async cleanup in Drop, so we spawn a blocking task.
         // Tests should call cleanup() explicitly in an async context.
         // This is a best-effort fallback.
@@ -129,7 +249,15 @@ impl Drop for TestHarness {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let _ = store.delete_prefix(&prefix).await;
+                if let Err(error) = store.delete_prefix(&prefix).await {
+                    eprintln!(
+                        "[test harness] best-effort domain cleanup failed for {prefix}: {error}"
+                    );
+                }
+                let scope = prefix.trim_end_matches('/');
+                if let Err(error) = cleanup_audit_scope(&store, scope).await {
+                    eprintln!("[test harness] best-effort {error}");
+                }
             });
         });
     }

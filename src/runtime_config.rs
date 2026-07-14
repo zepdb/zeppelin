@@ -152,6 +152,25 @@ pub struct RuntimeQueryConfig {
     inner: RwLock<Arc<QueryKnobs>>,
 }
 
+/// Atomic before/after snapshots returned by an accepted runtime update.
+///
+/// Both values are captured while the same write lock is held, so audit cannot
+/// pair a concurrent administrator's value with the wrong replacement.
+pub struct RuntimeQueryConfigUpdate {
+    /// Snapshot that was authoritative immediately before publication.
+    pub old: Arc<QueryKnobs>,
+    /// Snapshot published by this update.
+    pub new: Arc<QueryKnobs>,
+}
+
+impl std::ops::Deref for RuntimeQueryConfigUpdate {
+    type Target = QueryKnobs;
+
+    fn deref(&self) -> &Self::Target {
+        self.new.as_ref()
+    }
+}
+
 impl RuntimeQueryConfig {
     /// Seeds the first runtime snapshot from boot-time configuration.
     ///
@@ -287,7 +306,7 @@ impl RuntimeQueryConfig {
         &self,
         patch: QueryKnobsPatch,
         bounds: &QueryKnobBounds,
-    ) -> Result<Arc<QueryKnobs>> {
+    ) -> Result<RuntimeQueryConfigUpdate> {
         if patch.rerank_coalesce_gap_bytes.is_some() && patch.cost_latency_profile.is_some() {
             return Err(ZeppelinError::Validation(
                 "rerank_coalesce_gap_bytes and cost_latency_profile are mutually exclusive".into(),
@@ -315,7 +334,8 @@ impl RuntimeQueryConfig {
             .inner
             .write()
             .map_err(|_| ZeppelinError::Config("runtime query config lock poisoned".to_string()))?;
-        let old = guard.as_ref();
+        let old_snapshot = guard.clone();
+        let old = old_snapshot.as_ref();
         let mut new = old.clone();
 
         if let Some(gap) = patch.rerank_coalesce_gap_bytes {
@@ -341,7 +361,10 @@ impl RuntimeQueryConfig {
         *guard = new_snapshot.clone();
         crate::metrics::RERANK_COALESCE_GAP_BYTES
             .set(i64::try_from(new_snapshot.rerank_coalesce_gap_bytes).unwrap_or(i64::MAX));
-        Ok(new_snapshot)
+        Ok(RuntimeQueryConfigUpdate {
+            old: old_snapshot,
+            new: new_snapshot,
+        })
     }
 }
 

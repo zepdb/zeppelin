@@ -20,10 +20,10 @@
 //! normalize selected bare error responses             (all routes)
 //!   |
 //!   v
-//! request ID -> body limits -> timeout -> rate limit
+//! request ID -> full trace (non-query only) -> body limits -> rate limit
 //!   |
 //!   v
-//! full trace (non-query only) -> HTTP metrics
+//! HTTP metrics -> authn -> authz -> timeout
 //!   |
 //!   v
 //! query semaphore (query only) -> handler -> domain/storage services
@@ -79,7 +79,7 @@ pub mod handlers;
 
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, State};
@@ -108,8 +108,9 @@ use crate::metrics::{HTTP_REQUESTS_TOTAL, RATE_LIMITED_TOTAL};
 use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::security::{
-    classify_route, Action, AllowDecision, CredentialAdapter, Decision, NamespaceId, Principal,
-    RequestContext, Resource, RouteClass, SecurityError, SecurityKernel, SnapshotName,
+    classify_route, Action, AllowDecision, AuditClient, AuditOutcome, AuditParams, AuditRecord,
+    CredentialAdapter, Decision, DenyDecision, NamespaceId, PolicyVersion, Principal,
+    RequestContext, Resource, ResourceRef, RouteClass, SecurityError, SecurityKernel, SnapshotName,
 };
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
@@ -272,6 +273,8 @@ pub struct AppState {
     pub clock: Clock,
     /// Central pure-CPU authorization kernel compiled at startup.
     pub security: Arc<SecurityKernel>,
+    /// Cloneable request-path handle for structured tracing and durable audit.
+    pub audit: AuditClient,
     /// Transport credential boundary; phase 1 installs the named API-key adapter.
     pub credential_adapter: Arc<dyn CredentialAdapter>,
     /// Domain service for namespace CRUD and authoritative metadata changes.
@@ -313,6 +316,85 @@ pub struct AppState {
     pub query_semaphore: Arc<Semaphore>,
     /// Concurrent, process-local token buckets keyed by client and traffic class.
     pub rate_limiters: Arc<DashMap<RateLimitKey, RateLimitBucket>>,
+}
+
+/// Mutable, request-local audit annotation shared with one endpoint handler.
+///
+/// Authorization inserts this extension only for Phase 2 event families. A
+/// handler can replace the initial resource/decision for a body-derived scope
+/// check and attach typed redacted parameters; response-side authorization
+/// snapshots it after domain work settles.
+#[derive(Clone)]
+pub struct AuditRequest {
+    inner: Arc<Mutex<AuditRequestState>>,
+}
+
+#[derive(Clone)]
+struct AuditRequestState {
+    action: Action,
+    resource: ResourceRef,
+    decision: AuditRequestDecision,
+    params: AuditParams,
+}
+
+#[derive(Clone)]
+enum AuditRequestDecision {
+    Allow(AllowDecision),
+    Deny(DenyDecision),
+}
+
+impl AuditRequest {
+    fn new(
+        action: Action,
+        resource: ResourceRef,
+        decision: AllowDecision,
+        params: AuditParams,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(AuditRequestState {
+                action,
+                resource,
+                decision: AuditRequestDecision::Allow(decision),
+                params,
+            })),
+        }
+    }
+
+    fn snapshot(&self) -> AuditRequestState {
+        self.inner
+            .lock()
+            .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"))
+            .clone()
+    }
+
+    /// Replace the typed parameter projection selected by the handler.
+    pub(crate) fn set_params(&self, params: AuditParams) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"))
+            .params = params;
+    }
+
+    fn set_allow(&self, action: Action, resource: ResourceRef, decision: AllowDecision) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"));
+        state.action = action;
+        state.resource = resource;
+        state.decision = AuditRequestDecision::Allow(decision);
+    }
+
+    fn set_deny(&self, action: Action, resource: ResourceRef, decision: DenyDecision) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"));
+        state.action = action;
+        state.resource = resource;
+        state.decision = AuditRequestDecision::Deny(decision);
+        state.params = AuditParams::AuthzDenial;
+    }
 }
 
 /// Records HTTP response counts, latency, and structured request context.
@@ -592,6 +674,9 @@ pub async fn authenticate(
         Err(error) => return ApiError(error.into()).into_response(),
     };
     let context = RequestContext::at(request_id, state.clock.now());
+    let Some(source) = request.extensions().get::<RateLimitIdentity>().copied() else {
+        return ApiError(SecurityError::MissingSourceIp.into()).into_response();
+    };
 
     if state.config.security.mode == crate::config::SecurityMode::OpenUnsafe {
         request.extensions_mut().insert(Principal::anonymous());
@@ -608,12 +693,237 @@ pub async fn authenticate(
             request.extensions_mut().insert(context);
             next.run(request).await
         }
-        Err(failure) => ApiError(SecurityError::Authentication(failure).into()).into_response(),
+        Err(failure) => {
+            crate::metrics::AUTH_FAILURES_TOTAL
+                .with_label_values(&[failure.code()])
+                .inc();
+            let resource = route_resource(matched_path.as_str(), request.uri().path()).map_or_else(
+                |_| ResourceRef::Route {
+                    matched_path: matched_path.as_str().to_string(),
+                },
+                |resource| ResourceRef::from(&resource),
+            );
+            let action = match class {
+                RouteClass::Protected(action) => action,
+                RouteClass::Public => unreachable!("public route returned before authentication"),
+            };
+            let record = AuditRecord::authn_failure(
+                state.clock.now(),
+                context.request_id.clone(),
+                action,
+                resource,
+                PolicyVersion::BOOT,
+                source.ip,
+                failure,
+                state.audit.node_id(),
+            );
+            submit_buffered_audit(&state.audit, record);
+            ApiError(SecurityError::Authentication(failure).into()).into_response()
+        }
     }
 }
 
 fn required_security_request_id() -> Result<String, SecurityError> {
     current_request_id().ok_or(SecurityError::MissingRequestContext)
+}
+
+fn audited_action(action: Action) -> bool {
+    matches!(
+        action,
+        Action::RuntimeConfigRead
+            | Action::RuntimeConfigWrite
+            | Action::NamespaceCreate
+            | Action::NamespaceDelete
+            | Action::SnapshotWrite
+            | Action::SnapshotDelete
+            | Action::NamespaceClone
+            | Action::IndexConfigWrite
+            | Action::CompactionTrigger
+            | Action::HydrationTrigger
+            | Action::VectorDelete
+    )
+}
+
+fn initial_audit_params(action: Action, resource: &Resource) -> AuditParams {
+    match (action, resource) {
+        (Action::NamespaceDelete, Resource::Namespace(namespace)) => AuditParams::NamespaceDelete {
+            namespace: namespace.clone(),
+        },
+        (Action::SnapshotWrite, Resource::Snapshot(namespace, snapshot)) => {
+            AuditParams::SnapshotPut {
+                namespace: namespace.clone(),
+                snapshot: snapshot.clone(),
+            }
+        }
+        (Action::SnapshotDelete, Resource::Snapshot(namespace, snapshot)) => {
+            AuditParams::SnapshotDelete {
+                namespace: namespace.clone(),
+                snapshot: snapshot.clone(),
+            }
+        }
+        (Action::CompactionTrigger, Resource::Namespace(namespace)) => {
+            AuditParams::CompactionTrigger {
+                namespace: namespace.clone(),
+            }
+        }
+        (Action::HydrationTrigger, Resource::Namespace(namespace)) => {
+            AuditParams::HydrationTrigger {
+                namespace: namespace.clone(),
+            }
+        }
+        _ => AuditParams::None,
+    }
+}
+
+fn submit_buffered_audit(client: &AuditClient, record: AuditRecord) {
+    if let Err(error) = client.submit_buffered(record) {
+        crate::metrics::AUDIT_FLUSH_FAILURES_TOTAL.inc();
+        tracing::error!(
+            target: "zeppelin::audit",
+            error = %error,
+            "security audit record could not be queued"
+        );
+    }
+}
+
+fn emit_authorization_denial(
+    state: &AppState,
+    principal: &Principal,
+    action: Action,
+    resource: &Resource,
+    context: &RequestContext,
+    source_ip: IpAddr,
+    deny: &DenyDecision,
+) {
+    crate::metrics::AUTHZ_DENIALS_TOTAL
+        .with_label_values(&[action.as_str()])
+        .inc();
+    let record = AuditRecord::authorization_denial(
+        state.clock.now(),
+        context.request_id.clone(),
+        principal,
+        action,
+        ResourceRef::from(resource),
+        source_ip,
+        deny,
+        state.audit.node_id(),
+    );
+    submit_buffered_audit(&state.audit, record);
+}
+
+async fn finish_audited_request(
+    state: &AppState,
+    principal: &Principal,
+    context: &RequestContext,
+    source_ip: IpAddr,
+    audit_request: &AuditRequest,
+    response: Response,
+) -> Response {
+    let audit = audit_request.snapshot();
+    let durable_audit = matches!(
+        &audit.decision,
+        AuditRequestDecision::Allow(allow)
+            if allow.obligations.contains(&crate::security::Obligation::DurableAudit)
+    );
+    let (decision_id, policy_version, outcome) = match &audit.decision {
+        AuditRequestDecision::Deny(deny) => {
+            crate::metrics::AUTHZ_DENIALS_TOTAL
+                .with_label_values(&[audit.action.as_str()])
+                .inc();
+            (
+                deny.decision_id,
+                deny.policy_version,
+                AuditOutcome::Denied {
+                    reason: deny.reason.code().to_string(),
+                },
+            )
+        }
+        AuditRequestDecision::Allow(allow) if response.status().is_success() => (
+            allow.decision_id,
+            allow.policy_version,
+            AuditOutcome::Success,
+        ),
+        AuditRequestDecision::Allow(allow) => {
+            let code = response
+                .extensions()
+                .get::<handlers::AuditErrorCode>()
+                .map_or_else(
+                    || format!("http_{}", response.status().as_u16()),
+                    |code| code.0.to_string(),
+                );
+            (
+                allow.decision_id,
+                allow.policy_version,
+                AuditOutcome::Error { code },
+            )
+        }
+    };
+    let success = matches!(outcome, AuditOutcome::Success);
+    let record = AuditRecord::decision_outcome(
+        state.clock.now(),
+        context.request_id.clone(),
+        decision_id,
+        principal,
+        audit.action,
+        audit.resource.clone(),
+        policy_version,
+        source_ip,
+        outcome,
+        audit.params,
+        state.audit.node_id(),
+    );
+
+    if success && durable_audit {
+        if let Err(error) = state.audit.submit_durable(record).await {
+            tracing::error!(
+                target: "zeppelin::audit",
+                error = %error,
+                action = audit.action.as_str(),
+                "must_audit durability barrier failed"
+            );
+            return ApiError(SecurityError::AuditUnavailable.into()).into_response();
+        }
+        if audit.action == Action::NamespaceDelete {
+            if let ResourceRef::Namespace { namespace } = audit.resource {
+                spawn_namespace_delete_cleanup(state, namespace.as_str().to_string());
+            }
+        }
+    } else {
+        submit_buffered_audit(&state.audit, record);
+    }
+    response
+}
+
+fn spawn_namespace_delete_cleanup(state: &AppState, namespace: String) {
+    let namespace_manager = state.namespace_manager.clone();
+    tokio::spawn(async move {
+        match namespace_manager
+            .finish_delete(&namespace, Duration::from_secs(25))
+            .await
+        {
+            Ok(outcome) if outcome.complete => {
+                tracing::info!(
+                    namespace = %namespace,
+                    objects_deleted = outcome.deleted,
+                    "namespace background delete completed"
+                );
+            }
+            Ok(outcome) => {
+                tracing::warn!(
+                    namespace = %namespace,
+                    objects_deleted = outcome.deleted,
+                    "namespace background delete budget exhausted; retry DELETE to resume"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    namespace = %namespace,
+                    error = %error,
+                    "namespace background delete failed; retry DELETE to resume"
+                );
+            }
+        }
+    });
 }
 
 /// Invoke the central route map and kernel before any protected handler.
@@ -646,6 +956,9 @@ pub async fn authorize(
     let Some(context) = request.extensions().get::<RequestContext>().cloned() else {
         return ApiError(SecurityError::MissingRequestContext.into()).into_response();
     };
+    let Some(source) = request.extensions().get::<RateLimitIdentity>().copied() else {
+        return ApiError(SecurityError::MissingSourceIp.into()).into_response();
+    };
 
     let allow = match state
         .security
@@ -653,6 +966,9 @@ pub async fn authorize(
     {
         Decision::Allow(allow) => allow,
         Decision::Deny(deny) => {
+            emit_authorization_denial(
+                &state, &principal, action, &resource, &context, source.ip, &deny,
+            );
             return ApiError(SecurityError::Authorization(deny.reason).into()).into_response();
         }
     };
@@ -667,13 +983,47 @@ pub async fn authorize(
                     .security
                     .authorize(&principal, required_action, &required_resource, &context)
             {
+                emit_authorization_denial(
+                    &state,
+                    &principal,
+                    required_action,
+                    &required_resource,
+                    &context,
+                    source.ip,
+                    &deny,
+                );
                 return ApiError(SecurityError::Authorization(deny.reason).into()).into_response();
             }
         }
     }
 
+    let audit_request = audited_action(action).then(|| {
+        AuditRequest::new(
+            action,
+            ResourceRef::from(&resource),
+            allow.clone(),
+            initial_audit_params(action, &resource),
+        )
+    });
     request.extensions_mut().insert::<AllowDecision>(allow);
-    next.run(request).await
+    if let Some(audit_request) = &audit_request {
+        request.extensions_mut().insert(audit_request.clone());
+    }
+    let response = next.run(request).await;
+    match audit_request {
+        Some(audit_request) => {
+            finish_audited_request(
+                &state,
+                &principal,
+                &context,
+                source.ip,
+                &audit_request,
+                response,
+            )
+            .await
+        }
+        None => response,
+    }
 }
 
 fn route_resource(matched_path: &str, request_path: &str) -> Result<Resource, SecurityError> {
@@ -713,6 +1063,7 @@ pub(crate) fn authorize_namespace_action(
     state: &AppState,
     principal: &Principal,
     context: &RequestContext,
+    audit: &AuditRequest,
     action: Action,
     namespace: &str,
 ) -> Result<AllowDecision, SecurityError> {
@@ -721,8 +1072,16 @@ pub(crate) fn authorize_namespace_action(
         .security
         .authorize(principal, action, &resource, context)
     {
-        Decision::Allow(allow) => Ok(allow),
-        Decision::Deny(deny) => Err(SecurityError::Authorization(deny.reason)),
+        Decision::Allow(allow) => {
+            if audit.snapshot().action == action {
+                audit.set_allow(action, ResourceRef::from(&resource), allow.clone());
+            }
+            Ok(allow)
+        }
+        Decision::Deny(deny) => {
+            audit.set_deny(action, ResourceRef::from(&resource), deny.clone());
+            Err(SecurityError::Authorization(deny.reason))
+        }
     }
 }
 
@@ -1105,9 +1464,7 @@ pub async fn rate_limit(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    let Some(class) = rate_limit_class(request.method(), path) else {
-        return next.run(request).await;
-    };
+    let class = rate_limit_class(request.method(), path);
 
     let x_forwarded_for = request
         .headers()
@@ -1122,6 +1479,10 @@ pub async fn rate_limit(
         Err(err) => return ApiError(err).into_response(),
     };
     request.extensions_mut().insert(RateLimitIdentity { ip });
+
+    let Some(class) = class else {
+        return next.run(request).await;
+    };
 
     match consume_rate_limit(&state, ip, class, 1) {
         Ok(()) => next.run(request).await,
@@ -1372,9 +1733,14 @@ fn evict_idle_rate_limiters(
 /// `MethodRouter::route_layer` deliberately leaves Axum's method-not-allowed
 /// fallback unwrapped. That preserves canonical 405 responses while ensuring
 /// every actual handler, including Axum's implicit HEAD dispatch for GET, runs
-/// through the same route map before domain code.
+/// through the same route map before domain code. The timeout wraps only the
+/// endpoint future: authentication and authorization remain outside it so
+/// response-side audit finalization still observes a timed-out mutation.
 fn secure_route(methods: MethodRouter<AppState>, state: &AppState) -> MethodRouter<AppState> {
     methods
+        .route_layer(TimeoutLayer::new(Duration::from_secs(
+            state.config.server.request_timeout_secs,
+        )))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authorize,
@@ -1397,13 +1763,13 @@ fn secure_route(methods: MethodRouter<AppState>, state: &AppState) -> MethodRout
 ///
 /// ```text
 /// query:
-/// normalize -> query ID -> body limits -> timeout -> rate limit
-///           -> HTTP metrics -> authn -> authz -> concurrency permit
+/// normalize -> query ID -> body limits -> rate limit -> HTTP metrics
+///           -> authn -> authz -> timeout -> concurrency permit
 ///           -> query handler
 ///
 /// other:
-/// normalize -> request ID -> TraceLayer -> body limits -> timeout
-///           -> rate limit -> HTTP metrics -> authn -> authz
+/// normalize -> request ID -> TraceLayer -> body limits -> rate limit
+///           -> HTTP metrics -> authn -> authz -> timeout
 ///           -> endpoint handler
 /// ```
 ///
@@ -1446,7 +1812,6 @@ fn secure_route(methods: MethodRouter<AppState>, state: &AppState) -> MethodRout
 /// final owned handle to the router; earlier `state.clone()` calls clone the
 /// internal shared handles needed to configure middleware.
 pub fn build_router(state: AppState) -> Router {
-    let timeout = Duration::from_secs(state.config.server.request_timeout_secs);
     let body_limit = state.config.server.max_request_body_mb * 1024 * 1024;
 
     // Query route: lightweight middleware (request id, no trace layer/span
@@ -1478,7 +1843,6 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             rate_limit,
         ))
-        .layer(TimeoutLayer::new(timeout))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(axum::middleware::from_fn_with_state(
@@ -1581,7 +1945,6 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             rate_limit,
         ))
-        .layer(TimeoutLayer::new(timeout))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(axum::middleware::from_fn_with_state(
@@ -1658,5 +2021,54 @@ mod tests {
             required_security_request_id(),
             Err(SecurityError::MissingRequestContext)
         ));
+    }
+
+    #[test]
+    fn phase_two_audited_action_inventory_is_exact() {
+        let audited = Action::ALL
+            .into_iter()
+            .filter(|action| audited_action(*action))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            audited,
+            vec![
+                Action::RuntimeConfigRead,
+                Action::RuntimeConfigWrite,
+                Action::NamespaceCreate,
+                Action::NamespaceDelete,
+                Action::SnapshotWrite,
+                Action::SnapshotDelete,
+                Action::NamespaceClone,
+                Action::IndexConfigWrite,
+                Action::CompactionTrigger,
+                Action::HydrationTrigger,
+                Action::VectorDelete,
+            ]
+        );
+    }
+
+    #[test]
+    fn phase_two_must_audit_action_inventory_is_exact() {
+        let must_audit = Action::ALL
+            .into_iter()
+            .filter(|action| {
+                AllowDecision::boot(*action)
+                    .obligations
+                    .contains(&crate::security::Obligation::DurableAudit)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            must_audit,
+            vec![
+                Action::RuntimeConfigWrite,
+                Action::NamespaceDelete,
+                Action::SnapshotDelete,
+                Action::IndexConfigWrite,
+                Action::VectorDelete,
+            ]
+        );
+        assert!(must_audit.into_iter().all(audited_action));
     }
 }

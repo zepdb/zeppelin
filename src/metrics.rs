@@ -235,6 +235,33 @@ mod inner {
             &["mode"]
         ).unwrap();
 
+        /// Authentication failures partitioned only by the bounded failure-reason enum.
+        pub static ref AUTH_FAILURES_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_auth_failures_total",
+            "Authentication failures by bounded reason",
+            &["reason"]
+        ).unwrap();
+
+        /// Authorization denials partitioned only by the bounded security-action enum.
+        pub static ref AUTHZ_DENIALS_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_authz_denials_total",
+            "Authorization denials by bounded action",
+            &["action"]
+        ).unwrap();
+
+        /// Audit records submitted, partitioned only by the bounded outcome class.
+        pub static ref AUDIT_RECORDS_TOTAL: IntCounterVec = register_int_counter_vec!(
+            "zeppelin_audit_records_total",
+            "Structured audit records by bounded outcome class",
+            &["outcome_class"]
+        ).unwrap();
+
+        /// Audit batches that failed to become durable in object storage.
+        pub static ref AUDIT_FLUSH_FAILURES_TOTAL: IntCounter = register_int_counter!(
+            "zeppelin_audit_flush_failures_total",
+            "Audit batch flushes that failed"
+        ).unwrap();
+
         /// Durable non-finite vectors skipped defensively during compaction.
         ///
         /// This records legacy or corrupt S3 data containing NaN or infinity;
@@ -401,6 +428,10 @@ pub fn init() {
     lazy_static::initialize(&FTS_QUERIES_TOTAL);
     lazy_static::initialize(&RATE_LIMITED_TOTAL);
     lazy_static::initialize(&SECURITY_MODE);
+    lazy_static::initialize(&AUTH_FAILURES_TOTAL);
+    lazy_static::initialize(&AUTHZ_DENIALS_TOTAL);
+    lazy_static::initialize(&AUDIT_RECORDS_TOTAL);
+    lazy_static::initialize(&AUDIT_FLUSH_FAILURES_TOTAL);
     lazy_static::initialize(&NON_FINITE_VECTORS_SKIPPED_TOTAL);
     lazy_static::initialize(&COMPACTION_LEASE_RENEWALS_TOTAL);
     lazy_static::initialize(&COMPACTION_LEASE_LOST_TOTAL);

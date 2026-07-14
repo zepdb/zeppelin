@@ -148,8 +148,8 @@ use crate::index::ivf_flat::build::{
 };
 use crate::index::ivf_flat::membership::deserialize_membership;
 use crate::query;
-use crate::security::AllowDecision;
-use crate::server::AppState;
+use crate::security::{AllowDecision, AuditParams, NamespaceId};
+use crate::server::{AppState, AuditRequest};
 use crate::types::{AttributeValue, ConsistencyLevel, VectorEntry, VectorId};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::{FragmentCachePolicy, Manifest};
@@ -252,7 +252,8 @@ pub struct UpsertVectorsResponse {
 #[derive(Debug, Deserialize)]
 pub struct DeleteVectorsRequest {
     /// Tombstone IDs stored in request order. The handler requires at least one
-    /// ID but currently performs no per-ID syntax or duplicate validation here.
+    /// ID and applies the shared configured length and ASCII syntax rules.
+    /// Duplicate IDs remain accepted and retain their request order.
     pub ids: Vec<VectorId>,
 }
 
@@ -436,7 +437,7 @@ fn default_true() -> bool {
 /// references here; C would require an explicit ownership-transfer convention.
 /// The `?`-style conversions are written with `map_err` where the boundary must
 /// wrap a domain error as [`ApiError`].
-#[instrument(skip(state, _decision, body), fields(namespace = %ns))]
+#[instrument(skip(state, _decision, headers, body), fields(namespace = %ns))]
 pub async fn upsert_vectors(
     State(state): State<AppState>,
     Extension(_decision): Extension<AllowDecision>,
@@ -912,14 +913,17 @@ where
 ///
 /// # Errors
 ///
-/// Returns validation for malformed JSON or an empty ID list, a namespace error
-/// when the namespace is absent/deleting, and WAL, storage, serialization, or
-/// manifest-publication errors. The current handler does not apply the upsert
-/// batch-size, ID-character, ID-length, or duplicate-ID checks to deletes.
+/// Returns validation for malformed JSON, an empty ID list, or an ID that
+/// violates the configured byte-length or ASCII syntax contract; a namespace
+/// error when the namespace is absent/deleting; and WAL, storage,
+/// serialization, or manifest-publication errors. The handler does not apply
+/// the upsert batch-size or duplicate-ID checks to deletes.
 ///
-/// Validation and namespace failures create no fragment. Publication failure
-/// can occur after fragment upload; [`crate::wal::WalWriter`] owns best-effort
-/// orphan cleanup and returns the original error rather than claiming success.
+/// ID validation runs before namespace storage I/O and before request values
+/// are projected into audit parameters. Validation and namespace failures
+/// create no fragment. Publication failure can occur after fragment upload;
+/// [`crate::wal::WalWriter`] owns best-effort orphan cleanup and returns the
+/// original error rather than claiming success.
 ///
 /// # Side Effects
 ///
@@ -957,10 +961,11 @@ where
 /// fragment without cloning every string. Rust prevents this handler from using
 /// that vector afterward. Java has no compiler-enforced move; C would need an
 /// explicit “callee now owns this allocation” rule.
-#[instrument(skip(state, _decision, body), fields(namespace = %ns))]
+#[instrument(skip(state, _decision, audit, body), fields(namespace = %ns))]
 pub async fn delete_vectors(
     State(state): State<AppState>,
     Extension(_decision): Extension<AllowDecision>,
+    Extension(audit): Extension<AuditRequest>,
     Path(ns): Path<String>,
     body: bytes::Bytes,
 ) -> Result<StatusCode, ApiError> {
@@ -974,6 +979,10 @@ pub async fn delete_vectors(
             "ids array cannot be empty".into(),
         )));
     }
+    for id in &req.ids {
+        validate_vector_id_for_request(id, state.config.server.max_vector_id_length)
+            .map_err(ApiError::from)?;
+    }
 
     info!(count = req.ids.len(), "deleting vectors");
 
@@ -985,6 +994,10 @@ pub async fn delete_vectors(
         .map_err(ApiError::from)?;
 
     let count = req.ids.len();
+    audit.set_params(AuditParams::vector_delete(
+        NamespaceId::new(ns.clone()).map_err(ZeppelinError::from)?,
+        &req.ids,
+    ));
     // Group commit lives in WalWriter::append — no separate batch-writer path.
     let (_, manifest) = state
         .wal_writer

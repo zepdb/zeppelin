@@ -25,7 +25,7 @@ use object_store::{
 use serde::Serialize;
 use zeppelin::storage::ZeppelinStore;
 
-use crate::common::counting::{classify, ArtifactClass};
+use crate::common::counting::{classify, is_audit_key, ArtifactClass};
 
 /// The logical object-store operation represented by an [`OpSpan`].
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -703,6 +703,9 @@ impl ObjectStore for DepthStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> OsResult<PutResult> {
+        if is_audit_key(location.as_ref()) {
+            return self.inner.put_opts(location, payload, opts).await;
+        }
         let pending = self.tracker.begin(
             SpanKind::Put,
             PhysicalRequest::from_put_mode(&opts.mode),
@@ -727,6 +730,9 @@ impl ObjectStore for DepthStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        if is_audit_key(location.as_ref()) {
+            return self.inner.get_opts(location, options).await;
+        }
         let pending = self.tracker.begin(
             SpanKind::Get,
             PhysicalRequest::from_get_options(&options),
@@ -761,6 +767,9 @@ impl ObjectStore for DepthStore {
     }
 
     async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        if is_audit_key(location.as_ref()) {
+            return self.inner.head(location).await;
+        }
         let pending = self.tracker.begin(
             SpanKind::Head,
             PhysicalRequest::Head,
@@ -775,6 +784,9 @@ impl ObjectStore for DepthStore {
     }
 
     async fn delete(&self, location: &Path) -> OsResult<()> {
+        if is_audit_key(location.as_ref()) {
+            return self.inner.delete(location).await;
+        }
         let pending = self.tracker.begin(
             SpanKind::Delete,
             PhysicalRequest::Delete,
@@ -825,6 +837,9 @@ impl ObjectStore for DepthStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
         let key = prefix.map(ToString::to_string).unwrap_or_default();
+        if is_audit_key(&key) {
+            return self.inner.list(prefix);
+        }
         let pending = self.tracker.begin(
             SpanKind::List,
             PhysicalRequest::ListRecursive,
@@ -841,6 +856,9 @@ impl ObjectStore for DepthStore {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
         let key = prefix.map(ToString::to_string).unwrap_or_default();
+        if is_audit_key(&key) {
+            return self.inner.list_with_delimiter(prefix).await;
+        }
         let pending = self.tracker.begin(
             SpanKind::List,
             PhysicalRequest::ListDelimiter,
@@ -855,6 +873,9 @@ impl ObjectStore for DepthStore {
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        if is_audit_key(from.as_ref()) || is_audit_key(to.as_ref()) {
+            return self.inner.copy(from, to).await;
+        }
         let pending = self.tracker.begin(
             SpanKind::Copy,
             PhysicalRequest::CopyOverwrite,
@@ -869,6 +890,9 @@ impl ObjectStore for DepthStore {
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        if is_audit_key(from.as_ref()) || is_audit_key(to.as_ref()) {
+            return self.inner.copy_if_not_exists(from, to).await;
+        }
         let pending = self.tracker.begin(
             SpanKind::Copy,
             PhysicalRequest::CopyIfAbsent,
@@ -1327,6 +1351,37 @@ mod tests {
         assert_eq!(spans[0].outcome, SpanOutcome::NotFound);
         assert_eq!(spans[1].outcome, SpanOutcome::Success);
         assert_eq!(spans[2].outcome, SpanOutcome::Precondition);
+    }
+
+    #[tokio::test]
+    async fn audit_control_plane_operations_do_not_change_domain_depth() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = ZeppelinStore::new(inner);
+        let (store, tracker) = depth_store(&store);
+        let backend = store.inner();
+
+        backend
+            .put(
+                &Path::from("namespace/meta.json"),
+                PutPayload::from_static(b"domain"),
+            )
+            .await
+            .expect("write domain object");
+        backend
+            .put(
+                &Path::from("_audit/2026-07-13/node/record.jsonl"),
+                PutPayload::from_static(b"audit"),
+            )
+            .await
+            .expect("write audit object");
+
+        let spans = tracker.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].key, "namespace/meta.json");
+        assert_eq!(
+            DepthTracker::critical_path(&spans, &[SpanKind::Put], None).depth,
+            1
+        );
     }
 
     #[test]

@@ -300,7 +300,7 @@ async fn test_get_namespace_reports_manifest_stats_after_upsert() {
     let harness = TestHarness::new().await;
     let (store, _counter) = counting_store(&harness.store);
     let (base_url, _cache, cache_dir, admin_bearer) =
-        start_test_server_on_store(store, Some(harness.prefix.clone())).await;
+        start_test_server_on_store(&harness, store, Some(harness.prefix.clone())).await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 16).await;
 
@@ -346,7 +346,7 @@ async fn test_get_namespace_stats_reuses_manifest_freshness_get_without_listing_
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);
     let (base_url, _cache, cache_dir, admin_bearer) =
-        start_test_server_on_store(store, Some(harness.prefix.clone())).await;
+        start_test_server_on_store(&harness, store, Some(harness.prefix.clone())).await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api(&client, &base_url, 8).await;
 

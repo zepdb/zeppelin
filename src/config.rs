@@ -181,7 +181,7 @@ pub struct Config {
     /// Garbage-collection safety horizons, history retention, and unsafe override.
     #[serde(default)]
     pub gc: GcConfig,
-    /// Authentication mode, bootstrap API keys, and security refresh settings.
+    /// Authentication, durable audit, bootstrap-key, and security refresh settings.
     pub security: SecurityConfig,
 }
 
@@ -229,6 +229,12 @@ pub struct SecurityConfig {
     /// Maximum interval between authoritative policy-head refreshes.
     #[serde(default = "default_security_policy_refresh_secs")]
     pub policy_refresh_secs: u64,
+    /// Whether structured audit batches are persisted to authoritative object storage.
+    #[serde(default = "default_security_audit_s3")]
+    pub audit_s3: bool,
+    /// Maximum interval between background audit-batch flushes.
+    #[serde(default = "default_security_audit_flush_secs")]
+    pub audit_flush_secs: u64,
     /// Optional signed-license path used by the later entitlement phase.
     #[serde(default)]
     pub license_path: String,
@@ -243,6 +249,8 @@ impl Default for SecurityConfig {
             mode: SecurityMode::Enforced,
             readyz_public: false,
             policy_refresh_secs: default_security_policy_refresh_secs(),
+            audit_s3: default_security_audit_s3(),
+            audit_flush_secs: default_security_audit_flush_secs(),
             license_path: String::new(),
             api_keys: Vec::new(),
         }
@@ -271,6 +279,16 @@ pub struct ApiKeyConfig {
 /// Returns the policy-head refresh interval used until phase 3 activates it.
 const fn default_security_policy_refresh_secs() -> u64 {
     5
+}
+
+/// Enables durable S3 audit evidence unless an unsafe development posture opts out.
+const fn default_security_audit_s3() -> bool {
+    true
+}
+
+/// Returns the bounded audit flush interval used when the operator omits it.
+const fn default_security_audit_flush_secs() -> u64 {
+    2
 }
 
 fn missing_security_section_error() -> ZeppelinError {
@@ -637,6 +655,48 @@ mod tests {
             ),
             &["max_topk"],
         );
+    }
+
+    /// Pins the durable-audit defaults used by both enforced and unsafe modes.
+    #[test]
+    fn security_audit_defaults_are_enabled_and_flush_every_two_seconds() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        let config = load_toml("").unwrap();
+
+        assert!(config.security.audit_s3);
+        assert_eq!(config.security.audit_flush_secs, 2);
+    }
+
+    /// Enforced mode cannot boot without durable audit, and every mode needs a live timer.
+    #[test]
+    fn security_audit_configuration_fails_loudly_when_unsafe() {
+        let mut disabled = Config::default();
+        disabled.security.audit_s3 = false;
+        assert_config_error_contains(
+            disabled.validate().map(|()| disabled),
+            &["security.audit_s3"],
+        );
+
+        let mut zero_interval = Config::default();
+        zero_interval.security.mode = SecurityMode::OpenUnsafe;
+        zero_interval.security.audit_flush_secs = 0;
+        assert_config_error_contains(
+            zero_interval.validate().map(|()| zero_interval),
+            &["security.audit_flush_secs"],
+        );
+
+        let open_unsafe: Config = r#"
+            [security]
+            mode = "open_unsafe"
+            audit_s3 = false
+            audit_flush_secs = 7
+        "#
+        .parse()
+        .unwrap();
+        assert!(!open_unsafe.security.audit_s3);
+        assert_eq!(open_unsafe.security.audit_flush_secs, 7);
     }
 
     /// Exercises each independent validation rule with one focused mutation.
@@ -2348,6 +2408,13 @@ impl Config {
         }
         if self.security.policy_refresh_secs == 0 {
             violations.push("security.policy_refresh_secs must be greater than zero".to_string());
+        }
+        if self.security.audit_flush_secs == 0 {
+            violations.push("security.audit_flush_secs must be greater than zero".to_string());
+        }
+        if self.security.mode == SecurityMode::Enforced && !self.security.audit_s3 {
+            violations
+                .push("security.audit_s3 must be true when security.mode is enforced".to_string());
         }
         let mut key_ids = HashSet::new();
         for (index, key) in self.security.api_keys.iter().enumerate() {

@@ -392,7 +392,7 @@ async fn active_namespace_stale_manifest_body_fails_fetch_loudly() {
     let harness = TestHarness::new().await;
     let (store, stale_manifest) = StaleManifestOnceStore::wrap(&harness.store);
     let (base_url, _cache, _cache_dir, admin_bearer) =
-        start_test_server_on_store(store, Some(harness.prefix.clone())).await;
+        start_test_server_on_store(&harness, store, Some(harness.prefix.clone())).await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);
     let namespace = create_ns_api_with(
         &client,

@@ -53,7 +53,8 @@ async fn build_app_refuses_dead_s3_when_fail_fast_enabled() {
         .expect("dead-endpoint startup probe should finish quickly");
 
     let message = match result {
-        Ok((_router, shutdown_tx, compaction_handle)) => {
+        Ok((_router, shutdown_tx, compaction_handle, audit_runtime)) => {
+            let _ = audit_runtime.shutdown().await;
             let _ =
                 shutdown_background_tasks(shutdown_tx, compaction_handle, Duration::from_secs(1))
                     .await;
@@ -79,13 +80,14 @@ async fn build_app_allows_dead_s3_when_fail_fast_disabled() {
     let mut config = dead_s3_config(endpoint, &cache_dir);
     config.storage.fail_fast = false;
 
-    let (router, shutdown_tx, compaction_handle) =
+    let (router, shutdown_tx, compaction_handle, audit_runtime) =
         tokio::time::timeout(Duration::from_secs(5), build_app(config))
             .await
             .expect("opted-out startup should finish quickly")
             .expect("storage.fail_fast=false should allow degraded boot");
     drop(router);
 
+    audit_runtime.shutdown().await.unwrap();
     shutdown_background_tasks(shutdown_tx, compaction_handle, Duration::from_secs(1))
         .await
         .unwrap();
@@ -97,10 +99,11 @@ async fn idle_shutdown_joins_background_compaction_without_fixed_sleep() {
     let cache_dir = tempfile::TempDir::new().unwrap();
     let config = local_config(&storage_dir, &cache_dir);
 
-    let (router, shutdown_tx, compaction_handle) = build_app(config).await.unwrap();
+    let (router, shutdown_tx, compaction_handle, audit_runtime) = build_app(config).await.unwrap();
     drop(router);
 
     let start = Instant::now();
+    audit_runtime.shutdown().await.unwrap();
     shutdown_background_tasks(shutdown_tx, compaction_handle, Duration::from_secs(30))
         .await
         .unwrap();

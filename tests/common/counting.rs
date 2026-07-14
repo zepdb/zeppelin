@@ -4,12 +4,14 @@
 //! Wraps the harness's real backend (S3/MinIO/memory), so tests still hit
 //! real object storage — the wrapper only observes.
 //!
-//! F1/H12: in addition to per-key counts, every GET and PUT is attributed to
-//! an [`ArtifactClass`] bucket
+//! F1/H12: in addition to per-key counts, every domain GET and PUT is
+//! attributed to an [`ArtifactClass`] bucket
 //! (cluster_/attrs_/bootstrap/sq_/bitmap_/coarse_sketch/fts/wal/manifest) with BOTH
 //! operation counts and byte counts per bucket. GET bytes are the actual
 //! returned payload size (`GetResult::range`), PUT bytes the actual request
-//! body size (`PutPayload::content_length`).
+//! body size (`PutPayload::content_length`). Security audit objects remain
+//! visible through the per-key counters but are excluded from the frozen
+//! domain-artifact totals.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -142,6 +144,13 @@ pub fn classify(key: &str) -> ArtifactClass {
     } else {
         ArtifactClass::Other
     }
+}
+
+/// Whether `key` belongs to the security audit control plane rather than a
+/// namespace's frozen domain-artifact cost model.
+#[must_use]
+pub fn is_audit_key(key: &str) -> bool {
+    key == "_audit" || key.starts_with("_audit/")
 }
 
 /// Ops + bytes recorded for a single artifact class.
@@ -415,9 +424,11 @@ impl ObjectStore for CountingStore {
             .entry(location.to_string())
             .and_modify(|v| *v += 1)
             .or_insert(1);
-        self.counter
-            .classes
-            .record_put(classify(location.as_ref()), payload.content_length() as u64);
+        if !is_audit_key(location.as_ref()) {
+            self.counter
+                .classes
+                .record_put(classify(location.as_ref()), payload.content_length() as u64);
+        }
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -433,6 +444,7 @@ impl ObjectStore for CountingStore {
     // `get_range`, and `get_ranges` default impls delegate here).
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
         let class = classify(location.as_ref());
+        let is_audit = is_audit_key(location.as_ref());
         self.counter
             .gets
             .entry(location.to_string())
@@ -440,12 +452,16 @@ impl ObjectStore for CountingStore {
             .or_insert(1);
         // Count attempts before the backend returns so conditional 304-style
         // freshness checks are visible as GET ops with zero returned bytes.
-        self.counter.classes.record_get_attempt(class);
+        if !is_audit {
+            self.counter.classes.record_get_attempt(class);
+        }
         let result = self.inner.get_opts(location, options).await?;
         // `GetResult::range` is the byte range actually returned (the whole
         // object for plain GETs, the requested slice for range GETs).
         let bytes = (result.range.end - result.range.start) as u64;
-        self.counter.classes.record_get_bytes(class, bytes);
+        if !is_audit {
+            self.counter.classes.record_get_bytes(class, bytes);
+        }
         Ok(result)
     }
 
@@ -512,7 +528,7 @@ mod tests {
         PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as OsResult,
     };
 
-    use super::{counting_store, perf_counting_store};
+    use super::{counting_store, is_audit_key, perf_counting_store, ArtifactClass};
     use zeppelin::storage::ZeppelinStore;
 
     #[derive(Debug)]
@@ -636,5 +652,50 @@ mod tests {
             expected
         );
         assert_eq!(probe.native_stream_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn audit_puts_remain_key_visible_but_do_not_change_domain_totals() {
+        let base = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let (counted, counter) = perf_counting_store(&base);
+        let backend = counted.inner();
+
+        backend
+            .put(
+                &Path::from("namespace/meta.json"),
+                PutPayload::from_static(b"domain"),
+            )
+            .await
+            .expect("write domain object");
+        backend
+            .put(
+                &Path::from("_audit/2026-07-13/node/record.jsonl"),
+                PutPayload::from_static(b"audit"),
+            )
+            .await
+            .expect("write audit object");
+
+        assert_eq!(counter.puts_matching("_audit/"), 1);
+        assert_eq!(counter.puts_for(ArtifactClass::Other), 1);
+        assert_eq!(counter.put_bytes_for(ArtifactClass::Other), 6);
+        assert_eq!(
+            counter
+                .class_breakdown()
+                .values()
+                .map(|s| s.put_ops)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            counter
+                .class_breakdown()
+                .values()
+                .map(|s| s.put_bytes)
+                .sum::<u64>(),
+            6
+        );
+        assert!(is_audit_key("_audit/day/node/object.jsonl"));
+        assert!(!is_audit_key("tenant/_audit/object.jsonl"));
+        assert!(!is_audit_key("_audit2/object.jsonl"));
     }
 }

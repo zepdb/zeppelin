@@ -1349,6 +1349,12 @@ impl NamespaceManager {
 
         for prefix in &namespace_prefixes {
             let ns_name = prefix.trim_end_matches('/');
+            // Reserved control-plane roots such as `_audit/` are not namespace
+            // candidates. Filtering with the same creation grammar avoids an
+            // unnecessary `<reserved>/meta.json` GET on every stateless boot.
+            if !is_valid_namespace_name(ns_name) {
+                continue;
+            }
             if seen.insert(ns_name.to_string()) {
                 match self.read_metadata_from_s3(ns_name).await {
                     Ok(meta) => {

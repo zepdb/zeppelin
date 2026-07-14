@@ -9,17 +9,14 @@
 mod common;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
 use common::counting::{counting_store, ArtifactClass, GetCounter};
 use common::harness::TestHarness;
 use common::server::{cleanup_ns, create_ns_api_fts, create_ns_api_with};
 use dashmap::DashMap;
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
 
 use zeppelin::cache::decoded_cache::DecodedArtifactCache;
 use zeppelin::cache::manifest_cache::ManifestCache;
@@ -49,20 +46,6 @@ struct CountingApiServer {
     compactor: Arc<Compactor>,
     _cache: Arc<DiskCache>,
     _cache_dir: tempfile::TempDir,
-}
-
-async fn spawn_router(app: Router) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
-    format!("http://{addr}")
 }
 
 async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
@@ -102,11 +85,14 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
     let fragment_cache = Arc::new(WalFragmentCache::new(
         config.cache.wal_fragment_cache_max_mb * 1024 * 1024,
     ));
+    let (audit, audit_runtime, _audit_node_id) =
+        common::server::start_test_audit(&config, &store, Some(&harness.prefix));
 
     let app = build_router(AppState {
         store: store.clone(),
         clock: zeppelin::time::Clock::system(),
         security,
+        audit,
         credential_adapter,
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
         namespace_name_prefix: None,
@@ -129,7 +115,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         query_semaphore,
         rate_limiters: Arc::new(DashMap::new()),
     });
-    let base_url = spawn_router(app).await;
+    let base_url = common::server::spawn_test_router(&harness, app, audit_runtime).await;
 
     CountingApiServer {
         base_url,

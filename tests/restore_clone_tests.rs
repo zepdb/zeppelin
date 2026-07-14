@@ -452,7 +452,7 @@ async fn clone_copy_failure_cleans_target_and_allows_retry() {
     let harness = common::harness::TestHarness::new().await;
     let (failing_store, failures) = fail_copy_once_matching(&harness.store, "/wal/");
     let (base_url, _cache, _cache_dir, admin_bearer) =
-        start_test_server_on_store(failing_store, None).await;
+        start_test_server_on_store(&harness, failing_store, None).await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
         &client,
@@ -592,7 +592,7 @@ async fn clone_holds_internal_source_pin_while_copying() {
     let harness = common::harness::TestHarness::new().await;
     let (asserting_store, snapshot_observer) = assert_snapshot_on_copy(&harness.store);
     let (base_url, _cache, _cache_dir, admin_bearer) =
-        start_test_server_on_store(asserting_store, None).await;
+        start_test_server_on_store(&harness, asserting_store, None).await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
         &client,

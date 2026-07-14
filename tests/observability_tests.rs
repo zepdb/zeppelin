@@ -9,6 +9,72 @@ use common::vectors::{clustered_vectors, random_vectors};
 use zeppelin::wal::manifest::Manifest;
 use zeppelin::wal::{WalReader, WalWriter};
 
+#[derive(Clone)]
+struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|_| panic!("captured log buffer lock poisoned"))
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn bearer_secret_is_not_recorded_in_handler_spans() {
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer({
+            let captured = std::sync::Arc::clone(&captured);
+            move || CapturedLogWriter(std::sync::Arc::clone(&captured))
+        })
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (base_url, harness, admin_bearer) = start_test_server().await;
+                let client = crate::common::server::client_with_bearer(&admin_bearer);
+                let namespace = create_ns_api(&client, &base_url, 2).await;
+
+                let response = client
+                    .post(format!("{base_url}/v1/namespaces/{namespace}/vectors"))
+                    .json(&serde_json::json!({
+                        "vectors": [{"id": "redaction-probe", "values": [1.0, 0.0]}]
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 200);
+
+                cleanup_ns(&harness.store, &namespace).await;
+                harness.cleanup().await;
+
+                let output = String::from_utf8(
+                    captured
+                        .lock()
+                        .unwrap_or_else(|_| panic!("captured log buffer lock poisoned"))
+                        .clone(),
+                )
+                .unwrap();
+                assert!(
+                    !output.contains(&admin_bearer),
+                    "bearer material leaked into tracing output"
+                );
+            });
+    });
+}
+
 // --- Test 1: HTTP request metrics are incremented after API calls ---
 
 #[tokio::test]
@@ -630,6 +696,14 @@ async fn test_all_metrics_registered() {
         .with_label_values(&["__test__", "capacity"])
         .inc();
     SECURITY_MODE.with_label_values(&["enforced"]).set(1);
+    AUTH_FAILURES_TOTAL
+        .with_label_values(&["credential_unknown"])
+        .inc();
+    AUTHZ_DENIALS_TOTAL
+        .with_label_values(&["NamespaceDelete"])
+        .inc();
+    AUDIT_RECORDS_TOTAL.with_label_values(&["success"]).inc();
+    AUDIT_FLUSH_FAILURES_TOTAL.inc();
 
     let families = prometheus::gather();
     let names: Vec<String> = families.iter().map(|f| f.name().to_string()).collect();
@@ -652,6 +726,10 @@ async fn test_all_metrics_registered() {
         "zeppelin_hydration_required_bytes",
         "zeppelin_hydration_refusal_logs_total",
         "zeppelin_security_mode",
+        "zeppelin_auth_failures_total",
+        "zeppelin_authz_denials_total",
+        "zeppelin_audit_records_total",
+        "zeppelin_audit_flush_failures_total",
         "zeppelin_cache_entries",
         "zeppelin_cache_evictions_total",
         "zeppelin_active_queries",

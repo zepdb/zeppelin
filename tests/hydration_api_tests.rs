@@ -1,6 +1,5 @@
 mod common;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -11,7 +10,6 @@ use common::vectors::random_vectors;
 use dashmap::DashMap;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
 use zeppelin::cache::decoded_cache::DecodedArtifactCache;
 use zeppelin::cache::hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator};
 use zeppelin::cache::manifest_cache::ManifestCache;
@@ -115,10 +113,13 @@ async fn start_api_server(mut config: Config) -> ApiServer {
     let fragment_cache = Arc::new(WalFragmentCache::new(
         config.cache.wal_fragment_cache_max_mb * 1024 * 1024,
     ));
+    let (audit, audit_runtime, _audit_node_id) =
+        common::server::start_test_audit(&config, &store, Some(&harness.prefix));
     let state = AppState {
         store: store.clone(),
         clock: zeppelin::time::Clock::system(),
         security,
+        audit,
         credential_adapter,
         namespace_manager: Arc::new(NamespaceManager::new(store.clone())),
         namespace_name_prefix: None,
@@ -143,17 +144,7 @@ async fn start_api_server(mut config: Config) -> ApiServer {
     };
 
     let app = build_router(state);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let base_url = format!("http://{addr}");
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
-    });
+    let base_url = common::server::spawn_test_router(&harness, app, audit_runtime).await;
 
     ApiServer {
         base_url,

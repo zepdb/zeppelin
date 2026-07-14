@@ -7,6 +7,8 @@ use ulid::Ulid;
 
 use crate::types::{AttributeValue, Filter};
 
+use super::Action;
+
 /// Collision-resistant identity shared by authorization and audit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -159,17 +161,61 @@ pub struct AllowDecision {
 }
 
 impl AllowDecision {
-    /// Construct the full-shaped, unconstrained phase-1 allow value.
+    /// Construct the full-shaped boot-policy allow value for one action.
+    ///
+    /// Phase 2 attaches the baseline durable-audit obligation here so the
+    /// kernel's decision remains the single source of pre-success work.
     #[must_use]
-    pub fn boot() -> Self {
+    pub fn boot(action: Action) -> Self {
+        let obligations = if matches!(
+            action,
+            Action::RuntimeConfigWrite
+                | Action::NamespaceDelete
+                | Action::SnapshotDelete
+                | Action::IndexConfigWrite
+                | Action::VectorDelete
+        ) {
+            vec![Obligation::DurableAudit]
+        } else {
+            Vec::new()
+        };
         Self {
             decision_id: DecisionId::new(),
             policy_version: PolicyVersion::BOOT,
             mandatory_filter: None,
             field_mask: None,
             write_constraints: WriteConstraints::none(),
-            obligations: Vec::new(),
+            obligations,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AllowDecision, Obligation};
+    use crate::security::Action;
+
+    #[test]
+    fn phase_two_durable_audit_obligation_inventory_is_exact() {
+        let durable = Action::ALL
+            .into_iter()
+            .filter(|action| {
+                AllowDecision::boot(*action)
+                    .obligations
+                    .contains(&Obligation::DurableAudit)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            durable,
+            vec![
+                Action::RuntimeConfigWrite,
+                Action::NamespaceDelete,
+                Action::SnapshotDelete,
+                Action::IndexConfigWrite,
+                Action::VectorDelete,
+            ]
+        );
     }
 }
 
