@@ -10,6 +10,7 @@ use common::server::{cleanup_ns, create_ns_api_with};
 use dashmap::DashMap;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use zeppelin::cache::decoded_cache::DecodedArtifactCache;
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::Compactor;
@@ -74,6 +75,9 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
         compactor: compactor.clone(),
         lease_manager,
         fragment_cache,
+        decoded_artifact_cache: Arc::new(DecodedArtifactCache::new(
+            config.cache.decoded_artifact_cache_max_mb * 1024 * 1024,
+        )),
         query_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.server.max_concurrent_queries,
         )),

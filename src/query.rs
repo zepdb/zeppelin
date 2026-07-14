@@ -133,6 +133,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tracing::{debug, instrument};
 
+use crate::cache::decoded_cache::DecodedArtifactCache;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::{with_cache_diagnostics, CacheDiagnostics, DiskCache};
 use crate::error::Result;
@@ -1941,8 +1942,9 @@ async fn segment_search(
 ///
 /// # Side Effects
 ///
-/// Reads current authority and immutable artifacts, may populate three distinct
-/// caches, evicts compacted fragment entries from the WAL FTS cache, emits
+/// Reads current authority and immutable artifacts, may populate the manifest,
+/// byte, decoded-WAL, WAL-FTS, and decoded-segment caches, evicts compacted
+/// fragment entries from the WAL FTS cache, emits
 /// tracing, and may emit an operator warning for the old full-scan path.
 ///
 /// # Consistency
@@ -1985,6 +1987,7 @@ async fn segment_search(
         manifest_cache,
         fts_cache,
         fragment_cache,
+        decoded_artifact_cache,
         cache
     ),
     fields(namespace = namespace)
@@ -2002,6 +2005,7 @@ pub async fn execute_bm25_query(
     manifest_cache: Option<&Arc<ManifestCache>>,
     fts_cache: Option<&Arc<WalFtsCache>>,
     fragment_cache: Option<&Arc<WalFragmentCache>>,
+    decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -2020,6 +2024,7 @@ pub async fn execute_bm25_query(
         last_as_prefix,
         fts_cache,
         fragment_cache,
+        decoded_artifact_cache,
         cache,
         max_full_scan_clusters,
         max_full_scan_vectors,
@@ -2048,6 +2053,8 @@ pub async fn execute_bm25_query(
 /// - `consistency`: WAL inclusion policy applied within the supplied snapshot.
 /// - `last_as_prefix`: Whether the final query token is a prefix.
 /// - `fts_cache`: Optional shared WAL lexical cache.
+/// - `fragment_cache`: Optional decoded immutable WAL memo.
+/// - `decoded_artifact_cache`: Optional decoded immutable segment FTS memo.
 /// - `cache`: Optional immutable-object disk cache.
 /// - `max_full_scan_clusters`: Old-index cluster fan-out limit, or zero.
 /// - `max_full_scan_vectors`: Old-index vector-count limit, or zero.
@@ -2081,6 +2088,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
     fragment_cache: Option<&Arc<WalFragmentCache>>,
+    decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -2099,6 +2107,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
         last_as_prefix,
         fts_cache,
         fragment_cache,
+        decoded_artifact_cache,
         cache,
         max_full_scan_clusters,
         max_full_scan_vectors,
@@ -2149,6 +2158,7 @@ pub(crate) async fn execute_bm25_query_with_manifest_debug(
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
     fragment_cache: Option<&Arc<WalFragmentCache>>,
+    decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -2167,6 +2177,7 @@ pub(crate) async fn execute_bm25_query_with_manifest_debug(
         last_as_prefix,
         fts_cache,
         fragment_cache,
+        decoded_artifact_cache,
         cache,
         max_full_scan_clusters,
         max_full_scan_vectors,
@@ -2211,6 +2222,7 @@ async fn execute_bm25_query_with_manifest_inner(
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
     fragment_cache: Option<&Arc<WalFragmentCache>>,
+    decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -2233,6 +2245,7 @@ async fn execute_bm25_query_with_manifest_inner(
                 last_as_prefix,
                 fts_cache,
                 fragment_cache,
+                decoded_artifact_cache,
                 cache,
                 max_full_scan_clusters,
                 max_full_scan_vectors,
@@ -2256,6 +2269,7 @@ async fn execute_bm25_query_with_manifest_inner(
         last_as_prefix,
         fts_cache,
         fragment_cache,
+        decoded_artifact_cache,
         cache,
         max_full_scan_clusters,
         max_full_scan_vectors,
@@ -2309,7 +2323,8 @@ async fn execute_bm25_query_with_manifest_inner(
 /// WAL and segment futures overlap. When uncompacted fragments exist, segment
 /// search requests an unbounded intermediate frontier (`usize::MAX`) so later
 /// suppression cannot underfill BM25 results; final merge bounds it to `top_k`.
-/// The global index avoids scanning all clusters.
+/// The global index avoids scanning all clusters. A decoded-artifact cache hit
+/// also avoids reparsing the immutable global or legacy per-cluster FTS bytes.
 ///
 /// # Examples
 ///
@@ -2335,6 +2350,7 @@ async fn execute_bm25_query_with_manifest_scoped(
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
     fragment_cache: Option<&Arc<WalFragmentCache>>,
+    decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -2453,6 +2469,7 @@ async fn execute_bm25_query_with_manifest_scoped(
                     fts_configs,
                     filter,
                     last_as_prefix,
+                    decoded_artifact_cache,
                     cache,
                     max_full_scan_clusters,
                     max_full_scan_vectors,
@@ -2808,6 +2825,7 @@ async fn segment_bm25_search(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -2825,6 +2843,7 @@ async fn segment_bm25_search(
             fts_configs,
             filter,
             last_as_prefix,
+            decoded_artifact_cache,
             cache,
             top_k,
             include_attributes,
@@ -2856,6 +2875,7 @@ async fn segment_bm25_search(
         fts_configs,
         filter,
         last_as_prefix,
+        decoded_artifact_cache,
         cache,
         top_k,
         include_attributes,
@@ -2942,6 +2962,7 @@ async fn segment_bm25_search_global(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
     cache: Option<&Arc<DiskCache>>,
     top_k: usize,
     include_attributes: bool,
@@ -2952,10 +2973,18 @@ async fn segment_bm25_search_global(
 
     let segment_id = &segment_ref.id;
 
-    // Load global FTS index (1 S3 GET, ~50KB)
+    // Load and decode the global FTS index once per retained immutable key.
     let gkey = global_fts_key(namespace, segment_id);
-    let global_data = fetch_query_object(cache, store, &gkey).await?;
-    let global_index = GlobalInvertedIndex::from_bytes(&global_data)?;
+    let global_index = match decoded_artifact_cache {
+        Some(decoded_cache) => {
+            decoded_cache
+                .get_or_decode_global_fts(&gkey, || fetch_query_object(cache, store, &gkey))
+                .await?
+        }
+        None => Arc::new(GlobalInvertedIndex::from_bytes(
+            &fetch_query_object(cache, store, &gkey).await?,
+        )?),
+    };
 
     let field_queries = rank_by.extract_field_queries();
 
@@ -3374,6 +3403,7 @@ async fn segment_bm25_search_full_scan(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     filter: Option<&Filter>,
     last_as_prefix: bool,
+    decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
     cache: Option<&Arc<DiskCache>>,
     top_k: usize,
     include_attributes: bool,
@@ -3384,7 +3414,7 @@ async fn segment_bm25_search_full_scan(
     let fts_fields = &segment_ref.fts_fields;
 
     // Load the IVF-Flat index using manifest metadata to skip cluster probing.
-    // BM25 full-scan is a cold fallback path — no cache handle is threaded here.
+    // The decoded FTS memo is separate from this index-metadata load.
     let index = IvfFlatIndex::load_from_manifest(
         store,
         namespace,
@@ -3414,18 +3444,30 @@ async fn segment_bm25_search_full_scan(
         let akey = attrs_key(namespace, owner, cluster_idx);
         let ckey = crate::index::ivf_flat::build::cluster_key(namespace, owner, cluster_idx);
         async move {
+            let fts_future = async {
+                match decoded_artifact_cache {
+                    Some(decoded_cache) => {
+                        decoded_cache
+                            .get_or_decode_cluster_fts(&fts_key, || {
+                                fetch_query_object(cache, store, &fts_key)
+                            })
+                            .await
+                    }
+                    None => Ok(Arc::new(InvertedIndex::from_bytes(
+                        &fetch_query_object(cache, store, &fts_key).await?,
+                    )?)),
+                }
+            };
             if load_attrs {
                 let (fts_res, attrs_res, cluster_res) = tokio::join!(
-                    fetch_query_object(cache, store, &fts_key),
+                    fts_future,
                     fetch_query_object(cache, store, &akey),
                     fetch_query_object(cache, store, &ckey),
                 );
                 (cluster_idx, fts_res, Some(attrs_res), cluster_res)
             } else {
-                let (fts_res, cluster_res) = tokio::join!(
-                    fetch_query_object(cache, store, &fts_key),
-                    fetch_query_object(cache, store, &ckey),
-                );
+                let (fts_res, cluster_res) =
+                    tokio::join!(fts_future, fetch_query_object(cache, store, &ckey),);
                 (cluster_idx, fts_res, None, cluster_res)
             }
         }
@@ -3434,12 +3476,10 @@ async fn segment_bm25_search_full_scan(
 
     // Process prefetched results — CPU-bound, no I/O.
     for (_cluster_idx, fts_res, attrs_res, cluster_res) in prefetched {
-        let fts_data = match fts_res {
-            Ok(data) => data,
+        let inv_index = match fts_res {
+            Ok(index) => index,
             Err(e) => return Err(e),
         };
-
-        let inv_index = InvertedIndex::from_bytes(&fts_data)?;
 
         let cluster_attrs = match attrs_res {
             Some(Ok(data)) => Some(deserialize_attrs(&data)?),
@@ -4059,6 +4099,7 @@ mod tests {
             None,
             false,
             None,
+            None,
             500,
             100_000,
             10,
@@ -4133,6 +4174,7 @@ mod tests {
             None,
             false,
             None,
+            None,
             500,
             100_000,
             10,
@@ -4174,6 +4216,7 @@ mod tests {
             &fts_configs,
             None,
             false,
+            None,
             None,
             0,
             0,

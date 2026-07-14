@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use zeppelin::cache::decoded_cache::DecodedArtifactCache;
 use zeppelin::cache::hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator};
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
@@ -121,6 +122,9 @@ async fn start_api_server(config: Config) -> ApiServer {
         compactor: compactor.clone(),
         lease_manager,
         fragment_cache,
+        decoded_artifact_cache: Arc::new(DecodedArtifactCache::new(
+            config.cache.decoded_artifact_cache_max_mb * 1024 * 1024,
+        )),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,

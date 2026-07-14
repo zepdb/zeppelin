@@ -107,6 +107,7 @@ use dashmap::DashMap;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 
+use crate::cache::decoded_cache::DecodedArtifactCache;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::{
     hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator},
@@ -301,6 +302,7 @@ pub async fn build_app(
         cache_dir = %config.cache.dir.display(),
         cache_max_size_gb = config.cache.max_size_gb,
         wal_fragment_cache_max_mb = config.cache.wal_fragment_cache_max_mb,
+        decoded_artifact_cache_max_mb = config.cache.decoded_artifact_cache_max_mb,
         compaction_interval_secs = config.compaction.interval_secs,
         max_wal_fragments = config.compaction.max_wal_fragments_before_compact,
         max_wal_age_secs = config.compaction.max_wal_age_before_compact_secs,
@@ -490,6 +492,17 @@ pub async fn build_app(
             )
         })?;
     let fragment_cache = Arc::new(WalFragmentCache::new(fragment_cache_max_bytes));
+    let decoded_artifact_cache_max_bytes = config
+        .cache
+        .decoded_artifact_cache_max_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| {
+            ZeppelinError::Config(
+                "cache.decoded_artifact_cache_max_mb overflows the platform byte size".to_string(),
+            )
+        })?;
+    let decoded_artifact_cache =
+        Arc::new(DecodedArtifactCache::new(decoded_artifact_cache_max_bytes));
 
     // Runtime query config uses a std-only RwLock<Arc<_>> snapshot holder.
     // Bounds remain boot-time values so mutable defaults cannot outgrow limits.
@@ -534,6 +547,7 @@ pub async fn build_app(
         hydrator,
         fts_cache,
         fragment_cache,
+        decoded_artifact_cache,
         query_semaphore,
         rate_limiters,
     };

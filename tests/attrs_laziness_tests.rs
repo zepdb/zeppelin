@@ -21,6 +21,7 @@ use dashmap::DashMap;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
+use zeppelin::cache::decoded_cache::DecodedArtifactCache;
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::Compactor;
@@ -109,6 +110,9 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         compactor: compactor.clone(),
         lease_manager,
         fragment_cache,
+        decoded_artifact_cache: Arc::new(DecodedArtifactCache::new(
+            config.cache.decoded_artifact_cache_max_mb * 1024 * 1024,
+        )),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,

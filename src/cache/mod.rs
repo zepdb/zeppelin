@@ -142,6 +142,8 @@
 //! runtime check while `Send + Sync + 'static` prevents storing a borrowed or
 //! thread-unsafe value in this process-wide concurrent cache.
 
+/// Bounded decoded memo for immutable segment FTS artifacts.
+pub mod decoded_cache;
 /// Warm-set hydration policy and worker support.
 pub mod hydration;
 /// Manifest-level TTL cache to avoid repeated S3 reads.

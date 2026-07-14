@@ -824,6 +824,14 @@ async fn run_scenario_inner(
             // pre-state or leak observer state from a prior measurement.
             measured_server.clear_wal_fragment_cache();
         }
+        if !world.repeat_cache_keys.is_empty() {
+            // Frozen contracts that invalidate selected immutable byte-cache
+            // entries define every repeat against that cold byte pre-state.
+            // Mirror the same boundary in the decoded FTS tier so priming or a
+            // prior repeat cannot hide a contracted object-store GET. The
+            // ignored ideal catalog remains free to measure true warm reuse.
+            measured_server.clear_decoded_artifact_cache();
+        }
         for key in world
             .eventual_wal_keys
             .iter()

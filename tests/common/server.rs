@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use super::harness::TestHarness;
 
+use zeppelin::cache::decoded_cache::DecodedArtifactCache;
 use zeppelin::cache::hydration::{heat_policy_from_config, HydrationConfig, SegmentHydrator};
 use zeppelin::cache::manifest_cache::ManifestCache;
 use zeppelin::cache::DiskCache;
@@ -34,6 +35,15 @@ fn test_fragment_cache(config: &Config) -> Arc<WalFragmentCache> {
         .checked_mul(1024 * 1024)
         .expect("test WAL fragment cache capacity overflow");
     Arc::new(WalFragmentCache::new(max_bytes))
+}
+
+fn test_decoded_artifact_cache(config: &Config) -> Arc<DecodedArtifactCache> {
+    let max_bytes = config
+        .cache
+        .decoded_artifact_cache_max_mb
+        .checked_mul(1024 * 1024)
+        .expect("test decoded artifact cache capacity overflow");
+    Arc::new(DecodedArtifactCache::new(max_bytes))
 }
 
 /// Returns whether the current future belongs to a spawned compaction loop.
@@ -174,6 +184,7 @@ async fn start_test_server_with_config_inner(
         compactor,
         lease_manager,
         fragment_cache: test_fragment_cache(&config),
+        decoded_artifact_cache: test_decoded_artifact_cache(&config),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -240,6 +251,7 @@ pub async fn start_test_server_on_store(
         compactor,
         lease_manager,
         fragment_cache: test_fragment_cache(&config),
+        decoded_artifact_cache: test_decoded_artifact_cache(&config),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -312,6 +324,7 @@ pub async fn start_test_server_with_compactor(
         compactor: compactor.clone(),
         lease_manager,
         fragment_cache: test_fragment_cache(&config),
+        decoded_artifact_cache: test_decoded_artifact_cache(&config),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -414,6 +427,7 @@ pub async fn start_test_server_with_compaction(
         compactor,
         lease_manager,
         fragment_cache: test_fragment_cache(&config),
+        decoded_artifact_cache: test_decoded_artifact_cache(&config),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -528,6 +542,7 @@ pub struct FullTestServer {
     pub lease_manager: Arc<LeaseManager>,
     pub manifest_cache: Arc<ManifestCache>,
     fragment_cache: Arc<WalFragmentCache>,
+    decoded_artifact_cache: Arc<DecodedArtifactCache>,
     wal_writer: Arc<WalWriter>,
     pub shutdown_compaction: Option<tokio::sync::watch::Sender<bool>>,
     pub compaction_loop_task: Option<JoinHandle<()>>,
@@ -539,6 +554,35 @@ impl FullTestServer {
     /// Drop disposable decoded WAL state between isolated measured rounds.
     pub fn clear_wal_fragment_cache(&self) {
         self.fragment_cache.clear();
+    }
+
+    /// Drop disposable decoded segment FTS state between isolated rounds.
+    pub fn clear_decoded_artifact_cache(&self) {
+        self.decoded_artifact_cache.clear();
+    }
+
+    /// Return successful segment FTS decodes since server construction.
+    #[must_use]
+    pub fn decoded_artifact_cache_decode_count(&self) -> u64 {
+        self.decoded_artifact_cache.decode_count()
+    }
+
+    /// Return successful global FTS decodes since server construction.
+    #[must_use]
+    pub fn decoded_artifact_cache_global_decode_count(&self) -> u64 {
+        self.decoded_artifact_cache.global_decode_count()
+    }
+
+    /// Return successful legacy cluster FTS decodes since construction.
+    #[must_use]
+    pub fn decoded_artifact_cache_cluster_decode_count(&self) -> u64 {
+        self.decoded_artifact_cache.cluster_decode_count()
+    }
+
+    /// Return the number of retained decoded segment FTS objects.
+    #[must_use]
+    pub fn decoded_artifact_cache_len(&self) -> usize {
+        self.decoded_artifact_cache.len()
     }
 
     /// Drop disposable per-namespace writer state between measured test rounds.
@@ -662,6 +706,7 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let wal_writer = Arc::new(WalWriter::with_clock(store.clone(), clock.clone()));
     let fragment_cache = test_fragment_cache(&config);
+    let decoded_artifact_cache = test_decoded_artifact_cache(&config);
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
@@ -672,6 +717,7 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
         compactor: compactor.clone(),
         lease_manager: lease_manager.clone(),
         fragment_cache: Arc::clone(&fragment_cache),
+        decoded_artifact_cache: Arc::clone(&decoded_artifact_cache),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -712,6 +758,7 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
         lease_manager,
         manifest_cache,
         fragment_cache,
+        decoded_artifact_cache,
         wal_writer,
         shutdown_compaction,
         compaction_loop_task,

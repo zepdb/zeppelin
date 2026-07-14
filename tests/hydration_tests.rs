@@ -557,6 +557,7 @@ async fn test_hydration_includes_global_fts_index() {
         None,
         None,
         None,
+        None,
         Some(&cache),
         0,
         0,

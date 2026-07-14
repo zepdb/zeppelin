@@ -96,6 +96,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{Instrument, Level};
 
+use crate::cache::decoded_cache::DecodedArtifactCache;
 use crate::cache::hydration::SegmentHydrator;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::DiskCache;
@@ -298,6 +299,8 @@ pub struct AppState {
     pub fts_cache: Arc<WalFtsCache>,
     /// Bounded disposable memo of decoded immutable WAL fragments.
     pub fragment_cache: Arc<WalFragmentCache>,
+    /// Bounded disposable memo of decoded immutable segment FTS artifacts.
+    pub decoded_artifact_cache: Arc<DecodedArtifactCache>,
     /// Non-blocking admission semaphore for in-flight query handlers.
     pub query_semaphore: Arc<Semaphore>,
     /// Concurrent, process-local token buckets keyed by client and traffic class.

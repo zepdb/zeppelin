@@ -40,6 +40,7 @@
 # dir = "/var/cache/zeppelin"        # ZEPPELIN_CACHE_DIR
 # max_size_gb = 50                   # ZEPPELIN_CACHE_MAX_SIZE_GB
 # wal_fragment_cache_max_mb = 128    # ZEPPELIN_WAL_FRAGMENT_CACHE_MAX_MB; 0 disables decoded memo
+# decoded_artifact_cache_max_mb = 64 # ZEPPELIN_DECODED_ARTIFACT_CACHE_MAX_MB; 0 disables FTS decode memo
 # namespace_registry_ttl_ms = 5000   # positive cache TTL for namespace metadata
 # hydration_enabled = false
 # hydration_policy = "session_window"       # ZEPPELIN_HYDRATION_POLICY
