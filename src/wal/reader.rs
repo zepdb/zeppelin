@@ -79,6 +79,7 @@ use crate::error::{Result, ZeppelinError};
 use crate::storage::ZeppelinStore;
 
 use super::fragment::WalFragment;
+use super::fragment_cache::WalFragmentCache;
 use super::manifest::{FragmentRef, Manifest};
 
 /// Cache behavior for a batch of immutable WAL fragment reads.
@@ -419,6 +420,48 @@ impl WalReader {
         Ok(fragments)
     }
 
+    /// Reads query-visible refs while memoizing successful decoded fragments.
+    ///
+    /// Manifest selection remains the caller's responsibility. A decoded-cache
+    /// hit is used only for an exact referenced ULID and bypasses both the byte
+    /// cache and object storage. Misses retain the normal fail-loud read and
+    /// validation path; decode errors are returned and never inserted.
+    #[instrument(skip(self, refs, cache_policy, fragment_cache), fields(namespace = namespace, ref_count = refs.len(), cache_policy = cache_policy.name(), decoded_cache = fragment_cache.is_some()))]
+    pub async fn read_query_fragments_from_refs_unchecked(
+        &self,
+        namespace: &str,
+        refs: &[FragmentRef],
+        cache_policy: FragmentCachePolicy<'_>,
+        fragment_cache: Option<&Arc<WalFragmentCache>>,
+    ) -> Result<Vec<Arc<WalFragment>>> {
+        let results = futures::future::join_all(refs.iter().map(|fref| async move {
+            if let Some(cache) = fragment_cache {
+                if let Some(fragment) = cache.get(&fref.id) {
+                    return Ok(fragment);
+                }
+            }
+
+            let fragment = Arc::new(
+                self.read_fragment_unchecked_with_cache(namespace, &fref.id, cache_policy)
+                    .await?,
+            );
+            if let Some(cache) = fragment_cache {
+                cache.insert_decoded(namespace, Arc::clone(&fragment));
+            }
+            Ok(fragment)
+        }))
+        .await;
+
+        let fragments = self
+            .finish_fragment_results(namespace, refs, results)
+            .await?;
+        debug!(
+            fragment_count = fragments.len(),
+            "read query fragments from refs"
+        );
+        Ok(fragments)
+    }
+
     /// Computes the effective tombstone IDs from delete-bearing refs only.
     ///
     /// Eventual queries use this to hide deleted segment results without fetching
@@ -468,12 +511,13 @@ impl WalReader {
     /// requires an explicit hash-table library and ownership policy for strings;
     /// Rust's set owns each cloned [`String`] and frees it automatically when the
     /// set drops.
-    #[instrument(skip(self, refs, cache_policy), fields(namespace = namespace, ref_count = refs.len(), cache_policy = cache_policy.name()))]
+    #[instrument(skip(self, refs, cache_policy, fragment_cache), fields(namespace = namespace, ref_count = refs.len(), cache_policy = cache_policy.name(), decoded_cache = fragment_cache.is_some()))]
     pub async fn read_delete_ids_from_refs_unchecked(
         &self,
         namespace: &str,
         refs: &[FragmentRef],
         cache_policy: FragmentCachePolicy<'_>,
+        fragment_cache: Option<&Arc<WalFragmentCache>>,
     ) -> Result<HashSet<String>> {
         let delete_refs: Vec<FragmentRef> = refs
             .iter()
@@ -491,7 +535,12 @@ impl WalReader {
         }
 
         let fragments = self
-            .read_fragments_from_refs_unchecked(namespace, &delete_refs, cache_policy)
+            .read_query_fragments_from_refs_unchecked(
+                namespace,
+                &delete_refs,
+                cache_policy,
+                fragment_cache,
+            )
             .await?;
         let mut deleted_ids = HashSet::new();
         for fragment in &fragments {
@@ -757,12 +806,12 @@ impl WalReader {
     /// If old refs `[A, B]` are being read while compaction publishes a manifest
     /// containing neither and GC removes `A`, the missing `A` can be skipped. If
     /// the fresh manifest still contains `A`, the method returns `NotFound`.
-    async fn finish_fragment_results(
+    async fn finish_fragment_results<T>(
         &self,
         namespace: &str,
         refs: &[FragmentRef],
-        results: Vec<Result<WalFragment>>,
-    ) -> Result<Vec<WalFragment>> {
+        results: Vec<Result<T>>,
+    ) -> Result<Vec<T>> {
         let mut fragments = Vec::new();
         let mut missing = Vec::new();
 

@@ -108,7 +108,7 @@ use crate::namespace::NamespaceManager;
 use crate::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
-use crate::wal::{LeaseManager, WalReader, WalWriter};
+use crate::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 use self::handlers::{config as config_handler, namespace, query, vectors, ApiError};
 
@@ -296,6 +296,8 @@ pub struct AppState {
     pub hydrator: Option<Arc<SegmentHydrator>>,
     /// Disposable in-memory cache for WAL-level full-text search indexes.
     pub fts_cache: Arc<WalFtsCache>,
+    /// Bounded disposable memo of decoded immutable WAL fragments.
+    pub fragment_cache: Arc<WalFragmentCache>,
     /// Non-blocking admission semaphore for in-flight query handlers.
     pub query_semaphore: Arc<Semaphore>,
     /// Concurrent, process-local token buckets keyed by client and traffic class.

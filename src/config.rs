@@ -396,6 +396,7 @@ mod tests {
                 "ZEPPELIN_CACHE_DIR",
                 "ZEPPELIN_CACHE_MAX_SIZE_GB",
                 "ZEPPELIN_MEMORY_CACHE_MAX_MB",
+                "ZEPPELIN_WAL_FRAGMENT_CACHE_MAX_MB",
                 "ZEPPELIN_MANIFEST_CACHE_TTL_MS",
                 "ZEPPELIN_NAMESPACE_REGISTRY_TTL_MS",
                 "ZEPPELIN_DEFAULT_NUM_CENTROIDS",
@@ -897,6 +898,29 @@ mod tests {
         assert_eq!(explicit.cache.hydration_max_segment_fraction, 0.25);
     }
 
+    #[test]
+    fn wal_fragment_cache_capacity_defaults_and_obeys_toml_and_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        assert_eq!(load_toml("").unwrap().cache.wal_fragment_cache_max_mb, 128);
+        assert_eq!(
+            load_toml("[cache]\nwal_fragment_cache_max_mb = 7")
+                .unwrap()
+                .cache
+                .wal_fragment_cache_max_mb,
+            7
+        );
+        std::env::set_var("ZEPPELIN_WAL_FRAGMENT_CACHE_MAX_MB", "9");
+        assert_eq!(
+            load_toml("[cache]\nwal_fragment_cache_max_mb = 7")
+                .unwrap()
+                .cache
+                .wal_fragment_cache_max_mb,
+            9
+        );
+    }
+
     /// Verifies that GC floor failures name every interval used in the calculation.
     #[test]
     fn gc_horizon_below_floor_is_rejected_with_all_inputs() {
@@ -1273,6 +1297,9 @@ pub struct CacheConfig {
     /// Maximum memory cache size in MB. Set to `0` to disable. Default: `256`.
     #[serde(default = "default_memory_cache_max_mb")]
     pub memory_cache_max_mb: usize,
+    /// Maximum decoded WAL fragment memo size in MB. `0` disables it. Default: `128`.
+    #[serde(default = "default_wal_fragment_cache_max_mb")]
+    pub wal_fragment_cache_max_mb: usize,
     /// Manifest cache TTL in milliseconds. Default: `500`.
     #[serde(default = "default_manifest_cache_ttl_ms")]
     pub manifest_cache_ttl_ms: u64,
@@ -1634,6 +1661,10 @@ fn default_max_size_gb() -> u64 {
 fn default_memory_cache_max_mb() -> usize {
     256
 }
+/// Returns the default decoded-WAL cache capacity in megabytes.
+fn default_wal_fragment_cache_max_mb() -> usize {
+    128
+}
 /// Returns the default manifest-cache TTL in milliseconds.
 fn default_manifest_cache_ttl_ms() -> u64 {
     500
@@ -1841,6 +1872,7 @@ impl Default for CacheConfig {
             dir: default_cache_dir(),
             max_size_gb: default_max_size_gb(),
             memory_cache_max_mb: default_memory_cache_max_mb(),
+            wal_fragment_cache_max_mb: default_wal_fragment_cache_max_mb(),
             manifest_cache_ttl_ms: default_manifest_cache_ttl_ms(),
             namespace_registry_ttl_ms: default_namespace_registry_ttl_ms(),
             hydration_enabled: false,
@@ -2254,6 +2286,16 @@ impl Config {
         if self.cache.hydration_heat_queries == 0 {
             violations.push("cache.hydration_heat_queries must be greater than zero".to_string());
         }
+        if self
+            .cache
+            .wal_fragment_cache_max_mb
+            .checked_mul(1024 * 1024)
+            .is_none()
+        {
+            violations.push(
+                "cache.wal_fragment_cache_max_mb overflows the platform byte size".to_string(),
+            );
+        }
         if self.cache.hydration_heat_window_secs == 0 {
             violations
                 .push("cache.hydration_heat_window_secs must be greater than zero".to_string());
@@ -2628,6 +2670,9 @@ impl Config {
         }
         if let Some(v) = env_override("ZEPPELIN_MEMORY_CACHE_MAX_MB")? {
             self.cache.memory_cache_max_mb = v;
+        }
+        if let Some(v) = env_override("ZEPPELIN_WAL_FRAGMENT_CACHE_MAX_MB")? {
+            self.cache.wal_fragment_cache_max_mb = v;
         }
         if let Some(v) = env_override("ZEPPELIN_MANIFEST_CACHE_TTL_MS")? {
             self.cache.manifest_cache_ttl_ms = v;

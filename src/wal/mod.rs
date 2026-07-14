@@ -66,6 +66,7 @@
 
 /// Defines immutable WAL fragment payloads, versioned serialization, and checksum validation.
 pub mod fragment;
+pub mod fragment_cache;
 /// Coordinates namespace lease acquisition, renewal, fencing generations, and release.
 pub mod lease;
 /// Defines and publishes the authoritative namespace manifest and retained history.
@@ -77,6 +78,7 @@ pub mod writer;
 
 /// Re-exports the primary immutable WAL fragment type for crate consumers.
 pub use fragment::WalFragment;
+pub use fragment_cache::WalFragmentCache;
 /// Re-exports namespace lease snapshots and their object-store manager.
 pub use lease::{Lease, LeaseManager};
 /// Re-exports the authoritative manifest and its object-store version token.

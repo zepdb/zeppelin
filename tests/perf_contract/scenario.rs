@@ -817,6 +817,13 @@ async fn run_scenario_inner(
             .or(cold_server.as_ref())
             .unwrap_or(&setup_server);
         let measured_namespace = measured_namespaces.get(repeat).unwrap_or(&namespace);
+        if !world.eventual_wal_keys.is_empty() {
+            // This frozen scenario explicitly invalidates the immutable WAL
+            // byte entries before every repeat. Keep the new decoded tier on
+            // the same repeat boundary so it cannot change the contracted S3
+            // pre-state or leak observer state from a prior measurement.
+            measured_server.clear_wal_fragment_cache();
+        }
         for key in world
             .eventual_wal_keys
             .iter()

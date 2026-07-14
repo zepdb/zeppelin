@@ -152,7 +152,7 @@ use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
-use crate::wal::{FragmentCachePolicy, WalReader};
+use crate::wal::{FragmentCachePolicy, WalFragmentCache, WalReader};
 
 /// Carries one ranked query result set and the optional HTTP enrichments.
 ///
@@ -1035,7 +1035,27 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         params.manifest_cache,
     )
     .await?;
-    execute_query_with_manifest_inner(params, manifest, false).await
+    execute_query_with_manifest_inner(params, manifest, None, false).await
+}
+
+/// Executes a vector query with a disposable decoded-WAL memo.
+///
+/// Visibility is still selected from the same authoritative manifest path as
+/// [`execute_query`]. The supplied cache can only satisfy exact fragment IDs
+/// referenced by that snapshot.
+#[instrument(skip(params, fragment_cache), fields(namespace = params.namespace))]
+pub async fn execute_query_with_fragment_cache(
+    params: QueryParams<'_>,
+    fragment_cache: &Arc<WalFragmentCache>,
+) -> Result<QueryResponse> {
+    let manifest = read_manifest_for_query(
+        params.store,
+        params.namespace,
+        params.consistency,
+        params.manifest_cache,
+    )
+    .await?;
+    execute_query_with_manifest_inner(params, manifest, Some(fragment_cache), false).await
 }
 
 /// Executes a vector query against an already-selected manifest snapshot.
@@ -1073,8 +1093,9 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
 pub(crate) async fn execute_query_with_manifest(
     params: QueryParams<'_>,
     manifest: Manifest,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
 ) -> Result<QueryResponse> {
-    execute_query_with_manifest_inner(params, manifest, false).await
+    execute_query_with_manifest_inner(params, manifest, fragment_cache, false).await
 }
 
 /// Executes a supplied-snapshot vector query while collecting scoped diagnostics.
@@ -1105,8 +1126,9 @@ pub(crate) async fn execute_query_with_manifest(
 pub(crate) async fn execute_query_with_manifest_debug(
     params: QueryParams<'_>,
     manifest: Manifest,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
 ) -> Result<QueryResponse> {
-    execute_query_with_manifest_inner(params, manifest, true).await
+    execute_query_with_manifest_inner(params, manifest, fragment_cache, true).await
 }
 
 /// Selects normal or diagnostic vector execution for one supplied snapshot.
@@ -1144,16 +1166,18 @@ pub(crate) async fn execute_query_with_manifest_debug(
 async fn execute_query_with_manifest_inner(
     params: QueryParams<'_>,
     manifest: Manifest,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
     emit_debug: bool,
 ) -> Result<QueryResponse> {
     if emit_debug {
         let diagnostics = Arc::new(CacheDiagnostics::default());
         return with_cache_diagnostics(Arc::clone(&diagnostics), async move {
-            execute_query_with_manifest_scoped(params, manifest, Some(diagnostics)).await
+            execute_query_with_manifest_scoped(params, manifest, fragment_cache, Some(diagnostics))
+                .await
         })
         .await;
     }
-    execute_query_with_manifest_scoped(params, manifest, None).await
+    execute_query_with_manifest_scoped(params, manifest, fragment_cache, None).await
 }
 
 /// Runs all vector-query phases against one immutable manifest view.
@@ -1237,6 +1261,7 @@ async fn execute_query_with_manifest_inner(
 async fn execute_query_with_manifest_scoped(
     params: QueryParams<'_>,
     manifest: Manifest,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
     cache_diagnostics: Option<Arc<CacheDiagnostics>>,
 ) -> Result<QueryResponse> {
     let QueryParams {
@@ -1255,6 +1280,15 @@ async fn execute_query_with_manifest_scoped(
         manifest_cache: _,
         include_attributes,
     } = params;
+
+    if let Some(fragment_cache) = fragment_cache {
+        let active_ids: Vec<ulid::Ulid> = manifest
+            .uncompacted_fragments()
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect();
+        fragment_cache.evict_compacted(namespace, &active_ids);
+    }
     let eventual_skipped_wal =
         consistency == ConsistencyLevel::Eventual && !manifest.uncompacted_fragments().is_empty();
     let segment_ref = active_segment_ref(&manifest);
@@ -1276,6 +1310,7 @@ async fn execute_query_with_manifest_scoped(
                     filter,
                     distance_metric,
                     cache,
+                    fragment_cache,
                     include_attributes,
                     top_k,
                 )
@@ -1287,6 +1322,7 @@ async fn execute_query_with_manifest_scoped(
                         namespace,
                         manifest.uncompacted_fragments(),
                         cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
+                        fragment_cache,
                     )
                     .await?;
                 WalScanResult {
@@ -1519,9 +1555,10 @@ struct WalScanResult {
 ///
 /// # Errors
 ///
-/// Propagates fragment fetch and decode failures. Query reads intentionally use
-/// the unchecked reader because fragments were checksum-validated when written;
-/// this path does not silently skip a missing or malformed visible object.
+/// Propagates fragment fetch, decode, and checksum failures. The reader keeps
+/// its historical `unchecked` name for compatibility, but cache misses still
+/// validate immutable payload integrity and this path never skips a missing or
+/// malformed visible object.
 ///
 /// # Panics
 ///
@@ -1570,17 +1607,20 @@ async fn wal_scan(
     filter: Option<&Filter>,
     distance_metric: DistanceMetric,
     cache: Option<&Arc<DiskCache>>,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
     include_attributes: bool,
     top_k: usize,
 ) -> Result<WalScanResult> {
     let refs = manifest.uncompacted_fragments().to_vec();
-    // Skip checksum validation on query reads — fragments were already
-    // validated on write. Saves ~11% CPU on fragment deserialization.
+    // The historical `unchecked` name is compatibility-only: misses still
+    // validate payload checksums, while decoded-cache hits reuse values that
+    // already passed that validation.
     let fragments = wal_reader
-        .read_fragments_from_refs_unchecked(
+        .read_query_fragments_from_refs_unchecked(
             namespace,
             &refs,
             cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
+            fragment_cache,
         )
         .await?;
     let frag_count = fragments.len();
@@ -1944,6 +1984,7 @@ async fn segment_search(
         filter,
         manifest_cache,
         fts_cache,
+        fragment_cache,
         cache
     ),
     fields(namespace = namespace)
@@ -1960,6 +2001,7 @@ pub async fn execute_bm25_query(
     last_as_prefix: bool,
     manifest_cache: Option<&Arc<ManifestCache>>,
     fts_cache: Option<&Arc<WalFtsCache>>,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -1977,6 +2019,7 @@ pub async fn execute_bm25_query(
         consistency,
         last_as_prefix,
         fts_cache,
+        fragment_cache,
         cache,
         max_full_scan_clusters,
         max_full_scan_vectors,
@@ -2037,6 +2080,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
     consistency: ConsistencyLevel,
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -2054,6 +2098,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
         consistency,
         last_as_prefix,
         fts_cache,
+        fragment_cache,
         cache,
         max_full_scan_clusters,
         max_full_scan_vectors,
@@ -2103,6 +2148,7 @@ pub(crate) async fn execute_bm25_query_with_manifest_debug(
     consistency: ConsistencyLevel,
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -2120,6 +2166,7 @@ pub(crate) async fn execute_bm25_query_with_manifest_debug(
         consistency,
         last_as_prefix,
         fts_cache,
+        fragment_cache,
         cache,
         max_full_scan_clusters,
         max_full_scan_vectors,
@@ -2163,6 +2210,7 @@ async fn execute_bm25_query_with_manifest_inner(
     consistency: ConsistencyLevel,
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -2184,6 +2232,7 @@ async fn execute_bm25_query_with_manifest_inner(
                 consistency,
                 last_as_prefix,
                 fts_cache,
+                fragment_cache,
                 cache,
                 max_full_scan_clusters,
                 max_full_scan_vectors,
@@ -2206,6 +2255,7 @@ async fn execute_bm25_query_with_manifest_inner(
         consistency,
         last_as_prefix,
         fts_cache,
+        fragment_cache,
         cache,
         max_full_scan_clusters,
         max_full_scan_vectors,
@@ -2284,6 +2334,7 @@ async fn execute_bm25_query_with_manifest_scoped(
     consistency: ConsistencyLevel,
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
     cache: Option<&Arc<DiskCache>>,
     max_full_scan_clusters: usize,
     max_full_scan_vectors: usize,
@@ -2294,14 +2345,18 @@ async fn execute_bm25_query_with_manifest_scoped(
     let eventual_skipped_wal =
         consistency == ConsistencyLevel::Eventual && !manifest.uncompacted_fragments().is_empty();
 
-    // Evict compacted fragments from the FTS cache to prevent unbounded growth
+    let active_ids: Vec<ulid::Ulid> = manifest
+        .uncompacted_fragments()
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect();
+
+    // Evict compacted fragments from the derived caches to bound local memory.
     if let Some(cache) = fts_cache {
-        let active_ids: Vec<ulid::Ulid> = manifest
-            .uncompacted_fragments()
-            .iter()
-            .map(|f| f.id)
-            .collect();
         cache.evict_compacted(&active_ids);
+    }
+    if let Some(cache) = fragment_cache {
+        cache.evict_compacted(namespace, &active_ids);
     }
 
     // WAL BM25 work and segment BM25 search are independent — run them
@@ -2316,12 +2371,14 @@ async fn execute_bm25_query_with_manifest_scoped(
         let wal_results = match consistency {
             ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
                 let refs = manifest.uncompacted_fragments().to_vec();
-                // Skip checksum validation — already validated on write.
+                // The historical `unchecked` name is compatibility-only;
+                // misses still validate checksums before memo insertion.
                 let fragments = wal_reader
-                    .read_fragments_from_refs_unchecked(
+                    .read_query_fragments_from_refs_unchecked(
                         namespace,
                         &refs,
                         cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
+                        fragment_cache,
                     )
                     .await?;
                 let scan_result = wal_bm25_scan(
@@ -2345,6 +2402,7 @@ async fn execute_bm25_query_with_manifest_scoped(
                         namespace,
                         manifest.uncompacted_fragments(),
                         cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
+                        fragment_cache,
                     )
                     .await?;
                 Vec::new()
@@ -3755,6 +3813,7 @@ mod tests {
             None,
             DistanceMetric::Euclidean,
             None,
+            None,
             false,
             5,
         )
@@ -3779,6 +3838,7 @@ mod tests {
             &[0.0, 0.0],
             None,
             DistanceMetric::Euclidean,
+            None,
             None,
             true,
             5,

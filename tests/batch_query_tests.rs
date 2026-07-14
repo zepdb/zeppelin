@@ -19,7 +19,7 @@ use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
+use zeppelin::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 struct BatchApiServer {
     base_url: String,
@@ -60,6 +60,9 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
         Duration::from_secs(config.compaction.lease_duration_secs),
     ));
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
+    let fragment_cache = Arc::new(WalFragmentCache::new(
+        config.cache.wal_fragment_cache_max_mb * 1024 * 1024,
+    ));
 
     let app = build_router(AppState {
         store: store.clone(),
@@ -70,6 +73,7 @@ async fn start_batch_server(config: Config, counted: bool) -> BatchApiServer {
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),
         lease_manager,
+        fragment_cache,
         query_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.server.max_concurrent_queries,
         )),

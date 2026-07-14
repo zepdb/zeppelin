@@ -1467,6 +1467,12 @@ async fn fetch_vectors_by_id(
     projection: FetchProjection<'_>,
     manifest: Manifest,
 ) -> Result<GetVectorsResponse, ZeppelinError> {
+    let active_ids: Vec<ulid::Ulid> = manifest
+        .uncompacted_fragments()
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect();
+    state.fragment_cache.evict_compacted(ns, &active_ids);
     let requested: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let mut found = HashMap::new();
     let mut deleted = HashSet::new();
@@ -1491,6 +1497,7 @@ async fn fetch_vectors_by_id(
                     ns,
                     manifest.uncompacted_fragments(),
                     FragmentCachePolicy::ReadWrite(&state.cache),
+                    Some(&state.fragment_cache),
                 )
                 .await?;
         }
@@ -1595,23 +1602,27 @@ async fn fetch_strong_wal_records(
 
     let fragments = state
         .wal_reader
-        .read_fragments_from_refs_unchecked(
+        .read_query_fragments_from_refs_unchecked(
             ns,
             manifest.uncompacted_fragments(),
             FragmentCachePolicy::ReadWrite(&state.cache),
+            Some(&state.fragment_cache),
         )
         .await?;
-    for fragment in fragments {
-        for id in fragment.deletes {
+    for fragment in &fragments {
+        for id in &fragment.deletes {
             if requested.contains(id.as_str()) {
                 found.remove(id.as_str());
-                deleted.insert(id);
+                deleted.insert(id.clone());
             }
         }
-        for vector in fragment.vectors {
+        for vector in &fragment.vectors {
             if requested.contains(vector.id.as_str()) {
                 deleted.remove(vector.id.as_str());
-                found.insert(vector.id.clone(), project_vector_entry(vector, projection));
+                found.insert(
+                    vector.id.clone(),
+                    project_vector_entry(vector.clone(), projection),
+                );
             }
         }
     }

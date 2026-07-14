@@ -25,7 +25,7 @@ use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::types::{ConsistencyLevel, DistanceMetric, VectorEntry};
 use zeppelin::wal::manifest::{Manifest, SegmentRef};
-use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
+use zeppelin::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 struct ParityServer {
     base_url: String,
@@ -111,6 +111,9 @@ async fn start_parity_server(config: Config) -> ParityServer {
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),
         lease_manager,
+        fragment_cache: Arc::new(WalFragmentCache::new(
+            config.cache.wal_fragment_cache_max_mb * 1024 * 1024,
+        )),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,

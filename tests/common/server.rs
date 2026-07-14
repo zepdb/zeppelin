@@ -21,10 +21,19 @@ use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
-use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
+use zeppelin::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 tokio::task_local! {
     static BACKGROUND_COMPACTION_ORIGIN: bool;
+}
+
+fn test_fragment_cache(config: &Config) -> Arc<WalFragmentCache> {
+    let max_bytes = config
+        .cache
+        .wal_fragment_cache_max_mb
+        .checked_mul(1024 * 1024)
+        .expect("test WAL fragment cache capacity overflow");
+    Arc::new(WalFragmentCache::new(max_bytes))
 }
 
 /// Returns whether the current future belongs to a spawned compaction loop.
@@ -164,6 +173,7 @@ async fn start_test_server_with_config_inner(
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor,
         lease_manager,
+        fragment_cache: test_fragment_cache(&config),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -229,6 +239,7 @@ pub async fn start_test_server_on_store(
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor,
         lease_manager,
+        fragment_cache: test_fragment_cache(&config),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -300,6 +311,7 @@ pub async fn start_test_server_with_compactor(
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor: compactor.clone(),
         lease_manager,
+        fragment_cache: test_fragment_cache(&config),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -401,6 +413,7 @@ pub async fn start_test_server_with_compaction(
         wal_reader: Arc::new(WalReader::new(harness.store.clone())),
         compactor,
         lease_manager,
+        fragment_cache: test_fragment_cache(&config),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -514,6 +527,7 @@ pub struct FullTestServer {
     pub compactor: Arc<Compactor>,
     pub lease_manager: Arc<LeaseManager>,
     pub manifest_cache: Arc<ManifestCache>,
+    fragment_cache: Arc<WalFragmentCache>,
     wal_writer: Arc<WalWriter>,
     pub shutdown_compaction: Option<tokio::sync::watch::Sender<bool>>,
     pub compaction_loop_task: Option<JoinHandle<()>>,
@@ -522,6 +536,11 @@ pub struct FullTestServer {
 }
 
 impl FullTestServer {
+    /// Drop disposable decoded WAL state between isolated measured rounds.
+    pub fn clear_wal_fragment_cache(&self) {
+        self.fragment_cache.clear();
+    }
+
     /// Drop disposable per-namespace writer state between measured test rounds.
     pub fn reset_wal_writer_state(&self, namespace: &str) {
         self.wal_writer.remove_lock(namespace);
@@ -642,6 +661,7 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
     let hydrator = maybe_hydrator(&config, &store, &cache);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let wal_writer = Arc::new(WalWriter::with_clock(store.clone(), clock.clone()));
+    let fragment_cache = test_fragment_cache(&config);
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
@@ -651,6 +671,7 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),
         lease_manager: lease_manager.clone(),
+        fragment_cache: Arc::clone(&fragment_cache),
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,
@@ -690,6 +711,7 @@ pub async fn start_test_server_full_with_disk_cache_max_bytes(
         compactor,
         lease_manager,
         manifest_cache,
+        fragment_cache,
         wal_writer,
         shutdown_compaction,
         compaction_loop_task,

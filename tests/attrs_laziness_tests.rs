@@ -33,7 +33,7 @@ use zeppelin::namespace::NamespaceManager;
 use zeppelin::runtime_config::{QueryKnobBounds, RuntimeQueryConfig};
 use zeppelin::server::{build_router, parse_trusted_proxies, AppState};
 use zeppelin::types::{AttributeValue, DistanceMetric, Filter, SearchResult, VectorEntry};
-use zeppelin::wal::{LeaseManager, WalReader, WalWriter};
+use zeppelin::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 const IVF_PREFIX_ATTRS_GETS: u64 = 4;
 const FILTERED_SQ8_ATTRS_GETS: u64 = 5;
@@ -95,6 +95,9 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         config.server.max_concurrent_queries,
     ));
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
+    let fragment_cache = Arc::new(WalFragmentCache::new(
+        config.cache.wal_fragment_cache_max_mb * 1024 * 1024,
+    ));
 
     let app = build_router(AppState {
         store: store.clone(),
@@ -105,6 +108,7 @@ async fn start_counting_api_server(mut config: Config) -> CountingApiServer {
         wal_reader: Arc::new(WalReader::new(store.clone())),
         compactor: compactor.clone(),
         lease_manager,
+        fragment_cache,
         config: Arc::new(config),
         trusted_proxies,
         runtime_query_config,

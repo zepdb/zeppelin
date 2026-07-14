@@ -123,7 +123,7 @@ use crate::server::build_router;
 use crate::server::AppState;
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
-use crate::wal::{LeaseManager, WalReader, WalWriter};
+use crate::wal::{LeaseManager, WalFragmentCache, WalReader, WalWriter};
 
 /// Maximum duration for each endpoint, LIST, or namespace-scan startup probe.
 const STORAGE_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -300,6 +300,7 @@ pub async fn build_app(
         backend = %config.storage.backend,
         cache_dir = %config.cache.dir.display(),
         cache_max_size_gb = config.cache.max_size_gb,
+        wal_fragment_cache_max_mb = config.cache.wal_fragment_cache_max_mb,
         compaction_interval_secs = config.compaction.interval_secs,
         max_wal_fragments = config.compaction.max_wal_fragments_before_compact,
         max_wal_age_secs = config.compaction.max_wal_age_before_compact_secs,
@@ -479,6 +480,16 @@ pub async fn build_app(
 
     // Initialize WAL FTS cache (pre-tokenized BM25 data)
     let fts_cache = Arc::new(WalFtsCache::new());
+    let fragment_cache_max_bytes = config
+        .cache
+        .wal_fragment_cache_max_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| {
+            ZeppelinError::Config(
+                "cache.wal_fragment_cache_max_mb overflows the platform byte size".to_string(),
+            )
+        })?;
+    let fragment_cache = Arc::new(WalFragmentCache::new(fragment_cache_max_bytes));
 
     // Runtime query config uses a std-only RwLock<Arc<_>> snapshot holder.
     // Bounds remain boot-time values so mutable defaults cannot outgrow limits.
@@ -522,6 +533,7 @@ pub async fn build_app(
         manifest_cache,
         hydrator,
         fts_cache,
+        fragment_cache,
         query_semaphore,
         rate_limiters,
     };

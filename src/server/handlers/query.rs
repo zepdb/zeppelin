@@ -3913,6 +3913,7 @@ async fn execute_query_source_with_manifest(
                     req.consistency,
                     last_as_prefix,
                     Some(&state.fts_cache),
+                    Some(&state.fragment_cache),
                     Some(&state.cache),
                     knobs.bm25_max_full_scan_clusters,
                     knobs.bm25_max_full_scan_vectors,
@@ -3932,6 +3933,7 @@ async fn execute_query_source_with_manifest(
                     req.consistency,
                     last_as_prefix,
                     Some(&state.fts_cache),
+                    Some(&state.fragment_cache),
                     Some(&state.cache),
                     knobs.bm25_max_full_scan_clusters,
                     knobs.bm25_max_full_scan_vectors,
@@ -3983,9 +3985,15 @@ async fn execute_query_source_with_manifest(
             };
 
             let response = if emit_debug {
-                query::execute_query_with_manifest_debug(params, manifest).await
+                query::execute_query_with_manifest_debug(
+                    params,
+                    manifest,
+                    Some(&state.fragment_cache),
+                )
+                .await
             } else {
-                query::execute_query_with_manifest(params, manifest).await
+                query::execute_query_with_manifest(params, manifest, Some(&state.fragment_cache))
+                    .await
             };
             let mut response = response?;
             if let Some(exclude_id) = exclude_id {

@@ -70,6 +70,7 @@
 //! borrow. Iterator pipelines build query states and term inputs without
 //! virtual dispatch, while `TopK` owns only the best bounded set.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -288,8 +289,8 @@ pub struct WalBm25ScanResult {
 /// after top-k selection, avoiding Java-style eager object copies and manual C
 /// ownership bookkeeping.
 #[allow(clippy::too_many_arguments)]
-pub fn wal_bm25_scan(
-    fragments: &[WalFragment],
+pub fn wal_bm25_scan<F>(
+    fragments: &[F],
     rank_by: &RankBy,
     fts_configs: &HashMap<String, FtsFieldConfig>,
     last_as_prefix: bool,
@@ -297,7 +298,10 @@ pub fn wal_bm25_scan(
     filter: Option<&Filter>,
     include_attributes: bool,
     top_k: Option<usize>,
-) -> WalBm25ScanResult {
+) -> WalBm25ScanResult
+where
+    F: Borrow<WalFragment>,
+{
     let frag_count = fragments.len();
 
     if fragments.is_empty() {
@@ -316,6 +320,7 @@ pub fn wal_bm25_scan(
         HashMap::new();
 
     for fragment in fragments {
+        let fragment = fragment.borrow();
         for del_id in &fragment.deletes {
             deleted_ids.insert(del_id.clone());
             latest_vectors.remove(del_id.as_str());
@@ -398,6 +403,7 @@ pub fn wal_bm25_scan(
     if let Some(cache) = fts_cache {
         // Cache hits avoid tokenizer CPU but still clone owned maps.
         for fragment in fragments {
+            let fragment = fragment.borrow();
             let cached = cache.get_or_tokenize(fragment, fts_configs, &fields_needed);
             for ((doc_id, field_name), token_data) in &cached.doc_field_data {
                 // Exclude IDs whose final operation is a delete. Notice that an
@@ -813,7 +819,7 @@ mod tests {
     /// reported.
     fn test_wal_scan_empty_fragments() {
         let result = wal_bm25_scan(
-            &[],
+            &[] as &[WalFragment],
             &RankBy::Bm25 {
                 field: "content".to_string(),
                 query: "cat".to_string(),
