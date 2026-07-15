@@ -87,10 +87,11 @@ pub enum OracleMutation {
     ConstraintDrop,
     DelegationParentDesync,
     DelegationNarrowingBypass,
+    PreservationBypass,
 }
 
 impl OracleMutation {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::DropDelete,
         Self::SkewScore,
         Self::PhantomId,
@@ -115,6 +116,7 @@ impl OracleMutation {
         Self::ConstraintDrop,
         Self::DelegationParentDesync,
         Self::DelegationNarrowingBypass,
+        Self::PreservationBypass,
     ];
 
     #[must_use]
@@ -144,6 +146,7 @@ impl OracleMutation {
             "constraint-drop" => Self::ConstraintDrop,
             "delegation-parent-desync" => Self::DelegationParentDesync,
             "delegation-narrowing-bypass" => Self::DelegationNarrowingBypass,
+            "preservation-bypass" => Self::PreservationBypass,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -175,6 +178,7 @@ impl OracleMutation {
             Self::ConstraintDrop => "constraint-drop",
             Self::DelegationParentDesync => "delegation-parent-desync",
             Self::DelegationNarrowingBypass => "delegation-narrowing-bypass",
+            Self::PreservationBypass => "preservation-bypass",
         }
     }
 
@@ -190,6 +194,7 @@ impl OracleMutation {
                 | Self::ConstraintDrop
                 | Self::DelegationParentDesync
                 | Self::DelegationNarrowingBypass
+                | Self::PreservationBypass
         )
     }
 }
@@ -531,7 +536,11 @@ impl Model {
             | Op::ForbiddenWriteProbe { .. }
             | Op::ExportProbe { .. }
             | Op::SecurityAdminProbe { .. }
-            | Op::AuditBarrierOp { .. } => {}
+            | Op::AuditBarrierOp { .. }
+            | Op::CreateLock { .. }
+            | Op::ReleaseLock { .. }
+            | Op::DeleteUnderLock { .. }
+            | Op::GcUnderLock { .. } => {}
         }
     }
 
@@ -831,7 +840,11 @@ impl Model {
             | Op::ForbiddenWriteProbe { .. }
             | Op::ExportProbe { .. }
             | Op::SecurityAdminProbe { .. }
-            | Op::AuditBarrierOp { .. } => {}
+            | Op::AuditBarrierOp { .. }
+            | Op::CreateLock { .. }
+            | Op::ReleaseLock { .. }
+            | Op::DeleteUnderLock { .. }
+            | Op::GcUnderLock { .. } => {}
         }
     }
 

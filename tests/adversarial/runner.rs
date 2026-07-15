@@ -50,24 +50,25 @@ use super::model::{
     AmbiguityReason, IndetEffect, Model, ModelRecord, NsIndeterminate, OpOutcome, OracleMutation,
 };
 use super::ops::{
-    ActorSel, DelegatedTokenSpec, ExecutionMetadata, ExecutionPhase, ForbiddenWriteKind, GenVector,
-    GeneratedQuery, GrantChange, HeldExecutionMetadata, HoldReleaseCause, InvalidProbe,
-    NamespaceSpec, Op, OpRecord, QueryOracleClass, TenantProbeSurface, TokenSel,
+    ActorSel, DelegatedTokenSpec, DeleteUnderLockSurface, ExecutionMetadata, ExecutionPhase,
+    ForbiddenWriteKind, GenVector, GeneratedQuery, GrantChange, HeldExecutionMetadata,
+    HoldReleaseCause, InvalidProbe, LockSel, NamespaceSpec, Op, OpRecord, PreservationScopeSpec,
+    QueryOracleClass, TenantProbeSurface, TokenSel,
 };
 use super::oracle::{self, Violation, ViolationId};
 use super::s3_oracle::{self, S3Tracker};
 use super::security_program::{
     check_i22_authz_decision, check_i23_tenant_leak, check_i24_revocation_freshness,
     check_i25_audit_evidence, check_i26_security_state, check_i27_constraint_drop,
-    ExpectedDecision, SecurityFinding, SecurityProgramConfig, SecurityStateObservation,
-    SECURITY_AUDIT_BARRIER_OP,
+    modeled_preservation_reason, ExpectedDecision, SecurityFinding, SecurityProgramConfig,
+    SecurityStateObservation, SECURITY_AUDIT_BARRIER_OP,
 };
 use super::{effective_seed_assignment, PreserveMode, RunMode, RunnerEnv};
 
 const AMBIGUITY_MARKER: &str = "_adversarial_ambiguity";
 const STORE_FAULT_MARKER: &str = "_adversarial_store_fault";
 const DUAL_WRITER_LEASE_HOLD_EVENT_ID: &str = "ops-dual-writer-lease-hold";
-const SECURITY_OP_KINDS: [&str; 15] = [
+const SECURITY_OP_KINDS: [&str; 19] = [
     "create_key",
     "rotate_key",
     "revoke_key",
@@ -83,6 +84,10 @@ const SECURITY_OP_KINDS: [&str; 15] = [
     "token_exceed_scope_probe",
     "use_expired_token",
     "revoke_parent_then_use_token",
+    "create_lock",
+    "release_lock",
+    "delete_under_lock",
+    "gc_under_lock",
 ];
 
 /// Delegated bearers are deliberately process-local and are redacted before an
@@ -91,6 +96,63 @@ const SECURITY_OP_KINDS: [&str; 15] = [
 /// credential.
 static DELEGATED_TOKEN_BEARERS: LazyLock<RwLock<BTreeMap<(String, TokenSel), String>>> =
     LazyLock::new(|| RwLock::new(BTreeMap::new()));
+
+static PRESERVATION_LOCK_IDS: LazyLock<RwLock<BTreeMap<(String, LockSel), String>>> =
+    LazyLock::new(|| RwLock::new(BTreeMap::new()));
+
+fn install_preservation_lock(base_url: &str, lock: LockSel, lock_id: String) {
+    PRESERVATION_LOCK_IDS
+        .write()
+        .unwrap_or_else(|_| panic!("preservation lock registry poisoned"))
+        .insert((base_url.to_string(), lock), lock_id);
+}
+
+fn registered_preservation_lock_id(base_url: &str, lock: LockSel) -> Option<String> {
+    PRESERVATION_LOCK_IDS
+        .read()
+        .unwrap_or_else(|_| panic!("preservation lock registry poisoned"))
+        .get(&(base_url.to_string(), lock))
+        .cloned()
+}
+
+async fn preservation_lock_id_or_resolve(target: &OpExecutionTarget, lock: LockSel) -> String {
+    if let Some(lock_id) = registered_preservation_lock_id(&target.base_url, lock) {
+        return lock_id;
+    }
+
+    let preservation = target
+        .security
+        .preservation_service()
+        .expect("security profile omitted the preservation authority");
+    preservation
+        .refresh_once()
+        .await
+        .unwrap_or_else(|error| panic!("preservation lock recovery refresh failed: {error}"));
+    let reason = modeled_preservation_reason(lock);
+    let matching = preservation
+        .list_active()
+        .unwrap_or_else(|error| panic!("preservation lock recovery list failed: {error}"))
+        .into_iter()
+        .filter(|record| record.reason_text == reason)
+        .map(|record| record.lock_id.as_str().to_string())
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [lock_id] => {
+            install_preservation_lock(&target.base_url, lock, lock_id.clone());
+            lock_id.clone()
+        }
+        [] => {
+            // The create was authoritatively not applied. A strict, valid but
+            // nonexistent identity lets the release exercise product NotFound
+            // handling without inventing a successful create in the model.
+            "plk_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string()
+        }
+        _ => panic!(
+            "preservation selector {:?} matched multiple authoritative locks",
+            lock
+        ),
+    }
+}
 
 fn install_delegated_token(base_url: &str, token: TokenSel, bearer: String) {
     DELEGATED_TOKEN_BEARERS
@@ -1093,7 +1155,7 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
                 "security overnight coverage floor requires {kind} >= 5, observed {count}"
             );
         }
-        for oracle in ["I22", "I23", "I24", "I25", "I26", "I27"] {
+        for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28"] {
             let count = summary
                 .coverage
                 .security_oracle_counts
@@ -3141,6 +3203,9 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
             OracleMutation::DelegationParentDesync | OracleMutation::DelegationNarrowingBypass => {
                 fired.contains(&ViolationId::I22AuthzDecision)
             }
+            OracleMutation::PreservationBypass => {
+                fired.contains(&ViolationId::I28PreservationBypass)
+            }
         };
         assert!(
             accepted,
@@ -4880,12 +4945,7 @@ async fn execute_raw_recorded_op(
                     .and_then(serde_json::Value::as_u64);
             }
             Op::DeleteNamespace { .. } | Op::PatchIndexConfig { .. } => {}
-            Op::CreateKey { .. }
-            | Op::RotateKey { .. }
-            | Op::RevokeKey { .. }
-            | Op::PublishGrantChange { .. }
-            | Op::MintToken { .. }
-            | Op::ForbiddenWriteProbe { .. } => {}
+            _ if op.is_security_op() => {}
             _ if op.is_mutating() => {
                 rec.gen_after = if let Some(context) = http_fault_context.as_ref() {
                     if op_records_manifest_generation(&op) {
@@ -5672,7 +5732,13 @@ async fn execute_op(
         Op::GcCycle { ns, keep_count, .. } => {
             let path = format!("gc::run_gc_cycle({ns})");
             let config = gc_config(*keep_count);
-            let report = gc::run_gc_cycle_at(&target.store, ns, &config, target.clock.now())
+            let mut runner = gc::GcRunner::new(target.store.clone(), config)
+                .with_preservation_service(target.security.preservation_service().cloned());
+            let report = runner
+                .run_cycle_at(
+                    gc::GcNamespaceIncarnation::new(ns.clone(), target.clock.now()),
+                    target.clock.now(),
+                )
                 .await
                 .unwrap_or_else(|error| panic!("gc cycle failed for {ns}: {error}"));
             target.manifest_cache.invalidate_at(ns, target.clock.now());
@@ -5862,7 +5928,11 @@ async fn execute_op(
         | Op::ForbiddenWriteProbe { .. }
         | Op::ExportProbe { .. }
         | Op::SecurityAdminProbe { .. }
-        | Op::AuditBarrierOp { .. } => execute_security_op(client, target, op, index).await,
+        | Op::AuditBarrierOp { .. }
+        | Op::CreateLock { .. }
+        | Op::ReleaseLock { .. }
+        | Op::DeleteUnderLock { .. }
+        | Op::GcUnderLock { .. } => execute_security_op(client, target, op, index).await,
     };
 
     OpRecord {
@@ -6155,7 +6225,161 @@ async fn execute_security_op(
             }
             ("GET".to_string(), path, status, response)
         }
+        Op::CreateLock { lock, scope, .. } => {
+            let path = "/v1/security/preservation".to_string();
+            let (status, mut response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", target.base_url, path),
+                Some(json!({
+                    "scope": preservation_scope_body(scope),
+                    "reason_kind": "investigation",
+                    "reason_text": modeled_preservation_reason(*lock)
+                })),
+            )
+            .await;
+            if (200..300).contains(&status) {
+                let lock_id = response
+                    .get("lock_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("successful preservation create omitted lock_id"))
+                    .to_string();
+                install_preservation_lock(&target.base_url, *lock, lock_id);
+                record_success_request_id(&mut response, &request_id);
+            }
+            ("POST".to_string(), path, status, response)
+        }
+        Op::ReleaseLock { lock, .. } => {
+            let lock_id = preservation_lock_id_or_resolve(target, *lock).await;
+            let path = format!("/v1/security/preservation/{lock_id}/release");
+            let approver = target.workload_credentials.credential(5, 0).bearer;
+            let response = client
+                .post(format!("{}{}", target.base_url, path))
+                .header("x-request-id", &request_id)
+                .header("x-zeppelin-approval", approver)
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("preservation release request failed: {error}"));
+            let status = response.status().as_u16();
+            let bytes = response
+                .bytes()
+                .await
+                .unwrap_or_else(|error| panic!("preservation release body failed: {error}"));
+            let mut response = if bytes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|error| panic!("preservation release JSON failed: {error}"))
+            };
+            if (200..300).contains(&status) {
+                record_success_request_id(&mut response, &request_id);
+            }
+            ("POST".to_string(), path, status, response)
+        }
+        Op::DeleteUnderLock { ns, surface, .. } => {
+            let (method, path, status, response) = match surface {
+                DeleteUnderLockSurface::Namespace => {
+                    let path = format!("/v1/namespaces/{ns}");
+                    let (status, response) = request_json(
+                        client,
+                        Method::DELETE,
+                        &format!("{}{}", target.base_url, path),
+                        None,
+                    )
+                    .await;
+                    ("DELETE".to_string(), path, status, response)
+                }
+                DeleteUnderLockSurface::Snapshot => {
+                    let path = format!("/v1/namespaces/{ns}/snapshots/adversarial-preservation");
+                    let (create_status, create_response) = request_json(
+                        client,
+                        Method::PUT,
+                        &format!("{}{}", target.base_url, path),
+                        None,
+                    )
+                    .await;
+                    assert!(
+                        matches!(create_status, 200 | 201 | 409),
+                        "preservation snapshot setup failed: {create_response}"
+                    );
+                    let (status, response) = request_json(
+                        client,
+                        Method::DELETE,
+                        &format!("{}{}", target.base_url, path),
+                        None,
+                    )
+                    .await;
+                    ("DELETE".to_string(), path, status, response)
+                }
+                DeleteUnderLockSurface::VectorIds => {
+                    let path = format!("/v1/namespaces/{ns}/vectors");
+                    let (status, response) = request_json(
+                        client,
+                        Method::DELETE,
+                        &format!("{}{}", target.base_url, path),
+                        Some(json!({"ids": ["preservation-probe"]})),
+                    )
+                    .await;
+                    ("DELETE".to_string(), path, status, response)
+                }
+                DeleteUnderLockSurface::VectorFilter => {
+                    let path = format!("/v1/namespaces/{ns}/vectors");
+                    let (status, response) = request_json(
+                        client,
+                        Method::DELETE,
+                        &format!("{}{}", target.base_url, path),
+                        Some(json!({
+                            "filter": {"op": "eq", "field": "group", "value": "g0"}
+                        })),
+                    )
+                    .await;
+                    ("DELETE".to_string(), path, status, response)
+                }
+            };
+            (method, path, status, response)
+        }
+        Op::GcUnderLock { ns, keep_count, .. } => {
+            let config = gc_config(*keep_count);
+            let mut runner = gc::GcRunner::new(target.store.clone(), config)
+                .with_preservation_service(target.security.preservation_service().cloned());
+            let report = runner
+                .run_cycle_at(
+                    gc::GcNamespaceIncarnation::new(ns.clone(), target.clock.now()),
+                    target.clock.now(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("lock-aware GC failed for {ns}: {error}"));
+            (
+                "IN_PROCESS".to_string(),
+                format!("gc::GcRunner::run_cycle_at({ns})"),
+                StatusCode::OK.as_u16(),
+                json!({
+                    "candidates_marked": report.candidates_marked,
+                    "objects_deleted": report.objects_deleted,
+                    "pending_deletes_deleted": report.pending_deletes_deleted,
+                    "pending_deletes_pruned": report.pending_deletes_pruned,
+                    "pending_deletes_retained": report.pending_deletes_retained,
+                    "bytes_reclaimed": report.bytes_reclaimed,
+                    "candidates_skipped": report.candidates_skipped,
+                    "keep_count": keep_count
+                }),
+            )
+        }
         _ => panic!("non-security operation reached execute_security_op"),
+    }
+}
+
+fn preservation_scope_body(scope: &PreservationScopeSpec) -> serde_json::Value {
+    match scope {
+        PreservationScopeSpec::Global => json!({"kind": "global"}),
+        PreservationScopeSpec::Namespace { namespace } => {
+            json!({"kind": "namespace", "namespace": namespace})
+        }
+        PreservationScopeSpec::NamespaceFilter { namespace, filter } => json!({
+            "kind": "namespace_filter",
+            "namespace": namespace,
+            "filter": filter
+        }),
     }
 }
 
@@ -7460,8 +7684,7 @@ async fn inject_dual_writer_fencing_mutation(
         FaultScheduler::from_schedule(FaultSchedule::stale_manifest_cas_selftest());
     let mutation_store = stale_manifest_cas_selftest_proxy(store, mutation_scheduler.clone());
     let stale_etag = stale_version
-        .0
-        .as_deref()
+        .e_tag()
         .expect("dual-writer stale CAS requires a backend ETag");
     mutation_store
         .put_if_match(&key, stale_bytes, stale_etag, namespace)
@@ -8048,6 +8271,55 @@ async fn run_security_refresh_checks(
         findings.push(finding);
     }
 
+    let preservation_resolution = async {
+        let preservation = server.security.preservation_service().ok_or_else(|| {
+            "security profile omitted the preservation authority at quiescence".to_string()
+        })?;
+        preservation
+            .refresh_once()
+            .await
+            .map_err(|error| format!("authoritative preservation refresh failed: {error}"))?;
+        let active = preservation
+            .list_active()
+            .map_err(|error| format!("authoritative preservation list failed: {error}"))?
+            .into_iter()
+            .map(|record| {
+                (
+                    record.lock_id.as_str().to_string(),
+                    (
+                        modeled_preservation_scope(&record.scope),
+                        record.reason_text,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        model
+            .security
+            .resolve_preservation_authoritative(&active, &durable_audit_records)
+    }
+    .await;
+    let preservation_resolved = match preservation_resolution {
+        Ok(installs) => {
+            for (selector, lock_id) in installs {
+                install_preservation_lock(&server.base_url, selector, lock_id);
+            }
+            ensure_quiet_preservation_lock(server, model).await;
+            true
+        }
+        Err(detail) => {
+            findings.push(SecurityFinding {
+                id: ViolationId::I18IndeterminateResolution,
+                detail,
+                evidence: json!({
+                    "pending_preservation_mutations": &model
+                        .security
+                        .indeterminate_preservation_mutations,
+                }),
+            });
+            false
+        }
+    };
+
     let head_key = format!("{prefix}/_security/heads/policy.json");
     let head_bytes = server.store.get(&head_key).await.ok();
     let head = head_bytes
@@ -8118,7 +8390,8 @@ async fn run_security_refresh_checks(
             &durable_audit_records,
         );
         match resolution {
-            Ok(()) => model.security.close_staleness_windows(),
+            Ok(()) if preservation_resolved => model.security.close_staleness_windows(),
+            Ok(()) => {}
             Err(detail) => findings.push(SecurityFinding {
                 id: ViolationId::I18IndeterminateResolution,
                 detail,
@@ -8163,6 +8436,82 @@ async fn run_security_refresh_checks(
         .into_iter()
         .map(|finding| security_finding_to_violation(finding, op_index, "_security"))
         .collect()
+}
+
+fn modeled_preservation_scope(
+    scope: &zeppelin::security::PreservationScope,
+) -> PreservationScopeSpec {
+    match scope {
+        zeppelin::security::PreservationScope::Global => PreservationScopeSpec::Global,
+        zeppelin::security::PreservationScope::Namespace { namespace } => {
+            PreservationScopeSpec::Namespace {
+                namespace: namespace.as_str().to_string(),
+            }
+        }
+        zeppelin::security::PreservationScope::NamespaceFilter { namespace, filter } => {
+            PreservationScopeSpec::NamespaceFilter {
+                namespace: namespace.as_str().to_string(),
+                filter: serde_json::to_value(filter).unwrap_or_else(|error| {
+                    panic!("authoritative preservation filter failed to serialize: {error}")
+                }),
+            }
+        }
+    }
+}
+
+async fn ensure_quiet_preservation_lock(server: &FullTestServer, model: &mut Model) {
+    if model
+        .security
+        .preservation_locks
+        .values()
+        .any(|lock| lock.active)
+    {
+        return;
+    }
+    assert!(
+        model
+            .namespaces
+            .values()
+            .any(|namespace| !namespace.live.is_empty()),
+        "security quiet period requires one live namespace for preservation validation"
+    );
+    let selector = LockSel(1);
+    assert!(
+        !model.security.preservation_locks.contains_key(&selector),
+        "quiet preservation selector was already used"
+    );
+    let admin = client_with_bearer(&server.admin_bearer);
+    let path = "/v1/security/preservation";
+    let (status, response) = request_json(
+        &admin,
+        Method::POST,
+        &format!("{}{}", server.base_url, path),
+        Some(json!({
+            "scope": {"kind": "global"},
+            "reason_kind": "investigation",
+            "reason_text": "adversarial quiet-period global preservation lock"
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED.as_u16(),
+        "quiet preservation lock creation failed: {response}"
+    );
+    let lock_id = response
+        .get("lock_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("quiet preservation response omitted lock_id: {response}"))
+        .to_string();
+    install_preservation_lock(&server.base_url, selector, lock_id.clone());
+    model.security.preservation_locks.insert(
+        selector,
+        super::security_program::ModeledPreservationLock {
+            lock_id,
+            scope: PreservationScopeSpec::Global,
+            active: true,
+        },
+    );
 }
 
 fn security_finding_to_violation(
@@ -8532,7 +8881,25 @@ async fn run_quiescent_checks(
             .namespaces
             .get(ns)
             .map_or(0, |ns_model| ns_model.live.len());
-        let mut oracle_violations = if exact_vector_count {
+        let preservation_locked = model.security.preservation_locks.values().any(|lock| {
+            lock.active
+                && match &lock.scope {
+                    PreservationScopeSpec::Global => true,
+                    PreservationScopeSpec::Namespace { namespace }
+                    | PreservationScopeSpec::NamespaceFilter { namespace, .. } => namespace == ns,
+                }
+        });
+        let mut oracle_violations = if preservation_locked {
+            s3_oracle::check_quiescent_namespace_under_preservation(
+                &server.store,
+                ns,
+                expected_live,
+                &status,
+                *op_index,
+                exact_vector_count,
+            )
+            .await
+        } else if exact_vector_count {
             s3_oracle::check_quiescent_namespace_after_second_node(
                 &server.store,
                 ns,
@@ -8706,6 +9073,7 @@ async fn check_quiet_security_visibility(
     };
     coverage.record_security_oracle("I23");
     coverage.record_security_oracle("I27");
+    coverage.record_security_oracle("I28");
     let mut violations = Vec::new();
     for actor in [ActorSel(2), ActorSel(3)] {
         let namespace = config
@@ -8762,7 +9130,137 @@ async fn check_quiet_security_visibility(
             violations.push(security_finding_to_violation(finding, op_index, namespace));
         }
     }
+
+    let admin = client_with_bearer(&server.admin_bearer);
+    let destruction_keys = server
+        .store
+        .list_prefix("_audit/destruction/")
+        .await
+        .unwrap_or_else(|error| panic!("quiet destruction evidence LIST failed: {error}"))
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for key in &destruction_keys {
+        let bytes = server
+            .store
+            .get(key)
+            .await
+            .unwrap_or_else(|error| panic!("quiet destruction evidence GET failed: {error}"));
+        let _: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("quiet destruction record was invalid: {error}"));
+    }
+    let mut injected_bypass = false;
+    for (selector, lock) in model
+        .security
+        .preservation_locks
+        .iter()
+        .filter(|(_, lock)| lock.active)
+    {
+        let locked_namespaces = match &lock.scope {
+            PreservationScopeSpec::Global => model.namespaces.keys().cloned().collect::<Vec<_>>(),
+            PreservationScopeSpec::Namespace { namespace }
+            | PreservationScopeSpec::NamespaceFilter { namespace, .. } => {
+                vec![namespace.clone()]
+            }
+        };
+        for namespace in locked_namespaces {
+            // Destruction evidence is incarnation-specific even though its JSON
+            // names only the reusable namespace string. Consult the current
+            // authoritative tombstone binding instead of treating an older
+            // incarnation's valid evidence as a bypass of a later global lock.
+            let current_meta = match server.store.get(&format!("{namespace}/meta.json")).await {
+                Ok(bytes) => Some(
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(|error| {
+                        panic!("quiet namespace metadata was invalid for {namespace}: {error}")
+                    }),
+                ),
+                Err(ZeppelinError::NotFound { .. }) => None,
+                Err(error) => {
+                    panic!("quiet namespace metadata GET failed for {namespace}: {error}")
+                }
+            };
+            let current_destruction_record =
+                current_destruction_record_present(current_meta.as_ref(), &destruction_keys);
+            let current_incarnation_destroyed =
+                current_incarnation_destroyed(current_meta.as_ref());
+            let expected = model
+                .namespaces
+                .get(&namespace)
+                .map(|namespace| namespace.live.keys().cloned().collect::<BTreeSet<_>>())
+                .unwrap_or_default();
+            let mut observed = BTreeSet::new();
+            let mut status = 200;
+            let mut body = serde_json::Value::Null;
+            if !expected.is_empty() {
+                let path = format!("/v1/namespaces/{namespace}/vectors/get");
+                let response = admin
+                    .post(format!("{}{}", server.base_url, path))
+                    .header(
+                        "x-request-id",
+                        format!("adv-quiet-preservation-{}-{namespace}", selector.0),
+                    )
+                    .json(&json!({
+                        "ids": expected.iter().cloned().collect::<Vec<_>>(),
+                        "consistency": "strong",
+                        "include_vector": false,
+                        "include_attributes": false
+                    }))
+                    .send()
+                    .await
+                    .unwrap_or_else(|error| panic!("quiet preservation fetch failed: {error}"));
+                status = response.status().as_u16();
+                body = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("quiet preservation fetch was non-JSON: {error}")
+                    });
+                observed = oracle::security_response_ids(&body);
+            }
+            if mutation == Some(OracleMutation::PreservationBypass) && !injected_bypass {
+                injected_bypass = true;
+                observed.clear();
+            }
+            if status != 200
+                || observed != expected
+                || current_destruction_record
+                || current_incarnation_destroyed
+            {
+                violations.push(Violation {
+                    id: ViolationId::I28PreservationBypass,
+                    op_index,
+                    namespace: namespace.clone(),
+                    detail: "active preservation lock did not retain every modeled row without destruction evidence"
+                        .to_string(),
+                    evidence: json!({
+                        "lock": selector.0,
+                        "lock_id": lock.lock_id,
+                        "scope": lock.scope,
+                        "status": status,
+                        "expected": expected,
+                        "observed": observed,
+                        "destruction_record": current_destruction_record,
+                        "namespace_metadata_missing": current_incarnation_destroyed,
+                        "body": body,
+                    }),
+                });
+            }
+        }
+    }
     violations
+}
+
+fn current_destruction_record_present(
+    current_meta: Option<&serde_json::Value>,
+    destruction_keys: &BTreeSet<String>,
+) -> bool {
+    current_meta
+        .and_then(|meta| meta.get("destruction_record_key"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|key| destruction_keys.contains(key))
+}
+
+fn current_incarnation_destroyed(current_meta: Option<&serde_json::Value>) -> bool {
+    current_meta.is_none()
 }
 
 fn push_skipped_quiet_steps(
@@ -9339,6 +9837,31 @@ mod outcome_tests {
 
     use super::*;
     use crate::adversarial::faults::{Direction, FaultEvent, TargetSelector};
+
+    #[test]
+    fn i28_matches_destruction_evidence_only_through_the_current_tombstone() {
+        let historical_key = "_audit/destruction/old-incarnation.json".to_string();
+        let current_key = "_audit/destruction/current-incarnation.json".to_string();
+        let mut destruction_keys = BTreeSet::from([historical_key]);
+        let active_meta = json!({"name": "reused", "state": "active"});
+
+        assert!(!current_destruction_record_present(
+            Some(&active_meta),
+            &destruction_keys
+        ));
+
+        destruction_keys.insert(current_key.clone());
+        let deleting_meta = json!({
+            "name": "reused",
+            "state": "deleting",
+            "destruction_record_key": current_key,
+        });
+        assert!(current_destruction_record_present(
+            Some(&deleting_meta),
+            &destruction_keys
+        ));
+        assert!(current_incarnation_destroyed(None));
+    }
 
     #[test]
     fn i26_scans_current_server_delegated_bearers_without_cross_server_bleed() {

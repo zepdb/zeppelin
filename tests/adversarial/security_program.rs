@@ -19,8 +19,9 @@ use zeppelin::types::{AttributeValue, Filter};
 
 use super::model::{Model, ModelRecord};
 use super::ops::{
-    ActorRole, ActorSel, DelegatedTokenSpec, ForbiddenWriteKind, GrantChange, KeySel, Op,
-    SecurityGrantSpec, TenantProbeSurface, TokenSel,
+    ActorRole, ActorSel, DelegatedTokenSpec, DeleteUnderLockSurface, ForbiddenWriteKind,
+    GrantChange, KeySel, LockSel, Op, PreservationScopeSpec, SecurityGrantSpec, TenantProbeSurface,
+    TokenSel,
 };
 use super::oracle::ViolationId;
 
@@ -151,6 +152,7 @@ impl SecurityProgramConfig {
                         actions: vec![
                             "SecurityAdminRead".to_string(),
                             "SecurityAdminWrite".to_string(),
+                            "PreservationRelease".to_string(),
                         ],
                         mandatory_filter: None,
                         write_constraints: None,
@@ -174,6 +176,10 @@ impl SecurityProgramConfig {
                 "token_exceed_scope_probe",
                 "use_expired_token",
                 "revoke_parent_then_use_token",
+                "create_lock",
+                "release_lock",
+                "delete_under_lock",
+                "gc_under_lock",
             ]
             .into_iter()
             .map(str::to_string)
@@ -186,6 +192,7 @@ impl SecurityProgramConfig {
                 "tenant-isolation",
                 "delegation-narrows-parent",
                 "delegation-parent-revocation",
+                "preservation-blocks-destruction",
             ]
             .into_iter()
             .map(str::to_string)
@@ -395,8 +402,43 @@ impl SecurityProgramConfig {
                 change: GrantChange::Add,
             },
         ]);
+        let released_lock = LockSel(0);
+        ops.push(Op::CreateLock {
+            actor: ActorSel::ADMIN,
+            lock: released_lock,
+            scope: PreservationScopeSpec::Global,
+        });
+        ops.extend(
+            DeleteUnderLockSurface::ALL
+                .into_iter()
+                .map(|surface| Op::DeleteUnderLock {
+                    actor: ActorSel::ADMIN,
+                    lock: released_lock,
+                    ns: tenant_a_ns.clone(),
+                    surface,
+                }),
+        );
+        ops.push(Op::GcUnderLock {
+            actor: ActorSel::ADMIN,
+            lock: released_lock,
+            ns: tenant_a_ns.clone(),
+            keep_count: 1,
+        });
+        ops.push(Op::ReleaseLock {
+            actor: ActorSel::ADMIN,
+            lock: released_lock,
+        });
         ops
     }
+}
+
+impl DeleteUnderLockSurface {
+    pub const ALL: [Self; 4] = [
+        Self::Namespace,
+        Self::Snapshot,
+        Self::VectorIds,
+        Self::VectorFilter,
+    ];
 }
 
 impl TenantProbeSurface {
@@ -452,7 +494,18 @@ pub struct SecurityPolicyModel {
     pub revoked_credentials: BTreeSet<KeySel>,
     pub successful_audit_requests: BTreeSet<String>,
     pub indeterminate_mutations: Vec<IndeterminateSecurityMutation>,
+    #[serde(default)]
+    pub indeterminate_preservation_mutations: Vec<IndeterminateSecurityMutation>,
     pub resolved_mutations: Vec<SecurityMutationResolution>,
+    #[serde(default)]
+    pub preservation_locks: BTreeMap<LockSel, ModeledPreservationLock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModeledPreservationLock {
+    pub lock_id: String,
+    pub scope: PreservationScopeSpec,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -467,6 +520,11 @@ pub struct DelegatedTokenModel {
 pub struct IndeterminateSecurityMutation {
     pub op_index: u64,
     pub op: Op,
+}
+
+#[must_use]
+pub fn modeled_preservation_reason(lock: LockSel) -> String {
+    format!("adversarial preservation lock {}", lock.0)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -780,6 +838,201 @@ impl SecurityPolicyModel {
         Ok(())
     }
 
+    /// Reconcile ambiguous lock mutations against the S3-authoritative active
+    /// head plus immutable durable audit evidence gathered at quiescence.
+    pub fn resolve_preservation_authoritative(
+        &mut self,
+        active: &BTreeMap<String, (PreservationScopeSpec, String)>,
+        durable_audit_records: &BTreeMap<String, AuditRecord>,
+    ) -> Result<Vec<(LockSel, String)>, String> {
+        let pending = self.indeterminate_preservation_mutations.clone();
+        let mut preservation_locks = self.preservation_locks.clone();
+        let mut installs = Vec::new();
+        let mut resolutions = Vec::with_capacity(pending.len());
+        for mutation in &pending {
+            let request_id = format!("adv-{}-{}", mutation.op_index, mutation.op.kind());
+            let audit = durable_audit_records.get(&request_id);
+            let audit_succeeded =
+                audit.is_some_and(|record| record.outcome == AuditOutcome::Success);
+            let resolved = match &mutation.op {
+                Op::CreateLock { lock, scope, .. } => {
+                    let audit_lock_id = match audit {
+                        Some(record) if record.action != Action::PreservationAdmin => {
+                            return Err(format!(
+                                "preservation ambiguity {request_id} resolved from wrong audit action {}",
+                                record.action.as_str()
+                            ));
+                        }
+                        Some(AuditRecord {
+                            params: AuditParams::PreservationCreate { lock_id },
+                            outcome: AuditOutcome::Success,
+                            ..
+                        }) => Some(lock_id.clone()),
+                        Some(record) if record.outcome == AuditOutcome::Success => {
+                            return Err(format!(
+                                "preservation create ambiguity {request_id} success omitted lock identity"
+                            ));
+                        }
+                        _ => None,
+                    };
+                    let existing_lock_id = preservation_locks
+                        .get(lock)
+                        .map(|modeled| modeled.lock_id.clone());
+                    let matching_active = active
+                        .iter()
+                        .filter(|(_, (active_scope, reason_text))| {
+                            active_scope == scope
+                                && reason_text == &modeled_preservation_reason(*lock)
+                        })
+                        .map(|(lock_id, _)| lock_id.clone())
+                        .collect::<Vec<_>>();
+                    if matching_active.len() > 1 {
+                        return Err(format!(
+                            "preservation create ambiguity {request_id} matched multiple active locks"
+                        ));
+                    }
+                    if let (Some(audit_lock_id), Some(active_lock_id)) =
+                        (audit_lock_id.as_ref(), matching_active.first())
+                    {
+                        if audit_lock_id != active_lock_id {
+                            return Err(format!(
+                                "preservation create ambiguity {request_id} audit/head identities disagree"
+                            ));
+                        }
+                    }
+                    if let (Some(existing_lock_id), Some(audit_lock_id)) =
+                        (existing_lock_id.as_ref(), audit_lock_id.as_ref())
+                    {
+                        if existing_lock_id != audit_lock_id {
+                            return Err(format!(
+                                "preservation selector {} audit identity changed",
+                                lock.0
+                            ));
+                        }
+                    }
+                    let lock_id = existing_lock_id
+                        .or(audit_lock_id)
+                        .or_else(|| matching_active.first().cloned());
+                    if let Some(lock_id) = lock_id {
+                        let is_active = active.contains_key(&lock_id);
+                        match preservation_locks.get_mut(lock) {
+                            Some(modeled) if modeled.lock_id != lock_id => {
+                                return Err(format!(
+                                    "preservation selector {} changed authoritative lock identity",
+                                    lock.0
+                                ));
+                            }
+                            Some(modeled) if modeled.scope != *scope => {
+                                return Err(format!(
+                                    "preservation selector {} changed authoritative scope",
+                                    lock.0
+                                ));
+                            }
+                            Some(modeled) => modeled.active = is_active,
+                            None => {
+                                preservation_locks.insert(
+                                    *lock,
+                                    ModeledPreservationLock {
+                                        lock_id: lock_id.clone(),
+                                        scope: scope.clone(),
+                                        active: is_active,
+                                    },
+                                );
+                            }
+                        }
+                        installs.push((*lock, lock_id));
+                        SecurityMutationOutcome::Applied
+                    } else {
+                        SecurityMutationOutcome::NotApplied
+                    }
+                }
+                Op::ReleaseLock { lock, .. } => {
+                    let mut audit_release_lock_id = None;
+                    if let Some(record) = audit {
+                        if record.action != Action::PreservationRelease {
+                            return Err(format!(
+                                "preservation ambiguity {request_id} resolved from wrong audit action {}",
+                                record.action.as_str()
+                            ));
+                        }
+                        if record.outcome == AuditOutcome::Success {
+                            match &record.params {
+                                AuditParams::PreservationRelease { lock_id } => {
+                                    audit_release_lock_id = Some(lock_id.as_str());
+                                }
+                                _ => {
+                                    return Err(format!(
+                                        "preservation release ambiguity {request_id} success omitted lock identity"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    let Some(modeled) = preservation_locks.get_mut(lock) else {
+                        if audit_succeeded {
+                            return Err(format!(
+                                "preservation release ambiguity {request_id} applied without a modeled create"
+                            ));
+                        }
+                        resolutions.push(SecurityMutationResolution {
+                            op_index: mutation.op_index,
+                            effect: mutation.op.kind().to_string(),
+                            request_id,
+                            resolved: SecurityMutationOutcome::NotApplied,
+                            audit_outcome: audit
+                                .map(|record| record.outcome.outcome_class().to_string()),
+                            audit_policy_version: audit.map(|record| record.policy_version.get()),
+                            published_policy_version: None,
+                            authoritative_policy_version: self.policy_version,
+                        });
+                        continue;
+                    };
+                    if audit_release_lock_id.is_some_and(|lock_id| lock_id != modeled.lock_id) {
+                        return Err(format!(
+                            "preservation release ambiguity {request_id} audit lock identity disagreed with the model"
+                        ));
+                    }
+                    if audit_succeeded && active.contains_key(&modeled.lock_id) {
+                        return Err(format!(
+                            "preservation release ambiguity {request_id} success audit contradicted the authoritative active head"
+                        ));
+                    }
+                    if !active.contains_key(&modeled.lock_id) {
+                        modeled.active = false;
+                        SecurityMutationOutcome::Applied
+                    } else {
+                        SecurityMutationOutcome::NotApplied
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "non-preservation operation {} entered preservation ambiguity resolution",
+                        mutation.op.kind()
+                    ));
+                }
+            };
+            resolutions.push(SecurityMutationResolution {
+                op_index: mutation.op_index,
+                effect: mutation.op.kind().to_string(),
+                request_id,
+                resolved,
+                audit_outcome: audit.map(|record| record.outcome.outcome_class().to_string()),
+                audit_policy_version: audit.map(|record| record.policy_version.get()),
+                published_policy_version: None,
+                authoritative_policy_version: self.policy_version,
+            });
+        }
+        self.preservation_locks = preservation_locks;
+        self.indeterminate_preservation_mutations.clear();
+        self.resolved_mutations.extend(resolutions);
+        Ok(installs)
+    }
+
+    #[must_use]
+    pub fn has_indeterminate_preservation_mutations(&self) -> bool {
+        !self.indeterminate_preservation_mutations.is_empty()
+    }
+
     pub fn take_resolved_mutations(&mut self) -> Vec<SecurityMutationResolution> {
         std::mem::take(&mut self.resolved_mutations)
     }
@@ -875,6 +1128,49 @@ impl SecurityPolicyModel {
                     "token selector was minted more than once"
                 );
             }
+            Op::CreateLock { lock, scope, .. } => {
+                let lock_id = response
+                    .get("lock_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("successful preservation create omitted lock_id"));
+                let previous = self.preservation_locks.insert(
+                    *lock,
+                    ModeledPreservationLock {
+                        lock_id: lock_id.to_string(),
+                        scope: scope.clone(),
+                        active: true,
+                    },
+                );
+                assert!(previous.is_none(), "preservation selector was reused");
+            }
+            Op::ReleaseLock { lock, .. } => {
+                if let Some(modeled) = self.preservation_locks.get_mut(lock) {
+                    modeled.active = false;
+                } else {
+                    let lock_id = response
+                        .get("lock_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!("successful preservation release omitted lock_id")
+                        });
+                    let scope = serde_json::from_value::<PreservationScopeSpec>(
+                        response.get("scope").cloned().unwrap_or_else(|| {
+                            panic!("successful preservation release omitted scope")
+                        }),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("successful preservation release scope was invalid: {error}")
+                    });
+                    self.preservation_locks.insert(
+                        *lock,
+                        ModeledPreservationLock {
+                            lock_id: lock_id.to_string(),
+                            scope,
+                            active: false,
+                        },
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -888,6 +1184,13 @@ impl SecurityPolicyModel {
                 | Op::PublishGrantChange { .. }
         ) {
             self.indeterminate_mutations
+                .push(IndeterminateSecurityMutation {
+                    op_index,
+                    op: op.clone(),
+                });
+        }
+        if matches!(op, Op::CreateLock { .. } | Op::ReleaseLock { .. }) {
+            self.indeterminate_preservation_mutations
                 .push(IndeterminateSecurityMutation {
                     op_index,
                     op: op.clone(),
@@ -1003,6 +1306,23 @@ impl SecurityPolicyModel {
                 &active_windows,
                 AccessExpectation::Allow,
             )),
+            Op::CreateLock { .. } => Some(self.expected_actor_operation_decision(
+                op,
+                &active_windows,
+                AccessExpectation::Allow,
+            )),
+            Op::ReleaseLock { .. } => Some(self.expected_actor_operation_decision(
+                op,
+                &active_windows,
+                AccessExpectation::Authorized,
+            )),
+            Op::DeleteUnderLock { .. } | Op::GcUnderLock { .. } => {
+                Some(self.expected_actor_operation_decision(
+                    op,
+                    &active_windows,
+                    AccessExpectation::Authorized,
+                ))
+            }
             Op::UseToken { .. } | Op::RevokeParentThenUseToken { .. } => {
                 Some(self.expected_actor_operation_decision(
                     op,
@@ -1044,6 +1364,10 @@ impl SecurityPolicyModel {
         assert!(
             self.indeterminate_mutations.is_empty(),
             "cannot close security staleness windows before resolving ambiguous mutations"
+        );
+        assert!(
+            self.indeterminate_preservation_mutations.is_empty(),
+            "cannot close security staleness windows before resolving ambiguous preservation mutations"
         );
         self.staleness_windows.clear();
     }
@@ -1256,6 +1580,9 @@ impl SecurityPolicyModel {
                 | Op::MintToken { .. }
                 | Op::ForbiddenWriteProbe { .. }
                 | Op::AuditBarrierOp { .. }
+                | Op::CreateLock { .. }
+                | Op::ReleaseLock { .. }
+                | Op::DeleteUnderLock { .. }
         ) || matches!(
             op,
             Op::Upsert { actor, ns, .. }
@@ -1497,6 +1824,30 @@ fn simple_operation_requirement(op: &Op) -> Option<GrantRequirement<'_>> {
             namespace: None,
             unconstrained: true,
         }),
+        Op::CreateLock { .. } => Some(GrantRequirement {
+            action: Action::PreservationAdmin,
+            namespace: None,
+            unconstrained: true,
+        }),
+        Op::ReleaseLock { .. } => Some(GrantRequirement {
+            action: Action::PreservationRelease,
+            namespace: None,
+            unconstrained: true,
+        }),
+        Op::DeleteUnderLock { ns, surface, .. } => Some(GrantRequirement {
+            action: match surface {
+                DeleteUnderLockSurface::Namespace => Action::NamespaceDelete,
+                DeleteUnderLockSurface::Snapshot => Action::SnapshotDelete,
+                DeleteUnderLockSurface::VectorIds | DeleteUnderLockSurface::VectorFilter => {
+                    Action::VectorDelete
+                }
+            },
+            namespace: Some(ns),
+            unconstrained: !matches!(
+                surface,
+                DeleteUnderLockSurface::VectorIds | DeleteUnderLockSurface::VectorFilter
+            ),
+        }),
         Op::UseToken { target_ns, .. }
         | Op::TokenExceedScopeProbe { target_ns, .. }
         | Op::UseExpiredToken { target_ns, .. }
@@ -1506,6 +1857,7 @@ fn simple_operation_requirement(op: &Op) -> Option<GrantRequirement<'_>> {
             unconstrained: false,
         }),
         Op::GcCycle { .. }
+        | Op::GcUnderLock { .. }
         | Op::ProbeSandwich { .. }
         | Op::CompactInline { .. }
         | Op::CloneNamespace { .. }
@@ -2931,6 +3283,128 @@ mod tests {
             .expect_err("wrong-action audit evidence must fail closed");
         assert!(error.contains("wrong audit action"));
         assert_eq!(model.indeterminate_mutations.len(), 1);
+        assert!(model.resolved_mutations.is_empty());
+    }
+
+    #[test]
+    fn authoritative_preservation_resolution_recovers_an_ambiguous_create() {
+        let mut model = SecurityPolicyModel::default();
+        let lock = LockSel(7);
+        let scope = PreservationScopeSpec::Namespace {
+            namespace: "tenant-a".to_string(),
+        };
+        model.observe_ambiguous(
+            &Op::CreateLock {
+                actor: ActorSel::ADMIN,
+                lock,
+                scope: scope.clone(),
+            },
+            20,
+        );
+        let lock_id = "plk_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
+        let active = BTreeMap::from([(
+            lock_id.clone(),
+            (scope.clone(), modeled_preservation_reason(lock)),
+        )]);
+
+        let installs = model
+            .resolve_preservation_authoritative(&active, &BTreeMap::new())
+            .expect("the authoritative active head must resolve the ambiguous create");
+
+        assert_eq!(installs, vec![(lock, lock_id.clone())]);
+        assert!(model.indeterminate_preservation_mutations.is_empty());
+        assert_eq!(model.preservation_locks[&lock].lock_id, lock_id);
+        assert_eq!(model.preservation_locks[&lock].scope, scope);
+        assert!(model.preservation_locks[&lock].active);
+        assert_eq!(
+            model.take_resolved_mutations()[0].resolved,
+            SecurityMutationOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn authoritative_preservation_resolution_uses_head_presence_for_release() {
+        let mut model = SecurityPolicyModel::default();
+        let lock = LockSel(8);
+        let scope = PreservationScopeSpec::Namespace {
+            namespace: "tenant-a".to_string(),
+        };
+        let lock_id = "plk_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
+        model.observe_applied(
+            &Op::CreateLock {
+                actor: ActorSel::ADMIN,
+                lock,
+                scope: scope.clone(),
+            },
+            &json!({"lock_id": lock_id}),
+            20,
+        );
+        let release = Op::ReleaseLock {
+            actor: ActorSel::ADMIN,
+            lock,
+        };
+        model.observe_ambiguous(&release, 21);
+        let active =
+            BTreeMap::from([(lock_id.clone(), (scope, modeled_preservation_reason(lock)))]);
+
+        model
+            .resolve_preservation_authoritative(&active, &BTreeMap::new())
+            .expect("an active authoritative lock means the release was not applied");
+        assert!(model.preservation_locks[&lock].active);
+        assert_eq!(
+            model.take_resolved_mutations()[0].resolved,
+            SecurityMutationOutcome::NotApplied
+        );
+
+        model.observe_ambiguous(&release, 22);
+        model
+            .resolve_preservation_authoritative(&BTreeMap::new(), &BTreeMap::new())
+            .expect("absence from the authoritative head means the release applied");
+        assert!(!model.preservation_locks[&lock].active);
+        assert_eq!(
+            model.take_resolved_mutations()[0].resolved,
+            SecurityMutationOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn preservation_release_success_audit_cannot_override_an_active_head() {
+        let mut model = SecurityPolicyModel::default();
+        let lock = LockSel(9);
+        let scope = PreservationScopeSpec::Global;
+        let lock_id = "plk_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
+        model.observe_applied(
+            &Op::CreateLock {
+                actor: ActorSel::ADMIN,
+                lock,
+                scope: scope.clone(),
+            },
+            &json!({"lock_id": lock_id}),
+            20,
+        );
+        let release = Op::ReleaseLock {
+            actor: ActorSel::ADMIN,
+            lock,
+        };
+        model.observe_ambiguous(&release, 21);
+        let active =
+            BTreeMap::from([(lock_id.clone(), (scope, modeled_preservation_reason(lock)))]);
+        let mut audit =
+            security_mutation_audit("adv-21-release_lock", Action::PreservationRelease, 1, 1);
+        audit.params = AuditParams::PreservationRelease {
+            lock_id: lock_id.clone(),
+        };
+
+        let error = model
+            .resolve_preservation_authoritative(
+                &active,
+                &BTreeMap::from([("adv-21-release_lock".to_string(), audit)]),
+            )
+            .expect_err("success audit plus active head is an I18 contradiction");
+
+        assert!(error.contains("contradicted the authoritative active head"));
+        assert_eq!(model.indeterminate_preservation_mutations.len(), 1);
+        assert!(model.preservation_locks[&lock].active);
         assert!(model.resolved_mutations.is_empty());
     }
 

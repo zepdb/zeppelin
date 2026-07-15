@@ -166,8 +166,8 @@ assumptions. A new provider-abuse or future-architecture event must be reachable
 only through an explicit campaign; a new supported event may join Mixed only
 after its assumption audit.
 
-The consolidated matrix contains twenty-two mutations, including one pinned
-mutation for each security oracle I22-I27. Each clean
+The consolidated matrix contains twenty-five mutations, including one pinned
+mutation for each security oracle I22-I28. Each clean
 control and mutation is capped at 80 workload operations. Run it with:
 
 ```bash

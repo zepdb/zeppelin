@@ -46,6 +46,7 @@ pub enum ViolationId {
     I25AuditEvidence,
     I26SecurityStateSanity,
     I27ConstraintDrop,
+    I28PreservationBypass,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +179,66 @@ fn check_security_operation(
                 });
             }
         }
+    }
+
+    match &rec.op {
+        Op::DeleteUnderLock { lock, .. } => {
+            let modeled_locked = model
+                .security
+                .preservation_locks
+                .get(lock)
+                .is_some_and(|lock| lock.active);
+            if modeled_locked {
+                let bypassed = mutation == Some(OracleMutation::PreservationBypass);
+                if bypassed
+                    || rec.status != 409
+                    || rec.response.get("code").and_then(serde_json::Value::as_str)
+                        != Some("preservation_locked")
+                {
+                    findings.push(SecurityFinding {
+                        id: ViolationId::I28PreservationBypass,
+                        detail: "modeled active lock did not block a destructive surface"
+                            .to_string(),
+                        evidence: serde_json::json!({
+                            "lock": lock.0,
+                            "status": rec.status,
+                            "response": rec.response,
+                            "mutation": bypassed,
+                        }),
+                    });
+                }
+            }
+        }
+        Op::GcUnderLock { lock, .. } => {
+            let modeled_locked = model
+                .security
+                .preservation_locks
+                .get(lock)
+                .is_some_and(|lock| lock.active);
+            let deleted = rec.response["objects_deleted"]
+                .as_u64()
+                .unwrap_or(u64::MAX)
+                .saturating_add(
+                    rec.response["pending_deletes_deleted"]
+                        .as_u64()
+                        .unwrap_or(u64::MAX),
+                );
+            if modeled_locked
+                && (mutation == Some(OracleMutation::PreservationBypass) || deleted != 0)
+            {
+                findings.push(SecurityFinding {
+                    id: ViolationId::I28PreservationBypass,
+                    detail: "lock-aware GC reported destructive work under an active lock"
+                        .to_string(),
+                    evidence: serde_json::json!({
+                        "lock": lock.0,
+                        "deleted": deleted,
+                        "mutation": mutation == Some(OracleMutation::PreservationBypass),
+                    }),
+                });
+            }
+        }
+        _ => {}
     }
 
     findings
@@ -2495,6 +2556,11 @@ const KNOWN_ERROR_CODES: &[&str] = &[
     "security_entity_exists",
     "security_entity_not_found",
     "audit_unavailable",
+    "preservation_locked",
+    "preservation_state_unavailable",
+    "invalid_preservation_request",
+    "preservation_lock_not_found",
+    "preservation_conflict",
     "unmapped_route",
     "security_internal",
 ];

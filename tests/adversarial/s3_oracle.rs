@@ -481,6 +481,7 @@ pub async fn check_quiescent_namespace(
         compact_status,
         op_index,
         false,
+        false,
     )
     .await
 }
@@ -499,6 +500,29 @@ pub async fn check_quiescent_namespace_after_second_node(
         compact_status,
         op_index,
         true,
+        false,
+    )
+    .await
+}
+
+/// Check quiescent S3 safety while an active preservation lock deliberately
+/// permits uncompacted fragments and unreachable-but-retained WAL artifacts.
+pub async fn check_quiescent_namespace_under_preservation(
+    store: &ZeppelinStore,
+    namespace: &str,
+    expected_live: usize,
+    compact_status: &serde_json::Value,
+    op_index: u64,
+    exact_vector_count: bool,
+) -> Vec<Violation> {
+    check_quiescent_namespace_with_count_policy(
+        store,
+        namespace,
+        expected_live,
+        compact_status,
+        op_index,
+        exact_vector_count,
+        true,
     )
     .await
 }
@@ -510,6 +534,7 @@ async fn check_quiescent_namespace_with_count_policy(
     compact_status: &serde_json::Value,
     op_index: u64,
     exact_vector_count: bool,
+    preservation_locked: bool,
 ) -> Vec<Violation> {
     let manifest = match read_manifest_for_oracle(store, namespace).await {
         Ok(Some(manifest)) => manifest,
@@ -556,7 +581,7 @@ async fn check_quiescent_namespace_with_count_policy(
             }),
         ));
     }
-    if ready != Some(true) || uncompacted != Some(0) {
+    if !preservation_locked && (ready != Some(true) || uncompacted != Some(0)) {
         violations.push(violation(
             ViolationId::I16Quiescence,
             op_index,
@@ -617,7 +642,7 @@ async fn check_quiescent_namespace_with_count_policy(
         .filter(|key| key.starts_with(&format!("{namespace}/wal/")))
         .filter(|key| !reachable.contains(key))
         .collect::<Vec<_>>();
-    if !stray_wal.is_empty() {
+    if !preservation_locked && !stray_wal.is_empty() {
         violations.push(violation(
             ViolationId::I16Quiescence,
             op_index,

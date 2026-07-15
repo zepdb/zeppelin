@@ -100,6 +100,45 @@ pub struct TokenSel {
     pub slot: u8,
 }
 
+/// Deterministic selector for one preservation lock within a seed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct LockSel(pub u8);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PreservationScopeSpec {
+    Global,
+    Namespace {
+        namespace: String,
+    },
+    NamespaceFilter {
+        namespace: String,
+        filter: serde_json::Value,
+    },
+}
+
+impl PreservationScopeSpec {
+    #[must_use]
+    pub fn namespace(&self) -> Option<&str> {
+        match self {
+            Self::Global => None,
+            Self::Namespace { namespace } | Self::NamespaceFilter { namespace, .. } => {
+                Some(namespace)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteUnderLockSurface {
+    Namespace,
+    Snapshot,
+    VectorIds,
+    VectorFilter,
+}
+
 impl TokenSel {
     #[must_use]
     pub fn artifact_key(self) -> String {
@@ -310,6 +349,27 @@ pub enum Op {
     AuditBarrierOp {
         actor: ActorSel,
     },
+    CreateLock {
+        actor: ActorSel,
+        lock: LockSel,
+        scope: PreservationScopeSpec,
+    },
+    ReleaseLock {
+        actor: ActorSel,
+        lock: LockSel,
+    },
+    DeleteUnderLock {
+        actor: ActorSel,
+        lock: LockSel,
+        ns: String,
+        surface: DeleteUnderLockSurface,
+    },
+    GcUnderLock {
+        actor: ActorSel,
+        lock: LockSel,
+        ns: String,
+        keep_count: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -506,7 +566,11 @@ impl Op {
             | Self::ForbiddenWriteProbe { actor, .. }
             | Self::ExportProbe { actor, .. }
             | Self::SecurityAdminProbe { actor }
-            | Self::AuditBarrierOp { actor } => *actor,
+            | Self::AuditBarrierOp { actor }
+            | Self::CreateLock { actor, .. }
+            | Self::ReleaseLock { actor, .. }
+            | Self::DeleteUnderLock { actor, .. }
+            | Self::GcUnderLock { actor, .. } => *actor,
             Self::UseRevokedCredential { key } => key.actor,
             Self::UseToken { token, .. }
             | Self::TokenExceedScopeProbe { token, .. }
@@ -537,6 +601,10 @@ impl Op {
                 | Op::ExportProbe { .. }
                 | Op::SecurityAdminProbe { .. }
                 | Op::AuditBarrierOp { .. }
+                | Op::CreateLock { .. }
+                | Op::ReleaseLock { .. }
+                | Op::DeleteUnderLock { .. }
+                | Op::GcUnderLock { .. }
         )
     }
 
@@ -579,6 +647,10 @@ impl Op {
             Op::ExportProbe { .. } => "export_probe",
             Op::SecurityAdminProbe { .. } => "security_admin_probe",
             Op::AuditBarrierOp { .. } => "audit_barrier",
+            Op::CreateLock { .. } => "create_lock",
+            Op::ReleaseLock { .. } => "release_lock",
+            Op::DeleteUnderLock { .. } => "delete_under_lock",
+            Op::GcUnderLock { .. } => "gc_under_lock",
         }
     }
 
@@ -601,6 +673,10 @@ impl Op {
                 | Op::ExportProbe { .. }
                 | Op::SecurityAdminProbe { .. }
                 | Op::AuditBarrierOp { .. }
+                | Op::CreateLock { .. }
+                | Op::ReleaseLock { .. }
+                | Op::DeleteUnderLock { .. }
+                | Op::GcUnderLock { .. }
         )
     }
 
@@ -627,6 +703,8 @@ impl Op {
             | Op::DeleteNamespace { ns, .. }
             | Op::ProbeSandwich { ns, .. }
             | Op::CompactInline { ns, .. } => ns,
+            Op::DeleteUnderLock { ns, .. } | Op::GcUnderLock { ns, .. } => ns,
+            Op::CreateLock { scope, .. } => scope.namespace().unwrap_or("_security"),
             Op::CloneNamespace { source, .. } => source,
             Op::TenantBoundaryProbe { target_ns, .. }
             | Op::ForbiddenWriteProbe { target_ns, .. }
@@ -643,6 +721,7 @@ impl Op {
             | Op::UseRevokedCredential { .. }
             | Op::SecurityAdminProbe { .. }
             | Op::AuditBarrierOp { .. } => "_security",
+            Op::ReleaseLock { .. } => "_security",
         }
     }
 
@@ -667,6 +746,10 @@ impl Op {
                 | Op::PublishGrantChange { .. }
                 | Op::MintToken { .. }
                 | Op::ForbiddenWriteProbe { .. }
+                | Op::CreateLock { .. }
+                | Op::ReleaseLock { .. }
+                | Op::DeleteUnderLock { .. }
+                | Op::GcUnderLock { .. }
         )
     }
 
@@ -706,6 +789,10 @@ impl Op {
             | Op::ExportProbe { .. }
             | Op::SecurityAdminProbe { .. }
             | Op::AuditBarrierOp { .. } => vec!["security"],
+            Op::CreateLock { .. }
+            | Op::ReleaseLock { .. }
+            | Op::DeleteUnderLock { .. }
+            | Op::GcUnderLock { .. } => vec!["security", "preservation"],
             _ => Vec::new(),
         }
     }
@@ -942,6 +1029,50 @@ impl Op {
             },
             Op::SecurityAdminProbe { actor } => Op::SecurityAdminProbe { actor: *actor },
             Op::AuditBarrierOp { actor } => Op::AuditBarrierOp { actor: *actor },
+            Op::CreateLock { actor, lock, scope } => Op::CreateLock {
+                actor: *actor,
+                lock: *lock,
+                scope: match scope {
+                    PreservationScopeSpec::Global => PreservationScopeSpec::Global,
+                    PreservationScopeSpec::Namespace { namespace } => {
+                        PreservationScopeSpec::Namespace {
+                            namespace: rewrite(namespace),
+                        }
+                    }
+                    PreservationScopeSpec::NamespaceFilter { namespace, filter } => {
+                        PreservationScopeSpec::NamespaceFilter {
+                            namespace: rewrite(namespace),
+                            filter: filter.clone(),
+                        }
+                    }
+                },
+            },
+            Op::ReleaseLock { actor, lock } => Op::ReleaseLock {
+                actor: *actor,
+                lock: *lock,
+            },
+            Op::DeleteUnderLock {
+                actor,
+                lock,
+                ns,
+                surface,
+            } => Op::DeleteUnderLock {
+                actor: *actor,
+                lock: *lock,
+                ns: rewrite(ns),
+                surface: *surface,
+            },
+            Op::GcUnderLock {
+                actor,
+                lock,
+                ns,
+                keep_count,
+            } => Op::GcUnderLock {
+                actor: *actor,
+                lock: *lock,
+                ns: rewrite(ns),
+                keep_count: *keep_count,
+            },
         }
     }
 }

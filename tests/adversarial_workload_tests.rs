@@ -59,6 +59,10 @@ const REQUIRED_SECURITY_OP_KINDS: &[&str] = &[
     "token_exceed_scope_probe",
     "use_expired_token",
     "revoke_parent_then_use_token",
+    "create_lock",
+    "release_lock",
+    "delete_under_lock",
+    "gc_under_lock",
 ];
 
 fn operation_coverage_required(mode: adversarial::RunMode, kind: &str) -> bool {
@@ -159,7 +163,7 @@ async fn smoke() {
                 "security operation kind {kind} was not covered"
             );
         }
-        for oracle in ["I22", "I23", "I24", "I25", "I26", "I27"] {
+        for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28"] {
             assert!(
                 summary
                     .coverage

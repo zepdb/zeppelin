@@ -923,8 +923,8 @@ mod tests {
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(seed.dir.join("config.json")).unwrap()).unwrap();
         assert_eq!(config["principals"].as_array().unwrap().len(), 5);
-        assert_eq!(config["security_ops"].as_array().unwrap().len(), 15);
-        assert_eq!(config["protected_assumptions"].as_array().unwrap().len(), 6);
+        assert_eq!(config["security_ops"].as_array().unwrap().len(), 19);
+        assert_eq!(config["protected_assumptions"].as_array().unwrap().len(), 7);
         assert!(!config["security_program"].is_null());
 
         let mut authz = record(0);
@@ -1991,9 +1991,11 @@ fn build_report(
     }) {
         out.push_str("## Authorization Summary\n\n");
         out.push_str(
-            "| seed | allow | forbidden | unauthorized | staleness resolutions | I22 | I23 | I24 | I25 | I26 | I27 |\n",
+            "| seed | allow | forbidden | unauthorized | staleness resolutions | I22 | I23 | I24 | I25 | I26 | I27 | I28 |\n",
         );
-        out.push_str("| --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- |\n");
+        out.push_str(
+            "| --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |\n",
+        );
         for seed in seeds {
             let records = read_ops(&seed.dir);
             let security_records = records
@@ -2027,7 +2029,7 @@ fn build_report(
                 }
             };
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 seed.seed,
                 allow,
                 forbidden,
@@ -2039,6 +2041,7 @@ fn build_report(
                 oracle_status(ViolationId::I25AuditEvidence),
                 oracle_status(ViolationId::I26SecurityStateSanity),
                 oracle_status(ViolationId::I27ConstraintDrop),
+                oracle_status(ViolationId::I28PreservationBypass),
             ));
         }
         out.push('\n');
@@ -2361,7 +2364,7 @@ fn build_report(
     out.push('\n');
 
     out.push_str("## Security Oracle Coverage\n\n");
-    for oracle in ["I22", "I23", "I24", "I25", "I26", "I27"] {
+    for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28"] {
         let count = coverage
             .security_oracle_counts
             .get(oracle)
@@ -2692,6 +2695,10 @@ const SECURITY_OP_KINDS: &[&str] = &[
     "token_exceed_scope_probe",
     "use_expired_token",
     "revoke_parent_then_use_token",
+    "create_lock",
+    "release_lock",
+    "delete_under_lock",
+    "gc_under_lock",
 ];
 
 const REQUIRED_TAGS: &[&str] = &[
