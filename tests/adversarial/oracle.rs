@@ -8,6 +8,9 @@ use super::model::{
     model_distance, IndetEffect, Model, ModelRecord, NsIndeterminate, NsModel, OracleMutation,
 };
 use super::ops::{AsOfTarget, GeneratedQuery, MaintenanceKind, Op, OpRecord, QueryOracleClass};
+use super::security_program::{
+    check_i22_authz_decision, check_i23_tenant_leak, ExpectedDecision, SecurityFinding,
+};
 use super::RunMode;
 
 pub const SCORE_ABS_EPS: f32 = 1e-5;
@@ -36,6 +39,12 @@ pub enum ViolationId {
     I19CrashRecovery,
     I20CorruptionSurfaced,
     I21FencingViolation,
+    I22AuthzDecision,
+    I23TenantLeak,
+    I24RevocationFreshness,
+    I25AuditEvidence,
+    I26SecurityStateSanity,
+    I27ConstraintDrop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +71,7 @@ pub fn check_op(
     let mut violations = Vec::new();
     violations.extend(check_i11_error_envelope(rec));
     violations.extend(check_expected_error(model, rec, mode));
+    violations.extend(check_security_operation(model, rec, mutation));
     if mode == RunMode::Deterministic {
         violations.extend(check_i10_failed_validation_no_wal(rec));
     }
@@ -80,6 +90,142 @@ pub fn check_op(
         violations.extend(check_i7_fts_membership(model, rec));
     }
     violations
+}
+
+fn check_security_operation(
+    model: &Model,
+    rec: &OpRecord,
+    mutation: Option<OracleMutation>,
+) -> Vec<Violation> {
+    if !model.security.enabled() {
+        return Vec::new();
+    }
+    let mut findings = Vec::new();
+    if !rec.outcome.starts_with("ambiguous:")
+        && rec.response.get("_adversarial_store_fault").is_none()
+        && !(rec.status == 429 && rec.response["request_id"] == "adversarial-drop-request")
+    {
+        if let Some(mut expected) = model.security.expected_decision(&rec.op, rec.index) {
+            if mutation == Some(OracleMutation::GrantModelDesync)
+                && matches!(rec.op, Op::AuditBarrierOp { .. })
+            {
+                expected = match expected {
+                    ExpectedDecision::Forbidden => ExpectedDecision::Allow,
+                    _ => ExpectedDecision::Forbidden,
+                };
+            }
+            if let Some(finding) = check_i22_authz_decision(expected, rec.status) {
+                findings.push(finding);
+            }
+        }
+    }
+
+    if let Op::TenantBoundaryProbe {
+        actor, target_ns, ..
+    } = &rec.op
+    {
+        let visible = model.security.expected_visible_ids(model, rec.op.actor());
+        let mut observed = security_response_ids(&rec.response);
+        if mutation == Some(OracleMutation::LeakedIdSuppression) {
+            observed.insert("mutation-outsider-id".to_string());
+        }
+        if let Some(finding) = check_i23_tenant_leak(&visible, &observed) {
+            findings.push(finding);
+        }
+        let own_namespace = model
+            .security
+            .config
+            .as_ref()
+            .and_then(|config| config.tenant_namespace(*actor));
+        if own_namespace != Some(target_ns.as_str()) {
+            let aggregate_leaks = security_response_aggregate_leaks(&rec.response);
+            if !aggregate_leaks.is_empty() {
+                findings.push(SecurityFinding {
+                    id: ViolationId::I23TenantLeak,
+                    detail: "cross-tenant response exposed non-empty aggregate data".to_string(),
+                    evidence: serde_json::json!({
+                        "target_namespace": target_ns,
+                        "aggregate_leaks": aggregate_leaks,
+                    }),
+                });
+            }
+        }
+    }
+
+    findings
+        .into_iter()
+        .map(|finding| security_finding_violation(rec, finding))
+        .collect()
+}
+
+fn security_response_aggregate_leaks(value: &serde_json::Value) -> BTreeSet<String> {
+    fn collect(value: &serde_json::Value, path: &str, leaks: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    collect(value, &format!("{path}/{index}"), leaks);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    let child = format!("{path}/{key}");
+                    if matches!(key.as_str(), "count" | "total" | "total_count")
+                        && value.as_u64().is_some_and(|count| count > 0)
+                    {
+                        leaks.insert(child.clone());
+                    }
+                    if matches!(key.as_str(), "facets" | "groups" | "buckets")
+                        && match value {
+                            serde_json::Value::Array(values) => !values.is_empty(),
+                            serde_json::Value::Object(values) => !values.is_empty(),
+                            _ => false,
+                        }
+                    {
+                        leaks.insert(child.clone());
+                    }
+                    collect(value, &child, leaks);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut leaks = BTreeSet::new();
+    collect(value, "", &mut leaks);
+    leaks
+}
+
+pub(crate) fn security_response_ids(value: &serde_json::Value) -> BTreeSet<String> {
+    fn collect(value: &serde_json::Value, ids: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, ids);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                if let Some(id) = object.get("id").and_then(serde_json::Value::as_str) {
+                    ids.insert(id.to_string());
+                }
+                for value in object.values() {
+                    collect(value, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ids = BTreeSet::new();
+    collect(value, &mut ids);
+    ids
+}
+
+fn security_finding_violation(rec: &OpRecord, finding: SecurityFinding) -> Violation {
+    Violation {
+        id: finding.id,
+        op_index: rec.index,
+        namespace: rec.op.namespace().to_string(),
+        detail: finding.detail,
+        evidence: finding.evidence,
+    }
 }
 
 pub struct CorruptionContext<'a> {
@@ -173,7 +319,7 @@ fn check_i1_strong_exact(
     if mode != RunMode::Deterministic {
         return Vec::new();
     }
-    let Op::Query { ns, q, as_of } = &rec.op else {
+    let Op::Query { ns, q, as_of, .. } = &rec.op else {
         return Vec::new();
     };
     if as_of.is_some() {
@@ -425,6 +571,7 @@ fn check_i4_fetch_exact(model: &Model, rec: &OpRecord, _mode: RunMode) -> Vec<Vi
         ns,
         ids,
         consistency,
+        ..
     } = &rec.op
     else {
         return Vec::new();
@@ -647,6 +794,7 @@ fn check_i8_as_of_exact(
         ns,
         q,
         as_of: Some(as_of),
+        ..
     } = &rec.op
     else {
         return Vec::new();
@@ -918,6 +1066,10 @@ fn nested_error_envelopes(rec: &OpRecord) -> Vec<NestedErrorEnvelope<'_>> {
             }
             push_nested_error(&mut nested, "big", &rec.response["big"]);
         }
+        Op::ExportProbe { .. } => {
+            push_nested_error(&mut nested, "fetch", &rec.response["fetch"]);
+            push_nested_error(&mut nested, "snapshot", &rec.response["snapshot"]);
+        }
         _ => {}
     }
     nested
@@ -999,7 +1151,7 @@ fn check_expected_error(model: &Model, rec: &OpRecord, mode: RunMode) -> Vec<Vio
             };
             (ns.as_str(), *status, code.as_str())
         }
-        Op::InvalidProbe { ns, probe } => {
+        Op::InvalidProbe { ns, probe, .. } => {
             (ns.as_str(), probe.expected_status(), probe.expected_code())
         }
         _ => return Vec::new(),
@@ -1047,7 +1199,7 @@ fn check_expected_error(model: &Model, rec: &OpRecord, mode: RunMode) -> Vec<Vio
 }
 
 fn check_i10_failed_validation_no_wal(rec: &OpRecord) -> Vec<Violation> {
-    let Op::InvalidProbe { ns, probe } = &rec.op else {
+    let Op::InvalidProbe { ns, probe, .. } = &rec.op else {
         return Vec::new();
     };
     if !probe.is_write_shaped() || !(400..500).contains(&rec.status) {
@@ -1083,7 +1235,7 @@ fn check_i10_failed_validation_no_wal(rec: &OpRecord) -> Vec<Violation> {
 fn check_i12_structural_sanity(model: &Model, rec: &OpRecord) -> Vec<Violation> {
     match &rec.op {
         Op::Query { ns, q, .. } => check_query_structural(model, rec, ns, q, &rec.response),
-        Op::BatchQuery { ns, qs } => rec.response["batch"]["results"]
+        Op::BatchQuery { ns, qs, .. } => rec.response["batch"]["results"]
             .as_array()
             .into_iter()
             .flatten()
@@ -1380,7 +1532,7 @@ fn check_debug_structural(
 }
 
 fn check_i3_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
-    let Op::Query { ns, q, as_of } = &rec.op else {
+    let Op::Query { ns, q, as_of, .. } = &rec.op else {
         return Vec::new();
     };
     if as_of.is_some() {
@@ -1414,7 +1566,7 @@ fn check_i3_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
 }
 
 fn check_i5_batch_equivalence(rec: &OpRecord) -> Vec<Violation> {
-    let Op::BatchQuery { ns, qs } = &rec.op else {
+    let Op::BatchQuery { ns, qs, .. } = &rec.op else {
         return Vec::new();
     };
     let Some(batch_entries) = rec.response["batch"]["results"].as_array() else {
@@ -1698,7 +1850,7 @@ fn query_scan_shape(body: &serde_json::Value) -> Option<(u64, u64)> {
 }
 
 fn check_i7_fts_membership(model: &Model, rec: &OpRecord) -> Vec<Violation> {
-    let Op::Query { ns, q, as_of } = &rec.op else {
+    let Op::Query { ns, q, as_of, .. } = &rec.op else {
         return Vec::new();
     };
     if as_of.is_some() {
@@ -1778,7 +1930,10 @@ fn is_pure_bm25_query(body: &serde_json::Value) -> bool {
 }
 
 fn check_i13_probe_sandwich(rec: &OpRecord) -> Vec<Violation> {
-    let Op::ProbeSandwich { ns, maintenance } = &rec.op else {
+    let Op::ProbeSandwich {
+        ns, maintenance, ..
+    } = &rec.op
+    else {
         return Vec::new();
     };
     let before = &rec.response["before"];
@@ -2296,6 +2451,24 @@ const KNOWN_ERROR_CODES: &[&str] = &[
     "INDEX_UNAVAILABLE",
     "CONCURRENCY_LIMIT",
     "RATE_LIMITED",
+    "unauthenticated",
+    "credential_expired",
+    "credential_unknown",
+    "forbidden",
+    "namespace_not_granted",
+    "security_stale",
+    "obligation_unsatisfied",
+    "constraint_violation",
+    "cursor_policy_stale",
+    "invalid_namespace",
+    "invalid_snapshot",
+    "invalid_security_request",
+    "security_conflict",
+    "security_entity_exists",
+    "security_entity_not_found",
+    "audit_unavailable",
+    "unmapped_route",
+    "security_internal",
 ];
 
 #[cfg(test)]
@@ -2304,7 +2477,7 @@ mod tests {
     use zeppelin::index::quantization::QuantizationType;
     use zeppelin::types::DistanceMetric;
 
-    use crate::adversarial::ops::NamespaceSpec;
+    use crate::adversarial::ops::{ActorSel, NamespaceSpec};
 
     use super::*;
 
@@ -2332,6 +2505,7 @@ mod tests {
         );
         Model {
             namespaces: BTreeMap::from([(NS.to_string(), ns_model)]),
+            ..Model::default()
         }
     }
 
@@ -2340,6 +2514,7 @@ mod tests {
             index: 17,
             wall_ms: 0,
             op: Op::FetchVectors {
+                actor: ActorSel::ADMIN,
                 ns: NS.to_string(),
                 ids: vec!["row".to_string()],
                 consistency: ConsistencyLevel::Strong,
@@ -2385,6 +2560,7 @@ mod tests {
             index: 1,
             wall_ms: 0,
             op: Op::Query {
+                actor: ActorSel::ADMIN,
                 ns: NS.to_string(),
                 q: GeneratedQuery {
                     body,
@@ -2413,6 +2589,7 @@ mod tests {
             index: 1,
             wall_ms: 0,
             op: Op::BatchQuery {
+                actor: ActorSel::ADMIN,
                 ns: NS.to_string(),
                 qs: vec![GeneratedQuery {
                     body: json!({
@@ -2552,6 +2729,7 @@ mod tests {
             index: 1,
             wall_ms: 0,
             op: Op::PaginateAll {
+                actor: ActorSel::ADMIN,
                 ns: NS.to_string(),
                 q: GeneratedQuery {
                     body: json!({
@@ -2898,5 +3076,20 @@ mod tests {
         let violations = check_i6_pagination_equivalence(&rec);
 
         assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn i23_aggregate_scan_finds_counts_facets_and_groups() {
+        let leaks = security_response_aggregate_leaks(&json!({
+            "count": 2,
+            "facets": {"group": [{"value": "g1", "count": 2}]},
+            "groups": [{"key": "g1", "count": 2}],
+            "empty_buckets": {"buckets": []}
+        }));
+
+        assert!(leaks.contains("/count"));
+        assert!(leaks.contains("/facets"));
+        assert!(leaks.contains("/groups"));
+        assert!(!leaks.contains("/empty_buckets/buckets"));
     }
 }

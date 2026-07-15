@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use self::process::{CrashPoint, ProcessController, TriggerPosition};
 use super::chaos::StoreOp;
+use super::security_program::SECURITY_AUDIT_BARRIER_OP;
 
 const FAULT_WINDOW_TRAILING_OPS: u64 = 8;
 
@@ -52,6 +53,7 @@ pub enum FaultProfile {
     Crash,
     Clock,
     SupportedFull,
+    Security,
     ProviderContractAbuse,
     FutureArchitecture,
     // Legacy Phase 5-7 profiles remain decodable and explicitly runnable for
@@ -73,6 +75,7 @@ impl FaultProfile {
             "crash" => Self::Crash,
             "clock" => Self::Clock,
             "supported_full" => Self::SupportedFull,
+            "security" => Self::Security,
             "provider_contract_abuse" => Self::ProviderContractAbuse,
             "future_architecture" => Self::FutureArchitecture,
             "content" => Self::Content,
@@ -93,6 +96,7 @@ impl FaultProfile {
             Self::Crash => "crash",
             Self::Clock => "clock",
             Self::SupportedFull => "supported_full",
+            Self::Security => "security",
             Self::ProviderContractAbuse => "provider_contract_abuse",
             Self::FutureArchitecture => "future_architecture",
             Self::Content => "content",
@@ -111,6 +115,7 @@ impl FaultProfile {
             Self::Crash => "crash",
             Self::Clock => "clock",
             Self::SupportedFull => "supported-full",
+            Self::Security => "security",
             Self::ProviderContractAbuse => "provider-contract-abuse",
             Self::FutureArchitecture => "future-architecture",
             Self::Content => "content",
@@ -1959,6 +1964,61 @@ fn schedule_for_seed(seed: u64, profile: FaultProfile) -> FaultSchedule {
                 FaultKind::StartReadOnlyNode { for_ops: 20 },
             );
         }
+        FaultProfile::Security => {
+            push_event(
+                &mut events,
+                profile,
+                SECURITY_AUDIT_BARRIER_OP,
+                None,
+                Boundary::ObjectStore,
+                TargetSelector {
+                    store_op: Some(StoreOp::Get),
+                    key_substring: Some("_security/heads/policy.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                FaultKind::PreFail {
+                    error: InjectedErrorKind::Http503,
+                },
+            );
+            push_event(
+                &mut events,
+                profile,
+                24,
+                None,
+                Boundary::ClientHttp,
+                TargetSelector {
+                    path_substring: Some("/v1/security".to_string()),
+                    methods: Some(vec!["POST".to_string(), "DELETE".to_string()]),
+                    ..TargetSelector::default()
+                },
+                FaultKind::DropResponse,
+            );
+            push_event(
+                &mut events,
+                profile,
+                20,
+                None,
+                Boundary::Process,
+                TargetSelector {
+                    store_op: Some(StoreOp::Put),
+                    key_substring: Some("_security/heads/policy.json".to_string()),
+                    ..TargetSelector::default()
+                },
+                FaultKind::CrashAt {
+                    point: CrashPoint::ManifestCas,
+                    position: TriggerPosition::Pre,
+                },
+            );
+            push_event(
+                &mut events,
+                profile,
+                32,
+                None,
+                Boundary::Clock,
+                TargetSelector::default(),
+                FaultKind::ClockJump { delta_ms: 120_000 },
+            );
+        }
         FaultProfile::ProviderContractAbuse => {
             for (index, source) in [FaultProfile::Content, FaultProfile::Semantic]
                 .into_iter()
@@ -2674,6 +2734,7 @@ mod tests {
             FaultProfile::Network,
             FaultProfile::Crash,
             FaultProfile::Clock,
+            FaultProfile::Security,
             FaultProfile::Content,
             FaultProfile::Semantic,
             FaultProfile::Sched,
@@ -3081,6 +3142,48 @@ mod tests {
                     && event.violated_assumptions() == [ProtectedAssumption::A3]
             }));
         }
+    }
+
+    #[test]
+    fn security_profile_is_supported_and_spans_only_the_four_v1_boundaries() {
+        let schedule = FaultScheduler::for_seed(7, FaultProfile::Security)
+            .schedule()
+            .clone();
+        assert_eq!(schedule.events.len(), 4, "{schedule:#?}");
+        assert_eq!(
+            schedule
+                .events
+                .iter()
+                .map(|event| event.boundary)
+                .collect::<Vec<_>>(),
+            vec![
+                Boundary::ObjectStore,
+                Boundary::ClientHttp,
+                Boundary::Process,
+                Boundary::Clock,
+            ]
+        );
+        assert!(schedule.events.iter().all(|event| {
+            event.contract_class() == ContractClass::SupportedV1
+                && event.violated_assumptions().is_empty()
+                && !matches!(
+                    event.kind,
+                    FaultKind::Content(_)
+                        | FaultKind::ListOmit { .. }
+                        | FaultKind::ListDuplicate { .. }
+                        | FaultKind::ListReorder
+                        | FaultKind::StaleRead
+                        | FaultKind::HeadGetDiverge
+                        | FaultKind::StartSecondNode { .. }
+                )
+        }));
+        let mut starts = schedule
+            .events
+            .iter()
+            .map(|event| event.start_op)
+            .collect::<Vec<_>>();
+        starts.sort_unstable();
+        assert_eq!(starts, vec![20, 24, 32, 38]);
     }
 
     #[test]

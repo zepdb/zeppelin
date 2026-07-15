@@ -43,6 +43,19 @@ const REQUIRED_TAGS: &[&str] = &[
     "sketch-adc-v4",
 ];
 
+const REQUIRED_SECURITY_OP_KINDS: &[&str] = &[
+    "create_key",
+    "rotate_key",
+    "revoke_key",
+    "publish_grant_change",
+    "tenant_boundary_probe",
+    "use_revoked_credential",
+    "forbidden_write_probe",
+    "export_probe",
+    "security_admin_probe",
+    "audit_barrier",
+];
+
 fn operation_coverage_required(mode: adversarial::RunMode, kind: &str) -> bool {
     mode != adversarial::RunMode::Chaos
         || !matches!(
@@ -55,10 +68,22 @@ fn tag_coverage_required(mode: adversarial::RunMode, tag: &str) -> bool {
     mode != adversarial::RunMode::Chaos || !matches!(tag, "gc-cycle" | "sandwich")
 }
 
+fn minimum_explicit_compactions(security_profile: bool, seed_count: u64) -> u64 {
+    if security_profile {
+        // The security profile runs in chaos mode, where foreground maintenance
+        // operations are deliberately sanitized. Require the quiet-period proof
+        // from every seed instead of the mixed-profile foreground floor.
+        seed_count
+    } else {
+        20
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn smoke() {
     let env = adversarial::RunnerEnv::from_env();
+    let security_profile = env.profile == Some(adversarial::faults::FaultProfile::Security);
     let configured_seed_count = env.seeds.len() as u64;
     let mode = if env.profile.is_some() {
         adversarial::RunMode::Chaos
@@ -85,9 +110,11 @@ async fn smoke() {
         "expected at least 200 ops, ran {}",
         summary.ops_total
     );
+    let required_compactions =
+        minimum_explicit_compactions(security_profile, configured_seed_count);
     assert!(
-        summary.compactions_total >= 20,
-        "expected at least 20 compactions, ran {}",
+        summary.compactions_total >= required_compactions,
+        "expected at least {required_compactions} compactions, ran {}",
         summary.compactions_total
     );
     assert!(
@@ -119,6 +146,26 @@ async fn smoke() {
             summary.coverage.tag_counts.get(tag).copied().unwrap_or(0) > 0,
             "scenario tag {tag} was not covered"
         );
+    }
+    if security_profile {
+        for kind in REQUIRED_SECURITY_OP_KINDS {
+            assert!(
+                summary.coverage.op_counts.get(*kind).copied().unwrap_or(0) > 0,
+                "security operation kind {kind} was not covered"
+            );
+        }
+        for oracle in ["I22", "I23", "I24", "I25", "I26", "I27"] {
+            assert!(
+                summary
+                    .coverage
+                    .security_oracle_counts
+                    .get(oracle)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0,
+                "security oracle scenario {oracle} was not covered"
+            );
+        }
     }
     assert!(
         summary
@@ -180,6 +227,12 @@ fn smoke_coverage_contract_is_mode_aware() {
         adversarial::RunMode::Chaos,
         "delete-then-reupsert"
     ));
+}
+
+#[test]
+fn security_smoke_requires_quiet_period_compaction_per_seed() {
+    assert_eq!(minimum_explicit_compactions(false, 2), 20);
+    assert_eq!(minimum_explicit_compactions(true, 2), 2);
 }
 
 #[tokio::test]

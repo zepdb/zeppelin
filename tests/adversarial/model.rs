@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use zeppelin::types::{AttributeValue, DistanceMetric};
 
 use super::ops::{AsOfTarget, GenVector, GeneratedQuery, MaintenanceKind, NamespaceSpec, Op};
+use super::security_program::SecurityPolicyModel;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -78,10 +79,16 @@ pub enum OracleMutation {
     MisdirectedWriteReachability,
     /// Admit one stale-token writer result so lineage must report I21.
     DualWriterFencing,
+    GrantModelDesync,
+    LeakedIdSuppression,
+    RevocationMisclassification,
+    AuditRecordDeletion,
+    SecuritySecretLeak,
+    ConstraintDrop,
 }
 
 impl OracleMutation {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 22] = [
         Self::DropDelete,
         Self::SkewScore,
         Self::PhantomId,
@@ -98,6 +105,12 @@ impl OracleMutation {
         Self::SwallowCorruption,
         Self::MisdirectedWriteReachability,
         Self::DualWriterFencing,
+        Self::GrantModelDesync,
+        Self::LeakedIdSuppression,
+        Self::RevocationMisclassification,
+        Self::AuditRecordDeletion,
+        Self::SecuritySecretLeak,
+        Self::ConstraintDrop,
     ];
 
     #[must_use]
@@ -119,6 +132,12 @@ impl OracleMutation {
             "swallow-corruption" => Self::SwallowCorruption,
             "misdirected-write-reachability" => Self::MisdirectedWriteReachability,
             "dual-writer-fencing" => Self::DualWriterFencing,
+            "grant-model-desync" => Self::GrantModelDesync,
+            "leaked-id-suppression" => Self::LeakedIdSuppression,
+            "revocation-misclassification" => Self::RevocationMisclassification,
+            "audit-record-deletion" => Self::AuditRecordDeletion,
+            "security-secret-leak" => Self::SecuritySecretLeak,
+            "constraint-drop" => Self::ConstraintDrop,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -142,13 +161,34 @@ impl OracleMutation {
             Self::SwallowCorruption => "swallow-corruption",
             Self::MisdirectedWriteReachability => "misdirected-write-reachability",
             Self::DualWriterFencing => "dual-writer-fencing",
+            Self::GrantModelDesync => "grant-model-desync",
+            Self::LeakedIdSuppression => "leaked-id-suppression",
+            Self::RevocationMisclassification => "revocation-misclassification",
+            Self::AuditRecordDeletion => "audit-record-deletion",
+            Self::SecuritySecretLeak => "security-secret-leak",
+            Self::ConstraintDrop => "constraint-drop",
         }
+    }
+
+    #[must_use]
+    pub const fn is_security(self) -> bool {
+        matches!(
+            self,
+            Self::GrantModelDesync
+                | Self::LeakedIdSuppression
+                | Self::RevocationMisclassification
+                | Self::AuditRecordDeletion
+                | Self::SecuritySecretLeak
+                | Self::ConstraintDrop
+        )
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Model {
     pub namespaces: BTreeMap<String, NsModel>,
+    #[serde(default)]
+    pub security: SecurityPolicyModel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -278,7 +318,7 @@ impl Model {
         }
 
         match op {
-            Op::CreateNamespace { ns, spec } => {
+            Op::CreateNamespace { ns, spec, .. } => {
                 if status == 201 {
                     // A fresh named create proves that an earlier ambiguous
                     // clone did not leave this target visible. An idempotent
@@ -302,7 +342,7 @@ impl Model {
                         .retain(|entry| !matches!(entry, NsIndeterminate::MaybeCreatedNs));
                 }
             }
-            Op::Upsert { ns, vectors } => {
+            Op::Upsert { ns, vectors, .. } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     panic!("upsert acked for unknown namespace {ns}");
                 };
@@ -321,7 +361,7 @@ impl Model {
                     model.corrupt_latest_checkpoint();
                 }
             }
-            Op::DeleteVectors { ns, ids } => {
+            Op::DeleteVectors { ns, ids, .. } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     panic!("delete acked for unknown namespace {ns}");
                 };
@@ -340,7 +380,7 @@ impl Model {
                     model.corrupt_latest_checkpoint();
                 }
             }
-            Op::CompactInline { ns } => {
+            Op::CompactInline { ns, .. } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     panic!("compaction acked for unknown namespace {ns}");
                 };
@@ -354,10 +394,11 @@ impl Model {
                     model.corrupt_latest_checkpoint();
                 }
             }
-            Op::CompactEndpoint { ns }
+            Op::CompactEndpoint { ns, .. }
             | Op::ProbeSandwich {
                 ns,
                 maintenance: MaintenanceKind::CompactInline | MaintenanceKind::CompactEndpoint,
+                ..
             } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     panic!("maintenance acked for unknown namespace {ns}");
@@ -381,7 +422,7 @@ impl Model {
                     model.corrupt_latest_checkpoint();
                 }
             }
-            Op::CreateSnapshot { ns, name } => {
+            Op::CreateSnapshot { ns, name, .. } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     panic!("snapshot acked for unknown namespace {ns}");
                 };
@@ -396,7 +437,7 @@ impl Model {
                     !matches!(entry, NsIndeterminate::MaybeSnapshot { name: pending } if pending == name)
                 });
             }
-            Op::DeleteSnapshot { ns, name } => {
+            Op::DeleteSnapshot { ns, name, .. } => {
                 if let Some(model) = self.namespaces.get_mut(ns) {
                     model.snapshots.remove(name);
                     model.indeterminate_ns.retain(|entry| {
@@ -443,7 +484,7 @@ impl Model {
                     });
                 }
             }
-            Op::DeleteNamespace { ns } => {
+            Op::DeleteNamespace { ns, .. } => {
                 // Once deletion is acknowledged, any earlier ambiguous clone
                 // into this name can no longer affect the current namespace.
                 for model in self.namespaces.values_mut() {
@@ -465,7 +506,17 @@ impl Model {
             | Op::GetSnapshot { .. }
             | Op::ListSnapshots { .. }
             | Op::PatchIndexConfig { .. }
-            | Op::Hydrate { .. } => {}
+            | Op::Hydrate { .. }
+            | Op::CreateKey { .. }
+            | Op::RotateKey { .. }
+            | Op::RevokeKey { .. }
+            | Op::PublishGrantChange { .. }
+            | Op::TenantBoundaryProbe { .. }
+            | Op::UseRevokedCredential { .. }
+            | Op::ForbiddenWriteProbe { .. }
+            | Op::ExportProbe { .. }
+            | Op::SecurityAdminProbe { .. }
+            | Op::AuditBarrierOp { .. } => {}
         }
     }
 
@@ -493,6 +544,9 @@ impl Model {
     ) {
         match outcome {
             OpOutcome::Applied { status, response } => {
+                if self.security.enabled() && (200..300).contains(status) {
+                    self.security.observe_applied(op, response, op_index);
+                }
                 self.apply_with_generation_checkpoints(
                     op,
                     *status,
@@ -504,6 +558,9 @@ impl Model {
             }
             OpOutcome::NotApplied { .. } => {}
             OpOutcome::Ambiguous { reason, .. } => {
+                if self.security.enabled() {
+                    self.security.observe_ambiguous(op, op_index);
+                }
                 let chaos_lost_write_selftest = mutation == Some(OracleMutation::ChaosLostWrite)
                     && matches!(op, Op::Upsert { .. })
                     && matches!(reason, AmbiguityReason::ServerError { status: 500 });
@@ -568,11 +625,11 @@ impl Model {
     fn clear_held_vector_effects(&mut self, op: &Op, op_index: u64) {
         self.clear_held_namespace_effect(op);
         let (ns, ids): (&str, Vec<&str>) = match op {
-            Op::Upsert { ns, vectors } => (
+            Op::Upsert { ns, vectors, .. } => (
                 ns,
                 vectors.iter().map(|vector| vector.id.as_str()).collect(),
             ),
-            Op::DeleteVectors { ns, ids } => (ns, ids.iter().map(String::as_str).collect()),
+            Op::DeleteVectors { ns, ids, .. } => (ns, ids.iter().map(String::as_str).collect()),
             _ => return,
         };
         let Some(model) = self.namespaces.get_mut(ns) else {
@@ -590,7 +647,7 @@ impl Model {
 
     fn clear_held_namespace_effect(&mut self, op: &Op) {
         let (namespace, matches_effect): (&str, fn(&NsIndeterminate) -> bool) = match op {
-            Op::CreateSnapshot { ns, name } => {
+            Op::CreateSnapshot { ns, name, .. } => {
                 let name = name.clone();
                 if let Some(model) = self.namespaces.get_mut(ns) {
                     model.indeterminate_ns.retain(|effect| {
@@ -599,7 +656,7 @@ impl Model {
                 }
                 return;
             }
-            Op::DeleteSnapshot { ns, name } => {
+            Op::DeleteSnapshot { ns, name, .. } => {
                 let name = name.clone();
                 if let Some(model) = self.namespaces.get_mut(ns) {
                     model.indeterminate_ns.retain(|effect| {
@@ -617,11 +674,11 @@ impl Model {
                 }
                 return;
             }
-            Op::DeleteNamespace { ns } => (ns, |effect| {
+            Op::DeleteNamespace { ns, .. } => (ns, |effect| {
                 matches!(effect, NsIndeterminate::MaybeDeletedNs)
             }),
-            Op::CompactInline { ns }
-            | Op::CompactEndpoint { ns }
+            Op::CompactInline { ns, .. }
+            | Op::CompactEndpoint { ns, .. }
             | Op::ProbeSandwich { ns, .. } => (ns, |effect| {
                 matches!(effect, NsIndeterminate::MaybeCompacted)
             }),
@@ -635,7 +692,7 @@ impl Model {
     }
 
     fn corrupt_indeterminate_candidate(&mut self, op: &Op) {
-        let Op::Upsert { ns, vectors } = op else {
+        let Op::Upsert { ns, vectors, .. } = op else {
             return;
         };
         let Some(model) = self.namespaces.get_mut(ns) else {
@@ -658,14 +715,14 @@ impl Model {
     fn record_indeterminate(&mut self, op: &Op, op_index: u64, reason: &AmbiguityReason) {
         let reason = reason.label();
         match op {
-            Op::CreateNamespace { ns, spec } => {
+            Op::CreateNamespace { ns, spec, .. } => {
                 let model = self
                     .namespaces
                     .entry(ns.clone())
                     .or_insert_with(|| NsModel::new(spec.clone(), 0));
                 model.indeterminate_ns.push(NsIndeterminate::MaybeCreatedNs);
             }
-            Op::Upsert { ns, vectors } => {
+            Op::Upsert { ns, vectors, .. } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     return;
                 };
@@ -680,7 +737,7 @@ impl Model {
                     );
                 }
             }
-            Op::DeleteVectors { ns, ids } => {
+            Op::DeleteVectors { ns, ids, .. } => {
                 let Some(model) = self.namespaces.get_mut(ns) else {
                     return;
                 };
@@ -695,14 +752,14 @@ impl Model {
                     );
                 }
             }
-            Op::CreateSnapshot { ns, name } => {
+            Op::CreateSnapshot { ns, name, .. } => {
                 if let Some(model) = self.namespaces.get_mut(ns) {
                     model
                         .indeterminate_ns
                         .push(NsIndeterminate::MaybeSnapshot { name: name.clone() });
                 }
             }
-            Op::DeleteSnapshot { ns, name } => {
+            Op::DeleteSnapshot { ns, name, .. } => {
                 if let Some(model) = self.namespaces.get_mut(ns) {
                     model
                         .indeterminate_ns
@@ -713,6 +770,7 @@ impl Model {
                 source,
                 target,
                 as_of,
+                ..
             } => {
                 if let Some(model) = self.namespaces.get_mut(source) {
                     model.indeterminate_ns.push(NsIndeterminate::MaybeCloned {
@@ -721,13 +779,13 @@ impl Model {
                     });
                 }
             }
-            Op::DeleteNamespace { ns } => {
+            Op::DeleteNamespace { ns, .. } => {
                 if let Some(model) = self.namespaces.get_mut(ns) {
                     model.indeterminate_ns.push(NsIndeterminate::MaybeDeletedNs);
                 }
             }
-            Op::CompactInline { ns }
-            | Op::CompactEndpoint { ns }
+            Op::CompactInline { ns, .. }
+            | Op::CompactEndpoint { ns, .. }
             | Op::GcCycle { ns, .. }
             | Op::ProbeSandwich { ns, .. } => {
                 if let Some(model) = self.namespaces.get_mut(ns) {
@@ -743,7 +801,17 @@ impl Model {
             | Op::GetSnapshot { .. }
             | Op::ListSnapshots { .. }
             | Op::PatchIndexConfig { .. }
-            | Op::Hydrate { .. } => {}
+            | Op::Hydrate { .. }
+            | Op::CreateKey { .. }
+            | Op::RotateKey { .. }
+            | Op::RevokeKey { .. }
+            | Op::PublishGrantChange { .. }
+            | Op::TenantBoundaryProbe { .. }
+            | Op::UseRevokedCredential { .. }
+            | Op::ForbiddenWriteProbe { .. }
+            | Op::ExportProbe { .. }
+            | Op::SecurityAdminProbe { .. }
+            | Op::AuditBarrierOp { .. } => {}
         }
     }
 
@@ -944,7 +1012,7 @@ mod tests {
     use crate::adversarial::oracle::{score_close, SCORE_ABS_EPS, SCORE_REL_EPS};
     use crate::common::server::{cleanup_ns, start_test_server_with_compactor};
 
-    use crate::adversarial::ops::{AsOfTarget, GenVector, NamespaceSpec, Op};
+    use crate::adversarial::ops::{ActorSel, AsOfTarget, GenVector, NamespaceSpec, Op};
 
     use super::{
         model_distance, AmbiguityReason, Model, ModelRecord, NsModel, OpOutcome, OracleMutation,
@@ -989,6 +1057,7 @@ mod tests {
     fn generation_checkpoints_pause_only_during_second_node_window() {
         let (mut model, ns) = model_with_old_record();
         let active_window_upsert = Op::Upsert {
+            actor: ActorSel::ADMIN,
             ns: ns.clone(),
             vectors: vec![GenVector {
                 id: "during-window".to_string(),
@@ -1014,6 +1083,7 @@ mod tests {
         assert!(!during.checkpoints.contains_key(&2));
 
         let after_window_upsert = Op::Upsert {
+            actor: ActorSel::ADMIN,
             ns: ns.clone(),
             vectors: vec![GenVector {
                 id: "after-window".to_string(),
@@ -1065,6 +1135,7 @@ mod tests {
 
         model.apply_outcome(
             &Op::DeleteVectors {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 ids: vec!["id-1".to_string()],
             },
@@ -1110,6 +1181,7 @@ mod tests {
         );
         model.apply_outcome(
             &Op::DeleteVectors {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 ids: vec!["id-1".to_string()],
             },
@@ -1150,6 +1222,7 @@ mod tests {
         };
         model.apply_outcome(
             &Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 vectors: vec![candidate.clone()],
             },
@@ -1176,6 +1249,7 @@ mod tests {
         };
         model.apply_outcome(
             &Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 vectors: vec![candidate],
             },
@@ -1209,6 +1283,7 @@ mod tests {
         };
         model.apply_outcome(
             &Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 vectors: vec![candidate.clone()],
             },
@@ -1226,6 +1301,7 @@ mod tests {
 
         model.apply_outcome(
             &Op::DeleteVectors {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 ids: vec!["id-1".to_string()],
             },
@@ -1253,6 +1329,7 @@ mod tests {
         };
         model.apply_outcome(
             &Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 vectors: vec![ambiguous],
             },
@@ -1263,6 +1340,7 @@ mod tests {
         );
         model.apply_outcome(
             &Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 vectors: vec![definite.clone()],
             },
@@ -1283,6 +1361,7 @@ mod tests {
     fn joined_rejection_clears_held_upsert_without_changing_state() {
         let (mut model, ns) = model_with_old_record();
         let op = Op::Upsert {
+            actor: ActorSel::ADMIN,
             ns: ns.clone(),
             vectors: vec![GenVector {
                 id: "id-1".to_string(),
@@ -1327,6 +1406,7 @@ mod tests {
         let spec = model.namespaces[&source].spec.clone();
         model.apply_outcome(
             &Op::CloneNamespace {
+                actor: ActorSel::ADMIN,
                 source: source.clone(),
                 target: target.clone(),
                 as_of: AsOfTarget::Generation(1),
@@ -1339,6 +1419,7 @@ mod tests {
 
         model.apply_outcome(
             &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
                 ns: target.clone(),
                 spec,
             },
@@ -1361,6 +1442,7 @@ mod tests {
         let target = "deleted-after-ambiguous-clone".to_string();
         model.apply_outcome(
             &Op::CloneNamespace {
+                actor: ActorSel::ADMIN,
                 source: source.clone(),
                 target: target.clone(),
                 as_of: AsOfTarget::Generation(1),
@@ -1372,7 +1454,10 @@ mod tests {
         );
 
         model.apply_outcome(
-            &Op::DeleteNamespace { ns: target.clone() },
+            &Op::DeleteNamespace {
+                actor: ActorSel::ADMIN,
+                ns: target.clone(),
+            },
             &OpOutcome::Applied {
                 status: 202,
                 response: json!({ "state": "deleting" }),

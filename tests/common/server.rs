@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -173,6 +174,131 @@ pub fn client_with_bearer(bearer: &str) -> reqwest::Client {
         .default_headers(bearer_headers(bearer))
         .build()
         .expect("failed to build authenticated test client")
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkloadCredential {
+    pub principal_id: String,
+    pub key_id: String,
+    pub bearer: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ActorCredentials {
+    principal_id: String,
+    current: Option<WorkloadCredential>,
+    retired: Vec<WorkloadCredential>,
+}
+
+/// Per-seed credential registry used by the adversarial workload client.
+///
+/// Secrets remain in memory only. Artifacts persist actor indexes, principal
+/// IDs, and key IDs, never bearer material.
+#[derive(Debug, Clone, Default)]
+pub struct WorkloadCredentialRegistry {
+    actors: Arc<RwLock<BTreeMap<u8, ActorCredentials>>>,
+}
+
+impl WorkloadCredentialRegistry {
+    #[must_use]
+    pub fn with_admin(bearer: &str) -> Self {
+        let registry = Self::default();
+        let (key_id, _) = bearer
+            .split_once('.')
+            .expect("test admin bearer must contain a key id and secret");
+        registry.register_principal(0, "service:test-admin");
+        registry.install(0, key_id, bearer);
+        registry
+    }
+
+    pub fn register_principal(&self, actor: u8, principal_id: &str) {
+        let mut actors = self
+            .actors
+            .write()
+            .unwrap_or_else(|_| panic!("workload credential registry lock poisoned"));
+        let entry = actors.entry(actor).or_default();
+        if entry.principal_id.is_empty() {
+            entry.principal_id = principal_id.to_string();
+        } else {
+            assert_eq!(
+                entry.principal_id, principal_id,
+                "actor {actor} changed principal identity"
+            );
+        }
+    }
+
+    pub fn install(&self, actor: u8, key_id: &str, bearer: &str) {
+        let mut actors = self
+            .actors
+            .write()
+            .unwrap_or_else(|_| panic!("workload credential registry lock poisoned"));
+        let entry = actors
+            .get_mut(&actor)
+            .unwrap_or_else(|| panic!("actor {actor} must register a principal before a key"));
+        if let Some(current) = entry.current.replace(WorkloadCredential {
+            principal_id: entry.principal_id.clone(),
+            key_id: key_id.to_string(),
+            bearer: bearer.to_string(),
+        }) {
+            entry.retired.insert(0, current);
+        }
+    }
+
+    #[must_use]
+    pub fn principal_id(&self, actor: u8) -> String {
+        self.actors
+            .read()
+            .unwrap_or_else(|_| panic!("workload credential registry lock poisoned"))
+            .get(&actor)
+            .unwrap_or_else(|| panic!("unknown workload actor {actor}"))
+            .principal_id
+            .clone()
+    }
+
+    #[must_use]
+    pub fn credential(&self, actor: u8, retired: u8) -> WorkloadCredential {
+        let actors = self
+            .actors
+            .read()
+            .unwrap_or_else(|_| panic!("workload credential registry lock poisoned"));
+        let entry = actors
+            .get(&actor)
+            .unwrap_or_else(|| panic!("unknown workload actor {actor}"));
+        if retired == 0 {
+            return entry
+                .current
+                .clone()
+                .unwrap_or_else(|| panic!("workload actor {actor} has no current credential"));
+        }
+        entry
+            .retired
+            .get(usize::from(retired - 1))
+            .cloned()
+            .unwrap_or_else(|| panic!("workload actor {actor} has no retired credential {retired}"))
+    }
+
+    #[must_use]
+    pub fn client(&self, actor: u8, retired: u8) -> reqwest::Client {
+        client_with_bearer(&self.credential(actor, retired).bearer)
+    }
+
+    #[must_use]
+    pub fn all_secrets(&self) -> Vec<String> {
+        self.actors
+            .read()
+            .unwrap_or_else(|_| panic!("workload credential registry lock poisoned"))
+            .values()
+            .flat_map(|entry| entry.current.iter().chain(entry.retired.iter()))
+            .map(|credential| {
+                credential
+                    .bearer
+                    .split_once('.')
+                    .expect("registered bearer must contain key id and secret")
+                    .1
+                    .to_string()
+            })
+            .collect()
+    }
 }
 
 /// Inject a freshly generated administrator and build the store-backed test runtime.
@@ -750,6 +876,8 @@ pub struct FullTestServer {
     pub manifest_cache: Arc<ManifestCache>,
     pub audit: AuditClient,
     pub audit_node_id: String,
+    pub security: Arc<SecurityKernel>,
+    pub workload_credentials: WorkloadCredentialRegistry,
     audit_runtime: Option<AuditRuntime>,
     fragment_cache: Arc<WalFragmentCache>,
     decoded_artifact_cache: Arc<DecodedArtifactCache>,
@@ -761,6 +889,14 @@ pub struct FullTestServer {
 }
 
 impl FullTestServer {
+    /// Force this node to observe the authoritative policy head immediately.
+    pub async fn force_policy_refresh(&self) {
+        self.security
+            .refresh_authoritative_policy_for_test()
+            .await
+            .expect("test security policy refresh must succeed");
+    }
+
     /// Force all audit records accepted before this call to durable storage.
     pub async fn flush_audit(&self) {
         self.audit
@@ -1057,10 +1193,12 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
     let decoded_artifact_cache = test_decoded_artifact_cache(&config);
     let (audit, audit_runtime, audit_node_id) =
         start_test_audit(&config, &store, namespace_name_prefix.as_deref());
+    let workload_credentials = WorkloadCredentialRegistry::with_admin(&admin_bearer);
+    let state_security = Arc::clone(&security);
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
-        security,
+        security: state_security,
         audit: audit.clone(),
         credential_adapter,
         namespace_manager,
@@ -1113,6 +1251,8 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         manifest_cache,
         audit,
         audit_node_id,
+        security,
+        workload_credentials,
         audit_runtime: Some(audit_runtime),
         fragment_cache,
         decoded_artifact_cache,

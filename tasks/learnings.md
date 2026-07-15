@@ -1337,3 +1337,122 @@ new learnings as tasks complete. Rule first, context second, keep entries short.
      source survives and the retained target exposes only its safe bootstrap
      state, not assert that the target manifest is absent. (Phase 4 namespace
      clone adversarial regression)
+
+138. **Security fault choreography needs fixed logical indexes across seeded
+     setup variation.** A variable namespace count moves grant publication and
+     can make a nominal four-boundary profile miss a fault entirely or collide
+     two faults on one request. Pad only with harmless admin reads before the
+     security script, then pin remove, restore, clock, and refresh events to
+     invariant logical operations. (Phase 5 adversarial security)
+
+139. **A cached policy-head fault needs an explicit refresh attempt to be
+     observable.** Authorized requests normally use the bounded-stale in-memory
+     policy and may perform no S3 GET during a short deterministic smoke. At a
+     pinned workload barrier, force one refresh through a test-only kernel seam,
+     require the scheduled head GET to fail, and prove the cached authorization
+     path remains correct. (Phase 5 adversarial security)
+
+140. **Chaos-mode compaction coverage belongs to quiescence, not sanitized
+     foreground maintenance.** Chaos deliberately rewrites manual compaction
+     and GC operations so storage faults do not drown foreground invariants. A
+     security-profile smoke must require at least one explicit quiet-period
+     compaction per seed while retaining the existing 20-compaction floor for
+     mixed profiles. (Phase 5 adversarial security)
+
+141. **A policy oracle must model grant state, not only expected status
+     constants.** Apply definite grant mutations to a per-actor grant map,
+     retain old/new outcomes for ambiguous publication within the bounded
+     window, and close that window only after an authoritative refresh. Record
+     every successful must-audit request ID at the same model transition so the
+     durable audit oracle covers mutations as well as its explicit barrier.
+     (Phase 5 adversarial security)
+
+142. **Actor metadata is not actor execution.** Once every recorded operation
+     carries an actor, the HTTP client-selection seam and the policy model must
+     both consume it: select that actor's current credential for ordinary
+     routes and derive the expected decision from the exact action and scope.
+     Leaving either side on implicit admin makes authorization failures and
+     false passes indistinguishable. (Phase 5 adversarial security)
+
+143. **An audit-request predicate is broader than the durable-audit success
+     contract.** Vector upserts create an audit request so constraint denials
+     and AttributeAdmin writes can be recorded, but an ordinary successful
+     upsert emits no durable record. An audit-evidence oracle must mirror the
+     final durable boundary: always-audited actions plus explicit
+     `DurableAudit` obligations, including AttributeAdmin. (Phase 5
+     adversarial security)
+
+144. **Final policy state cannot resolve inverse ambiguous mutations by
+     itself.** A remove followed by an add can leave the same snapshot whether
+     both applied or neither did. Classify each mutation with its deterministic
+     request ID, typed security-policy audit action/resource, and old/new
+     policy-version lineage against the authoritative head; emit that evidence
+     per op and retain every pending mutation if validation fails. (Phase 5
+     adversarial security)
+
+145. **Compound routes need compound policy-model requirements.** A clone is
+     not authorized by `NamespaceClone` alone: the same actor also needs source
+     `NamespaceRead` and target `NamespaceCreate`, and every decision consumed
+     by the raw copy must be unconstrained. Represent all route requirements at
+     the model seam so a partial grant cannot turn a conforming 403 into an
+     oracle false positive. (Phase 5 adversarial security)
+
+146. **Bounded staleness is a decision transition, not an HTTP status pair.**
+     Authorized creates, deletes, snapshots, compactions, and clones can return
+     different 2xx statuses. Store complete old/new grant states and evaluate
+     the operation under each; keep credential revocation as a separate
+     authenticated-to-unauthorized transition. (Phase 5 adversarial security)
+
+147. **Overlapping absorption windows compose as reachable whole-policy
+     branches.** A definite publication advances every current branch; an
+     ambiguous publication retains both its not-applied and applied branches;
+     an overlapping credential revocation independently adds an unauthenticated
+     outcome. Never take a Cartesian product of per-principal states because it
+     invents combinations that never shared one authoritative policy version.
+     (Phase 5 adversarial security)
+
+148. **Clone no-widening is policy-wide, not only an acting-principal check.**
+     The clone caller's three control grants can all pass while another
+     principal gains target-only read or write authority over the raw copy.
+     Mirror the production derived-action scope proof across every principal,
+     including filter conjuncts, stamps, forbidden fields, and
+     `AttributeAdmin` bypass. (Phase 5 adversarial security)
+
+149. **A compound observation is not necessarily a compound authorization
+     requirement.** `ExportProbe` reports success when either vector fetch or
+     snapshot read reaches a non-forbidden surface, so its model must accept
+     either grant. Keep all-of semantics only for routes, such as clone, whose
+     production handler actually requires every capability. (Phase 5
+     adversarial security)
+
+150. **Policy-oracle action vocabulary must be typed and fail loud.** Raw
+     string comparisons turn misspelled or newly added actions into silent
+     denials and can hide omitted actors behind empty grant defaults. Parse
+     modeled actions into the production `Action` type and require every actor
+     lookup to exist in the configured principal vocabulary. (Phase 5
+     adversarial security)
+
+151. **A serialized security staleness bound is executable policy, not report
+     metadata.** Window constructors must read the configured logical-op bound
+     and use checked arithmetic. Hard-coded constants drift from replayed
+     configuration, while saturation silently makes an overflowed window
+     effectively permanent. (Phase 5 adversarial security)
+
+152. **Security control-plane ops still authorize the declared actor.** Key
+     mutations and grant publication require typed `SecurityAdminWrite`;
+     security reads and audit barriers require typed `SecurityAdminRead`.
+     Unconditionally predicting success hides non-admin coverage and
+     mismodels legitimate 403 responses. (Phase 5 adversarial security)
+
+153. **Grant binding identity uses canonical typed action sets.** Production
+     sorts and validates selected actions before add/remove binding comparison,
+     so an oracle that compares raw string-vector order can retain a grant the
+     server removed. Parse every action eagerly and compare the resulting sets.
+     (Phase 5 adversarial security)
+
+154. **`ZEPPELIN_ADVERSARIAL_SEEDS` without a comma is a count, not a seed
+     value.** Setting it to `0` requests zero seeds and fails before the runner
+     executes an operation. Use `1` for one emitted seed (`0`), or a comma list
+     when naming explicit seed values. Treat this startup rejection as a soak
+     preflight/configuration failure, not an executed soak. (Phase 5
+     adversarial security)

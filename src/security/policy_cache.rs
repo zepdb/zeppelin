@@ -90,7 +90,7 @@ impl PolicyCache {
         cached.last_confirmed.elapsed() <= self.refresh_interval.saturating_mul(2)
     }
 
-    async fn refresh_once(&self) -> Result<()> {
+    pub(crate) async fn refresh_once(&self) -> Result<()> {
         let observed = self.current();
         let refresh = self.store.refresh(&observed.head_etag).await?;
         match refresh {

@@ -72,12 +72,15 @@ Every deterministic, LegacyChaos, and scheduled profile uses one ordered
 3. release and join held operations;
 4. stop the second node;
 5. restart the primary if needed and wait for health;
-6. stop and join background compaction;
-7. resolve indeterminate effects;
-8. force one inline compaction for each live namespace;
-9. run two GC cycles with `keep_count=1`;
-10. run S3, sketch-publication, lineage, and fencing oracles;
-11. exhaustively fetch modeled ids and run model-derived queries.
+6. force an authoritative security-policy refresh, resolve security mutations,
+   close bounded-staleness windows, and verify revocation/audit/policy state;
+7. stop and join background compaction;
+8. resolve indeterminate data effects;
+9. force one inline compaction for each live namespace;
+10. run two GC cycles with `keep_count=1`;
+11. run S3, sketch-publication, lineage, and fencing oracles;
+12. exhaustively fetch modeled ids and run model-derived queries, including
+    per-tenant I23/I27 visibility checks when the security program is active.
 
 Each step emits one `quiet:<step>` timeline event, including no-op or skipped
 steps. There is no second quiesce implementation.
@@ -98,6 +101,13 @@ one-writer/read-only-node window; it never includes provider lies or a second
 writer.
 
 An explicit `ZEPPELIN_ADVERSARIAL_PROFILE` overrides the table for every seed.
+The `security` profile adds a deterministic actor/credential registry, key and
+grant lifecycle operations, all tenant observation surfaces, constrained-write,
+export, security-admin, and audit probes. It uses supported faults at all four
+boundaries, never provider lies or a second writer. Security artifacts persist
+redaction-safe `principals` and `security_ops`; operation-linked timeline events
+add actor and decision metadata. Bearer secrets remain memory-only. Artifacts
+recorded before this profile continue to decode with the implicit administrator.
 Use `provider_contract_abuse` for broken provider/adapter research and
 `future_architecture` for dual-writer research. The legacy `content`,
 `semantic`, `ops`, and `full` profile names remain accepted for artifact replay
@@ -153,7 +163,8 @@ assumptions. A new provider-abuse or future-architecture event must be reachable
 only through an explicit campaign; a new supported event may join Mixed only
 after its assumption audit.
 
-The consolidated memory-backend matrix contains sixteen mutations. Each clean
+The consolidated matrix contains twenty-two mutations, including one pinned
+mutation for each security oracle I22-I27. Each clean
 control and mutation is capped at 80 workload operations. Run it with:
 
 ```bash

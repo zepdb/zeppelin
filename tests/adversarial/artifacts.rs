@@ -26,7 +26,8 @@ use super::faults::{
 use super::generator::Coverage;
 use super::model::Model;
 use super::ops::{NamespaceSpec, OpRecord};
-use super::oracle::Violation;
+use super::oracle::{Violation, ViolationId};
+use super::security_program::SecurityProgramConfig;
 use super::{effective_seed_assignment, RunMode, RunnerEnv, SeedAssignment};
 
 #[derive(Debug)]
@@ -170,6 +171,32 @@ impl RunArtifacts {
         chaos_plan: Option<&serde_json::Value>,
         fault_schedule: Option<&FaultSchedule>,
     ) -> SeedArtifacts {
+        self.seed_with_security(
+            seed,
+            config,
+            specs,
+            mode,
+            fault_plan,
+            selftest_probe,
+            chaos_plan,
+            fault_schedule,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_with_security(
+        &self,
+        seed: u64,
+        config: &Config,
+        specs: &BTreeMap<String, NamespaceSpec>,
+        mode: RunMode,
+        fault_plan: Option<&str>,
+        selftest_probe: Option<&str>,
+        chaos_plan: Option<&serde_json::Value>,
+        fault_schedule: Option<&FaultSchedule>,
+        security_program: Option<&SecurityProgramConfig>,
+    ) -> SeedArtifacts {
         let dir = self.root.join(format!("seed-{seed}"));
         fs::create_dir_all(&dir)
             .unwrap_or_else(|error| panic!("failed to create seed dir {}: {error}", dir.display()));
@@ -213,6 +240,13 @@ impl RunArtifacts {
                 "fault_contracts": fault_contracts,
                 "config": config,
                 "namespace_specs": specs,
+                "principals": security_program
+                    .map_or(&[][..], |program| program.principals.as_slice()),
+                "security_ops": security_program
+                    .map_or(&[][..], |program| program.security_ops.as_slice()),
+                "protected_assumptions": security_program
+                    .map_or(&[][..], |program| program.protected_assumptions.as_slice()),
+                "security_program": security_program,
             }),
         );
         let ops_file = File::create(dir.join("ops.jsonl")).unwrap_or_else(|error| {
@@ -394,6 +428,10 @@ impl SeedArtifacts {
         let file = File::create(&path)
             .unwrap_or_else(|error| panic!("failed to create {}: {error}", path.display()));
         let mut writer = BufWriter::new(file);
+        let operations = read_ops(&self.dir)
+            .into_iter()
+            .map(|record| (record.index, record))
+            .collect::<BTreeMap<_, _>>();
         for event in timeline {
             let mut value = serde_json::to_value(event).expect("TimelineEvent must serialize");
             let contract = self.fault_contracts.get(&event.event_id);
@@ -424,6 +462,23 @@ impl SeedArtifacts {
                 serde_json::to_value(violated_assumptions)
                     .expect("ProtectedAssumption must serialize"),
             );
+            let operation = (!event.action.starts_with("quiet:"))
+                .then(|| operations.get(&event.op_index))
+                .flatten();
+            let (actor, decision) = operation.map_or(("runner", "not_applicable"), |record| {
+                (
+                    record.op.actor().label(),
+                    match record.status {
+                        200..=299 => "allow",
+                        401 => "unauthorized",
+                        403 => "forbidden",
+                        _ if record.outcome.starts_with("ambiguous:") => "indeterminate",
+                        _ => "non_authz_error",
+                    },
+                )
+            });
+            object.insert("actor".to_string(), serde_json::json!(actor));
+            object.insert("decision".to_string(), serde_json::json!(decision));
             let encoded = serde_json::to_string(&value).expect("timeline artifact must serialize");
             writeln!(writer, "{encoded}")
                 .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
@@ -784,7 +839,8 @@ mod tests {
     use crate::adversarial::faults::{
         Boundary, FaultEvent, FaultSemantics, ObservedResult, TargetSelector,
     };
-    use crate::adversarial::ops::{ExecutionMetadata, Op};
+    use crate::adversarial::ops::{ActorSel, ExecutionMetadata, Op};
+    use crate::adversarial::security_program::SecurityProgramConfig;
     use crate::adversarial::PreserveMode;
 
     fn record(index: u64) -> OpRecord {
@@ -792,6 +848,7 @@ mod tests {
             index,
             wall_ms: index,
             op: Op::GetNamespace {
+                actor: ActorSel::ADMIN,
                 ns: "ordered".to_string(),
             },
             method: "GET".to_string(),
@@ -830,6 +887,108 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(indexes, vec![0, 1]);
         assert_eq!(artifacts.op_count(), 2);
+    }
+
+    #[test]
+    fn security_artifacts_persist_program_and_authz_metadata() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = RunnerEnv {
+            seconds: 1,
+            seeds: vec![7, 8],
+            max_ops: Some(1),
+            artifacts: dir.path().to_path_buf(),
+            preserve: PreserveMode::Never,
+            selftest: None,
+            mode: RunMode::Chaos,
+            profile: Some(FaultProfile::Security),
+            env_echo: BTreeMap::new(),
+        };
+        let run = RunArtifacts::create(&env);
+        let program = SecurityProgramConfig::for_seed(
+            "artifact-security",
+            &["tenant-a".to_string(), "tenant-b".to_string()],
+        );
+        let mut seed = run.seed_with_security(
+            7,
+            &Config::default(),
+            &BTreeMap::new(),
+            RunMode::Chaos,
+            None,
+            None,
+            None,
+            None,
+            Some(&program),
+        );
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(seed.dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["principals"].as_array().unwrap().len(), 5);
+        assert_eq!(config["security_ops"].as_array().unwrap().len(), 10);
+        assert_eq!(config["protected_assumptions"].as_array().unwrap().len(), 4);
+        assert!(!config["security_program"].is_null());
+
+        let mut authz = record(0);
+        authz.op = Op::SecurityAdminProbe { actor: ActorSel(2) };
+        authz.status = 403;
+        authz.outcome = "not_applied".to_string();
+        seed.write_op(&authz);
+        seed.write_timeline(&[
+            TimelineEvent {
+                event_id: "quiet-06".to_string(),
+                op_index: 0,
+                wall_ms: 1,
+                boundary: Boundary::Runner,
+                action: "quiet:security-refresh".to_string(),
+                key: None,
+                semantics: FaultSemantics::WindowEnd,
+                observed: ObservedResult::DefiniteNotApplied,
+                recovery: None,
+            },
+            TimelineEvent {
+                event_id: "quiet-12".to_string(),
+                op_index: 1,
+                wall_ms: 2,
+                boundary: Boundary::ClientHttp,
+                action: "quiet:exhaustive-sweep".to_string(),
+                key: None,
+                semantics: FaultSemantics::WindowEnd,
+                observed: ObservedResult::DefiniteApplied,
+                recovery: None,
+            },
+        ]);
+
+        let timeline = fs::read_to_string(seed.dir.join("timeline.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(timeline[0]["actor"], "runner");
+        assert_eq!(timeline[0]["decision"], "not_applicable");
+        assert_eq!(timeline[1]["actor"], "runner");
+        assert_eq!(timeline[1]["decision"], "not_applicable");
+
+        let seed_dir = seed.dir.clone();
+        let report = build_report(
+            run.root(),
+            &RunManifest::at_start(&env),
+            &[SeedReport {
+                seed: 7,
+                mode: RunMode::Chaos,
+                profile: Some(FaultProfile::Security),
+                dir: seed_dir,
+                failed: false,
+                ops: 1,
+                compactions: 0,
+                background_compactions: 0,
+                violations: Vec::new(),
+                wall_secs: 1.0,
+                object_store: ObjectStorePhaseCensus::default(),
+                fired_faults: Vec::new(),
+            }],
+            &Coverage::default(),
+        );
+        assert!(report.contains("## Authorization Summary"));
+        assert!(report.contains("| 7 | 0 | 1 | 0 | 0 | pass | pass | pass | pass | pass | pass |"));
     }
 
     #[test]
@@ -1825,6 +1984,66 @@ fn build_report(
         ops as f64 / wall
     ));
 
+    if seeds.iter().any(|seed| {
+        read_ops(&seed.dir)
+            .iter()
+            .any(|record| record.op.tags().contains(&"security"))
+    }) {
+        out.push_str("## Authorization Summary\n\n");
+        out.push_str(
+            "| seed | allow | forbidden | unauthorized | staleness resolutions | I22 | I23 | I24 | I25 | I26 | I27 |\n",
+        );
+        out.push_str("| --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- |\n");
+        for seed in seeds {
+            let records = read_ops(&seed.dir);
+            let security_records = records
+                .iter()
+                .filter(|record| record.op.tags().contains(&"security"))
+                .collect::<Vec<_>>();
+            let allow = security_records
+                .iter()
+                .filter(|record| (200..300).contains(&record.status))
+                .count();
+            let forbidden = security_records
+                .iter()
+                .filter(|record| record.status == 403)
+                .count();
+            let unauthorized = security_records
+                .iter()
+                .filter(|record| record.status == 401)
+                .count();
+            let staleness = security_records
+                .iter()
+                .filter(|record| {
+                    matches!(record.op, super::ops::Op::UseRevokedCredential { .. })
+                        && matches!(record.status, 200 | 401)
+                })
+                .count();
+            let oracle_status = |id| {
+                if seed.violations.iter().any(|violation| violation.id == id) {
+                    "fail"
+                } else {
+                    "pass"
+                }
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                seed.seed,
+                allow,
+                forbidden,
+                unauthorized,
+                staleness,
+                oracle_status(ViolationId::I22AuthzDecision),
+                oracle_status(ViolationId::I23TenantLeak),
+                oracle_status(ViolationId::I24RevocationFreshness),
+                oracle_status(ViolationId::I25AuditEvidence),
+                oracle_status(ViolationId::I26SecurityStateSanity),
+                oracle_status(ViolationId::I27ConstraintDrop),
+            ));
+        }
+        out.push('\n');
+    }
+
     out.push_str("## Contract Classification\n\n");
     out.push_str("| seed | contract class | violated assumptions | blocking v1 gate |\n");
     out.push_str("| --- | --- | --- | --- |\n");
@@ -2128,8 +2347,32 @@ fn build_report(
     }
     for (kind, count) in &coverage.op_counts {
         if !REQUIRED_OP_KINDS.contains(&kind.as_str()) {
-            out.push_str(&format!("- `{kind}`: {count}\n"));
+            let marker = if manifest.profile == Some(FaultProfile::Security)
+                && SECURITY_OP_KINDS.contains(&kind.as_str())
+                && *count < 5
+            {
+                " ⚠ below security floor 5"
+            } else {
+                ""
+            };
+            out.push_str(&format!("- `{kind}`: {count}{marker}\n"));
         }
+    }
+    out.push('\n');
+
+    out.push_str("## Security Oracle Coverage\n\n");
+    for oracle in ["I22", "I23", "I24", "I25", "I26", "I27"] {
+        let count = coverage
+            .security_oracle_counts
+            .get(oracle)
+            .copied()
+            .unwrap_or(0);
+        let marker = if manifest.profile == Some(FaultProfile::Security) && count == 0 {
+            " ⚠"
+        } else {
+            ""
+        };
+        out.push_str(&format!("- `{oracle}`: {count}{marker}\n"));
     }
     out.push('\n');
 
@@ -2305,6 +2548,7 @@ fn profile_contracts(profile: Option<FaultProfile>) -> Vec<FaultContract> {
             | FaultProfile::Crash
             | FaultProfile::Clock
             | FaultProfile::SupportedFull
+            | FaultProfile::Security
             | FaultProfile::Sched,
         )
         | None => &[ContractClass::SupportedV1],
@@ -2430,6 +2674,19 @@ const REQUIRED_OP_KINDS: &[&str] = &[
     "delete_namespace",
     "probe_sandwich",
     "compact_inline",
+];
+
+const SECURITY_OP_KINDS: &[&str] = &[
+    "create_key",
+    "rotate_key",
+    "revoke_key",
+    "publish_grant_change",
+    "tenant_boundary_probe",
+    "use_revoked_credential",
+    "forbidden_write_probe",
+    "export_probe",
+    "security_admin_probe",
+    "audit_barrier",
 ];
 
 const REQUIRED_TAGS: &[&str] = &[

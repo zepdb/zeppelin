@@ -13,6 +13,7 @@ use zeppelin::compaction::gc;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{Config, GcConfig};
 use zeppelin::error::ZeppelinError;
+use zeppelin::security::{AuditRecord, PolicyHead, PolicySnapshot, SecurityKernel};
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
 use zeppelin::types::ConsistencyLevel;
@@ -23,6 +24,7 @@ use crate::common::harness::TestHarness;
 use crate::common::server::{
     cleanup_ns, start_test_server_full, start_test_server_full_with_disk_cache_max_bytes,
     start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer, FullTestServer,
+    WorkloadCredentialRegistry,
 };
 
 use super::artifacts::{
@@ -47,21 +49,62 @@ use super::model::{
     AmbiguityReason, IndetEffect, Model, ModelRecord, NsIndeterminate, OpOutcome, OracleMutation,
 };
 use super::ops::{
-    ExecutionMetadata, ExecutionPhase, GenVector, GeneratedQuery, HeldExecutionMetadata,
-    HoldReleaseCause, InvalidProbe, NamespaceSpec, Op, OpRecord, QueryOracleClass,
+    ActorSel, ExecutionMetadata, ExecutionPhase, ForbiddenWriteKind, GenVector, GeneratedQuery,
+    GrantChange, HeldExecutionMetadata, HoldReleaseCause, InvalidProbe, NamespaceSpec, Op,
+    OpRecord, QueryOracleClass, TenantProbeSurface,
 };
 use super::oracle::{self, Violation, ViolationId};
 use super::s3_oracle::{self, S3Tracker};
+use super::security_program::{
+    check_i22_authz_decision, check_i23_tenant_leak, check_i24_revocation_freshness,
+    check_i25_audit_evidence, check_i26_security_state, check_i27_constraint_drop,
+    ExpectedDecision, SecurityFinding, SecurityProgramConfig, SecurityStateObservation,
+    SECURITY_AUDIT_BARRIER_OP,
+};
 use super::{effective_seed_assignment, PreserveMode, RunMode, RunnerEnv};
 
 const AMBIGUITY_MARKER: &str = "_adversarial_ambiguity";
 const STORE_FAULT_MARKER: &str = "_adversarial_store_fault";
 const DUAL_WRITER_LEASE_HOLD_EVENT_ID: &str = "ops-dual-writer-lease-hold";
+const SECURITY_OP_KINDS: [&str; 10] = [
+    "create_key",
+    "rotate_key",
+    "revoke_key",
+    "publish_grant_change",
+    "tenant_boundary_probe",
+    "use_revoked_credential",
+    "forbidden_write_probe",
+    "export_probe",
+    "security_admin_probe",
+    "audit_barrier",
+];
+
+fn initialize_security_model(
+    model: &mut Model,
+    program: SecurityProgramConfig,
+    policy_version: u64,
+    credentials: &WorkloadCredentialRegistry,
+) {
+    let bootstrap_actors = program
+        .principals
+        .iter()
+        .filter(|principal| principal.bootstrap_key)
+        .map(|principal| principal.actor)
+        .collect::<Vec<_>>();
+    model.security.initialize(program, policy_version);
+    for actor in bootstrap_actors {
+        let credential = credentials.credential(actor.0, 0);
+        model
+            .security
+            .register_known_key(super::ops::KeySel { actor, retired: 0 }, credential.key_id);
+    }
+}
 
 tokio::task_local! {
     static REQUEST_AMBIGUITY_ALLOWED: bool;
     static REQUEST_IS_MUTATION: bool;
     static HTTP_FAULT_CONTEXT: Option<HttpFaultContext>;
+    static WORKLOAD_REQUEST_ID: String;
 }
 
 #[derive(Clone)]
@@ -88,6 +131,8 @@ struct OpExecutionTarget {
     clock: Clock,
     compactor: Arc<Compactor>,
     manifest_cache: Arc<ManifestCache>,
+    security: Arc<SecurityKernel>,
+    workload_credentials: WorkloadCredentialRegistry,
 }
 
 impl From<&FullTestServer> for OpExecutionTarget {
@@ -98,6 +143,8 @@ impl From<&FullTestServer> for OpExecutionTarget {
             clock: server.clock.clone(),
             compactor: Arc::clone(&server.compactor),
             manifest_cache: Arc::clone(&server.manifest_cache),
+            security: Arc::clone(&server.security),
+            workload_credentials: server.workload_credentials.clone(),
         }
     }
 }
@@ -564,6 +611,7 @@ impl OperationalState {
                     let mut values = vec![0.0; dims];
                     values[0] = 1.0;
                     let upsert = Op::Upsert {
+                        actor: ActorSel::ADMIN,
                         ns: ns.clone(),
                         vectors: vec![GenVector {
                             id: format!("operational-race-{op_index}"),
@@ -571,7 +619,10 @@ impl OperationalState {
                             attributes: None,
                         }],
                     };
-                    let delete = Op::DeleteNamespace { ns: ns.clone() };
+                    let delete = Op::DeleteNamespace {
+                        actor: ActorSel::ADMIN,
+                        ns: ns.clone(),
+                    };
                     let held = OpOutcome::Ambiguous {
                         reason: AmbiguityReason::HeldInFlight,
                         status: None,
@@ -985,6 +1036,27 @@ pub async fn run_overnight(env: RunnerEnv) -> RunSummary {
     }
 
     summary.ops_per_sec = summary.ops_total as f64 / started.elapsed().as_secs_f64().max(0.001);
+    if env.profile == Some(FaultProfile::Security) {
+        for kind in SECURITY_OP_KINDS {
+            let count = summary.coverage.op_counts.get(kind).copied().unwrap_or(0);
+            assert!(
+                count >= 5,
+                "security overnight coverage floor requires {kind} >= 5, observed {count}"
+            );
+        }
+        for oracle in ["I22", "I23", "I24", "I25", "I26", "I27"] {
+            let count = summary
+                .coverage
+                .security_oracle_counts
+                .get(oracle)
+                .copied()
+                .unwrap_or(0);
+            assert!(
+                count > 0,
+                "security overnight scenario coverage requires {oracle}, observed {count}"
+            );
+        }
+    }
     artifacts.write_report(&env, &seed_reports, &summary.coverage, true);
     summary
 }
@@ -1144,8 +1216,12 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         .iter()
         .map(|(ns, spec)| (rewrite_prefix(ns, &old_prefix, &prefix), spec.clone()))
         .collect::<BTreeMap<_, _>>();
+    let security_program = seed_config
+        .security_program
+        .as_ref()
+        .map(|program| program.rewrite_namespace_prefix(&old_prefix, &prefix));
     let run_artifacts = RunArtifacts::create(env);
-    let mut artifacts = run_artifacts.seed(
+    let mut artifacts = run_artifacts.seed_with_security(
         seed_config.seed,
         &config,
         &specs,
@@ -1154,6 +1230,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         seed_config.selftest_probe.map(OracleMutation::key),
         chaos_plan_json.as_ref(),
         scheduler.as_ref().map(FaultScheduler::schedule),
+        security_program.as_ref(),
     );
     let disk_cache_max_bytes = disk_cache_max_bytes_for_schedule(scheduler.as_ref());
     let mut server = start_test_server_full_with_disk_cache_max_bytes(
@@ -1165,6 +1242,11 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         disk_cache_max_bytes,
     )
     .await;
+    let bootstrapped_policy_version = if let Some(program) = &security_program {
+        Some(bootstrap_security_program(&server, program).await)
+    } else {
+        None
+    };
     let mut operational_state = OperationalState::default();
     let mut injector = if scheduler.is_some() {
         Some(start_http_fault_injector(&server.base_url).await)
@@ -1184,6 +1266,16 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
             });
     let client = adversarial_client(&server);
     let mut model = Model::default();
+    if let (Some(program), Some(policy_version)) =
+        (security_program.clone(), bootstrapped_policy_version)
+    {
+        initialize_security_model(
+            &mut model,
+            program,
+            policy_version,
+            &server.workload_credentials,
+        );
+    }
     let mut coverage = Coverage::default();
     let mut s3_tracker = S3Tracker::default();
     let mut corruption_tracker = CorruptionTracker::default();
@@ -1537,13 +1629,13 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                 created_namespaces.push(target.clone());
             }
         }
-        if let Op::DeleteNamespace { ns } = &op {
+        if let Op::DeleteNamespace { ns, .. } = &op {
             if (200..300).contains(&step.status) {
                 created_namespaces.retain(|created| created != ns);
             }
         }
         if matches!(
-            op,
+            &op,
             Op::CompactInline { .. } | Op::CompactEndpoint { .. } | Op::ProbeSandwich { .. }
         ) && (200..300).contains(&step.status)
         {
@@ -1750,6 +1842,8 @@ struct ReplaySeedConfig {
     chaos_plan: Option<FaultPlan>,
     #[serde(default)]
     fault_schedule: Option<FaultSchedule>,
+    #[serde(default)]
+    security_program: Option<SecurityProgramConfig>,
     config: Config,
     namespace_specs: BTreeMap<String, NamespaceSpec>,
 }
@@ -2196,6 +2290,116 @@ fn adversarial_client(server: &FullTestServer) -> Client {
         .expect("failed to build adversarial reqwest client")
 }
 
+async fn bootstrap_security_program(
+    server: &FullTestServer,
+    program: &SecurityProgramConfig,
+) -> u64 {
+    let admin = crate::common::server::client_with_bearer(&server.admin_bearer);
+    let mut policy_version = 1u64;
+    for principal in &program.principals {
+        let response = admin
+            .post(format!("{}/v1/security/principals", server.base_url))
+            .json(&json!({
+                "principal_id": principal.principal_id,
+                "kind": "service",
+                "display_name": principal.display_name,
+            }))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("security principal bootstrap request failed: {error}"));
+        let body = required_bootstrap_response(response, StatusCode::CREATED, "principal").await;
+        policy_version = policy_version.max(required_policy_version(&body));
+        server
+            .workload_credentials
+            .register_principal(principal.actor.0, &principal.principal_id);
+
+        for grant in &principal.grants {
+            let response = admin
+                .post(format!("{}/v1/security/grants", server.base_url))
+                .json(&security_grant_body(&principal.principal_id, grant))
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("security grant bootstrap request failed: {error}"));
+            let body = required_bootstrap_response(response, StatusCode::CREATED, "grant").await;
+            policy_version = policy_version.max(required_policy_version(&body));
+        }
+
+        if principal.bootstrap_key {
+            let response = admin
+                .post(format!("{}/v1/security/keys", server.base_url))
+                .json(&json!({
+                    "principal_id": principal.principal_id,
+                    "name": format!("adversarial-{}-bootstrap", principal.actor.0),
+                }))
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("security key bootstrap request failed: {error}"));
+            let body = required_bootstrap_response(response, StatusCode::CREATED, "key").await;
+            policy_version = policy_version.max(required_policy_version(&body));
+            let key_id = body["key_id"]
+                .as_str()
+                .expect("security key bootstrap response omitted key_id");
+            let bearer = body["api_key"]
+                .as_str()
+                .expect("security key bootstrap response omitted api_key");
+            server
+                .workload_credentials
+                .install(principal.actor.0, key_id, bearer);
+        }
+    }
+    policy_version
+}
+
+async fn required_bootstrap_response(
+    response: reqwest::Response,
+    expected: StatusCode,
+    operation: &str,
+) -> serde_json::Value {
+    let status = response.status();
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("security {operation} bootstrap response was not JSON: {error}")
+        });
+    assert_eq!(
+        status, expected,
+        "security {operation} bootstrap failed: {body}"
+    );
+    body
+}
+
+fn required_policy_version(body: &serde_json::Value) -> u64 {
+    body["policy_version"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("security mutation response omitted policy_version: {body}"))
+}
+
+fn security_grant_body(
+    principal_id: &str,
+    grant: &super::ops::SecurityGrantSpec,
+) -> serde_json::Value {
+    let scope = grant.namespace.as_deref().map_or_else(
+        || json!({"kind": "global"}),
+        |namespace| json!({"kind": "namespace", "namespace": namespace}),
+    );
+    let mut body = json!({
+        "principal_id": principal_id,
+        "scope": scope,
+        "actions": {"kind": "selected", "actions": grant.actions},
+    });
+    let object = body
+        .as_object_mut()
+        .expect("security grant request must be an object");
+    if let Some(filter) = &grant.mandatory_filter {
+        object.insert("mandatory_filter".to_string(), filter.clone());
+    }
+    if let Some(constraints) = &grant.write_constraints {
+        object.insert("write_constraints".to_string(), constraints.clone());
+    }
+    body
+}
+
 #[cfg(test)]
 fn raw_adversarial_client() -> Client {
     Client::builder()
@@ -2247,6 +2451,7 @@ async fn restart_after_crash(
     *http_fault_context = None;
     let clock = server.clock.clone();
     let admin_bearer = server.admin_bearer.clone();
+    let workload_credentials = server.workload_credentials.clone();
     server.abort();
     controller.park_token.cancel();
     shutdown_http_fault_injector(injector).await;
@@ -2261,6 +2466,7 @@ async fn restart_after_crash(
         &admin_bearer,
     )
     .await;
+    server.workload_credentials = workload_credentials;
     wait_for_health(client, &server.base_url).await;
     scheduler.record(TimelineEvent {
         event_id: crash.event_id,
@@ -2351,16 +2557,22 @@ fn sanitize_op_for_mode(op: Op, mode: RunMode) -> Op {
         // that drown out foreground invariants; keep explicit maintenance out
         // of chaos mode and use the live background loop for compaction
         // coverage instead.
-        Op::CompactInline { ns }
-        | Op::CompactEndpoint { ns }
-        | Op::GcCycle { ns, .. }
-        | Op::ProbeSandwich { ns, .. } => Op::GetNamespace { ns },
-        Op::FetchVectors { ns, ids, .. } => Op::FetchVectors {
+        Op::CompactInline { actor, ns }
+        | Op::CompactEndpoint { actor, ns }
+        | Op::GcCycle { actor, ns, .. }
+        | Op::ProbeSandwich { actor, ns, .. } => Op::GetNamespace { actor, ns },
+        Op::FetchVectors { actor, ns, ids, .. } => Op::FetchVectors {
+            actor,
             ns,
             ids,
             consistency: ConsistencyLevel::Strong,
         },
-        Op::Query { ns, mut q, as_of } => {
+        Op::Query {
+            actor,
+            ns,
+            mut q,
+            as_of,
+        } => {
             if let Some(object) = q.body.as_object_mut() {
                 object.insert("consistency".to_string(), json!(ConsistencyLevel::Strong));
             }
@@ -2376,8 +2588,15 @@ fn sanitize_op_for_mode(op: Op, mode: RunMode) -> Op {
                 QueryOracleClass::ExpectError { status, code } => {
                     QueryOracleClass::ExpectError { status, code }
                 }
+                QueryOracleClass::Unauthorized => QueryOracleClass::Unauthorized,
+                QueryOracleClass::Forbidden => QueryOracleClass::Forbidden,
             };
-            Op::Query { ns, q, as_of }
+            Op::Query {
+                actor,
+                ns,
+                q,
+                as_of,
+            }
         }
         other => other,
     }
@@ -2516,7 +2735,7 @@ fn latest_recorded_seed_dir(env: &RunnerEnv, seed: u64) -> Option<PathBuf> {
 
 fn recorded_trace_uses_generated_ids(records: &[OpRecord]) -> bool {
     for record in records {
-        if let Op::Upsert { ns, vectors } = &record.op {
+        if let Op::Upsert { ns, vectors, .. } = &record.op {
             return vectors.iter().all(|vector| vector.id.starts_with(ns));
         }
     }
@@ -2860,6 +3079,16 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 fired.contains(&ViolationId::I14S3Reachability)
             }
             OracleMutation::DualWriterFencing => fired == vec![ViolationId::I21FencingViolation],
+            OracleMutation::GrantModelDesync => fired.contains(&ViolationId::I22AuthzDecision),
+            OracleMutation::LeakedIdSuppression => fired.contains(&ViolationId::I23TenantLeak),
+            OracleMutation::RevocationMisclassification => {
+                fired.contains(&ViolationId::I24RevocationFreshness)
+            }
+            OracleMutation::AuditRecordDeletion => fired.contains(&ViolationId::I25AuditEvidence),
+            OracleMutation::SecuritySecretLeak => {
+                fired.contains(&ViolationId::I26SecurityStateSanity)
+            }
+            OracleMutation::ConstraintDrop => fired.contains(&ViolationId::I27ConstraintDrop),
         };
         assert!(
             accepted,
@@ -2922,9 +3151,19 @@ async fn run_seed(
     } else {
         assignment.mode
     };
+    let security_program_enabled = profile == Some(FaultProfile::Security)
+        || mutation.is_some_and(OracleMutation::is_security)
+        || selftest_probe.is_some_and(OracleMutation::is_security);
     let harness = TestHarness::new().await;
     let prefix = harness.prefix.clone();
-    let mut generator = AdversarialGenerator::new(seed, &prefix);
+    let mut generator = if profile == Some(FaultProfile::Security) {
+        AdversarialGenerator::new_security_profile(seed, &prefix)
+    } else if security_program_enabled {
+        AdversarialGenerator::new_security(seed, &prefix)
+    } else {
+        AdversarialGenerator::new(seed, &prefix)
+    };
+    let security_program = generator.security_program().cloned();
     let specs = generator.specs();
     let scheduler = if dual_writer_fencing_selftest {
         Some(FaultScheduler::from_schedule(
@@ -2996,7 +3235,7 @@ async fn run_seed(
     );
     let config = config_for_mode(mode, seed, scheduler.as_ref().map(FaultScheduler::schedule));
     let recorded_ops = recorded_seed_ops_if_requested(env, seed, &prefix);
-    let mut artifacts = artifacts.seed(
+    let mut artifacts = artifacts.seed_with_security(
         seed,
         &config,
         &specs,
@@ -3005,6 +3244,7 @@ async fn run_seed(
         selftest_probe.map(OracleMutation::key),
         chaos_plan_json.as_ref(),
         scheduler.as_ref().map(FaultScheduler::schedule),
+        security_program.as_ref(),
     );
     let disk_cache_max_bytes = disk_cache_max_bytes_for_schedule(scheduler.as_ref());
     let mut server = start_test_server_full_with_disk_cache_max_bytes(
@@ -3016,6 +3256,11 @@ async fn run_seed(
         disk_cache_max_bytes,
     )
     .await;
+    let bootstrapped_policy_version = if let Some(program) = &security_program {
+        Some(bootstrap_security_program(&server, program).await)
+    } else {
+        None
+    };
     let mut operational_state = OperationalState::default();
     let mut injector = if scheduler.is_some() {
         Some(start_http_fault_injector(&server.base_url).await)
@@ -3035,6 +3280,16 @@ async fn run_seed(
             });
     let client = adversarial_client(&server);
     let mut model = Model::default();
+    if let (Some(program), Some(policy_version)) =
+        (security_program.clone(), bootstrapped_policy_version)
+    {
+        initialize_security_model(
+            &mut model,
+            program,
+            policy_version,
+            &server.workload_credentials,
+        );
+    }
     let mut coverage = Coverage::default();
     let mut created_namespaces = Vec::new();
     let mut background_compaction_starts = BTreeMap::new();
@@ -3325,7 +3580,7 @@ async fn run_seed(
                 created_namespaces.push(target.clone());
             }
         }
-        if let Op::DeleteNamespace { ns } = &op {
+        if let Op::DeleteNamespace { ns, .. } = &op {
             if (200..300).contains(&step.status) {
                 created_namespaces.retain(|created| created != ns);
             }
@@ -4078,7 +4333,7 @@ fn apply_step_bookkeeping(
             note_background_compaction_namespace(background_compaction_starts, target);
             created_namespaces.push(target.clone());
         }
-        Op::DeleteNamespace { ns } => {
+        Op::DeleteNamespace { ns, .. } => {
             created_namespaces.retain(|created| created != ns);
         }
         Op::CompactInline { .. } | Op::CompactEndpoint { .. } | Op::ProbeSandwich { .. } => {
@@ -4208,7 +4463,7 @@ fn op_awaits_store_fault_window_close(
     let Some(scheduler) = scheduler else {
         return false;
     };
-    if let Op::DeleteNamespace { ns } = op {
+    if let Op::DeleteNamespace { ns, .. } = op {
         if scheduler.scheduled_store_fault_window_active(op_index) {
             return true;
         }
@@ -4220,7 +4475,7 @@ fn op_awaits_store_fault_window_close(
 fn deferred_namespace_delete_targets(deferred: &VecDeque<Op>, namespace: &str) -> bool {
     deferred
         .iter()
-        .any(|pending| matches!(pending, Op::DeleteNamespace { ns } if ns == namespace))
+        .any(|pending| matches!(pending, Op::DeleteNamespace { ns, .. } if ns == namespace))
 }
 
 fn next_fifo_deferred_op<G, C>(deferred: &mut VecDeque<Op>, mut generate: G, mut conflicts: C) -> Op
@@ -4399,7 +4654,7 @@ async fn reachable_keys_for_taint(
 }
 
 fn unresolved_create_allows_missing_manifest_bookkeeping(model: &Model, op: &Op) -> bool {
-    let Op::InvalidProbe { ns, probe } = op else {
+    let Op::InvalidProbe { ns, probe, .. } = op else {
         return false;
     };
     probe.is_write_shaped()
@@ -4500,18 +4755,38 @@ async fn execute_raw_recorded_op(
         .as_ref()
         .and_then(|context| context.scheduler.process_controller());
     let request_target = target.clone();
-    let request = REQUEST_AMBIGUITY_ALLOWED.scope(
-        ambiguity_allowed,
-        REQUEST_IS_MUTATION.scope(
-            op.is_mutating(),
-            execute_op(
-                &client,
-                &request_target,
-                &op,
-                index,
-                started,
-                allow_missing_manifest_bookkeeping,
-                durably_tainted_keys.as_ref(),
+    let ordinary_actor = ordinary_execution_actor(&op);
+    if ordinary_actor.is_some()
+        && matches!(
+            &op,
+            Op::GcCycle { .. } | Op::ProbeSandwich { .. } | Op::CompactInline { .. }
+        )
+    {
+        panic!(
+            "{} cannot execute as actor {} because it bypasses the HTTP authorization seam",
+            op.kind(),
+            op.actor().0
+        );
+    }
+    let execution_client = ordinary_actor.map_or_else(
+        || client.clone(),
+        |actor| target.workload_credentials.client(actor.0, 0),
+    );
+    let request = WORKLOAD_REQUEST_ID.scope(
+        format!("adv-{index}-{}", op.kind()),
+        REQUEST_AMBIGUITY_ALLOWED.scope(
+            ambiguity_allowed,
+            REQUEST_IS_MUTATION.scope(
+                op.is_mutating(),
+                execute_op(
+                    &execution_client,
+                    &request_target,
+                    &op,
+                    index,
+                    started,
+                    allow_missing_manifest_bookkeeping,
+                    durably_tainted_keys.as_ref(),
+                ),
             ),
         ),
     );
@@ -4553,6 +4828,11 @@ async fn execute_raw_recorded_op(
                     .and_then(serde_json::Value::as_u64);
             }
             Op::DeleteNamespace { .. } | Op::PatchIndexConfig { .. } => {}
+            Op::CreateKey { .. }
+            | Op::RotateKey { .. }
+            | Op::RevokeKey { .. }
+            | Op::PublishGrantChange { .. }
+            | Op::ForbiddenWriteProbe { .. } => {}
             _ if op.is_mutating() => {
                 rec.gen_after = if let Some(context) = http_fault_context.as_ref() {
                     if op_records_manifest_generation(&op) {
@@ -4582,6 +4862,11 @@ async fn execute_raw_recorded_op(
         target,
         http_fault_context,
     }
+}
+
+#[must_use]
+fn ordinary_execution_actor(op: &Op) -> Option<ActorSel> {
+    (!op.is_security_op() && op.actor() != ActorSel::ADMIN).then(|| op.actor())
 }
 
 enum HoldCandidateOutcome {
@@ -4880,7 +5165,7 @@ async fn finish_recorded_op(
         corruption_tracker.observe(&context.scheduler.timeline(), &model.namespace_names());
     }
     if (200..300).contains(&rec.status) {
-        if let Op::DeleteNamespace { ns } = op {
+        if let Op::DeleteNamespace { ns, .. } = op {
             s3_tracker.forget_namespace(ns);
             corruption_tracker.forget_namespace(ns);
         }
@@ -5087,7 +5372,7 @@ async fn execute_op(
 ) -> OpRecord {
     let before = Instant::now();
     let (method, path, status, response) = match op {
-        Op::CreateNamespace { ns, spec } => {
+        Op::CreateNamespace { ns, spec, .. } => {
             let path = "/v1/namespaces".to_string();
             let body = spec.create_body(ns);
             let (status, response) = request_json(
@@ -5099,7 +5384,7 @@ async fn execute_op(
             .await;
             ("POST".to_string(), path, status, response)
         }
-        Op::GetNamespace { ns } => {
+        Op::GetNamespace { ns, .. } => {
             let path = format!("/v1/namespaces/{ns}");
             let (status, response) = request_json(
                 client,
@@ -5110,7 +5395,7 @@ async fn execute_op(
             .await;
             ("GET".to_string(), path, status, response)
         }
-        Op::Upsert { ns, vectors } => {
+        Op::Upsert { ns, vectors, .. } => {
             let path = format!("/v1/namespaces/{ns}/vectors");
             let (status, response) = request_json(
                 client,
@@ -5121,7 +5406,7 @@ async fn execute_op(
             .await;
             ("POST".to_string(), path, status, response)
         }
-        Op::DeleteVectors { ns, ids } => {
+        Op::DeleteVectors { ns, ids, .. } => {
             let path = format!("/v1/namespaces/{ns}/vectors");
             let (status, response) = request_json(
                 client,
@@ -5136,6 +5421,7 @@ async fn execute_op(
             ns,
             ids,
             consistency,
+            ..
         } => {
             let path = format!("/v1/namespaces/{ns}/vectors/get");
             let (status, response) = request_json(
@@ -5152,7 +5438,7 @@ async fn execute_op(
             .await;
             ("POST".to_string(), path, status, response)
         }
-        Op::Query { ns, q, as_of } => {
+        Op::Query { ns, q, as_of, .. } => {
             let path = if let Some(as_of) = as_of {
                 format!("/v1/namespaces/{ns}/query?as_of={as_of}")
             } else {
@@ -5167,7 +5453,7 @@ async fn execute_op(
             .await;
             ("POST".to_string(), path, status, response)
         }
-        Op::BatchQuery { ns, qs } => {
+        Op::BatchQuery { ns, qs, .. } => {
             let path = format!("/v1/namespaces/{ns}/query/batch");
             let queries = qs.iter().map(|q| q.body.clone()).collect::<Vec<_>>();
             let (status, batch) = request_json(
@@ -5202,7 +5488,9 @@ async fn execute_op(
                 }),
             )
         }
-        Op::PaginateAll { ns, q, page_size } => {
+        Op::PaginateAll {
+            ns, q, page_size, ..
+        } => {
             let path = format!("/v1/namespaces/{ns}/query");
             let mut pages = Vec::new();
             let mut cursor = json!({ "type": "none" });
@@ -5268,7 +5556,7 @@ async fn execute_op(
                 }),
             )
         }
-        Op::InvalidProbe { ns, probe } => {
+        Op::InvalidProbe { ns, probe, .. } => {
             let status_before = if probe.is_write_shaped() {
                 Some(
                     bookkeeping_compact_status(
@@ -5302,7 +5590,7 @@ async fn execute_op(
             }
             (method, path, status, response)
         }
-        Op::CompactEndpoint { ns } => {
+        Op::CompactEndpoint { ns, .. } => {
             let path = format!("/v1/namespaces/{ns}/compact");
             let (trigger_status, trigger) = request_json(
                 client,
@@ -5328,7 +5616,7 @@ async fn execute_op(
                 }),
             )
         }
-        Op::GcCycle { ns, keep_count } => {
+        Op::GcCycle { ns, keep_count, .. } => {
             let path = format!("gc::run_gc_cycle({ns})");
             let config = gc_config(*keep_count);
             let report = gc::run_gc_cycle_at(&target.store, ns, &config, target.clock.now())
@@ -5358,7 +5646,7 @@ async fn execute_op(
                 }),
             )
         }
-        Op::CreateSnapshot { ns, name } => {
+        Op::CreateSnapshot { ns, name, .. } => {
             let path = format!("/v1/namespaces/{ns}/snapshots/{name}");
             let (status, response) = request_json(
                 client,
@@ -5369,7 +5657,7 @@ async fn execute_op(
             .await;
             ("PUT".to_string(), path, status, response)
         }
-        Op::GetSnapshot { ns, name } => {
+        Op::GetSnapshot { ns, name, .. } => {
             let path = format!("/v1/namespaces/{ns}/snapshots/{name}");
             let (status, response) = request_json(
                 client,
@@ -5380,7 +5668,7 @@ async fn execute_op(
             .await;
             ("GET".to_string(), path, status, response)
         }
-        Op::ListSnapshots { ns } => {
+        Op::ListSnapshots { ns, .. } => {
             let path = format!("/v1/namespaces/{ns}/snapshots");
             let (status, response) = request_json(
                 client,
@@ -5391,7 +5679,7 @@ async fn execute_op(
             .await;
             ("GET".to_string(), path, status, response)
         }
-        Op::DeleteSnapshot { ns, name } => {
+        Op::DeleteSnapshot { ns, name, .. } => {
             let path = format!("/v1/namespaces/{ns}/snapshots/{name}");
             let (status, response) = request_json(
                 client,
@@ -5406,6 +5694,7 @@ async fn execute_op(
             source,
             target: clone_target,
             as_of,
+            ..
         } => {
             let path = format!("/v1/namespaces/{source}/clone");
             let (status, response) = request_json(
@@ -5420,7 +5709,7 @@ async fn execute_op(
             .await;
             ("POST".to_string(), path, status, response)
         }
-        Op::PatchIndexConfig { ns, patch } => {
+        Op::PatchIndexConfig { ns, patch, .. } => {
             let path = format!("/v1/namespaces/{ns}/index_config");
             let (status, response) = request_json(
                 client,
@@ -5431,7 +5720,7 @@ async fn execute_op(
             .await;
             ("PATCH".to_string(), path, status, response)
         }
-        Op::Hydrate { ns } => {
+        Op::Hydrate { ns, .. } => {
             let path = format!("/v1/namespaces/{ns}/hydrate");
             let (status, response) = request_json(
                 client,
@@ -5442,7 +5731,7 @@ async fn execute_op(
             .await;
             ("POST".to_string(), path, status, response)
         }
-        Op::DeleteNamespace { ns } => {
+        Op::DeleteNamespace { ns, .. } => {
             let path = format!("/v1/namespaces/{ns}");
             let (status, response) = request_json(
                 client,
@@ -5456,7 +5745,9 @@ async fn execute_op(
             }
             ("DELETE".to_string(), path, status, response)
         }
-        Op::ProbeSandwich { ns, maintenance } => {
+        Op::ProbeSandwich {
+            ns, maintenance, ..
+        } => {
             let path = format!("probe_sandwich({ns},{maintenance:?})");
             let before = compact_status(client, &target.base_url, ns).await;
             let maintenance_response =
@@ -5473,7 +5764,7 @@ async fn execute_op(
                 }),
             )
         }
-        Op::CompactInline { ns } => match target.compactor.compact(ns).await {
+        Op::CompactInline { ns, .. } => match target.compactor.compact(ns).await {
             Ok(result) => {
                 target.manifest_cache.invalidate_at(ns, target.clock.now());
                 (
@@ -5504,6 +5795,16 @@ async fn execute_op(
                 )
             }
         },
+        Op::CreateKey { .. }
+        | Op::RotateKey { .. }
+        | Op::RevokeKey { .. }
+        | Op::PublishGrantChange { .. }
+        | Op::TenantBoundaryProbe { .. }
+        | Op::UseRevokedCredential { .. }
+        | Op::ForbiddenWriteProbe { .. }
+        | Op::ExportProbe { .. }
+        | Op::SecurityAdminProbe { .. }
+        | Op::AuditBarrierOp { .. } => execute_security_op(client, target, op, index).await,
     };
 
     OpRecord {
@@ -5520,6 +5821,415 @@ async fn execute_op(
         gen_after: None,
         duration_ms: before.elapsed().as_millis() as u64,
         violations: Vec::new(),
+    }
+}
+
+async fn execute_security_op(
+    admin_client: &Client,
+    target: &OpExecutionTarget,
+    op: &Op,
+    op_index: u64,
+) -> (String, String, u16, serde_json::Value) {
+    let selected_key = match op {
+        Op::UseRevokedCredential { key } => Some(*key),
+        _ if op.actor() != ActorSel::ADMIN => Some(super::ops::KeySel {
+            actor: op.actor(),
+            retired: 0,
+        }),
+        _ => None,
+    };
+    let actor_client =
+        selected_key.map(|key| target.workload_credentials.client(key.actor.0, key.retired));
+    let client = actor_client.as_ref().unwrap_or(admin_client);
+    let request_id = WORKLOAD_REQUEST_ID
+        .try_with(Clone::clone)
+        .expect("security operation must have a deterministic request id");
+
+    match op {
+        Op::CreateKey {
+            subject,
+            expires_after_secs,
+            ..
+        } => {
+            let path = "/v1/security/keys".to_string();
+            let mut body = json!({
+                "principal_id": target.workload_credentials.principal_id(subject.0),
+                "name": format!("adversarial-{}-runtime", subject.0),
+            });
+            if let Some(seconds) = expires_after_secs {
+                let expires_at = target
+                    .clock
+                    .now()
+                    .checked_add_signed(chrono::Duration::seconds(
+                        i64::try_from(*seconds).expect("key expiry must fit i64 seconds"),
+                    ))
+                    .expect("key expiry timestamp overflowed");
+                body.as_object_mut()
+                    .expect("key body must be an object")
+                    .insert("expires_at".to_string(), json!(expires_at.to_rfc3339()));
+            }
+            let (status, mut response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", target.base_url, path),
+                Some(body),
+            )
+            .await;
+            if (200..300).contains(&status) {
+                install_and_redact_credential(
+                    &target.workload_credentials,
+                    subject.0,
+                    &mut response,
+                );
+                record_success_request_id(&mut response, &request_id);
+            }
+            ("POST".to_string(), path, status, response)
+        }
+        Op::RotateKey { key, .. } => {
+            let credential = target
+                .workload_credentials
+                .credential(key.actor.0, key.retired);
+            let path = format!("/v1/security/keys/{}/rotate", credential.key_id);
+            let (status, mut response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", target.base_url, path),
+                Some(json!({"overlap_secs": 0})),
+            )
+            .await;
+            if (200..300).contains(&status) {
+                install_and_redact_credential(
+                    &target.workload_credentials,
+                    key.actor.0,
+                    &mut response,
+                );
+                record_success_request_id(&mut response, &request_id);
+            }
+            ("POST".to_string(), path, status, response)
+        }
+        Op::RevokeKey { key, .. } => {
+            let credential = target
+                .workload_credentials
+                .credential(key.actor.0, key.retired);
+            let path = format!("/v1/security/keys/{}", credential.key_id);
+            let (status, mut response) = request_json(
+                client,
+                Method::DELETE,
+                &format!("{}{}", target.base_url, path),
+                None,
+            )
+            .await;
+            if (200..300).contains(&status) {
+                record_success_request_id(&mut response, &request_id);
+            }
+            ("DELETE".to_string(), path, status, response)
+        }
+        Op::PublishGrantChange {
+            principal,
+            grants,
+            change,
+            ..
+        } => {
+            assert_eq!(grants.len(), 1, "adversarial grant mutations are atomic");
+            let path = "/v1/security/grants".to_string();
+            let principal_id = target.workload_credentials.principal_id(principal.0);
+            let mut body = security_grant_body(&principal_id, &grants[0]);
+            let method = match change {
+                GrantChange::Add => Method::POST,
+                GrantChange::Remove => {
+                    let object = body
+                        .as_object_mut()
+                        .expect("grant removal body must be an object");
+                    object.remove("mandatory_filter");
+                    object.remove("write_constraints");
+                    Method::DELETE
+                }
+            };
+            let (status, mut response) = request_json(
+                client,
+                method.clone(),
+                &format!("{}{}", target.base_url, path),
+                Some(body),
+            )
+            .await;
+            if (200..300).contains(&status) {
+                record_success_request_id(&mut response, &request_id);
+            }
+            (method.to_string(), path, status, response)
+        }
+        Op::TenantBoundaryProbe {
+            target_ns, surface, ..
+        } => execute_tenant_boundary_probe(admin_client, client, target, target_ns, *surface).await,
+        Op::UseRevokedCredential { .. } => {
+            let path = "/readyz".to_string();
+            let (status, response) = request_json(
+                client,
+                Method::GET,
+                &format!("{}{}", target.base_url, path),
+                None,
+            )
+            .await;
+            ("GET".to_string(), path, status, response)
+        }
+        Op::ForbiddenWriteProbe {
+            target_ns, kind, ..
+        } => execute_forbidden_write_probe(admin_client, client, target, target_ns, *kind).await,
+        Op::ExportProbe { target_ns, .. } => {
+            let fetch_path = format!("/v1/namespaces/{target_ns}/vectors/get");
+            let (fetch_status, fetch_body) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", target.base_url, fetch_path),
+                Some(json!({
+                    "ids": ["security-export-probe"],
+                    "include_vector": true,
+                    "include_attributes": true,
+                    "consistency": "strong"
+                })),
+            )
+            .await;
+            let snapshot_path = format!("/v1/namespaces/{target_ns}/snapshots/security-export");
+            let (snapshot_status, snapshot_body) = request_json(
+                client,
+                Method::GET,
+                &format!("{}{}", target.base_url, snapshot_path),
+                None,
+            )
+            .await;
+            let status = if fetch_status != 403 {
+                fetch_status
+            } else {
+                snapshot_status
+            };
+            (
+                "COMPOSITE".to_string(),
+                format!("export_probe({target_ns})"),
+                status,
+                json!({
+                    "fetch": {"status": fetch_status, "body": fetch_body},
+                    "snapshot": {"status": snapshot_status, "body": snapshot_body}
+                }),
+            )
+        }
+        Op::SecurityAdminProbe { .. } => {
+            let path = "/v1/security/principals".to_string();
+            let (status, response) = request_json(
+                client,
+                Method::GET,
+                &format!("{}{}", target.base_url, path),
+                None,
+            )
+            .await;
+            ("GET".to_string(), path, status, response)
+        }
+        Op::AuditBarrierOp { .. } => {
+            let security_fault = HTTP_FAULT_CONTEXT
+                .try_with(Clone::clone)
+                .ok()
+                .flatten()
+                .filter(|context| {
+                    context.scheduler.schedule().profile == FaultProfile::Security
+                        && op_index == SECURITY_AUDIT_BARRIER_OP
+                });
+            if security_fault.is_some() {
+                target
+                    .security
+                    .refresh_authoritative_policy_for_test()
+                    .await
+                    .expect_err(
+                        "security profile must drop the scheduled policy-head GET before the audit barrier",
+                    );
+            }
+            let path = "/v1/security/policy".to_string();
+            let (status, mut response) = request_json(
+                client,
+                Method::GET,
+                &format!("{}{}", target.base_url, path),
+                None,
+            )
+            .await;
+            if (200..300).contains(&status) {
+                record_success_request_id(&mut response, &request_id);
+            }
+            ("GET".to_string(), path, status, response)
+        }
+        _ => panic!("non-security operation reached execute_security_op"),
+    }
+}
+
+fn install_and_redact_credential(
+    registry: &WorkloadCredentialRegistry,
+    actor: u8,
+    response: &mut serde_json::Value,
+) {
+    let key_id = response["key_id"]
+        .as_str()
+        .expect("successful key response omitted key_id")
+        .to_string();
+    let bearer = response["api_key"]
+        .as_str()
+        .expect("successful key response omitted one-time api_key")
+        .to_string();
+    registry.install(actor, &key_id, &bearer);
+    response
+        .as_object_mut()
+        .expect("successful key response must be an object")
+        .insert("api_key".to_string(), json!("[REDACTED]"));
+}
+
+fn record_success_request_id(response: &mut serde_json::Value, request_id: &str) {
+    response
+        .as_object_mut()
+        .expect("successful security response must be an object")
+        .insert("request_id".to_string(), json!(request_id));
+}
+
+async fn execute_tenant_boundary_probe(
+    admin_client: &Client,
+    client: &Client,
+    target: &OpExecutionTarget,
+    namespace: &str,
+    surface: TenantProbeSurface,
+) -> (String, String, u16, serde_json::Value) {
+    let metadata_path = format!("/v1/namespaces/{namespace}");
+    let (metadata_status, metadata) = request_json(
+        admin_client,
+        Method::GET,
+        &format!("{}{}", target.base_url, metadata_path),
+        None,
+    )
+    .await;
+    assert_eq!(
+        metadata_status, 200,
+        "admin tenant-probe metadata lookup failed"
+    );
+    let dimensions = metadata["dimensions"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .expect("tenant-probe namespace metadata omitted dimensions");
+    let base_query = json!({
+        "sources": [{"type": "ann", "vector": vec![0.0_f32; dimensions]}],
+        "fusion": {"type": "none"},
+        "top_k": 4,
+        "consistency": "strong"
+    });
+    let (path, body) = match surface {
+        TenantProbeSurface::Query => (format!("/v1/namespaces/{namespace}/query"), base_query),
+        TenantProbeSurface::Batch => (
+            format!("/v1/namespaces/{namespace}/query/batch"),
+            json!({"queries": [base_query]}),
+        ),
+        TenantProbeSurface::Fetch => (
+            format!("/v1/namespaces/{namespace}/vectors/get"),
+            json!({"ids": ["tenant-boundary-probe"], "consistency": "strong"}),
+        ),
+        TenantProbeSurface::Paginate => (
+            format!("/v1/namespaces/{namespace}/query"),
+            json!({
+                "sources": [{"type": "ann", "vector": vec![0.0_f32; dimensions]}],
+                "fusion": {"type": "none"}, "top_k": 1,
+                "cursor": {"type": "none"}, "consistency": "strong"
+            }),
+        ),
+        TenantProbeSurface::Facet => (
+            format!("/v1/namespaces/{namespace}/query"),
+            json!({
+                "sources": [{"type": "ann", "vector": vec![0.0_f32; dimensions]}],
+                "fusion": {"type": "none"}, "top_k": 4,
+                "facets": [{"field": "group", "limit": 8}], "consistency": "strong"
+            }),
+        ),
+        TenantProbeSurface::Group => (
+            format!("/v1/namespaces/{namespace}/query"),
+            json!({
+                "sources": [{"type": "ann", "vector": vec![0.0_f32; dimensions]}],
+                "fusion": {"type": "none"}, "top_k": 4,
+                "group_by": {"field": "group", "max_per_group": 2},
+                "consistency": "strong"
+            }),
+        ),
+        TenantProbeSurface::AsOf => (
+            format!("/v1/namespaces/{namespace}/query?as_of=1"),
+            base_query,
+        ),
+        TenantProbeSurface::Explain => (
+            format!("/v1/namespaces/{namespace}/query"),
+            json!({
+                "sources": [{"type": "ann", "vector": vec![0.0_f32; dimensions]}],
+                "fusion": {"type": "none"}, "top_k": 4,
+                "explain": "full", "consistency": "strong"
+            }),
+        ),
+    };
+    let (status, response) = request_json(
+        client,
+        Method::POST,
+        &format!("{}{}", target.base_url, path),
+        Some(body),
+    )
+    .await;
+    ("POST".to_string(), path, status, response)
+}
+
+async fn execute_forbidden_write_probe(
+    admin_client: &Client,
+    actor_client: &Client,
+    target: &OpExecutionTarget,
+    namespace: &str,
+    kind: ForbiddenWriteKind,
+) -> (String, String, u16, serde_json::Value) {
+    let path = format!("/v1/namespaces/{namespace}/vectors");
+    match kind {
+        ForbiddenWriteKind::CrossScopeDelete => {
+            let (status, response) = request_json(
+                actor_client,
+                Method::DELETE,
+                &format!("{}{}", target.base_url, path),
+                Some(json!({
+                    "filter": {"op": "eq", "field": "group", "value": "g1"}
+                })),
+            )
+            .await;
+            ("DELETE".to_string(), path, status, response)
+        }
+        ForbiddenWriteKind::StampForgery | ForbiddenWriteKind::ForbidSetAttribute => {
+            let metadata_path = format!("/v1/namespaces/{namespace}");
+            let (metadata_status, metadata) = request_json(
+                admin_client,
+                Method::GET,
+                &format!("{}{}", target.base_url, metadata_path),
+                None,
+            )
+            .await;
+            assert_eq!(
+                metadata_status, 200,
+                "admin namespace metadata lookup failed"
+            );
+            let dimensions = metadata["dimensions"]
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .expect("namespace metadata omitted dimensions");
+            let attributes = match kind {
+                ForbiddenWriteKind::StampForgery => json!({"group": "g1"}),
+                ForbiddenWriteKind::ForbidSetAttribute => {
+                    json!({"classification": "restricted"})
+                }
+                ForbiddenWriteKind::CrossScopeDelete => unreachable!(),
+            };
+            let (status, response) = request_json(
+                actor_client,
+                Method::POST,
+                &format!("{}{}", target.base_url, path),
+                Some(json!({
+                    "vectors": [{
+                        "values": vec![0.0_f32; dimensions],
+                        "attributes": attributes
+                    }]
+                })),
+            )
+            .await;
+            ("POST".to_string(), path, status, response)
+        }
     }
 }
 
@@ -5930,6 +6640,9 @@ async fn send_exchange(
     timeout: Option<Duration>,
 ) -> RequestExchange {
     let mut request = client.request(method, url);
+    if let Ok(request_id) = WORKLOAD_REQUEST_ID.try_with(Clone::clone) {
+        request = request.header("x-request-id", request_id);
+    }
     if let Some(body) = body {
         request = request.json(body);
     }
@@ -6506,6 +7219,7 @@ fn accept_loud_durable_manifest_resolution(
         index: 0,
         wall_ms: 0,
         op: Op::FetchVectors {
+            actor: ActorSel::ADMIN,
             ns: namespace.to_string(),
             ids: Vec::new(),
             consistency: ConsistencyLevel::Strong,
@@ -6926,6 +7640,7 @@ impl QuietPeriod<'_> {
             let store = self.server.store.clone();
             let clock = self.server.clock.clone();
             let admin_bearer = self.server.admin_bearer.clone();
+            let workload_credentials = self.server.workload_credentials.clone();
             let spawn_compaction_loop = self.server.shutdown_compaction.is_some();
             self.server.abort();
             *self.server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
@@ -6938,6 +7653,7 @@ impl QuietPeriod<'_> {
                 &admin_bearer,
             )
             .await;
+            self.server.workload_credentials = workload_credentials;
             true
         } else {
             false
@@ -6959,6 +7675,36 @@ impl QuietPeriod<'_> {
             }),
         );
 
+        let security_refresh_violations = run_security_refresh_checks(
+            self.server,
+            self.model,
+            self.coverage,
+            self.prefix,
+            *self.op_index,
+            self.mutation,
+        )
+        .await;
+        violations.extend(security_refresh_violations);
+        push_quiet_event(
+            &mut timeline,
+            self.scheduler,
+            self.started,
+            *self.op_index,
+            6,
+            Boundary::ObjectStore,
+            "security-refresh",
+            quiet_observed(&violations),
+            Some(if self.model.security.enabled() {
+                format!(
+                    "policy_version={}; violations={}",
+                    self.model.security.policy_version,
+                    violations.len()
+                )
+            } else {
+                "security program not active; implicit-admin compatibility retained".to_string()
+            }),
+        );
+
         stop_background_compaction(self.server).await;
         let misdirected_recovery =
             restore_misdirected_write_artifacts(&self.server.store, self.scheduler, self.mutation)
@@ -6971,7 +7717,7 @@ impl QuietPeriod<'_> {
             self.scheduler,
             self.started,
             *self.op_index,
-            6,
+            7,
             Boundary::Runner,
             "stop-background",
             ObservedResult::DefiniteApplied,
@@ -7009,11 +7755,11 @@ impl QuietPeriod<'_> {
             );
         } else {
             for (step, boundary, action) in [
-                (7, Boundary::Runner, "resolve-indeterminates"),
-                (8, Boundary::Runner, "force-compaction"),
-                (9, Boundary::Runner, "gc-twice"),
-                (10, Boundary::ObjectStore, "s3-oracles"),
-                (11, Boundary::ClientHttp, "exhaustive-sweep"),
+                (8, Boundary::Runner, "resolve-indeterminates"),
+                (9, Boundary::Runner, "force-compaction"),
+                (10, Boundary::Runner, "gc-twice"),
+                (11, Boundary::ObjectStore, "s3-oracles"),
+                (12, Boundary::ClientHttp, "exhaustive-sweep"),
             ] {
                 push_quiet_event(
                     &mut timeline,
@@ -7096,6 +7842,194 @@ fn quiet_observed(violations: &[Violation]) -> ObservedResult {
         ObservedResult::DefiniteApplied
     } else {
         ObservedResult::Corrupted
+    }
+}
+
+async fn run_security_refresh_checks(
+    server: &FullTestServer,
+    model: &mut Model,
+    coverage: &mut Coverage,
+    prefix: &str,
+    op_index: u64,
+    mutation: Option<OracleMutation>,
+) -> Vec<Violation> {
+    if !model.security.enabled() {
+        return Vec::new();
+    }
+
+    server.force_policy_refresh().await;
+    let mut findings = Vec::new();
+    server.flush_audit().await;
+    let audit_prefix = "_audit/";
+    let mut durable_request_ids = BTreeSet::new();
+    let mut durable_audit_records = BTreeMap::new();
+    for key in server
+        .store
+        .list_prefix(audit_prefix)
+        .await
+        .unwrap_or_else(|error| panic!("quiet audit LIST failed: {error}"))
+    {
+        if !key.contains(&format!("/test-node-{prefix}-")) {
+            continue;
+        }
+        let bytes = server
+            .store
+            .get(&key)
+            .await
+            .unwrap_or_else(|error| panic!("quiet audit GET failed for {key}: {error}"));
+        let body = String::from_utf8(bytes.to_vec())
+            .unwrap_or_else(|error| panic!("quiet audit object {key} was not UTF-8: {error}"));
+        for line in body.lines().filter(|line| !line.is_empty()) {
+            let record: AuditRecord = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("quiet audit record in {key} was invalid: {error}"));
+            durable_request_ids.insert(record.request_id.clone());
+            durable_audit_records.insert(record.request_id.clone(), record);
+        }
+    }
+    if mutation == Some(OracleMutation::AuditRecordDeletion) {
+        if let Some(request_id) = model.security.successful_audit_requests.iter().next() {
+            durable_request_ids.remove(request_id);
+        }
+    }
+    if let Some(finding) = check_i25_audit_evidence(
+        &model.security.successful_audit_requests,
+        &durable_request_ids,
+    ) {
+        findings.push(finding);
+    }
+
+    let head_key = format!("{prefix}/_security/heads/policy.json");
+    let head_bytes = server.store.get(&head_key).await.ok();
+    let head = head_bytes
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<PolicyHead>(bytes).ok());
+    let mut checksum_valid = false;
+    let mut observed_version = 0;
+    let mut authoritative_snapshot = None;
+    if let Some(head) = &head {
+        observed_version = head.version().get();
+        let snapshot_key = format!("{prefix}/{}", head.object_key());
+        if let Ok(snapshot_bytes) = server.store.get(&snapshot_key).await {
+            if let Ok(snapshot) = serde_json::from_slice::<PolicySnapshot>(&snapshot_bytes) {
+                checksum_valid = snapshot.verify_checksum().is_ok()
+                    && snapshot.version() == head.version()
+                    && snapshot.checksum() == head.checksum();
+                if checksum_valid {
+                    authoritative_snapshot = Some(snapshot);
+                }
+            }
+        }
+    }
+
+    let secrets = server.workload_credentials.all_secrets();
+    let mut leaked_secret_locations = Vec::new();
+    for state_prefix in [format!("{prefix}/_security/"), audit_prefix.to_string()] {
+        for key in server
+            .store
+            .list_prefix(&state_prefix)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("security-state LIST failed for {state_prefix}: {error}")
+            })
+        {
+            if state_prefix == audit_prefix && !key.contains(&format!("/test-node-{prefix}-")) {
+                continue;
+            }
+            let bytes = server
+                .store
+                .get(&key)
+                .await
+                .unwrap_or_else(|error| panic!("security-state GET failed for {key}: {error}"));
+            if secrets.iter().any(|secret| {
+                !secret.is_empty()
+                    && bytes
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes())
+            }) {
+                leaked_secret_locations.push(key);
+            }
+        }
+    }
+    if mutation == Some(OracleMutation::SecuritySecretLeak) {
+        leaked_secret_locations.push("mutation://plaintext-secret".to_string());
+    }
+    let observation = SecurityStateObservation {
+        head_parsed: head.is_some(),
+        checksum_valid,
+        observed_version,
+        minimum_version: model.security.policy_version,
+        leaked_secret_locations,
+    };
+    if let Some(finding) = check_i26_security_state(&observation) {
+        findings.push(finding);
+    } else {
+        let resolution = model.security.resolve_authoritative(
+            authoritative_snapshot
+                .as_ref()
+                .expect("valid security state omitted authoritative snapshot"),
+            server.clock.now(),
+            op_index,
+            &durable_audit_records,
+        );
+        match resolution {
+            Ok(()) => model.security.close_staleness_windows(),
+            Err(detail) => findings.push(SecurityFinding {
+                id: ViolationId::I18IndeterminateResolution,
+                detail,
+                evidence: json!({
+                    "authoritative_policy_version": observed_version,
+                    "pending_security_mutations": &model.security.indeterminate_mutations,
+                }),
+            }),
+        }
+    }
+
+    coverage.record_security_oracle("I24");
+    for (position, key) in model
+        .security
+        .revoked_credentials
+        .clone()
+        .into_iter()
+        .enumerate()
+    {
+        let client = server.workload_credentials.client(key.actor.0, key.retired);
+        let response = client
+            .get(format!("{}/readyz", server.base_url))
+            .header(
+                "x-request-id",
+                format!("adv-quiet-revocation-{}-{}", key.actor.0, key.retired),
+            )
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("quiet revocation probe failed: {error}"));
+        let mut status = response.status().as_u16();
+        if mutation == Some(OracleMutation::RevocationMisclassification) && position == 0 {
+            status = 200;
+        }
+        if let Some(finding) = check_i24_revocation_freshness(true, status) {
+            findings.push(finding);
+        }
+    }
+    coverage.record_security_oracle("I25");
+    coverage.record_security_oracle("I26");
+
+    findings
+        .into_iter()
+        .map(|finding| security_finding_to_violation(finding, op_index, "_security"))
+        .collect()
+}
+
+fn security_finding_to_violation(
+    finding: SecurityFinding,
+    op_index: u64,
+    namespace: &str,
+) -> Violation {
+    Violation {
+        id: finding.id,
+        op_index,
+        namespace: namespace.to_string(),
+        detail: finding.detail,
+        evidence: finding.evidence,
     }
 }
 
@@ -7230,7 +8164,7 @@ async fn run_quiescent_checks(
         scheduler,
         started,
         *op_index,
-        7,
+        8,
         Boundary::Runner,
         "resolve-indeterminates",
         quiet_observed(&violations),
@@ -7241,13 +8175,16 @@ async fn run_quiescent_checks(
         }),
     );
     if !violations.is_empty() {
-        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 8);
+        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 9);
         return violations;
     }
 
     let namespaces = model.namespace_names();
     'compactions: for ns in &namespaces {
-        let compact = Op::CompactInline { ns: ns.clone() };
+        let compact = Op::CompactInline {
+            actor: ActorSel::ADMIN,
+            ns: ns.clone(),
+        };
         let step = execute_recorded_op(
             client,
             server,
@@ -7306,7 +8243,7 @@ async fn run_quiescent_checks(
         scheduler,
         started,
         *op_index,
-        8,
+        9,
         Boundary::Runner,
         "force-compaction",
         quiet_observed(&violations),
@@ -7317,13 +8254,14 @@ async fn run_quiescent_checks(
         )),
     );
     if !violations.is_empty() {
-        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 9);
+        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 10);
         return violations;
     }
 
     'gc: for ns in &namespaces {
         for _ in 0..2 {
             let gc = Op::GcCycle {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 keep_count: 1,
             };
@@ -7359,7 +8297,7 @@ async fn run_quiescent_checks(
         scheduler,
         started,
         *op_index,
-        9,
+        10,
         Boundary::Runner,
         "gc-twice",
         quiet_observed(&violations),
@@ -7371,7 +8309,7 @@ async fn run_quiescent_checks(
         )),
     );
     if !violations.is_empty() {
-        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 10);
+        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 11);
         return violations;
     }
 
@@ -7501,7 +8439,7 @@ async fn run_quiescent_checks(
         scheduler,
         started,
         *op_index,
-        10,
+        11,
         Boundary::ObjectStore,
         "s3-oracles",
         quiet_observed(&violations),
@@ -7512,7 +8450,7 @@ async fn run_quiescent_checks(
         )),
     );
     if !violations.is_empty() {
-        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 11);
+        push_skipped_quiet_steps(quiet_timeline, scheduler, started, *op_index, 12);
         return violations;
     }
 
@@ -7523,6 +8461,7 @@ async fn run_quiescent_checks(
             .map(|ns_model| ns_model.live.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         let fetch = Op::FetchVectors {
+            actor: ActorSel::ADMIN,
             ns: ns.clone(),
             ids,
             consistency: ConsistencyLevel::Strong,
@@ -7555,6 +8494,7 @@ async fn run_quiescent_checks(
 
         let q = exhaustive_query_from_model(model, ns);
         let query = Op::Query {
+            actor: ActorSel::ADMIN,
             ns: ns.clone(),
             q,
             as_of: None,
@@ -7585,12 +8525,17 @@ async fn run_quiescent_checks(
             break 'sweep;
         }
     }
+    if violations.is_empty() {
+        violations.extend(
+            check_quiet_security_visibility(server, model, coverage, *op_index, mutation).await,
+        );
+    }
     push_quiet_event(
         quiet_timeline,
         scheduler,
         started,
         *op_index,
-        11,
+        12,
         Boundary::ClientHttp,
         "exhaustive-sweep",
         quiet_observed(&violations),
@@ -7603,6 +8548,77 @@ async fn run_quiescent_checks(
     violations
 }
 
+async fn check_quiet_security_visibility(
+    server: &FullTestServer,
+    model: &Model,
+    coverage: &mut Coverage,
+    op_index: u64,
+    mutation: Option<OracleMutation>,
+) -> Vec<Violation> {
+    let Some(config) = model.security.config.clone() else {
+        return Vec::new();
+    };
+    coverage.record_security_oracle("I23");
+    coverage.record_security_oracle("I27");
+    let mut violations = Vec::new();
+    for actor in [ActorSel(2), ActorSel(3)] {
+        let namespace = config
+            .tenant_namespace(actor)
+            .unwrap_or_else(|| panic!("tenant actor {} has no namespace grant", actor.0));
+        let namespace_model = model
+            .namespaces
+            .get(namespace)
+            .unwrap_or_else(|| panic!("tenant namespace {namespace} is absent from the model"));
+        let expected = model.security.expected_visible_ids(model, actor);
+        let client = server.workload_credentials.client(actor.0, 0);
+        let path = format!("/v1/namespaces/{namespace}/query");
+        let body = json!({
+            "sources": [{
+                "type": "ann",
+                "vector": vec![0.0_f32; namespace_model.spec.dims],
+                "nprobe": namespace_model.spec.num_centroids
+            }],
+            "fusion": {"type": "none"},
+            "top_k": expected.len().max(1),
+            "consistency": "strong",
+            "include_attributes": true
+        });
+        let response = client
+            .post(format!("{}{}", server.base_url, path))
+            .header("x-request-id", format!("adv-quiet-tenant-{}", actor.0))
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("quiet tenant query failed for actor {}: {error}", actor.0)
+            });
+        let status = response.status().as_u16();
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or_else(|error| panic!("quiet tenant query returned non-JSON: {error}"));
+        if let Some(finding) = check_i22_authz_decision(ExpectedDecision::Allow, status) {
+            violations.push(security_finding_to_violation(finding, op_index, namespace));
+            continue;
+        }
+        let mut observed = oracle::security_response_ids(&body);
+        if mutation == Some(OracleMutation::ConstraintDrop) && actor == ActorSel(2) {
+            if let Some(id) = observed.iter().next().cloned() {
+                observed.remove(&id);
+            } else {
+                observed.insert("mutation-constraint-drop".to_string());
+            }
+        }
+        if let Some(finding) = check_i23_tenant_leak(&expected, &observed) {
+            violations.push(security_finding_to_violation(finding, op_index, namespace));
+        }
+        if let Some(finding) = check_i27_constraint_drop(&expected, &observed) {
+            violations.push(security_finding_to_violation(finding, op_index, namespace));
+        }
+    }
+    violations
+}
+
 fn push_skipped_quiet_steps(
     timeline: &mut Vec<TimelineEvent>,
     scheduler: Option<&FaultScheduler>,
@@ -7611,10 +8627,10 @@ fn push_skipped_quiet_steps(
     first_step: u8,
 ) {
     for (step, boundary, action) in [
-        (8, Boundary::Runner, "force-compaction"),
-        (9, Boundary::Runner, "gc-twice"),
-        (10, Boundary::ObjectStore, "s3-oracles"),
-        (11, Boundary::ClientHttp, "exhaustive-sweep"),
+        (9, Boundary::Runner, "force-compaction"),
+        (10, Boundary::Runner, "gc-twice"),
+        (11, Boundary::ObjectStore, "s3-oracles"),
+        (12, Boundary::ClientHttp, "exhaustive-sweep"),
     ]
     .into_iter()
     .filter(|(step, _, _)| *step >= first_step)
@@ -7642,7 +8658,14 @@ async fn resolve_indeterminates(
     mutation: Option<OracleMutation>,
     op_index: u64,
 ) -> Vec<Violation> {
-    let mut resolutions = Vec::new();
+    let mut resolutions = model
+        .security
+        .take_resolved_mutations()
+        .into_iter()
+        .map(|resolution| {
+            serde_json::to_value(resolution).expect("security mutation resolution must serialize")
+        })
+        .collect::<Vec<_>>();
     let mut violations = Vec::new();
 
     for ns in model.namespace_names() {
@@ -7789,6 +8812,7 @@ async fn resolve_indeterminates(
                         let generation = clone_source_generation(model, &ns, &as_of);
                         model.apply(
                             &Op::CloneNamespace {
+                                actor: ActorSel::ADMIN,
                                 source: ns.clone(),
                                 target: target.clone(),
                                 as_of,
@@ -8076,6 +9100,7 @@ fn selftest_probe_op(
         | (OracleMutation::PhantomId, Op::Upsert { ns, .. }) => {
             let ids = model.namespaces.get(ns)?.live.keys().cloned().collect();
             Some(Op::FetchVectors {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 ids,
                 consistency: ConsistencyLevel::Strong,
@@ -8085,6 +9110,7 @@ fn selftest_probe_op(
             let q = generator.exhaustive_query(model, ns, None);
             if matches!(&q.class, QueryOracleClass::ExactAnn { .. }) {
                 Some(Op::Query {
+                    actor: ActorSel::ADMIN,
                     ns: ns.clone(),
                     q,
                     as_of: None,
@@ -8096,10 +9122,14 @@ fn selftest_probe_op(
         (OracleMutation::SwallowCorruption, Op::Upsert { ns, .. }) => {
             let ns_model = model.namespaces.get(ns)?;
             if ns_model.compacted_live.is_empty() {
-                Some(Op::CompactInline { ns: ns.clone() })
+                Some(Op::CompactInline {
+                    actor: ActorSel::ADMIN,
+                    ns: ns.clone(),
+                })
             } else {
                 let q = generator.exhaustive_query(model, ns, None);
                 matches!(&q.class, QueryOracleClass::ExactAnn { .. }).then(|| Op::Query {
+                    actor: ActorSel::ADMIN,
                     ns: ns.clone(),
                     q,
                     as_of: None,
@@ -8107,7 +9137,10 @@ fn selftest_probe_op(
             }
         }
         (OracleMutation::MisdirectedWriteReachability, Op::Upsert { ns, .. }) => {
-            Some(Op::CompactInline { ns: ns.clone() })
+            Some(Op::CompactInline {
+                actor: ActorSel::ADMIN,
+                ns: ns.clone(),
+            })
         }
         _ => None,
     }
@@ -8308,6 +9341,30 @@ mod outcome_tests {
             zeppelin::config::SecurityMode::Enforced
         );
         assert!(replay.config.security.api_keys.is_empty());
+        assert!(replay.security_program.is_none());
+
+        let legacy_op: Op = serde_json::from_value(json!({
+            "GetNamespace": { "ns": "legacy" }
+        }))
+        .unwrap();
+        assert_eq!(legacy_op.actor(), ActorSel::ADMIN);
+    }
+
+    #[test]
+    fn ordinary_execution_uses_the_declared_non_admin_actor() {
+        let tenant_read = Op::GetNamespace {
+            actor: ActorSel(2),
+            ns: "tenant-a".to_string(),
+        };
+        let admin_read = Op::GetNamespace {
+            actor: ActorSel::ADMIN,
+            ns: "tenant-a".to_string(),
+        };
+        let security_probe = Op::SecurityAdminProbe { actor: ActorSel(2) };
+
+        assert_eq!(ordinary_execution_actor(&tenant_read), Some(ActorSel(2)));
+        assert_eq!(ordinary_execution_actor(&admin_read), None);
+        assert_eq!(ordinary_execution_actor(&security_probe), None);
     }
 
     #[test]
@@ -8373,6 +9430,7 @@ mod outcome_tests {
             index: 43,
             wall_ms: 0,
             op: Op::Query {
+                actor: ActorSel::ADMIN,
                 ns: "ns".to_string(),
                 q: GeneratedQuery {
                     body: json!({}),
@@ -8554,6 +9612,7 @@ mod outcome_tests {
         let mut model = Model::default();
         model.apply(
             &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
                 ns: namespace.clone(),
                 spec,
             },
@@ -8594,6 +9653,7 @@ mod outcome_tests {
             &mut S3Tracker::default(),
             &mut corruption_tracker,
             &Op::FetchVectors {
+                actor: ActorSel::ADMIN,
                 ns: namespace.clone(),
                 ids: vec!["missing".to_string()],
                 consistency: ConsistencyLevel::Strong,
@@ -8659,17 +9719,24 @@ mod outcome_tests {
             replay_trace_record(
                 0,
                 ExecutionPhase::Workload,
-                Op::GetNamespace { ns: ns.clone() },
+                Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
+                    ns: ns.clone(),
+                },
             ),
             replay_trace_record(
                 1,
                 ExecutionPhase::Quiescence,
-                Op::CompactInline { ns: ns.clone() },
+                Op::CompactInline {
+                    actor: ActorSel::ADMIN,
+                    ns: ns.clone(),
+                },
             ),
             replay_trace_record(
                 2,
                 ExecutionPhase::Quiescence,
                 Op::GcCycle {
+                    actor: ActorSel::ADMIN,
                     ns: ns.clone(),
                     keep_count: 1,
                 },
@@ -8680,6 +9747,7 @@ mod outcome_tests {
                 3,
                 ExecutionPhase::Quiescence,
                 Op::FetchVectors {
+                    actor: ActorSel::ADMIN,
                     ns,
                     ids: vec![format!("{prefix}-v0")],
                     consistency: ConsistencyLevel::Strong,
@@ -8707,6 +9775,7 @@ mod outcome_tests {
             4,
             ExecutionPhase::Quiescence,
             Op::Query {
+                actor: ActorSel::ADMIN,
                 ns: "replay-prefix-ns".to_string(),
                 q: GeneratedQuery {
                     body: json!({}),
@@ -8752,6 +9821,7 @@ mod outcome_tests {
                 0,
                 ExecutionPhase::Workload,
                 Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
                     ns: "source-prefix-ns".to_string(),
                 },
             ),
@@ -8759,6 +9829,7 @@ mod outcome_tests {
                 1,
                 ExecutionPhase::Workload,
                 Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
                     ns: "source-prefix-ns".to_string(),
                 },
             ),
@@ -8894,6 +9965,7 @@ mod outcome_tests {
                 "quiet:release-held",
                 "quiet:stop-second-node",
                 "quiet:primary-health",
+                "quiet:security-refresh",
                 "quiet:stop-background",
                 "quiet:resolve-indeterminates",
                 "quiet:force-compaction",
@@ -9311,6 +10383,7 @@ mod outcome_tests {
 
         let upsert = rewrite_replayed_op(
             &Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: "source-prefix-exact".to_string(),
                 vectors: vec![GenVector {
                     id: "source-prefix-exact-v1".to_string(),
@@ -9321,7 +10394,7 @@ mod outcome_tests {
             old_prefix,
             new_prefix,
         );
-        let Op::Upsert { ns, vectors } = upsert else {
+        let Op::Upsert { ns, vectors, .. } = upsert else {
             panic!("rewritten upsert changed operation kind")
         };
         assert_eq!(ns, "replay-prefix-exact");
@@ -9329,6 +10402,7 @@ mod outcome_tests {
 
         let query = rewrite_replayed_op(
             &Op::Query {
+                actor: ActorSel::ADMIN,
                 ns: "source-prefix-exact".to_string(),
                 q: GeneratedQuery {
                     body: json!({
@@ -9381,6 +10455,7 @@ mod outcome_tests {
     fn foreground_hold_call_footprints_are_deliberate_and_bounded() {
         assert_eq!(
             foreground_hold_calls(&Op::DeleteVectors {
+                actor: ActorSel::ADMIN,
                 ns: "ns".to_string(),
                 ids: vec!["one".to_string()],
             }),
@@ -9388,6 +10463,7 @@ mod outcome_tests {
         );
         assert_eq!(
             foreground_hold_calls(&Op::Hydrate {
+                actor: ActorSel::ADMIN,
                 ns: "ns".to_string(),
             }),
             vec![
@@ -9397,6 +10473,7 @@ mod outcome_tests {
         );
         assert_eq!(
             foreground_hold_calls(&Op::GcCycle {
+                actor: ActorSel::ADMIN,
                 ns: "ns".to_string(),
                 keep_count: 4,
             }),
@@ -9407,6 +10484,7 @@ mod outcome_tests {
         );
         assert_eq!(
             foreground_hold_calls(&Op::GetNamespace {
+                actor: ActorSel::ADMIN,
                 ns: "ns".to_string(),
             }),
             vec![(StoreOp::Get, "ns/manifest.json".to_string())]
@@ -9416,13 +10494,16 @@ mod outcome_tests {
     #[test]
     fn held_namespace_blocks_only_another_harness_mutation() {
         let mutation = Op::DeleteVectors {
+            actor: ActorSel::ADMIN,
             ns: "held".to_string(),
             ids: vec!["one".to_string()],
         };
         let read = Op::GetNamespace {
+            actor: ActorSel::ADMIN,
             ns: "held".to_string(),
         };
         let other_mutation = Op::DeleteVectors {
+            actor: ActorSel::ADMIN,
             ns: "other".to_string(),
             ids: vec!["one".to_string()],
         };
@@ -9438,9 +10519,11 @@ mod outcome_tests {
     #[test]
     fn pending_hold_isolates_reads_that_can_stall_its_logical_release() {
         let held_read = Op::GetNamespace {
+            actor: ActorSel::ADMIN,
             ns: "held".to_string(),
         };
         let other_read = Op::GetNamespace {
+            actor: ActorSel::ADMIN,
             ns: "other".to_string(),
         };
 
@@ -9451,12 +10534,15 @@ mod outcome_tests {
     #[test]
     fn pending_hold_advances_with_reads_but_never_with_another_mutation() {
         let held_read = Op::GetNamespace {
+            actor: ActorSel::ADMIN,
             ns: "held".to_string(),
         };
         let other_read = Op::GetNamespace {
+            actor: ActorSel::ADMIN,
             ns: "other".to_string(),
         };
         let other_mutation = Op::DeleteVectors {
+            actor: ActorSel::ADMIN,
             ns: "other".to_string(),
             ids: vec!["one".to_string()],
         };
@@ -9469,10 +10555,12 @@ mod outcome_tests {
     #[tokio::test]
     async fn pending_query_hold_defers_exact_error_probe_but_not_ordinary_query() {
         let exact_error = Op::InvalidProbe {
+            actor: ActorSel::ADMIN,
             ns: "other".to_string(),
             probe: InvalidProbe::WeightsLenMismatch,
         };
         let ordinary_query = Op::Query {
+            actor: ActorSel::ADMIN,
             ns: "other".to_string(),
             q: GeneratedQuery {
                 body: json!({}),
@@ -9484,6 +10572,7 @@ mod outcome_tests {
             as_of: None,
         };
         let exact_error_query = Op::Query {
+            actor: ActorSel::ADMIN,
             ns: "other".to_string(),
             q: GeneratedQuery {
                 body: json!({}),
@@ -9496,6 +10585,7 @@ mod outcome_tests {
             as_of: None,
         };
         let non_query_probe = Op::InvalidProbe {
+            actor: ActorSel::ADMIN,
             ns: "other".to_string(),
             probe: InvalidProbe::WrongDims,
         };
@@ -9543,6 +10633,7 @@ mod outcome_tests {
     fn sched_fifo_deferral_preserves_every_baseline_generated_operation() {
         fn upsert(ns: &str, id: &str) -> Op {
             Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: ns.to_string(),
                 vectors: vec![GenVector {
                     id: id.to_string(),
@@ -9602,6 +10693,7 @@ mod outcome_tests {
     fn sched_fifo_boundary_drain_preserves_every_generated_operation() {
         fn upsert(ns: &str, id: &str) -> Op {
             Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: ns.to_string(),
                 vectors: vec![GenVector {
                     id: id.to_string(),
@@ -9900,6 +10992,7 @@ mod outcome_tests {
         let mut model = Model::default();
         model.apply(
             &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
                 ns: namespace.clone(),
                 spec,
             },
@@ -9910,6 +11003,7 @@ mod outcome_tests {
         );
         model.apply(
             &Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: namespace.clone(),
                 vectors: vec![GenVector {
                     id: "live-vector".to_string(),
@@ -10496,6 +11590,7 @@ mod outcome_tests {
         let mut model = Model::default();
         model.apply(
             &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
                 ns: namespace,
                 spec,
             },
@@ -10616,6 +11711,7 @@ mod outcome_tests {
         let mut model = Model::default();
         model.apply(
             &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
                 ns: namespace,
                 spec,
             },
@@ -10691,6 +11787,7 @@ mod outcome_tests {
         let mut model = Model::default();
         model.apply(
             &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
                 ns: namespace.clone(),
                 spec,
             },
@@ -10799,6 +11896,7 @@ mod outcome_tests {
                 index: 0,
                 wall_ms: 0,
                 op: Op::CreateNamespace {
+                    actor: ActorSel::ADMIN,
                     ns: source_namespace.clone(),
                     spec,
                 },
@@ -10817,6 +11915,7 @@ mod outcome_tests {
                 index: 1,
                 wall_ms: 1,
                 op: Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
                     ns: source_namespace.clone(),
                 },
                 method: "GET".to_string(),
@@ -10915,6 +12014,7 @@ mod outcome_tests {
         let mut model = Model::default();
         model.apply(
             &Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
                 ns: namespace.clone(),
                 spec,
             },
@@ -11016,9 +12116,11 @@ mod outcome_tests {
         );
 
         let read = Op::GetNamespace {
+            actor: ActorSel::ADMIN,
             ns: "catalog".to_string(),
         };
         let write = Op::Upsert {
+            actor: ActorSel::ADMIN,
             ns: "catalog".to_string(),
             vectors: Vec::new(),
         };
@@ -11078,9 +12180,11 @@ mod outcome_tests {
             .is_none());
 
         let read = Op::GetNamespace {
+            actor: ActorSel::ADMIN,
             ns: "catalog".to_string(),
         };
         let write = Op::Upsert {
+            actor: ActorSel::ADMIN,
             ns: "catalog".to_string(),
             vectors: Vec::new(),
         };
@@ -11211,6 +12315,7 @@ mod outcome_tests {
                 &mut s3_tracker,
                 &mut corruption_tracker,
                 &Op::CreateNamespace {
+                    actor: ActorSel::ADMIN,
                     ns,
                     spec: spec.clone(),
                 },
@@ -11230,6 +12335,7 @@ mod outcome_tests {
         }
 
         let held_op = Op::Upsert {
+            actor: ActorSel::ADMIN,
             ns: held_ns.clone(),
             vectors: vec![GenVector {
                 id: "held-vector".to_string(),
@@ -11285,6 +12391,7 @@ mod outcome_tests {
                 &mut s3_tracker,
                 &mut corruption_tracker,
                 &Op::Upsert {
+                    actor: ActorSel::ADMIN,
                     ns: other_ns.clone(),
                     vectors: vec![GenVector {
                         id: id.to_string(),
@@ -11310,6 +12417,7 @@ mod outcome_tests {
         let mut pending = Some(pending);
         let mut drain_ops = VecDeque::from([QuietDrainOp::Generated {
             op: Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: held_ns.clone(),
                 vectors: vec![GenVector {
                     id: "deferred-vector".to_string(),
@@ -11498,6 +12606,7 @@ mod outcome_tests {
                 index: 0,
                 wall_ms: 0,
                 op: Op::CreateNamespace {
+                    actor: ActorSel::ADMIN,
                     ns: held_ns.clone(),
                     spec: spec.clone(),
                 },
@@ -11516,6 +12625,7 @@ mod outcome_tests {
                 index: 1,
                 wall_ms: 1,
                 op: Op::CreateNamespace {
+                    actor: ActorSel::ADMIN,
                     ns: other_ns.clone(),
                     spec,
                 },
@@ -11534,6 +12644,7 @@ mod outcome_tests {
                 index: 2,
                 wall_ms: 2,
                 op: Op::Upsert {
+                    actor: ActorSel::ADMIN,
                     ns: held_ns,
                     vectors: vec![GenVector {
                         id: "terminal-held-vector".to_string(),
@@ -11565,6 +12676,7 @@ mod outcome_tests {
                 index: 3,
                 wall_ms: 3,
                 op: Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
                     ns: other_ns.clone(),
                 },
                 method: "GET".to_string(),
@@ -11581,7 +12693,10 @@ mod outcome_tests {
             OpRecord {
                 index: 4,
                 wall_ms: 4,
-                op: Op::GetNamespace { ns: other_ns },
+                op: Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
+                    ns: other_ns,
+                },
                 method: "GET".to_string(),
                 path: "/v1/namespaces/other".to_string(),
                 status: StatusCode::OK.as_u16(),

@@ -10,9 +10,10 @@ use zeppelin::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter};
 
 use super::model::Model;
 use super::ops::{
-    AsOfTarget, GenVector, GeneratedQuery, InvalidProbe, MaintenanceKind, NamespaceSpec, Op,
-    QueryOracleClass,
+    ActorSel, AsOfTarget, GenVector, GeneratedQuery, InvalidProbe, MaintenanceKind, NamespaceSpec,
+    Op, QueryOracleClass,
 };
+use super::security_program::{SecurityProgramConfig, SECURITY_PROGRAM_START_OP};
 use super::vocab;
 
 const DELETE_REUPSERT_TAG: &str = "delete-then-reupsert";
@@ -27,6 +28,8 @@ const SKETCH_ADC_TAG: &str = "sketch-adc-v4";
 pub struct Coverage {
     pub op_counts: BTreeMap<String, u64>,
     pub tag_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub security_oracle_counts: BTreeMap<String, u64>,
 }
 
 impl Coverage {
@@ -35,6 +38,22 @@ impl Coverage {
         for tag in op.tags() {
             *self.tag_counts.entry(tag.to_string()).or_default() += 1;
         }
+        if op.is_security_op() {
+            self.record_security_oracle("I22");
+        }
+        match op {
+            Op::TenantBoundaryProbe { .. } => self.record_security_oracle("I23"),
+            Op::UseRevokedCredential { .. } => self.record_security_oracle("I24"),
+            Op::AuditBarrierOp { .. } => self.record_security_oracle("I25"),
+            _ => {}
+        }
+    }
+
+    pub fn record_security_oracle(&mut self, id: &str) {
+        *self
+            .security_oracle_counts
+            .entry(id.to_string())
+            .or_default() += 1;
     }
 
     pub fn merge(&mut self, other: &Coverage) {
@@ -43,6 +62,9 @@ impl Coverage {
         }
         for (tag, count) in &other.tag_counts {
             *self.tag_counts.entry(tag.clone()).or_default() += count;
+        }
+        for (id, count) in &other.security_oracle_counts {
+            *self.security_oracle_counts.entry(id.clone()).or_default() += count;
         }
     }
 }
@@ -53,6 +75,7 @@ pub struct AdversarialGenerator {
     pending: VecDeque<Op>,
     scenario: ScenarioState,
     phase3_started: bool,
+    security_program: Option<SecurityProgramConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +102,25 @@ enum ScenarioState {
 impl AdversarialGenerator {
     #[must_use]
     pub fn new(seed: u64, namespace_prefix: &str) -> Self {
+        Self::new_with_security(seed, namespace_prefix, false, false)
+    }
+
+    #[must_use]
+    pub fn new_security(seed: u64, namespace_prefix: &str) -> Self {
+        Self::new_with_security(seed, namespace_prefix, true, false)
+    }
+
+    #[must_use]
+    pub fn new_security_profile(seed: u64, namespace_prefix: &str) -> Self {
+        Self::new_with_security(seed, namespace_prefix, true, true)
+    }
+
+    fn new_with_security(
+        seed: u64,
+        namespace_prefix: &str,
+        security_enabled: bool,
+        expiry_scenario: bool,
+    ) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let namespace_count = rng.gen_range(2..=4);
         let mut namespaces = Vec::new();
@@ -114,10 +156,14 @@ impl AdversarialGenerator {
             };
             let name = format!("{namespace_prefix}-adv-{seed}-{index}");
             pending.push_back(Op::CreateNamespace {
+                actor: ActorSel::ADMIN,
                 ns: name.clone(),
                 spec: spec.clone(),
             });
-            pending.push_back(Op::GetNamespace { ns: name.clone() });
+            pending.push_back(Op::GetNamespace {
+                actor: ActorSel::ADMIN,
+                ns: name.clone(),
+            });
             namespaces.push(GenNamespace {
                 name,
                 spec,
@@ -135,10 +181,12 @@ impl AdversarialGenerator {
         };
         let sketch_name = format!("{namespace_prefix}-adv-{seed}-sketch");
         pending.push_back(Op::CreateNamespace {
+            actor: ActorSel::ADMIN,
             ns: sketch_name.clone(),
             spec: sketch_spec.clone(),
         });
         pending.push_back(Op::GetNamespace {
+            actor: ActorSel::ADMIN,
             ns: sketch_name.clone(),
         });
         namespaces.push(GenNamespace {
@@ -153,6 +201,7 @@ impl AdversarialGenerator {
             pending,
             scenario: ScenarioState::Waiting,
             phase3_started: false,
+            security_program: None,
         };
         let exact_ns = generator
             .namespaces
@@ -168,16 +217,54 @@ impl AdversarialGenerator {
                 exact_vectors = vectors.clone();
             }
             generator.pending.push_back(Op::Upsert {
+                actor: ActorSel::ADMIN,
                 ns: ns.clone(),
                 vectors,
             });
             if !generator.namespaces[index].spec.fts_fields.is_empty() {
-                generator.pending.push_back(Op::CompactInline { ns });
+                generator.pending.push_back(Op::CompactInline {
+                    actor: ActorSel::ADMIN,
+                    ns,
+                });
             }
+        }
+        if security_enabled {
+            // Keep the security program on fixed logical indexes across the
+            // seeded namespace-count variation. Fault choreography can then
+            // target grant publication, bounded staleness, and the audit
+            // barrier without coupling the scheduler to generator internals.
+            let security_start_op = usize::try_from(SECURITY_PROGRAM_START_OP)
+                .expect("security program start index must fit usize");
+            let padding_ns = generator.namespaces[0].name.clone();
+            while generator.pending.len() < security_start_op {
+                generator.pending.push_back(Op::GetNamespace {
+                    actor: ActorSel::ADMIN,
+                    ns: padding_ns.clone(),
+                });
+            }
+            assert_eq!(generator.pending.len(), security_start_op);
+            let namespace_names = generator
+                .namespaces
+                .iter()
+                .take(namespace_count)
+                .map(|namespace| namespace.name.clone())
+                .collect::<Vec<_>>();
+            let security_program = if expiry_scenario {
+                SecurityProgramConfig::for_security_profile(namespace_prefix, &namespace_names)
+            } else {
+                SecurityProgramConfig::for_seed(namespace_prefix, &namespace_names)
+            };
+            generator.pending.extend(security_program.scripted_ops());
+            generator.security_program = Some(security_program);
         }
         generator.enqueue_phase2_script(exact_ns, &exact_vectors);
         generator.enqueue_sketch_adc_script(namespace_count);
         generator
+    }
+
+    #[must_use]
+    pub fn security_program(&self) -> Option<&SecurityProgramConfig> {
+        self.security_program.as_ref()
     }
 
     fn enqueue_sketch_adc_script(&mut self, namespace_index: usize) {
@@ -186,13 +273,16 @@ impl AdversarialGenerator {
         let query_vector = initial[0].values.clone();
 
         self.pending.push_back(Op::Upsert {
+            actor: ActorSel::ADMIN,
             ns: namespace.name.clone(),
             vectors: initial,
         });
         self.pending.push_back(Op::CompactInline {
+            actor: ActorSel::ADMIN,
             ns: namespace.name.clone(),
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: namespace.name.clone(),
             q: Self::fixed_membership_query(
                 &namespace,
@@ -206,13 +296,16 @@ impl AdversarialGenerator {
 
         let incremental = self.sketch_blob_vectors(&namespace, "incremental", 0..4, 4);
         self.pending.push_back(Op::Upsert {
+            actor: ActorSel::ADMIN,
             ns: namespace.name.clone(),
             vectors: incremental,
         });
         self.pending.push_back(Op::CompactInline {
+            actor: ActorSel::ADMIN,
             ns: namespace.name.clone(),
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: namespace.name.clone(),
             q: Self::fixed_membership_query(&namespace, query_vector, 10, 144, &[SKETCH_ADC_TAG]),
             as_of: None,
@@ -251,13 +344,16 @@ impl AdversarialGenerator {
         let delete_ids = vec![exact_vectors[0].id.clone(), exact_vectors[1].id.clone()];
 
         self.pending.push_back(Op::CompactInline {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
         });
         self.pending.push_back(Op::DeleteVectors {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             ids: delete_ids.clone(),
         });
         self.pending.push_back(Op::FetchVectors {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             ids: vec![
                 exact_vectors[0].id.clone(),
@@ -267,6 +363,7 @@ impl AdversarialGenerator {
             consistency: ConsistencyLevel::Eventual,
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             q: Self::fixed_ann_query(
                 &exact,
@@ -290,10 +387,12 @@ impl AdversarialGenerator {
             .collect::<Vec<_>>();
         let reupsert_query = reupserted[0].values.clone();
         self.pending.push_back(Op::Upsert {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             vectors: reupserted,
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             q: Self::fixed_ann_query(
                 &exact,
@@ -307,6 +406,7 @@ impl AdversarialGenerator {
             as_of: None,
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             q: Self::fixed_ann_query(
                 &exact,
@@ -320,9 +420,11 @@ impl AdversarialGenerator {
             as_of: None,
         });
         self.pending.push_back(Op::CompactInline {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             q: Self::fixed_ann_query(
                 &exact,
@@ -341,6 +443,7 @@ impl AdversarialGenerator {
             value: AttributeValue::String("g1".to_string()),
         };
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             q: Self::fixed_ann_query(
                 &exact,
@@ -389,10 +492,12 @@ impl AdversarialGenerator {
             pattern_tags: vec![BATCH_TAG.to_string()],
         };
         self.pending.push_back(Op::BatchQuery {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             qs: vec![valid_one, invalid, valid_two],
         });
         self.pending.push_back(Op::PaginateAll {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             q: Self::fixed_ann_query(
                 &exact,
@@ -414,6 +519,7 @@ impl AdversarialGenerator {
         {
             let q = self.fts_query(&fts, 5, &[FTS_TAG]);
             self.pending.push_back(Op::Query {
+                actor: ActorSel::ADMIN,
                 ns: fts.name.clone(),
                 q,
                 as_of: None,
@@ -432,6 +538,7 @@ impl AdversarialGenerator {
             InvalidProbe::WeightsLenMismatch,
         ] {
             self.pending.push_back(Op::InvalidProbe {
+                actor: ActorSel::ADMIN,
                 ns: exact.name.clone(),
                 probe,
             });
@@ -498,80 +605,99 @@ impl AdversarialGenerator {
         };
         let q_clone = self.exhaustive_query(model, &exact.name, Some("clone-independence"));
         self.pending.push_back(Op::CreateSnapshot {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             name: snapshot.clone(),
         });
         self.pending.push_back(Op::GetSnapshot {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             name: snapshot.clone(),
         });
         self.pending.push_back(Op::ListSnapshots {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             q: q_generation,
             as_of: Some(AsOfTarget::Generation(generation)),
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             q: q_snapshot,
             as_of: Some(AsOfTarget::Snapshot(snapshot.clone())),
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             q: q_zero,
             as_of: Some(AsOfTarget::Generation(0)),
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             q: q_future,
             as_of: Some(AsOfTarget::Generation(generation + 10_000)),
         });
         self.pending.push_back(Op::GcCycle {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             keep_count: 4,
         });
         self.pending.push_back(Op::CompactEndpoint {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
         });
         self.pending.push_back(Op::PatchIndexConfig {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             patch: json!({ "nlist": exact.spec.num_centroids }),
         });
         self.pending.push_back(Op::Hydrate {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
         });
         self.pending.push_back(Op::CloneNamespace {
+            actor: ActorSel::ADMIN,
             source: exact.name.clone(),
             target: clone_target.clone(),
             as_of: AsOfTarget::Generation(generation),
         });
         self.pending.push_back(Op::CompactEndpoint {
+            actor: ActorSel::ADMIN,
             ns: clone_target.clone(),
         });
         self.pending.push_back(Op::FetchVectors {
+            actor: ActorSel::ADMIN,
             ns: clone_target.clone(),
             ids: clone_ids,
             consistency: ConsistencyLevel::Strong,
         });
         self.pending.push_back(Op::Query {
+            actor: ActorSel::ADMIN,
             ns: clone_target.clone(),
             q: q_clone,
             as_of: None,
         });
         self.pending.push_back(Op::ProbeSandwich {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             maintenance: MaintenanceKind::GcCycle,
         });
         self.pending.push_back(Op::DeleteSnapshot {
+            actor: ActorSel::ADMIN,
             ns: exact.name.clone(),
             name: snapshot,
         });
         self.pending.push_back(Op::DeleteNamespace {
+            actor: ActorSel::ADMIN,
             ns: clone_target.clone(),
         });
         self.pending.push_back(Op::CreateNamespace {
+            actor: ActorSel::ADMIN,
             ns: clone_target,
             spec: exact.spec.clone(),
         });
@@ -625,6 +751,7 @@ impl AdversarialGenerator {
             ScenarioState::Waiting if live_ids.len() >= 3 => {
                 self.scenario = ScenarioState::FetchDeleted;
                 Some(Op::DeleteVectors {
+                    actor: ActorSel::ADMIN,
                     ns,
                     ids: live_ids.into_iter().take(2).collect(),
                 })
@@ -633,6 +760,7 @@ impl AdversarialGenerator {
                 self.scenario = ScenarioState::QueryDeleted;
                 let ids = model.namespaces[&ns].live.keys().cloned().collect();
                 Some(Op::FetchVectors {
+                    actor: ActorSel::ADMIN,
                     ns,
                     ids,
                     consistency: ConsistencyLevel::Strong,
@@ -641,7 +769,12 @@ impl AdversarialGenerator {
             ScenarioState::QueryDeleted => {
                 self.scenario = ScenarioState::Reupsert;
                 let q = self.exhaustive_query(model, &ns, Some(DELETE_REUPSERT_TAG));
-                Some(Op::Query { ns, q, as_of: None })
+                Some(Op::Query {
+                    actor: ActorSel::ADMIN,
+                    ns,
+                    q,
+                    as_of: None,
+                })
             }
             ScenarioState::Reupsert => {
                 self.scenario = ScenarioState::QueryReupserted;
@@ -662,21 +795,38 @@ impl AdversarialGenerator {
                         )),
                     })
                     .collect();
-                Some(Op::Upsert { ns, vectors })
+                Some(Op::Upsert {
+                    actor: ActorSel::ADMIN,
+                    ns,
+                    vectors,
+                })
             }
             ScenarioState::QueryReupserted => {
                 self.scenario = ScenarioState::Compact;
                 let q = self.exhaustive_query(model, &ns, Some(DELETE_REUPSERT_TAG));
-                Some(Op::Query { ns, q, as_of: None })
+                Some(Op::Query {
+                    actor: ActorSel::ADMIN,
+                    ns,
+                    q,
+                    as_of: None,
+                })
             }
             ScenarioState::Compact => {
                 self.scenario = ScenarioState::QueryCompacted;
-                Some(Op::CompactInline { ns })
+                Some(Op::CompactInline {
+                    actor: ActorSel::ADMIN,
+                    ns,
+                })
             }
             ScenarioState::QueryCompacted => {
                 self.scenario = ScenarioState::Done;
                 let q = self.exhaustive_query(model, &ns, Some(DELETE_REUPSERT_TAG));
-                Some(Op::Query { ns, q, as_of: None })
+                Some(Op::Query {
+                    actor: ActorSel::ADMIN,
+                    ns,
+                    q,
+                    as_of: None,
+                })
             }
             _ => None,
         }
@@ -716,7 +866,11 @@ impl AdversarialGenerator {
         let capacity = 600usize.saturating_sub(live).max(1);
         let count = self.rng.gen_range(1..=20).min(capacity);
         let vectors = self.make_vectors(index, count);
-        Op::Upsert { ns, vectors }
+        Op::Upsert {
+            actor: ActorSel::ADMIN,
+            ns,
+            vectors,
+        }
     }
 
     fn random_delete(&mut self, model: &Model) -> Op {
@@ -748,7 +902,11 @@ impl AdversarialGenerator {
             .choose_multiple(&mut self.rng, count)
             .cloned()
             .collect();
-        Op::DeleteVectors { ns, ids }
+        Op::DeleteVectors {
+            actor: ActorSel::ADMIN,
+            ns,
+            ids,
+        }
     }
 
     fn random_fetch(&mut self, model: &Model) -> Op {
@@ -777,6 +935,7 @@ impl AdversarialGenerator {
         }
         ids.shuffle(&mut self.rng);
         Op::FetchVectors {
+            actor: ActorSel::ADMIN,
             ns,
             ids,
             consistency: self.random_consistency(),
@@ -789,7 +948,12 @@ impl AdversarialGenerator {
         if !namespace.spec.fts_fields.is_empty() && self.rng.gen_bool(0.35) {
             let top_k = self.rng.gen_range(1..=20);
             let q = self.fts_query(&namespace, top_k, &[FTS_TAG]);
-            return Op::Query { ns, q, as_of: None };
+            return Op::Query {
+                actor: ActorSel::ADMIN,
+                ns,
+                q,
+                as_of: None,
+            };
         }
         let consistency = self.random_consistency();
         let (candidate_count, exact_allowed) = model
@@ -821,7 +985,12 @@ impl AdversarialGenerator {
                 tag,
             )
         };
-        Op::Query { ns, q, as_of: None }
+        Op::Query {
+            actor: ActorSel::ADMIN,
+            ns,
+            q,
+            as_of: None,
+        }
     }
 
     fn random_batch_query(&mut self, model: &Model) -> Op {
@@ -857,7 +1026,11 @@ impl AdversarialGenerator {
                 ),
             );
         }
-        Op::BatchQuery { ns, qs }
+        Op::BatchQuery {
+            actor: ActorSel::ADMIN,
+            ns,
+            qs,
+        }
     }
 
     fn random_paginate(&mut self, model: &Model) -> Op {
@@ -880,6 +1053,7 @@ impl AdversarialGenerator {
             Some(PAGINATION_TAG),
         );
         Op::PaginateAll {
+            actor: ActorSel::ADMIN,
             ns,
             q,
             page_size: self.rng.gen_range(1..=5).min(total),
@@ -901,7 +1075,11 @@ impl AdversarialGenerator {
         ]
         .choose(&mut self.rng)
         .unwrap();
-        Op::InvalidProbe { ns, probe }
+        Op::InvalidProbe {
+            actor: ActorSel::ADMIN,
+            ns,
+            probe,
+        }
     }
 
     fn random_compact(&mut self, model: &Model) -> Op {
@@ -919,6 +1097,7 @@ impl AdversarialGenerator {
             .map(|namespace| namespace.name.clone())
             .collect();
         Op::CompactInline {
+            actor: ActorSel::ADMIN,
             ns: candidates
                 .choose(&mut self.rng)
                 .cloned()
@@ -928,6 +1107,7 @@ impl AdversarialGenerator {
 
     fn random_get_namespace(&mut self) -> Op {
         Op::GetNamespace {
+            actor: ActorSel::ADMIN,
             ns: self.random_namespace_name(),
         }
     }

@@ -425,6 +425,22 @@ impl SecurityKernel {
             .into()),
         }
     }
+
+    /// Force one authoritative policy-head refresh for integration harnesses.
+    ///
+    /// Production refresh scheduling remains internal and monotonic. This
+    /// explicit seam exists so the adversarial runner can close its bounded
+    /// staleness window before final security oracles execute.
+    #[doc(hidden)]
+    pub async fn refresh_authoritative_policy_for_test(&self) -> ZeppelinResult<()> {
+        match &self.authority {
+            SecurityAuthority::Policy(cache) => cache.refresh_once().await,
+            SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
+                "authoritative policy refresh requires S3 policy authority".to_string(),
+            )
+            .into()),
+        }
+    }
 }
 
 #[cfg(test)]
