@@ -54,6 +54,11 @@ const REQUIRED_SECURITY_OP_KINDS: &[&str] = &[
     "export_probe",
     "security_admin_probe",
     "audit_barrier",
+    "mint_token",
+    "use_token",
+    "token_exceed_scope_probe",
+    "use_expired_token",
+    "revoke_parent_then_use_token",
 ];
 
 fn operation_coverage_required(mode: adversarial::RunMode, kind: &str) -> bool {

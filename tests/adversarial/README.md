@@ -101,13 +101,16 @@ one-writer/read-only-node window; it never includes provider lies or a second
 writer.
 
 An explicit `ZEPPELIN_ADVERSARIAL_PROFILE` overrides the table for every seed.
-The `security` profile adds a deterministic actor/credential registry, key and
-grant lifecycle operations, all tenant observation surfaces, constrained-write,
-export, security-admin, and audit probes. It uses supported faults at all four
-boundaries, never provider lies or a second writer. Security artifacts persist
-redaction-safe `principals` and `security_ops`; operation-linked timeline events
-add actor and decision metadata. Bearer secrets remain memory-only. Artifacts
-recorded before this profile continue to decode with the implicit administrator.
+The `security` profile adds a deterministic actor/credential registry, key,
+grant, and delegated-token lifecycle operations, all tenant observation
+surfaces, constrained-write, export, security-admin, and audit probes. Token
+actors exercise narrowing, expiry under clock jumps, and parent-revocation
+absorption. The profile uses supported faults at all four boundaries, never
+provider lies or a second writer. Security artifacts persist redaction-safe
+`principals`, token selectors, and `security_ops`; operation-linked timeline
+events add actor and decision metadata. API-key and delegated bearer secrets
+remain memory-only. Artifacts recorded before this profile continue to decode
+with the implicit administrator.
 Use `provider_contract_abuse` for broken provider/adapter research and
 `future_architecture` for dual-writer research. The legacy `content`,
 `semantic`, `ops`, and `full` profile names remain accepted for artifact replay

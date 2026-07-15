@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant};
 
 use reqwest::{Client, Method, StatusCode};
@@ -22,7 +22,8 @@ use zeppelin::wal::{Lease, LeaseManager, Manifest, WalReader};
 use crate::common::counting::{counting_store, ArtifactClass, ClassStats, GetCounter};
 use crate::common::harness::TestHarness;
 use crate::common::server::{
-    cleanup_ns, start_test_server_full, start_test_server_full_with_disk_cache_max_bytes,
+    cleanup_ns, client_with_bearer, start_test_server_full,
+    start_test_server_full_with_disk_cache_max_bytes,
     start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer, FullTestServer,
     WorkloadCredentialRegistry,
 };
@@ -49,9 +50,9 @@ use super::model::{
     AmbiguityReason, IndetEffect, Model, ModelRecord, NsIndeterminate, OpOutcome, OracleMutation,
 };
 use super::ops::{
-    ActorSel, ExecutionMetadata, ExecutionPhase, ForbiddenWriteKind, GenVector, GeneratedQuery,
-    GrantChange, HeldExecutionMetadata, HoldReleaseCause, InvalidProbe, NamespaceSpec, Op,
-    OpRecord, QueryOracleClass, TenantProbeSurface,
+    ActorSel, DelegatedTokenSpec, ExecutionMetadata, ExecutionPhase, ForbiddenWriteKind, GenVector,
+    GeneratedQuery, GrantChange, HeldExecutionMetadata, HoldReleaseCause, InvalidProbe,
+    NamespaceSpec, Op, OpRecord, QueryOracleClass, TenantProbeSurface, TokenSel,
 };
 use super::oracle::{self, Violation, ViolationId};
 use super::s3_oracle::{self, S3Tracker};
@@ -66,7 +67,7 @@ use super::{effective_seed_assignment, PreserveMode, RunMode, RunnerEnv};
 const AMBIGUITY_MARKER: &str = "_adversarial_ambiguity";
 const STORE_FAULT_MARKER: &str = "_adversarial_store_fault";
 const DUAL_WRITER_LEASE_HOLD_EVENT_ID: &str = "ops-dual-writer-lease-hold";
-const SECURITY_OP_KINDS: [&str; 10] = [
+const SECURITY_OP_KINDS: [&str; 15] = [
     "create_key",
     "rotate_key",
     "revoke_key",
@@ -77,7 +78,55 @@ const SECURITY_OP_KINDS: [&str; 10] = [
     "export_probe",
     "security_admin_probe",
     "audit_barrier",
+    "mint_token",
+    "use_token",
+    "token_exceed_scope_probe",
+    "use_expired_token",
+    "revoke_parent_then_use_token",
 ];
+
+/// Delegated bearers are deliberately process-local and are redacted before an
+/// operation response reaches persisted artifacts. The ephemeral server URL is
+/// part of the key so a failed mint can never fall back to an earlier seed's
+/// credential.
+static DELEGATED_TOKEN_BEARERS: LazyLock<RwLock<BTreeMap<(String, TokenSel), String>>> =
+    LazyLock::new(|| RwLock::new(BTreeMap::new()));
+
+fn install_delegated_token(base_url: &str, token: TokenSel, bearer: String) {
+    DELEGATED_TOKEN_BEARERS
+        .write()
+        .unwrap_or_else(|_| panic!("delegated token registry lock poisoned"))
+        .insert((base_url.to_string(), token), bearer);
+}
+
+fn delegated_token_client(base_url: &str, token: TokenSel) -> Client {
+    let bearer = DELEGATED_TOKEN_BEARERS
+        .read()
+        .unwrap_or_else(|_| panic!("delegated token registry lock poisoned"))
+        .get(&(base_url.to_string(), token))
+        .cloned()
+        .unwrap_or_else(|| panic!("token selector {:?} has not been minted", token));
+    client_with_bearer(&bearer)
+}
+
+fn delegated_token_secrets(base_url: &str) -> Vec<String> {
+    DELEGATED_TOKEN_BEARERS
+        .read()
+        .unwrap_or_else(|_| panic!("delegated token registry lock poisoned"))
+        .iter()
+        .filter(|((server_url, _), _)| server_url == base_url)
+        .map(|(_, bearer)| bearer.clone())
+        .collect()
+}
+
+fn bytes_contain_secret(bytes: &[u8], secrets: &[String]) -> bool {
+    secrets.iter().any(|secret| {
+        !secret.is_empty()
+            && bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+    })
+}
 
 fn initialize_security_model(
     model: &mut Model,
@@ -3089,6 +3138,9 @@ pub async fn run_oracle_selftest(env: RunnerEnv) {
                 fired.contains(&ViolationId::I26SecurityStateSanity)
             }
             OracleMutation::ConstraintDrop => fired.contains(&ViolationId::I27ConstraintDrop),
+            OracleMutation::DelegationParentDesync | OracleMutation::DelegationNarrowingBypass => {
+                fired.contains(&ViolationId::I22AuthzDecision)
+            }
         };
         assert!(
             accepted,
@@ -4832,6 +4884,7 @@ async fn execute_raw_recorded_op(
             | Op::RotateKey { .. }
             | Op::RevokeKey { .. }
             | Op::PublishGrantChange { .. }
+            | Op::MintToken { .. }
             | Op::ForbiddenWriteProbe { .. } => {}
             _ if op.is_mutating() => {
                 rec.gen_after = if let Some(context) = http_fault_context.as_ref() {
@@ -5799,6 +5852,11 @@ async fn execute_op(
         | Op::RotateKey { .. }
         | Op::RevokeKey { .. }
         | Op::PublishGrantChange { .. }
+        | Op::MintToken { .. }
+        | Op::UseToken { .. }
+        | Op::TokenExceedScopeProbe { .. }
+        | Op::UseExpiredToken { .. }
+        | Op::RevokeParentThenUseToken { .. }
         | Op::TenantBoundaryProbe { .. }
         | Op::UseRevokedCredential { .. }
         | Op::ForbiddenWriteProbe { .. }
@@ -5830,9 +5888,18 @@ async fn execute_security_op(
     op: &Op,
     op_index: u64,
 ) -> (String, String, u16, serde_json::Value) {
+    let token_client = match op {
+        Op::UseToken { token, .. }
+        | Op::TokenExceedScopeProbe { token, .. }
+        | Op::UseExpiredToken { token, .. }
+        | Op::RevokeParentThenUseToken { token, .. } => {
+            Some(delegated_token_client(&target.base_url, *token))
+        }
+        _ => None,
+    };
     let selected_key = match op {
         Op::UseRevokedCredential { key } => Some(*key),
-        _ if op.actor() != ActorSel::ADMIN => Some(super::ops::KeySel {
+        _ if token_client.is_none() && op.actor() != ActorSel::ADMIN => Some(super::ops::KeySel {
             actor: op.actor(),
             retired: 0,
         }),
@@ -5840,7 +5907,10 @@ async fn execute_security_op(
     };
     let actor_client =
         selected_key.map(|key| target.workload_credentials.client(key.actor.0, key.retired));
-    let client = actor_client.as_ref().unwrap_or(admin_client);
+    let client = token_client
+        .as_ref()
+        .or(actor_client.as_ref())
+        .unwrap_or(admin_client);
     let request_id = WORKLOAD_REQUEST_ID
         .try_with(Clone::clone)
         .expect("security operation must have a deterministic request id");
@@ -5957,6 +6027,38 @@ async fn execute_security_op(
             }
             (method.to_string(), path, status, response)
         }
+        Op::MintToken {
+            token, narrowed, ..
+        } => {
+            let path = "/v1/security/tokens".to_string();
+            let (status, mut response) = request_json(
+                client,
+                Method::POST,
+                &format!("{}{}", target.base_url, path),
+                Some(delegated_token_body(narrowed)),
+            )
+            .await;
+            if (200..300).contains(&status) {
+                let bearer = response
+                    .get("token")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("successful token mint omitted bearer"))
+                    .to_string();
+                install_delegated_token(&target.base_url, *token, bearer);
+                response
+                    .as_object_mut()
+                    .expect("token mint response must be an object")
+                    .insert("token".to_string(), json!("<redacted>"));
+                record_success_request_id(&mut response, &request_id);
+            }
+            ("POST".to_string(), path, status, response)
+        }
+        Op::UseToken { target_ns, .. }
+        | Op::TokenExceedScopeProbe { target_ns, .. }
+        | Op::UseExpiredToken { target_ns, .. }
+        | Op::RevokeParentThenUseToken { target_ns, .. } => {
+            execute_delegated_query(admin_client, client, target, target_ns).await
+        }
         Op::TenantBoundaryProbe {
             target_ns, surface, ..
         } => execute_tenant_boundary_probe(admin_client, client, target, target_ns, *surface).await,
@@ -6055,6 +6157,54 @@ async fn execute_security_op(
         }
         _ => panic!("non-security operation reached execute_security_op"),
     }
+}
+
+fn delegated_token_body(narrowed: &DelegatedTokenSpec) -> serde_json::Value {
+    json!({
+        "actions": narrowed.actions,
+        "namespaces": narrowed.namespaces,
+        "mandatory_filter": narrowed.mandatory_filter,
+        "purpose": narrowed.purpose,
+        "expires_in_secs": narrowed.expires_after_secs,
+    })
+}
+
+async fn execute_delegated_query(
+    admin_client: &Client,
+    token_client: &Client,
+    target: &OpExecutionTarget,
+    namespace: &str,
+) -> (String, String, u16, serde_json::Value) {
+    let metadata_path = format!("/v1/namespaces/{namespace}");
+    let (metadata_status, metadata) = request_json(
+        admin_client,
+        Method::GET,
+        &format!("{}{}", target.base_url, metadata_path),
+        None,
+    )
+    .await;
+    assert_eq!(
+        metadata_status, 200,
+        "admin delegated-query metadata lookup failed"
+    );
+    let dimensions = metadata["dimensions"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .expect("delegated-query namespace metadata omitted dimensions");
+    let path = format!("/v1/namespaces/{namespace}/query");
+    let (status, response) = request_json(
+        token_client,
+        Method::POST,
+        &format!("{}{}", target.base_url, path),
+        Some(json!({
+            "sources": [{"type": "ann", "vector": vec![0.0_f32; dimensions]}],
+            "fusion": {"type": "none"},
+            "top_k": 100,
+            "consistency": "strong"
+        })),
+    )
+    .await;
+    ("POST".to_string(), path, status, response)
 }
 
 fn install_and_redact_credential(
@@ -7921,7 +8071,8 @@ async fn run_security_refresh_checks(
         }
     }
 
-    let secrets = server.workload_credentials.all_secrets();
+    let mut secrets = server.workload_credentials.all_secrets();
+    secrets.extend(delegated_token_secrets(&server.base_url));
     let mut leaked_secret_locations = Vec::new();
     for state_prefix in [format!("{prefix}/_security/"), audit_prefix.to_string()] {
         for key in server
@@ -7940,12 +8091,7 @@ async fn run_security_refresh_checks(
                 .get(&key)
                 .await
                 .unwrap_or_else(|error| panic!("security-state GET failed for {key}: {error}"));
-            if secrets.iter().any(|secret| {
-                !secret.is_empty()
-                    && bytes
-                        .windows(secret.len())
-                        .any(|window| window == secret.as_bytes())
-            }) {
+            if bytes_contain_secret(&bytes, &secrets) {
                 leaked_secret_locations.push(key);
             }
         }
@@ -9193,6 +9339,44 @@ mod outcome_tests {
 
     use super::*;
     use crate::adversarial::faults::{Direction, FaultEvent, TargetSelector};
+
+    #[test]
+    fn i26_scans_current_server_delegated_bearers_without_cross_server_bleed() {
+        let left_url = format!("http://delegation-left-{}", uuid::Uuid::new_v4());
+        let right_url = format!("http://delegation-right-{}", uuid::Uuid::new_v4());
+        let left_token = TokenSel {
+            parent: ActorSel(1),
+            slot: 1,
+        };
+        let right_token = TokenSel {
+            parent: ActorSel(2),
+            slot: 1,
+        };
+        let left_secret = "zpt1_left.payload.signature".to_string();
+        let right_secret = "zpt1_right.payload.signature".to_string();
+        install_delegated_token(&left_url, left_token, left_secret.clone());
+        install_delegated_token(&right_url, right_token, right_secret.clone());
+
+        let secrets = delegated_token_secrets(&left_url);
+        assert_eq!(secrets, vec![left_secret.clone()]);
+        assert!(bytes_contain_secret(
+            format!("artifact contains {left_secret}").as_bytes(),
+            &secrets
+        ));
+        assert!(!bytes_contain_secret(
+            format!("artifact contains {right_secret}").as_bytes(),
+            &secrets
+        ));
+        assert!(!bytes_contain_secret(
+            b"artifact contains <redacted>",
+            &secrets
+        ));
+
+        DELEGATED_TOKEN_BEARERS
+            .write()
+            .unwrap_or_else(|_| panic!("delegated token registry lock poisoned"))
+            .retain(|(server_url, _), _| server_url != &left_url && server_url != &right_url);
+    }
 
     #[test]
     fn object_store_delta_reconstructs_every_metric_by_typed_class() {

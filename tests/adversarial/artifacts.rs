@@ -923,8 +923,8 @@ mod tests {
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(seed.dir.join("config.json")).unwrap()).unwrap();
         assert_eq!(config["principals"].as_array().unwrap().len(), 5);
-        assert_eq!(config["security_ops"].as_array().unwrap().len(), 10);
-        assert_eq!(config["protected_assumptions"].as_array().unwrap().len(), 4);
+        assert_eq!(config["security_ops"].as_array().unwrap().len(), 15);
+        assert_eq!(config["protected_assumptions"].as_array().unwrap().len(), 6);
         assert!(!config["security_program"].is_null());
 
         let mut authz = record(0);
@@ -2687,6 +2687,11 @@ const SECURITY_OP_KINDS: &[&str] = &[
     "export_probe",
     "security_admin_probe",
     "audit_barrier",
+    "mint_token",
+    "use_token",
+    "token_exceed_scope_probe",
+    "use_expired_token",
+    "revoke_parent_then_use_token",
 ];
 
 const REQUIRED_TAGS: &[&str] = &[

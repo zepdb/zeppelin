@@ -9,7 +9,8 @@ use super::model::{
 };
 use super::ops::{AsOfTarget, GeneratedQuery, MaintenanceKind, Op, OpRecord, QueryOracleClass};
 use super::security_program::{
-    check_i22_authz_decision, check_i23_tenant_leak, ExpectedDecision, SecurityFinding,
+    check_i22_authz_decision, check_i23_tenant_leak, check_i27_constraint_drop, ExpectedDecision,
+    SecurityFinding,
 };
 use super::RunMode;
 
@@ -114,7 +115,34 @@ fn check_security_operation(
                     _ => ExpectedDecision::Forbidden,
                 };
             }
+            if mutation == Some(OracleMutation::DelegationParentDesync)
+                && matches!(rec.op, Op::RevokeParentThenUseToken { .. })
+            {
+                expected = ExpectedDecision::Allow;
+            }
+            if mutation == Some(OracleMutation::DelegationNarrowingBypass)
+                && matches!(rec.op, Op::TokenExceedScopeProbe { .. })
+            {
+                expected = ExpectedDecision::Allow;
+            }
             if let Some(finding) = check_i22_authz_decision(expected, rec.status) {
+                findings.push(finding);
+            }
+        }
+    }
+
+    if let Op::UseToken { token, target_ns } | Op::TokenExceedScopeProbe { token, target_ns } =
+        &rec.op
+    {
+        let visible = model
+            .security
+            .expected_token_visible_ids(model, *token, target_ns);
+        let observed = security_response_ids(&rec.response);
+        if let Some(finding) = check_i23_tenant_leak(&visible, &observed) {
+            findings.push(finding);
+        }
+        if matches!(rec.op, Op::UseToken { .. }) {
+            if let Some(finding) = check_i27_constraint_drop(&visible, &observed) {
                 findings.push(finding);
             }
         }

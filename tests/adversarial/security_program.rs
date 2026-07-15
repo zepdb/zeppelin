@@ -10,16 +10,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use zeppelin::index::filter::evaluate_filter;
 use zeppelin::security::{
     Action, AuditOutcome, AuditParams, AuditRecord, GrantActions, GrantScope, KeyState,
     PolicyGrant, PolicySnapshot, WriteConstraints,
 };
-use zeppelin::types::Filter;
+use zeppelin::types::{AttributeValue, Filter};
 
 use super::model::{Model, ModelRecord};
 use super::ops::{
-    ActorRole, ActorSel, ForbiddenWriteKind, GrantChange, KeySel, Op, SecurityGrantSpec,
-    TenantProbeSurface,
+    ActorRole, ActorSel, DelegatedTokenSpec, ForbiddenWriteKind, GrantChange, KeySel, Op,
+    SecurityGrantSpec, TenantProbeSurface, TokenSel,
 };
 use super::oracle::ViolationId;
 
@@ -118,6 +119,12 @@ impl SecurityProgramConfig {
                     vec![
                         query_grant(&tenant_a_ns, &filter_a),
                         data_grant(&tenant_a_ns, &filter_a, "g0"),
+                        SecurityGrantSpec {
+                            namespace: None,
+                            actions: vec!["CredentialDelegate".to_string()],
+                            mandatory_filter: None,
+                            write_constraints: None,
+                        },
                     ],
                     true,
                 ),
@@ -162,6 +169,11 @@ impl SecurityProgramConfig {
                 "export_probe",
                 "security_admin_probe",
                 "audit_barrier",
+                "mint_token",
+                "use_token",
+                "token_exceed_scope_probe",
+                "use_expired_token",
+                "revoke_parent_then_use_token",
             ]
             .into_iter()
             .map(str::to_string)
@@ -172,6 +184,8 @@ impl SecurityProgramConfig {
                 "policy-cas-head",
                 "audit-evidence-durable",
                 "tenant-isolation",
+                "delegation-narrows-parent",
+                "delegation-parent-revocation",
             ]
             .into_iter()
             .map(str::to_string)
@@ -234,6 +248,25 @@ impl SecurityProgramConfig {
             .find(|grant| grant.actions == ["Query"])
             .cloned()
             .expect("tenant A must have an exact Query grant");
+        let expiring_token = TokenSel {
+            parent: ActorSel(2),
+            slot: 0,
+        };
+        let live_token = TokenSel {
+            parent: ActorSel(2),
+            slot: 1,
+        };
+        let narrowed_token = |purpose: &str, expires_after_secs| DelegatedTokenSpec {
+            actions: vec!["Query".to_string()],
+            namespaces: vec![tenant_a_ns.clone()],
+            mandatory_filter: Some(json!({
+                "op": "eq",
+                "field": "bucket",
+                "value": 0
+            })),
+            purpose: purpose.to_string(),
+            expires_after_secs,
+        };
         let mut ops = vec![
             Op::CreateKey {
                 actor: ActorSel::ADMIN,
@@ -292,16 +325,14 @@ impl SecurityProgramConfig {
         ops.push(Op::PublishGrantChange {
             actor: ActorSel::ADMIN,
             principal: ActorSel(2),
-            grants: vec![query_grant],
+            grants: vec![query_grant.clone()],
             change: GrantChange::Add,
         });
         if self.expiry_scenario {
-            ops.push(Op::CreateKey {
-                actor: ActorSel::ADMIN,
-                subject: ActorSel(4),
-                principal_kind: revocation.role,
-                grants: revocation.grants.clone(),
-                expires_after_secs: Some(60),
+            ops.push(Op::MintToken {
+                actor: ActorSel(2),
+                token: expiring_token,
+                narrowed: narrowed_token("adversarial-expiry", 60),
             });
         }
         ops.extend([
@@ -322,20 +353,47 @@ impl SecurityProgramConfig {
             },
         ]);
         if self.expiry_scenario {
-            ops.push(Op::UseRevokedCredential {
-                key: KeySel {
-                    actor: ActorSel(4),
-                    retired: 0,
-                },
+            ops.push(Op::UseExpiredToken {
+                token: expiring_token,
+                target_ns: tenant_a_ns.clone(),
             });
         }
         ops.extend([
             Op::ExportProbe {
                 actor: ActorSel(1),
-                target_ns: tenant_a_ns,
+                target_ns: tenant_a_ns.clone(),
             },
             Op::SecurityAdminProbe { actor: ActorSel(2) },
             Op::AuditBarrierOp { actor: ActorSel(5) },
+            Op::MintToken {
+                actor: ActorSel(2),
+                token: live_token,
+                narrowed: narrowed_token("adversarial-live", 300),
+            },
+            Op::UseToken {
+                token: live_token,
+                target_ns: tenant_a_ns.clone(),
+            },
+            Op::TokenExceedScopeProbe {
+                token: live_token,
+                target_ns: denied_target,
+            },
+            Op::PublishGrantChange {
+                actor: ActorSel::ADMIN,
+                principal: ActorSel(2),
+                grants: vec![query_grant.clone()],
+                change: GrantChange::Remove,
+            },
+            Op::RevokeParentThenUseToken {
+                token: live_token,
+                target_ns: tenant_a_ns.clone(),
+            },
+            Op::PublishGrantChange {
+                actor: ActorSel::ADMIN,
+                principal: ActorSel(2),
+                grants: vec![query_grant],
+                change: GrantChange::Add,
+            },
         ]);
         ops
     }
@@ -387,12 +445,22 @@ pub struct SecurityPolicyModel {
     pub known_key_ids: BTreeMap<u8, BTreeMap<u8, String>>,
     pub live_grants: BTreeMap<ActorSel, Vec<SecurityGrantSpec>>,
     #[serde(default)]
+    pub delegated_tokens: BTreeMap<String, DelegatedTokenModel>,
+    #[serde(default)]
     pub policy_branches: Vec<BTreeMap<ActorSel, Vec<SecurityGrantSpec>>>,
     pub staleness_windows: Vec<StalenessWindow>,
     pub revoked_credentials: BTreeSet<KeySel>,
     pub successful_audit_requests: BTreeSet<String>,
     pub indeterminate_mutations: Vec<IndeterminateSecurityMutation>,
     pub resolved_mutations: Vec<SecurityMutationResolution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegatedTokenModel {
+    pub token_id: String,
+    pub parent: ActorSel,
+    pub narrowed: DelegatedTokenSpec,
+    pub minted_at_op: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -780,6 +848,33 @@ impl SecurityPolicyModel {
                 self.open_policy_window(*principal, op_index, *change, grants.clone(), true);
                 self.live_grants.insert(*principal, new_grants);
             }
+            Op::MintToken {
+                actor,
+                token,
+                narrowed,
+            } => {
+                assert_eq!(
+                    *actor, token.parent,
+                    "delegated token selector parent must equal the minting actor"
+                );
+                let token_id = response
+                    .get("token_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("successful token mint omitted token_id"));
+                let previous = self.delegated_tokens.insert(
+                    token.artifact_key(),
+                    DelegatedTokenModel {
+                        token_id: token_id.to_string(),
+                        parent: *actor,
+                        narrowed: narrowed.clone(),
+                        minted_at_op: op_index,
+                    },
+                );
+                assert!(
+                    previous.is_none(),
+                    "token selector was minted more than once"
+                );
+            }
             _ => {}
         }
     }
@@ -903,6 +998,20 @@ impl SecurityPolicyModel {
                 &active_windows,
                 AccessExpectation::Authorized,
             )),
+            Op::MintToken { .. } => Some(self.expected_actor_operation_decision(
+                op,
+                &active_windows,
+                AccessExpectation::Allow,
+            )),
+            Op::UseToken { .. } | Op::RevokeParentThenUseToken { .. } => {
+                Some(self.expected_actor_operation_decision(
+                    op,
+                    &active_windows,
+                    AccessExpectation::Allow,
+                ))
+            }
+            Op::TokenExceedScopeProbe { .. } => Some(ExpectedDecision::Forbidden),
+            Op::UseExpiredToken { .. } => Some(ExpectedDecision::Unauthorized),
             Op::AuditBarrierOp { .. }
             | Op::TenantBoundaryProbe { .. }
             | Op::SecurityAdminProbe { .. } => Some(self.expected_actor_operation_decision(
@@ -1052,7 +1161,15 @@ impl SecurityPolicyModel {
                     op.actor().0
                 )
             });
-            actor_operation_authorized_by_grants(op, grants)
+            match op {
+                Op::UseToken { token, target_ns }
+                | Op::TokenExceedScopeProbe { token, target_ns }
+                | Op::UseExpiredToken { token, target_ns }
+                | Op::RevokeParentThenUseToken { token, target_ns } => {
+                    self.token_authorized_by_grants(*token, target_ns, grants)
+                }
+                _ => actor_operation_authorized_by_grants(op, grants),
+            }
         };
         actor_authorized
             && match op {
@@ -1061,6 +1178,37 @@ impl SecurityPolicyModel {
                 }
                 _ => true,
             }
+    }
+
+    fn token_authorized_by_grants(
+        &self,
+        token: TokenSel,
+        namespace: &str,
+        parent_grants: &[SecurityGrantSpec],
+    ) -> bool {
+        let token_model = self
+            .delegated_tokens
+            .get(&token.artifact_key())
+            .unwrap_or_else(|| panic!("token use referenced an unminted selector"));
+        token_model.parent == token.parent
+            && token_model
+                .narrowed
+                .actions
+                .iter()
+                .any(|action| action == "Query")
+            && token_model
+                .narrowed
+                .namespaces
+                .iter()
+                .any(|candidate| candidate == namespace)
+            && grants_satisfy_requirement(
+                parent_grants,
+                GrantRequirement {
+                    action: Action::Query,
+                    namespace: Some(namespace),
+                    unconstrained: false,
+                },
+            )
     }
 
     fn actor_grants(&self, actor: ActorSel) -> &[SecurityGrantSpec] {
@@ -1105,6 +1253,7 @@ impl SecurityPolicyModel {
                 | Op::RotateKey { .. }
                 | Op::RevokeKey { .. }
                 | Op::PublishGrantChange { .. }
+                | Op::MintToken { .. }
                 | Op::ForbiddenWriteProbe { .. }
                 | Op::AuditBarrierOp { .. }
         ) || matches!(
@@ -1160,6 +1309,64 @@ impl SecurityPolicyModel {
             .map(|(id, _)| id.clone())
             .collect()
     }
+
+    #[must_use]
+    pub fn expected_token_visible_ids(
+        &self,
+        model: &Model,
+        token: TokenSel,
+        namespace: &str,
+    ) -> BTreeSet<String> {
+        let Some(token_model) = self.delegated_tokens.get(&token.artifact_key()) else {
+            return BTreeSet::new();
+        };
+        if !token_model
+            .narrowed
+            .actions
+            .iter()
+            .any(|action| action == "Query")
+            || !token_model
+                .narrowed
+                .namespaces
+                .iter()
+                .any(|candidate| candidate == namespace)
+        {
+            return BTreeSet::new();
+        }
+        let Some(namespace_model) = model.namespaces.get(namespace) else {
+            return BTreeSet::new();
+        };
+        let parent_grants = self
+            .actor_grants(token_model.parent)
+            .iter()
+            .filter(|grant| {
+                grant_has_action(grant, Action::Query)
+                    && grant_scope_matches(grant, Some(namespace))
+            })
+            .collect::<Vec<_>>();
+        if parent_grants.is_empty() {
+            return BTreeSet::new();
+        }
+        namespace_model
+            .live
+            .iter()
+            .filter(|(_, record)| {
+                record_matches_all_parent_grants(record, &parent_grants)
+                    && token_model
+                        .narrowed
+                        .mandatory_filter
+                        .as_ref()
+                        .is_none_or(|filter| record_matches_filter(record, filter))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+}
+
+fn record_matches_all_parent_grants(record: &ModelRecord, grants: &[&SecurityGrantSpec]) -> bool {
+    grants
+        .iter()
+        .all(|grant| record_matches_grant(record, grant))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1284,6 +1491,19 @@ fn simple_operation_requirement(op: &Op) -> Option<GrantRequirement<'_>> {
             action: Action::SecurityAdminWrite,
             namespace: None,
             unconstrained: true,
+        }),
+        Op::MintToken { .. } => Some(GrantRequirement {
+            action: Action::CredentialDelegate,
+            namespace: None,
+            unconstrained: true,
+        }),
+        Op::UseToken { target_ns, .. }
+        | Op::TokenExceedScopeProbe { target_ns, .. }
+        | Op::UseExpiredToken { target_ns, .. }
+        | Op::RevokeParentThenUseToken { target_ns, .. } => Some(GrantRequirement {
+            action: Action::Query,
+            namespace: Some(target_ns),
+            unconstrained: false,
         }),
         Op::GcCycle { .. }
         | Op::ProbeSandwich { .. }
@@ -1686,6 +1906,15 @@ fn record_matches_grant(record: &ModelRecord, grant: &SecurityGrantSpec) -> bool
         zeppelin::types::AttributeValue::Bool(value) => expected.as_bool() == Some(*value),
         _ => false,
     })
+}
+
+fn record_matches_filter(record: &ModelRecord, raw_filter: &Value) -> bool {
+    let Some(attributes) = &record.attributes else {
+        return false;
+    };
+    let filter = serde_json::from_value::<Filter>(raw_filter.clone())
+        .unwrap_or_else(|error| panic!("invalid modeled delegated filter: {error}"));
+    evaluate_filter(&filter, attributes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2504,6 +2733,45 @@ mod tests {
         assert!(model.successful_audit_requests.contains("adv-11-upsert"));
     }
 
+    #[test]
+    fn delegated_visibility_intersects_every_matching_parent_grant() {
+        let record = ModelRecord {
+            values: vec![1.0, 0.0],
+            attributes: Some(std::collections::HashMap::from([
+                (
+                    "group".to_string(),
+                    AttributeValue::String("g0".to_string()),
+                ),
+                ("bucket".to_string(), AttributeValue::Integer(1)),
+            ])),
+        };
+        let group_grant = SecurityGrantSpec {
+            namespace: Some("tenant-a".to_string()),
+            actions: vec!["Query".to_string()],
+            mandatory_filter: Some(json!({"field": "group", "value": "g0"})),
+            write_constraints: None,
+        };
+        let wrong_bucket_grant = SecurityGrantSpec {
+            namespace: Some("tenant-a".to_string()),
+            actions: vec!["Query".to_string()],
+            mandatory_filter: Some(json!({"field": "bucket", "value": 0})),
+            write_constraints: None,
+        };
+        let matching_bucket_grant = SecurityGrantSpec {
+            mandatory_filter: Some(json!({"field": "bucket", "value": 1})),
+            ..wrong_bucket_grant.clone()
+        };
+
+        assert!(!record_matches_all_parent_grants(
+            &record,
+            &[&group_grant, &wrong_bucket_grant]
+        ));
+        assert!(record_matches_all_parent_grants(
+            &record,
+            &[&group_grant, &matching_bucket_grant]
+        ));
+    }
+
     fn empty_policy_snapshot(version: u64) -> PolicySnapshot {
         serde_json::from_value(json!({
             "version": version,
@@ -2758,24 +3026,110 @@ mod tests {
         let ops = config.scripted_ops();
         assert!(matches!(
             &ops[usize::try_from(31 - SECURITY_PROGRAM_START_OP).unwrap()],
-            Op::CreateKey {
-                subject: ActorSel(4),
-                expires_after_secs: Some(60),
+            Op::MintToken {
+                token: TokenSel {
+                    parent: ActorSel(2),
+                    slot: 0,
+                },
+                narrowed: DelegatedTokenSpec {
+                    expires_after_secs: 60,
+                    ..
+                },
                 ..
             }
         ));
         assert!(matches!(
             &ops[usize::try_from(35 - SECURITY_PROGRAM_START_OP).unwrap()],
-            Op::UseRevokedCredential {
-                key: KeySel {
-                    actor: ActorSel(4),
-                    retired: 0,
-                }
+            Op::UseExpiredToken {
+                token: TokenSel {
+                    parent: ActorSel(2),
+                    slot: 0,
+                },
+                ..
             }
         ));
         assert!(matches!(
             &ops[usize::try_from(SECURITY_AUDIT_BARRIER_OP - SECURITY_PROGRAM_START_OP).unwrap()],
             Op::AuditBarrierOp { .. }
         ));
+    }
+
+    #[test]
+    fn delegated_token_model_intersects_narrowing_with_current_parent_grants() {
+        let config = SecurityProgramConfig::for_seed(
+            "delegation-model",
+            &["tenant-a".to_string(), "tenant-b".to_string()],
+        );
+        let query_grant = config.principal(ActorSel(2)).grants[0].clone();
+        let token = TokenSel {
+            parent: ActorSel(2),
+            slot: 7,
+        };
+        let narrowed = DelegatedTokenSpec {
+            actions: vec!["Query".to_string()],
+            namespaces: vec!["tenant-a".to_string()],
+            mandatory_filter: Some(json!({
+                "op": "eq",
+                "field": "bucket",
+                "value": 0
+            })),
+            purpose: "model-test".to_string(),
+            expires_after_secs: 300,
+        };
+        let mint = Op::MintToken {
+            actor: ActorSel(2),
+            token,
+            narrowed: narrowed.clone(),
+        };
+        let use_token = Op::UseToken {
+            token,
+            target_ns: "tenant-a".to_string(),
+        };
+        let exceed = Op::TokenExceedScopeProbe {
+            token,
+            target_ns: "tenant-b".to_string(),
+        };
+        let mut model = SecurityPolicyModel::default();
+        model.initialize(config, 1);
+
+        assert_eq!(
+            model.expected_decision(&mint, 1),
+            Some(ExpectedDecision::Allow)
+        );
+        model.observe_applied(&mint, &json!({"token_id": "token-model-7"}), 1);
+        assert_eq!(
+            model.expected_decision(&use_token, 2),
+            Some(ExpectedDecision::Allow)
+        );
+        assert_eq!(
+            model.expected_decision(&exceed, 2),
+            Some(ExpectedDecision::Forbidden)
+        );
+
+        model.observe_applied(
+            &Op::PublishGrantChange {
+                actor: ActorSel::ADMIN,
+                principal: ActorSel(2),
+                grants: vec![query_grant],
+                change: GrantChange::Remove,
+            },
+            &json!({"policy_version": 2}),
+            3,
+        );
+        let revoked_use = Op::RevokeParentThenUseToken {
+            token,
+            target_ns: "tenant-a".to_string(),
+        };
+        assert_eq!(
+            model.expected_decision(&revoked_use, 4),
+            Some(ExpectedDecision::StalenessWindow {
+                allowed: vec![AccessExpectation::Allow, AccessExpectation::Forbidden],
+            })
+        );
+        model.close_staleness_windows();
+        assert_eq!(
+            model.expected_decision(&revoked_use, 20),
+            Some(ExpectedDecision::Forbidden)
+        );
     }
 }

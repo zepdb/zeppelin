@@ -42,8 +42,19 @@ impl Coverage {
             self.record_security_oracle("I22");
         }
         match op {
-            Op::TenantBoundaryProbe { .. } => self.record_security_oracle("I23"),
-            Op::UseRevokedCredential { .. } => self.record_security_oracle("I24"),
+            Op::TenantBoundaryProbe { .. } | Op::TokenExceedScopeProbe { .. } => {
+                self.record_security_oracle("I23");
+            }
+            Op::UseToken { .. } => {
+                self.record_security_oracle("I23");
+                self.record_security_oracle("I27");
+            }
+            Op::RevokeParentThenUseToken { .. } => {
+                self.record_security_oracle("I24");
+            }
+            Op::UseRevokedCredential { .. } | Op::UseExpiredToken { .. } => {
+                self.record_security_oracle("I24");
+            }
             Op::AuditBarrierOp { .. } => self.record_security_oracle("I25"),
             _ => {}
         }

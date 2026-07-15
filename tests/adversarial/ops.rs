@@ -91,6 +91,32 @@ pub struct KeySel {
     pub retired: u8,
 }
 
+/// Deterministic selector for one delegated credential derived from a parent
+/// actor. Artifacts retain only this redaction-safe identity; bearer material
+/// remains process-local in the runner.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TokenSel {
+    pub parent: ActorSel,
+    pub slot: u8,
+}
+
+impl TokenSel {
+    #[must_use]
+    pub fn artifact_key(self) -> String {
+        format!("actor-{}-token-{}", self.parent.0, self.slot)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DelegatedTokenSpec {
+    pub actions: Vec<String>,
+    pub namespaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandatory_filter: Option<serde_json::Value>,
+    pub purpose: String,
+    pub expires_after_secs: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::enum_variant_names)] // `AuditBarrierOp` is the frozen artifact vocabulary.
 pub enum Op {
@@ -239,6 +265,27 @@ pub enum Op {
         principal: ActorSel,
         grants: Vec<SecurityGrantSpec>,
         change: GrantChange,
+    },
+    MintToken {
+        actor: ActorSel,
+        token: TokenSel,
+        narrowed: DelegatedTokenSpec,
+    },
+    UseToken {
+        token: TokenSel,
+        target_ns: String,
+    },
+    TokenExceedScopeProbe {
+        token: TokenSel,
+        target_ns: String,
+    },
+    UseExpiredToken {
+        token: TokenSel,
+        target_ns: String,
+    },
+    RevokeParentThenUseToken {
+        token: TokenSel,
+        target_ns: String,
     },
     TenantBoundaryProbe {
         actor: ActorSel,
@@ -454,12 +501,17 @@ impl Op {
             | Self::RotateKey { actor, .. }
             | Self::RevokeKey { actor, .. }
             | Self::PublishGrantChange { actor, .. }
+            | Self::MintToken { actor, .. }
             | Self::TenantBoundaryProbe { actor, .. }
             | Self::ForbiddenWriteProbe { actor, .. }
             | Self::ExportProbe { actor, .. }
             | Self::SecurityAdminProbe { actor }
             | Self::AuditBarrierOp { actor } => *actor,
             Self::UseRevokedCredential { key } => key.actor,
+            Self::UseToken { token, .. }
+            | Self::TokenExceedScopeProbe { token, .. }
+            | Self::UseExpiredToken { token, .. }
+            | Self::RevokeParentThenUseToken { token, .. } => token.parent,
         }
     }
 
@@ -478,6 +530,10 @@ impl Op {
                 | Op::ListSnapshots { .. }
                 | Op::TenantBoundaryProbe { .. }
                 | Op::UseRevokedCredential { .. }
+                | Op::UseToken { .. }
+                | Op::TokenExceedScopeProbe { .. }
+                | Op::UseExpiredToken { .. }
+                | Op::RevokeParentThenUseToken { .. }
                 | Op::ExportProbe { .. }
                 | Op::SecurityAdminProbe { .. }
                 | Op::AuditBarrierOp { .. }
@@ -512,6 +568,11 @@ impl Op {
             Op::RotateKey { .. } => "rotate_key",
             Op::RevokeKey { .. } => "revoke_key",
             Op::PublishGrantChange { .. } => "publish_grant_change",
+            Op::MintToken { .. } => "mint_token",
+            Op::UseToken { .. } => "use_token",
+            Op::TokenExceedScopeProbe { .. } => "token_exceed_scope_probe",
+            Op::UseExpiredToken { .. } => "use_expired_token",
+            Op::RevokeParentThenUseToken { .. } => "revoke_parent_then_use_token",
             Op::TenantBoundaryProbe { .. } => "tenant_boundary_probe",
             Op::UseRevokedCredential { .. } => "use_revoked_credential",
             Op::ForbiddenWriteProbe { .. } => "forbidden_write_probe",
@@ -529,6 +590,11 @@ impl Op {
                 | Op::RotateKey { .. }
                 | Op::RevokeKey { .. }
                 | Op::PublishGrantChange { .. }
+                | Op::MintToken { .. }
+                | Op::UseToken { .. }
+                | Op::TokenExceedScopeProbe { .. }
+                | Op::UseExpiredToken { .. }
+                | Op::RevokeParentThenUseToken { .. }
                 | Op::TenantBoundaryProbe { .. }
                 | Op::UseRevokedCredential { .. }
                 | Op::ForbiddenWriteProbe { .. }
@@ -564,11 +630,16 @@ impl Op {
             Op::CloneNamespace { source, .. } => source,
             Op::TenantBoundaryProbe { target_ns, .. }
             | Op::ForbiddenWriteProbe { target_ns, .. }
-            | Op::ExportProbe { target_ns, .. } => target_ns,
+            | Op::ExportProbe { target_ns, .. }
+            | Op::UseToken { target_ns, .. }
+            | Op::TokenExceedScopeProbe { target_ns, .. }
+            | Op::UseExpiredToken { target_ns, .. }
+            | Op::RevokeParentThenUseToken { target_ns, .. } => target_ns,
             Op::CreateKey { .. }
             | Op::RotateKey { .. }
             | Op::RevokeKey { .. }
             | Op::PublishGrantChange { .. }
+            | Op::MintToken { .. }
             | Op::UseRevokedCredential { .. }
             | Op::SecurityAdminProbe { .. }
             | Op::AuditBarrierOp { .. } => "_security",
@@ -594,6 +665,7 @@ impl Op {
                 | Op::RotateKey { .. }
                 | Op::RevokeKey { .. }
                 | Op::PublishGrantChange { .. }
+                | Op::MintToken { .. }
                 | Op::ForbiddenWriteProbe { .. }
         )
     }
@@ -623,6 +695,11 @@ impl Op {
             | Op::RotateKey { .. }
             | Op::RevokeKey { .. }
             | Op::PublishGrantChange { .. }
+            | Op::MintToken { .. }
+            | Op::UseToken { .. }
+            | Op::TokenExceedScopeProbe { .. }
+            | Op::UseExpiredToken { .. }
+            | Op::RevokeParentThenUseToken { .. }
             | Op::TenantBoundaryProbe { .. }
             | Op::UseRevokedCredential { .. }
             | Op::ForbiddenWriteProbe { .. }
@@ -804,6 +881,41 @@ impl Op {
                 principal: *principal,
                 grants: rewrite_security_grants(grants, &rewrite),
                 change: *change,
+            },
+            Op::MintToken {
+                actor,
+                token,
+                narrowed,
+            } => Op::MintToken {
+                actor: *actor,
+                token: *token,
+                narrowed: DelegatedTokenSpec {
+                    actions: narrowed.actions.clone(),
+                    namespaces: narrowed
+                        .namespaces
+                        .iter()
+                        .map(|namespace| rewrite(namespace))
+                        .collect(),
+                    mandatory_filter: narrowed.mandatory_filter.clone(),
+                    purpose: narrowed.purpose.clone(),
+                    expires_after_secs: narrowed.expires_after_secs,
+                },
+            },
+            Op::UseToken { token, target_ns } => Op::UseToken {
+                token: *token,
+                target_ns: rewrite(target_ns),
+            },
+            Op::TokenExceedScopeProbe { token, target_ns } => Op::TokenExceedScopeProbe {
+                token: *token,
+                target_ns: rewrite(target_ns),
+            },
+            Op::UseExpiredToken { token, target_ns } => Op::UseExpiredToken {
+                token: *token,
+                target_ns: rewrite(target_ns),
+            },
+            Op::RevokeParentThenUseToken { token, target_ns } => Op::RevokeParentThenUseToken {
+                token: *token,
+                target_ns: rewrite(target_ns),
             },
             Op::TenantBoundaryProbe {
                 actor,

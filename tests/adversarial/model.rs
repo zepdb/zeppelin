@@ -85,10 +85,12 @@ pub enum OracleMutation {
     AuditRecordDeletion,
     SecuritySecretLeak,
     ConstraintDrop,
+    DelegationParentDesync,
+    DelegationNarrowingBypass,
 }
 
 impl OracleMutation {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 24] = [
         Self::DropDelete,
         Self::SkewScore,
         Self::PhantomId,
@@ -111,6 +113,8 @@ impl OracleMutation {
         Self::AuditRecordDeletion,
         Self::SecuritySecretLeak,
         Self::ConstraintDrop,
+        Self::DelegationParentDesync,
+        Self::DelegationNarrowingBypass,
     ];
 
     #[must_use]
@@ -138,6 +142,8 @@ impl OracleMutation {
             "audit-record-deletion" => Self::AuditRecordDeletion,
             "security-secret-leak" => Self::SecuritySecretLeak,
             "constraint-drop" => Self::ConstraintDrop,
+            "delegation-parent-desync" => Self::DelegationParentDesync,
+            "delegation-narrowing-bypass" => Self::DelegationNarrowingBypass,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -167,6 +173,8 @@ impl OracleMutation {
             Self::AuditRecordDeletion => "audit-record-deletion",
             Self::SecuritySecretLeak => "security-secret-leak",
             Self::ConstraintDrop => "constraint-drop",
+            Self::DelegationParentDesync => "delegation-parent-desync",
+            Self::DelegationNarrowingBypass => "delegation-narrowing-bypass",
         }
     }
 
@@ -180,6 +188,8 @@ impl OracleMutation {
                 | Self::AuditRecordDeletion
                 | Self::SecuritySecretLeak
                 | Self::ConstraintDrop
+                | Self::DelegationParentDesync
+                | Self::DelegationNarrowingBypass
         )
     }
 }
@@ -511,6 +521,11 @@ impl Model {
             | Op::RotateKey { .. }
             | Op::RevokeKey { .. }
             | Op::PublishGrantChange { .. }
+            | Op::MintToken { .. }
+            | Op::UseToken { .. }
+            | Op::TokenExceedScopeProbe { .. }
+            | Op::UseExpiredToken { .. }
+            | Op::RevokeParentThenUseToken { .. }
             | Op::TenantBoundaryProbe { .. }
             | Op::UseRevokedCredential { .. }
             | Op::ForbiddenWriteProbe { .. }
@@ -806,6 +821,11 @@ impl Model {
             | Op::RotateKey { .. }
             | Op::RevokeKey { .. }
             | Op::PublishGrantChange { .. }
+            | Op::MintToken { .. }
+            | Op::UseToken { .. }
+            | Op::TokenExceedScopeProbe { .. }
+            | Op::UseExpiredToken { .. }
+            | Op::RevokeParentThenUseToken { .. }
             | Op::TenantBoundaryProbe { .. }
             | Op::UseRevokedCredential { .. }
             | Op::ForbiddenWriteProbe { .. }
