@@ -510,11 +510,14 @@ async fn build_app_with_entitlement_resolver(
     }
 
     // Initialize namespace manager and scan existing namespaces
-    let namespace_manager = Arc::new(NamespaceManager::with_clock(
-        store.clone(),
-        Duration::from_millis(config.cache.namespace_registry_ttl_ms),
-        clock.clone(),
-    ));
+    let namespace_manager = Arc::new(
+        NamespaceManager::with_clock(
+            store.clone(),
+            Duration::from_millis(config.cache.namespace_registry_ttl_ms),
+            clock.clone(),
+        )
+        .with_preservation_service(security.preservation_service().cloned()),
+    );
     if storage_available {
         match tokio::time::timeout(
             STORAGE_STARTUP_TIMEOUT,
@@ -591,14 +594,17 @@ async fn build_app_with_entitlement_resolver(
     )));
 
     // Initialize compactor
-    let compactor = Arc::new(Compactor::with_clock(
-        store.clone(),
-        WalReader::new(store.clone()),
-        config.compaction.clone(),
-        config.indexing.clone(),
-        Duration::from_secs(config.gc.compaction_upload_window_secs),
-        clock.clone(),
-    ));
+    let compactor = Arc::new(
+        Compactor::with_clock(
+            store.clone(),
+            WalReader::new(store.clone()),
+            config.compaction.clone(),
+            config.indexing.clone(),
+            Duration::from_secs(config.gc.compaction_upload_window_secs),
+            clock.clone(),
+        )
+        .with_preservation_service(security.preservation_service().cloned()),
+    );
 
     // Per-namespace compaction lease: only one node compacts a namespace at
     // a time. The holder ID is unique per process; the fencing token from the

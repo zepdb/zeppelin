@@ -1,0 +1,8 @@
+{
+  "reason_kind": "regulatory",
+  "reason_text": "contract fixture preservation evidence",
+  "scope": {
+    "kind": "namespace",
+    "namespace": "contract-preserved"
+  }
+}

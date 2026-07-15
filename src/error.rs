@@ -600,6 +600,10 @@ impl ZeppelinError {
                 | ZeppelinError::QueryConcurrencyExhausted
                 | ZeppelinError::RateLimitExceeded { .. }
                 | ZeppelinError::Security(crate::security::SecurityError::PolicyConflict)
+                | ZeppelinError::Security(
+                    crate::security::SecurityError::PreservationConflict
+                        | crate::security::SecurityError::PreservationStateUnavailable
+                )
                 | ZeppelinError::Storage(_)
         )
     }
@@ -628,7 +632,11 @@ impl ZeppelinError {
             | ZeppelinError::LeaseHeld { .. }
             | ZeppelinError::LeaseExpired { .. }
             | ZeppelinError::FencingTokenStale { .. }
-            | ZeppelinError::Security(crate::security::SecurityError::PolicyConflict) => Some(1),
+            | ZeppelinError::Security(
+                crate::security::SecurityError::PolicyConflict
+                | crate::security::SecurityError::PreservationConflict
+                | crate::security::SecurityError::PreservationStateUnavailable,
+            ) => Some(1),
             _ => None,
         }
     }

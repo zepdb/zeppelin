@@ -395,6 +395,16 @@ impl AuditRequest {
             .approval_principal_id = Some(principal_id);
     }
 
+    /// Return the independently authorized approver attached by middleware.
+    #[must_use]
+    pub(crate) fn approval_principal_id(&self) -> Option<PrincipalId> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"))
+            .approval_principal_id
+            .clone()
+    }
+
     /// Mark a top-level-success batch response that contains authorization denials.
     pub(crate) fn mark_batch_constraint_denial(&self, denied_entries: usize, total_entries: usize) {
         let mut state = self
@@ -815,6 +825,8 @@ fn audited_action(action: Action) -> bool {
             | Action::SecurityAdminRead
             | Action::SecurityAdminWrite
             | Action::CredentialDelegate
+            | Action::PreservationAdmin
+            | Action::PreservationRelease
     )
 }
 
@@ -1113,6 +1125,13 @@ pub async fn authorize(
             return ApiError(SecurityError::Authorization(deny.reason).into()).into_response();
         }
     };
+
+    // Preservation release is always two-person. This obligation is attached
+    // outside persisted grants so no administrator can accidentally mint a
+    // one-person release grant.
+    if action == Action::PreservationRelease {
+        allow.require_approval();
+    }
 
     let approval_principal = if allow
         .obligations
@@ -2363,7 +2382,43 @@ fn security_routes(state: &AppState) -> Router<AppState> {
         )
     };
 
-    rbac_routes.merge(token_routes)
+    let preservation_routes = if state.security.entitlements().has(Feature::Preservation) {
+        Router::new()
+            .route(
+                "/v1/security/preservation",
+                secure_route(get(security_handler::list_preservation_locks), state).merge(
+                    secure_route(
+                        license_gated_security_mutation(
+                            post(security_handler::create_preservation_lock),
+                            state,
+                        ),
+                        state,
+                    ),
+                ),
+            )
+            .route(
+                "/v1/security/preservation/:lock_id/release",
+                secure_route(
+                    license_gated_security_mutation(
+                        post(security_handler::release_preservation_lock),
+                        state,
+                    ),
+                    state,
+                ),
+            )
+    } else {
+        Router::new()
+            .route(
+                "/v1/security/preservation",
+                secure_route(get(feature_not_licensed).post(feature_not_licensed), state),
+            )
+            .route(
+                "/v1/security/preservation/:lock_id/release",
+                secure_route(post(feature_not_licensed), state),
+            )
+    };
+
+    rbac_routes.merge(token_routes).merge(preservation_routes)
 }
 
 /// Builds the complete Axum service from initialized Zeppelin dependencies.
@@ -2643,7 +2698,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_seven_audited_action_inventory_is_exact() {
+    fn phase_eight_audited_action_inventory_is_exact() {
         let audited = Action::ALL
             .into_iter()
             .filter(|action| audited_action(*action))
@@ -2666,12 +2721,14 @@ mod tests {
                 Action::SecurityAdminRead,
                 Action::SecurityAdminWrite,
                 Action::CredentialDelegate,
+                Action::PreservationAdmin,
+                Action::PreservationRelease,
             ]
         );
     }
 
     #[test]
-    fn phase_seven_must_audit_action_inventory_is_exact() {
+    fn phase_eight_must_audit_action_inventory_is_exact() {
         let must_audit = Action::ALL
             .into_iter()
             .filter(|action| {
@@ -2692,6 +2749,8 @@ mod tests {
                 Action::SecurityAdminRead,
                 Action::SecurityAdminWrite,
                 Action::CredentialDelegate,
+                Action::PreservationAdmin,
+                Action::PreservationRelease,
             ]
         );
         assert!(must_audit.into_iter().all(audited_action));

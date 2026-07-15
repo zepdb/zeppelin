@@ -102,6 +102,7 @@
 //! status codes as C code often would.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -122,6 +123,7 @@ use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
 use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
 use crate::index::quantization::QuantizationType;
 use crate::namespace::manager::{NamespaceIncarnationId, NamespaceMetadata};
+use crate::security::{NamespaceId, PreservationService};
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{ListedObject, StorageVersion, ZeppelinStore};
 use crate::wal::fragment::WalFragment;
@@ -219,6 +221,7 @@ impl GcNamespaceIncarnation {
 pub struct GcRunner {
     store: ZeppelinStore,
     gc: GcConfig,
+    preservation: Option<Arc<PreservationService>>,
     namespaces: BTreeMap<String, NamespaceGcMemo>,
 }
 
@@ -1793,7 +1796,7 @@ async fn drain_pending_deletes_with_inventory_authority_from(
                 observed = Manifest::read_versioned(store, namespace).await?;
                 if observed
                     .as_ref()
-                    .is_some_and(|(_, version)| version.0.is_none())
+                    .is_some_and(|(_, version)| !version.has_e_tag())
                 {
                     return Err(ZeppelinError::Serialization(format!(
                         "manifest {} has no ETag after pending-delete CAS conflict",
@@ -2197,8 +2200,19 @@ impl GcRunner {
         Self {
             store,
             gc,
+            preservation: None,
             namespaces: BTreeMap::new(),
         }
+    }
+
+    /// Attach the boot-composed preservation authority to destructive cycles.
+    #[must_use]
+    pub fn with_preservation_service(
+        mut self,
+        preservation: Option<Arc<PreservationService>>,
+    ) -> Self {
+        self.preservation = preservation;
+        self
     }
 
     /// Replaces the GC policy used by subsequent cycles.
@@ -2217,6 +2231,22 @@ impl GcRunner {
         incarnation: GcNamespaceIncarnation,
         now: DateTime<Utc>,
     ) -> Result<GcCycleReport> {
+        if let Some(preservation) = &self.preservation {
+            let namespace = NamespaceId::new(incarnation.name().to_string())?;
+            let guard = preservation.guard_namespace(&namespace)?;
+            if guard.is_locked() {
+                preservation
+                    .record_maintenance_deferral(false, &namespace, &guard)
+                    .await?;
+                info!(
+                    namespace = incarnation.name(),
+                    lock_count = guard.lock_ids().len(),
+                    "gc_deferred_preservation"
+                );
+                return Ok(GcCycleReport::default());
+            }
+        }
+
         let mut previous = self
             .namespaces
             .remove(incarnation.name())
@@ -2870,10 +2900,9 @@ async fn read_versioned_manifest_from_inventory(
                     "manifest {key} changed between LIST ETag {list_etag:?} and GET ETag {get_etag:?}"
                 )));
             }
-            Ok(Some((
-                Manifest::from_bytes_for_namespace(&bytes, namespace)?,
-                ManifestVersion(get_etag),
-            )))
+            let manifest = Manifest::from_bytes_for_namespace(&bytes, namespace)?;
+            let version = ManifestVersion::for_manifest(get_etag, &manifest);
+            Ok(Some((manifest, version)))
         }
         Err(ZeppelinError::NotFound { .. }) if listed.is_none() => Ok(None),
         Err(error) => Err(error),

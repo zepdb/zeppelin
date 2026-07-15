@@ -13,15 +13,18 @@ use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
 use zeppelin::metrics::{
     AUDIT_FLUSH_FAILURES_TOTAL, AUDIT_RECORDS_TOTAL, AUTHZ_DENIALS_TOTAL, AUTH_FAILURES_TOTAL,
 };
+use zeppelin::security::Feature;
 use zeppelin::security::{AuthenticationOutcome, AuthnFailure, CredentialAdapter, PolicyVersion};
 use zeppelin::storage::ZeppelinStore;
+use zeppelin::time::Clock;
 
 use common::counting::counting_store;
 use common::fault_injection::{delay_delete_matching, fail_put_once_matching};
 use common::harness::TestHarness;
 use common::server::{
     client_with_bearer, create_ns_api, start_test_server_full,
-    start_test_server_full_with_credential_adapter,
+    start_test_server_full_with_credential_adapter, start_test_server_full_with_entitlements,
+    test_entitlements,
 };
 
 const READER_KEY_ID: &str = "zpk1_audit_reader";
@@ -400,7 +403,7 @@ async fn namespace_delete_is_must_audit() {
     harness.cleanup().await;
 
     let failing_harness = TestHarness::new().await;
-    let (failing_store, failure) = fail_put_once_matching(&failing_harness.store, "_audit/");
+    let (failing_store, failure) = fail_put_once_matching(&failing_harness.store, ".jsonl");
     let mut config = audit_config();
     config.security.audit_flush_secs = 60;
     let failing_server = start_test_server_full(
@@ -527,12 +530,12 @@ async fn open_unsafe_boot_is_audited() {
     let harness = TestHarness::new().await;
     let mut config = Config::default();
     config.security.mode = SecurityMode::OpenUnsafe;
-    let server = start_test_server_full(
+    let server = start_test_server_full_with_entitlements(
         harness.store.clone(),
         Some(harness.prefix.clone()),
         config,
-        false,
-        None,
+        Clock::system(),
+        test_entitlements([Feature::Rbac, Feature::AuditS3]),
     )
     .await;
 

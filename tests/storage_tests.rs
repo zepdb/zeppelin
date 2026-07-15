@@ -6,7 +6,7 @@ use futures::StreamExt;
 use std::time::Duration;
 use zeppelin::config::{StorageBackend, StorageConfig};
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::wal::{Manifest, ManifestVersion};
+use zeppelin::wal::Manifest;
 
 /// Smoke test: connect to S3, write an object, read it back, verify content, delete it.
 #[tokio::test]
@@ -197,12 +197,20 @@ async fn test_fresh_manifest_write_conditional_returns_authoritative_etag() {
     let harness = TestHarness::new().await;
     let namespace = harness.key("returned-manifest-etag");
     let mut manifest = Manifest::new();
+    manifest
+        .write(&harness.store, &namespace)
+        .await
+        .expect("initial manifest publication should succeed");
+    let (_, base_version) = Manifest::read_versioned(&harness.store, &namespace)
+        .await
+        .expect("initial manifest should be readable")
+        .expect("initial manifest should exist");
 
     let written_version = manifest
-        .write_conditional(&harness.store, &namespace, &ManifestVersion(None))
+        .write_conditional(&harness.store, &namespace, &base_version)
         .await
-        .expect("fresh conditional manifest publication should succeed");
-    let Some(written_etag) = written_version.0 else {
+        .expect("conditional manifest publication should succeed");
+    let Some(written_etag) = written_version.e_tag() else {
         eprintln!("backend omitted the manifest PUT ETag; skipping its equality assertion");
         harness.cleanup().await;
         return;
@@ -212,8 +220,8 @@ async fn test_fresh_manifest_write_conditional_returns_authoritative_etag() {
         .expect("fresh manifest should be readable")
         .expect("fresh manifest should exist");
 
-    assert_eq!(observed_version.0.as_deref(), Some(written_etag.as_str()));
-    assert_eq!(manifest.version(), 1);
+    assert_eq!(observed_version.e_tag(), Some(written_etag));
+    assert_eq!(manifest.version(), 2);
 
     harness.cleanup().await;
 }

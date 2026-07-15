@@ -52,6 +52,7 @@ pub async fn write_active_namespace_metadata_with_fts(
         created_at: now,
         updated_at: now,
         state: zeppelin::namespace::manager::NamespaceState::Active,
+        destruction_record_key: None,
         full_text_search,
         index_config: None,
         compaction_health: zeppelin::namespace::manager::CompactionHealth::default(),

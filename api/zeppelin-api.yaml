@@ -584,6 +584,110 @@ paths:
         "422":
           $ref: "#/components/responses/UnprocessableEntity"
 
+  /v1/security/preservation:
+    get:
+      operationId: listPreservationLocks
+      summary: List active preservation locks
+      description: |
+        Returns the fresh S3-authoritative active lock set. If the cached head
+        cannot be refreshed within its bounded freshness interval, the request
+        fails closed with 503 rather than returning uncertain state.
+      tags: [Security]
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "200":
+          description: Fresh active preservation-lock inventory
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListPreservationLocksResponse"
+        "503":
+          $ref: "#/components/responses/PreservationStateUnavailable"
+    post:
+      operationId: createPreservationLock
+      summary: Create an active preservation lock
+      description: |
+        Writes an immutable lock record, then CAS-adds its identity to the
+        authoritative active head. Namespace-filter overlap is conservative:
+        deletion is blocked unless disjointness is structurally provable.
+      tags: [Security]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePreservationLockRequest"
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "201":
+          description: Immutable lock created and activated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreservationLockRecord"
+        "400":
+          $ref: "#/components/responses/PreservationRequestError"
+        "409":
+          $ref: "#/components/responses/PreservationConflict"
+        "500":
+          $ref: "#/components/responses/AuditUnavailable"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /v1/security/preservation/{lock_id}/release:
+    post:
+      operationId: releasePreservationLock
+      summary: Release an active preservation lock
+      description: |
+        Appends an immutable release record and CAS-removes the lock from the
+        active head. A distinct authorized zpk1 principal must be supplied in
+        X-Zeppelin-Approval; delegated tokens cannot satisfy approval.
+      tags: [Security]
+      parameters:
+        - name: lock_id
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/PreservationLockId"
+        - name: X-Zeppelin-Approval
+          in: header
+          required: true
+          schema:
+            $ref: "#/components/schemas/SecurityApiKey"
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "200":
+          description: Immutable release evidence written and lock deactivated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PreservationLockRecord"
+        "400":
+          $ref: "#/components/responses/PreservationRequestError"
+        "404":
+          $ref: "#/components/responses/PreservationLockNotFound"
+        "409":
+          $ref: "#/components/responses/PreservationConflict"
+        "500":
+          $ref: "#/components/responses/AuditUnavailable"
+
   /v1/namespaces:
     post:
       operationId: createNamespace
@@ -679,6 +783,12 @@ paths:
                 $ref: "#/components/schemas/DeleteNamespaceResponse"
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/PreservationLocked"
+        "500":
+          $ref: "#/components/responses/AuditUnavailable"
+        "503":
+          $ref: "#/components/responses/PreservationStateUnavailable"
 
   /v1/namespaces/{ns}/snapshots:
     parameters:
@@ -787,8 +897,12 @@ paths:
           description: Snapshot pin released
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/PreservationLocked"
         "410":
           $ref: "#/components/responses/NamespaceDeletingError"
+        "503":
+          $ref: "#/components/responses/PreservationStateUnavailable"
 
   /v1/namespaces/{ns}/clone:
     parameters:
@@ -1072,10 +1186,14 @@ paths:
           $ref: "#/components/responses/ValidationError"
         "404":
           $ref: "#/components/responses/NotFoundError"
+        "409":
+          $ref: "#/components/responses/PreservationLocked"
         "410":
           $ref: "#/components/responses/NamespaceDeletingError"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
+        "503":
+          $ref: "#/components/responses/PreservationStateUnavailable"
 
   /v1/namespaces/{ns}/vectors/get:
     parameters:
@@ -1332,6 +1450,64 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    PreservationRequestError:
+      description: |
+        The preservation request or lock identifier is invalid (400). The
+        canonical error envelope uses code `invalid_preservation_request`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    PreservationLockNotFound:
+      description: |
+        The requested preservation lock is not active or does not exist (404).
+        The canonical error envelope uses code `preservation_lock_not_found`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    PreservationConflict:
+      description: |
+        Bounded preservation-head CAS retries were exhausted or a concurrent
+        transition superseded the requested release (409). The canonical error
+        envelope uses code `preservation_conflict` and is retryable.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+          description: Seconds to wait before retrying the preservation mutation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    PreservationLocked:
+      description: |
+        One or more active preservation locks block the destructive operation
+        (409). The canonical error envelope uses code `preservation_locked` and
+        omits lock identifiers; identifiers are retained only in audit evidence.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    PreservationStateUnavailable:
+      description: |
+        The S3-authoritative preservation head could not be confirmed within
+        the bounded freshness interval (503). The canonical error envelope uses
+        code `preservation_state_unavailable`; destructive work fails closed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    AuditUnavailable:
+      description: |
+        Required durable audit or destruction evidence could not be committed
+        (500). The canonical error envelope uses code `audit_unavailable`; the
+        protected mutation is not reported as successful.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
     ValidationError:
       description: Validation error (400)
       content:
@@ -1460,6 +1636,11 @@ components:
             - security_entity_exists
             - security_entity_not_found
             - audit_unavailable
+            - preservation_locked
+            - preservation_state_unavailable
+            - invalid_preservation_request
+            - preservation_lock_not_found
+            - preservation_conflict
             - unmapped_route
             - security_internal
             - VALIDATION_ERROR
@@ -1737,6 +1918,8 @@ components:
         - SecurityAdminWrite
         - AttributeAdmin
         - CredentialDelegate
+        - PreservationAdmin
+        - PreservationRelease
 
     DelegatedSecurityAction:
       type: string
@@ -1801,8 +1984,9 @@ components:
       type: object
       description: |
         Grants the frozen baseline action inventory. AttributeAdmin,
-        CredentialDelegate, and SecurityAdminWrite are excluded and must always
-        be named explicitly in a selected action grant.
+        CredentialDelegate, PreservationAdmin, PreservationRelease, and
+        SecurityAdminWrite are excluded and must always be named explicitly in
+        a selected action grant.
       additionalProperties: false
       required: [kind]
       properties:
@@ -1885,7 +2069,7 @@ components:
       uniqueItems: true
       items:
         type: string
-        enum: [NamespaceDelete, SnapshotDelete, VectorDelete, SecurityAdminWrite]
+        enum: [NamespaceDelete, SnapshotDelete, VectorDelete, SecurityAdminWrite, PreservationRelease]
 
     SecurityGrantRemovalRequest:
       type: object
@@ -2031,6 +2215,117 @@ components:
         expires_at:
           type: string
           format: date-time
+
+    PreservationLockId:
+      type: string
+      pattern: "^plk_[0-9A-HJKMNP-TV-Z]{26}$"
+
+    PreservationScope:
+      oneOf:
+        - $ref: "#/components/schemas/PreservationGlobalScope"
+        - $ref: "#/components/schemas/PreservationNamespaceScope"
+        - $ref: "#/components/schemas/PreservationNamespaceFilterScope"
+      discriminator:
+        propertyName: kind
+        mapping:
+          global: "#/components/schemas/PreservationGlobalScope"
+          namespace: "#/components/schemas/PreservationNamespaceScope"
+          namespace_filter: "#/components/schemas/PreservationNamespaceFilterScope"
+
+    PreservationGlobalScope:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          const: global
+
+    PreservationNamespaceScope:
+      type: object
+      additionalProperties: false
+      required: [kind, namespace]
+      properties:
+        kind:
+          const: namespace
+        namespace:
+          type: string
+          minLength: 1
+          maxLength: 255
+
+    PreservationNamespaceFilterScope:
+      type: object
+      additionalProperties: false
+      required: [kind, namespace, filter]
+      properties:
+        kind:
+          const: namespace_filter
+        namespace:
+          type: string
+          minLength: 1
+          maxLength: 255
+        filter:
+          $ref: "#/components/schemas/SecurityPolicyFilter"
+
+    PreservationReasonKind:
+      type: string
+      enum: [litigation, regulatory, investigation, customer_freeze, other]
+
+    PreservationState:
+      type: string
+      enum: [active, released]
+
+    CreatePreservationLockRequest:
+      type: object
+      additionalProperties: false
+      required: [scope, reason_kind, reason_text]
+      properties:
+        scope:
+          $ref: "#/components/schemas/PreservationScope"
+        reason_kind:
+          $ref: "#/components/schemas/PreservationReasonKind"
+        reason_text:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          pattern: ".*\\S.*"
+
+    PreservationLockRecord:
+      type: object
+      additionalProperties: false
+      required: [lock_id, scope, reason_kind, reason_text, created_by, created_at, state]
+      properties:
+        lock_id:
+          $ref: "#/components/schemas/PreservationLockId"
+        scope:
+          $ref: "#/components/schemas/PreservationScope"
+        reason_kind:
+          $ref: "#/components/schemas/PreservationReasonKind"
+        reason_text:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        created_by:
+          $ref: "#/components/schemas/SecurityPrincipalId"
+        created_at:
+          type: string
+          format: date-time
+        released_by:
+          $ref: "#/components/schemas/SecurityPrincipalId"
+        released_at:
+          type: string
+          format: date-time
+        state:
+          $ref: "#/components/schemas/PreservationState"
+
+    ListPreservationLocksResponse:
+      type: object
+      additionalProperties: false
+      required: [locks]
+      properties:
+        locks:
+          type: array
+          items:
+            $ref: "#/components/schemas/PreservationLockRecord"
 
     SecurityPolicyMetadataResponse:
       type: object

@@ -149,13 +149,15 @@ use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
 use crate::namespace::manager::{
-    CreateNamespaceOutcome, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
-    COMPACTION_DEGRADED_FAILURE_THRESHOLD,
+    CreateNamespaceOutcome, NamespaceDestructionRecord, NamespaceIndexConfig, NamespaceMetadata,
+    NamespaceState, COMPACTION_DEGRADED_FAILURE_THRESHOLD,
 };
 use crate::security::{
-    Action, AllowDecision, AuditParams, IndexConfigValues, NamespaceId, Principal, RequestContext,
+    Action, AllowDecision, AuditParams, IndexConfigValues, NamespaceId, PreservationBlockedSurface,
+    Principal, RequestContext, SecurityError,
 };
 use crate::server::{AppState, AuditRequest};
+use crate::storage::CreateOnlyOutcome;
 use crate::types::{DistanceMetric, IndexType};
 use crate::wal::manifest::{NamedSnapshot, NamedSnapshotRef, SegmentRef};
 use crate::wal::{FragmentCachePolicy, Manifest};
@@ -882,13 +884,26 @@ pub async fn get_snapshot(
 ///
 /// Removing `before-migration` returns 204. A later GET returns 404, while the
 /// previously pinned generation can remain readable until retention pruning.
-#[instrument(skip(state, decision), fields(namespace = %ns, snapshot = %name))]
+#[instrument(skip(state, decision, audit), fields(namespace = %ns, snapshot = %name))]
 pub async fn delete_snapshot(
     State(state): State<AppState>,
     Extension(decision): Extension<AllowDecision>,
+    Extension(audit): Extension<AuditRequest>,
     Path((ns, name)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_unconstrained_namespace_operation(&decision)?;
+    let namespace_id = NamespaceId::new(ns.clone()).map_err(|error| ApiError(error.into()))?;
+    let guard = state
+        .security
+        .guard_namespace_destruction(&namespace_id)
+        .map_err(|error| ApiError(error.into()))?;
+    if guard.is_locked() {
+        audit.set_params(AuditParams::preservation_blocked(
+            PreservationBlockedSurface::SnapshotDelete,
+            &guard,
+        ));
+        return Err(ApiError(SecurityError::PreservationLocked.into()));
+    }
     state
         .namespace_manager
         .get(&ns)
@@ -2339,14 +2354,33 @@ pub async fn patch_index_config(
     ))
 }
 
+async fn namespace_destruction_census(
+    store: &crate::storage::ZeppelinStore,
+    namespace: &str,
+) -> crate::error::Result<(usize, u64)> {
+    let objects = store.list_prefix_meta(&format!("{namespace}/")).await?;
+    let byte_count = objects.iter().try_fold(0_u64, |total, object| {
+        total.checked_add(object.size).ok_or_else(|| {
+            ZeppelinError::Validation(format!(
+                "namespace {namespace} destruction census byte count overflowed"
+            ))
+        })
+    })?;
+    Ok((objects.len(), byte_count))
+}
+
 /// Tombstones a namespace and resumes destructive cleanup in the background.
 ///
 /// Phase one is completed before HTTP acceptance: metadata is conditionally
-/// changed to `deleting`, then the live manifest is removed so ordinary readers
-/// can no longer discover artifacts. The handler evicts disposable WAL-lock and
-/// manifest-cache state, then spawns a 25-second bounded prefix-deletion pass.
-/// The metadata tombstone is deleted last only after S3/MinIO verifies no other
-/// namespace keys remain.
+/// changed to `deleting` while binding a deterministic destruction-record key.
+/// The live manifest is then CAS-fenced against further publication, and the
+/// exact immutable evidence record is created from that fenced generation before
+/// the manifest is removed. The handler evicts disposable WAL-lock and
+/// manifest-cache state;
+/// after its must-audit response barrier succeeds, middleware spawns a 25-second
+/// bounded prefix-deletion pass. Every cleanup pass rechecks preservation state,
+/// and the metadata tombstone is deleted last only after S3/MinIO verifies no
+/// other namespace keys remain.
 ///
 /// # Parameters
 ///
@@ -2356,39 +2390,48 @@ pub async fn patch_index_config(
 ///
 /// # Returns
 ///
-/// HTTP 202 with `{"state":"deleting"}` after the tombstone and manifest
-/// removal succeed and a cleanup task is spawned. Completion is observed when
-/// [`get_namespace`] returns 404.
+/// HTTP 202 with `{"state":"deleting"}` after the tombstone, immutable
+/// destruction evidence, and fenced manifest removal succeed. The must-audit
+/// middleware spawns cleanup only after its own durable audit barrier succeeds.
+/// Completion is observed when [`get_namespace`] returns 404.
 ///
 /// # Errors
 ///
-/// Returns 404 after deletion has fully removed metadata, 409 if the metadata
-/// tombstone CAS repeatedly conflicts, or mapped metadata/manifest storage and
-/// serialization failures. If manifest deletion fails, the durable tombstone
-/// can already exist even though this request returns an error.
+/// Returns 404 after deletion has fully removed metadata; 409 for preservation
+/// locks or repeated tombstone CAS conflicts; 503 when fresh lock authority is
+/// unavailable; 500 when required audit or destruction-evidence durability is
+/// unavailable; or mapped metadata, manifest, and serialization failures. If
+/// evidence or manifest publication fails, the durable tombstone can already
+/// exist even though this request returns an error; its bound evidence key makes
+/// retry deterministic.
 ///
 /// Background listing/deletion failures happen after HTTP 202 and are logged;
 /// they leave the tombstone so a later DELETE can resume safely.
 ///
 /// # Side Effects
 ///
-/// CAS-updates metadata, deletes the live manifest, removes the process-local
-/// WAL writer lock, invalidates the manifest cache, and spawns prefix cleanup.
-/// The worker can delete every object under the namespace and finally
-/// `meta.json`.
+/// CAS-updates metadata, CAS-publishes a manifest deletion fence, publishes
+/// immutable destruction evidence, deletes the live manifest, removes the
+/// process-local WAL writer lock, and invalidates the manifest cache. Successful
+/// durable response auditing spawns prefix cleanup; the worker can delete every
+/// object under the namespace and finally `meta.json`.
 ///
 /// # Consistency
 ///
-/// Tombstone-before-data ordering prevents a new active namespace from
-/// appearing over partially deleted objects. Removing the manifest ends the
-/// visibility root before artifact deletion. DELETE is resumable while the
-/// tombstone exists; after completion another retry returns 404. More than one
-/// retry may spawn overlapping cleanup passes, which rely on idempotent delete
-/// behavior and final authoritative relisting.
+/// Tombstone-before-fence-before-evidence-before-manifest-removal ordering
+/// prevents new operations, invalidates publication capabilities held by
+/// in-flight manifest writers, binds evidence to the exact visibility root being
+/// removed, and ends visibility before artifact deletion. DELETE is resumable
+/// while the tombstone exists; retries reuse its evidence key and after
+/// completion return 404. More than one retry may spawn overlapping cleanup
+/// passes, which each recheck fresh preservation state and rely on idempotent
+/// delete behavior plus final authoritative relisting.
 ///
 /// # Performance
 ///
-/// Before returning, the handler pays for versioned metadata read/CAS and a
+/// Before returning, the handler pays for fresh preservation state, versioned
+/// metadata read/CAS, evidence lookup or create-only publication, manifest
+/// read/CAS fencing, two exact namespace object censuses for new evidence, and a
 /// manifest DELETE. The detached pass spends up to 25 seconds on paged LIST and
 /// DELETE work; large namespaces may require a later retry.
 ///
@@ -2406,17 +2449,157 @@ pub async fn patch_index_config(
 /// borrowed stack pointer to become invalid. Remote cleanup is not covered by
 /// Rust RAII, so the tombstone is the durable equivalent of a resumable cleanup
 /// record after process cancellation or crash.
-#[instrument(skip(state, decision), fields(namespace = %ns))]
+#[instrument(skip(state, decision, principal, audit), fields(namespace = %ns))]
 pub async fn delete_namespace(
     State(state): State<AppState>,
     Extension(decision): Extension<AllowDecision>,
+    Extension(principal): Extension<Principal>,
+    Extension(audit): Extension<AuditRequest>,
     Path(ns): Path<String>,
 ) -> Result<(StatusCode, Json<DeleteNamespaceResponse>), ApiError> {
     require_unconstrained_namespace_operation(&decision)?;
+    let namespace_id = NamespaceId::new(ns.clone()).map_err(|error| ApiError(error.into()))?;
+    let guard = state
+        .security
+        .guard_namespace_destruction(&namespace_id)
+        .map_err(|error| ApiError(error.into()))?;
+    if guard.is_locked() {
+        audit.set_params(AuditParams::preservation_blocked(
+            PreservationBlockedSurface::NamespaceDelete,
+            &guard,
+        ));
+        return Err(ApiError(SecurityError::PreservationLocked.into()));
+    }
+
+    // The manager derives this key from the authoritative incarnation and
+    // publishes both the key and the tombstone in one CAS retry loop. A cached
+    // lifecycle snapshot is never allowed to bind destruction evidence.
+    let lifecycle = state
+        .namespace_manager
+        .prepare_governed_delete(&ns)
+        .await
+        .map_err(ApiError::from)?;
+    let destruction_key = lifecycle.destruction_record_key.clone().ok_or_else(|| {
+        ApiError(ZeppelinError::Validation(
+            "governed namespace tombstone omitted its destruction record key".to_string(),
+        ))
+    })?;
+    if !destruction_key.starts_with("_audit/destruction/")
+        || !destruction_key.ends_with(".json")
+        || destruction_key.contains("..")
+    {
+        return Err(ApiError(ZeppelinError::Validation(
+            "namespace tombstone contains an invalid destruction record key".to_string(),
+        )));
+    }
+
+    let existing = match state.store.get(&destruction_key).await {
+        Ok(bytes) => Some(NamespaceDestructionRecord::from_bytes(&bytes).map_err(ApiError::from)?),
+        Err(ZeppelinError::NotFound { .. }) => None,
+        Err(error) => return Err(ApiError::from(error)),
+    };
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.namespace != namespace_id)
+    {
+        return Err(ApiError(ZeppelinError::Validation(
+            "destruction record namespace does not match its tombstone".to_string(),
+        )));
+    }
+
+    let fenced_manifest = match Manifest::read(&state.store, &ns)
+        .await
+        .map_err(ApiError::from)?
+    {
+        Some(_) => Some(
+            Manifest::fence_for_destruction(&state.store, &ns, &destruction_key)
+                .await
+                .map_err(ApiError::from)?,
+        ),
+        None if existing.is_some() => None,
+        None => {
+            return Err(ApiError(ZeppelinError::ManifestNotFound {
+                namespace: ns.clone(),
+            }));
+        }
+    };
+
+    let destruction = if let Some(record) = existing {
+        record
+    } else {
+        let manifest = fenced_manifest.as_ref().ok_or_else(|| {
+            ApiError(ZeppelinError::ManifestNotFound {
+                namespace: ns.clone(),
+            })
+        })?;
+        let (object_count, byte_count) = namespace_destruction_census(&state.store, &ns)
+            .await
+            .map_err(ApiError::from)?;
+        let destruction = NamespaceDestructionRecord {
+            namespace: namespace_id.clone(),
+            manifest_version_destroyed: manifest.version(),
+            object_count,
+            byte_count,
+            actor: principal.id,
+            approver: audit.approval_principal_id(),
+            decision_id: decision.decision_id,
+            ts: state.clock.now(),
+        };
+        let body = destruction.to_bytes().map_err(ApiError::from)?;
+        let publication = state.store.put_create_outcome(&destruction_key, body).await;
+        match publication {
+            Ok(CreateOnlyOutcome::Created { .. }) => {}
+            Ok(CreateOnlyOutcome::AlreadyExists) => {
+                let bytes = state
+                    .store
+                    .get(&destruction_key)
+                    .await
+                    .map_err(ApiError::from)?;
+                let concurrent =
+                    NamespaceDestructionRecord::from_bytes(&bytes).map_err(ApiError::from)?;
+                if concurrent != destruction {
+                    return Err(ApiError(ZeppelinError::Validation(
+                        "concurrent destruction record did not match the fenced census".to_string(),
+                    )));
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    namespace = %ns,
+                    error = %error,
+                    "destruction record failed after tombstone and before manifest removal"
+                );
+                return Err(ApiError(SecurityError::AuditUnavailable.into()));
+            }
+        }
+        destruction
+    };
+
+    if let Some(manifest) = &fenced_manifest {
+        manifest
+            .require_destruction_fence(
+                &ns,
+                &destruction_key,
+                destruction.manifest_version_destroyed,
+            )
+            .map_err(ApiError::from)?;
+        let (object_count, byte_count) = namespace_destruction_census(&state.store, &ns)
+            .await
+            .map_err(ApiError::from)?;
+        if object_count != destruction.object_count || byte_count != destruction.byte_count {
+            return Err(ApiError(ZeppelinError::ManifestConflict {
+                namespace: ns.clone(),
+            }));
+        }
+    }
     info!(namespace = %ns, "deleting namespace");
     state
         .namespace_manager
-        .start_delete(&ns)
+        .commit_governed_delete(
+            &ns,
+            &destruction_key,
+            destruction.manifest_version_destroyed,
+        )
         .await
         .map_err(ApiError::from)?;
 

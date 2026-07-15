@@ -18,14 +18,15 @@ mod license;
 mod policy;
 mod policy_cache;
 mod policy_store;
+mod preservation;
 mod principal;
 mod resource;
 mod route_map;
 
 pub use action::Action;
 pub use audit::{
-    AuditOutcome, AuditParams, AuditRecord, AuditedVectorIds, IndexConfigValues, ResourceRef,
-    RuntimeConfigValues, MAX_AUDITED_VECTOR_IDS,
+    AuditOutcome, AuditParams, AuditRecord, AuditedVectorIds, IndexConfigValues,
+    PreservationBlockedSurface, ResourceRef, RuntimeConfigValues, MAX_AUDITED_VECTOR_IDS,
 };
 pub use audit_sink::{AuditClient, AuditRuntime, AuditSinkError};
 pub use authn::{ApiKeyAdapter, AuthenticationOutcome, AuthnFailure, CredentialAdapter};
@@ -52,6 +53,10 @@ pub use policy::{
     KeyState, PolicyGrant, PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot,
 };
 pub use policy_store::{LoadedPolicy, PolicyStore};
+pub use preservation::{
+    CreatePreservationLock, PreservationGuard, PreservationLockId, PreservationLockRecord,
+    PreservationReasonKind, PreservationScope, PreservationService, PreservationState,
+};
 pub use principal::{AuthStrength, Principal, PrincipalId, PrincipalKind};
 pub use resource::{NamespaceId, Resource, SnapshotName};
 pub use route_map::{classify_route, RouteAction, RouteClass, ROUTE_ACTIONS};
@@ -172,6 +177,24 @@ pub enum SecurityError {
     /// A two-person obligation lacked one distinct authorized API-key approver.
     #[error("independent approval is required")]
     ApprovalRequired,
+    /// An active preservation lock blocks the requested destructive operation.
+    #[error("preservation lock blocks destructive operation")]
+    PreservationLocked,
+    /// Authoritative preservation state is stale or unavailable.
+    #[error("authoritative preservation state is unavailable")]
+    PreservationStateUnavailable,
+    /// A preservation request violates the strict public schema or bounds.
+    #[error("invalid preservation request: {0}")]
+    InvalidPreservationRequest(String),
+    /// The requested active preservation lock does not exist.
+    #[error("active preservation lock not found")]
+    PreservationLockNotFound,
+    /// Concurrent lock-head publication exhausted its bounded retries.
+    #[error("preservation state changed concurrently; retry")]
+    PreservationConflict,
+    /// Persisted preservation head or record data violates its invariants.
+    #[error("invalid authoritative preservation state")]
+    InvalidPreservationState,
     /// A bounded policy-head CAS retry loop could not publish its mutation.
     #[error("security policy changed concurrently; retry")]
     PolicyConflict,
@@ -283,11 +306,17 @@ impl SecurityError {
             Self::ConstraintViolation => 403,
             Self::DelegationChainingForbidden | Self::DelegationPrincipalKindForbidden => 403,
             Self::ApprovalRequired => 403,
+            Self::PreservationLocked => 409,
+            Self::PreservationStateUnavailable => 503,
             Self::CursorPolicyStale => 400,
             Self::InvalidNamespaceId | Self::InvalidSnapshotName => 400,
-            Self::InvalidPolicyRequest(_) | Self::DelegationScopeExceeded => 400,
-            Self::PolicyConflict | Self::PolicyEntityAlreadyExists => 409,
-            Self::PolicyEntityNotFound => 404,
+            Self::InvalidPolicyRequest(_)
+            | Self::DelegationScopeExceeded
+            | Self::InvalidPreservationRequest(_) => 400,
+            Self::PolicyConflict | Self::PolicyEntityAlreadyExists | Self::PreservationConflict => {
+                409
+            }
+            Self::PolicyEntityNotFound | Self::PreservationLockNotFound => 404,
             Self::UnknownAction(_)
             | Self::InvalidPrincipalId
             | Self::DuplicatePrincipal
@@ -310,7 +339,8 @@ impl SecurityError {
             | Self::InvalidDelegationSigningKey
             | Self::DelegationSigningKeyPermissions
             | Self::DelegationSignerCollision
-            | Self::InvalidDelegationSigner => 500,
+            | Self::InvalidDelegationSigner
+            | Self::InvalidPreservationState => 500,
         }
     }
 
@@ -330,6 +360,11 @@ impl SecurityError {
             Self::DelegationChainingForbidden => "delegation_chaining_forbidden",
             Self::DelegationPrincipalKindForbidden => "delegation_parent_kind_forbidden",
             Self::ApprovalRequired => "approval_required",
+            Self::PreservationLocked => "preservation_locked",
+            Self::PreservationStateUnavailable => "preservation_state_unavailable",
+            Self::InvalidPreservationRequest(_) => "invalid_preservation_request",
+            Self::PreservationLockNotFound => "preservation_lock_not_found",
+            Self::PreservationConflict => "preservation_conflict",
             Self::PolicyConflict => "security_conflict",
             Self::PolicyEntityAlreadyExists => "security_entity_exists",
             Self::PolicyEntityNotFound => "security_entity_not_found",
@@ -358,7 +393,8 @@ impl SecurityError {
             | Self::InvalidDelegationSigningKey
             | Self::DelegationSigningKeyPermissions
             | Self::DelegationSignerCollision
-            | Self::InvalidDelegationSigner => "security_internal",
+            | Self::InvalidDelegationSigner
+            | Self::InvalidPreservationState => "security_internal",
         }
     }
 
@@ -390,6 +426,17 @@ impl SecurityError {
                 "principal kind cannot mint delegated credentials".to_string()
             }
             Self::ApprovalRequired => "independent approval is required".to_string(),
+            Self::PreservationLocked => {
+                "operation is blocked by an active preservation lock".to_string()
+            }
+            Self::PreservationStateUnavailable => {
+                "preservation state is unavailable; destructive operation denied".to_string()
+            }
+            Self::InvalidPreservationRequest(_) => "invalid preservation request".to_string(),
+            Self::PreservationLockNotFound => "active preservation lock not found".to_string(),
+            Self::PreservationConflict => {
+                "preservation state changed concurrently; retry".to_string()
+            }
             Self::PolicyConflict => "security policy changed concurrently; retry".to_string(),
             Self::PolicyEntityAlreadyExists => "security policy entity already exists".to_string(),
             Self::PolicyEntityNotFound => "security policy entity not found".to_string(),
@@ -427,7 +474,8 @@ impl SecurityError {
             | Self::InvalidDelegationSigningKey
             | Self::DelegationSigningKeyPermissions
             | Self::DelegationSignerCollision
-            | Self::InvalidDelegationSigner => "an internal security error occurred".to_string(),
+            | Self::InvalidDelegationSigner
+            | Self::InvalidPreservationState => "an internal security error occurred".to_string(),
         }
     }
 }

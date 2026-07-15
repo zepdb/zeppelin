@@ -131,6 +131,30 @@
       "response": "security_get_policy.resp.json"
     },
     {
+      "name": "security_create_preservation",
+      "method": "POST",
+      "path": "/v1/security/preservation",
+      "status": 201,
+      "request": "security_create_preservation.req.json",
+      "response": "security_create_preservation.resp.json"
+    },
+    {
+      "name": "security_list_preservation",
+      "method": "GET",
+      "path": "/v1/security/preservation",
+      "status": 200,
+      "request": "security_list_preservation.req.json",
+      "response": "security_list_preservation.resp.json"
+    },
+    {
+      "name": "security_release_preservation",
+      "method": "POST",
+      "path": "/v1/security/preservation/plk_00000000000000000000000000/release",
+      "status": 200,
+      "request": "security_release_preservation.req.json",
+      "response": "security_release_preservation.resp.json"
+    },
+    {
       "name": "create_namespace",
       "method": "POST",
       "path": "/v1/namespaces",

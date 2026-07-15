@@ -48,6 +48,9 @@ const ROUTED_OPERATIONS: &[(&str, &str)] = &[
     ("delete", "/v1/security/grants"),
     ("get", "/v1/security/policy"),
     ("post", "/v1/security/tokens"),
+    ("get", "/v1/security/preservation"),
+    ("post", "/v1/security/preservation"),
+    ("post", "/v1/security/preservation/{lock_id}/release"),
     ("post", "/v1/namespaces"),
     ("get", "/v1/namespaces/{ns}"),
     ("delete", "/v1/namespaces/{ns}"),
@@ -88,6 +91,9 @@ const FIXTURE_CASES: &[&str] = &[
     "security_delete_grant",
     "security_mint_token",
     "security_get_policy",
+    "security_create_preservation",
+    "security_list_preservation",
+    "security_release_preservation",
     "error_constraint_violation_403",
     "error_cursor_policy_stale_400",
     "create_namespace",
@@ -276,11 +282,39 @@ fn openapi_security_admin_contract_is_exact_and_redacted() {
             "/v1/security/tokens",
             &[201, 400, 401, 403, 415, 422, 429],
         ),
+        (
+            "get",
+            "/v1/security/preservation",
+            &[200, 401, 403, 429, 503],
+        ),
+        (
+            "post",
+            "/v1/security/preservation",
+            &[201, 400, 401, 403, 409, 415, 422, 429, 500],
+        ),
+        (
+            "post",
+            "/v1/security/preservation/{lock_id}/release",
+            &[200, 400, 401, 403, 404, 409, 429, 500],
+        ),
     ];
     for (method, path, expected) in expected_statuses {
         let actual = documented_statuses(api, method, path);
         let expected = expected.iter().copied().collect::<BTreeSet<_>>();
         assert_eq!(actual, expected, "unexpected statuses for {method} {path}");
+    }
+
+    for (method, path) in [
+        ("post", "/v1/security/preservation"),
+        ("post", "/v1/security/preservation/{lock_id}/release"),
+        ("delete", "/v1/namespaces/{ns}"),
+    ] {
+        assert!(
+            operation_block(api, method, path).contains(
+                "        \"500\":\n          $ref: \"#/components/responses/AuditUnavailable\""
+            ),
+            "{method} {path} must use the canonical audit-unavailable response"
+        );
     }
 
     let key_view = component_schema_block(api, "SecurityKeyView");
@@ -1511,6 +1545,126 @@ async fn security_admin_fixtures(client: &reqwest::Client, base_url: &str) -> Ve
         &security_replacements,
     ));
 
+    let preservation_request = json!({
+        "scope": {"kind": "namespace", "namespace": "contract-preserved"},
+        "reason_kind": "regulatory",
+        "reason_text": "contract fixture preservation evidence"
+    });
+    let (status, preservation_response) = send_json(
+        client,
+        base_url,
+        "post",
+        "/v1/security/preservation",
+        "security_create_preservation",
+        preservation_request.clone(),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "fixture security_create_preservation expected status 201, got {status}: {preservation_response}"
+    );
+    let lock_id = response_string(
+        &preservation_response,
+        "lock_id",
+        "security_create_preservation",
+    );
+    let preservation_replacements = [(
+        lock_id.clone(),
+        "plk_00000000000000000000000000".to_string(),
+    )];
+    fixtures.push(fixture_from_response(
+        "security_create_preservation",
+        "post",
+        "/v1/security/preservation",
+        201,
+        preservation_request,
+        preservation_response,
+        &preservation_replacements,
+    ));
+    fixtures.push(
+        capture_json(
+            client,
+            base_url,
+            "security_list_preservation",
+            "get",
+            "/v1/security/preservation",
+            "/v1/security/preservation",
+            200,
+            Value::Null,
+            Value::Null,
+            &preservation_replacements,
+            &[],
+        )
+        .await,
+    );
+
+    let approver_id = "human:contract-preservation-approver";
+    for (name, path, request, expected) in [
+        (
+            "setup_contract_preservation_approver",
+            "/v1/security/principals",
+            json!({
+                "principal_id": approver_id,
+                "kind": "human",
+                "display_name": "contract preservation approver"
+            }),
+            201,
+        ),
+        (
+            "setup_contract_preservation_approver_key",
+            "/v1/security/keys",
+            json!({"principal_id": approver_id, "name": "contract preservation approval"}),
+            201,
+        ),
+        (
+            "setup_contract_preservation_approver_grant",
+            "/v1/security/grants",
+            json!({
+                "principal_id": approver_id,
+                "scope": {"kind": "global"},
+                "actions": {"kind": "selected", "actions": ["PreservationRelease"]}
+            }),
+            201,
+        ),
+    ] {
+        let (status, response) = send_json(client, base_url, "post", path, name, request).await;
+        assert_eq!(status, expected, "{name} failed: {response}");
+        if name == "setup_contract_preservation_approver_key" {
+            security_replacements.push((
+                response_string(&response, "api_key", name),
+                "zpk1_contract_preservation_approver.secret".to_string(),
+            ));
+        }
+    }
+    let approval_bearer = security_replacements
+        .iter()
+        .find(|(_, canonical)| canonical == "zpk1_contract_preservation_approver.secret")
+        .map(|(actual, _)| actual.clone())
+        .expect("contract preservation approver bearer must be captured");
+    let release_path = format!("/v1/security/preservation/{lock_id}/release");
+    let release_response = client
+        .post(format!("{base_url}{release_path}"))
+        .header("x-request-id", "contract-security_release_preservation")
+        .header("x-zeppelin-approval", approval_bearer)
+        .send()
+        .await
+        .unwrap();
+    let status = release_response.status().as_u16();
+    let release_response: Value = release_response.json().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "fixture security_release_preservation expected status 200, got {status}: {release_response}"
+    );
+    fixtures.push(fixture_from_response(
+        "security_release_preservation",
+        "post",
+        "/v1/security/preservation/plk_00000000000000000000000000/release",
+        200,
+        Value::Null,
+        release_response,
+        &preservation_replacements,
+    ));
+
     fixtures
 }
 
@@ -2307,6 +2461,7 @@ async fn seed_deleting_namespace(store: &zeppelin::storage::ZeppelinStore, ns: &
         created_at: timestamp,
         updated_at: timestamp,
         state: NamespaceState::Deleting,
+        destruction_record_key: None,
         full_text_search: Default::default(),
         index_config: Some(NamespaceIndexConfig::from_indexing_config(
             &Config::default().indexing,
@@ -2330,7 +2485,7 @@ fn normalize_contract_value(
         Value::Object(object) => {
             for (key, child) in object {
                 match key.as_str() {
-                    "created_at" | "updated_at" | "revokes_at" | "expires_at" => {
+                    "created_at" | "updated_at" | "revokes_at" | "expires_at" | "released_at" => {
                         if child.is_string() {
                             *child = json!("2026-01-01T00:00:00+00:00");
                         }
@@ -2600,6 +2755,17 @@ fn assert_response_contract_shape(fixture: &Fixture) {
 }
 
 fn assert_security_admin_contract(fixture: &Fixture) {
+    if fixture.name.contains("preservation") {
+        let serialized = serde_json::to_string(&fixture.response).unwrap();
+        assert!(!serialized.contains("api_key"));
+        assert!(!serialized.contains("sha256_hex"));
+        assert!(
+            fixture.response.get("lock_id").is_some() || fixture.response.get("locks").is_some(),
+            "{} must expose lock evidence or the lock inventory",
+            fixture.name
+        );
+        return;
+    }
     assert!(
         fixture.response["policy_version"].is_u64(),
         "{} must expose its authoritative policy version",
@@ -2810,6 +2976,7 @@ impl Fixture {
         self.path
             .replace(CONTRACT_PRIMARY_KEY_ID, "{key_id}")
             .replace(CONTRACT_ROTATED_KEY_ID, "{key_id}")
+            .replace("plk_00000000000000000000000000", "{lock_id}")
             .replace("contract-main", "{ns}")
             .replace("contract-compact", "{ns}")
             .replace("contract-delete", "{ns}")

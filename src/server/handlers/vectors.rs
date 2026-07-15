@@ -1238,6 +1238,23 @@ pub async fn delete_vectors(
         }
     }
 
+    let namespace_id = NamespaceId::new(ns.clone()).map_err(|error| ApiError(error.into()))?;
+    let preservation_filter = match &selection {
+        DeleteSelection::Ids(_) => None,
+        DeleteSelection::Filter(filter) => Some(filter),
+    };
+    let guard = state
+        .security
+        .guard_vector_destruction(&namespace_id, preservation_filter)
+        .map_err(|error| ApiError(error.into()))?;
+    if guard.is_locked() {
+        audit.set_params(AuditParams::preservation_blocked(
+            crate::security::PreservationBlockedSurface::VectorDelete,
+            &guard,
+        ));
+        return Err(ApiError(SecurityError::PreservationLocked.into()));
+    }
+
     let requires_guard =
         decision.mandatory_filter.is_some() || matches!(&selection, DeleteSelection::Filter(_));
     let meta = if requires_guard {

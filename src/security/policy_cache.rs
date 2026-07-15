@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn delayed_write_through_install_uses_cas_completion_origin() {
         let now = Utc::now();
-        let initial = PolicySnapshot::from_bootstrap(&bootstrap_config(), now)
+        let initial = PolicySnapshot::from_bootstrap(&bootstrap_config(), now, false)
             .expect("unit policy must compile");
         let initial_head =
             PolicyHead::new(&initial, format!("_security/policies/{}.json", Ulid::new()))
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn regressing_authoritative_refresh_is_rejected() {
         let now = Utc::now();
-        let initial = PolicySnapshot::from_bootstrap(&bootstrap_config(), now)
+        let initial = PolicySnapshot::from_bootstrap(&bootstrap_config(), now, false)
             .expect("unit policy must compile");
         let initial_head =
             PolicyHead::new(&initial, format!("_security/policies/{}.json", Ulid::new()))

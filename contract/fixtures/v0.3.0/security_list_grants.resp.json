@@ -70,7 +70,9 @@
           "VectorDelete",
           "Query",
           "SecurityAdminRead",
-          "SecurityAdminWrite"
+          "SecurityAdminWrite",
+          "PreservationAdmin",
+          "PreservationRelease"
         ],
         "kind": "selected"
       },

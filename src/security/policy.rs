@@ -1010,6 +1010,7 @@ impl PolicySnapshot {
     pub(crate) fn from_bootstrap(
         config: &SecurityConfig,
         now: DateTime<Utc>,
+        include_preservation: bool,
     ) -> Result<Self, SecurityError> {
         if config.api_keys.is_empty() {
             return Err(SecurityError::MissingBootstrapCredentials);
@@ -1019,7 +1020,8 @@ impl PolicySnapshot {
         let mut keys = Vec::with_capacity(config.api_keys.len());
         let mut grants = Vec::new();
         for configured in &config.api_keys {
-            let (principal, key, mut key_grants) = bootstrap_key(configured, now)?;
+            let (principal, key, mut key_grants) =
+                bootstrap_key(configured, now, include_preservation)?;
             principals.push(principal);
             keys.push(key);
             grants.append(&mut key_grants);
@@ -1631,6 +1633,19 @@ impl PolicySnapshot {
         })
     }
 
+    /// Return whether any grant carries Phase 8 preservation authority.
+    #[must_use]
+    pub fn has_preservation_features(&self) -> bool {
+        self.grants.iter().any(|grant| {
+            matches!(
+                &grant.actions,
+                GrantActions::Selected { actions }
+                    if actions.contains(&Action::PreservationAdmin)
+                        || actions.contains(&Action::PreservationRelease)
+            )
+        })
+    }
+
     /// Return the number of stable principals in this snapshot.
     #[must_use]
     pub fn principal_count(&self) -> usize {
@@ -1708,6 +1723,7 @@ fn grant_scopes_overlap(left: &GrantScope, right: &GrantScope) -> bool {
 fn bootstrap_key(
     configured: &ApiKeyConfig,
     now: DateTime<Utc>,
+    include_preservation: bool,
 ) -> Result<(PolicyPrincipal, PolicyKey, Vec<PolicyGrant>), SecurityError> {
     if configured.actions.iter().any(|action| action == "*") && configured.actions.len() != 1 {
         return Err(SecurityError::InvalidPolicyRequest(
@@ -1741,9 +1757,11 @@ fn bootstrap_key(
     };
 
     let actions = if configured.actions.iter().any(|action| action == "*") {
-        GrantActions::Selected {
-            actions: Action::BOOTSTRAP_ADMIN_V1.to_vec(),
+        let mut actions = Action::BOOTSTRAP_ADMIN_V1.to_vec();
+        if include_preservation {
+            actions.extend([Action::PreservationAdmin, Action::PreservationRelease]);
         }
+        GrantActions::Selected { actions }
     } else {
         let mut actions = configured
             .actions
@@ -2070,7 +2088,7 @@ namespaces = ["*"]
             "fixed policy time must be valid",
         );
         let mut snapshot = fixture(
-            PolicySnapshot::from_bootstrap(&config.security, now),
+            PolicySnapshot::from_bootstrap(&config.security, now, false),
             "bootstrap snapshot must compile",
         );
         snapshot.grants = grants;

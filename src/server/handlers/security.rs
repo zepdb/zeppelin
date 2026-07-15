@@ -10,8 +10,8 @@ use crate::error::ZeppelinError;
 use crate::security::{
     Action, AllowDecision, ApiKeyId, AuditParams, Decision, DelegationNarrowing, FieldMask,
     GrantActions, GrantDefinition, GrantScope, KeyState, NamespaceId, PolicyGrant, PolicyPrincipal,
-    PolicyVersion, Principal, PrincipalId, PrincipalKind, ResourceRef, SecurityError,
-    SecurityOperationError, WriteConstraints,
+    PolicyVersion, PreservationLockId, PreservationLockRecord, Principal, PrincipalId,
+    PrincipalKind, ResourceRef, SecurityError, SecurityOperationError, WriteConstraints,
 };
 use crate::server::{AppState, AuditRequest};
 use crate::types::Filter;
@@ -117,6 +117,12 @@ pub struct PolicyKeyView {
     created_at: DateTime<Utc>,
     rotated_from: Option<String>,
     revokes_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+/// Fresh active preservation-lock inventory.
+pub struct ListPreservationLocksResponse {
+    locks: Vec<PreservationLockRecord>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -602,4 +608,55 @@ pub async fn get_policy(
         keys: snapshot.keys().len(),
         grants: snapshot.grants().len(),
     }))
+}
+
+/// Return the fresh S3-authoritative active preservation-lock inventory.
+pub async fn list_preservation_locks(
+    State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
+) -> Result<Json<ListPreservationLocksResponse>, ApiError> {
+    let locks = state
+        .security
+        .active_preservation_locks()
+        .map_err(|error| ApiError(error.into()))?;
+    Ok(Json(ListPreservationLocksResponse { locks }))
+}
+
+/// Create one immutable preservation lock and CAS-publish it as active.
+pub async fn create_preservation_lock(
+    State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
+    Extension(principal): Extension<Principal>,
+    Extension(audit): Extension<AuditRequest>,
+    Json(request): Json<crate::security::CreatePreservationLock>,
+) -> Result<(StatusCode, Json<PreservationLockRecord>), ApiError> {
+    let record = state
+        .security
+        .create_preservation_lock(principal.id, request)
+        .await
+        .map_err(ApiError::from)?;
+    audit.set_params(AuditParams::PreservationCreate {
+        lock_id: record.lock_id.as_str().to_string(),
+    });
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+/// Release one active lock after middleware proves a distinct approver.
+pub async fn release_preservation_lock(
+    State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
+    Extension(principal): Extension<Principal>,
+    Extension(audit): Extension<AuditRequest>,
+    Path(lock_id): Path<String>,
+) -> Result<Json<PreservationLockRecord>, ApiError> {
+    let lock_id = PreservationLockId::new(lock_id).map_err(|error| ApiError(error.into()))?;
+    let record = state
+        .security
+        .release_preservation_lock(&lock_id, principal.id)
+        .await
+        .map_err(ApiError::from)?;
+    audit.set_params(AuditParams::PreservationRelease {
+        lock_id: lock_id.as_str().to_string(),
+    });
+    Ok(Json(record))
 }

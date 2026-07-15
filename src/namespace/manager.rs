@@ -27,7 +27,10 @@
 //!                 v
 //!              active
 //!                 |
-//!                 | CAS meta.json -> deleting
+//!                 | CAS meta.json -> deleting + bind evidence key
+//!                 v
+//!       write immutable destruction evidence
+//!                 |
 //!                 v
 //!     delete manifest and namespace objects
 //!                 |
@@ -50,9 +53,12 @@
 //! 3. Read [`crate::namespace::manager::NamespaceManager::get_including_deleting`]
 //!    and [`crate::namespace::manager::NamespaceManager::list`] for cache and S3
 //!    discovery behavior.
-//! 4. Read [`crate::namespace::manager::NamespaceManager::start_delete`] and
-//!    [`crate::namespace::manager::NamespaceManager::finish_delete`] for the
-//!    resumable deletion protocol.
+//! 4. Read [`crate::namespace::manager::NamespaceManager::prepare_governed_delete`],
+//!    [`crate::namespace::manager::NamespaceManager::commit_governed_delete`],
+//!    and [`crate::namespace::manager::NamespaceManager::finish_delete`] for the
+//!    governed, evidence-producing, resumable deletion protocol. The lower-level
+//!    [`crate::namespace::manager::NamespaceManager::start_delete`] helper exists
+//!    only for managers constructed without preservation governance.
 //! 5. Finish with [`crate::namespace::manager::NamespaceManager::update_index_config`]
 //!    and the compaction-health methods for ETag-protected metadata updates.
 //!
@@ -69,6 +75,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, instrument};
 
@@ -76,6 +83,7 @@ use crate::config::IndexingConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
+use crate::security::{DecisionId, NamespaceId, PreservationService, PrincipalId, SecurityError};
 use crate::storage::{ObjectUserMetadata, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::{DistanceMetric, IndexType};
@@ -366,6 +374,9 @@ pub struct NamespaceMetadata {
     /// Lifecycle state for recoverable namespace deletion.
     #[serde(default)]
     pub state: NamespaceState,
+    /// Immutable destruction evidence committed by the governed delete protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destruction_record_key: Option<String>,
     /// Per-field full-text search configuration.
     /// Empty map means FTS is not enabled for this namespace.
     #[serde(default)]
@@ -381,6 +392,47 @@ pub struct NamespaceMetadata {
     /// objects written before incarnation IDs were introduced.
     #[serde(skip)]
     pub incarnation_id: Option<NamespaceIncarnationId>,
+}
+
+/// Immutable evidence that authorizes removal of one fenced live manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NamespaceDestructionRecord {
+    /// Namespace lifetime being destroyed.
+    pub(crate) namespace: NamespaceId,
+    /// Exact fenced manifest generation whose visibility root is removed.
+    pub(crate) manifest_version_destroyed: u64,
+    /// Exact namespace-prefix object count observed while fenced.
+    pub(crate) object_count: usize,
+    /// Exact namespace-prefix byte count observed while fenced.
+    pub(crate) byte_count: u64,
+    /// Principal that requested destruction.
+    pub(crate) actor: PrincipalId,
+    /// Distinct approval principal when the policy required one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) approver: Option<PrincipalId>,
+    /// Authorization decision bound to the destruction request.
+    pub(crate) decision_id: DecisionId,
+    /// Wall-clock evidence timestamp.
+    pub(crate) ts: DateTime<Utc>,
+}
+
+impl NamespaceDestructionRecord {
+    /// Strictly decode one governed-destruction evidence object.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_slice(bytes).map_err(|error| {
+            ZeppelinError::Serialization(format!("destruction record is invalid: {error}"))
+        })
+    }
+
+    /// Encode one governed-destruction evidence object as immutable JSON bytes.
+    pub(crate) fn to_bytes(&self) -> Result<Bytes> {
+        serde_json::to_vec(self).map(Bytes::from).map_err(|error| {
+            ZeppelinError::Serialization(format!(
+                "destruction record serialization failed: {error}"
+            ))
+        })
+    }
 }
 
 impl NamespaceMetadata {
@@ -517,6 +569,8 @@ pub struct NamespaceManager {
     registry_ttl: Duration,
     /// Explicit wall clock used only for persisted metadata stamps.
     clock: Clock,
+    /// Boot-composed preservation authority for every physical cleanup pass.
+    preservation: Option<Arc<PreservationService>>,
 }
 
 impl NamespaceManager {
@@ -568,7 +622,18 @@ impl NamespaceManager {
             registry: DashMap::new(),
             registry_ttl,
             clock,
+            preservation: None,
         }
+    }
+
+    /// Attach the preservation authority to the deepest namespace purge seam.
+    #[must_use]
+    pub fn with_preservation_service(
+        mut self,
+        preservation: Option<Arc<PreservationService>>,
+    ) -> Self {
+        self.preservation = preservation;
+        self
     }
 
     /// Creates an active vector namespace without full-text fields.
@@ -780,6 +845,7 @@ impl NamespaceManager {
             created_at: now,
             updated_at: now,
             state: NamespaceState::Creating,
+            destruction_record_key: None,
             full_text_search,
             index_config,
             compaction_health: CompactionHealth::default(),
@@ -1572,10 +1638,11 @@ impl NamespaceManager {
 
     /// Synchronously deletes a namespace through the resumable tombstone protocol.
     ///
-    /// Synchronous direct delete: flips `meta.json` to `deleting`, purges all
-    /// namespace data while keeping the tombstone, then deletes `meta.json`
-    /// last. The HTTP handler uses the same start/finish primitives but runs
-    /// the purge in a background task and returns 202.
+    /// On an explicitly ungoverned manager, synchronous direct delete flips
+    /// `meta.json` to `deleting`, purges all namespace data while keeping the
+    /// tombstone, then deletes `meta.json` last. A production manager with the
+    /// preservation service attached rejects this path before any mutation; its
+    /// HTTP handler uses governed prepare/evidence/commit primitives instead.
     ///
     /// # Parameters
     ///
@@ -1587,15 +1654,18 @@ impl NamespaceManager {
     ///
     /// # Errors
     ///
-    /// Propagates tombstone, manifest-delete, listing, object-delete, and final
-    /// metadata-delete errors. Returns namespace-delete-incomplete if an
-    /// unbounded pass unexpectedly stops early. Partial cleanup remains
-    /// resumable because `meta.json` stays in `deleting` state until the end.
+    /// Returns validation before mutation when preservation governance is
+    /// attached. Otherwise propagates tombstone, manifest-delete, listing,
+    /// object-delete, and final metadata-delete errors. Returns
+    /// namespace-delete-incomplete if an unbounded pass unexpectedly stops
+    /// early. Partial cleanup remains resumable because `meta.json` stays in
+    /// `deleting` state until the end.
     ///
     /// # Side Effects
     ///
-    /// Conditionally updates metadata, deletes the manifest and namespace
-    /// objects, removes registry state, and finally deletes the tombstone.
+    /// On an ungoverned manager, conditionally updates metadata, deletes the
+    /// manifest and namespace objects, removes registry state, and finally
+    /// deletes the tombstone. A governed-manager rejection has no side effects.
     ///
     /// # Examples
     ///
@@ -1617,9 +1687,13 @@ impl NamespaceManager {
 
     /// Marks a namespace deleting and removes its manifest visibility root.
     ///
-    /// This is phase one of deletion. The durable metadata tombstone is written
-    /// before the manifest is removed, so ordinary namespace access is rejected
-    /// before data cleanup begins.
+    /// This lower-level administrative/test helper predates governed destruction.
+    /// An explicitly ungoverned manager writes the durable metadata tombstone
+    /// before removing the manifest, so ordinary namespace access is rejected
+    /// before data cleanup begins. A production manager with preservation
+    /// attached rejects this path before tombstoning. HTTP deletion instead uses
+    /// [`Self::prepare_governed_delete`], a manifest deletion fence, durable
+    /// evidence publication, and [`Self::commit_governed_delete`].
     ///
     /// # Parameters
     ///
@@ -1632,14 +1706,16 @@ impl NamespaceManager {
     ///
     /// # Errors
     ///
-    /// Returns namespace-not-found, CAS conflict after bounded retries,
-    /// serialization, or storage errors. If manifest deletion fails, the
-    /// tombstone remains authoritative and cleanup can be retried.
+    /// Returns validation before mutation when preservation governance is
+    /// attached. Otherwise returns namespace-not-found, CAS conflict after
+    /// bounded retries, serialization, or storage errors. If manifest deletion
+    /// fails, the tombstone remains authoritative and cleanup can be retried.
     ///
     /// # Side Effects
     ///
-    /// CAS-updates `meta.json`, evicts the registry entry, deletes the manifest
-    /// if present, and logs the lifecycle transition.
+    /// On an ungoverned manager, CAS-updates `meta.json`, evicts the registry
+    /// entry, deletes the manifest if present, and logs the lifecycle transition.
+    /// A governed-manager rejection has no side effects.
     ///
     /// # Consistency
     ///
@@ -1648,18 +1724,19 @@ impl NamespaceManager {
     ///
     /// # Examples
     ///
-    /// The HTTP DELETE handler calls this phase, returns `202`, and lets a
-    /// background task continue with [`Self::finish_delete`].
+    /// Tests or explicitly ungoverned administrative callers may use this helper.
+    /// Governed HTTP deletion must use [`Self::prepare_governed_delete`].
     #[instrument(skip(self), fields(namespace = name))]
     pub async fn start_delete(&self, name: &str) -> Result<NamespaceMetadata> {
-        let meta = self.mark_deleting(name).await?;
+        if self.preservation.is_some() {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} requires governed deletion"
+            )));
+        }
+        let meta = self.mark_deleting(name, false).await?;
 
         self.registry.remove(name);
-        let manifest_key = crate::wal::Manifest::s3_key(name);
-        match self.store.delete(&manifest_key).await {
-            Ok(()) | Err(ZeppelinError::NotFound { .. }) => {}
-            Err(e) => return Err(e),
-        }
+        self.remove_live_manifest(name).await?;
         info!(
             namespace = name,
             state = NamespaceState::Deleting.as_str(),
@@ -1668,10 +1745,83 @@ impl NamespaceManager {
         Ok(meta)
     }
 
+    /// Tombstone a namespace while durably binding its destruction-record key.
+    ///
+    /// This is the first governed destruction step. It derives the immutable
+    /// evidence key from the authoritative namespace incarnation loaded in the
+    /// same CAS retry loop that publishes the tombstone. Legacy active metadata
+    /// is migrated first and then reloaded. It does not remove the live manifest.
+    pub async fn prepare_governed_delete(&self, name: &str) -> Result<NamespaceMetadata> {
+        self.mark_deleting(name, true).await
+    }
+
+    /// Remove the live manifest only after the referenced evidence exists.
+    ///
+    /// This is the governed destruction commit step. It reloads authoritative
+    /// tombstone metadata, verifies its exact evidence binding, requires the
+    /// immutable evidence object to exist, verifies that the current manifest is
+    /// the expected fenced generation, and refreshes preservation authority
+    /// immediately before ending manifest visibility.
+    pub async fn commit_governed_delete(
+        &self,
+        name: &str,
+        destruction_record_key: &str,
+        expected_manifest_version: u64,
+    ) -> Result<()> {
+        let meta = self.read_metadata_from_s3(name).await?;
+        if meta.state != NamespaceState::Deleting
+            || meta.destruction_record_key.as_deref() != Some(destruction_record_key)
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} destruction record is not bound to its tombstone"
+            )));
+        }
+        let evidence =
+            NamespaceDestructionRecord::from_bytes(&self.store.get(destruction_record_key).await?)?;
+        let namespace = NamespaceId::new(name.to_string())?;
+        if evidence.namespace != namespace
+            || evidence.manifest_version_destroyed != expected_manifest_version
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} destruction evidence does not match the governed commit"
+            )));
+        }
+        if let Some(manifest) = crate::wal::Manifest::read(&self.store, name).await? {
+            manifest.require_destruction_fence(
+                name,
+                destruction_record_key,
+                expected_manifest_version,
+            )?;
+        }
+        if let Some(preservation) = &self.preservation {
+            preservation.refresh_once().await?;
+            let guard = preservation.guard_namespace(&namespace)?;
+            if guard.is_locked() {
+                preservation
+                    .record_namespace_delete_deferral(&namespace, &guard)
+                    .await?;
+                return Err(SecurityError::PreservationLocked.into());
+            }
+        }
+        self.registry.remove(name);
+        self.remove_live_manifest(name).await
+    }
+
+    async fn remove_live_manifest(&self, name: &str) -> Result<()> {
+        let manifest_key = crate::wal::Manifest::s3_key(name);
+        match self.store.delete(&manifest_key).await {
+            Ok(()) | Err(ZeppelinError::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Resumes bounded object cleanup and deletes the tombstone only when safe.
     ///
     /// ```text
     /// require meta.json state = deleting
+    ///                 |
+    ///                 v
+    /// require fresh unlocked preservation state + bound evidence
     ///                 |
     ///                 v
     /// delete prefix except meta.json ---- budget ends --> incomplete outcome
@@ -1697,9 +1847,10 @@ impl NamespaceManager {
     /// # Errors
     ///
     /// Returns namespace-not-found if no tombstone exists, validation if the
-    /// namespace is still active, namespace-delete-incomplete if verification
-    /// finds remaining objects, or storage/listing failures. Partial deletion
-    /// may already have occurred.
+    /// namespace is still active or governed evidence is missing, preservation
+    /// locked if a fresh applicable lock exists, namespace-delete-incomplete if
+    /// verification finds remaining objects, or storage/listing failures.
+    /// Partial deletion may already have occurred.
     ///
     /// # Side Effects
     ///
@@ -1708,9 +1859,11 @@ impl NamespaceManager {
     ///
     /// # Consistency
     ///
-    /// Prefix deletion alone is not trusted as proof of completion. The method
-    /// relists authoritative storage and preserves the tombstone whenever any
-    /// non-metadata key remains.
+    /// Prefix deletion alone is not trusted as proof of completion. With
+    /// governance attached, each pass first consults fresh S3-authoritative lock
+    /// state and verifies the tombstone's immutable evidence reference. The
+    /// method relists authoritative storage and preserves the tombstone whenever
+    /// any non-metadata key remains.
     ///
     /// # Performance
     ///
@@ -1733,6 +1886,38 @@ impl NamespaceManager {
         if meta.state != NamespaceState::Deleting {
             return Err(ZeppelinError::Validation(format!(
                 "namespace {name} is not marked deleting"
+            )));
+        }
+        if let Some(preservation) = &self.preservation {
+            let namespace = NamespaceId::new(name.to_string())?;
+            preservation.refresh_once().await?;
+            let guard = preservation.guard_namespace(&namespace)?;
+            if guard.is_locked() {
+                preservation
+                    .record_namespace_delete_deferral(&namespace, &guard)
+                    .await?;
+                return Err(SecurityError::PreservationLocked.into());
+            }
+            let evidence_key = meta.destruction_record_key.as_deref().ok_or_else(|| {
+                ZeppelinError::Validation(format!(
+                    "namespace {name} deletion tombstone has no destruction evidence reference"
+                ))
+            })?;
+            let evidence =
+                NamespaceDestructionRecord::from_bytes(&self.store.get(evidence_key).await?)?;
+            if evidence.namespace != namespace {
+                return Err(ZeppelinError::Validation(format!(
+                    "namespace {name} destruction evidence does not match its tombstone"
+                )));
+            }
+        }
+
+        if crate::wal::Manifest::read(&self.store, name)
+            .await?
+            .is_some()
+        {
+            return Err(ZeppelinError::Validation(format!(
+                "namespace {name} cleanup requires governed manifest removal"
             )));
         }
 
@@ -2004,17 +2189,62 @@ impl NamespaceManager {
     ///
     /// Each retry reloads S3 and its ETag. The process registry is refreshed
     /// only with metadata read from or successfully written to S3.
-    async fn mark_deleting(&self, name: &str) -> Result<NamespaceMetadata> {
+    async fn mark_deleting(&self, name: &str, governed: bool) -> Result<NamespaceMetadata> {
         let key = NamespaceMetadata::s3_key(name);
-        for _ in 0..2 {
+        for _ in 0..8 {
             let (mut meta, etag) = self.read_metadata_versioned(name).await?;
-            if meta.state == NamespaceState::Deleting {
-                return Ok(meta);
+            if governed && meta.incarnation_id.is_none() {
+                if meta.state == NamespaceState::Deleting {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "deleting namespace {name} has no incarnation for governed destruction"
+                    )));
+                }
+                self.read_or_migrate_namespace_incarnation(name).await?;
+                continue;
             }
 
-            meta.state = NamespaceState::Deleting;
+            let governed_key = if governed {
+                let incarnation = meta.incarnation_id.as_ref().ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "authoritative namespace metadata {key} omitted its incarnation"
+                    ))
+                })?;
+                Some(format!(
+                    "_audit/destruction/{}.json",
+                    incarnation.as_uuid().simple()
+                ))
+            } else {
+                None
+            };
+
+            if meta.state == NamespaceState::Deleting {
+                match (&meta.destruction_record_key, &governed_key) {
+                    (Some(existing), Some(expected)) if existing != expected => {
+                        return Err(ZeppelinError::Validation(format!(
+                            "namespace {name} deletion is bound to a different destruction record"
+                        )));
+                    }
+                    (Some(_), Some(_)) | (None, None) => return Ok(meta),
+                    (Some(_), None) => {
+                        return Err(ZeppelinError::Validation(format!(
+                            "namespace {name} requires governed deletion"
+                        )));
+                    }
+                    (None, Some(expected)) => {
+                        meta.destruction_record_key = Some(expected.clone());
+                    }
+                }
+            } else {
+                meta.state = NamespaceState::Deleting;
+                meta.destruction_record_key = governed_key;
+            }
+
             meta.updated_at = self.clock.now();
-            let etag = etag.unwrap_or_default();
+            let etag = etag.filter(|value| !value.is_empty()).ok_or_else(|| {
+                ZeppelinError::Serialization(format!(
+                    "authoritative namespace metadata {key} has no non-empty ETag required for deletion"
+                ))
+            })?;
             match self.put_metadata_if_match(&key, &meta, &etag, name).await {
                 Ok(_) => {
                     self.insert_registry(meta.clone());
@@ -2243,6 +2473,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             state: NamespaceState::Active,
+            destruction_record_key: None,
             full_text_search: std::collections::HashMap::new(),
             index_config: None,
             compaction_health: CompactionHealth::default(),

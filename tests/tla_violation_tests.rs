@@ -158,7 +158,7 @@ async fn test_tla_concurrent_namespace_create() {
 /// ## Fix
 /// `WalWriter::append_with_lease()` now returns `ManifestNotFound` when
 /// `Manifest::read_versioned()` returns `None`, instead of falling back to
-/// `Manifest::default()` with `ManifestVersion(None)` (unconditional PUT).
+/// `Manifest::default()` with an unversioned capability (unconditional PUT).
 /// This is correct because `NamespaceManager::create()` always writes an
 /// initial manifest — if the manifest doesn't exist, the namespace was
 /// either never created or was deleted. In both cases, the writer must not

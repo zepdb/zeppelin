@@ -436,6 +436,8 @@ impl AllowDecision {
                 | Action::SecurityAdminRead
                 | Action::SecurityAdminWrite
                 | Action::CredentialDelegate
+                | Action::PreservationAdmin
+                | Action::PreservationRelease
         ) {
             vec![Obligation::DurableAudit]
         } else {
@@ -482,7 +484,7 @@ mod tests {
     use crate::{security::Action, types::AttributeValue};
 
     #[test]
-    fn durable_audit_obligation_inventory_is_exact_through_phase_seven() {
+    fn durable_audit_obligation_inventory_is_exact_through_phase_eight() {
         let durable = Action::ALL
             .into_iter()
             .filter(|action| {
@@ -503,6 +505,8 @@ mod tests {
                 Action::SecurityAdminRead,
                 Action::SecurityAdminWrite,
                 Action::CredentialDelegate,
+                Action::PreservationAdmin,
+                Action::PreservationRelease,
             ]
         );
     }

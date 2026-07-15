@@ -58,11 +58,15 @@ pub enum Action {
     AttributeAdmin,
     /// Mint one strictly narrowed, short-lived delegated credential.
     CredentialDelegate,
+    /// Create and inspect generic preservation locks.
+    PreservationAdmin,
+    /// Release one preservation lock under two-person approval.
+    PreservationRelease,
 }
 
 impl Action {
     /// Every action in declaration order for completeness tests and parsing.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::SystemRead,
         Self::MetricsRead,
         Self::RuntimeConfigRead,
@@ -86,6 +90,8 @@ impl Action {
         Self::SecurityAdminWrite,
         Self::AttributeAdmin,
         Self::CredentialDelegate,
+        Self::PreservationAdmin,
+        Self::PreservationRelease,
     ];
 
     /// Frozen Phase 3 wildcard expansion used by persisted `GrantActions::All`.
@@ -201,6 +207,8 @@ impl Action {
             Self::SecurityAdminWrite => "SecurityAdminWrite",
             Self::AttributeAdmin => "AttributeAdmin",
             Self::CredentialDelegate => "CredentialDelegate",
+            Self::PreservationAdmin => "PreservationAdmin",
+            Self::PreservationRelease => "PreservationRelease",
         }
     }
 
@@ -213,6 +221,7 @@ impl Action {
                 | Self::SnapshotDelete
                 | Self::VectorDelete
                 | Self::SecurityAdminWrite
+                | Self::PreservationRelease
         )
     }
 
@@ -259,7 +268,7 @@ mod tests {
     use super::Action;
 
     #[test]
-    fn action_inventory_has_exact_phase_seven_variants() {
+    fn action_inventory_has_exact_phase_eight_variants() {
         let names = Action::ALL.map(Action::as_str).to_vec();
 
         assert_eq!(
@@ -288,6 +297,8 @@ mod tests {
                 "SecurityAdminWrite",
                 "AttributeAdmin",
                 "CredentialDelegate",
+                "PreservationAdmin",
+                "PreservationRelease",
             ]
         );
     }
@@ -315,6 +326,10 @@ mod tests {
         assert!(Action::POLICY_ALL_V1.contains(&Action::SecurityAdminWrite));
         assert!(!Action::POLICY_SAFE_ALL_V2.contains(&Action::CredentialDelegate));
         assert!(!Action::POLICY_SAFE_ALL_V2.contains(&Action::SecurityAdminWrite));
+        assert!(!Action::POLICY_ALL_V1.contains(&Action::PreservationAdmin));
+        assert!(!Action::POLICY_ALL_V1.contains(&Action::PreservationRelease));
+        assert!(!Action::POLICY_SAFE_ALL_V2.contains(&Action::PreservationAdmin));
+        assert!(!Action::POLICY_SAFE_ALL_V2.contains(&Action::PreservationRelease));
         assert_eq!(Action::POLICY_ALL_V1.len(), 21);
         assert_eq!(Action::POLICY_SAFE_ALL_V2.len(), 20);
     }

@@ -117,6 +117,18 @@ pub enum AuditOutcome {
     },
 }
 
+/// Destructive surface blocked by one or more preservation locks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreservationBlockedSurface {
+    /// Namespace lifecycle deletion.
+    NamespaceDelete,
+    /// Named snapshot deletion.
+    SnapshotDelete,
+    /// Vector ID or filter tombstoning.
+    VectorDelete,
+}
+
 impl AuditOutcome {
     /// Return the bounded label used by audit metrics.
     #[must_use]
@@ -351,6 +363,23 @@ pub enum AuditParams {
         /// Mandatory operator-supplied purpose.
         purpose: String,
     },
+    /// One preservation lock was created.
+    PreservationCreate {
+        /// Stable lock identity; reason text is deliberately excluded.
+        lock_id: String,
+    },
+    /// One preservation lock was released through two-person authorization.
+    PreservationRelease {
+        /// Stable lock identity.
+        lock_id: String,
+    },
+    /// A destructive HTTP request was blocked before domain mutation.
+    PreservationBlocked {
+        /// Exact destructive surface.
+        surface: PreservationBlockedSurface,
+        /// Stable active lock identities; never returned in the HTTP error.
+        lock_ids: Vec<String>,
+    },
     /// The process booted with explicit unsafe-open security mode.
     OpenUnsafeBoot,
     /// The process booted with a verified but expired license.
@@ -358,6 +387,22 @@ pub enum AuditParams {
 }
 
 impl AuditParams {
+    /// Construct lock-bearing evidence for a blocked destructive request.
+    #[must_use]
+    pub fn preservation_blocked(
+        surface: PreservationBlockedSurface,
+        guard: &super::PreservationGuard,
+    ) -> Self {
+        Self::PreservationBlocked {
+            surface,
+            lock_ids: guard
+                .lock_ids()
+                .iter()
+                .map(|lock_id| lock_id.as_str().to_string())
+                .collect(),
+        }
+    }
+
     /// Construct vector-delete parameters while enforcing identifier redaction.
     #[must_use]
     pub fn vector_delete(namespace: NamespaceId, ids: &[String]) -> Self {

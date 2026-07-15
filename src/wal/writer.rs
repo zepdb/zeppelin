@@ -867,7 +867,7 @@ impl WalWriter {
                 .await
             {
                 Ok(new_version) => {
-                    let next_memo = if new_version.0.is_some() {
+                    let next_memo = if new_version.has_e_tag() {
                         Some((manifest.clone(), new_version))
                     } else {
                         None

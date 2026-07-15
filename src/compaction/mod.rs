@@ -204,6 +204,7 @@ pub mod background;
 pub mod gc;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
@@ -223,6 +224,7 @@ use crate::index::ivf_flat::membership::{
     build_membership_artifact, deserialize_membership, MembershipData,
 };
 use crate::namespace::manager::{NamespaceMetadata, NamespaceState};
+use crate::security::{NamespaceId, PreservationService};
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
 use crate::types::VectorEntry;
@@ -462,6 +464,8 @@ pub struct Compactor {
     upload_window: Duration,
     /// Explicit wall clock used for manifest stamps and GC orchestration.
     clock: Clock,
+    /// Fresh fail-closed preservation authority, when licensed at boot.
+    preservation: Option<Arc<PreservationService>>,
     /// Test-only hook: artificial delay injected after index build and
     /// before the final manifest CAS loop, simulating a compaction whose
     /// build phase outlasts the lease duration. Always `None` in production
@@ -588,8 +592,25 @@ impl Compactor {
             indexing_config,
             upload_window,
             clock,
+            preservation: None,
             test_pre_cas_delay: None,
         }
+    }
+
+    /// Attach the boot-composed preservation authority to destructive work.
+    #[must_use]
+    pub fn with_preservation_service(
+        mut self,
+        preservation: Option<Arc<PreservationService>>,
+    ) -> Self {
+        self.preservation = preservation;
+        self
+    }
+
+    /// Borrow the preservation authority shared with background GC.
+    #[must_use]
+    pub(crate) fn preservation_service(&self) -> Option<&Arc<PreservationService>> {
+        self.preservation.as_ref()
     }
 
     /// Injects a test-only delay between artifact construction and manifest CAS.
@@ -1117,6 +1138,26 @@ impl Compactor {
         fragment_cache: FragmentCachePolicy<'_>,
     ) -> Result<CompactionResult> {
         let start = std::time::Instant::now();
+
+        if let Some(preservation) = &self.preservation {
+            let namespace_id = NamespaceId::new(namespace.to_string())?;
+            let guard = preservation.guard_namespace(&namespace_id)?;
+            if guard.is_locked() {
+                preservation
+                    .record_maintenance_deferral(true, &namespace_id, &guard)
+                    .await?;
+                info!(
+                    lock_count = guard.lock_ids().len(),
+                    "compaction_deferred_preservation"
+                );
+                return Ok(CompactionResult {
+                    segment_id: None,
+                    vectors_compacted: 0,
+                    fragments_removed: 0,
+                    old_segment_removed: None,
+                });
+            }
+        }
 
         let processed_deletes: HashSet<String> = HashSet::new();
 
@@ -4313,6 +4354,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             state: NamespaceState::Active,
+            destruction_record_key: None,
             full_text_search: HashMap::new(),
             index_config: None,
             compaction_health: CompactionHealth::default(),

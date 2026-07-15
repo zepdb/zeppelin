@@ -18,9 +18,7 @@ use std::time::Duration;
 
 use zeppelin::error::ZeppelinError;
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::wal::{
-    Manifest, ManifestAppendGuard, ManifestVersion, WalFragment, WalReader, WalWriter,
-};
+use zeppelin::wal::{Manifest, ManifestAppendGuard, WalFragment, WalReader, WalWriter};
 
 /// Object-store decorator that replaces the ETag on one GET response.
 ///
@@ -119,16 +117,21 @@ async fn test_fragment_serialize_deserialize_roundtrip() {
     assert_eq!(restored.checksum, fragment.checksum);
 }
 
-#[test]
-fn guarded_append_rejects_a_legacy_unbound_manifest() {
-    let error = ManifestAppendGuard::new(
-        "legacy-namespace",
-        &Manifest::new(),
-        ManifestVersion(Some("legacy-etag".to_string())),
-    )
-    .expect_err("an unbound pre-upgrade manifest must fail loud");
+#[tokio::test]
+async fn guarded_append_rejects_a_legacy_unbound_manifest() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("legacy-unbound-append-guard");
+    let mut manifest = Manifest::new();
+    manifest.write(&harness.store, &namespace).await.unwrap();
+    let (manifest, version) = Manifest::read_versioned(&harness.store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    let error = ManifestAppendGuard::new(&namespace, &manifest, version)
+        .expect_err("an unbound pre-upgrade manifest must fail loud");
     assert!(matches!(error, ZeppelinError::Index(_)));
     assert!(error.to_string().contains("incarnation-bound manifest"));
+    harness.cleanup().await;
 }
 
 #[tokio::test]

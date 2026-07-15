@@ -395,7 +395,8 @@ impl ManifestCache {
     /// # Examples
     ///
     /// A write-through entry returns a manifest paired with
-    /// `ManifestVersion(None)`, causing strong reads to perform a full fetch.
+    /// an unversioned manifest capability, causing strong reads to perform a
+    /// full fetch.
     fn cached_manifest(&self, namespace: &str) -> Option<(Manifest, ManifestVersion)> {
         self.entries
             .get(namespace)
@@ -477,7 +478,7 @@ impl ManifestCache {
         } else {
             Manifest::read_versioned(store, namespace)
                 .await?
-                .unwrap_or_else(|| (Manifest::default(), ManifestVersion(None)))
+                .unwrap_or_else(|| (Manifest::default(), ManifestVersion::unversioned()))
         };
         #[cfg(test)]
         self.wait_before_remote_replacement().await;
@@ -760,7 +761,7 @@ impl ManifestCache {
                 .await;
         }
 
-        let Some(etag) = cached_version.0 else {
+        let Some(etag) = cached_version.into_e_tag() else {
             return self
                 .fetch_and_cache(
                     store,
@@ -794,13 +795,14 @@ impl ManifestCache {
         match conditional {
             Some((data, next_etag)) => {
                 let manifest = Manifest::from_bytes_for_namespace(&data, namespace)?;
+                let version = ManifestVersion::for_manifest(next_etag, &manifest);
                 #[cfg(test)]
                 self.wait_before_remote_replacement().await;
                 let now = Instant::now();
                 self.cache_remote_manifest(
                     namespace,
                     manifest,
-                    ManifestVersion(next_etag),
+                    version,
                     RemoteReplacementFence::for_cached(
                         required,
                         Some(&cached_manifest),
@@ -906,7 +908,7 @@ impl ManifestCache {
         let candidate_position = ManifestPosition::of(&manifest);
         let candidate = CachedManifest {
             manifest,
-            version: ManifestVersion(None),
+            version: ManifestVersion::unversioned(),
             fetched_at: Instant::now(),
             verified_at: None,
         };

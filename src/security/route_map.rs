@@ -118,6 +118,21 @@ pub static ROUTE_ACTIONS: &[RouteAction] = &[
         class: RouteClass::Protected(Action::CredentialDelegate),
     },
     RouteAction {
+        method: Method::GET,
+        path: "/v1/security/preservation",
+        class: RouteClass::Protected(Action::PreservationAdmin),
+    },
+    RouteAction {
+        method: Method::POST,
+        path: "/v1/security/preservation",
+        class: RouteClass::Protected(Action::PreservationAdmin),
+    },
+    RouteAction {
+        method: Method::POST,
+        path: "/v1/security/preservation/:lock_id/release",
+        class: RouteClass::Protected(Action::PreservationRelease),
+    },
+    RouteAction {
         method: Method::POST,
         path: "/v1/namespaces",
         class: RouteClass::Protected(Action::NamespaceCreate),
@@ -258,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn security_route_inventory_is_exact_through_phase_seven() {
+    fn security_route_inventory_is_exact_through_phase_eight() {
         let routes = ROUTE_ACTIONS
             .iter()
             .filter(|entry| entry.path.starts_with("/v1/security"))
@@ -288,6 +303,13 @@ mod tests {
                 ("DELETE", "/v1/security/grants", "SecurityAdminWrite"),
                 ("GET", "/v1/security/policy", "SecurityAdminRead"),
                 ("POST", "/v1/security/tokens", "CredentialDelegate"),
+                ("GET", "/v1/security/preservation", "PreservationAdmin"),
+                ("POST", "/v1/security/preservation", "PreservationAdmin"),
+                (
+                    "POST",
+                    "/v1/security/preservation/:lock_id/release",
+                    "PreservationRelease"
+                ),
             ]
         );
     }

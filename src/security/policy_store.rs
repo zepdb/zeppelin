@@ -141,7 +141,12 @@ impl PolicyStore {
             Err(error) => return Err(error),
         };
         policy = self.ensure_phase_seven_migrated(policy, now).await?;
-        if bootstrap_config_drifted(config, policy.snapshot(), now)? {
+        if bootstrap_config_drifted(
+            config,
+            policy.snapshot(),
+            now,
+            self.entitlements.has(Feature::Preservation),
+        )? {
             tracing::warn!(
                 policy_version = policy.snapshot().version().get(),
                 configured_bootstrap_key_count = config.api_keys.len(),
@@ -361,7 +366,11 @@ impl PolicyStore {
                 Err(error) => Err(error),
             };
         }
-        let snapshot = PolicySnapshot::from_bootstrap(config, now)?;
+        let snapshot = PolicySnapshot::from_bootstrap(
+            config,
+            now,
+            self.entitlements.has(super::Feature::Preservation),
+        )?;
         snapshot.validate_for_use()?;
         self.validate_entitlements(&snapshot)?;
         let object_key = format!("{POLICY_ROOT}/policies/{}.json", Ulid::new());
@@ -410,6 +419,9 @@ impl PolicyStore {
         if snapshot.has_delegation_features() && !self.entitlements.has(Feature::Delegation) {
             return Err(SecurityError::FeatureRequired(Feature::Delegation).into());
         }
+        if snapshot.has_preservation_features() && !self.entitlements.has(Feature::Preservation) {
+            return Err(SecurityError::FeatureRequired(Feature::Preservation).into());
+        }
         if self
             .entitlements
             .limits()
@@ -426,6 +438,7 @@ fn bootstrap_config_drifted(
     config: &SecurityConfig,
     authoritative: &PolicySnapshot,
     now: DateTime<Utc>,
+    include_preservation: bool,
 ) -> Result<bool> {
     if config.api_keys.is_empty() {
         return Ok(!authoritative.keys().is_empty()
@@ -439,7 +452,7 @@ fn bootstrap_config_drifted(
         .map(super::PolicyKey::created_at)
         .min()
         .unwrap_or(now);
-    let configured = PolicySnapshot::from_bootstrap(config, comparison_time)?;
+    let configured = PolicySnapshot::from_bootstrap(config, comparison_time, include_preservation)?;
     Ok(normalized_bootstrap_semantics(&configured)?
         != normalized_bootstrap_semantics(authoritative)?)
 }

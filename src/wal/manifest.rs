@@ -58,12 +58,11 @@
 //!
 //! [`Manifest::write_conditional`][crate::wal::manifest::Manifest::write_conditional]
 //! protects updates to an existing manifest.
-//! [`Manifest::write`][crate::wal::manifest::Manifest::write] is deliberately
-//! unconditional and is used for bootstrap, cloning, and controlled setup
-//! paths; it must not be mistaken for a stale-writer defense. A missing ETag in
-//! [`ManifestVersion`][crate::wal::manifest::ManifestVersion] likewise selects
-//! an unconditional first write, so update paths must not manufacture
-//! `ManifestVersion(None)` after a namespace has existed.
+//! [`Manifest::write`][crate::wal::manifest::Manifest::write] safely chooses
+//! create-only publication for absent state or ETag CAS for existing state
+//! without overwriting a concurrent writer. A missing ETag in
+//! [`ManifestVersion`][crate::wal::manifest::ManifestVersion] is never treated
+//! as permission to overwrite an existing namespace.
 //!
 //! ## Reading map
 //!
@@ -135,7 +134,7 @@ use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
-use crate::storage::{ListedObject, StorageVersion, ZeppelinStore};
+use crate::storage::{CreateOnlyOutcome, ListedObject, StorageVersion, ZeppelinStore};
 
 /// Prefix byte identifying Zeppelin's current MessagePack manifest encoding.
 ///
@@ -572,10 +571,23 @@ pub struct Manifest {
     /// byte-identical generation/ETag as authority for work derived from the old
     /// namespace lifetime.
     ///
-    /// NOTE: this field must stay last because MessagePack encodes structs as
-    /// positional arrays.
+    /// NOTE: retain this field's existing position; MessagePack encodes structs
+    /// as positional arrays, so new persisted fields append after existing ones.
     #[serde(default)]
     namespace_incarnation: Option<ManifestNamespaceIncarnation>,
+    /// Immutable governed-destruction fence bound to this namespace lifetime.
+    ///
+    /// The fence is CAS-published before destruction evidence is finalized.
+    /// Normal manifest writers reject a fenced base, while writers holding an
+    /// older ETag lose to the fence CAS. This field must remain last because
+    /// MessagePack encodes structs as positional arrays.
+    #[serde(default)]
+    deletion_fence: Option<ManifestDeletionFence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManifestDeletionFence {
+    destruction_record_key: String,
 }
 
 /// Location of one immutable, addressable historical manifest generation.
@@ -715,6 +727,7 @@ impl Manifest {
             version: 0,
             namespace: None,
             namespace_incarnation: None,
+            deletion_fence: None,
         }
     }
 
@@ -816,6 +829,7 @@ impl Manifest {
         self.version = 0;
         self.namespace = None;
         self.namespace_incarnation = None;
+        self.deletion_fence = None;
     }
 
     /// Adopts the exact empty target generation used as a clone-publication CAS base.
@@ -832,7 +846,11 @@ impl Manifest {
         target_incarnation: uuid::Uuid,
         target_base: &Manifest,
     ) -> Result<()> {
-        if self.version != 0 || self.namespace.is_some() || self.namespace_incarnation.is_some() {
+        if self.version != 0
+            || self.namespace.is_some()
+            || self.namespace_incarnation.is_some()
+            || self.deletion_fence.is_some()
+        {
             return Err(ZeppelinError::Serialization(
                 "clone candidate must clear source namespace identity before publication"
                     .to_string(),
@@ -844,6 +862,7 @@ impl Manifest {
             || !target_base.segments.is_empty()
             || target_base.active_segment.is_some()
             || !target_base.pending_deletes.is_empty()
+            || target_base.deletion_fence.is_some()
         {
             return Err(ZeppelinError::ManifestConflict {
                 namespace: target_namespace.to_string(),
@@ -1340,6 +1359,11 @@ impl Manifest {
                 )));
             }
         }
+        if let Some(fence) = &self.deletion_fence {
+            validate_destruction_record_key(&fence.destruction_record_key).map_err(|error| {
+                ZeppelinError::Serialization(format!("manifest deletion fence is invalid: {error}"))
+            })?;
+        }
         Ok(())
     }
 
@@ -1382,13 +1406,14 @@ impl Manifest {
         }
     }
 
-    /// Publishes this candidate with an unconditional live-manifest PUT.
+    /// Publishes this candidate without overwriting a concurrent live manifest.
     ///
     /// The method first reads the current live generation, chooses one greater
     /// than both that value and `self.version`, writes the corresponding history
-    /// snapshot, and finally writes the live object. Use
-    /// [`Manifest::write_conditional`] for normal updates that must reject stale
-    /// writers.
+    /// snapshot, and finally publishes the live object. Existing manifests use
+    /// the ETag from the discovery read; absent manifests use create-only PUT.
+    /// Use [`Manifest::write_conditional`] when the caller already holds a
+    /// versioned read capability.
     ///
     /// # Parameters
     ///
@@ -1403,21 +1428,20 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// Returns on read, generation overflow, serialization, history, or live PUT
-    /// failure. A history object can already exist if the final live PUT fails;
-    /// `self.version` remains unchanged so a retry can reconcile that orphan.
+    /// Returns on read, missing ETag, generation overflow, serialization,
+    /// history, live PUT, or concurrent-publication conflict. A history object
+    /// can already exist if the final live PUT fails; `self.version` remains
+    /// unchanged so a retry can reconcile that orphan.
     ///
     /// # Side Effects
     ///
     /// Performs one generation-discovery GET, at least one history operation,
-    /// and one unconditional live-manifest PUT on the success path.
+    /// and one conditional or create-only live-manifest PUT on the success path.
     ///
     /// # Consistency
     ///
-    /// This is not compare-and-swap. Concurrent callers can overwrite each
-    /// other's content even though the generation is advanced. Production
-    /// mutation paths should pair a fresh ETag with
-    /// [`Manifest::write_conditional`].
+    /// A concurrent fence, deletion, or publication after the discovery GET
+    /// makes the final PUT fail instead of overwriting or resurrecting state.
     ///
     /// # Examples
     ///
@@ -1425,10 +1449,24 @@ impl Manifest {
     /// fails, the live manifest is untouched. If the later live PUT fails,
     /// history generation 1 may exist without being authoritative.
     pub async fn write(&mut self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
+        if self.deletion_fence.is_some() {
+            return Err(ZeppelinError::NamespaceDeleting {
+                namespace: namespace.to_string(),
+            });
+        }
         let key = Self::s3_key(namespace);
-        let current_version = Self::read(store, namespace)
-            .await?
-            .map_or(0, |manifest| manifest.version());
+        let current = Self::read_versioned(store, namespace).await?;
+        if current
+            .as_ref()
+            .is_some_and(|(manifest, _)| manifest.deletion_fence.is_some())
+        {
+            return Err(ZeppelinError::NamespaceDeleting {
+                namespace: namespace.to_string(),
+            });
+        }
+        let current_version = current
+            .as_ref()
+            .map_or(0, |(manifest, _)| manifest.version());
         let base_version = self.version.max(current_version);
         let mut committed = self.clone();
         committed.version = Self::checked_next_version(base_version)?;
@@ -1442,7 +1480,20 @@ impl Manifest {
             ReferencedHistoryConflict::Serialization,
         )
         .await?;
-        store.put(&key, data).await?;
+        match current {
+            Some((_, version)) => {
+                let etag = version.require_etag(namespace, "manifest recovery write")?;
+                store.put_if_match(&key, data, etag, namespace).await?;
+            }
+            None => match store.put_create_outcome(&key, data).await? {
+                CreateOnlyOutcome::Created { .. } => {}
+                CreateOnlyOutcome::AlreadyExists => {
+                    return Err(ZeppelinError::ManifestConflict {
+                        namespace: namespace.to_string(),
+                    });
+                }
+            },
+        }
         *self = committed;
         Ok(())
     }
@@ -1456,8 +1507,8 @@ impl Manifest {
     ///
     /// # Returns
     ///
-    /// `Some((manifest, ManifestVersion(etag)))` when present, including a
-    /// possibly absent ETag as reported by the backend, or `None` for not found.
+    /// `Some((manifest, version))` when present, binding the backend ETag and
+    /// deletion-fence state from that same read, or `None` for not found.
     ///
     /// # Errors
     ///
@@ -1487,7 +1538,8 @@ impl Manifest {
         match store.get_with_meta(&key).await {
             Ok((data, etag)) => {
                 let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
-                Ok(Some((manifest, ManifestVersion(etag))))
+                let version = ManifestVersion::for_manifest(etag, &manifest);
+                Ok(Some((manifest, version)))
             }
             Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(None),
             Err(e) => Err(e),
@@ -1507,7 +1559,8 @@ impl Manifest {
         let key = Self::s3_key(namespace);
         let (data, etag) = store.get_with_meta(&key).await?;
         let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
-        Ok((manifest, ManifestVersion(etag)))
+        let version = ManifestVersion::for_manifest(etag, &manifest);
+        Ok((manifest, version))
     }
 
     /// Reads one authoritative manifest and binds a legacy generation to its
@@ -1581,15 +1634,14 @@ impl Manifest {
     ///
     /// - `store`: Borrowed storage abstraction configured for conditional PUT.
     /// - `namespace`: Namespace whose live manifest is being replaced.
-    /// - `version`: ETag returned with the base manifest. `None` selects an
-    ///   unconditional first-write path and must not be used to resurrect a
-    ///   deleted namespace.
+    /// - `version`: ETag returned with the base manifest. `None` permits only a
+    ///   create-only first write and cannot overwrite or resurrect a namespace.
     ///
     /// # Returns
     ///
     /// The new live-object ETag after the conditional PUT succeeds;
     /// `self.version` then advances by exactly one. Backends that omit an ETag
-    /// produce `ManifestVersion(None)` without fabricating a CAS capability.
+    /// produce an unversioned result without fabricating a CAS capability.
     ///
     /// # Errors
     ///
@@ -1601,7 +1653,7 @@ impl Manifest {
     /// # Side Effects
     ///
     /// Creates or reconciles the immutable history object before attempting one
-    /// conditional live PUT (or an unconditional PUT when the ETag is absent).
+    /// ETag-conditional live PUT, or a create-only PUT when the ETag is absent.
     ///
     /// # Consistency
     ///
@@ -1628,6 +1680,21 @@ impl Manifest {
         namespace: &str,
         version: &ManifestVersion,
     ) -> Result<ManifestVersion> {
+        if self.deletion_fence.is_some() || version.deletion_fenced {
+            return Err(ZeppelinError::NamespaceDeleting {
+                namespace: namespace.to_string(),
+            });
+        }
+        self.write_conditional_candidate(store, namespace, version)
+            .await
+    }
+
+    async fn write_conditional_candidate(
+        &mut self,
+        store: &ZeppelinStore,
+        namespace: &str,
+        version: &ManifestVersion,
+    ) -> Result<ManifestVersion> {
         let key = Self::s3_key(namespace);
         let next_version = self.next_committed_version()?;
         let mut committed = self.clone();
@@ -1642,12 +1709,80 @@ impl Manifest {
             ReferencedHistoryConflict::ManifestConflict,
         )
         .await?;
-        let new_etag = match &version.0 {
-            Some(etag) => store.put_if_match(&key, data, etag, namespace).await,
-            None => store.put(&key, data).await,
-        }?;
+        let new_etag = match &version.e_tag {
+            Some(etag) => store.put_if_match(&key, data, etag, namespace).await?,
+            None => match store.put_create_outcome(&key, data).await? {
+                CreateOnlyOutcome::Created { e_tag } => e_tag,
+                CreateOnlyOutcome::AlreadyExists => {
+                    return Err(ZeppelinError::ManifestConflict {
+                        namespace: namespace.to_string(),
+                    });
+                }
+            },
+        };
+        let new_version = ManifestVersion::for_manifest(new_etag, &committed);
         *self = committed;
-        Ok(ManifestVersion(new_etag))
+        Ok(new_version)
+    }
+
+    /// CAS-publish the governed-destruction fence and return its exact manifest.
+    pub(crate) async fn fence_for_destruction(
+        store: &ZeppelinStore,
+        namespace: &str,
+        destruction_record_key: &str,
+    ) -> Result<Self> {
+        const MAX_FENCE_ATTEMPTS: usize = 8;
+        validate_destruction_record_key(destruction_record_key)?;
+        for _ in 0..MAX_FENCE_ATTEMPTS {
+            let (mut manifest, version) = Self::read_versioned_required(store, namespace).await?;
+            version.require_etag(namespace, "governed destruction fence")?;
+            match &manifest.deletion_fence {
+                Some(existing) if existing.destruction_record_key == destruction_record_key => {
+                    return Ok(manifest);
+                }
+                Some(_) => {
+                    return Err(ZeppelinError::Validation(format!(
+                        "namespace {namespace} manifest is fenced by different destruction evidence"
+                    )));
+                }
+                None => {}
+            }
+            manifest.deletion_fence = Some(ManifestDeletionFence {
+                destruction_record_key: destruction_record_key.to_string(),
+            });
+            match manifest
+                .write_conditional_candidate(store, namespace, &version)
+                .await
+            {
+                Ok(_) => return Ok(manifest),
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
+        })
+    }
+
+    /// Verify that this exact manifest is governed by the expected evidence key.
+    pub(crate) fn require_destruction_fence(
+        &self,
+        namespace: &str,
+        destruction_record_key: &str,
+        expected_version: u64,
+    ) -> Result<()> {
+        if self.version != expected_version
+            || self
+                .deletion_fence
+                .as_ref()
+                .map(|fence| fence.destruction_record_key.as_str())
+                != Some(destruction_record_key)
+        {
+            return Err(ZeppelinError::ManifestConflict {
+                namespace: namespace.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Lists retained manifest history descriptors in ascending generation order.
@@ -2602,6 +2737,27 @@ impl NamedSnapshot {
 ///
 /// `release_7.2` is valid; an empty name, non-ASCII text, or `team/snapshot` is
 /// rejected.
+fn validate_destruction_record_key(key: &str) -> Result<()> {
+    let record_id = key
+        .strip_prefix("_audit/destruction/")
+        .and_then(|suffix| suffix.strip_suffix(".json"))
+        .filter(|record_id| {
+            record_id.len() == 32
+                && record_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| {
+            ZeppelinError::Validation("invalid governed destruction record key".to_string())
+        })?;
+    if record_id.contains('/') {
+        return Err(ZeppelinError::Validation(
+            "invalid governed destruction record key".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_snapshot_name(name: &str) -> Result<()> {
     let valid = !name.is_empty()
         && name.len() <= 255
@@ -2655,30 +2811,59 @@ fn snapshot_name_from_key(namespace: &str, key: &str) -> Result<String> {
 /// Opaque object-store ETag used for optimistic manifest publication.
 ///
 /// `Some(etag)` instructs [`Manifest::write_conditional`] to replace only the
-/// exact object read by [`Manifest::read_versioned`]. `None` selects an
-/// unconditional first write and is unsafe as a fabricated fallback for a
-/// missing manifest in an existing namespace.
+/// exact object read by [`Manifest::read_versioned`]. `None` permits only a
+/// create-only first write and cannot overwrite an existing namespace.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
-/// This tuple newtype gives an optional string a domain name, so APIs cannot as
+/// This struct gives an optional string a domain name, so APIs cannot as
 /// easily confuse an ETag with an arbitrary `Option<String>`. Java would often
 /// use a small wrapper class; C would use a struct plus a presence flag. Rust's
 /// [`Option`] encodes absence without a null `String`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManifestVersion(
+pub struct ManifestVersion {
     /// Backend-provided ETag, or `None` only when no conditional version exists.
-    pub Option<String>,
-);
+    e_tag: Option<String>,
+    /// Whether the same authoritative read observed a governed-deletion fence.
+    deletion_fenced: bool,
+}
 
 impl ManifestVersion {
+    pub(crate) fn for_manifest(e_tag: Option<String>, manifest: &Manifest) -> Self {
+        Self {
+            e_tag,
+            deletion_fenced: manifest.deletion_fence.is_some(),
+        }
+    }
+
+    pub(crate) fn unversioned() -> Self {
+        Self {
+            e_tag: None,
+            deletion_fenced: false,
+        }
+    }
+
+    /// Borrow the backend ETag carried by this observation, when available.
+    #[must_use]
+    pub fn e_tag(&self) -> Option<&str> {
+        self.e_tag.as_deref()
+    }
+
+    pub(crate) fn into_e_tag(self) -> Option<String> {
+        self.e_tag
+    }
+
+    pub(crate) fn has_e_tag(&self) -> bool {
+        self.e_tag.is_some()
+    }
+
     /// Returns the backend version required to replace an existing manifest.
     ///
     /// A missing or empty ETag is never converted into unconditional write
     /// authority. Callers that derive a mutation from an existing live object
     /// must stop before uploading history or replacing the live manifest.
     pub(crate) fn require_etag(&self, namespace: &str, operation: &str) -> Result<&str> {
-        self.0
+        self.e_tag
             .as_deref()
             .filter(|etag| !etag.is_empty())
             .ok_or_else(|| {
@@ -2715,7 +2900,13 @@ mod tests {
 
     #[test]
     fn conditional_manifest_versions_reject_missing_or_empty_etags() {
-        for version in [ManifestVersion(None), ManifestVersion(Some(String::new()))] {
+        for version in [
+            ManifestVersion::unversioned(),
+            ManifestVersion {
+                e_tag: Some(String::new()),
+                deletion_fenced: false,
+            },
+        ] {
             let error = version
                 .require_etag("catalog", "legacy manifest incarnation migration")
                 .expect_err("existing-manifest migration must never fall back to a plain PUT");

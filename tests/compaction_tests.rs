@@ -198,6 +198,7 @@ fn trigger_metadata(namespace: &str, dimensions: usize) -> NamespaceMetadata {
         created_at: now,
         updated_at: now,
         state: NamespaceState::Active,
+        destruction_record_key: None,
         full_text_search: HashMap::new(),
         index_config: None,
         compaction_health: CompactionHealth::default(),

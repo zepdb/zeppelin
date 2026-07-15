@@ -144,6 +144,42 @@ pub struct CasPairBarrierStore {
     barrier: Arc<tokio::sync::Barrier>,
 }
 
+/// Controller for a one-shot matching CAS publication pause.
+#[derive(Clone, Debug)]
+pub struct PauseCasHandle {
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl PauseCasHandle {
+    /// Wait until the first matching CAS has reached the publication boundary.
+    pub async fn wait_until_paused(&self) {
+        loop {
+            let notified = self.entered.notified();
+            if self.arrivals.load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Allow the paused CAS to reach the authoritative backend.
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+/// Object-store decorator that pauses the first matching ETag-update PUT.
+#[derive(Debug)]
+pub struct PauseCasStore {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
 /// Controller for inspecting a deterministic two-writer create-only race.
 #[derive(Clone, Debug)]
 pub struct CreatePairBarrierHandle {
@@ -197,6 +233,31 @@ pub fn synchronize_cas_pair_matching(
             enabled,
             arrivals,
             conflicts,
+        },
+    )
+}
+
+/// Wrap a store with a one-shot pause before the first matching CAS reaches S3.
+pub fn pause_first_cas_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+) -> (ZeppelinStore, PauseCasHandle) {
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let wrapper = PauseCasStore {
+        inner: store.inner(),
+        needle: needle.into(),
+        arrivals: Arc::clone(&arrivals),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    (
+        ZeppelinStore::new(Arc::new(wrapper)),
+        PauseCasHandle {
+            arrivals,
+            entered,
+            release,
         },
     )
 }
@@ -346,6 +407,92 @@ pub fn fail_put_once_matching(
     needle: impl Into<String>,
 ) -> (ZeppelinStore, PutFailureHandle) {
     let (failing, handle) = FailPutOnceStore::wrap(store.inner(), needle);
+    (ZeppelinStore::new(Arc::new(failing)), handle)
+}
+
+/// Object-store decorator that fails the first matching GET after a successful
+/// matching conditional PUT. This pins post-CAS reread hazards.
+#[derive(Debug)]
+pub struct FailGetAfterSuccessfulCasStore {
+    inner: Arc<dyn ObjectStore>,
+    cas_needle: String,
+    get_needle: String,
+    armed: AtomicBool,
+    failures_injected: Arc<AtomicUsize>,
+}
+
+impl FailGetAfterSuccessfulCasStore {
+    /// Wrap a store and arm one GET failure only after the matching CAS commits.
+    pub fn wrap(
+        inner: Arc<dyn ObjectStore>,
+        cas_needle: impl Into<String>,
+        get_needle: impl Into<String>,
+    ) -> (Self, PutFailureHandle) {
+        let failures_injected = Arc::new(AtomicUsize::new(0));
+        let handle = PutFailureHandle {
+            failures_injected: Arc::clone(&failures_injected),
+        };
+        (
+            Self {
+                inner,
+                cas_needle: cas_needle.into(),
+                get_needle: get_needle.into(),
+                armed: AtomicBool::new(false),
+                failures_injected,
+            },
+            handle,
+        )
+    }
+}
+
+/// Fail one preservation-head GET that occurs after a successful head CAS.
+pub fn fail_get_after_successful_cas_matching(
+    store: &ZeppelinStore,
+    cas_needle: impl Into<String>,
+    get_needle: impl Into<String>,
+) -> (ZeppelinStore, PutFailureHandle) {
+    let (failing, handle) =
+        FailGetAfterSuccessfulCasStore::wrap(store.inner(), cas_needle, get_needle);
+    (ZeppelinStore::new(Arc::new(failing)), handle)
+}
+
+/// Object-store decorator that fails the first matching DELETE.
+#[derive(Debug)]
+pub struct FailDeleteOnceStore {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    remaining: AtomicUsize,
+    failures_injected: Arc<AtomicUsize>,
+}
+
+impl FailDeleteOnceStore {
+    /// Wrap an existing store, failing one matching DELETE before it acts.
+    pub fn wrap(
+        inner: Arc<dyn ObjectStore>,
+        needle: impl Into<String>,
+    ) -> (Self, PutFailureHandle) {
+        let failures_injected = Arc::new(AtomicUsize::new(0));
+        let handle = PutFailureHandle {
+            failures_injected: Arc::clone(&failures_injected),
+        };
+        (
+            Self {
+                inner,
+                needle: needle.into(),
+                remaining: AtomicUsize::new(1),
+                failures_injected,
+            },
+            handle,
+        )
+    }
+}
+
+/// Wrap a `ZeppelinStore` in a fail-once DELETE layer.
+pub fn fail_delete_once_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+) -> (ZeppelinStore, PutFailureHandle) {
+    let (failing, handle) = FailDeleteOnceStore::wrap(store.inner(), needle);
     (ZeppelinStore::new(Arc::new(failing)), handle)
 }
 
@@ -792,6 +939,18 @@ impl fmt::Display for FailPutOnceStore {
     }
 }
 
+impl fmt::Display for FailGetAfterSuccessfulCasStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FailGetAfterSuccessfulCasStore({})", self.inner)
+    }
+}
+
+impl fmt::Display for FailDeleteOnceStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FailDeleteOnceStore({})", self.inner)
+    }
+}
+
 impl fmt::Display for ToggleGetFailureStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ToggleGetFailureStore({})", self.inner)
@@ -864,6 +1023,72 @@ impl fmt::Display for ToggleCasPreconditionFailureStore {
 impl fmt::Display for CasPairBarrierStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CasPairBarrierStore({})", self.inner)
+    }
+}
+
+impl fmt::Display for PauseCasStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PauseCasStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PauseCasStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        let should_pause = location.as_ref().contains(&self.needle)
+            && matches!(&opts.mode, PutMode::Update(_))
+            && self.arrivals.fetch_add(1, Ordering::SeqCst) == 0;
+        if should_pause {
+            self.entered.notify_waiters();
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("pause CAS semaphore must remain open");
+            permit.forget();
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
     }
 }
 
@@ -1234,6 +1459,136 @@ impl ObjectStore for FailPutOnceStore {
     }
 
     async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FailGetAfterSuccessfulCasStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        let arm = location.as_ref().contains(&self.cas_needle)
+            && matches!(&opts.mode, PutMode::Update(_));
+        let result = self.inner.put_opts(location, payload, opts).await;
+        if arm && result.is_ok() {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        if location.as_ref().contains(&self.get_needle)
+            && self
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.failures_injected.fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "fail_get_after_successful_cas",
+                source: Box::new(std::io::Error::other(format!(
+                    "injected post-CAS GET failure for {location}"
+                ))),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FailDeleteOnceStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        if location.as_ref().contains(&self.needle)
+            && self
+                .remaining
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.failures_injected.fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "fail_delete_once",
+                source: Box::new(std::io::Error::other(format!(
+                    "injected delete failure for {location}"
+                ))),
+            });
+        }
         self.inner.delete(location).await
     }
 

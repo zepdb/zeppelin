@@ -16,8 +16,9 @@ use super::{
     delegation::DelegationAuthority, policy_cache::PolicyCache, Action, AllowDecision,
     ApiKeyAdapter, Decision, DelegationNarrowing, DenyDecision, DenyReason, Entitlements,
     GrantActions, GrantDefinition, GrantScope, IssuedApiKey, IssuedDelegatedToken, NamespaceId,
-    PolicyGrant, PolicyPrincipal, PolicySnapshot, PolicyStore, Principal, PrincipalId,
-    PrincipalKind, RequestContext, Resource, SecurityError, SecurityOperationResult,
+    PolicyGrant, PolicyPrincipal, PolicySnapshot, PolicyStore, PreservationLockId,
+    PreservationLockRecord, PreservationService, Principal, PrincipalId, PrincipalKind,
+    RequestContext, Resource, SecurityError, SecurityOperationResult,
 };
 
 #[derive(Debug)]
@@ -46,6 +47,7 @@ pub struct SecurityKernel {
     cursor_binding_key: super::CursorBindingKey,
     entitlements: Arc<Entitlements>,
     delegation: Option<Arc<DelegationAuthority>>,
+    preservation: Option<Arc<PreservationService>>,
 }
 
 impl SecurityKernel {
@@ -74,6 +76,9 @@ impl SecurityKernel {
             let mut actions = HashSet::new();
             if key.actions.iter().any(|action| action == "*") {
                 actions.extend(Action::BOOTSTRAP_ADMIN_V1);
+                if entitlements.has(super::Feature::Preservation) {
+                    actions.extend([Action::PreservationAdmin, Action::PreservationRelease]);
+                }
             } else {
                 for action in &key.actions {
                     actions.insert(Action::from_str(action)?);
@@ -109,6 +114,7 @@ impl SecurityKernel {
             cursor_binding_key,
             entitlements,
             delegation: None,
+            preservation: None,
         })
     }
 
@@ -128,9 +134,22 @@ impl SecurityKernel {
                 "delegation entitlement requires the rbac entitlement".to_string(),
             ));
         }
+        if entitlements.has(super::Feature::Preservation) && !entitlements.has(super::Feature::Rbac)
+        {
+            return Err(crate::error::ZeppelinError::Config(
+                "preservation entitlement requires the rbac entitlement".to_string(),
+            ));
+        }
         if config.mode == SecurityMode::OpenUnsafe && entitlements.has(super::Feature::Delegation) {
             return Err(crate::error::ZeppelinError::Config(
                 "delegation requires security.mode = enforced so every token has authoritative parent grants"
+                    .to_string(),
+            ));
+        }
+        if config.mode == SecurityMode::OpenUnsafe && entitlements.has(super::Feature::Preservation)
+        {
+            return Err(crate::error::ZeppelinError::Config(
+                "preservation requires security.mode = enforced so destruction is centrally authorized"
                     .to_string(),
             ));
         }
@@ -182,11 +201,23 @@ impl SecurityKernel {
         let delegation = if entitlements.has(super::Feature::Delegation) {
             Some(
                 DelegationAuthority::compose(
-                    store,
+                    store.clone(),
                     Arc::clone(&cache),
-                    clock,
+                    clock.clone(),
                     PathBuf::from(&config.token_signing_key_path),
                     config.delegated_token_max_ttl_secs,
+                    Duration::from_secs(config.policy_refresh_secs),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let preservation = if entitlements.has(super::Feature::Preservation) {
+            Some(
+                PreservationService::start(
+                    store,
+                    clock,
                     Duration::from_secs(config.policy_refresh_secs),
                 )
                 .await?,
@@ -208,6 +239,7 @@ impl SecurityKernel {
                 cursor_binding_key,
                 entitlements,
                 delegation,
+                preservation,
             }),
             adapter,
         ))
@@ -217,6 +249,81 @@ impl SecurityKernel {
     #[must_use]
     pub fn entitlements(&self) -> &Entitlements {
         &self.entitlements
+    }
+
+    /// Borrow the composed preservation module for maintenance integration.
+    #[must_use]
+    pub fn preservation_service(&self) -> Option<&Arc<PreservationService>> {
+        self.preservation.as_ref()
+    }
+
+    /// Fail closed when an active lock protects one namespace destruction seam.
+    pub fn guard_namespace_destruction(
+        &self,
+        namespace: &NamespaceId,
+    ) -> std::result::Result<super::PreservationGuard, SecurityError> {
+        let Some(preservation) = &self.preservation else {
+            return Ok(super::PreservationGuard::unlocked());
+        };
+        preservation.guard_namespace(namespace)
+    }
+
+    /// Fail closed when an active lock conservatively overlaps vector deletion.
+    pub fn guard_vector_destruction(
+        &self,
+        namespace: &NamespaceId,
+        filter: Option<&crate::types::Filter>,
+    ) -> std::result::Result<super::PreservationGuard, SecurityError> {
+        let Some(preservation) = &self.preservation else {
+            return Ok(super::PreservationGuard::unlocked());
+        };
+        preservation.guard_vector_delete(namespace, filter)
+    }
+
+    /// Create one S3-authoritative active preservation lock.
+    pub async fn create_preservation_lock(
+        &self,
+        actor: PrincipalId,
+        request: super::CreatePreservationLock,
+    ) -> ZeppelinResult<PreservationLockRecord> {
+        self.preservation
+            .as_ref()
+            .ok_or_else(|| {
+                crate::error::ZeppelinError::from(SecurityError::FeatureNotLicensed(
+                    super::Feature::Preservation,
+                ))
+            })?
+            .create_lock(actor, request)
+            .await
+    }
+
+    /// Release one active lock through immutable evidence plus CAS head removal.
+    pub async fn release_preservation_lock(
+        &self,
+        lock_id: &PreservationLockId,
+        actor: PrincipalId,
+    ) -> ZeppelinResult<PreservationLockRecord> {
+        self.preservation
+            .as_ref()
+            .ok_or_else(|| {
+                crate::error::ZeppelinError::from(SecurityError::FeatureNotLicensed(
+                    super::Feature::Preservation,
+                ))
+            })?
+            .release_lock(lock_id, actor)
+            .await
+    }
+
+    /// Return the current fresh active lock inventory.
+    pub fn active_preservation_locks(
+        &self,
+    ) -> std::result::Result<Vec<PreservationLockRecord>, SecurityError> {
+        self.preservation
+            .as_ref()
+            .ok_or(SecurityError::FeatureNotLicensed(
+                super::Feature::Preservation,
+            ))?
+            .list_active()
     }
 
     /// Decide whether one principal may perform an action on a resource.

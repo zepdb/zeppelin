@@ -1028,7 +1028,8 @@ pub async fn compaction_loop(
         "background compaction loop started"
     );
 
-    let mut gc_runner = GcRunner::new(compactor.store().clone(), gc_config.clone());
+    let mut gc_runner = GcRunner::new(compactor.store().clone(), gc_config.clone())
+        .with_preservation_service(compactor.preservation_service().cloned());
     // The registry and manifest cache are warmed by startup before this loop is
     // spawned. Seed matching lifecycle identities so tick one's authoritative
     // discovery does not evict an unchanged resident manifest. A missing or
