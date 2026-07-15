@@ -138,6 +138,76 @@ async fn test_vector_get_strong_returns_requested_missing_and_deleted_ids() {
 }
 
 #[tokio::test]
+async fn test_unconstrained_upsert_preserves_absent_attributes_across_compaction() {
+    let harness = TestHarness::new().await;
+    let (base_url, _cache, _cache_dir, admin_bearer) = start_test_server_on_store(
+        &harness,
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+    )
+    .await;
+    let config = compact_fetch_config();
+    let compactor = Compactor::new(
+        harness.store.clone(),
+        WalReader::new(harness.store.clone()),
+        config.compaction.clone(),
+        config.indexing.clone(),
+        common::default_gc_upload_window(),
+    );
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
+    let ns = create_namespace(&client, &base_url).await;
+
+    upsert(
+        &client,
+        &base_url,
+        &ns,
+        serde_json::json!([{
+            "id": "no-attributes",
+            "values": [1.0, 0.0, 0.0]
+        }]),
+    )
+    .await;
+
+    let before = fetch(
+        &client,
+        &base_url,
+        &ns,
+        serde_json::json!({
+            "ids": ["no-attributes"],
+            "include_vector": true,
+            "include_attributes": true,
+            "consistency": "strong"
+        }),
+    )
+    .await;
+    assert!(
+        before["results"][0].get("attributes").is_none(),
+        "an unconstrained upsert must not synthesize an empty attribute object"
+    );
+
+    compactor.compact(&ns).await.unwrap();
+    let after = fetch(
+        &client,
+        &base_url,
+        &ns,
+        serde_json::json!({
+            "ids": ["no-attributes"],
+            "include_vector": true,
+            "include_attributes": true,
+            "consistency": "eventual"
+        }),
+    )
+    .await;
+    assert!(
+        after["results"][0].get("attributes").is_none(),
+        "compaction must retain the absent-versus-empty attribute distinction"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
 async fn test_vector_get_projection_avoids_omitted_segment_reads() {
     let harness = TestHarness::new().await;
     let (store, counter) = counting_store(&harness.store);

@@ -1,0 +1,7 @@
+{
+  "code": "constraint_violation",
+  "error": "operation violates security constraints",
+  "request_id": "contract-error_constraint_violation_403",
+  "retryable": false,
+  "status": 403
+}

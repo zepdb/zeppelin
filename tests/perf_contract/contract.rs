@@ -201,8 +201,14 @@ pub struct AssertionSpec {
 pub struct SecurityAssertionSpec {
     /// Existing unsecured-shape contract used as the object-store census.
     pub baseline_scenario: String,
+    /// Server-owned equality predicate used by a constrained measured principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandatory_filter: Option<FilterMeasure>,
     /// Maximum median CPU cost of production authn plus authz per request.
     pub authn_authz_p50_delta_ns_max: u64,
+    /// Maximum added constrained-policy CPU as a percentage of query p50.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_p50_regression_percent_max: Option<u64>,
     /// Exact GET-count delta against `baseline_scenario`.
     pub added_get_ops: i64,
     /// Exact PUT-count delta against `baseline_scenario`.
@@ -513,12 +519,80 @@ fn validate_contract(scenario: &str, contract: &ContractSpec) -> Result<(), Stri
                     "secured_query must freeze zero added object-store GETs and PUTs".to_string(),
                 );
             }
+            if security.mandatory_filter.is_some()
+                || security.query_p50_regression_percent_max.is_some()
+            {
+                return Err(
+                    "secured_query must not configure Phase 4 constraint assertions".to_string(),
+                );
+            }
         }
         ("secured_query", None) => {
             return Err("secured_query requires assert.security".to_string());
         }
+        ("secured_filtered_query", Some(security)) => {
+            if security.baseline_scenario != "filtered_query" {
+                return Err(
+                    "secured_filtered_query security baseline_scenario must be filtered_query"
+                        .to_string(),
+                );
+            }
+            let Some(mandatory_filter) = security.mandatory_filter.as_ref() else {
+                return Err(
+                    "secured_filtered_query requires assert.security.mandatory_filter".to_string(),
+                );
+            };
+            let MeasureSpec::Query { filter, .. } = &contract.run.measure else {
+                return Err("secured_filtered_query must measure a query".to_string());
+            };
+            if filter.is_some() {
+                return Err(
+                    "secured_filtered_query must receive its filter only from policy".to_string(),
+                );
+            }
+            let baseline = load_contract("filtered_query")?;
+            let MeasureSpec::Query {
+                filter: baseline_filter,
+                ..
+            } = &baseline.run.measure
+            else {
+                return Err("filtered_query baseline must measure a query".to_string());
+            };
+            if baseline_filter.as_ref() != Some(mandatory_filter) {
+                return Err(
+                    "secured_filtered_query mandatory filter must equal filtered_query caller filter"
+                        .to_string(),
+                );
+            }
+            if security.authn_authz_p50_delta_ns_max == 0
+                || security.authn_authz_p50_delta_ns_max > 10_000
+            {
+                return Err(
+                    "secured_filtered_query authn_authz_p50_delta_ns_max must be in 1..=10000"
+                        .to_string(),
+                );
+            }
+            if security
+                .query_p50_regression_percent_max
+                .is_none_or(|percent| percent == 0 || percent > 5)
+            {
+                return Err(
+                    "secured_filtered_query query_p50_regression_percent_max must be in 1..=5"
+                        .to_string(),
+                );
+            }
+            if security.added_get_ops != 0 || security.added_put_ops != 0 {
+                return Err(
+                    "secured_filtered_query must freeze zero added object-store GETs and PUTs"
+                        .to_string(),
+                );
+            }
+        }
+        ("secured_filtered_query", None) => {
+            return Err("secured_filtered_query requires assert.security".to_string());
+        }
         (_, Some(_)) => {
-            return Err("assert.security is currently reserved for secured_query".to_string());
+            return Err("assert.security is reserved for secured security scenarios".to_string());
         }
         (_, None) => {}
     }
@@ -692,6 +766,50 @@ fn check_security_budget(
                     actual: actual.authn_authz_p50_delta_ns.to_string(),
                 });
             }
+            let validated_query_regression = validate_direct_query_evidence(actual);
+            if let Err(error) = &validated_query_regression {
+                violations.push(CostViolation::SecurityBudget {
+                    metric: "query_p50_direct_evidence".to_string(),
+                    expected: "all paired-query fields absent, or a positive and arithmetically consistent direct measurement".to_string(),
+                    actual: error.clone(),
+                });
+            }
+            match (
+                expected.query_p50_regression_percent_max,
+                validated_query_regression.ok().flatten(),
+            ) {
+                (None, None) => {}
+                (Some(percent), Some(actual_basis_points)) => {
+                    let maximum_basis_points = percent.saturating_mul(100);
+                    if actual_basis_points > maximum_basis_points {
+                        violations.push(CostViolation::SecurityBudget {
+                            metric: "query_p50_regression_percent".to_string(),
+                            expected: format!("<= {percent}"),
+                            actual: format!("{:.2}", actual_basis_points as f64 / 100.0),
+                        });
+                    }
+                }
+                (Some(percent), None) => {
+                    if actual.paired_query_samples.is_none()
+                        && actual.caller_filtered_query_p50_ns.is_none()
+                        && actual.policy_filtered_query_p50_ns.is_none()
+                        && actual.query_p50_regression_basis_points.is_none()
+                    {
+                        violations.push(CostViolation::SecurityBudget {
+                            metric: "query_p50_direct_evidence".to_string(),
+                            expected: format!("present and <= {percent}%"),
+                            actual: "missing".to_string(),
+                        });
+                    }
+                }
+                (None, Some(actual_basis_points)) => {
+                    violations.push(CostViolation::SecurityBudget {
+                        metric: "query_p50_direct_evidence".to_string(),
+                        expected: "absent".to_string(),
+                        actual: format!("{:.2}", actual_basis_points as f64 / 100.0),
+                    });
+                }
+            }
             if actual.added_get_ops != expected.added_get_ops {
                 violations.push(CostViolation::SecurityBudget {
                     metric: "added_get_ops".to_string(),
@@ -707,6 +825,43 @@ fn check_security_budget(
                 });
             }
         }
+    }
+}
+
+fn validate_direct_query_evidence(
+    measurement: &super::security::SecurityMeasurement,
+) -> std::result::Result<Option<u64>, String> {
+    match (
+        measurement.paired_query_samples,
+        measurement.caller_filtered_query_p50_ns,
+        measurement.policy_filtered_query_p50_ns,
+        measurement.query_p50_regression_basis_points,
+    ) {
+        (None, None, None, None) => Ok(None),
+        (Some(samples), Some(caller_p50), Some(policy_p50), Some(reported_basis_points)) => {
+            if samples == 0 {
+                return Err("paired_query_samples must be positive".to_string());
+            }
+            if caller_p50 == 0 || policy_p50 == 0 {
+                return Err("paired query p50 observations must be positive".to_string());
+            }
+            let regression_ns = policy_p50.saturating_sub(caller_p50);
+            let recomputed_basis_points = u64::try_from(
+                u128::from(regression_ns)
+                    .saturating_mul(10_000)
+                    .div_ceil(u128::from(caller_p50)),
+            )
+            .map_err(|error| {
+                format!("paired query regression exceeds u64 basis points: {error}")
+            })?;
+            if reported_basis_points != recomputed_basis_points {
+                return Err(format!(
+                    "reported {reported_basis_points} basis points but direct p50 observations recompute to {recomputed_basis_points}"
+                ));
+            }
+            Ok(Some(recomputed_basis_points))
+        }
+        _ => Err("paired query evidence is partial".to_string()),
     }
 }
 
@@ -1740,7 +1895,9 @@ total = { exact = 0 }
         let mut contract = parsed_contract();
         contract.assertions.security = Some(SecurityAssertionSpec {
             baseline_scenario: "warm_query_strong".to_string(),
+            mandatory_filter: None,
             authn_authz_p50_delta_ns_max: 10_000,
+            query_p50_regression_percent_max: None,
             added_get_ops: 0,
             added_put_ops: 0,
         });
@@ -1754,6 +1911,10 @@ total = { exact = 0 }
             baseline_loop_p50_ns: 1,
             authn_authz_p50_ns: 10_002,
             authn_authz_p50_delta_ns: 10_001,
+            paired_query_samples: None,
+            caller_filtered_query_p50_ns: None,
+            policy_filtered_query_p50_ns: None,
+            query_p50_regression_basis_points: None,
             added_get_ops: 0,
             added_put_ops: 0,
         });
@@ -1763,6 +1924,106 @@ total = { exact = 0 }
             violation,
             CostViolation::SecurityBudget { metric, .. }
                 if metric == "authn_authz_p50_delta_ns"
+        )));
+    }
+
+    #[test]
+    fn security_budget_checker_rejects_constraint_query_regression_over_five_percent() {
+        let mut contract = parsed_contract();
+        contract.assertions.security = Some(SecurityAssertionSpec {
+            baseline_scenario: "filtered_query".to_string(),
+            mandatory_filter: Some(FilterMeasure {
+                field: "cat".to_string(),
+                value: "c0".to_string(),
+            }),
+            authn_authz_p50_delta_ns_max: 10_000,
+            query_p50_regression_percent_max: Some(5),
+            added_get_ops: 0,
+            added_put_ops: 0,
+        });
+        let paired = super::super::security::PairedQueryLatency::from_observed_ns(
+            vec![10_000, 9_900, 10_100],
+            vec![10_501, 10_400, 10_600],
+        );
+        let mut measured = outcome(vec![repeat(0, 4)]);
+        measured.security = Some(super::super::security::SecurityMeasurement {
+            security_mode: "enforced",
+            credential_kind: "api_key",
+            baseline_scenario: "filtered_query".to_string(),
+            samples: 101,
+            operations_per_sample: 1_024,
+            baseline_loop_p50_ns: 1,
+            authn_authz_p50_ns: 1_001,
+            authn_authz_p50_delta_ns: 1_000,
+            paired_query_samples: Some(paired.samples),
+            caller_filtered_query_p50_ns: Some(paired.caller_filtered_p50_ns),
+            policy_filtered_query_p50_ns: Some(paired.policy_filtered_p50_ns),
+            query_p50_regression_basis_points: Some(paired.regression_basis_points),
+            added_get_ops: 0,
+            added_put_ops: 0,
+        });
+
+        let violations = check_contract(&contract, &measured);
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            CostViolation::SecurityBudget { metric, .. }
+                if metric == "query_p50_regression_percent"
+        )));
+    }
+
+    #[test]
+    fn security_budget_checker_rejects_partial_or_forged_direct_query_evidence() {
+        let mut contract = parsed_contract();
+        contract.assertions.security = Some(SecurityAssertionSpec {
+            baseline_scenario: "filtered_query".to_string(),
+            mandatory_filter: Some(FilterMeasure {
+                field: "cat".to_string(),
+                value: "c0".to_string(),
+            }),
+            authn_authz_p50_delta_ns_max: 10_000,
+            query_p50_regression_percent_max: Some(5),
+            added_get_ops: 0,
+            added_put_ops: 0,
+        });
+        let mut measured = outcome(vec![repeat(0, 4)]);
+        measured.security = Some(super::super::security::SecurityMeasurement {
+            security_mode: "enforced",
+            credential_kind: "api_key",
+            baseline_scenario: "filtered_query".to_string(),
+            samples: 101,
+            operations_per_sample: 1_024,
+            baseline_loop_p50_ns: 1,
+            authn_authz_p50_ns: 1_001,
+            authn_authz_p50_delta_ns: 1_000,
+            paired_query_samples: None,
+            caller_filtered_query_p50_ns: None,
+            policy_filtered_query_p50_ns: None,
+            query_p50_regression_basis_points: Some(0),
+            added_get_ops: 0,
+            added_put_ops: 0,
+        });
+
+        let partial = check_contract(&contract, &measured);
+        assert!(partial.iter().any(|violation| matches!(
+            violation,
+            CostViolation::SecurityBudget { metric, .. }
+                if metric == "query_p50_direct_evidence"
+        )));
+
+        let security = measured
+            .security
+            .as_mut()
+            .unwrap_or_else(|| panic!("direct-evidence fixture must contain security data"));
+        security.paired_query_samples = Some(21);
+        security.caller_filtered_query_p50_ns = Some(10_000);
+        security.policy_filtered_query_p50_ns = Some(10_400);
+        security.query_p50_regression_basis_points = Some(0);
+
+        let forged = check_contract(&contract, &measured);
+        assert!(forged.iter().any(|violation| matches!(
+            violation,
+            CostViolation::SecurityBudget { metric, .. }
+                if metric == "query_p50_direct_evidence"
         )));
     }
 }

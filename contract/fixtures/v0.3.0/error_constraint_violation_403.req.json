@@ -1,0 +1,14 @@
+{
+  "candidate_k": 5,
+  "debug": true,
+  "sources": [
+    {
+      "type": "ann",
+      "vector": [
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "top_k": 2
+}

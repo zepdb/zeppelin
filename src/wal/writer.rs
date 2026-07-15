@@ -55,8 +55,10 @@
 //!
 //! - Fragment PUT precedes manifest publication. Only a successful manifest CAS
 //!   makes the immutable object visible to readers.
-//! - Batched appends share a manifest CAS only when their optional fencing tokens
-//!   are equal; mixing generations would let stale work ride with current work.
+//! - Ordinary batched appends share a manifest CAS only when their optional
+//!   fencing tokens are equal; mixing generations would let stale work ride with
+//!   current work. A guarded derived append always publishes alone and binds the
+//!   namespace incarnation, manifest generation, and ETag observed in one GET.
 //! - Fencing and CAS are both required. A token check alone has a time-of-check /
 //!   time-of-use race; CAS alone does not identify a zombie based on old work.
 //! - The last successful manifest/ETag pair is only an optimistic CAS base. Any
@@ -143,11 +145,45 @@ fn cas_backoff(attempt: u32) -> Duration {
     Duration::from_millis(base_ms + jitter_ms)
 }
 
+/// Exact authoritative manifest observation required by a derived write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestAppendGuard {
+    namespace: String,
+    namespace_incarnation: uuid::Uuid,
+    generation: u64,
+    storage_version: ManifestVersion,
+}
+
+impl ManifestAppendGuard {
+    /// Binds a manifest generation and incarnation to the ETag from one GET.
+    pub fn new(
+        namespace: &str,
+        manifest: &Manifest,
+        storage_version: ManifestVersion,
+    ) -> Result<Self> {
+        storage_version.require_etag(namespace, "scoped manifest append")?;
+        let namespace_incarnation = manifest
+            .namespace_incarnation()
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "scoped manifest append for namespace {namespace} requires an incarnation-bound manifest"
+                ))
+            })?;
+        Ok(Self {
+            namespace: namespace.to_string(),
+            namespace_incarnation,
+            generation: manifest.version(),
+            storage_version,
+        })
+    }
+}
+
 /// One uploaded fragment waiting for a manifest publication result.
 ///
 /// A value enters the queue only after its immutable object PUT succeeds. The
-/// commit leader consumes it, publishes its ref with a same-token batch, and
-/// uses the one-shot sender to return the covering manifest or terminal error.
+/// commit leader consumes it, publishes its ref, and uses the one-shot sender
+/// to return the covering manifest or terminal error. Ordinary appends may
+/// share a same-token batch; guarded derived writes always publish alone.
 struct PendingCommit {
     /// Reference to the durable-but-not-yet-visible fragment object.
     fref: FragmentRef,
@@ -157,6 +193,14 @@ struct PendingCommit {
     /// Only exactly equal options share a batch: `Some(7)` cannot mix with
     /// `Some(8)` or `None`.
     fencing_token: Option<u64>,
+    /// Exact manifest generation whose live records authorized this append.
+    ///
+    /// Scoped deletes and constrained upserts use `Some(guard)` so a namespace
+    /// recreation or any intervening manifest write forces the caller to reload
+    /// records and re-evaluate its mandatory filter. Ordinary appends use
+    /// `None`. Guarded commits never share a group batch, including when their
+    /// guards are equal.
+    expected_manifest: Option<ManifestAppendGuard>,
     /// Single-use channel that resolves the originating append.
     ///
     /// The sender carries either the manifest that references `fref` or the
@@ -453,9 +497,12 @@ impl WalWriter {
     /// # Consistency
     ///
     /// The fragment is invisible between its PUT and successful manifest CAS.
-    /// Grouping never crosses fencing-token options. The returned success is the
-    /// acknowledgment boundary: it proves the fragment is durable and referenced
-    /// by the committed manifest observed by this operation.
+    /// Grouping never crosses fencing-token options. Guarded appends additionally
+    /// bind the namespace incarnation, manifest generation, and exact object-store
+    /// ETag and publish alone, so two writes derived from one observation cannot
+    /// both succeed. The returned success is the acknowledgment boundary: it
+    /// proves the fragment is durable and referenced by the committed manifest
+    /// observed by this operation.
     ///
     /// # Performance
     ///
@@ -496,6 +543,64 @@ impl WalWriter {
         deletes: Vec<VectorId>,
         fencing_token: Option<u64>,
     ) -> Result<(WalFragment, Manifest)> {
+        self.append_with_guards(namespace, vectors, deletes, fencing_token, None)
+            .await
+    }
+
+    /// Appends only if the authoritative manifest still matches a read snapshot.
+    ///
+    /// This is the publication boundary for operations such as scoped deletes
+    /// whose exact tombstone set was derived from live records. Any manifest
+    /// generation change, including a same-process queued write, returns a
+    /// conflict instead of retrying against data the caller never authorized.
+    #[instrument(skip(self, deletes), fields(namespace = namespace))]
+    pub async fn append_deletes_if_manifest_unchanged(
+        &self,
+        namespace: &str,
+        deletes: Vec<VectorId>,
+        expected_manifest: ManifestAppendGuard,
+    ) -> Result<(WalFragment, Manifest)> {
+        self.append_with_guards(
+            namespace,
+            Vec::new(),
+            deletes,
+            None,
+            Some(expected_manifest),
+        )
+        .await
+    }
+
+    /// Appends replacement rows only while an authorization preflight snapshot
+    /// remains the exact authoritative manifest.
+    ///
+    /// Scoped upserts inspect existing rows before publication so they cannot
+    /// capture an out-of-scope ID or erase a protected field. They must not retry
+    /// against a newer manifest whose rows were never evaluated by that request.
+    #[instrument(skip(self, vectors), fields(namespace = namespace))]
+    pub async fn append_upserts_if_manifest_unchanged(
+        &self,
+        namespace: &str,
+        vectors: Vec<VectorEntry>,
+        expected_manifest: ManifestAppendGuard,
+    ) -> Result<(WalFragment, Manifest)> {
+        self.append_with_guards(
+            namespace,
+            vectors,
+            Vec::new(),
+            None,
+            Some(expected_manifest),
+        )
+        .await
+    }
+
+    async fn append_with_guards(
+        &self,
+        namespace: &str,
+        vectors: Vec<VectorEntry>,
+        deletes: Vec<VectorId>,
+        fencing_token: Option<u64>,
+        expected_manifest: Option<ManifestAppendGuard>,
+    ) -> Result<(WalFragment, Manifest)> {
         crate::metrics::WAL_APPENDS_TOTAL
             .with_label_values(&[namespace])
             .inc();
@@ -532,6 +637,7 @@ impl WalWriter {
                     size_bytes,
                 },
                 fencing_token,
+                expected_manifest,
                 reply: reply_tx,
             });
         }
@@ -649,19 +755,25 @@ impl WalWriter {
     /// reviewer; Java/C implementations rely more heavily on disciplined unlock
     /// paths.
     async fn commit_pending_group(&self, namespace: &str, group: &GroupCommitState) -> bool {
-        // Drain the pending queue, partitioning by fencing token: commit the
-        // token group of the OLDEST waiter (queue front) and put any
-        // differing-token waiters back for the leader's next round.
+        // Drain the pending queue, partitioning by fencing token and expected
+        // manifest generation. Every guarded append publishes alone: even two
+        // requests derived from the same snapshot must linearize independently
+        // so the second observes and conflicts with the first publication.
         let batch: Vec<PendingCommit> = {
             let mut pending = group.pending.lock().unwrap_or_else(|e| e.into_inner());
             if pending.is_empty() {
                 return false;
             }
             let leader_token = pending[0].fencing_token;
+            let leader_expected_manifest = pending[0].expected_manifest.clone();
+            let leader_is_guarded = leader_expected_manifest.is_some();
             let mut batch = Vec::with_capacity(pending.len());
             let mut deferred = Vec::new();
             for item in pending.drain(..) {
-                if item.fencing_token == leader_token {
+                if item.fencing_token == leader_token
+                    && item.expected_manifest == leader_expected_manifest
+                    && (!leader_is_guarded || batch.is_empty())
+                {
                     batch.push(item);
                 } else {
                     deferred.push(item);
@@ -674,6 +786,7 @@ impl WalWriter {
             return false;
         }
         let fencing_token = batch[0].fencing_token;
+        let expected_manifest = batch[0].expected_manifest.clone();
 
         // CAS retry loop: one manifest update carrying ALL batched refs.
         //
@@ -683,7 +796,7 @@ impl WalWriter {
         // proof: the conditional PUT may have committed before its reply was
         // lost, so that path re-reads S3 before deciding whether cleanup is safe.
         for attempt in 0..MAX_CAS_RETRIES {
-            let memo = if attempt == 0 {
+            let memo = if attempt == 0 && expected_manifest.is_none() {
                 group.committed_snapshot()
             } else {
                 None
@@ -711,6 +824,20 @@ impl WalWriter {
                     }
                 },
             };
+
+            if expected_manifest.as_ref().is_some_and(|expected| {
+                expected.namespace != namespace
+                    || manifest.namespace_incarnation() != Some(expected.namespace_incarnation)
+                    || manifest.version() != expected.generation
+                    || version != expected.storage_version
+            }) {
+                group.clear_committed();
+                self.fail_batch(namespace, batch, |_| ZeppelinError::ManifestConflict {
+                    namespace: namespace.to_string(),
+                })
+                .await;
+                return true;
+            }
 
             // Layer 1: Fencing check — reject zombie writers before committing.
             if let Some(token) = fencing_token {

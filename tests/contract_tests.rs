@@ -80,6 +80,8 @@ const FIXTURE_CASES: &[&str] = &[
     "security_list_grants",
     "security_delete_grant",
     "security_get_policy",
+    "error_constraint_violation_403",
+    "error_cursor_policy_stale_400",
     "create_namespace",
     "get_namespace",
     "patch_index_config",
@@ -294,6 +296,289 @@ fn openapi_security_admin_contract_is_exact_and_redacted() {
     let rotate = component_schema_block(api, "RotateSecurityKeyResponse");
     assert!(issue.contains("api_key:"));
     assert!(rotate.contains("api_key:"));
+
+    let errors = component_schema_block(api, "ErrorResponse");
+    assert!(errors.contains("- constraint_violation"));
+    assert!(errors.contains("- cursor_policy_stale"));
+
+    let all_actions = component_schema_block(api, "SecurityAllGrantActions");
+    assert!(all_actions.contains("AttributeAdmin is excluded"));
+    let grant = component_schema_block(api, "SecurityGrantMutationRequest");
+    for constraint in ["mandatory_filter:", "field_mask:", "write_constraints:"] {
+        assert!(
+            grant.contains(constraint),
+            "grant schema missing {constraint}"
+        );
+    }
+    let removal = component_schema_block(api, "SecurityGrantRemovalRequest");
+    assert!(!removal.contains("mandatory_filter:"));
+    assert!(!removal.contains("field_mask:"));
+    assert!(!removal.contains("write_constraints:"));
+
+    let policy_filter = component_schema_block(api, "SecurityPolicyFilter");
+    assert!(policy_filter.contains("publication-time fail-closed"));
+    let attribute_value = component_schema_block(api, "AttributeValue");
+    assert!(attribute_value.contains("anyOf:"));
+    assert!(!attribute_value.contains("oneOf:"));
+    let policy_range = component_schema_block(api, "SecurityPolicyFilterRange");
+    for bound in [
+        "required: [gte]",
+        "required: [lte]",
+        "required: [gt]",
+        "required: [lt]",
+    ] {
+        assert!(
+            policy_range.contains(bound),
+            "policy range schema missing {bound}"
+        );
+    }
+    for schema in [
+        "SecurityPolicyFilterIn",
+        "SecurityPolicyFilterNotIn",
+        "SecurityPolicyFilterContainsAllTokens",
+        "SecurityPolicyFilterContainsTokenSequence",
+        "SecurityPolicyFilterAnd",
+        "SecurityPolicyFilterOr",
+    ] {
+        assert!(
+            component_schema_block(api, schema).contains("minItems: 1"),
+            "{schema} must reject an empty policy-filter list"
+        );
+    }
+}
+
+#[test]
+fn openapi_phase_four_constraint_contract_is_strict_and_redacted() {
+    let api = include_str!("../api/zeppelin-api.yaml");
+
+    for schema in ["SecurityGrant", "SecurityGrantMutationRequest"] {
+        let block = component_schema_block(api, schema);
+        assert!(
+            block.contains("$ref: \"#/components/schemas/SecurityPolicyFilter\""),
+            "{schema}.mandatory_filter must use the recursively strict policy schema"
+        );
+        for constraint in ["mandatory_filter:", "field_mask:", "write_constraints:"] {
+            assert!(block.contains(constraint), "{schema} missing {constraint}");
+        }
+    }
+
+    let policy_filter = component_schema_block(api, "SecurityPolicyFilter");
+    for variant in [
+        "SecurityPolicyFilterEq",
+        "SecurityPolicyFilterNotEq",
+        "SecurityPolicyFilterRange",
+        "SecurityPolicyFilterIn",
+        "SecurityPolicyFilterNotIn",
+        "SecurityPolicyFilterContains",
+        "SecurityPolicyFilterContainsAllTokens",
+        "SecurityPolicyFilterContainsTokenSequence",
+        "SecurityPolicyFilterAnd",
+        "SecurityPolicyFilterOr",
+        "SecurityPolicyFilterNot",
+    ] {
+        assert!(
+            policy_filter.contains(&format!("#/components/schemas/{variant}")),
+            "policy-filter union missing {variant}"
+        );
+    }
+
+    for schema in [
+        "FilterEq",
+        "FilterNotEq",
+        "FilterRange",
+        "FilterIn",
+        "FilterNotIn",
+        "FilterContains",
+        "FilterContainsAllTokens",
+        "FilterContainsTokenSequence",
+        "FilterAnd",
+        "FilterOr",
+        "FilterNot",
+    ] {
+        assert!(
+            component_schema_block(api, schema).contains("additionalProperties: false"),
+            "{schema} must match Filter's deny_unknown_fields runtime contract"
+        );
+    }
+
+    for (schema, base) in [
+        ("SecurityPolicyFilterEq", "FilterEq"),
+        ("SecurityPolicyFilterNotEq", "FilterNotEq"),
+        ("SecurityPolicyFilterRange", "FilterRange"),
+        ("SecurityPolicyFilterIn", "FilterIn"),
+        ("SecurityPolicyFilterNotIn", "FilterNotIn"),
+        ("SecurityPolicyFilterContains", "FilterContains"),
+        (
+            "SecurityPolicyFilterContainsAllTokens",
+            "FilterContainsAllTokens",
+        ),
+        (
+            "SecurityPolicyFilterContainsTokenSequence",
+            "FilterContainsTokenSequence",
+        ),
+    ] {
+        let block = component_schema_block(api, schema);
+        assert!(
+            block.contains(&format!("#/components/schemas/{base}")),
+            "{schema} must retain the existing public Filter wire shape"
+        );
+        assert!(
+            block.contains(r#"pattern: "\\S""#),
+            "{schema} must reject blank policy field names"
+        );
+    }
+
+    let range = component_schema_block(api, "SecurityPolicyFilterRange");
+    for bound in ["gte", "lte", "gt", "lt"] {
+        assert!(
+            range.contains(&format!("required: [{bound}]")),
+            "policy range must accept {bound} as a nonempty bound"
+        );
+    }
+    for schema in ["SecurityPolicyFilterIn", "SecurityPolicyFilterNotIn"] {
+        assert!(
+            component_schema_block(api, schema).contains("minItems: 1"),
+            "{schema} must reject an empty membership list"
+        );
+    }
+    for schema in [
+        "SecurityPolicyFilterContainsAllTokens",
+        "SecurityPolicyFilterContainsTokenSequence",
+    ] {
+        let block = component_schema_block(api, schema);
+        assert!(block.contains("minItems: 1"));
+        assert!(block.contains(r#"pattern: "\\S""#));
+        assert!(block.contains("default production tokenizer"));
+        assert!(block.contains("at least one analyzed token"));
+    }
+    for schema in ["SecurityPolicyFilterAnd", "SecurityPolicyFilterOr"] {
+        let block = component_schema_block(api, schema);
+        assert!(block.contains("minItems: 1"));
+        assert!(block.contains("#/components/schemas/SecurityPolicyFilter"));
+    }
+    assert!(component_schema_block(api, "SecurityPolicyFilterNot")
+        .contains("#/components/schemas/SecurityPolicyFilter"));
+
+    let field_mask = component_schema_block(api, "SecurityFieldMask");
+    for rule in ["minItems: 1", "uniqueItems: true", r#"pattern: "\\S""#] {
+        assert!(
+            field_mask.contains(rule),
+            "field-mask schema missing {rule}"
+        );
+    }
+    assert!(field_mask.contains("cannot be referenced by caller filters"));
+    assert!(field_mask.contains("ranking expressions"));
+    assert!(field_mask.contains("value oracles"));
+    let writes = component_schema_block(api, "SecurityWriteConstraints");
+    for rule in [
+        "anyOf:",
+        "minProperties: 1",
+        "minItems: 1",
+        "AttributeAdmin",
+    ] {
+        assert!(
+            writes.contains(rule),
+            "write-constraint schema missing {rule}"
+        );
+    }
+
+    let delete_request = component_schema_block(api, "DeleteVectorsRequest");
+    assert!(delete_request.contains("DeleteVectorsByIdsRequest"));
+    assert!(delete_request.contains("DeleteVectorsByFilterRequest"));
+    for schema in ["DeleteVectorsByIdsRequest", "DeleteVectorsByFilterRequest"] {
+        assert!(
+            component_schema_block(api, schema).contains("additionalProperties: false"),
+            "{schema} must preserve the ids/filter XOR"
+        );
+    }
+    let upsert = operation_block(api, "post", "/v1/namespaces/{ns}/vectors");
+    assert!(upsert.contains("stamps"));
+    assert!(upsert.contains("forbid_set"));
+    assert!(upsert.contains("before a"));
+    assert!(upsert.contains("WAL fragment is published"));
+    assert!(upsert.contains("out-of-slice ID"));
+    assert!(upsert.contains("server-owned"));
+    assert!(upsert.contains("update-only"));
+    assert!(upsert.contains("UpsertVectorsResponse"));
+    let upsert_request = component_schema_block(api, "UpsertVectorsRequest");
+    assert!(upsert_request.contains("#/components/schemas/UpsertVectorInput"));
+    let upsert_input = component_schema_block(api, "UpsertVectorInput");
+    assert!(upsert_input.contains("required: [values]"));
+    assert!(upsert_input.contains("server-owned"));
+    assert!(upsert_input.contains("update-only"));
+    let upsert_response = component_schema_block(api, "UpsertVectorsResponse");
+    assert!(upsert_response.contains("generated_ids"));
+    assert!(upsert_response.contains("#/components/schemas/GeneratedVectorId"));
+    let generated_id = component_schema_block(api, "GeneratedVectorId");
+    assert!(generated_id.contains("required: [index, id]"));
+    let msgpack_upsert = component_schema_block(api, "MessagePackUpsertRequest");
+    assert!(msgpack_upsert.contains("server-owned"));
+    assert!(msgpack_upsert.contains("update-only"));
+    let delete = operation_block(api, "delete", "/v1/namespaces/{ns}/vectors");
+    assert!(delete.contains("outside the permitted row slice"));
+    assert!(delete.contains("nonexistent IDs"));
+
+    let explain = component_schema_block(api, "QueryExplainPlan");
+    assert!(explain.contains("- policy_filter_applied"));
+    assert!(explain.contains("The predicate itself is never exposed"));
+
+    let query = operation_block(api, "post", "/v1/namespaces/{ns}/query");
+    assert!(query.contains("debug: true"));
+    assert!(query.contains("constraint_violation"));
+    assert!(query.contains("Row-scoped responses report zero"));
+    assert!(query.contains("physical scan"));
+    assert!(query.contains("counters"));
+    let query_request = component_schema_block(api, "QueryRequest");
+    assert!(query_request.contains("debug: true"));
+    assert!(query_request.contains("constraint_violation"));
+    assert!(
+        component_schema_block(api, "BatchQueryRequest").contains("additionalProperties: false"),
+        "BatchQueryRequest must match its deny_unknown_fields runtime contract"
+    );
+    let query_response = component_schema_block(api, "QueryResponse");
+    assert_eq!(
+        query_response
+            .matches("cross-slice activity oracle")
+            .count(),
+        2,
+        "both physical scan counters must document policy-scoped redaction"
+    );
+
+    let fetch = operation_block(api, "post", "/v1/namespaces/{ns}/vectors/get");
+    assert!(fetch.contains("no existence distinction"));
+    let fetch_response = component_schema_block(api, "GetVectorsResponse");
+    assert!(fetch_response.contains("These cases are intentionally"));
+    assert!(fetch_response.contains("indistinguishable and preserve request order"));
+    assert!(api.contains("current policy constraints always apply"));
+    assert!(api.contains("an older manifest never restores older access"));
+    assert!(api.contains("every continuation must"));
+    assert!(api.contains("repeat the same `as_of` value"));
+
+    let clone = operation_block(api, "post", "/v1/namespaces/{ns}/clone");
+    assert!(clone.contains("Cloning never copies or"));
+    assert!(clone.contains("creates a security grant for the target namespace"));
+    for contract in [
+        "NamespaceRead",
+        "NamespaceCreate",
+        "unconstrained",
+        "same policy version",
+        "policy-wide",
+        "source-to-target dominance",
+    ] {
+        assert!(clone.contains(contract), "clone docs missing {contract}");
+    }
+
+    let cursor = component_schema_block(api, "CursorSpec");
+    for contract in [
+        "opaque",
+        "authenticated with HMAC-SHA256",
+        "result-affecting query shape, and issuing",
+        "policy version. Consuming a token",
+        "cursor_policy_stale",
+        "restart from the first page",
+    ] {
+        assert!(cursor.contains(contract), "cursor docs missing {contract}");
+    }
 }
 
 #[test]
@@ -415,6 +700,7 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
     config.server.default_top_k = 3;
     config.server.max_top_k = 100;
     config.server.max_query_batch_size = 2;
+    config.security.set_cursor_hmac_key_hex("55".repeat(32));
     config.security.api_keys.push(ApiKeyConfig {
         key_id: "zpk1_contract_forbidden".to_string(),
         name: "contract-forbidden".to_string(),
@@ -609,6 +895,8 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
     );
 
     fixtures.extend(query_fixtures(&client, &base_url, &main_ns, &replacements).await);
+    fixtures
+        .extend(phase4_security_error_fixtures(&client, &base_url, &main_ns, &replacements).await);
 
     fixtures.push(
         capture_json(
@@ -959,7 +1247,18 @@ async fn security_admin_fixtures(client: &reqwest::Client, base_url: &str) -> Ve
     let grant_request = json!({
         "principal_id": "service:contract",
         "scope": {"kind": "namespace", "namespace": "contract-main"},
-        "actions": {"kind": "selected", "actions": ["NamespaceRead", "Query"]}
+        "actions": {"kind": "selected", "actions": ["NamespaceRead", "Query", "VectorUpsert"]},
+        "mandatory_filter": {"op": "eq", "field": "tenant_id", "value": "acme"},
+        "field_mask": {"deny": ["salary", "ssn"]},
+        "write_constraints": {
+            "stamp": {"tenant_id": "acme"},
+            "forbid_set": ["classification", "is_public"]
+        }
+    });
+    let grant_removal_request = json!({
+        "principal_id": "service:contract",
+        "scope": {"kind": "namespace", "namespace": "contract-main"},
+        "actions": {"kind": "selected", "actions": ["NamespaceRead", "Query", "VectorUpsert"]}
     });
     fixtures.push(
         capture_json(
@@ -1002,8 +1301,8 @@ async fn security_admin_fixtures(client: &reqwest::Client, base_url: &str) -> Ve
             "/v1/security/grants",
             "/v1/security/grants",
             200,
-            grant_request.clone(),
-            grant_request,
+            grant_removal_request.clone(),
+            grant_removal_request,
             &security_replacements,
             &[],
         )
@@ -1046,6 +1345,154 @@ async fn security_admin_fixtures(client: &reqwest::Client, base_url: &str) -> Ve
     ));
 
     fixtures
+}
+
+async fn phase4_security_error_fixtures(
+    admin: &reqwest::Client,
+    base_url: &str,
+    namespace: &str,
+    replacements: &[(String, String)],
+) -> Vec<Fixture> {
+    let principal_id = "service:contract-phase4-errors";
+    let (status, response) = send_json(
+        admin,
+        base_url,
+        "post",
+        "/v1/security/principals",
+        "setup_phase4_error_principal",
+        json!({
+            "principal_id": principal_id,
+            "kind": "service",
+            "display_name": "contract-phase4-errors"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "phase4 error principal setup failed: {response}"
+    );
+
+    let (status, key_response) = send_json(
+        admin,
+        base_url,
+        "post",
+        "/v1/security/keys",
+        "setup_phase4_error_key",
+        json!({"principal_id": principal_id, "name": "contract-phase4-errors"}),
+    )
+    .await;
+    assert_eq!(status, 201, "phase4 error key setup failed: {key_response}");
+    let tenant_bearer = response_string(&key_response, "api_key", "setup_phase4_error_key");
+    let tenant = client_with_bearer(&tenant_bearer);
+
+    let query_grant = json!({
+        "principal_id": principal_id,
+        "scope": {"kind": "namespace", "namespace": namespace},
+        "actions": {"kind": "selected", "actions": ["Query"]},
+        "mandatory_filter": {"op": "not_eq", "field": "category", "value": "never"},
+        "field_mask": {"deny": ["title"]}
+    });
+    let (status, response) = send_json(
+        admin,
+        base_url,
+        "post",
+        "/v1/security/grants",
+        "setup_phase4_error_grant",
+        query_grant,
+    )
+    .await;
+    assert_eq!(status, 201, "phase4 error grant setup failed: {response}");
+
+    let query_path = format!("/v1/namespaces/{namespace}/query");
+    let canonical_query_path = "/v1/namespaces/contract-main/query";
+    let debug_request = json!({
+        "sources": [{"type": "ann", "vector": [0.0, 0.0]}],
+        "top_k": 2,
+        "candidate_k": 5,
+        "debug": true
+    });
+    let constraint = capture_json(
+        &tenant,
+        base_url,
+        "error_constraint_violation_403",
+        "post",
+        &query_path,
+        canonical_query_path,
+        403,
+        debug_request.clone(),
+        debug_request,
+        replacements,
+        &[],
+    )
+    .await;
+
+    let page_request = json!({
+        "sources": [{"type": "ann", "vector": [0.0, 0.0]}],
+        "top_k": 2,
+        "candidate_k": 5,
+        "cursor": {"type": "none"},
+        "consistency": "strong",
+        "projection": {"include_attributes": false}
+    });
+    let (status, page_response) = send_json(
+        &tenant,
+        base_url,
+        "post",
+        &query_path,
+        "setup_phase4_stale_cursor",
+        page_request,
+    )
+    .await;
+    assert_eq!(status, 200, "phase4 cursor setup failed: {page_response}");
+    let stale_cursor = response_string(&page_response, "next_cursor", "setup_phase4_stale_cursor");
+
+    let (status, response) = send_json(
+        admin,
+        base_url,
+        "post",
+        "/v1/security/grants",
+        "setup_phase4_policy_bump",
+        json!({
+            "principal_id": principal_id,
+            "scope": {"kind": "namespace", "namespace": namespace},
+            "actions": {"kind": "selected", "actions": ["NamespaceRead"]}
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "phase4 policy bump failed: {response}");
+
+    let stale_request = json!({
+        "sources": [{"type": "ann", "vector": [0.0, 0.0]}],
+        "top_k": 2,
+        "candidate_k": 5,
+        "cursor": {"type": "after", "token": stale_cursor},
+        "consistency": "strong",
+        "projection": {"include_attributes": false}
+    });
+    let canonical_stale_request = json!({
+        "sources": [{"type": "ann", "vector": [0.0, 0.0]}],
+        "top_k": 2,
+        "candidate_k": 5,
+        "cursor": {"type": "after", "token": "contract-stale-cursor"},
+        "consistency": "strong",
+        "projection": {"include_attributes": false}
+    });
+    let stale = capture_json(
+        &tenant,
+        base_url,
+        "error_cursor_policy_stale_400",
+        "post",
+        &query_path,
+        canonical_query_path,
+        400,
+        stale_request,
+        canonical_stale_request,
+        replacements,
+        &[],
+    )
+    .await;
+
+    vec![constraint, stale]
 }
 
 fn response_string(response: &Value, field: &str, fixture: &str) -> String {
@@ -1925,6 +2372,14 @@ fn assert_response_contract_shape(fixture: &Fixture) {
                 assert_eq!(fixture.response["error"], "access forbidden");
                 assert_eq!(fixture.response["retryable"], false);
             }
+            "error_constraint_violation_403" => {
+                assert_eq!(fixture.response["code"], "constraint_violation");
+                assert_eq!(fixture.response["retryable"], false);
+            }
+            "error_cursor_policy_stale_400" => {
+                assert_eq!(fixture.response["code"], "cursor_policy_stale");
+                assert_eq!(fixture.response["retryable"], false);
+            }
             _ => {}
         }
         return;
@@ -2019,6 +2474,29 @@ fn assert_security_admin_contract(fixture: &Fixture) {
             "{} request must use a tagged grant action set",
             fixture.name
         );
+        if fixture.name == "security_create_grant" {
+            for constraint in ["mandatory_filter", "field_mask", "write_constraints"] {
+                assert!(
+                    fixture.request.get(constraint).is_some(),
+                    "create-grant fixture must publish {constraint}"
+                );
+                assert!(
+                    fixture.response["grant"].get(constraint).is_some(),
+                    "create-grant response must retain {constraint}"
+                );
+            }
+        } else {
+            for constraint in ["mandatory_filter", "field_mask", "write_constraints"] {
+                assert!(
+                    fixture.request.get(constraint).is_none(),
+                    "delete-grant fixture must identify only the stable binding"
+                );
+                assert!(
+                    fixture.response["grant"].get(constraint).is_none(),
+                    "delete-grant response must return only the removed stable binding"
+                );
+            }
+        }
     }
 }
 

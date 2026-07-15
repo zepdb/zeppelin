@@ -442,7 +442,10 @@ paths:
       description: |
         CAS-publishes one exact grant. Scope and actions are strict tagged
         objects; unknown fields, empty selected action sets, and duplicate
-        selected actions are rejected.
+        selected actions are rejected. Every applicable grant participates in
+        authorization: mandatory filters are ANDed, field-mask deny sets are
+        unioned, and write constraints are merged. Conflicting stamp values are
+        rejected before an immutable policy object or head is published.
       tags: [Security]
       requestBody:
         required: true
@@ -477,14 +480,14 @@ paths:
     delete:
       operationId: deleteSecurityGrant
       summary: Remove a security grant
-      description: CAS-removes the grant that exactly matches the supplied principal, scope, and actions.
+      description: CAS-removes the grant binding that matches the supplied principal, scope, and actions.
       tags: [Security]
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/SecurityGrantMutationRequest"
+              $ref: "#/components/schemas/SecurityGrantRemovalRequest"
       responses:
         "401":
           $ref: "#/components/responses/UnauthorizedError"
@@ -746,7 +749,17 @@ paths:
         generation. The server materializes the clone by copying source
         artifacts into the target namespace prefix and rewriting manifest
         references, so the target is independently writable and remains
-        readable after source deletion or source GC.
+        readable after source deletion or source GC. Authorization requires
+        NamespaceClone and NamespaceRead on the source plus NamespaceCreate on
+        the target. All three allow decisions must be unconstrained and carry
+        the same policy version. Before publication, the kernel also proves
+        policy-wide source-to-target dominance: every principal and raw-copy
+        observation or mutation action must be denied on the target or be no
+        broader there than on the source.
+        Cloning never copies or creates a security grant for the target namespace.
+        Access requires an
+        independently applicable global grant or a target-specific grant that
+        an administrator publishes after the clone is created.
       tags: [Namespaces]
       requestBody:
         required: true
@@ -937,7 +950,16 @@ paths:
         and the logical `vectors` array is bounded by `server.max_batch_size`.
         Accepted requests are committed all-or-nothing as one bounded WAL
         fragment; oversized bodies or batches return the canonical 413
-        `PAYLOAD_TOO_LARGE` envelope before any WAL ref is committed.
+        `PAYLOAD_TOO_LARGE` envelope before any WAL ref is committed. When the
+        authorization decision carries write constraints, server stamps
+        overwrite caller values on every row and supplying any `forbid_set`
+        field rejects the whole batch with 403 `constraint_violation` before a
+        WAL fragment is published. Under a mandatory filter, caller-supplied
+        IDs are update-only: both an absent ID and an existing out-of-slice ID
+        are denied with the same 403 shape. A scoped create instead omits `id`;
+        the server assigns an opaque server-owned identity and returns it in
+        `generated_ids`. Unconstrained creates continue to require caller IDs.
+        Every final, stamped row must remain inside the caller's slice.
       tags: [Vectors]
       requestBody:
         required: true
@@ -958,12 +980,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [upserted]
-                properties:
-                  upserted:
-                    type: integer
-                    example: 100
+                $ref: "#/components/schemas/UpsertVectorsResponse"
         "400":
           $ref: "#/components/responses/ValidationError"
         "404":
@@ -976,7 +993,12 @@ paths:
     delete:
       operationId: deleteVectors
       summary: Delete vectors
-      description: Delete vectors by ID from a namespace.
+      description: |
+        Delete vectors by an explicit ID list or by an exact attribute filter.
+        The two selectors are mutually exclusive. Server-owned mandatory
+        filters are always ANDed into the selection before tombstones publish.
+        Explicit IDs outside the permitted row slice are ignored in exactly the
+        same way as nonexistent IDs, without exposing an existence distinction.
       tags: [Vectors]
       requestBody:
         required: true
@@ -1010,7 +1032,10 @@ paths:
       description: |
         Fetch explicit vector IDs with projection controls. Found records are
         returned in request order. Missing IDs and tombstoned IDs are reported
-        in `missing` and are never silently mapped to another record.
+        in `missing` and are never silently mapped to another record. For a
+        principal with a mandatory filter, an existing ID outside the allowed
+        row slice is reported in exactly the same `missing` shape and order as
+        a nonexistent ID; the response exposes no existence distinction.
 
         `consistency=strong` sees latest committed WAL writes and deletes.
         `consistency=eventual` reads the active segment plus WAL tombstones, so
@@ -1057,7 +1082,11 @@ paths:
           historical manifest instead of the live manifest. Reads near the
           retention boundary can fail with `POINT_IN_TIME_NOT_RETAINED` if the
           selected generation is pruned and swept while the query is in flight;
-          retry with a still-retained generation or named snapshot.
+          retry with a still-retained generation or named snapshot. The
+          principal's current policy constraints always apply to the selected
+          historical data; an older manifest never restores older access. A
+          cursor chain binds this exact selector, so every continuation must
+          repeat the same `as_of` value.
 
     post:
       operationId: queryNamespace
@@ -1067,7 +1096,15 @@ paths:
         retrieval-algebra search. Legacy requests provide exactly one of
         `vector` or `rank_by`; retrieval-algebra requests provide typed
         `sources`, with multi-source `ann` + `bm25` fusion supported by RRF
-        or weighted normalized score.
+        or weighted normalized score. A server-owned mandatory filter is always
+        ANDed with the caller filter for live and `as_of` reads. Policy-masked
+        attributes are omitted from results. Masked fields cannot be referenced
+        by caller filters or ranking expressions and cannot be selected as
+        facet or grouping output fields; such requests fail 403
+        `constraint_violation`. Row-scoped responses report zero physical scan
+        counters, and `debug: true` is rejected with
+        `constraint_violation`, because namespace-wide storage diagnostics can
+        reveal activity outside the permitted row slice.
       tags: [Query]
       requestBody:
         required: true
@@ -1186,7 +1223,9 @@ components:
     ForbiddenError:
       description: |
         The authenticated principal is not authorized for the requested action or
-        resource (403). The canonical error envelope carries a stable denial code.
+        resource, or the operation violates a server-owned mandatory filter,
+        field mask, or write constraint (403). The canonical error envelope
+        carries a stable denial or `constraint_violation` code.
       content:
         application/json:
           schema:
@@ -1342,6 +1381,8 @@ components:
             - namespace_not_granted
             - security_stale
             - obligation_unsatisfied
+            - constraint_violation
+            - cursor_policy_stale
             - invalid_namespace
             - invalid_snapshot
             - invalid_security_request
@@ -1624,6 +1665,7 @@ components:
         - Query
         - SecurityAdminRead
         - SecurityAdminWrite
+        - AttributeAdmin
 
     SecurityGrantScope:
       oneOf:
@@ -1667,6 +1709,9 @@ components:
 
     SecurityAllGrantActions:
       type: object
+      description: |
+        Grants the frozen baseline action inventory. AttributeAdmin is excluded
+        and must always be named explicitly in a selected action grant.
       additionalProperties: false
       required: [kind]
       properties:
@@ -1689,6 +1734,10 @@ components:
 
     SecurityGrant:
       type: object
+      description: |
+        One authorization grant and its optional server-owned constraints.
+        Multiple applicable grants all participate: filters are ANDed, mask
+        deny sets are unioned, and compatible write constraints are merged.
       additionalProperties: false
       required: [principal_id, scope, actions]
       properties:
@@ -1698,8 +1747,41 @@ components:
           $ref: "#/components/schemas/SecurityGrantScope"
         actions:
           $ref: "#/components/schemas/SecurityGrantActions"
+        mandatory_filter:
+          $ref: "#/components/schemas/SecurityPolicyFilter"
+        field_mask:
+          $ref: "#/components/schemas/SecurityFieldMask"
+        write_constraints:
+          $ref: "#/components/schemas/SecurityWriteConstraints"
 
     SecurityGrantMutationRequest:
+      type: object
+      description: |
+        Publishes one exact grant binding. `mandatory_filter` is enforced in
+        addition to any caller filter. `field_mask` removes denied attributes
+        from response payloads and rejects caller filters, BM25 ranking,
+        facets, or grouping that reference them, preventing value inference.
+        `write_constraints.stamp` overwrites caller values on every upsert,
+        while `forbid_set` rejects the whole batch when a protected field is
+        supplied. AttributeAdmin bypasses `forbid_set` only; server stamps
+        remain authoritative.
+      additionalProperties: false
+      required: [principal_id, scope, actions]
+      properties:
+        principal_id:
+          $ref: "#/components/schemas/SecurityPrincipalId"
+        scope:
+          $ref: "#/components/schemas/SecurityGrantScope"
+        actions:
+          $ref: "#/components/schemas/SecurityGrantActions"
+        mandatory_filter:
+          $ref: "#/components/schemas/SecurityPolicyFilter"
+        field_mask:
+          $ref: "#/components/schemas/SecurityFieldMask"
+        write_constraints:
+          $ref: "#/components/schemas/SecurityWriteConstraints"
+
+    SecurityGrantRemovalRequest:
       type: object
       additionalProperties: false
       required: [principal_id, scope, actions]
@@ -1710,6 +1792,57 @@ components:
           $ref: "#/components/schemas/SecurityGrantScope"
         actions:
           $ref: "#/components/schemas/SecurityGrantActions"
+
+    SecurityFieldMask:
+      type: object
+      description: |
+        Attribute fields omitted, rather than serialized as null, from query,
+        batch, fetch, grouped, and explain result payloads. A denied field also
+        cannot be referenced by caller filters or ranking expressions or
+        selected as a facet/grouping output field, because membership, ordering,
+        and counts would otherwise become value oracles. Such query requests
+        fail 403 `constraint_violation` before retrieval.
+      additionalProperties: false
+      required: [deny]
+      properties:
+        deny:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            pattern: "\\S"
+
+    SecurityWriteConstraints:
+      type: object
+      description: |
+        Server-owned upsert controls. Stamps overwrite caller values. Supplying
+        any `forbid_set` field rejects the complete batch before WAL publication,
+        unless the principal also has AttributeAdmin; stamps still apply for an
+        AttributeAdmin principal.
+      additionalProperties: false
+      anyOf:
+        - required: [stamp]
+          properties:
+            stamp:
+              minProperties: 1
+        - required: [forbid_set]
+          properties:
+            forbid_set:
+              minItems: 1
+      properties:
+        stamp:
+          type: object
+          propertyNames:
+            pattern: "\\S"
+          additionalProperties:
+            $ref: "#/components/schemas/AttributeValue"
+        forbid_set:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            pattern: "\\S"
 
     SecurityGrantMutationResponse:
       type: object
@@ -1940,7 +2073,7 @@ components:
         - array of strings
         - array of integers
         - array of numbers
-      oneOf:
+      anyOf:
         - type: string
         - type: integer
           format: int64
@@ -2037,6 +2170,7 @@ components:
 
     FilterEq:
       type: object
+      additionalProperties: false
       required: [op, field, value]
       properties:
         op:
@@ -2049,6 +2183,7 @@ components:
 
     FilterNotEq:
       type: object
+      additionalProperties: false
       required: [op, field, value]
       properties:
         op:
@@ -2061,6 +2196,7 @@ components:
 
     FilterRange:
       type: object
+      additionalProperties: false
       required: [op, field]
       properties:
         op:
@@ -2079,6 +2215,7 @@ components:
 
     FilterIn:
       type: object
+      additionalProperties: false
       required: [op, field, values]
       properties:
         op:
@@ -2093,6 +2230,7 @@ components:
 
     FilterNotIn:
       type: object
+      additionalProperties: false
       required: [op, field, values]
       properties:
         op:
@@ -2107,6 +2245,7 @@ components:
 
     FilterContains:
       type: object
+      additionalProperties: false
       required: [op, field, value]
       properties:
         op:
@@ -2119,6 +2258,7 @@ components:
 
     FilterContainsAllTokens:
       type: object
+      additionalProperties: false
       required: [op, field, tokens]
       properties:
         op:
@@ -2133,6 +2273,7 @@ components:
 
     FilterContainsTokenSequence:
       type: object
+      additionalProperties: false
       required: [op, field, tokens]
       properties:
         op:
@@ -2147,6 +2288,7 @@ components:
 
     FilterAnd:
       type: object
+      additionalProperties: false
       required: [op, filters]
       properties:
         op:
@@ -2159,6 +2301,7 @@ components:
 
     FilterOr:
       type: object
+      additionalProperties: false
       required: [op, filters]
       properties:
         op:
@@ -2171,6 +2314,7 @@ components:
 
     FilterNot:
       type: object
+      additionalProperties: false
       required: [op, filter]
       properties:
         op:
@@ -2178,6 +2322,169 @@ components:
           const: not
         filter:
           $ref: "#/components/schemas/Filter"
+
+    SecurityPolicyFilter:
+      description: |
+        The existing Filter wire AST with publication-time fail-closed
+        restrictions for server-owned policy predicates: field names contain a
+        non-whitespace character, ranges contain a bound, and membership,
+        token, and logical lists are nonempty. Every token entry must also
+        produce at least one analyzed token under the default production
+        tokenizer.
+      discriminator:
+        propertyName: op
+        mapping:
+          eq: "#/components/schemas/SecurityPolicyFilterEq"
+          not_eq: "#/components/schemas/SecurityPolicyFilterNotEq"
+          range: "#/components/schemas/SecurityPolicyFilterRange"
+          in: "#/components/schemas/SecurityPolicyFilterIn"
+          not_in: "#/components/schemas/SecurityPolicyFilterNotIn"
+          contains: "#/components/schemas/SecurityPolicyFilterContains"
+          contains_all_tokens: "#/components/schemas/SecurityPolicyFilterContainsAllTokens"
+          contains_token_sequence: "#/components/schemas/SecurityPolicyFilterContainsTokenSequence"
+          and: "#/components/schemas/SecurityPolicyFilterAnd"
+          or: "#/components/schemas/SecurityPolicyFilterOr"
+          not: "#/components/schemas/SecurityPolicyFilterNot"
+      oneOf:
+        - $ref: "#/components/schemas/SecurityPolicyFilterEq"
+        - $ref: "#/components/schemas/SecurityPolicyFilterNotEq"
+        - $ref: "#/components/schemas/SecurityPolicyFilterRange"
+        - $ref: "#/components/schemas/SecurityPolicyFilterIn"
+        - $ref: "#/components/schemas/SecurityPolicyFilterNotIn"
+        - $ref: "#/components/schemas/SecurityPolicyFilterContains"
+        - $ref: "#/components/schemas/SecurityPolicyFilterContainsAllTokens"
+        - $ref: "#/components/schemas/SecurityPolicyFilterContainsTokenSequence"
+        - $ref: "#/components/schemas/SecurityPolicyFilterAnd"
+        - $ref: "#/components/schemas/SecurityPolicyFilterOr"
+        - $ref: "#/components/schemas/SecurityPolicyFilterNot"
+
+    SecurityPolicyFilterEq:
+      allOf:
+        - $ref: "#/components/schemas/FilterEq"
+        - properties:
+            field:
+              type: string
+              pattern: "\\S"
+
+    SecurityPolicyFilterNotEq:
+      allOf:
+        - $ref: "#/components/schemas/FilterNotEq"
+        - properties:
+            field:
+              type: string
+              pattern: "\\S"
+
+    SecurityPolicyFilterRange:
+      allOf:
+        - $ref: "#/components/schemas/FilterRange"
+        - properties:
+            field:
+              type: string
+              pattern: "\\S"
+          anyOf:
+            - required: [gte]
+            - required: [lte]
+            - required: [gt]
+            - required: [lt]
+
+    SecurityPolicyFilterIn:
+      allOf:
+        - $ref: "#/components/schemas/FilterIn"
+        - properties:
+            field:
+              type: string
+              pattern: "\\S"
+            values:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/AttributeValue"
+
+    SecurityPolicyFilterNotIn:
+      allOf:
+        - $ref: "#/components/schemas/FilterNotIn"
+        - properties:
+            field:
+              type: string
+              pattern: "\\S"
+            values:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/AttributeValue"
+
+    SecurityPolicyFilterContains:
+      allOf:
+        - $ref: "#/components/schemas/FilterContains"
+        - properties:
+            field:
+              type: string
+              pattern: "\\S"
+
+    SecurityPolicyFilterContainsAllTokens:
+      allOf:
+        - $ref: "#/components/schemas/FilterContainsAllTokens"
+        - properties:
+            field:
+              type: string
+              pattern: "\\S"
+            tokens:
+              type: array
+              minItems: 1
+              description: |
+                Every entry must contain a non-whitespace character and produce
+                at least one analyzed token under the default production tokenizer.
+                Publication rejects whitespace-only, punctuation-only, stopword,
+                and overlength entries that analysis would discard.
+              items:
+                type: string
+                pattern: "\\S"
+
+    SecurityPolicyFilterContainsTokenSequence:
+      allOf:
+        - $ref: "#/components/schemas/FilterContainsTokenSequence"
+        - properties:
+            field:
+              type: string
+              pattern: "\\S"
+            tokens:
+              type: array
+              minItems: 1
+              description: |
+                Every entry must contain a non-whitespace character and produce
+                at least one analyzed token under the default production tokenizer.
+                Publication rejects whitespace-only, punctuation-only, stopword,
+                and overlength entries that analysis would discard.
+              items:
+                type: string
+                pattern: "\\S"
+
+    SecurityPolicyFilterAnd:
+      allOf:
+        - $ref: "#/components/schemas/FilterAnd"
+        - properties:
+            filters:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/SecurityPolicyFilter"
+
+    SecurityPolicyFilterOr:
+      allOf:
+        - $ref: "#/components/schemas/FilterOr"
+        - properties:
+            filters:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/SecurityPolicyFilter"
+
+    SecurityPolicyFilterNot:
+      allOf:
+        - $ref: "#/components/schemas/FilterNot"
+        - properties:
+            filter:
+              $ref: "#/components/schemas/SecurityPolicyFilter"
 
     RankByExpression:
       description: |
@@ -2536,7 +2843,7 @@ components:
         vectors:
           type: array
           items:
-            $ref: "#/components/schemas/VectorEntry"
+            $ref: "#/components/schemas/UpsertVectorInput"
           minItems: 1
           maxItems: 50000
           description: |
@@ -2544,14 +2851,67 @@ components:
             may advertise a different configured cap operationally. Batches
             above the cap return 413 and are not partially committed.
 
+    UpsertVectorInput:
+      type: object
+      required: [values]
+      properties:
+        id:
+          type: string
+          description: |
+            Caller-visible identity. Required for unconstrained creates. Under
+            a mandatory filter, an explicit identity is update-only and must
+            already name a visible in-scope row; omit it for a server-owned
+            create.
+        values:
+          type: array
+          items:
+            type: number
+            format: float
+          description: Vector embedding values.
+        attributes:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/AttributeValue"
+          description: Optional metadata subject to policy stamps and write constraints.
+
+    UpsertVectorsResponse:
+      type: object
+      required: [upserted]
+      properties:
+        upserted:
+          type: integer
+          minimum: 0
+          example: 100
+        generated_ids:
+          type: array
+          items:
+            $ref: "#/components/schemas/GeneratedVectorId"
+          description: |
+            Server-owned identities for request rows that omitted `id`, in
+            request-index order. Omitted when every row supplied an ID.
+
+    GeneratedVectorId:
+      type: object
+      required: [index, id]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: Zero-based position in the submitted vectors array.
+        id:
+          type: string
+          description: Opaque stable identity for later fetch, update, or delete.
+
     MessagePackUpsertRequest:
       oneOf:
         - $ref: "#/components/schemas/UpsertVectorsRequest"
         - $ref: "#/components/schemas/ColumnarUpsertEnvelope"
       description: |
         MessagePack upsert body. The row form is the same logical schema as
-        JSON (`vectors`). The columnar form carries the same logical vectors as
-        ids plus one row-major little-endian f32 byte buffer.
+        JSON (`vectors`) and supports server-owned scoped creates by omitting a
+        row's `id`. The columnar form carries explicit ids plus one row-major
+        little-endian f32 byte buffer, so those ids are update-only under a
+        mandatory filter.
 
     ColumnarUpsertEnvelope:
       type: object
@@ -2592,7 +2952,13 @@ components:
           description: Optional per-vector attributes in row order.
 
     DeleteVectorsRequest:
+      oneOf:
+        - $ref: "#/components/schemas/DeleteVectorsByIdsRequest"
+        - $ref: "#/components/schemas/DeleteVectorsByFilterRequest"
+
+    DeleteVectorsByIdsRequest:
       type: object
+      additionalProperties: false
       required: [ids]
       properties:
         ids:
@@ -2600,6 +2966,14 @@ components:
           minItems: 1
           items:
             type: string
+
+    DeleteVectorsByFilterRequest:
+      type: object
+      additionalProperties: false
+      required: [filter]
+      properties:
+        filter:
+          $ref: "#/components/schemas/Filter"
 
     GetVectorsRequest:
       type: object
@@ -2643,7 +3017,10 @@ components:
             $ref: "#/components/schemas/FetchedVectorRecord"
         missing:
           type: array
-          description: Requested IDs that were absent or tombstoned.
+          description: |
+            Requested IDs that were absent, tombstoned, or outside the current
+            principal's mandatory filter. These cases are intentionally
+            indistinguishable and preserve request order.
           items:
             type: string
 
@@ -2774,7 +3151,9 @@ components:
           description: |
             When true, include an optional `debug` block in the query response
             with phase timings, scan counts, cache counters, effective
-            consistency, and under-fill reason. Omitted by default.
+            consistency, and under-fill reason. Omitted by default. A principal
+            with a mandatory filter cannot request namespace-wide physical
+            diagnostics: `debug: true` returns 403 `constraint_violation`.
 
     CandidateSource:
       description: Typed retrieval-algebra candidate source.
@@ -3023,10 +3402,14 @@ components:
         page to request a `next_cursor`; pass that value back with
         `{"type":"after","token":"..."}` to continue after the last item
         from the previous page. Cursor tokens are stateless, opaque, and
-        bound to the namespace plus result-affecting query shape. Response
-        options such as debug, explain, facets, projection, and consistency
-        do not change the token fingerprint. Cursor pagination cannot be
-        combined with field grouping.
+        authenticated with HMAC-SHA256; callers must not inspect or modify
+        them. They bind the namespace, result-affecting query shape, and issuing
+        policy version. Consuming a token after the policy version changes
+        returns 400 `cursor_policy_stale`; restart from the first page. Response
+        options such as debug, explain, facets, and projection do not change
+        the token fingerprint. Consistency and the query route's exact `as_of`
+        selector do change it and must be repeated on every continuation.
+        Cursor pagination cannot be combined with field grouping.
       discriminator:
         propertyName: type
         mapping:
@@ -3069,6 +3452,7 @@ components:
     BatchQueryRequest:
       type: object
       required: [queries]
+      additionalProperties: false
       properties:
         queries:
           type: array
@@ -3088,10 +3472,16 @@ components:
             $ref: "#/components/schemas/SearchResult"
         scanned_fragments:
           type: integer
-          description: Number of WAL fragments scanned
+          description: |
+            Number of WAL fragments scanned. This is deliberately zero for a
+            response constrained by a mandatory filter, regardless of physical
+            work, to prevent a cross-slice activity oracle.
         scanned_segments:
           type: integer
-          description: Number of index segments scanned
+          description: |
+            Number of index segments scanned. This is deliberately zero for a
+            response constrained by a mandatory filter, regardless of physical
+            work, to prevent a cross-slice activity oracle.
         debug:
           $ref: "#/components/schemas/QueryDebug"
         next_cursor:
@@ -3170,6 +3560,7 @@ components:
         - cursor
         - facets
         - projection
+        - policy_filter_applied
       properties:
         path:
           type: string
@@ -3210,6 +3601,11 @@ components:
             type: string
         projection:
           $ref: "#/components/schemas/QueryExplainProjection"
+        policy_filter_applied:
+          type: boolean
+          description: |
+            True when a server-owned mandatory filter constrained execution.
+            The predicate itself is never exposed.
 
     QueryExplainSource:
       type: object
@@ -3225,7 +3621,10 @@ components:
           type: integer
           nullable: true
           minimum: 1
-          description: Effective IVF probe count for ANN sources; null for BM25.
+          description: |
+            Effective IVF probe count for unconstrained ANN sources. Null for
+            BM25 and for mandatory-filter callers, because a manifest-derived
+            value would reveal shared namespace topology outside their row slice.
         candidate_k:
           type: integer
           minimum: 1
@@ -3467,4 +3866,7 @@ components:
         latency_ms:
           type: integer
           minimum: 0
-          description: Server-side latency for this batch entry.
+          description: |
+            Server-side latency for this batch entry. Mandatory-filter callers
+            receive the sentinel value 0 so shared-namespace work cannot be
+            inferred from an explicit timing diagnostic.

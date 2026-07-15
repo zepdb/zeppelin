@@ -5,12 +5,13 @@ use std::time::Instant;
 
 use axum::http::Method;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-use zeppelin::config::{ApiKeyConfig, Config, SecurityMode};
+use zeppelin::config::{Config, SecurityMode};
 use zeppelin::security::{
-    classify_route, ApiKeyAdapter, CredentialAdapter, Decision, NamespaceId, RequestContext,
-    Resource, RouteClass, SecurityKernel,
+    classify_route, CredentialAdapter, Decision, NamespaceId, RequestContext, Resource, RouteClass,
+    SecurityKernel,
 };
+use zeppelin::storage::ZeppelinStore;
+use zeppelin::time::Clock;
 
 use crate::common::server::bearer_headers;
 
@@ -33,19 +34,92 @@ pub struct SecurityMeasurement {
     pub baseline_loop_p50_ns: u64,
     pub authn_authz_p50_ns: u64,
     pub authn_authz_p50_delta_ns: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paired_query_samples: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_filtered_query_p50_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_filtered_query_p50_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_p50_regression_basis_points: Option<u64>,
     pub added_get_ops: i64,
     pub added_put_ops: i64,
 }
 
+/// Direct latency comparison for equivalent caller-owned and policy-owned filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairedQueryLatency {
+    pub samples: usize,
+    pub caller_filtered_p50_ns: u64,
+    pub policy_filtered_p50_ns: u64,
+    pub regression_basis_points: u64,
+}
+
+/// Inputs for one security-contract CPU and storage-parity measurement.
+pub struct SecurityMeasureInput<'a> {
+    pub config: &'a Config,
+    pub measured_bearer: &'a str,
+    pub namespace: &'a str,
+    pub repeats: &'a [RepeatCounters],
+    pub assertions: &'a SecurityAssertionSpec,
+    pub security_store: &'a ZeppelinStore,
+    pub clock: Clock,
+    pub paired_query: Option<PairedQueryLatency>,
+}
+
+impl PairedQueryLatency {
+    /// Build the comparison from two directly observed HTTP latency distributions.
+    #[must_use]
+    pub fn from_observed_ns(mut caller_filtered: Vec<u64>, mut policy_filtered: Vec<u64>) -> Self {
+        assert!(
+            !caller_filtered.is_empty(),
+            "paired query latency requires observed samples"
+        );
+        assert_eq!(
+            caller_filtered.len(),
+            policy_filtered.len(),
+            "paired query latency distributions must have equal sample counts"
+        );
+        caller_filtered.sort_unstable();
+        policy_filtered.sort_unstable();
+        let samples = caller_filtered.len();
+        let caller_filtered_p50_ns = caller_filtered[samples / 2];
+        let policy_filtered_p50_ns = policy_filtered[samples / 2];
+        assert!(
+            caller_filtered_p50_ns > 0,
+            "caller-filtered query p50 must be nonzero"
+        );
+        let regression_ns = policy_filtered_p50_ns.saturating_sub(caller_filtered_p50_ns);
+        let regression_basis_points = match u64::try_from(
+            u128::from(regression_ns)
+                .saturating_mul(10_000)
+                .div_ceil(u128::from(caller_filtered_p50_ns)),
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("paired query regression exceeded u64 basis points: {error}"),
+        };
+        Self {
+            samples,
+            caller_filtered_p50_ns,
+            policy_filtered_p50_ns,
+            regression_basis_points,
+        }
+    }
+}
+
 /// Measure the same production adapter, route map, and kernel used by HTTP.
 #[must_use]
-pub fn measure(
-    config: &Config,
-    admin_bearer: &str,
-    namespace: &str,
-    repeats: &[RepeatCounters],
-    assertions: &SecurityAssertionSpec,
-) -> SecurityMeasurement {
+pub async fn measure(input: SecurityMeasureInput<'_>) -> SecurityMeasurement {
+    let SecurityMeasureInput {
+        config,
+        measured_bearer,
+        namespace,
+        repeats,
+        assertions,
+        security_store,
+        clock,
+        paired_query,
+    } = input;
     assert_eq!(
         config.security.mode,
         SecurityMode::Enforced,
@@ -56,17 +130,47 @@ pub fn measure(
         "secured_query must produce object-store counters"
     );
 
-    let security_config = config_for_bearer(config, admin_bearer);
-    let kernel = SecurityKernel::from_config(&security_config.security)
-        .expect("secured_query security kernel must compile");
-    let adapter = ApiKeyAdapter::from_config(&security_config.security)
-        .expect("secured_query credential adapter must compile");
-    let headers = bearer_headers(admin_bearer);
-    let now = chrono::Utc::now();
+    let (kernel, adapter) =
+        SecurityKernel::from_store(security_store.clone(), &config.security, clock.clone())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("secured performance security authority must load: {error}")
+            });
+    let headers = bearer_headers(measured_bearer);
+    let now = clock.now();
     let context = RequestContext::at("secured-query-perf", now);
-    let resource = Resource::Namespace(
-        NamespaceId::new(namespace.to_string())
-            .expect("performance namespace must be a valid security resource"),
+    let resource = Resource::Namespace(NamespaceId::new(namespace.to_string()).unwrap_or_else(
+        |error| panic!("performance namespace must be a valid security resource: {error}"),
+    ));
+
+    let preflight_principal = adapter.authenticate(&headers, now).unwrap_or_else(|error| {
+        panic!("measured performance principal must authenticate: {error}")
+    });
+    let RouteClass::Protected(query_action) = classify_route(&Method::POST, QUERY_ROUTE, false)
+        .unwrap_or_else(|| panic!("query route must stay mapped"))
+    else {
+        panic!("query route must stay protected");
+    };
+    let preflight = kernel.authorize(&preflight_principal, query_action, &resource, &context);
+    let Decision::Allow(preflight) = preflight else {
+        panic!("measured performance principal must be authorized for query");
+    };
+    let expected_filter =
+        assertions
+            .mandatory_filter
+            .as_ref()
+            .map_or(serde_json::Value::Null, |filter| {
+                serde_json::json!({
+                    "op": "eq",
+                    "field": filter.field,
+                    "value": filter.value,
+                })
+            });
+    let actual_filter = serde_json::to_value(&preflight.mandatory_filter)
+        .unwrap_or_else(|error| panic!("compiled mandatory filter must serialize: {error}"));
+    assert_eq!(
+        actual_filter, expected_filter,
+        "measured performance principal must carry the contract's mandatory filter"
     );
 
     for _ in 0..WARMUP_OPERATIONS {
@@ -90,10 +194,24 @@ pub fn measure(
         let (baseline, secured) = if sample % 2 == 0 {
             (
                 measure_baseline(&headers, &resource, &context),
-                measure_secured(&headers, now, &adapter, &kernel, &resource, &context),
+                measure_secured(
+                    &headers,
+                    now,
+                    adapter.as_ref(),
+                    kernel.as_ref(),
+                    &resource,
+                    &context,
+                ),
             )
         } else {
-            let secured = measure_secured(&headers, now, &adapter, &kernel, &resource, &context);
+            let secured = measure_secured(
+                &headers,
+                now,
+                adapter.as_ref(),
+                kernel.as_ref(),
+                &resource,
+                &context,
+            );
             let baseline = measure_baseline(&headers, &resource, &context);
             (baseline, secured)
         };
@@ -104,6 +222,12 @@ pub fn measure(
     let baseline_loop_p50_ns = median(&mut baseline_samples);
     let authn_authz_p50_ns = median(&mut secured_samples);
     let authn_authz_p50_delta_ns = authn_authz_p50_ns.saturating_sub(baseline_loop_p50_ns);
+
+    assert_eq!(
+        paired_query.is_some(),
+        assertions.mandatory_filter.is_some(),
+        "mandatory-filter contracts require a direct paired query measurement"
+    );
 
     let baseline = load_contract(&assertions.baseline_scenario).unwrap_or_else(|error| {
         panic!(
@@ -124,30 +248,16 @@ pub fn measure(
         baseline_loop_p50_ns,
         authn_authz_p50_ns,
         authn_authz_p50_delta_ns,
-        added_get_ops: signed_delta(measured.totals.get_ops, baseline_get_ops),
-        added_put_ops: signed_delta(measured.totals.put_ops, baseline_put_ops),
+        paired_query_samples: paired_query.map(|measurement| measurement.samples),
+        caller_filtered_query_p50_ns: paired_query
+            .map(|measurement| measurement.caller_filtered_p50_ns),
+        policy_filtered_query_p50_ns: paired_query
+            .map(|measurement| measurement.policy_filtered_p50_ns),
+        query_p50_regression_basis_points: paired_query
+            .map(|measurement| measurement.regression_basis_points),
+        added_get_ops: added_delta(measured.totals.get_ops, baseline_get_ops),
+        added_put_ops: added_delta(measured.totals.put_ops, baseline_put_ops),
     }
-}
-
-fn config_for_bearer(config: &Config, bearer: &str) -> Config {
-    let (key_id, secret) = bearer
-        .split_once('.')
-        .expect("server admin bearer must contain one key/secret separator");
-    assert!(
-        !secret.contains('.'),
-        "server admin bearer must contain one key/secret separator"
-    );
-    let mut configured = config.clone();
-    configured.security.mode = SecurityMode::Enforced;
-    configured.security.api_keys = vec![ApiKeyConfig {
-        key_id: key_id.to_string(),
-        name: "secured-query-admin".to_string(),
-        sha256_hex: format!("{:x}", Sha256::digest(secret.as_bytes())),
-        actions: vec!["*".to_string()],
-        namespaces: vec!["*".to_string()],
-        expires_at: None,
-    }];
-    configured
 }
 
 fn measure_baseline(
@@ -198,8 +308,29 @@ fn median(samples: &mut [u64]) -> u64 {
     samples[samples.len() / 2]
 }
 
-fn signed_delta(actual: u64, baseline: u64) -> i64 {
-    let actual = i128::from(actual);
-    let baseline = i128::from(baseline);
-    i64::try_from(actual - baseline).expect("object-store operation delta exceeded i64")
+fn added_delta(actual: u64, baseline: u64) -> i64 {
+    i64::try_from(actual.saturating_sub(baseline))
+        .expect("added object-store operation count exceeded i64")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paired_query_latency_uses_both_observed_distributions() {
+        let measurement =
+            PairedQueryLatency::from_observed_ns(vec![1_000, 900, 1_100], vec![1_060, 950, 1_200]);
+
+        assert_eq!(measurement.caller_filtered_p50_ns, 1_000);
+        assert_eq!(measurement.policy_filtered_p50_ns, 1_060);
+        assert_eq!(measurement.regression_basis_points, 600);
+    }
+
+    #[test]
+    fn added_delta_does_not_treat_a_cost_reduction_as_security_overhead() {
+        assert_eq!(added_delta(9, 14), 0);
+        assert_eq!(added_delta(14, 14), 0);
+        assert_eq!(added_delta(17, 14), 3);
+    }
 }

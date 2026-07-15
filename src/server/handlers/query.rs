@@ -149,6 +149,8 @@ use std::time::Instant;
 use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tracing::{info, instrument};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -168,8 +170,11 @@ use crate::query::{
     QueryExplainSource, QueryExplainSourceKind, QueryFacets, QueryResponse, QueryResultGroup,
 };
 use crate::runtime_config::QueryKnobs;
-use crate::security::AllowDecision;
-use crate::server::{AppState, RateLimitClass, RateLimitIdentity};
+use crate::security::{
+    apply_field_mask, filter_references_denied_field, AllowDecision, CursorBindingKey, FieldMask,
+    PolicyVersion, SecurityError,
+};
+use crate::server::{AppState, AuditRequest, RateLimitClass, RateLimitIdentity};
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, SearchResult};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
@@ -258,6 +263,61 @@ pub struct QueryRequest {
     /// Whether source execution should collect and return timing/cache diagnostics.
     #[serde(default)]
     pub debug: Option<bool>,
+}
+
+/// Validates server-owned query constraints before any retrieval planning.
+fn validate_query_security_constraints(
+    req: &QueryRequest,
+    decision: &AllowDecision,
+) -> Result<(), ZeppelinError> {
+    if decision.mandatory_filter.is_some() && req.debug == Some(true) {
+        return Err(SecurityError::ConstraintViolation.into());
+    }
+
+    let Some(mask) = decision.field_mask.as_ref() else {
+        return Ok(());
+    };
+    let denied = mask.denied_fields();
+    let masked_filter = req
+        .filter
+        .as_ref()
+        .is_some_and(|filter| filter_references_denied_field(filter, denied));
+    let masked_rank = req
+        .rank_by
+        .iter()
+        .chain(
+            req.sources
+                .iter()
+                .flatten()
+                .filter_map(|source| match source {
+                    CandidateSource::Bm25 { rank_by, .. } => Some(rank_by),
+                    CandidateSource::Ann { .. } => None,
+                }),
+        )
+        .chain(req.rerank.iter().filter_map(|rerank| match rerank {
+            RerankSpec::Bm25 { rank_by } => Some(rank_by),
+            RerankSpec::Default | RerankSpec::None | RerankSpec::Vector { .. } => None,
+        }))
+        .any(|rank_by| {
+            rank_by
+                .extract_field_queries()
+                .iter()
+                .any(|(field, _)| denied.contains(field))
+        });
+    if masked_filter
+        || masked_rank
+        || req
+            .facets
+            .as_ref()
+            .is_some_and(|facets| facets.iter().any(|facet| denied.contains(facet.field())))
+        || matches!(
+            req.grouping.as_ref(),
+            Some(GroupingSpec::Field { field, .. }) if denied.contains(field)
+        )
+    {
+        return Err(SecurityError::ConstraintViolation.into());
+    }
+    Ok(())
 }
 
 /// Selects one typed candidate generator in the retrieval-algebra request.
@@ -456,8 +516,10 @@ pub struct ProjectionSpec {
 /// Selects the first page or continuation after an opaque rank marker.
 ///
 /// Cursor paging is stateless: the token embeds a request fingerprint, score
-/// bits, and ID. It detects accidental reuse with another query but is not a
-/// cryptographic signature and does not pin a live manifest generation.
+/// bits, ID, and issuing policy version under an HMAC-SHA256 tag. It rejects
+/// deliberate field splicing as well as accidental reuse with another query,
+/// and the fingerprint binds the query route's exact `as_of` selector. It does
+/// not otherwise pin a live manifest generation.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CursorSpec {
@@ -525,6 +587,8 @@ struct ValidatedQuery {
     include_attributes: bool,
     /// Validated source syntax and execution path.
     source: ValidatedSource,
+    /// Caller-visible query identity computed before server-owned filters are attached.
+    cursor_fingerprint: Option<u64>,
 }
 
 /// Identifies the request syntax and source cardinality after validation.
@@ -620,6 +684,22 @@ struct QueryExecutionOptions {
     manifest: Option<Manifest>,
     /// Whether a live active segment should contribute to hydrator heat.
     notify_hydration: bool,
+}
+
+/// Complete borrowed and frozen state for one validated query execution.
+///
+/// Keeping the execution seam to one typed value prevents single and batch
+/// callers from swapping the request, policy decision, runtime knobs, or
+/// manifest options positionally.
+struct ValidatedQueryExecution<'a> {
+    state: &'a AppState,
+    ns: &'a str,
+    meta: &'a NamespaceMetadata,
+    req: &'a QueryRequest,
+    validated: ValidatedQuery,
+    knobs: &'a QueryKnobs,
+    security: &'a AllowDecision,
+    options: QueryExecutionOptions,
 }
 
 /// Parses optional point-in-time selection for the single-query route.
@@ -788,10 +868,10 @@ impl BatchQueryError {
 /// handle into the async future. `?`-style conversions preserve typed failures;
 /// RAII guards decrement the active gauge and observe duration even when an
 /// awaited operation returns early.
-#[instrument(skip(state, _decision, body), fields(namespace = %ns))]
+#[instrument(skip(state, decision, body), fields(namespace = %ns))]
 pub async fn query_namespace(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
     Query(params): Query<QueryRouteParams>,
     body: bytes::Bytes,
@@ -801,6 +881,12 @@ pub async fn query_namespace(
             "invalid request body: {e}"
         )))
     })?;
+    let mut cursor_fingerprint = if params.as_of.is_none() {
+        cursor_fingerprint_if_requested(&ns, None, &req).map_err(ApiError::from)?
+    } else {
+        None
+    };
+    validate_query_security_constraints(&req, &decision).map_err(ApiError::from)?;
     let knobs = state.runtime_query_config.snapshot();
 
     // ---- Phase 1: request-shape validation (NO I/O, needs no metadata) ----
@@ -808,7 +894,13 @@ pub async fn query_namespace(
     // namespace is a 400 (bad request), not a 404 (Task 14 I2). Also runs
     // BEFORE the query metrics increment so rejected requests aren't counted
     // as queries (I3).
-    let validated = validate_query_shape(&req, knobs.as_ref(), &state).map_err(ApiError::from)?;
+    let mut validated = validate_query_shape(&req, knobs.as_ref(), &state, cursor_fingerprint)
+        .map_err(ApiError::from)?;
+    validate_cursor_security_binding(&req, decision.policy_version, decision.cursor_binding_key)
+        .map_err(ApiError::from)?;
+    if params.as_of.is_none() {
+        validate_cursor_query_binding(&req, cursor_fingerprint).map_err(ApiError::from)?;
+    }
 
     // ---- Phase 2: metrics (only requests that passed shape validation) ----
     let start = std::time::Instant::now();
@@ -833,20 +925,28 @@ pub async fn query_namespace(
         Some(as_of) => Some(as_of::resolve_manifest(&state.store, &ns, as_of).await?),
         None => None,
     };
+    if let (Some(selector), Some(manifest)) = (params.as_of.as_deref(), as_of_manifest.as_ref()) {
+        cursor_fingerprint =
+            cursor_fingerprint_if_requested(&ns, Some((selector, manifest.version())), &req)
+                .map_err(ApiError::from)?;
+        validate_cursor_query_binding(&req, cursor_fingerprint).map_err(ApiError::from)?;
+        validated.cursor_fingerprint = cursor_fingerprint;
+    }
     let notify_hydration = as_of_manifest.is_none();
 
-    let result = execute_validated_query(
-        &state,
-        &ns,
-        &meta,
-        &req,
+    let result = execute_validated_query(ValidatedQueryExecution {
+        state: &state,
+        ns: &ns,
+        meta: &meta,
+        req: &req,
         validated,
-        knobs.as_ref(),
-        QueryExecutionOptions {
+        knobs: knobs.as_ref(),
+        security: &decision,
+        options: QueryExecutionOptions {
             manifest: as_of_manifest,
             notify_hydration,
         },
-    )
+    })
     .await
     .map_err(ApiError::from)?;
 
@@ -919,14 +1019,16 @@ pub async fn query_namespace(
 /// responses and one 400-class error envelope in their original positions. If
 /// namespace lookup fails, all shape-valid entries receive that error while an
 /// independently malformed entry retains its more specific validation error.
-#[instrument(skip(state, _decision, body), fields(namespace = %ns))]
+#[instrument(skip(state, decision, audit, body), fields(namespace = %ns))]
 pub async fn batch_query_namespace(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
+    audit: Option<Extension<AuditRequest>>,
     Extension(rate_limit_identity): Extension<RateLimitIdentity>,
     Path(ns): Path<String>,
     body: bytes::Bytes,
 ) -> Result<Json<BatchQueryResponse>, ApiError> {
+    let audit = audit.map(|Extension(audit)| audit);
     let req: BatchQueryRequest = serde_json::from_slice(&body).map_err(|e| {
         ApiError(ZeppelinError::Validation(format!(
             "invalid request body: {e}"
@@ -954,15 +1056,42 @@ pub async fn batch_query_namespace(
     .map_err(ApiError::from)?;
 
     let knobs = state.runtime_query_config.snapshot();
+    let redact_timing = decision.mandatory_filter.is_some();
     let validations: Vec<Result<ValidatedQuery, ZeppelinError>> = req
         .queries
         .iter()
-        .map(|query| validate_query_shape(query, knobs.as_ref(), &state))
+        .map(|query| {
+            let cursor_fingerprint = cursor_fingerprint_if_requested(&ns, None, query)?;
+            validate_query_security_constraints(query, &decision)?;
+            let validated =
+                validate_query_shape(query, knobs.as_ref(), &state, cursor_fingerprint)?;
+            validate_cursor_security_binding(
+                query,
+                decision.policy_version,
+                decision.cursor_binding_key,
+            )?;
+            validate_cursor_query_binding(query, cursor_fingerprint)?;
+            Ok(validated)
+        })
         .collect();
     for _ in validations.iter().filter(|validation| validation.is_ok()) {
         crate::metrics::QUERIES_TOTAL
             .with_label_values(&[&ns])
             .inc();
+    }
+
+    // When every entry is malformed or carries an unauthenticated cursor,
+    // settle the independent validation envelopes before namespace lookup.
+    // An all-invalid batch must not turn cheap request bytes into S3 work.
+    if validations.iter().all(Result::is_err) {
+        let results = validations
+            .into_iter()
+            .map(|validation| match validation {
+                Err(error) => batch_error_entry(&error, Instant::now(), redact_timing),
+                Ok(_) => unreachable!("all batch validations were checked as errors"),
+            })
+            .collect();
+        return Ok(finish_batch_response(audit.as_ref(), results));
     }
 
     let meta = state.namespace_manager.get(&ns).await;
@@ -974,12 +1103,14 @@ pub async fn batch_query_namespace(
                 .map(|validation| {
                     let start = Instant::now();
                     match validation {
-                        Ok(_) => batch_error_entry(&err, start),
-                        Err(validation_err) => batch_error_entry(&validation_err, start),
+                        Ok(_) => batch_error_entry(&err, start, redact_timing),
+                        Err(validation_err) => {
+                            batch_error_entry(&validation_err, start, redact_timing)
+                        }
                     }
                 })
                 .collect();
-            return Ok(Json(BatchQueryResponse { results }));
+            return Ok(finish_batch_response(audit.as_ref(), results));
         }
     };
 
@@ -1001,12 +1132,14 @@ pub async fn batch_query_namespace(
                         .map(|validation| {
                             let start = Instant::now();
                             match validation {
-                                Ok(_) => batch_error_entry(&err, start),
-                                Err(validation_err) => batch_error_entry(&validation_err, start),
+                                Ok(_) => batch_error_entry(&err, start, redact_timing),
+                                Err(validation_err) => {
+                                    batch_error_entry(&validation_err, start, redact_timing)
+                                }
                             }
                         })
                         .collect();
-                    return Ok(Json(BatchQueryResponse { results }));
+                    return Ok(finish_batch_response(audit.as_ref(), results));
                 }
             }
         }
@@ -1021,30 +1154,55 @@ pub async fn batch_query_namespace(
         let start = Instant::now();
         let entry = match &validations[idx] {
             Ok(validated) => {
-                match execute_validated_query(
-                    &state,
-                    &ns,
-                    &meta,
-                    query_req,
-                    *validated,
-                    knobs.as_ref(),
-                    QueryExecutionOptions {
+                match execute_validated_query(ValidatedQueryExecution {
+                    state: &state,
+                    ns: &ns,
+                    meta: &meta,
+                    req: query_req,
+                    validated: *validated,
+                    knobs: knobs.as_ref(),
+                    security: &decision,
+                    options: QueryExecutionOptions {
                         manifest: manifest.clone(),
                         notify_hydration: false,
                     },
-                )
+                })
                 .await
                 {
-                    Ok(response) => batch_success_entry(response, start),
-                    Err(err) => batch_error_entry(&err, start),
+                    Ok(response) => batch_success_entry(response, start, redact_timing),
+                    Err(err) => batch_error_entry(&err, start, redact_timing),
                 }
             }
-            Err(err) => batch_error_entry(err, start),
+            Err(err) => batch_error_entry(err, start, redact_timing),
         };
         results.push(entry);
     }
 
-    Ok(Json(BatchQueryResponse { results }))
+    Ok(finish_batch_response(audit.as_ref(), results))
+}
+
+/// Annotates per-entry constraint denials before returning a positional batch.
+fn finish_batch_response(
+    audit: Option<&AuditRequest>,
+    results: Vec<BatchQueryEntry>,
+) -> Json<BatchQueryResponse> {
+    let denied_entries = results
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                BatchQueryEntry::Error { error, .. }
+                    if error.code == "constraint_violation"
+            )
+        })
+        .count();
+    if denied_entries > 0 {
+        let Some(audit) = audit else {
+            panic!("batch constraint denial reached response assembly without audit context");
+        };
+        audit.mark_batch_constraint_denial(denied_entries, results.len());
+    }
+    Json(BatchQueryResponse { results })
 }
 
 /// Validates request-only constraints and freezes effective query controls.
@@ -1080,6 +1238,7 @@ fn validate_query_shape(
     req: &QueryRequest,
     knobs: &QueryKnobs,
     state: &AppState,
+    cursor_fingerprint: Option<u64>,
 ) -> Result<ValidatedQuery, ZeppelinError> {
     let top_k = req.top_k.unwrap_or(knobs.default_top_k);
     let (source, source_nprobe) =
@@ -1112,6 +1271,7 @@ fn validate_query_shape(
         nprobe,
         include_attributes,
         source,
+        cursor_fingerprint,
     })
 }
 
@@ -1569,13 +1729,8 @@ fn validate_projection(req: &QueryRequest) -> Result<bool, ZeppelinError> {
 ///
 /// # Parameters
 ///
-/// - `state`: Shared storage, query, cache, and hydration services.
-/// - `ns`: Resolved namespace name.
-/// - `meta`: Namespace dimensions, distance metric, and FTS configuration.
-/// - `req`: Original request retained for filter and response transforms.
-/// - `validated`: Effective widths, projection, and source path.
-/// - `knobs`: Runtime-query snapshot used consistently for this execution.
-/// - `options`: Optional caller-selected manifest and hydration notification flag.
+/// - `execution`: Original request, validated controls, policy decision, and
+///   shared execution dependencies captured as one consistent value.
 ///
 /// # Returns
 ///
@@ -1605,31 +1760,33 @@ fn validate_projection(req: &QueryRequest) -> Result<bool, ZeppelinError> {
 /// counts facets on that frontier, truncates to `top_k`, and returns the source's
 /// scan counters unchanged.
 async fn execute_validated_query(
-    state: &AppState,
-    ns: &str,
-    meta: &NamespaceMetadata,
-    req: &QueryRequest,
-    validated: ValidatedQuery,
-    knobs: &QueryKnobs,
-    options: QueryExecutionOptions,
+    execution: ValidatedQueryExecution<'_>,
 ) -> Result<QueryResponse, ZeppelinError> {
-    if let ValidatedSource::AlgebraHybrid { source_count } = validated.source {
-        return execute_hybrid_query(
-            state,
-            ns,
-            meta,
-            req,
-            validated,
-            source_count,
-            knobs,
-            options,
-        )
-        .await;
+    if let ValidatedSource::AlgebraHybrid { source_count } = execution.validated.source {
+        return execute_hybrid_query(execution, source_count).await;
     }
 
+    let ValidatedQueryExecution {
+        state,
+        ns,
+        meta,
+        req,
+        validated,
+        knobs,
+        security,
+        options,
+    } = execution;
+
     let manifest = read_manifest_for_execution(state, ns, req.consistency, options).await?;
-    let source_ref =
-        resolve_query_source_ref(state, ns, req, validated.source, manifest.clone()).await?;
+    let source_ref = resolve_query_source_ref(
+        state,
+        ns,
+        req,
+        validated.source,
+        manifest.clone(),
+        security.mandatory_filter.as_ref(),
+    )
+    .await?;
     validate_query_source_metadata(ns, meta, &source_ref)?;
     let emit_debug = req.debug.unwrap_or(false);
     let first_stage_top_k = first_stage_top_k(req, validated);
@@ -1644,18 +1801,23 @@ async fn execute_validated_query(
         knobs.default_nprobe,
     )?;
     let explain_source = explain_source_for_ref(0, &source_ref, nprobe, first_stage_top_k);
+    let effective_filter =
+        query::compile_effective_filter(security.mandatory_filter.as_ref(), req.filter.as_ref());
     let mut explain = build_explain_accumulator(
         req,
         validated,
         explain_path(validated.source),
         first_stage_top_k,
         vec![explain_source],
+        security.mandatory_filter.is_some(),
     );
     let source = execute_query_source_with_manifest(
         state,
         ns,
         meta,
         req,
+        effective_filter.as_ref(),
+        security.mandatory_filter.as_ref(),
         source_ref,
         first_stage_top_k,
         nprobe,
@@ -1677,6 +1839,11 @@ async fn execute_validated_query(
             top_k: validated.top_k,
             rerank_limit,
             include_attributes: validated.include_attributes,
+            field_mask: security.field_mask.as_ref(),
+            policy_filter_applied: security.mandatory_filter.is_some(),
+            policy_version: security.policy_version,
+            cursor_binding_key: security.cursor_binding_key,
+            cursor_fingerprint: validated.cursor_fingerprint,
             manifest,
         },
         source.response,
@@ -1685,7 +1852,6 @@ async fn execute_validated_query(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Executes every source in a validated hybrid request and fuses their results.
 ///
 /// Sources run sequentially in request order against clones of one manifest.
@@ -1696,8 +1862,8 @@ async fn execute_validated_query(
 ///
 /// # Parameters
 ///
-/// - `state`, `ns`, `meta`, `req`, `validated`, `knobs`, and `options`: Same
-///   execution dependencies and frozen controls as `execute_validated_query`.
+/// - `execution`: Same execution dependencies and frozen controls as
+///   `execute_validated_query`.
 /// - `source_count`: Source cardinality captured during shape validation.
 ///
 /// # Returns
@@ -1728,15 +1894,19 @@ async fn execute_validated_query(
 /// retrieves and trims 100 non-seed candidates from each source, combines them
 /// using requested/default fusion, then returns the requested page.
 async fn execute_hybrid_query(
-    state: &AppState,
-    ns: &str,
-    meta: &NamespaceMetadata,
-    req: &QueryRequest,
-    validated: ValidatedQuery,
+    execution: ValidatedQueryExecution<'_>,
     source_count: usize,
-    knobs: &QueryKnobs,
-    options: QueryExecutionOptions,
 ) -> Result<QueryResponse, ZeppelinError> {
+    let ValidatedQueryExecution {
+        state,
+        ns,
+        meta,
+        req,
+        validated,
+        knobs,
+        security,
+        options,
+    } = execution;
     let sources = req
         .sources
         .as_ref()
@@ -1759,9 +1929,18 @@ async fn execute_hybrid_query(
         .candidate_k
         .saturating_add(excluded_seed_ids.len());
     let mut explain_sources = Vec::with_capacity(source_count);
+    let effective_filter =
+        query::compile_effective_filter(security.mandatory_filter.as_ref(), req.filter.as_ref());
     for index in 0..source_count {
-        let source_ref =
-            resolve_algebra_source_ref(state, ns, req, index, manifest.clone()).await?;
+        let source_ref = resolve_algebra_source_ref(
+            state,
+            ns,
+            req,
+            index,
+            manifest.clone(),
+            security.mandatory_filter.as_ref(),
+        )
+        .await?;
         validate_query_source_metadata(ns, meta, &source_ref)?;
         let requested_nprobe = nprobe_for_algebra_source(req, index)?;
         let nprobe = resolve_source_nprobe(
@@ -1782,6 +1961,8 @@ async fn execute_hybrid_query(
             ns,
             meta,
             req,
+            effective_filter.as_ref(),
+            security.mandatory_filter.as_ref(),
             source_ref,
             source_candidate_k,
             nprobe,
@@ -1805,6 +1986,7 @@ async fn execute_hybrid_query(
         QueryExplainPath::AlgebraHybrid,
         first_stage_top_k,
         explain_sources,
+        security.mandatory_filter.is_some(),
     );
     if let Some(explain) = explain.as_mut() {
         explain.capture_hybrid_sources(req.fusion.as_ref(), &source_responses)?;
@@ -1825,6 +2007,11 @@ async fn execute_hybrid_query(
             top_k: validated.top_k,
             rerank_limit,
             include_attributes: validated.include_attributes,
+            field_mask: security.field_mask.as_ref(),
+            policy_filter_applied: security.mandatory_filter.is_some(),
+            policy_version: security.policy_version,
+            cursor_binding_key: security.cursor_binding_key,
+            cursor_fingerprint: validated.cursor_fingerprint,
             manifest,
         },
         response,
@@ -2411,9 +2598,15 @@ fn build_explain_accumulator(
     validated: ValidatedQuery,
     path: QueryExplainPath,
     first_stage_top_k: usize,
-    sources: Vec<QueryExplainSource>,
+    mut sources: Vec<QueryExplainSource>,
+    policy_filter_applied: bool,
 ) -> Option<ExplainAccumulator> {
     let mode = requested_explain_mode(req)?;
+    if policy_filter_applied {
+        for source in &mut sources {
+            source.nprobe = None;
+        }
+    }
     Some(ExplainAccumulator::new(
         mode,
         QueryExplainPlan {
@@ -2431,6 +2624,7 @@ fn build_explain_accumulator(
             projection: QueryExplainProjection {
                 include_attributes: validated.include_attributes,
             },
+            policy_filter_applied,
         },
     ))
 }
@@ -2621,6 +2815,16 @@ struct RerankExecutionContext<'a> {
     rerank_limit: usize,
     /// Whether attributes survive into client output.
     include_attributes: bool,
+    /// Server-owned fields removed from every returned attribute map.
+    field_mask: Option<&'a FieldMask>,
+    /// Whether physical namespace-wide diagnostics must be withheld.
+    policy_filter_applied: bool,
+    /// Policy generation bound into every emitted or consumed cursor.
+    policy_version: PolicyVersion,
+    /// Server-only key authenticating cursor version, shape, and marker fields.
+    cursor_binding_key: CursorBindingKey,
+    /// Caller-visible query identity captured before mandatory-filter injection.
+    cursor_fingerprint: Option<u64>,
     /// Owned visibility snapshot reused by vector-value fetches.
     manifest: Manifest,
 }
@@ -2699,16 +2903,52 @@ async fn apply_rerank_if_requested(
     }
     let response =
         apply_grouping_if_requested(ctx.req, response, ctx.top_k, ctx.include_attributes)?;
-    let mut response = apply_cursor_if_requested(ctx.ns, ctx.req, response, ctx.top_k)?;
+    let mut response = apply_cursor_if_requested(
+        ctx.req,
+        response,
+        ctx.top_k,
+        ctx.policy_version,
+        ctx.cursor_binding_key,
+        ctx.cursor_fingerprint,
+    )?;
     if !grouping_requested(ctx.req) && !cursor_requested(ctx.req) {
         response.results.truncate(ctx.top_k);
     }
     strip_attributes_if_needed(&mut response, ctx.include_attributes);
+    if let Some(mask) = ctx.field_mask {
+        apply_response_field_mask(&mut response, mask);
+    }
+    redact_policy_scoped_diagnostics(&mut response, ctx.policy_filter_applied)?;
     response.facets = facets;
     if let Some(explain) = explain {
         response.explain = Some(explain.finish(&response.results)?);
     }
     Ok(response)
+}
+
+/// Withholds namespace-wide physical work counters from row-scoped callers.
+///
+/// WAL-fragment, segment, cache, cluster, and timing diagnostics describe work
+/// across the shared namespace rather than only rows admitted by a mandatory
+/// filter. Returning them would create a cross-slice activity oracle. Explicit
+/// debug requests are rejected before execution; observing a debug block here
+/// is therefore an internal enforcement failure rather than something to
+/// silently redact.
+fn redact_policy_scoped_diagnostics(
+    response: &mut QueryResponse,
+    policy_filter_applied: bool,
+) -> Result<(), ZeppelinError> {
+    if !policy_filter_applied {
+        return Ok(());
+    }
+    if response.debug.is_some() {
+        return Err(ZeppelinError::Index(
+            "policy-scoped query reached response assembly with physical diagnostics".into(),
+        ));
+    }
+    response.scanned_fragments = 0;
+    response.scanned_segments = 0;
+    Ok(())
 }
 
 /// Removes attributes that were loaded only for internal transforms.
@@ -2738,6 +2978,29 @@ fn strip_attributes_if_needed(response: &mut QueryResponse, include_attributes: 
         for group in groups {
             for result in &mut group.results {
                 result.attributes = None;
+            }
+        }
+    }
+}
+
+/// Removes policy-denied attributes from flat and grouped response copies.
+fn apply_response_field_mask(response: &mut QueryResponse, mask: &FieldMask) {
+    fn mask_result(result: &mut SearchResult, mask: &FieldMask) {
+        if let Some(attributes) = result.attributes.as_mut() {
+            apply_field_mask(mask, attributes);
+            if attributes.is_empty() {
+                result.attributes = None;
+            }
+        }
+    }
+
+    for result in &mut response.results {
+        mask_result(result, mask);
+    }
+    if let Some(groups) = response.groups.as_mut() {
+        for group in groups {
+            for result in &mut group.results {
+                mask_result(result, mask);
             }
         }
     }
@@ -3120,14 +3383,18 @@ fn group_attribute_value(value: &AttributeValue) -> Result<String, ZeppelinError
     }
 }
 
-/// Decoded fields carried by a version-one opaque cursor token.
+/// Decoded fields carried by a policy-bound opaque cursor token.
 struct DecodedCursor {
+    /// Authoritative security policy generation at cursor issuance.
+    policy_version: u64,
     /// Non-cryptographic fingerprint of namespace and ranking request.
     fingerprint: u64,
     /// Exact IEEE-754 bits of the page-ending finite score.
     score_bits: u32,
     /// UTF-8 ID used as deterministic tie breaker.
     id: String,
+    /// HMAC-SHA256 over every preceding token field.
+    authentication_tag: [u8; 32],
 }
 
 /// Sorts, filters, slices, and emits a stateless cursor page when requested.
@@ -3139,7 +3406,6 @@ struct DecodedCursor {
 ///
 /// # Parameters
 ///
-/// - `ns`: Namespace bound into the cursor fingerprint.
 /// - `req`: Request defining ranking semantics and optional marker.
 /// - `response`: Ranked frontier with at least one extra entry when available.
 /// - `top_k`: Page size.
@@ -3157,10 +3423,10 @@ struct DecodedCursor {
 ///
 /// # Consistency
 ///
-/// Tokens bind the query shape but not a manifest generation and exclude the
-/// consistency mode from the fingerprint. Live data may change between pages;
-/// clients requiring a frozen view should query an explicit retained `as_of`
-/// snapshot, although cursor syntax itself is algebra-only in this route.
+/// Tokens bind the query shape, consistency mode, policy version, and optional
+/// historical selector, but not a manifest generation. Live data may change
+/// between pages; clients requiring a frozen view should query an explicit
+/// retained `as_of` snapshot.
 ///
 /// # Performance
 ///
@@ -3173,10 +3439,12 @@ struct DecodedCursor {
 /// returns `a,b` plus a token for `b`; the next page returns `c`. Reusing that
 /// token with another namespace or ranking vector fails validation.
 fn apply_cursor_if_requested(
-    ns: &str,
     req: &QueryRequest,
     mut response: QueryResponse,
     top_k: usize,
+    policy_version: PolicyVersion,
+    cursor_binding_key: CursorBindingKey,
+    fingerprint: Option<u64>,
 ) -> Result<QueryResponse, ZeppelinError> {
     let Some(cursor) = req.cursor.as_ref() else {
         response.next_cursor = None;
@@ -3185,9 +3453,28 @@ fn apply_cursor_if_requested(
 
     let cursor_cmp = cursor_result_cmp(req);
     response.results.sort_by(cursor_cmp);
-    let fingerprint = cursor_fingerprint(ns, req)?;
+    let fingerprint = fingerprint.ok_or_else(|| {
+        ZeppelinError::Index(
+            "cursor request reached response assembly without a caller fingerprint".into(),
+        )
+    })?;
     if let CursorSpec::After { token } = cursor {
         let decoded = decode_cursor_token(token)?;
+        let expected_tag = cursor_authentication_tag(
+            cursor_binding_key,
+            decoded.policy_version,
+            decoded.fingerprint,
+            decoded.score_bits,
+            decoded.id.as_bytes(),
+        );
+        if expected_tag.ct_eq(&decoded.authentication_tag).unwrap_u8() != 1 {
+            return Err(ZeppelinError::Validation(
+                "invalid cursor token authentication".into(),
+            ));
+        }
+        if decoded.policy_version != policy_version.get() {
+            return Err(SecurityError::CursorPolicyStale.into());
+        }
         if decoded.fingerprint != fingerprint {
             return Err(ZeppelinError::Validation(
                 "cursor token does not match query".into(),
@@ -3209,7 +3496,9 @@ fn apply_cursor_if_requested(
         response
             .results
             .last()
-            .map(|result| encode_cursor_token(fingerprint, result))
+            .map(|result| {
+                encode_cursor_token(cursor_binding_key, policy_version, fingerprint, result)
+            })
             .transpose()?
     } else {
         None
@@ -3263,13 +3552,15 @@ fn distance_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
 /// # Parameters
 ///
 /// - `ns`: Namespace preventing cross-namespace token reuse.
+/// - `as_of`: Caller-visible historical selector paired with the exact
+///   immutable generation it resolved to, when present.
 /// - `req`: Serializable request copied into a canonical struct-shaped JSON value.
 ///
 /// # Returns
 ///
 /// An XXH3 64-bit non-cryptographic fingerprint after removing cursor, debug,
-/// explain, facets, projection/attribute output, and consistency controls. Those
-/// fields do not define the score marker identity in the current contract.
+/// explain, facets, and projection/attribute output controls. Those fields do
+/// not define the score marker identity in the current contract.
 ///
 /// # Errors
 ///
@@ -3277,14 +3568,20 @@ fn distance_result_cmp(a: &SearchResult, b: &SearchResult) -> Ordering {
 ///
 /// # Consistency
 ///
-/// XXH3 detects accidental query mismatch; it is not a MAC and does not protect
-/// against a client deliberately forging a token.
+/// XXH3 supplies the compact query identity. The complete token authenticates
+/// that identity together with the policy version and page marker using
+/// HMAC-SHA256, so clients cannot replace or splice any individual field.
 ///
 /// # Examples
 ///
-/// Changing `top_k`, source vector, filter, fusion, or reranker changes the
-/// fingerprint. Toggling debug or attribute projection does not.
-fn cursor_fingerprint(ns: &str, req: &QueryRequest) -> Result<u64, ZeppelinError> {
+/// Changing the raw `as_of` selector, its resolved generation, consistency,
+/// `top_k`, source vector, filter, fusion, or reranker changes the fingerprint.
+/// Toggling debug or attribute projection does not.
+fn cursor_fingerprint(
+    ns: &str,
+    as_of: Option<(&str, u64)>,
+    req: &QueryRequest,
+) -> Result<u64, ZeppelinError> {
     let mut value = serde_json::to_value(req)?;
     let object = value.as_object_mut().ok_or_else(|| {
         ZeppelinError::Validation("cursor fingerprint requires object query".into())
@@ -3295,12 +3592,83 @@ fn cursor_fingerprint(ns: &str, req: &QueryRequest) -> Result<u64, ZeppelinError
     object.remove("facets");
     object.remove("include_attributes");
     object.remove("projection");
-    object.remove("consistency");
-    let payload = serde_json::to_vec(&(ns, value))?;
+    let payload = serde_json::to_vec(&(ns, as_of, value))?;
     Ok(xxh3_64(&payload))
 }
 
-/// Encodes one finite page-ending result as a version-one cursor token.
+/// Captures a cursor identity from the caller-visible request before policy
+/// constraints mutate the execution filter. The policy version carried beside
+/// the fingerprint binds authorization changes without exposing a digest of a
+/// server-only predicate in the opaque token; the final HMAC authenticates both
+/// values and the page marker as one unit.
+fn cursor_fingerprint_if_requested(
+    ns: &str,
+    as_of: Option<(&str, u64)>,
+    req: &QueryRequest,
+) -> Result<Option<u64>, ZeppelinError> {
+    req.cursor
+        .as_ref()
+        .map(|_| cursor_fingerprint(ns, as_of, req))
+        .transpose()
+}
+
+/// Authenticates an after-cursor before namespace lookup or retrieval work.
+///
+/// The server-only HMAC is checked before either the policy version or request
+/// fingerprint is trusted. A genuine token from an older policy receives the
+/// typed stale error; a caller-spliced token remains a generic validation
+/// failure and cannot trigger ANN, BM25, or object-store work.
+fn validate_cursor_security_binding(
+    req: &QueryRequest,
+    policy_version: PolicyVersion,
+    cursor_binding_key: CursorBindingKey,
+) -> Result<(), ZeppelinError> {
+    let Some(CursorSpec::After { token }) = req.cursor.as_ref() else {
+        return Ok(());
+    };
+    let decoded = decode_cursor_token(token)?;
+    let expected_tag = cursor_authentication_tag(
+        cursor_binding_key,
+        decoded.policy_version,
+        decoded.fingerprint,
+        decoded.score_bits,
+        decoded.id.as_bytes(),
+    );
+    if expected_tag.ct_eq(&decoded.authentication_tag).unwrap_u8() != 1 {
+        return Err(ZeppelinError::Validation(
+            "invalid cursor token authentication".into(),
+        ));
+    }
+    if decoded.policy_version != policy_version.get() {
+        return Err(SecurityError::CursorPolicyStale.into());
+    }
+    Ok(())
+}
+
+/// Compares an authenticated cursor with the request's complete query identity.
+///
+/// Live and batch requests perform this check before namespace I/O. Historical
+/// requests perform it immediately after resolving `as_of`, because the
+/// fingerprint binds both the caller's selector and the immutable manifest
+/// generation it selected. HMAC and policy validation always happen first, so
+/// forged cursors cannot force snapshot or manifest reads.
+fn validate_cursor_query_binding(
+    req: &QueryRequest,
+    fingerprint: Option<u64>,
+) -> Result<(), ZeppelinError> {
+    let Some(CursorSpec::After { token }) = req.cursor.as_ref() else {
+        return Ok(());
+    };
+    let decoded = decode_cursor_token(token)?;
+    if Some(decoded.fingerprint) != fingerprint {
+        return Err(ZeppelinError::Validation(
+            "cursor token does not match query".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Encodes one finite page-ending result as an authenticated cursor token.
 ///
 /// # Parameters
 ///
@@ -3309,8 +3677,10 @@ fn cursor_fingerprint(ns: &str, req: &QueryRequest) -> Result<u64, ZeppelinError
 ///
 /// # Returns
 ///
-/// `zp1:<fingerprint-hex>:<score-bits-hex>:<id-utf8-hex>`. Encoding exact score
-/// bits avoids decimal round-trip changes at page boundaries.
+/// `zp3:<policy-version-hex>:<fingerprint-hex>:<score-bits-hex>:<id-utf8-hex>:<hmac-hex>`.
+/// Encoding exact score bits avoids decimal round-trip changes at page boundaries;
+/// the HMAC prevents a caller from splicing a current policy version onto an old
+/// page marker.
 ///
 /// # Errors
 ///
@@ -3320,20 +3690,66 @@ fn cursor_fingerprint(ns: &str, req: &QueryRequest) -> Result<u64, ZeppelinError
 ///
 /// A result ID containing punctuation remains safe because its UTF-8 bytes are
 /// hex encoded rather than placed raw between separators.
-fn encode_cursor_token(fingerprint: u64, result: &SearchResult) -> Result<String, ZeppelinError> {
+fn encode_cursor_token(
+    cursor_binding_key: CursorBindingKey,
+    policy_version: PolicyVersion,
+    fingerprint: u64,
+    result: &SearchResult,
+) -> Result<String, ZeppelinError> {
     if !result.score.is_finite() {
         return Err(ZeppelinError::Validation(
             "cursor cannot encode non-finite score".into(),
         ));
     }
+    let score_bits = result.score.to_bits();
+    let id_bytes = result.id.as_bytes();
+    let authentication_tag = cursor_authentication_tag(
+        cursor_binding_key,
+        policy_version.get(),
+        fingerprint,
+        score_bits,
+        id_bytes,
+    );
     Ok(format!(
-        "zp1:{fingerprint:016x}:{:08x}:{}",
-        result.score.to_bits(),
-        hex_encode(result.id.as_bytes())
+        "zp3:{:016x}:{fingerprint:016x}:{score_bits:08x}:{}:{}",
+        policy_version.get(),
+        hex_encode(id_bytes),
+        hex_encode(&authentication_tag),
     ))
 }
 
-/// Parses and validates the structural contents of a version-one cursor token.
+/// Computes HMAC-SHA256 over the complete policy-bound cursor marker.
+fn cursor_authentication_tag(
+    cursor_binding_key: CursorBindingKey,
+    policy_version: u64,
+    fingerprint: u64,
+    score_bits: u32,
+    id: &[u8],
+) -> [u8; 32] {
+    const BLOCK_BYTES: usize = 64;
+    let mut inner_pad = [0x36_u8; BLOCK_BYTES];
+    let mut outer_pad = [0x5c_u8; BLOCK_BYTES];
+    for (index, key_byte) in cursor_binding_key.as_bytes().iter().enumerate() {
+        inner_pad[index] ^= key_byte;
+        outer_pad[index] ^= key_byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(b"zeppelin-cursor-v3\0");
+    inner.update(policy_version.to_be_bytes());
+    inner.update(fingerprint.to_be_bytes());
+    inner.update(score_bits.to_be_bytes());
+    inner.update((id.len() as u64).to_be_bytes());
+    inner.update(id);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+/// Parses and validates the structural contents of an authenticated cursor token.
 ///
 /// # Parameters
 ///
@@ -3355,12 +3771,14 @@ fn encode_cursor_token(fingerprint: u64, result: &SearchResult) -> Result<String
 /// before it can affect result filtering.
 fn decode_cursor_token(token: &str) -> Result<DecodedCursor, ZeppelinError> {
     let parts: Vec<&str> = token.split(':').collect();
-    if parts.len() != 4 || parts[0] != "zp1" {
+    if parts.len() != 6 || parts[0] != "zp3" {
         return Err(ZeppelinError::Validation("invalid cursor token".into()));
     }
-    let fingerprint = u64::from_str_radix(parts[1], 16)
+    let policy_version = u64::from_str_radix(parts[1], 16)
         .map_err(|_| ZeppelinError::Validation("invalid cursor token".into()))?;
-    let score_bits = u32::from_str_radix(parts[2], 16)
+    let fingerprint = u64::from_str_radix(parts[2], 16)
+        .map_err(|_| ZeppelinError::Validation("invalid cursor token".into()))?;
+    let score_bits = u32::from_str_radix(parts[3], 16)
         .map_err(|_| ZeppelinError::Validation("invalid cursor token".into()))?;
     let score = f32::from_bits(score_bits);
     if !score.is_finite() {
@@ -3368,13 +3786,18 @@ fn decode_cursor_token(token: &str) -> Result<DecodedCursor, ZeppelinError> {
             "invalid cursor token score".into(),
         ));
     }
-    let id_bytes = hex_decode(parts[3])?;
+    let id_bytes = hex_decode(parts[4])?;
     let id = String::from_utf8(id_bytes)
         .map_err(|_| ZeppelinError::Validation("invalid cursor token id".into()))?;
+    let authentication_tag = hex_decode(parts[5])?
+        .try_into()
+        .map_err(|_| ZeppelinError::Validation("invalid cursor token authentication".into()))?;
     Ok(DecodedCursor {
+        policy_version,
         fingerprint,
         score_bits,
         id,
+        authentication_tag,
     })
 }
 
@@ -3878,6 +4301,8 @@ async fn execute_query_source_with_manifest(
     ns: &str,
     meta: &NamespaceMetadata,
     req: &QueryRequest,
+    effective_filter: Option<&Filter>,
+    mandatory_filter: Option<&Filter>,
     source_ref: QuerySourceRef<'_>,
     top_k: usize,
     nprobe: usize,
@@ -3912,7 +4337,8 @@ async fn execute_query_source_with_manifest(
                     rank_by,
                     &meta.full_text_search,
                     top_k,
-                    req.filter.as_ref(),
+                    effective_filter,
+                    mandatory_filter,
                     req.consistency,
                     last_as_prefix,
                     Some(&state.fts_cache),
@@ -3933,7 +4359,8 @@ async fn execute_query_source_with_manifest(
                     rank_by,
                     &meta.full_text_search,
                     top_k,
-                    req.filter.as_ref(),
+                    effective_filter,
+                    mandatory_filter,
                     req.consistency,
                     last_as_prefix,
                     Some(&state.fts_cache),
@@ -3979,7 +4406,7 @@ async fn execute_query_source_with_manifest(
                 query: vector.as_ref(),
                 top_k: search_top_k,
                 nprobe,
-                filter: req.filter.as_ref(),
+                filter: effective_filter,
                 consistency: req.consistency,
                 distance_metric: meta.distance_metric,
                 oversample_factor: state.config.indexing.oversample_factor,
@@ -3988,17 +4415,32 @@ async fn execute_query_source_with_manifest(
                 manifest_cache: Some(&state.manifest_cache),
                 include_attributes,
             };
+            let scoped_indexing_config = meta.index_config.as_ref().map_or_else(
+                || state.config.indexing.clone(),
+                |config| config.apply_to_indexing_config(&state.config.indexing),
+            );
+            let scoped_ann = mandatory_filter.map(|mandatory_filter| query::ScopedAnnQuery {
+                mandatory_filter,
+                indexing_config: &scoped_indexing_config,
+                decoded_artifact_cache: &state.decoded_artifact_cache,
+            });
 
             let response = if emit_debug {
                 query::execute_query_with_manifest_debug(
                     params,
                     manifest,
                     Some(&state.fragment_cache),
+                    scoped_ann,
                 )
                 .await
             } else {
-                query::execute_query_with_manifest(params, manifest, Some(&state.fragment_cache))
-                    .await
+                query::execute_query_with_manifest(
+                    params,
+                    manifest,
+                    Some(&state.fragment_cache),
+                    scoped_ann,
+                )
+                .await
             };
             let mut response = response?;
             if let Some(exclude_id) = exclude_id {
@@ -4378,6 +4820,7 @@ async fn resolve_query_source_ref<'a>(
     req: &'a QueryRequest,
     source: ValidatedSource,
     manifest: Manifest,
+    mandatory_filter: Option<&Filter>,
 ) -> Result<QuerySourceRef<'a>, ZeppelinError> {
     match source {
         ValidatedSource::LegacyVector => req
@@ -4397,7 +4840,7 @@ async fn resolve_query_source_ref<'a>(
             })
             .ok_or_else(|| ZeppelinError::Validation("rank_by must be provided".into())),
         ValidatedSource::AlgebraAnn { index } | ValidatedSource::AlgebraBm25 { index } => {
-            resolve_algebra_source_ref(state, ns, req, index, manifest).await
+            resolve_algebra_source_ref(state, ns, req, index, manifest, mandatory_filter).await
         }
         ValidatedSource::AlgebraHybrid { .. } => Err(ZeppelinError::Validation(
             "hybrid query must execute through all algebra sources".into(),
@@ -4443,6 +4886,7 @@ async fn resolve_algebra_source_ref<'a>(
     req: &'a QueryRequest,
     index: usize,
     manifest: Manifest,
+    mandatory_filter: Option<&Filter>,
 ) -> Result<QuerySourceRef<'a>, ZeppelinError> {
     let sources = req
         .sources
@@ -4455,12 +4899,13 @@ async fn resolve_algebra_source_ref<'a>(
                 exclude_id: None,
             }),
             (None, Some(id)) => {
-                let vector = super::vectors::fetch_vector_values_by_id(
+                let vector = super::vectors::fetch_vector_values_by_id_scoped(
                     state,
                     ns,
                     id,
                     req.consistency,
                     manifest,
+                    mandatory_filter,
                 )
                 .await?
                 .ok_or_else(|| ZeppelinError::VectorNotFound {
@@ -4673,12 +5118,16 @@ fn strongest_consistency(
 /// # Returns
 ///
 /// `ok = true`, boxed response, and elapsed whole milliseconds.
-fn batch_success_entry(response: QueryResponse, start: Instant) -> BatchQueryEntry {
+fn batch_success_entry(
+    response: QueryResponse,
+    start: Instant,
+    redact_timing: bool,
+) -> BatchQueryEntry {
     BatchQueryEntry::Success {
         ok: true,
         response: Box::new(response),
         metadata: BatchQueryEntryMetadata {
-            latency_ms: start.elapsed().as_millis() as u64,
+            latency_ms: batch_entry_latency_ms(start, redact_timing),
         },
     }
 }
@@ -4698,7 +5147,7 @@ fn batch_success_entry(response: QueryResponse, start: Instant) -> BatchQueryEnt
 ///
 /// Logs 5xx-class failures at error level and client/other failures at warning
 /// level, preserving internal details in server telemetry.
-fn batch_error_entry(err: &ZeppelinError, start: Instant) -> BatchQueryEntry {
+fn batch_error_entry(err: &ZeppelinError, start: Instant, redact_timing: bool) -> BatchQueryEntry {
     let status = err.status_code();
     if status >= 500 {
         tracing::error!(
@@ -4719,8 +5168,17 @@ fn batch_error_entry(err: &ZeppelinError, start: Instant) -> BatchQueryEntry {
         ok: false,
         error: BatchQueryError::from_error(err),
         metadata: BatchQueryEntryMetadata {
-            latency_ms: start.elapsed().as_millis() as u64,
+            latency_ms: batch_entry_latency_ms(start, redact_timing),
         },
+    }
+}
+
+/// Returns entry timing unless a row-scoped policy makes it an activity oracle.
+fn batch_entry_latency_ms(start: Instant, redact_timing: bool) -> u64 {
+    if redact_timing {
+        0
+    } else {
+        start.elapsed().as_millis() as u64
     }
 }
 
@@ -4816,5 +5274,23 @@ mod tests {
         );
         assert_eq!(resolve_ann_nprobe(&config, None, None, 40).unwrap(), 40);
         assert!(resolve_ann_nprobe(&config, Some(&invalid_flat), None, 40).is_err());
+    }
+
+    /// Stateless nodes configured with one key agree on tags; another key cannot.
+    #[test]
+    fn cursor_hmac_is_stable_across_nodes_and_key_separated() {
+        let node_a = CursorBindingKey::from_config_hex(&"11".repeat(32)).unwrap();
+        let node_b = CursorBindingKey::from_config_hex(&"11".repeat(32)).unwrap();
+        let other = CursorBindingKey::from_config_hex(&"22".repeat(32)).unwrap();
+        let expected = cursor_authentication_tag(node_a, 7, 11, 0x3f80_0000, b"row-1");
+
+        assert_eq!(
+            cursor_authentication_tag(node_b, 7, 11, 0x3f80_0000, b"row-1"),
+            expected
+        );
+        assert_ne!(
+            cursor_authentication_tag(other, 7, 11, 0x3f80_0000, b"row-1"),
+            expected
+        );
     }
 }

@@ -490,6 +490,21 @@ impl SegmentRef {
     }
 }
 
+/// Persisted strong type for one namespace lifetime identity.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+struct ManifestNamespaceIncarnation([u8; 16]);
+
+impl ManifestNamespaceIncarnation {
+    fn from_uuid(value: uuid::Uuid) -> Self {
+        Self(*value.as_bytes())
+    }
+
+    fn as_uuid(self) -> uuid::Uuid {
+        uuid::Uuid::from_bytes(self.0)
+    }
+}
+
 /// Authoritative inventory of the data visible in one namespace.
 ///
 /// A value in memory is only a candidate view. It becomes authoritative when
@@ -546,10 +561,21 @@ pub struct Manifest {
     /// or history write sets it before serialization so a valid manifest
     /// returned for another namespace fails loud instead of becoming state.
     ///
+    /// NOTE: persisted fields added after this one must remain trailing because
+    /// MessagePack encodes structs as positional arrays.
+    #[serde(default)]
+    namespace: Option<String>,
+    /// Collision-resistant identity of the namespace lifetime owning these bytes.
+    ///
+    /// Guarded writes compare this value from the same manifest GET that
+    /// supplied their CAS ETag. A delete/recreate therefore cannot reuse a
+    /// byte-identical generation/ETag as authority for work derived from the old
+    /// namespace lifetime.
+    ///
     /// NOTE: this field must stay last because MessagePack encodes structs as
     /// positional arrays.
     #[serde(default)]
-    namespace: Option<String>,
+    namespace_incarnation: Option<ManifestNamespaceIncarnation>,
 }
 
 /// Location of one immutable, addressable historical manifest generation.
@@ -688,7 +714,34 @@ impl Manifest {
             updated_at: now,
             version: 0,
             namespace: None,
+            namespace_incarnation: None,
         }
+    }
+
+    /// Binds this manifest to one authoritative namespace lifetime.
+    ///
+    /// Rebinding an already-bound manifest fails loudly. Clone preparation must
+    /// first call [`Manifest::reset_version_for_clone`], which clears source
+    /// namespace identity before the target incarnation is attached.
+    pub fn bind_namespace_incarnation(&mut self, incarnation: uuid::Uuid) -> Result<()> {
+        let incarnation = ManifestNamespaceIncarnation::from_uuid(incarnation);
+        match self.namespace_incarnation {
+            Some(existing) if existing != incarnation => Err(ZeppelinError::Serialization(
+                "manifest namespace incarnation cannot be rebound".to_string(),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.namespace_incarnation = Some(incarnation);
+                Ok(())
+            }
+        }
+    }
+
+    /// Returns the namespace lifetime identity carried by these manifest bytes.
+    #[must_use]
+    pub(crate) fn namespace_incarnation(&self) -> Option<uuid::Uuid> {
+        self.namespace_incarnation
+            .map(ManifestNamespaceIncarnation::as_uuid)
     }
 
     /// Builds the live manifest key for a namespace.
@@ -761,6 +814,45 @@ impl Manifest {
     ///
     pub fn reset_version_for_clone(&mut self) {
         self.version = 0;
+        self.namespace = None;
+        self.namespace_incarnation = None;
+    }
+
+    /// Adopts the exact empty target generation used as a clone-publication CAS base.
+    ///
+    /// Clone materialization first clears all source namespace identity. Before
+    /// publication, this method verifies that the freshly created target still
+    /// names the expected incarnation and contains no data, then advances the
+    /// candidate from that target generation. The subsequent
+    /// [`Manifest::write_conditional`] therefore cannot overwrite a concurrent
+    /// target write, delete/recreate, or another clone attempt.
+    pub(crate) fn prepare_clone_publication(
+        &mut self,
+        target_namespace: &str,
+        target_incarnation: uuid::Uuid,
+        target_base: &Manifest,
+    ) -> Result<()> {
+        if self.version != 0 || self.namespace.is_some() || self.namespace_incarnation.is_some() {
+            return Err(ZeppelinError::Serialization(
+                "clone candidate must clear source namespace identity before publication"
+                    .to_string(),
+            ));
+        }
+        target_base.validate_namespace_binding(target_namespace)?;
+        if target_base.namespace_incarnation() != Some(target_incarnation)
+            || !target_base.fragments.is_empty()
+            || !target_base.segments.is_empty()
+            || target_base.active_segment.is_some()
+            || !target_base.pending_deletes.is_empty()
+        {
+            return Err(ZeppelinError::ManifestConflict {
+                namespace: target_namespace.to_string(),
+            });
+        }
+
+        self.version = target_base.version;
+        self.namespace = Some(target_namespace.to_string());
+        self.bind_namespace_incarnation(target_incarnation)
     }
 
     /// Computes the successor of a persisted generation without wrapping.
@@ -1416,6 +1508,51 @@ impl Manifest {
         let (data, etag) = store.get_with_meta(&key).await?;
         let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
         Ok((manifest, ManifestVersion(etag)))
+    }
+
+    /// Reads one authoritative manifest and binds a legacy generation to its
+    /// namespace incarnation with CAS before returning it as write authority.
+    ///
+    /// Manifests created before incarnation binding decode with `None`. When
+    /// namespace metadata already carries the durable incarnation, this method
+    /// publishes a data-identical successor generation containing that identity.
+    /// A concurrent writer or delete/recreate changes the live ETag; the method
+    /// then reloads and either observes the expected binding or fails on a
+    /// different incarnation. No cross-object check is used after migration:
+    /// all later guards bind generation, incarnation, and ETag from one GET.
+    pub async fn read_versioned_required_for_incarnation(
+        store: &ZeppelinStore,
+        namespace: &str,
+        expected_incarnation: uuid::Uuid,
+    ) -> Result<(Self, ManifestVersion)> {
+        const MAX_MIGRATION_ATTEMPTS: usize = 8;
+
+        for _ in 0..MAX_MIGRATION_ATTEMPTS {
+            let (mut manifest, version) = Self::read_versioned_required(store, namespace).await?;
+            version.require_etag(namespace, "incarnation-bound manifest read")?;
+            match manifest.namespace_incarnation() {
+                Some(actual) if actual == expected_incarnation => {
+                    return Ok((manifest, version));
+                }
+                Some(_) => {
+                    return Err(ZeppelinError::ManifestConflict {
+                        namespace: namespace.to_string(),
+                    });
+                }
+                None => {
+                    manifest.bind_namespace_incarnation(expected_incarnation)?;
+                    match manifest.write_conditional(store, namespace, &version).await {
+                        Ok(new_version) => return Ok((manifest, new_version)),
+                        Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+
+        Err(ZeppelinError::ManifestConflict {
+            namespace: namespace.to_string(),
+        })
     }
 
     /// Reads a required published manifest without exposing its object ETag.
@@ -2528,11 +2665,29 @@ fn snapshot_name_from_key(namespace: &str, key: &str) -> Result<String> {
 /// easily confuse an ETag with an arbitrary `Option<String>`. Java would often
 /// use a small wrapper class; C would use a struct plus a presence flag. Rust's
 /// [`Option`] encodes absence without a null `String`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestVersion(
     /// Backend-provided ETag, or `None` only when no conditional version exists.
     pub Option<String>,
 );
+
+impl ManifestVersion {
+    /// Returns the backend version required to replace an existing manifest.
+    ///
+    /// A missing or empty ETag is never converted into unconditional write
+    /// authority. Callers that derive a mutation from an existing live object
+    /// must stop before uploading history or replacing the live manifest.
+    pub(crate) fn require_etag(&self, namespace: &str, operation: &str) -> Result<&str> {
+        self.0
+            .as_deref()
+            .filter(|etag| !etag.is_empty())
+            .ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "{operation} for namespace {namespace} requires an object-store ETag"
+                ))
+            })
+    }
+}
 
 impl Default for Manifest {
     /// Returns the same unpublished empty value as [`Manifest::new`].
@@ -2557,6 +2712,16 @@ mod tests {
     //! breaks a focused compatibility test.
 
     use super::*;
+
+    #[test]
+    fn conditional_manifest_versions_reject_missing_or_empty_etags() {
+        for version in [ManifestVersion(None), ManifestVersion(Some(String::new()))] {
+            let error = version
+                .require_etag("catalog", "legacy manifest incarnation migration")
+                .expect_err("existing-manifest migration must never fall back to a plain PUT");
+            assert!(matches!(error, ZeppelinError::Index(_)));
+        }
+    }
     use object_store::memory::InMemory;
     use std::sync::Arc;
 
@@ -3263,6 +3428,40 @@ mod tests {
             0,
             "manifest-derived counts are lower-bounded at zero for deletes of absent IDs"
         );
+    }
+
+    /// The namespace lifetime is persisted in the same bytes and ETag used by
+    /// guarded appends, while clone preparation explicitly clears that source
+    /// identity before the target binds its own incarnation.
+    #[test]
+    fn namespace_incarnation_roundtrips_and_clone_rebinds() {
+        let source_incarnation = uuid::Uuid::from_u128(0xaced);
+        let target_incarnation = uuid::Uuid::from_u128(0xbeef);
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(source_incarnation)
+            .expect("a fresh manifest must accept its source incarnation");
+        manifest
+            .bind_namespace_incarnation(source_incarnation)
+            .expect("rebinding the identical incarnation must be idempotent");
+        assert!(manifest
+            .bind_namespace_incarnation(target_incarnation)
+            .is_err());
+
+        let decoded = Manifest::from_bytes(&manifest.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            decoded.namespace_incarnation(),
+            Some(source_incarnation),
+            "the guarded-write incarnation must survive the manifest wire format"
+        );
+
+        let mut clone = decoded;
+        clone.reset_version_for_clone();
+        assert_eq!(clone.namespace_incarnation(), None);
+        clone
+            .bind_namespace_incarnation(target_incarnation)
+            .expect("clone target must bind a fresh namespace lifetime");
+        assert_eq!(clone.namespace_incarnation(), Some(target_incarnation));
     }
 
     /// Backward compat: manifests serialized BEFORE `FragmentRef.size_bytes`

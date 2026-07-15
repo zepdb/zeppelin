@@ -44,14 +44,42 @@ isolated development and emits an unsafe-mode signal.
 mode = "enforced"
 audit_s3 = true
 audit_flush_secs = 2
+cursor_hmac_key_hex = "<64 random hexadecimal characters>"
 ```
 
 Enforced mode refuses to start when `audit_s3 = false`, and every mode rejects a
-zero flush interval. Keep audit persistence enabled. A successful
+zero flush interval. Enforced startup also requires a 256-bit cursor HMAC key;
+provision the same secret value on every stateless node, retain it across
+restarts, and never derive it from a client API key. Rotating it invalidates
+outstanding cursors. Keep audit persistence enabled. A successful
 `must_audit` response means the audit barrier completed, but an
 `audit_unavailable` response is intentionally ambiguous: the domain operation
 may already have occurred. Reconcile authoritative S3 state and the audit prefix
 before retrying a destructive request.
+
+The first constrained upsert or scoped delete against a pre-Phase-4 namespace
+repairs its lifetime identity with conditional S3 writes. If `meta.json` lacks
+the incarnation header, Zeppelin CAS-publishes the unchanged JSON body with an
+identity adopted from an already-bound live manifest, or with a fresh identity
+when the manifest is still unbound. It then CAS-publishes one data-identical
+manifest successor carrying that same identity. Every step requires a nonempty
+backend ETag; concurrent activity is reloaded and retried, a different
+incarnation fails with a conflict, and an active namespace missing its manifest
+is an integrity error. Quiesce old Zeppelin binaries during this one-time
+upgrade so they cannot create or republish unbound state.
+
+A namespace clone copies raw immutable artifacts, so it cannot apply a row
+filter or field mask while preserving the source representation. Zeppelin
+therefore requires unconstrained clone, source-read, and target-create
+decisions, then uses the current in-memory policy snapshot to prove that no
+principal gains broader `Query` or `VectorFetch` visibility at the target.
+This proof includes global grants, target grants created before the namespace,
+and principals that do not yet have a key. Unsafe clones fail before target
+creation. If copying fails after the target has become active, Zeppelin retains
+the target and invalidates local manifest state instead of deleting it: a
+concurrent writer may already have received a success response. Inspect the
+reported target and delete it explicitly after reconciling its authoritative S3
+state.
 
 Treat JSONL objects under
 `_audit/<yyyy-mm-dd>/<node-id>/<ulid>.jsonl` as security records. Export them to

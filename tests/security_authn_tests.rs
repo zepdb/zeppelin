@@ -12,6 +12,7 @@ fn adapter() -> ApiKeyAdapter {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_reader"

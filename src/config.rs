@@ -218,7 +218,7 @@ impl SecurityMode {
 }
 
 /// Boot-time security configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Required operator-selected security posture.
@@ -238,9 +238,37 @@ pub struct SecurityConfig {
     /// Optional signed-license path used by the later entitlement phase.
     #[serde(default)]
     pub license_path: String,
+    /// Server-only 256-bit key authenticating opaque query cursors.
+    ///
+    /// The TOML value is lowercase or uppercase hexadecimal. It is omitted
+    /// from serialized/debug-exported configuration so application responses
+    /// and diagnostics cannot echo signing material.
+    #[serde(default, skip_serializing)]
+    cursor_hmac_key_hex: String,
     /// Named credentials used only to bootstrap or recover S3 policy authority.
     #[serde(default)]
     pub api_keys: Vec<ApiKeyConfig>,
+}
+
+impl std::fmt::Debug for SecurityConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cursor_hmac_key = if self.cursor_hmac_key_hex.is_empty() {
+            "[UNSET]"
+        } else {
+            "[REDACTED]"
+        };
+        formatter
+            .debug_struct("SecurityConfig")
+            .field("mode", &self.mode)
+            .field("readyz_public", &self.readyz_public)
+            .field("policy_refresh_secs", &self.policy_refresh_secs)
+            .field("audit_s3", &self.audit_s3)
+            .field("audit_flush_secs", &self.audit_flush_secs)
+            .field("license_path", &self.license_path)
+            .field("cursor_hmac_key_hex", &cursor_hmac_key)
+            .field("api_keys", &self.api_keys)
+            .finish()
+    }
 }
 
 impl Default for SecurityConfig {
@@ -252,8 +280,25 @@ impl Default for SecurityConfig {
             audit_s3: default_security_audit_s3(),
             audit_flush_secs: default_security_audit_flush_secs(),
             license_path: String::new(),
+            cursor_hmac_key_hex: String::new(),
             api_keys: Vec::new(),
         }
+    }
+}
+
+impl SecurityConfig {
+    /// Borrow the configured server-only cursor authentication key.
+    #[must_use]
+    pub(crate) fn cursor_hmac_key_hex(&self) -> &str {
+        &self.cursor_hmac_key_hex
+    }
+
+    /// Set cursor authentication material for programmatic configuration.
+    ///
+    /// [`Config::validate`] and security-kernel construction reject malformed
+    /// values; this setter intentionally performs no normalization or fallback.
+    pub fn set_cursor_hmac_key_hex(&mut self, value: impl Into<String>) {
+        self.cursor_hmac_key_hex = value.into();
     }
 }
 
@@ -701,6 +746,33 @@ mod tests {
         .unwrap();
         assert!(!open_unsafe.security.audit_s3);
         assert_eq!(open_unsafe.security.audit_flush_secs, 7);
+    }
+
+    /// Cursor authentication material is mandatory in enforced mode and must
+    /// never appear in serialized configuration or debug diagnostics.
+    #[test]
+    fn cursor_hmac_key_is_required_validated_and_redacted() {
+        let mut missing = Config::default();
+        assert_config_error_contains(
+            missing.validate().map(|()| missing.clone()),
+            &["security.cursor_hmac_key_hex is required"],
+        );
+
+        missing.security.set_cursor_hmac_key_hex("not-hex");
+        assert_config_error_contains(
+            missing.validate().map(|()| missing.clone()),
+            &["must contain exactly 64 hexadecimal characters"],
+        );
+
+        let secret = "ab".repeat(32);
+        missing.security.set_cursor_hmac_key_hex(secret.clone());
+        assert!(missing.validate().is_ok());
+        let debug = format!("{:?}", missing.security);
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&secret));
+        let serialized = serde_json::to_string(&missing.security).unwrap();
+        assert!(!serialized.contains("cursor_hmac_key_hex"));
+        assert!(!serialized.contains(&secret));
     }
 
     /// Exercises each independent validation rule with one focused mutation.
@@ -2488,6 +2560,26 @@ impl Config {
         if self.security.mode == SecurityMode::Enforced && !self.security.audit_s3 {
             violations
                 .push("security.audit_s3 must be true when security.mode is enforced".to_string());
+        }
+        if self.security.mode == SecurityMode::Enforced
+            && self.security.cursor_hmac_key_hex.is_empty()
+        {
+            violations.push(
+                "security.cursor_hmac_key_hex is required when security.mode is enforced"
+                    .to_string(),
+            );
+        } else if !self.security.cursor_hmac_key_hex.is_empty()
+            && (self.security.cursor_hmac_key_hex.len() != 64
+                || !self
+                    .security
+                    .cursor_hmac_key_hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()))
+        {
+            violations.push(
+                "security.cursor_hmac_key_hex must contain exactly 64 hexadecimal characters"
+                    .to_string(),
+            );
         }
         let mut key_ids = HashSet::new();
         for (index, key) in self.security.api_keys.iter().enumerate() {

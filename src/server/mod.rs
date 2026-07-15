@@ -343,11 +343,12 @@ struct AuditRequestState {
     resource: ResourceRef,
     decision: AuditRequestDecision,
     params: AuditParams,
+    constraint_denial: bool,
 }
 
 #[derive(Clone)]
 enum AuditRequestDecision {
-    Allow(AllowDecision),
+    Allow(Box<AllowDecision>),
     Deny(DenyDecision),
 }
 
@@ -362,8 +363,9 @@ impl AuditRequest {
             inner: Arc::new(Mutex::new(AuditRequestState {
                 action,
                 resource,
-                decision: AuditRequestDecision::Allow(decision),
+                decision: AuditRequestDecision::Allow(Box::new(decision)),
                 params,
+                constraint_denial: false,
             })),
         }
     }
@@ -383,6 +385,19 @@ impl AuditRequest {
             .params = params;
     }
 
+    /// Mark a top-level-success batch response that contains authorization denials.
+    pub(crate) fn mark_batch_constraint_denial(&self, denied_entries: usize, total_entries: usize) {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"));
+        state.constraint_denial = true;
+        state.params = AuditParams::BatchQueryConstraintDenial {
+            denied_entries,
+            total_entries,
+        };
+    }
+
     pub(crate) fn set_allow(&self, action: Action, resource: ResourceRef, decision: AllowDecision) {
         let mut state = self
             .inner
@@ -390,7 +405,8 @@ impl AuditRequest {
             .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"));
         state.action = action;
         state.resource = resource;
-        state.decision = AuditRequestDecision::Allow(decision);
+        state.decision = AuditRequestDecision::Allow(Box::new(decision));
+        state.constraint_denial = false;
     }
 
     fn set_deny(&self, action: Action, resource: ResourceRef, decision: DenyDecision) {
@@ -402,6 +418,7 @@ impl AuditRequest {
         state.resource = resource;
         state.decision = AuditRequestDecision::Deny(decision);
         state.params = AuditParams::AuthzDenial;
+        state.constraint_denial = false;
     }
 }
 
@@ -902,11 +919,21 @@ async fn finish_audited_request(
     response: Response,
 ) -> Response {
     let audit = audit_request.snapshot();
+    let response_error_code = response
+        .extensions()
+        .get::<handlers::AuditErrorCode>()
+        .map(|code| code.0);
+    let response_constraint_denial = matches!(&audit.decision, AuditRequestDecision::Allow(_))
+        && response_error_code == Some("constraint_violation");
+    let constraint_denial = audit.constraint_denial || response_constraint_denial;
     let durable_audit = matches!(
         &audit.decision,
         AuditRequestDecision::Allow(allow)
             if allow.obligations.contains(&crate::security::Obligation::DurableAudit)
     );
+    if !audited_action(audit.action) && !constraint_denial && !durable_audit {
+        return response;
+    }
     let (decision_id, policy_version, outcome) = match &audit.decision {
         AuditRequestDecision::Deny(deny) => {
             crate::metrics::AUTHZ_DENIALS_TOTAL
@@ -920,19 +947,28 @@ async fn finish_audited_request(
                 },
             )
         }
+        AuditRequestDecision::Allow(allow) if constraint_denial => {
+            crate::metrics::AUTHZ_DENIALS_TOTAL
+                .with_label_values(&[audit.action.as_str()])
+                .inc();
+            (
+                allow.decision_id,
+                allow.policy_version,
+                AuditOutcome::Denied {
+                    reason: "constraint_violation".to_string(),
+                },
+            )
+        }
         AuditRequestDecision::Allow(allow) if response.status().is_success() => (
             allow.decision_id,
             allow.policy_version,
             AuditOutcome::Success,
         ),
         AuditRequestDecision::Allow(allow) => {
-            let code = response
-                .extensions()
-                .get::<handlers::AuditErrorCode>()
-                .map_or_else(
-                    || format!("http_{}", response.status().as_u16()),
-                    |code| code.0.to_string(),
-                );
+            let code = response_error_code.map_or_else(
+                || format!("http_{}", response.status().as_u16()),
+                str::to_string,
+            );
             (
                 allow.decision_id,
                 allow.policy_version,
@@ -941,6 +977,11 @@ async fn finish_audited_request(
         }
     };
     let success = matches!(outcome, AuditOutcome::Success);
+    let params = if response_constraint_denial {
+        AuditParams::AuthzDenial
+    } else {
+        audit.params
+    };
     let record = AuditRecord::decision_outcome(
         state.clock.now(),
         context.request_id.clone(),
@@ -951,7 +992,7 @@ async fn finish_audited_request(
         policy_version,
         source_ip,
         outcome,
-        audit.params,
+        params,
         state.audit.node_id(),
     );
 
@@ -1052,7 +1093,7 @@ pub async fn authorize(
             .authorize(&principal, action, &resource, &context)
     };
     let allow = match decision {
-        Decision::Allow(allow) => allow,
+        Decision::Allow(allow) => *allow,
         Decision::Deny(deny) => {
             emit_authorization_denial(
                 &state, &principal, action, &resource, &context, source.ip, &deny,
@@ -1060,6 +1101,35 @@ pub async fn authorize(
             return ApiError(SecurityError::Authorization(deny.reason).into()).into_response();
         }
     };
+
+    if action != Action::NamespaceClone
+        && !action_consumes_data_constraints(action)
+        && allow_has_data_constraints(&allow)
+    {
+        let response = ApiError(SecurityError::ConstraintViolation.into()).into_response();
+        let audit_request = audit_request_required(action, &allow).then(|| {
+            AuditRequest::new(
+                action,
+                ResourceRef::from(&resource),
+                allow.clone(),
+                initial_audit_params(action, &resource),
+            )
+        });
+        return match audit_request {
+            Some(audit_request) => {
+                finish_audited_request(
+                    &state,
+                    &principal,
+                    &context,
+                    source.ip,
+                    &audit_request,
+                    response,
+                )
+                .await
+            }
+            None => response,
+        };
+    }
 
     if action == Action::NamespaceClone {
         if let Decision::Deny(deny) =
@@ -1096,7 +1166,7 @@ pub async fn authorize(
         }
     }
 
-    let audit_request = audited_action(action).then(|| {
+    let audit_request = audit_request_required(action, &allow).then(|| {
         AuditRequest::new(
             action,
             ResourceRef::from(&resource),
@@ -1123,6 +1193,35 @@ pub async fn authorize(
         }
         None => response,
     }
+}
+
+/// Return whether one action has a handler that consumes row/data constraints.
+///
+/// Clone is deliberately excluded: it combines three independent decisions and
+/// performs a policy-wide derived-artifact proof in its body-aware handler.
+#[must_use]
+const fn action_consumes_data_constraints(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Query | Action::VectorFetch | Action::VectorUpsert | Action::VectorDelete
+    )
+}
+
+#[must_use]
+fn allow_has_data_constraints(decision: &AllowDecision) -> bool {
+    decision.mandatory_filter.is_some()
+        || decision.field_mask.is_some()
+        || !decision.write_constraints.is_empty()
+}
+
+#[must_use]
+fn audit_request_required(action: Action, decision: &AllowDecision) -> bool {
+    audited_action(action)
+        || action == Action::VectorUpsert
+        || allow_has_data_constraints(decision)
+        || decision
+            .obligations
+            .contains(&crate::security::Obligation::DurableAudit)
 }
 
 fn route_resource(matched_path: &str, request_path: &str) -> Result<Resource, SecurityError> {
@@ -1176,9 +1275,9 @@ pub(crate) fn authorize_namespace_action(
     {
         Decision::Allow(allow) => {
             if audit.snapshot().action == action {
-                audit.set_allow(action, ResourceRef::from(&resource), allow.clone());
+                audit.set_allow(action, ResourceRef::from(&resource), allow.as_ref().clone());
             }
-            Ok(allow)
+            Ok(*allow)
         }
         Decision::Deny(deny) => {
             audit.set_deny(action, ResourceRef::from(&resource), deny.clone());
@@ -2262,5 +2361,59 @@ mod tests {
             ]
         );
         assert!(must_audit.into_iter().all(audited_action));
+    }
+
+    #[test]
+    fn phase_four_constraint_consumers_are_exhaustive() {
+        let consumers = Action::ALL
+            .into_iter()
+            .filter(|action| action_consumes_data_constraints(*action))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            consumers,
+            vec![
+                Action::VectorFetch,
+                Action::VectorUpsert,
+                Action::VectorDelete,
+                Action::Query,
+            ]
+        );
+
+        let mut constrained = AllowDecision::boot(Action::Query);
+        constrained.mandatory_filter = Some(crate::types::Filter::And {
+            filters: Vec::new(),
+        });
+        assert!(allow_has_data_constraints(&constrained));
+        constrained.mandatory_filter = None;
+        assert!(!allow_has_data_constraints(&constrained));
+
+        let admitted = Action::ALL
+            .into_iter()
+            .filter(|action| {
+                *action == Action::NamespaceClone || action_consumes_data_constraints(*action)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            admitted,
+            vec![
+                Action::NamespaceClone,
+                Action::VectorFetch,
+                Action::VectorUpsert,
+                Action::VectorDelete,
+                Action::Query,
+            ]
+        );
+    }
+
+    #[test]
+    fn durable_audit_obligation_alone_requires_response_settlement() {
+        let mut decision = AllowDecision::boot(Action::Query);
+        assert!(!audit_request_required(Action::Query, &decision));
+
+        decision
+            .obligations
+            .push(crate::security::Obligation::DurableAudit);
+
+        assert!(audit_request_required(Action::Query, &decision));
     }
 }

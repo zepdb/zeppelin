@@ -12,22 +12,19 @@ const CANONICAL_HEADER: &str =
 fn adapter() -> &'static ApiKeyAdapter {
     static ADAPTER: OnceLock<ApiKeyAdapter> = OnceLock::new();
     ADAPTER.get_or_init(|| {
-        let config = SecurityConfig {
-            mode: SecurityMode::Enforced,
-            readyz_public: false,
-            policy_refresh_secs: 5,
-            license_path: String::new(),
-            api_keys: vec![ApiKeyConfig {
-                key_id: "zpk1_fuzz".to_string(),
-                name: "fuzz-key".to_string(),
-                sha256_hex:
-                    "0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a"
-                        .to_string(),
-                actions: vec!["Query".to_string()],
-                namespaces: vec!["tenant-a".to_string()],
-                expires_at: None,
-            }],
-        };
+        let mut config = SecurityConfig::default();
+        config.mode = SecurityMode::Enforced;
+        config.set_cursor_hmac_key_hex("11".repeat(32));
+        config.api_keys = vec![ApiKeyConfig {
+            key_id: "zpk1_fuzz".to_string(),
+            name: "fuzz-key".to_string(),
+            sha256_hex:
+                "0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a"
+                    .to_string(),
+            actions: vec!["Query".to_string()],
+            namespaces: vec!["tenant-a".to_string()],
+            expires_at: None,
+        }];
         ApiKeyAdapter::from_config(&config).expect("static fuzz credential must be valid")
     })
 }

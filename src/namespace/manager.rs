@@ -82,7 +82,9 @@ use crate::types::{DistanceMetric, IndexType};
 
 /// Default lifetime of a process-local namespace registry entry.
 const DEFAULT_NAMESPACE_REGISTRY_TTL: Duration = Duration::from_secs(5);
-const NAMESPACE_INCARNATION_METADATA_KEY: &str = "zeppelin-namespace-incarnation";
+/// Maximum CAS attempts when adding an incarnation to legacy metadata.
+const MAX_NAMESPACE_INCARNATION_MIGRATION_ATTEMPTS: usize = 8;
+pub(crate) const NAMESPACE_INCARNATION_METADATA_KEY: &str = "zeppelin-namespace-incarnation";
 /// Consecutive compaction failures before a namespace is reported degraded.
 pub const COMPACTION_DEGRADED_FAILURE_THRESHOLD: u32 = 5;
 
@@ -110,6 +112,10 @@ impl NamespaceIncarnationId {
 
     fn as_string(&self) -> String {
         self.0.to_string()
+    }
+
+    pub(crate) const fn as_uuid(&self) -> uuid::Uuid {
+        self.0
     }
 }
 
@@ -807,6 +813,16 @@ impl NamespaceManager {
         // Reusing the persisted creation timestamp makes a crash retry produce
         // byte-identical generation-one history.
         let mut manifest = crate::wal::Manifest::new_at(meta.created_at);
+        manifest.bind_namespace_incarnation(
+            meta.incarnation_id
+                .as_ref()
+                .ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "new namespace {name} is missing its incarnation identity"
+                    ))
+                })?
+                .as_uuid(),
+        )?;
         manifest.write(&self.store, name).await?;
 
         let meta = self.activate_created_namespace(name).await?;
@@ -824,28 +840,92 @@ impl NamespaceManager {
     /// missing manifest remains a loud integrity failure.
     async fn recover_creating_namespace(
         &self,
-        meta: NamespaceMetadata,
+        mut meta: NamespaceMetadata,
     ) -> Result<NamespaceMetadata> {
         if meta.state != NamespaceState::Creating {
             return Ok(meta);
         }
 
+        // A legacy interrupted create has no identity in meta.json user
+        // metadata. Establish or recover that identity before inspecting or
+        // publishing its bootstrap manifest. Active legacy namespaces are not
+        // migrated by ordinary reads; this branch is part of creation recovery,
+        // which is already a mutation path.
+        if meta.incarnation_id.is_none() {
+            meta = self
+                .read_or_migrate_namespace_incarnation(&meta.name)
+                .await?;
+            if meta.state != NamespaceState::Creating {
+                return self.ensure_active(meta);
+            }
+        }
+
         let name = meta.name.clone();
         match crate::wal::Manifest::read(&self.store, &name).await? {
-            Some(manifest) => {
-                if manifest.version() != 1
-                    || manifest.vector_count() != 0
-                    || !manifest.uncompacted_fragments().is_empty()
-                    || manifest.segment_vector_count() != 0
-                {
+            Some(mut manifest) => {
+                let is_empty_bootstrap = manifest.fragments.is_empty()
+                    && manifest.segments.is_empty()
+                    && manifest.compaction_watermark.is_none()
+                    && manifest.active_segment.is_none()
+                    && manifest.next_sequence == 0
+                    && manifest.pending_deletes.is_empty()
+                    && manifest.fencing_token == 0;
+                if !is_empty_bootstrap {
                     return Err(ZeppelinError::Serialization(format!(
-                        "creating namespace {name} has non-bootstrap manifest generation {}",
+                        "creating namespace {name} has non-empty bootstrap manifest generation {}",
                         manifest.version()
                     )));
+                }
+                let expected_incarnation = meta
+                    .incarnation_id
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ZeppelinError::Serialization(format!(
+                            "creating namespace {name} is missing its incarnation identity"
+                        ))
+                    })?
+                    .as_uuid();
+                match (manifest.version(), manifest.namespace_incarnation()) {
+                    (1, None) => {
+                        manifest = crate::wal::Manifest::read_versioned_required_for_incarnation(
+                            &self.store,
+                            &name,
+                            expected_incarnation,
+                        )
+                        .await?
+                        .0;
+                        if manifest.namespace_incarnation() != Some(expected_incarnation) {
+                            return Err(ZeppelinError::Serialization(format!(
+                                "creating namespace {name} manifest incarnation does not match metadata"
+                            )));
+                        }
+                    }
+                    (1 | 2, Some(actual)) if actual == expected_incarnation => {}
+                    (_, Some(actual)) if actual != expected_incarnation => {
+                        return Err(ZeppelinError::Serialization(format!(
+                            "creating namespace {name} manifest incarnation does not match metadata"
+                        )));
+                    }
+                    _ => {
+                        return Err(ZeppelinError::Serialization(format!(
+                            "creating namespace {name} has non-bootstrap manifest generation {}",
+                            manifest.version()
+                        )));
+                    }
                 }
             }
             None => {
                 let mut manifest = crate::wal::Manifest::new_at(meta.created_at);
+                manifest.bind_namespace_incarnation(
+                    meta.incarnation_id
+                        .as_ref()
+                        .ok_or_else(|| {
+                            ZeppelinError::Serialization(format!(
+                                "creating namespace {name} is missing its incarnation identity"
+                            ))
+                        })?
+                        .as_uuid(),
+                )?;
                 manifest.write(&self.store, &name).await?;
             }
         }
@@ -1065,6 +1145,119 @@ impl NamespaceManager {
     pub async fn get(&self, name: &str) -> Result<NamespaceMetadata> {
         let meta = self.get_including_deleting(name).await?;
         self.ensure_active(meta)
+    }
+
+    /// Returns authoritative active metadata for a guarded write, migrating a
+    /// legacy `meta.json` object when its user metadata has no incarnation.
+    ///
+    /// This is an explicit mutation-path seam for guarded writes. Ordinary
+    /// [`Self::get`] and [`Self::list`] calls remain read-only so their object-
+    /// store operation contracts do not change.
+    ///
+    /// Returning the complete metadata snapshot keeps dimensions and other
+    /// validation fields paired with the same namespace lifetime as the
+    /// incarnation. The result never combines an ordinary cached metadata body
+    /// with an incarnation loaded after a delete/recreate race.
+    ///
+    /// # Errors
+    ///
+    /// Returns namespace lifecycle, storage, and decoding errors unchanged.
+    /// Missing or empty authoritative ETags fail before any write because an
+    /// unconditional legacy migration could overwrite concurrent metadata.
+    /// Exhausting the bounded CAS retries returns a manifest conflict.
+    #[instrument(skip(self), fields(namespace = name))]
+    pub async fn get_active_metadata_for_guarded_write(
+        &self,
+        name: &str,
+    ) -> Result<NamespaceMetadata> {
+        let meta = self.read_or_migrate_namespace_incarnation(name).await?;
+        self.ensure_active(meta)
+    }
+
+    /// Loads metadata and establishes its incarnation without using the
+    /// process registry as a precondition.
+    ///
+    /// Active and creating records are accepted. Deleting records fail before
+    /// any metadata or manifest write. This narrower helper lets interrupted
+    /// namespace creation recover a legacy record without turning ordinary
+    /// active reads into migration writes.
+    async fn read_or_migrate_namespace_incarnation(&self, name: &str) -> Result<NamespaceMetadata> {
+        let key = NamespaceMetadata::s3_key(name);
+
+        for _ in 0..MAX_NAMESPACE_INCARNATION_MIGRATION_ATTEMPTS {
+            let (body, object_metadata) = match self.store.get_with_object_metadata(&key).await {
+                Ok(value) => value,
+                Err(ZeppelinError::NotFound { .. }) => {
+                    return Err(ZeppelinError::NamespaceNotFound {
+                        namespace: name.to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            let mut meta = NamespaceMetadata::from_bytes(&body)?
+                .attach_user_metadata(&object_metadata.user_metadata)?;
+            if meta.state == NamespaceState::Deleting {
+                return Err(ZeppelinError::NamespaceDeleting {
+                    namespace: meta.name,
+                });
+            }
+
+            if meta.incarnation_id.is_some() {
+                self.insert_registry(meta.clone());
+                return Ok(meta);
+            }
+
+            let etag = object_metadata
+                .e_tag
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ZeppelinError::Serialization(format!(
+                        "authoritative namespace metadata {key} has no non-empty ETag required for incarnation migration"
+                    ))
+                })?;
+            // Mixed-version deployments may already have bound the manifest
+            // before metadata received its header. Adopt that identity rather
+            // than minting a conflicting lifetime. An active namespace without
+            // any live manifest is an integrity error; an interrupted create is
+            // allowed to establish a new identity before creating its first
+            // manifest.
+            let incarnation_id = match crate::wal::Manifest::read(&self.store, name).await? {
+                Some(manifest) => manifest
+                    .namespace_incarnation()
+                    .map(NamespaceIncarnationId)
+                    .unwrap_or_else(NamespaceIncarnationId::new),
+                None if meta.state == NamespaceState::Creating => NamespaceIncarnationId::new(),
+                None => {
+                    return Err(ZeppelinError::Serialization(format!(
+                        "active namespace {name} is missing its live manifest during incarnation migration"
+                    )));
+                }
+            };
+            let mut user_metadata = object_metadata.user_metadata;
+            user_metadata.insert(
+                NAMESPACE_INCARNATION_METADATA_KEY,
+                incarnation_id.as_string(),
+            );
+
+            match self
+                .store
+                .put_if_match_with_user_metadata(&key, body, &etag, name, &user_metadata)
+                .await
+            {
+                Ok(_) => {
+                    meta.incarnation_id = Some(incarnation_id);
+                    self.insert_registry(meta.clone());
+                    info!(namespace = name, "migrated legacy namespace incarnation");
+                    return Ok(meta);
+                }
+                Err(ZeppelinError::ManifestConflict { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(ZeppelinError::ManifestConflict {
+            namespace: name.to_string(),
+        })
     }
 
     /// Returns namespace metadata without rejecting the deletion tombstone.

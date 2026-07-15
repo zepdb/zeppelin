@@ -18,10 +18,37 @@ fn boot_fails_without_mode() {
 
 #[test]
 fn enforced_config_allows_no_bootstrap_keys_pending_s3_authority_check() {
-    let config = Config::from_str("[security]\nmode = \"enforced\"\n")
+    let config = Config::from_str(
+        "[security]\nmode = \"enforced\"\ncursor_hmac_key_hex = \"1111111111111111111111111111111111111111111111111111111111111111\"\n",
+    )
         .expect("credential availability is decided after checking S3 policy authority");
 
     assert!(config.security.api_keys.is_empty());
+}
+
+#[test]
+fn enforced_config_requires_and_redacts_cursor_hmac_key() {
+    let missing = Config::from_str("[security]\nmode = \"enforced\"\n")
+        .expect_err("enforced configuration without cursor signing material must fail closed");
+    assert!(missing
+        .to_string()
+        .contains("security.cursor_hmac_key_hex is required"));
+
+    let malformed =
+        Config::from_str("[security]\nmode = \"enforced\"\ncursor_hmac_key_hex = \"abcd\"\n")
+            .expect_err("short cursor signing material must fail closed");
+    assert!(malformed
+        .to_string()
+        .contains("must contain exactly 64 hexadecimal characters"));
+
+    let secret = "12".repeat(32);
+    let config = Config::from_str(&format!(
+        "[security]\nmode = \"enforced\"\ncursor_hmac_key_hex = \"{secret}\"\n"
+    ))
+    .expect("valid cursor signing material must parse");
+    let debug = format!("{config:?}");
+    assert!(!debug.contains(&secret));
+    assert!(debug.contains("[REDACTED]"));
 }
 
 #[test]
@@ -30,6 +57,7 @@ fn boot_fails_bad_action_name() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_admin"
@@ -53,6 +81,7 @@ fn boot_fails_dup_key_id() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_duplicate"
@@ -83,6 +112,7 @@ fn boot_fails_bad_key_digest() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_bad_digest"
@@ -117,6 +147,7 @@ fn boot_fails_noncanonical_key_id() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_reader.with-dot"
@@ -141,6 +172,7 @@ fn boot_fails_empty_key_name() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_reader"
@@ -165,6 +197,7 @@ fn boot_fails_empty_action_grants() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_reader"
@@ -189,6 +222,7 @@ fn boot_fails_empty_namespace_scopes() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_reader"
@@ -213,6 +247,7 @@ fn boot_fails_invalid_namespace_scope() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_reader"
@@ -254,6 +289,7 @@ fn enforced_config_allows_expired_recovery_key_pending_s3_authority_check() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_expired"

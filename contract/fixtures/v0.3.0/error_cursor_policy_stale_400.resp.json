@@ -1,0 +1,7 @@
+{
+  "code": "cursor_policy_stale",
+  "error": "cursor was issued under a different security policy; re-query required",
+  "request_id": "contract-error_cursor_policy_stale_400",
+  "retryable": false,
+  "status": 400
+}

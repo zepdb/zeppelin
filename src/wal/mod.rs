@@ -86,4 +86,4 @@ pub use manifest::{Manifest, ManifestVersion};
 /// Re-exports the fragment reader and its explicit immutable-byte cache policy.
 pub use reader::{FragmentCachePolicy, WalReader};
 /// Re-exports the fragment uploader and manifest group-commit coordinator.
-pub use writer::WalWriter;
+pub use writer::{ManifestAppendGuard, WalWriter};

@@ -3,6 +3,7 @@
     "actions": {
       "actions": [
         "NamespaceRead",
+        "VectorUpsert",
         "Query"
       ],
       "kind": "selected"

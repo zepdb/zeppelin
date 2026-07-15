@@ -237,6 +237,11 @@ pub mod namespace;
 /// segment results, and reports storage/cache diagnostics. HTTP-level hybrid
 /// fusion and presentation transforms are layered above it.
 pub mod query;
+/// Policy-scope-derived retrieval artifacts and their integrity errors.
+///
+/// Query execution owns the concrete artifact types; the public error type is
+/// exposed so [`error::ZeppelinError`] can preserve the subsystem boundary.
+pub mod retrieval_scope;
 /// Atomically published snapshots of the query controls allowed to change at runtime.
 ///
 /// [`runtime_config::RuntimeQueryConfig`] validates patches and gives each query

@@ -51,11 +51,45 @@ pub enum Action {
     SecurityAdminRead,
     /// Create or change security principals, credentials, grants, and policy.
     SecurityAdminWrite,
+    /// Override caller-owned protected attributes while retaining server stamps.
+    ///
+    /// This capability is evaluated by the kernel during vector-write
+    /// authorization and is deliberately not mapped to an HTTP route.
+    AttributeAdmin,
 }
 
 impl Action {
-    /// Every action in declaration order for completeness tests and wildcards.
-    pub const ALL: [Self; 21] = [
+    /// Every action in declaration order for completeness tests and parsing.
+    pub const ALL: [Self; 22] = [
+        Self::SystemRead,
+        Self::MetricsRead,
+        Self::RuntimeConfigRead,
+        Self::RuntimeConfigWrite,
+        Self::NamespaceCreate,
+        Self::NamespaceRead,
+        Self::NamespaceDelete,
+        Self::SnapshotRead,
+        Self::SnapshotWrite,
+        Self::SnapshotDelete,
+        Self::NamespaceClone,
+        Self::IndexConfigWrite,
+        Self::CompactionTrigger,
+        Self::CompactionStatusRead,
+        Self::HydrationTrigger,
+        Self::VectorFetch,
+        Self::VectorUpsert,
+        Self::VectorDelete,
+        Self::Query,
+        Self::SecurityAdminRead,
+        Self::SecurityAdminWrite,
+        Self::AttributeAdmin,
+    ];
+
+    /// Frozen Phase 3 wildcard expansion used by persisted `GrantActions::All`.
+    ///
+    /// Adding a new action must never silently widen an immutable policy grant.
+    /// `AttributeAdmin` therefore requires an explicit selected grant.
+    pub(crate) const POLICY_ALL_V1: [Self; 21] = [
         Self::SystemRead,
         Self::MetricsRead,
         Self::RuntimeConfigRead,
@@ -104,6 +138,7 @@ impl Action {
             Self::Query => "Query",
             Self::SecurityAdminRead => "SecurityAdminRead",
             Self::SecurityAdminWrite => "SecurityAdminWrite",
+            Self::AttributeAdmin => "AttributeAdmin",
         }
     }
 }
@@ -124,7 +159,7 @@ mod tests {
     use super::Action;
 
     #[test]
-    fn action_inventory_has_exact_phase_three_variants() {
+    fn action_inventory_has_exact_phase_four_variants() {
         let names = Action::ALL.map(Action::as_str).to_vec();
 
         assert_eq!(
@@ -151,7 +186,19 @@ mod tests {
                 "Query",
                 "SecurityAdminRead",
                 "SecurityAdminWrite",
+                "AttributeAdmin",
             ]
         );
+    }
+
+    #[test]
+    fn attribute_admin_is_parseable_but_not_in_the_frozen_policy_all_set() {
+        assert!(matches!(
+            "AttributeAdmin".parse::<Action>(),
+            Ok(Action::AttributeAdmin)
+        ));
+        assert!(Action::ALL.contains(&Action::AttributeAdmin));
+        assert!(!Action::POLICY_ALL_V1.contains(&Action::AttributeAdmin));
+        assert_eq!(Action::POLICY_ALL_V1.len(), 21);
     }
 }

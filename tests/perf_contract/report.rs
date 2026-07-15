@@ -672,6 +672,22 @@ fn build_report(artifacts: &RunArtifacts, scenarios: &BTreeMap<String, ScenarioR
                 security.added_get_ops,
                 security.added_put_ops
             ));
+            if let (
+                Some(samples),
+                Some(caller_filtered_p50_ns),
+                Some(policy_filtered_p50_ns),
+                Some(regression_basis_points),
+            ) = (
+                security.paired_query_samples,
+                security.caller_filtered_query_p50_ns,
+                security.policy_filtered_query_p50_ns,
+                security.query_p50_regression_basis_points,
+            ) {
+                out.push_str(&format!(
+                    "- paired filtered-query samples: {samples}; caller p50: {caller_filtered_p50_ns} ns; policy p50: {policy_filtered_p50_ns} ns; regression: {:.2}%\n",
+                    regression_basis_points as f64 / 100.0,
+                ));
+            }
         }
         out.push('\n');
         out.push_str("### Object-Store Totals\n\n");

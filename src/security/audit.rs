@@ -242,6 +242,13 @@ pub enum AuditParams {
     AuthnFailure,
     /// Authorization denied an authenticated principal.
     AuthzDenial,
+    /// One or more entries in a query batch violated server-owned constraints.
+    BatchQueryConstraintDenial {
+        /// Number of positional entries rejected by constraint enforcement.
+        denied_entries: usize,
+        /// Total positional entries in the accepted outer batch.
+        total_entries: usize,
+    },
     /// The current process-local query configuration was read.
     RuntimeConfigRead {
         /// Configuration returned to the authorized caller.
@@ -313,6 +320,15 @@ pub enum AuditParams {
         /// IDs only when `count` is at most [`MAX_AUDITED_VECTOR_IDS`].
         ids: Option<AuditedVectorIds>,
     },
+    /// Vectors were written with explicit AttributeAdmin authority.
+    VectorUpsert {
+        /// Namespace that owns the vectors.
+        namespace: NamespaceId,
+        /// Number of vectors in the accepted batch.
+        count: usize,
+        /// Whether the decision carried privileged AttributeAdmin authority.
+        attribute_admin: bool,
+    },
     /// Security policy metadata was read through an administrative route.
     SecurityPolicyRead {
         /// Authoritative version returned to the caller.
@@ -338,6 +354,16 @@ impl AuditParams {
             namespace,
             count: ids.len(),
             ids: audited_ids,
+        }
+    }
+
+    /// Construct a redacted vector-upsert projection for security audit.
+    #[must_use]
+    pub fn vector_upsert(namespace: NamespaceId, count: usize, attribute_admin: bool) -> Self {
+        Self::VectorUpsert {
+            namespace,
+            count,
+            attribute_admin,
         }
     }
 }

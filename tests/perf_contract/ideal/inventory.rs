@@ -20,6 +20,8 @@ pub(crate) struct StorageMethodInventory {
 pub(crate) enum StoreMethod {
     ProbeConfiguredEndpoint,
     Put,
+    PutCreate,
+    PutCreateOutcome,
     Get,
     GetRange,
     GetRanges,
@@ -27,6 +29,7 @@ pub(crate) enum StoreMethod {
     GetWithObjectMetadata,
     GetIfNoneMatch,
     PutIfMatch,
+    PutIfMatchOutcome,
     PutIfMatchWithUserMetadata,
     PutIfNotExists,
     PutIfNotExistsWithUserMetadata,
@@ -51,6 +54,8 @@ const STORAGE_METHOD_INVENTORY: &[StorageMethodInventory] = &[
         },
     },
     object_store_method(StoreMethod::Put, "put"),
+    object_store_method(StoreMethod::PutCreate, "put_create"),
+    object_store_method(StoreMethod::PutCreateOutcome, "put_create_outcome"),
     object_store_method(StoreMethod::Get, "get"),
     object_store_method(StoreMethod::GetRange, "get_range"),
     object_store_method(StoreMethod::GetRanges, "get_ranges"),
@@ -61,6 +66,7 @@ const STORAGE_METHOD_INVENTORY: &[StorageMethodInventory] = &[
     ),
     object_store_method(StoreMethod::GetIfNoneMatch, "get_if_none_match"),
     object_store_method(StoreMethod::PutIfMatch, "put_if_match"),
+    object_store_method(StoreMethod::PutIfMatchOutcome, "put_if_match_outcome"),
     object_store_method(
         StoreMethod::PutIfMatchWithUserMetadata,
         "put_if_match_with_user_metadata",
@@ -192,6 +198,79 @@ const fn path(
 }
 
 const PRODUCTION_PATHS: &[ProductionPath] = &[
+    path(
+        "security.audit.persist_exact",
+        "src/security/audit_sink.rs:persist_exact",
+        &[StoreMethod::PutCreate, StoreMethod::Get],
+        &[PhysicalVariant::PutCreate, PhysicalVariant::GetFull],
+        PathCoverage::ExplicitGap {
+            catalog_case: None,
+            reason: "security audit flush cost is owned by the Phase 2 counting-store tests; the detached sink has no ideal-runner completion handle",
+        },
+    ),
+    path(
+        "security.policy.bootstrap",
+        "src/security/policy_store.rs:PolicyStore::bootstrap",
+        &[
+            StoreMethod::PutCreateOutcome,
+            StoreMethod::GetWithMeta,
+            StoreMethod::Get,
+        ],
+        &[PhysicalVariant::PutCreate, PhysicalVariant::GetFull],
+        PathCoverage::ExplicitGap {
+            catalog_case: None,
+            reason: "policy bootstrap is a security control-plane boot path covered by the real-store security boot suite, outside the data-plane ideal catalog",
+        },
+    ),
+    path(
+        "security.policy.load_current",
+        "src/security/policy_store.rs:PolicyStore::load_current",
+        &[StoreMethod::GetWithMeta, StoreMethod::Get],
+        &[PhysicalVariant::GetFull],
+        PathCoverage::ExplicitGap {
+            catalog_case: None,
+            reason: "authoritative policy head and immutable snapshot loading are covered by the Phase 3 real-store boot and policy-store tests, outside the data-plane ideal catalog",
+        },
+    ),
+    path(
+        "security.policy.publish",
+        "src/security/policy_store.rs:PolicyStore::publish",
+        &[
+            StoreMethod::PutCreateOutcome,
+            StoreMethod::PutIfMatchOutcome,
+            StoreMethod::GetWithMeta,
+            StoreMethod::Get,
+        ],
+        &[
+            PhysicalVariant::PutCreate,
+            PhysicalVariant::PutUpdate,
+            PhysicalVariant::GetFull,
+        ],
+        PathCoverage::ExplicitGap {
+            catalog_case: None,
+            reason: "policy publication is an admin control-plane CAS path covered by Phase 3 policy-store tests, outside the data-plane ideal catalog",
+        },
+    ),
+    path(
+        "security.policy.refresh_changed",
+        "src/security/policy_store.rs:PolicyStore::refresh",
+        &[StoreMethod::GetIfNoneMatch, StoreMethod::Get],
+        &[PhysicalVariant::GetConditional, PhysicalVariant::GetFull],
+        PathCoverage::ExplicitGap {
+            catalog_case: None,
+            reason: "changed policy-head refresh and immutable snapshot loading are covered by the Phase 3 real-store refresh tests, outside the data-plane ideal catalog",
+        },
+    ),
+    path(
+        "security.policy.refresh_unchanged",
+        "src/security/policy_store.rs:PolicyStore::refresh",
+        &[StoreMethod::GetIfNoneMatch],
+        &[PhysicalVariant::GetConditional],
+        PathCoverage::ExplicitGap {
+            catalog_case: None,
+            reason: "unchanged conditional policy-head refresh is covered by the Phase 3 counting-store refresh tests, outside the data-plane ideal catalog",
+        },
+    ),
     path(
         "background.compaction_fenced",
         "src/compaction/background.rs:compact_namespace_under_lease",
@@ -1957,6 +2036,13 @@ const ADDITIONAL_PRODUCTION_PATHS: &[ProductionPath] = &[
         frozen_case("secured_query"),
     ),
     path(
+        "catalog.secured_filtered_query",
+        "src/server/handlers/query.rs:query_namespace",
+        &[StoreMethod::Get, StoreMethod::GetRange],
+        &[PhysicalVariant::GetFull, PhysicalVariant::GetRange],
+        frozen_case("secured_filtered_query"),
+    ),
+    path(
         "catalog.query.flat_none_filtered_no_bitmap",
         "src/index/ivf_flat/search.rs:search_ivf_flat",
         &[StoreMethod::Get],
@@ -2240,6 +2326,39 @@ mod tests {
                     method.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn security_policy_storage_states_have_explicit_paths() {
+        let paths = production_paths()
+            .into_iter()
+            .map(|path| (path.id, path))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        for (id, methods, variants) in [
+            (
+                "security.policy.load_current",
+                &[StoreMethod::GetWithMeta, StoreMethod::Get][..],
+                &[PhysicalVariant::GetFull][..],
+            ),
+            (
+                "security.policy.refresh_unchanged",
+                &[StoreMethod::GetIfNoneMatch][..],
+                &[PhysicalVariant::GetConditional][..],
+            ),
+            (
+                "security.policy.refresh_changed",
+                &[StoreMethod::GetIfNoneMatch, StoreMethod::Get][..],
+                &[PhysicalVariant::GetConditional, PhysicalVariant::GetFull][..],
+            ),
+        ] {
+            let path = paths
+                .get(id)
+                .unwrap_or_else(|| panic!("missing state-specific policy path {id}"));
+            assert_eq!(path.store_methods, methods, "method drift for {id}");
+            assert_eq!(path.physical_variants, variants, "variant drift for {id}");
+            assert!(matches!(path.coverage, PathCoverage::ExplicitGap { .. }));
         }
     }
 

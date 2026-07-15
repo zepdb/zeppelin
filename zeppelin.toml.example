@@ -12,6 +12,7 @@ mode = "enforced"                    # "enforced" or "open_unsafe"
 # audit_s3 = true                    # required true in enforced mode; durable JSONL under _audit/
 # audit_flush_secs = 2               # must be > 0; max background batch-flush interval
 # license_path = ""                  # phase 6 signed-license path; empty = community
+# cursor_hmac_key_hex = "..."        # REQUIRED in enforced mode; generate: openssl rand -hex 32
 
 # Generate one 43-character base64url secret and its SHA-256 digest:
 # openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | tee /dev/stderr | shasum -a 256

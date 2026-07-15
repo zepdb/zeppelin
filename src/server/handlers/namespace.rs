@@ -92,12 +92,12 @@
 //! copy every manifest-reachable immutable object (up to 16 concurrently)
 //!              |
 //!              v
-//! rewrite target keys + publish target manifest generation 1
+//! rewrite target keys + conditionally publish target clone manifest
 //!              |
 //!              v
 //! invalidate target cache + release source pin --> 201 Created
 //!              |
-//!              `-- failure: best-effort target cleanup and pin release
+//!              `-- failure: retain target, invalidate cache, release pin
 //! ```
 //!
 //! ## Invariants
@@ -705,12 +705,13 @@ impl NamespaceResponse {
 /// PUT `.../snapshots/before-migration` at generation 12 creates a pin. A
 /// repeated PUT at generation 12 returns the same timestamp. If an upsert has
 /// advanced the live manifest to 13, the same PUT returns 409.
-#[instrument(skip(state, _decision), fields(namespace = %ns, snapshot = %name))]
+#[instrument(skip(state, decision), fields(namespace = %ns, snapshot = %name))]
 pub async fn put_snapshot(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path((ns, name)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<SnapshotResponse>), ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
     state
         .namespace_manager
         .get(&ns)
@@ -771,12 +772,13 @@ pub async fn put_snapshot(
 ///
 /// Pins named `weekly` and `daily` are returned as `daily`, then `weekly`,
 /// regardless of S3 listing order.
-#[instrument(skip(state, _decision), fields(namespace = %ns))]
+#[instrument(skip(state, decision), fields(namespace = %ns))]
 pub async fn list_snapshots(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<Json<ListSnapshotsResponse>, ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
     state
         .namespace_manager
         .get(&ns)
@@ -817,12 +819,13 @@ pub async fn list_snapshots(
 ///
 /// GET `.../snapshots/daily` returns the generation protected by `daily`.
 /// GET of a valid but unknown name returns `SNAPSHOT_NOT_FOUND` with HTTP 404.
-#[instrument(skip(state, _decision), fields(namespace = %ns, snapshot = %name))]
+#[instrument(skip(state, decision), fields(namespace = %ns, snapshot = %name))]
 pub async fn get_snapshot(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path((ns, name)): Path<(String, String)>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
     state
         .namespace_manager
         .get(&ns)
@@ -879,12 +882,13 @@ pub async fn get_snapshot(
 ///
 /// Removing `before-migration` returns 204. A later GET returns 404, while the
 /// previously pinned generation can remain readable until retention pruning.
-#[instrument(skip(state, _decision), fields(namespace = %ns, snapshot = %name))]
+#[instrument(skip(state, decision), fields(namespace = %ns, snapshot = %name))]
 pub async fn delete_snapshot(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path((ns, name)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
     state
         .namespace_manager
         .get(&ns)
@@ -1028,7 +1032,7 @@ pub async fn create_namespace(
     .map_err(ApiError::from)?;
 
     if let Some(name) = req.name {
-        crate::server::authorize_namespace_action(
+        let target_decision = crate::server::authorize_namespace_action(
             &state,
             &principal,
             &context,
@@ -1038,6 +1042,7 @@ pub async fn create_namespace(
         )
         .map_err(ZeppelinError::from)
         .map_err(ApiError::from)?;
+        require_unconstrained_namespace_operation(&target_decision)?;
         audit.set_params(AuditParams::NamespaceCreate {
             namespace: NamespaceId::new(name.clone()).map_err(ZeppelinError::from)?,
         });
@@ -1079,7 +1084,7 @@ pub async fn create_namespace(
     }
 
     let name = generated_namespace_name(state.namespace_name_prefix.as_deref());
-    crate::server::authorize_namespace_action(
+    let target_decision = crate::server::authorize_namespace_action(
         &state,
         &principal,
         &context,
@@ -1089,6 +1094,7 @@ pub async fn create_namespace(
     )
     .map_err(ZeppelinError::from)
     .map_err(ApiError::from)?;
+    require_unconstrained_namespace_operation(&target_decision)?;
     audit.set_params(AuditParams::NamespaceCreate {
         namespace: NamespaceId::new(name.clone()).map_err(ZeppelinError::from)?,
     });
@@ -1146,19 +1152,20 @@ pub async fn create_namespace(
 /// retained, and 409 when the target already exists. Snapshot pin, copy,
 /// manifest publication, serialization, and storage failures also propagate.
 ///
-/// Once target creation succeeds, a later copy or publication failure triggers
-/// best-effort synchronous target deletion. Cleanup or temporary-pin deletion
-/// errors are logged rather than replacing the original failure, so rare
-/// cleanup failures can leave a deleting target or internal pin for later
-/// maintenance.
+/// Once target creation succeeds, a later copy or publication failure retains
+/// the target and invalidates its local manifest cache entry. A concurrently
+/// acknowledged target write may already have advanced the bootstrap manifest;
+/// deleting the namespace after a clone failure would destroy that write. The
+/// original failure is returned and the retained target is reported in a
+/// structured warning so an administrator can inspect or delete it explicitly.
 ///
 /// # Side Effects
 ///
 /// Creates a temporary source snapshot, creates target metadata and an initial
 /// empty manifest, performs bounded-concurrency server-side object copies,
 /// publishes the rewritten target manifest, writes it through to the target
-/// manifest cache, and deletes the temporary pin. Failed attempts may copy some
-/// target objects before cleanup begins.
+/// manifest cache, and deletes the temporary pin. Failed attempts after target
+/// activation retain the target and may leave unreachable copied objects.
 ///
 /// # Consistency
 ///
@@ -1183,9 +1190,9 @@ pub async fn create_namespace(
 /// only artifacts reachable at the pinned generation. Later writes to either
 /// namespace and deletion of the source do not alter the other namespace.
 ///
-/// If one object copy fails, the response carries the storage error, the target
-/// is cleaned up best-effort, and a later retry can reserve the target again
-/// after cleanup completes.
+/// If one object copy fails after target activation, the response carries the
+/// storage error and the target remains reserved. This fail-closed behavior
+/// prevents cleanup from racing and deleting an acknowledged target write.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
@@ -1195,10 +1202,10 @@ pub async fn create_namespace(
 /// path must explicitly release the temporary pin. Java would commonly encode
 /// this with `try/finally`; C would use cleanup labels. Rust has RAII for local
 /// memory, but remote S3 objects still require explicit asynchronous cleanup.
-#[instrument(skip(state, _decision, principal, context, audit, req), fields(source = %source))]
+#[instrument(skip(state, clone_decision, principal, context, audit, req), fields(source = %source))]
 pub async fn clone_namespace(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(clone_decision): Extension<AllowDecision>,
     Extension(principal): Extension<Principal>,
     Extension(context): Extension<RequestContext>,
     Extension(audit): Extension<AuditRequest>,
@@ -1212,7 +1219,17 @@ pub async fn clone_namespace(
             "clone target must differ from source namespace".into(),
         )));
     }
-    crate::server::authorize_namespace_action(
+    let source_read_decision = crate::server::authorize_namespace_action(
+        &state,
+        &principal,
+        &context,
+        &audit,
+        Action::NamespaceRead,
+        &source,
+    )
+    .map_err(ZeppelinError::from)
+    .map_err(ApiError::from)?;
+    let target_create_decision = crate::server::authorize_namespace_action(
         &state,
         &principal,
         &context,
@@ -1222,9 +1239,21 @@ pub async fn clone_namespace(
     )
     .map_err(ZeppelinError::from)
     .map_err(ApiError::from)?;
+    require_unconstrained_clone_control(
+        &clone_decision,
+        &source_read_decision,
+        &target_create_decision,
+    )?;
+    let source_id = NamespaceId::new(source.clone()).map_err(ZeppelinError::from)?;
+    let target_id = NamespaceId::new(target.clone()).map_err(ZeppelinError::from)?;
+    state
+        .security
+        .validate_namespace_copy_no_widening(clone_decision.policy_version, &source_id, &target_id)
+        .map_err(ZeppelinError::from)
+        .map_err(ApiError::from)?;
     audit.set_params(AuditParams::NamespaceClone {
-        source: NamespaceId::new(source.clone()).map_err(ZeppelinError::from)?,
-        target: NamespaceId::new(target.clone()).map_err(ZeppelinError::from)?,
+        source: source_id.clone(),
+        target: target_id.clone(),
     });
 
     let source_meta = state
@@ -1269,18 +1298,64 @@ pub async fn clone_namespace(
             return Err(ApiError::from(e));
         }
     };
+    let target_incarnation = match target_meta.incarnation_id.as_ref() {
+        Some(incarnation) => incarnation.as_uuid(),
+        None => {
+            retain_failed_clone_target(&state, &target, "missing namespace incarnation");
+            release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+            return Err(ApiError(ZeppelinError::Serialization(format!(
+                "clone target {target} is missing its namespace incarnation"
+            ))));
+        }
+    };
+    let (target_base_manifest, target_base_version) =
+        match Manifest::read_versioned_required_for_incarnation(
+            &state.store,
+            &target,
+            target_incarnation,
+        )
+        .await
+        {
+            Ok(base) => base,
+            Err(e) => {
+                retain_failed_clone_target(&state, &target, "bootstrap manifest read failed");
+                release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+                return Err(ApiError::from(e));
+            }
+        };
 
     let mut target_manifest =
         match materialize_clone_manifest(&state, &source, &target, source_manifest).await {
             Ok(manifest) => manifest,
             Err(e) => {
-                cleanup_failed_clone_target(&state, &target).await;
+                retain_failed_clone_target(&state, &target, "artifact materialization failed");
                 release_internal_clone_pin(&state, &source, &clone_pin_name).await;
                 return Err(ApiError::from(e));
             }
         };
-    if let Err(e) = target_manifest.write(&state.store, &target).await {
-        cleanup_failed_clone_target(&state, &target).await;
+    if let Err(e) = target_manifest.prepare_clone_publication(
+        &target,
+        target_incarnation,
+        &target_base_manifest,
+    ) {
+        retain_failed_clone_target(&state, &target, "manifest preparation failed");
+        release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+        return Err(ApiError::from(e));
+    }
+    if let Err(error) = state.security.validate_namespace_copy_no_widening(
+        clone_decision.policy_version,
+        &source_id,
+        &target_id,
+    ) {
+        retain_failed_clone_target(&state, &target, "authorization proof changed");
+        release_internal_clone_pin(&state, &source, &clone_pin_name).await;
+        return Err(ApiError(ZeppelinError::from(error)));
+    }
+    if let Err(e) = target_manifest
+        .write_conditional(&state.store, &target, &target_base_version)
+        .await
+    {
+        retain_failed_clone_target(&state, &target, "conditional manifest publication failed");
         release_internal_clone_pin(&state, &source, &clone_pin_name).await;
         return Err(ApiError::from(e));
     }
@@ -1313,6 +1388,31 @@ pub async fn clone_namespace(
             ),
         }),
     ))
+}
+
+/// Require all control-plane decisions for a raw copy to be unconstrained.
+///
+/// Clone copies immutable artifacts byte-for-byte and returns namespace-wide
+/// aggregates. It cannot honor row filters, field masks, or write stamps by
+/// partially copying or fabricating response values, so each independently
+/// authorized source/target control action must be unconstrained and from the
+/// same authoritative policy version.
+fn require_unconstrained_clone_control(
+    clone_decision: &AllowDecision,
+    source_read_decision: &AllowDecision,
+    target_create_decision: &AllowDecision,
+) -> Result<(), ApiError> {
+    if clone_decision.policy_version != source_read_decision.policy_version
+        || clone_decision.policy_version != target_create_decision.policy_version
+    {
+        return Err(ApiError(
+            crate::security::SecurityError::ConstraintViolation.into(),
+        ));
+    }
+    for decision in [clone_decision, source_read_decision, target_create_decision] {
+        require_unconstrained_namespace_operation(decision)?;
+    }
+    Ok(())
 }
 
 /// Generates a collision-resistant name in the reserved clone-pin namespace.
@@ -1366,45 +1466,42 @@ async fn release_internal_clone_pin(state: &AppState, source: &str, name: &str) 
     }
 }
 
-/// Best-effort removes all target state left by a failed clone attempt.
+/// Retains an activated clone target after a later clone failure.
 ///
-/// The target was reserved specifically for this clone before copying began,
-/// so cleanup can run the normal full namespace-delete protocol. Cache
-/// invalidation happens first so no process-local manifest survives cleanup.
+/// Target activation makes the namespace independently writable before the
+/// clone's final manifest CAS. A concurrent request can therefore acknowledge a
+/// write while artifact copying is still in flight. No read-then-delete proof
+/// can exclude a write in the gap before destructive cleanup, so failure paths
+/// invalidate only disposable cache state and leave S3 state authoritative.
 ///
 /// # Parameters
 ///
-/// - `state`: Borrowed services used for cache invalidation and durable delete.
-/// - `target`: Fresh target namespace whose partial state should be removed.
+/// - `state`: Borrowed services used for cache invalidation and reporting.
+/// - `target`: Activated target namespace whose durable state is retained.
+/// - `stage`: Static clone stage that failed after activation.
 ///
 /// # Side Effects
 ///
-/// Invalidates disposable manifest cache state, tombstones the target, deletes
-/// its manifest and prefix objects, and removes metadata last. Missing targets
-/// are accepted; other cleanup failures are logged and not returned.
+/// Invalidates disposable manifest cache state and emits a structured warning.
+/// It performs no object-store mutation.
 ///
 /// # Performance
 ///
-/// Calls synchronous namespace deletion with an unbounded cleanup budget, so
-/// the original clone error is not returned until cleanup succeeds or fails.
-/// Cost scales with every object already copied under the target prefix.
+/// Performs no network or object-store work.
 ///
 /// # Examples
 ///
-/// If the seventh object copy fails, this helper removes target metadata and
-/// the first six copied objects so a later clone request can reuse the name.
-async fn cleanup_failed_clone_target(state: &AppState, target: &str) {
+/// If the seventh object copy fails, this helper makes subsequent reads miss
+/// process-local cache state while preserving any concurrent target write.
+fn retain_failed_clone_target(state: &AppState, target: &str, stage: &'static str) {
     state
         .manifest_cache
         .invalidate_at(target, state.clock.now());
-    match state.namespace_manager.delete(target).await {
-        Ok(()) | Err(ZeppelinError::NamespaceNotFound { .. }) => {}
-        Err(e) => warn!(
-            target,
-            error = %e,
-            "failed to clean up target namespace after clone failure"
-        ),
-    }
+    warn!(
+        target,
+        stage,
+        "clone failed after target activation; target retained to preserve concurrent writes"
+    );
 }
 
 /// Resolves creation overrides against complete server indexing defaults.
@@ -1578,7 +1675,8 @@ fn generated_namespace_name(prefix: Option<&str>) -> String {
 ///
 /// Returns an index error if a manifest key escapes the source prefix, or the
 /// first copy/storage error observed. Some copies may already exist under the
-/// target prefix; [`clone_namespace`] is responsible for cleanup.
+/// target prefix; after target activation [`clone_namespace`] retains them to
+/// avoid destructively racing a concurrent target write.
 ///
 /// # Side Effects
 ///
@@ -1601,8 +1699,8 @@ fn generated_namespace_name(prefix: Option<&str>) -> String {
 ///
 /// A source manifest at generation 42 with one WAL fragment and one segment is
 /// transformed into generation zero with target-prefixed explicit references.
-/// After copies finish, the caller's manifest write publishes target generation
-/// one.
+/// After copies finish, the caller adopts the target bootstrap generation and
+/// conditionally publishes its successor.
 ///
 /// # Rust Notes for Java/C Engineers
 ///
@@ -1857,12 +1955,13 @@ pub async fn list_namespaces(
 /// After an upsert publishes one seven-vector WAL fragment, GET reports seven
 /// vectors and one uncompacted fragment. During deletion it may briefly report
 /// `deleting` with zero counts; after tombstone removal the same GET returns 404.
-#[instrument(skip(state, _decision), fields(namespace = %ns))]
+#[instrument(skip(state, decision), fields(namespace = %ns))]
 pub async fn get_namespace(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<Json<NamespaceResponse>, ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
     let meta = state
         .namespace_manager
         .get_including_deleting(&ns)
@@ -1929,12 +2028,13 @@ pub async fn get_namespace(
 /// A manifest with two fragments returns `ready = false`. After a successful
 /// compaction publishes a segment and removes both references, a later poll
 /// returns a newer generation with `ready = true`.
-#[instrument(skip(state, _decision), fields(namespace = %ns))]
+#[instrument(skip(state, decision), fields(namespace = %ns))]
 pub async fn get_compaction_status(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<Json<CompactionStatusResponse>, ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
     state
         .namespace_manager
         .get(&ns)
@@ -1947,6 +2047,27 @@ pub async fn get_compaction_status(
         .map_err(ApiError::from)?;
 
     Ok(Json(compaction_status_from_manifest(&ns, &manifest)))
+}
+
+/// Reject unsupported row- or attribute-constrained namespace-wide work.
+///
+/// Namespace status, retention, index configuration, hydration, compaction,
+/// and deletion operate on or reveal the entire namespace. They cannot honor a
+/// row filter or field mask by editing a response or partially mutating state.
+/// Dropping those constraints would widen authority, while projecting fake
+/// values would fabricate state, so these handlers fail closed before storage
+/// work.
+fn require_unconstrained_namespace_operation(decision: &AllowDecision) -> Result<(), ApiError> {
+    if decision.mandatory_filter.is_some()
+        || decision.field_mask.is_some()
+        || !decision.write_constraints.is_empty()
+    {
+        Err(ApiError(
+            crate::security::SecurityError::ConstraintViolation.into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Starts one lease-protected compaction cycle when manifest work is pending.
@@ -2027,12 +2148,13 @@ pub async fn get_compaction_status(
 /// namespace string, FTS map, and lease move into the task. Java relies on heap
 /// reachability for similar callbacks; C requires explicit reference counting
 /// and cleanup. Rust verifies the task cannot retain borrowed request locals.
-#[instrument(skip(state, _decision), fields(namespace = %ns))]
+#[instrument(skip(state, decision), fields(namespace = %ns))]
 pub async fn compact_namespace(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<(StatusCode, Json<CompactNamespaceResponse>), ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
     let meta = state
         .namespace_manager
         .get(&ns)
@@ -2162,14 +2284,15 @@ pub async fn compact_namespace(
 /// PATCH `{"nlist":256}` returns 202 immediately. The active segment keeps its
 /// old cluster count until a later compaction publishes a replacement built
 /// with 256 centroids.
-#[instrument(skip(state, _decision, audit), fields(namespace = %ns))]
+#[instrument(skip(state, decision, audit), fields(namespace = %ns))]
 pub async fn patch_index_config(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Extension(audit): Extension<AuditRequest>,
     Path(ns): Path<String>,
     Json(req): Json<PatchNamespaceIndexConfigRequest>,
 ) -> Result<(StatusCode, Json<UpdateIndexConfigResponse>), ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
     if req.is_empty() {
         return Err(ApiError(ZeppelinError::Validation(
             "index_config patch must include at least one field".into(),
@@ -2283,12 +2406,13 @@ pub async fn patch_index_config(
 /// borrowed stack pointer to become invalid. Remote cleanup is not covered by
 /// Rust RAII, so the tombstone is the durable equivalent of a resumable cleanup
 /// record after process cancellation or crash.
-#[instrument(skip(state, _decision), fields(namespace = %ns))]
+#[instrument(skip(state, decision), fields(namespace = %ns))]
 pub async fn delete_namespace(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<(StatusCode, Json<DeleteNamespaceResponse>), ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
     info!(namespace = %ns, "deleting namespace");
     state
         .namespace_manager
@@ -2358,12 +2482,13 @@ pub async fn delete_namespace(
 /// POST `/hydrate` after compaction returns 202 with `segment_id = "s42"` in
 /// well under the time needed to download that segment. A later query can hit
 /// disk cache after the worker completes. An empty namespace returns 400.
-#[instrument(skip(state, _decision), fields(namespace = %ns))]
+#[instrument(skip(state, decision), fields(namespace = %ns))]
 pub async fn trigger_hydration(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
 ) -> Result<(StatusCode, Json<HydrateNamespaceResponse>), ApiError> {
+    require_unconstrained_namespace_operation(&decision)?;
     let hydrator = state
         .hydrator
         .as_ref()

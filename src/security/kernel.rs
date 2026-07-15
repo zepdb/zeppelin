@@ -13,9 +13,9 @@ use chrono::{DateTime, Utc};
 
 use super::{
     policy_cache::PolicyCache, Action, AllowDecision, ApiKeyAdapter, Decision, DenyDecision,
-    DenyReason, GrantActions, GrantScope, IssuedApiKey, NamespaceId, PolicyGrant, PolicyPrincipal,
-    PolicySnapshot, PolicyStore, Principal, PrincipalId, PrincipalKind, RequestContext, Resource,
-    SecurityError, SecurityOperationResult,
+    DenyReason, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, NamespaceId, PolicyGrant,
+    PolicyPrincipal, PolicySnapshot, PolicyStore, Principal, PrincipalId, PrincipalKind,
+    RequestContext, Resource, SecurityError, SecurityOperationResult,
 };
 
 #[derive(Debug)]
@@ -23,6 +23,13 @@ struct BootstrapGrant {
     actions: HashSet<Action>,
     all_namespaces: bool,
     namespaces: HashSet<NamespaceId>,
+}
+
+impl BootstrapGrant {
+    fn allows_namespace(&self, action: Action, namespace: &NamespaceId) -> bool {
+        self.actions.contains(&action)
+            && (self.all_namespaces || self.namespaces.contains(namespace))
+    }
 }
 
 enum SecurityAuthority {
@@ -34,17 +41,23 @@ enum SecurityAuthority {
 pub struct SecurityKernel {
     mode: SecurityMode,
     authority: SecurityAuthority,
+    cursor_binding_key: super::CursorBindingKey,
 }
 
 impl SecurityKernel {
     /// Compile validated boot configuration into typed, immutable grants.
     pub fn from_config(config: &SecurityConfig) -> Result<Self, SecurityError> {
+        let cursor_binding_key = if config.mode == SecurityMode::OpenUnsafe {
+            super::CursorBindingKey::default()
+        } else {
+            super::CursorBindingKey::from_config_hex(config.cursor_hmac_key_hex())?
+        };
         let mut grants = HashMap::new();
         for key in &config.api_keys {
             let principal_id = PrincipalId::new(key.key_id.clone())?;
             let mut actions = HashSet::new();
             if key.actions.iter().any(|action| action == "*") {
-                actions.extend(Action::ALL);
+                actions.extend(Action::POLICY_ALL_V1);
             } else {
                 for action in &key.actions {
                     actions.insert(Action::from_str(action)?);
@@ -77,6 +90,7 @@ impl SecurityKernel {
         Ok(Self {
             mode: config.mode,
             authority: SecurityAuthority::Bootstrap(grants),
+            cursor_binding_key,
         })
     }
 
@@ -94,6 +108,8 @@ impl SecurityKernel {
         }
 
         let policy_store = PolicyStore::new(store);
+        let cursor_binding_key =
+            super::CursorBindingKey::from_config_hex(config.cursor_hmac_key_hex())?;
         let loaded = policy_store.load_or_bootstrap(config, clock.now()).await?;
         let cache = PolicyCache::start(
             policy_store,
@@ -105,6 +121,7 @@ impl SecurityKernel {
             Arc::new(Self {
                 mode: config.mode,
                 authority: SecurityAuthority::Policy(Arc::clone(&cache)),
+                cursor_binding_key,
             }),
             Arc::new(ApiKeyAdapter::from_policy_cache(cache)),
         ))
@@ -120,7 +137,7 @@ impl SecurityKernel {
         context: &RequestContext,
     ) -> Decision {
         if self.mode == SecurityMode::OpenUnsafe && principal.is_anonymous() {
-            return Decision::Allow(AllowDecision::boot(action));
+            return Decision::Allow(Box::new(AllowDecision::boot(action)));
         }
         if principal.is_anonymous() {
             return Decision::Deny(DenyDecision::boot(DenyReason::Unauthenticated));
@@ -145,7 +162,13 @@ impl SecurityKernel {
                     }
                 }
 
-                Decision::Allow(AllowDecision::boot(action))
+                let mut allow = AllowDecision::boot(action);
+                allow.cursor_binding_key = self.cursor_binding_key;
+                if action == Action::VectorUpsert && grant.actions.contains(&Action::AttributeAdmin)
+                {
+                    allow.mark_attribute_admin_write();
+                }
+                Decision::Allow(Box::new(allow))
             }
             SecurityAuthority::Policy(cache) => {
                 let cached = cache.current();
@@ -156,15 +179,24 @@ impl SecurityKernel {
                         version,
                     ));
                 }
-                if let Err(reason) =
-                    cached
-                        .policy
-                        .authorize(principal, context.now, action, resource)
+                match cached
+                    .policy
+                    .authorize(principal, context.now, action, resource)
                 {
-                    return Decision::Deny(DenyDecision::for_policy(reason, version));
+                    Ok(constraints) => {
+                        let mut allow = AllowDecision::for_policy(action, version);
+                        allow.cursor_binding_key = self.cursor_binding_key;
+                        let attribute_admin = constraints.attribute_admin;
+                        allow.mandatory_filter = constraints.mandatory_filter;
+                        allow.field_mask = constraints.field_mask;
+                        allow.write_constraints = constraints.write_constraints;
+                        if action == Action::VectorUpsert && attribute_admin {
+                            allow.mark_attribute_admin_write();
+                        }
+                        Decision::Allow(Box::new(allow))
+                    }
+                    Err(reason) => Decision::Deny(DenyDecision::for_policy(reason, version)),
                 }
-
-                Decision::Allow(AllowDecision::for_policy(action, version))
             }
         }
     }
@@ -178,7 +210,7 @@ impl SecurityKernel {
         context: &RequestContext,
     ) -> Decision {
         if self.mode == SecurityMode::OpenUnsafe && principal.is_anonymous() {
-            return Decision::Allow(AllowDecision::boot(action));
+            return Decision::Allow(Box::new(AllowDecision::boot(action)));
         }
         if principal.is_anonymous() {
             return Decision::Deny(DenyDecision::boot(DenyReason::Unauthenticated));
@@ -197,7 +229,7 @@ impl SecurityKernel {
                 if !grant.actions.contains(&action) {
                     return Decision::Deny(DenyDecision::boot(DenyReason::ActionNotGranted));
                 }
-                Decision::Allow(AllowDecision::boot(action))
+                Decision::Allow(Box::new(AllowDecision::boot(action)))
             }
             SecurityAuthority::Policy(cache) => {
                 let cached = cache.current();
@@ -214,7 +246,43 @@ impl SecurityKernel {
                 {
                     return Decision::Deny(DenyDecision::for_policy(reason, version));
                 }
-                Decision::Allow(AllowDecision::for_policy(action, version))
+                Decision::Allow(Box::new(AllowDecision::for_policy(action, version)))
+            }
+        }
+    }
+
+    /// Fail closed unless one verified policy version proves that a raw namespace
+    /// copy preserves every principal's namespace-scoped authority.
+    pub(crate) fn validate_namespace_copy_no_widening(
+        &self,
+        expected_policy_version: super::PolicyVersion,
+        source: &NamespaceId,
+        target: &NamespaceId,
+    ) -> Result<(), SecurityError> {
+        match &self.authority {
+            SecurityAuthority::Bootstrap(grants) => {
+                if expected_policy_version != super::PolicyVersion::BOOT {
+                    return Err(SecurityError::ConstraintViolation);
+                }
+                for grant in grants.values() {
+                    for action in super::policy::DERIVED_NAMESPACE_ACTIONS {
+                        if grant.allows_namespace(action, target)
+                            && !grant.allows_namespace(action, source)
+                        {
+                            return Err(SecurityError::ConstraintViolation);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            SecurityAuthority::Policy(cache) => {
+                let cached = cache.current();
+                if cached.policy.version() != expected_policy_version || !cache.is_fresh(&cached) {
+                    return Err(SecurityError::ConstraintViolation);
+                }
+                cached
+                    .policy
+                    .validate_namespace_copy_no_widening(source, target)
             }
         }
     }
@@ -296,14 +364,10 @@ impl SecurityKernel {
     pub async fn add_grant(
         &self,
         actor: &Principal,
-        principal_id: PrincipalId,
-        scope: GrantScope,
-        actions: GrantActions,
+        definition: GrantDefinition,
     ) -> SecurityOperationResult<(AllowDecision, super::PolicyVersion, PolicyGrant)> {
         match &self.authority {
-            SecurityAuthority::Policy(cache) => {
-                cache.add_grant(actor, principal_id, scope, actions).await
-            }
+            SecurityAuthority::Policy(cache) => cache.add_grant(actor, definition).await,
             SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
                 "security administration requires S3 policy authority".to_string(),
             )
@@ -360,5 +424,95 @@ impl SecurityKernel {
             )
             .into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use crate::{
+        config::Config,
+        security::{NamespaceId, PolicyVersion, SecurityError},
+    };
+
+    use super::SecurityKernel;
+
+    fn fixture<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
+        result.unwrap_or_else(|error| panic!("{context}: {error:?}"))
+    }
+
+    fn kernel(namespaces: &[&str]) -> SecurityKernel {
+        let namespaces = namespaces
+            .iter()
+            .map(|namespace| format!(r#""{namespace}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let config = fixture(
+            Config::from_str(&format!(
+                r#"
+[security]
+mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[security.api_keys]]
+key_id = "zpk1_reader"
+name = "reader"
+sha256_hex = "0000000000000000000000000000000000000000000000000000000000000000"
+actions = ["NamespaceRead", "Query", "VectorFetch"]
+namespaces = [{namespaces}]
+"#
+            )),
+            "bootstrap clone config must parse",
+        );
+        fixture(
+            SecurityKernel::from_config(&config.security),
+            "bootstrap clone kernel must compile",
+        )
+    }
+
+    fn namespace(name: &str) -> NamespaceId {
+        fixture(
+            NamespaceId::new(name.to_string()),
+            "bootstrap clone namespace must validate",
+        )
+    }
+
+    #[test]
+    fn bootstrap_copy_allows_target_denied_or_equal_access() {
+        assert!(kernel(&["source"])
+            .validate_namespace_copy_no_widening(
+                PolicyVersion::BOOT,
+                &namespace("source"),
+                &namespace("target"),
+            )
+            .is_ok());
+        assert!(kernel(&["*"])
+            .validate_namespace_copy_no_widening(
+                PolicyVersion::BOOT,
+                &namespace("source"),
+                &namespace("target"),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn bootstrap_copy_rejects_target_only_access_and_version_mismatch() {
+        let widened = kernel(&["target"]).validate_namespace_copy_no_widening(
+            PolicyVersion::BOOT,
+            &namespace("source"),
+            &namespace("target"),
+        );
+        assert!(matches!(widened, Err(SecurityError::ConstraintViolation)));
+
+        let mismatch = kernel(&["*"]).validate_namespace_copy_no_widening(
+            fixture(
+                PolicyVersion::persisted(1),
+                "mismatched policy version must validate",
+            ),
+            &namespace("source"),
+            &namespace("target"),
+        );
+        assert!(matches!(mismatch, Err(SecurityError::ConstraintViolation)));
     }
 }

@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ZeppelinError;
 use crate::security::{
-    Action, AllowDecision, ApiKeyId, AuditParams, Decision, GrantActions, GrantScope, KeyState,
-    PolicyGrant, PolicyPrincipal, PolicyVersion, Principal, PrincipalId, PrincipalKind,
-    ResourceRef, SecurityError, SecurityOperationError,
+    Action, AllowDecision, ApiKeyId, AuditParams, Decision, FieldMask, GrantActions,
+    GrantDefinition, GrantScope, KeyState, PolicyGrant, PolicyPrincipal, PolicyVersion, Principal,
+    PrincipalId, PrincipalKind, ResourceRef, SecurityError, SecurityOperationError,
+    WriteConstraints,
 };
 use crate::server::{AppState, AuditRequest};
+use crate::types::Filter;
 
 use super::ApiError;
 
@@ -23,7 +25,9 @@ fn security_operation_api_error(
 ) -> ApiError {
     let (decision, error) = error.into_parts();
     match decision {
-        Some(Decision::Allow(allow)) => audit.set_allow(action, ResourceRef::SecurityPolicy, allow),
+        Some(Decision::Allow(allow)) => {
+            audit.set_allow(action, ResourceRef::SecurityPolicy, *allow)
+        }
         Some(Decision::Deny(deny)) => audit.set_deny(action, ResourceRef::SecurityPolicy, deny),
         None => {}
     }
@@ -119,6 +123,21 @@ pub struct PolicyKeyView {
 #[serde(deny_unknown_fields)]
 /// Exact principal, scope, and actions for one grant mutation.
 pub struct GrantMutationRequest {
+    principal_id: String,
+    scope: GrantScope,
+    actions: GrantActions,
+    #[serde(default)]
+    mandatory_filter: Option<Filter>,
+    #[serde(default)]
+    field_mask: Option<FieldMask>,
+    #[serde(default)]
+    write_constraints: WriteConstraints,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Binding-only request for removing a grant regardless of its constraints.
+pub struct GrantRemovalRequest {
     principal_id: String,
     scope: GrantScope,
     actions: GrantActions,
@@ -398,9 +417,17 @@ pub async fn create_grant(
     Json(request): Json<GrantMutationRequest>,
 ) -> Result<(StatusCode, Json<GrantMutationResponse>), ApiError> {
     let principal_id = parse_principal_id(request.principal_id)?;
+    let definition = GrantDefinition::new(
+        principal_id,
+        request.scope,
+        request.actions,
+        request.mandatory_filter,
+        request.field_mask,
+        request.write_constraints,
+    );
     let (authorization, new_version, grant) = state
         .security
-        .add_grant(&principal, principal_id, request.scope, request.actions)
+        .add_grant(&principal, definition)
         .await
         .map_err(|error| security_operation_api_error(&audit, Action::SecurityAdminWrite, error))?;
     let old_version = authorization.policy_version;
@@ -428,7 +455,7 @@ pub async fn delete_grant(
     Extension(_decision): Extension<AllowDecision>,
     Extension(principal): Extension<Principal>,
     Extension(audit): Extension<AuditRequest>,
-    Json(request): Json<GrantMutationRequest>,
+    Json(request): Json<GrantRemovalRequest>,
 ) -> Result<Json<GrantMutationResponse>, ApiError> {
     let principal_id = parse_principal_id(request.principal_id)?;
     let (authorization, new_version, grant) = state

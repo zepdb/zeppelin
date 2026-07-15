@@ -23,14 +23,18 @@ use rand::Rng;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::global_index::{GlobalInvertedIndex, GlobalPosting};
 use crate::fts::inverted_index::{InvertedIndex, Posting};
+use crate::retrieval_scope::{ScopedAnnIndex, ScopedFtsIndex, ScopedSegmentCorpus};
 
 /// Number of candidates compared during one approximate-LRU choice.
 const EVICTION_SAMPLE_SIZE: usize = 16;
 
-/// One of the two deliberately supported decoded FTS artifact families.
+/// One deliberately supported decoded or derived immutable artifact family.
 enum CachedArtifact {
     GlobalFts(Arc<GlobalInvertedIndex>),
     ClusterFts(Arc<InvertedIndex>),
+    SegmentCorpus(Arc<ScopedSegmentCorpus>),
+    ScopedAnn(Arc<ScopedAnnIndex>),
+    ScopedFts(Arc<ScopedFtsIndex>),
 }
 
 /// Shared decoded value plus approximate capacity and recency metadata.
@@ -128,6 +132,84 @@ impl DecodedArtifactCache {
         Ok(index)
     }
 
+    /// Returns or derives one logical corpus from a manifest-selected segment.
+    pub(crate) async fn get_or_build_segment_corpus<F, Fut>(
+        &self,
+        key: &str,
+        build: F,
+    ) -> Result<Arc<ScopedSegmentCorpus>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<ScopedSegmentCorpus>>,
+    {
+        if let Some(corpus) = self.get_segment_corpus(key)? {
+            return Ok(corpus);
+        }
+        let corpus = Arc::new(build().await?);
+        let size_bytes = corpus
+            .estimated_size_bytes()
+            .checked_add(key.len())
+            .unwrap_or_else(|| panic!("decoded artifact cache entry size overflowed"));
+        self.insert(
+            key,
+            CachedArtifact::SegmentCorpus(Arc::clone(&corpus)),
+            size_bytes,
+        );
+        Ok(corpus)
+    }
+
+    /// Returns or derives one ANN structure trained on a mandatory row slice.
+    pub(crate) async fn get_or_build_scoped_ann<F, Fut>(
+        &self,
+        key: &str,
+        build: F,
+    ) -> Result<Arc<ScopedAnnIndex>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<ScopedAnnIndex>>,
+    {
+        if let Some(index) = self.get_scoped_ann(key)? {
+            return Ok(index);
+        }
+        let index = Arc::new(build().await?);
+        let size_bytes = index
+            .estimated_size_bytes()
+            .checked_add(key.len())
+            .unwrap_or_else(|| panic!("decoded artifact cache entry size overflowed"));
+        self.insert(
+            key,
+            CachedArtifact::ScopedAnn(Arc::clone(&index)),
+            size_bytes,
+        );
+        Ok(index)
+    }
+
+    /// Returns or derives one BM25 structure over a mandatory row corpus.
+    pub(crate) async fn get_or_build_scoped_fts<F, Fut>(
+        &self,
+        key: &str,
+        build: F,
+    ) -> Result<Arc<ScopedFtsIndex>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<ScopedFtsIndex>>,
+    {
+        if let Some(index) = self.get_scoped_fts(key)? {
+            return Ok(index);
+        }
+        let index = Arc::new(build().await?);
+        let size_bytes = index
+            .estimated_size_bytes()
+            .checked_add(key.len())
+            .unwrap_or_else(|| panic!("decoded artifact cache entry size overflowed"));
+        self.insert(
+            key,
+            CachedArtifact::ScopedFts(Arc::clone(&index)),
+            size_bytes,
+        );
+        Ok(index)
+    }
+
     /// Clears all disposable decoded values without resetting diagnostics.
     pub fn clear(&self) {
         let _guard = self
@@ -187,7 +269,7 @@ impl DecodedArtifactCache {
         entry.last_accessed = Instant::now();
         match &entry.artifact {
             CachedArtifact::GlobalFts(index) => Ok(Some(Arc::clone(index))),
-            CachedArtifact::ClusterFts(_) => Err(ZeppelinError::Cache(format!(
+            _ => Err(ZeppelinError::Cache(format!(
                 "decoded artifact key {key} was reused across FTS artifact variants"
             ))),
         }
@@ -200,8 +282,47 @@ impl DecodedArtifactCache {
         entry.last_accessed = Instant::now();
         match &entry.artifact {
             CachedArtifact::ClusterFts(index) => Ok(Some(Arc::clone(index))),
-            CachedArtifact::GlobalFts(_) => Err(ZeppelinError::Cache(format!(
+            _ => Err(ZeppelinError::Cache(format!(
                 "decoded artifact key {key} was reused across FTS artifact variants"
+            ))),
+        }
+    }
+
+    fn get_segment_corpus(&self, key: &str) -> Result<Option<Arc<ScopedSegmentCorpus>>> {
+        let Some(mut entry) = self.entries.get_mut(key) else {
+            return Ok(None);
+        };
+        entry.last_accessed = Instant::now();
+        match &entry.artifact {
+            CachedArtifact::SegmentCorpus(corpus) => Ok(Some(Arc::clone(corpus))),
+            _ => Err(ZeppelinError::Cache(format!(
+                "decoded artifact key {key} was reused across scoped artifact variants"
+            ))),
+        }
+    }
+
+    fn get_scoped_ann(&self, key: &str) -> Result<Option<Arc<ScopedAnnIndex>>> {
+        let Some(mut entry) = self.entries.get_mut(key) else {
+            return Ok(None);
+        };
+        entry.last_accessed = Instant::now();
+        match &entry.artifact {
+            CachedArtifact::ScopedAnn(index) => Ok(Some(Arc::clone(index))),
+            _ => Err(ZeppelinError::Cache(format!(
+                "decoded artifact key {key} was reused across scoped artifact variants"
+            ))),
+        }
+    }
+
+    fn get_scoped_fts(&self, key: &str) -> Result<Option<Arc<ScopedFtsIndex>>> {
+        let Some(mut entry) = self.entries.get_mut(key) else {
+            return Ok(None);
+        };
+        entry.last_accessed = Instant::now();
+        match &entry.artifact {
+            CachedArtifact::ScopedFts(index) => Ok(Some(Arc::clone(index))),
+            _ => Err(ZeppelinError::Cache(format!(
+                "decoded artifact key {key} was reused across scoped artifact variants"
             ))),
         }
     }
@@ -351,8 +472,10 @@ fn approximate_cluster_size(index: &InvertedIndex) -> usize {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
+    use crate::types::VectorEntry;
 
     fn global_bytes() -> Bytes {
         GlobalInvertedIndex {
@@ -447,5 +570,38 @@ mod tests {
         assert!(matches!(error, ZeppelinError::Cache(_)));
         assert_eq!(cache.decode_count(), 1);
         assert_eq!(cache.cluster_decode_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn scoped_segment_corpus_is_bounded_and_pointer_reused() {
+        let cache = DecodedArtifactCache::new(1024 * 1024);
+        let builds = AtomicUsize::new(0);
+        let key = "segment-corpus:v1:ns:fixture";
+        let first = cache
+            .get_or_build_segment_corpus(key, || async {
+                builds.fetch_add(1, Ordering::Relaxed);
+                ScopedSegmentCorpus::new(
+                    vec![VectorEntry {
+                        id: "visible".to_string(),
+                        values: vec![1.0, 0.0],
+                        attributes: None,
+                    }],
+                    2,
+                )
+            })
+            .await
+            .expect("cold scoped corpus must build");
+        let second = cache
+            .get_or_build_segment_corpus(key, || async {
+                panic!("warm scoped corpus lookup rebuilt authoritative rows")
+            })
+            .await
+            .expect("warm scoped corpus must be retained");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        assert!(cache.contains(key));
+        assert!(cache.total_size() > 0);
+        assert!(cache.total_size() <= 1024 * 1024);
     }
 }

@@ -1280,14 +1280,40 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                 &mut background_compaction_starts,
                 &mut compactions,
             );
-            assert!(
-                step.crash.is_none(),
-                "a replayed foreground HoldCall cannot also complete through a process crash"
-            );
             if !step.violations.is_empty() {
                 failed = true;
                 failure_violations = step.violations;
                 break;
+            }
+            if let Some(crash) = take_step_crash(&step, scheduler.as_ref()) {
+                let scheduler = scheduler
+                    .as_ref()
+                    .expect("replayed held-call process crash requires a scheduler");
+                let controller = scheduler
+                    .process_controller()
+                    .expect("replayed held-call process crash requires a controller");
+                let recovery = restart_after_crash(
+                    &mut server,
+                    &controller,
+                    scheduler,
+                    &mut injector,
+                    &mut http_fault_context,
+                    &store,
+                    &harness.store,
+                    &prefix,
+                    &config,
+                    true,
+                    &client,
+                    &model,
+                    source.index,
+                    crash,
+                )
+                .await;
+                if !recovery.is_empty() {
+                    failed = true;
+                    failure_violations = recovery;
+                    break;
+                }
             }
         }
         let remaining = operational_state
@@ -1420,9 +1446,15 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                         pending.release_cause = recorded_hold.release_cause;
                         RecordedExecutionOutcome::Held(pending)
                     }
-                    HoldCandidateOutcome::Completed(_) => panic!(
-                        "recorded foreground hold {} for op {} completed without parking",
-                        recorded_hold.event_id, source.index
+                    HoldCandidateOutcome::Completed(raw) => RecordedExecutionOutcome::Held(
+                        preserve_recorded_hold_after_early_completion(
+                            raw,
+                            recorded_hold,
+                            &op,
+                            source.index,
+                            replay_mutation,
+                            &mut model,
+                        ),
                     ),
                 }
             } else {
@@ -1489,12 +1521,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
                 continue;
             }
         };
-        let pending_crash = step.crash.clone().or_else(|| {
-            scheduler
-                .as_ref()
-                .and_then(FaultScheduler::process_controller)
-                .and_then(|controller| controller.try_take_request())
-        });
+        let pending_crash = take_step_crash(&step, scheduler.as_ref());
         assert_eq!(
             step.post_commit_ack_lost, replay_lost_ack,
             "replay could not reproduce the recorded post-commit acknowledgement loss"
@@ -3076,14 +3103,40 @@ async fn run_seed(
                 &mut compactions,
             );
             post_commit_ack_loss_fired |= step.post_commit_ack_lost;
-            assert!(
-                step.crash.is_none(),
-                "a foreground HoldCall cannot also complete through a process crash"
-            );
             if !step.violations.is_empty() {
                 failed = true;
                 failure_violations = step.violations;
                 break;
+            }
+            if let Some(crash) = take_step_crash(&step, scheduler.as_ref()) {
+                let scheduler = scheduler
+                    .as_ref()
+                    .expect("held-call process crash requires a fault scheduler");
+                let controller = scheduler
+                    .process_controller()
+                    .expect("held-call process crash requires a process controller");
+                let recovery = restart_after_crash(
+                    &mut server,
+                    &controller,
+                    scheduler,
+                    &mut injector,
+                    &mut http_fault_context,
+                    &store,
+                    &harness.store,
+                    &prefix,
+                    &config,
+                    true,
+                    &client,
+                    &model,
+                    op_index,
+                    crash,
+                )
+                .await;
+                if !recovery.is_empty() {
+                    failed = true;
+                    failure_violations = recovery;
+                    break;
+                }
             }
         }
         let remaining = operational_state
@@ -3236,12 +3289,7 @@ async fn run_seed(
                 continue;
             }
         };
-        let pending_crash = step.crash.clone().or_else(|| {
-            scheduler
-                .as_ref()
-                .and_then(FaultScheduler::process_controller)
-                .and_then(|controller| controller.try_take_request())
-        });
+        let pending_crash = take_step_crash(&step, scheduler.as_ref());
         post_commit_ack_loss_fired |= step.post_commit_ack_lost;
         if matches!(op, Op::CreateNamespace { .. }) && (200..300).contains(&step.status) {
             let ns = op.namespace().to_string();
@@ -3684,6 +3732,14 @@ struct StepOutcome {
     crash: Option<CrashRequest>,
 }
 
+fn take_step_crash(step: &StepOutcome, scheduler: Option<&FaultScheduler>) -> Option<CrashRequest> {
+    step.crash.clone().or_else(|| {
+        scheduler
+            .and_then(FaultScheduler::process_controller)
+            .and_then(|controller| controller.try_take_request())
+    })
+}
+
 struct PendingHeldOp {
     event_id: String,
     window_op: u64,
@@ -3694,6 +3750,47 @@ struct PendingHeldOp {
     namespace: String,
     holds_query_admission: bool,
     task: JoinHandle<RawRecordedOp>,
+}
+
+fn preserve_recorded_hold_after_early_completion(
+    raw: Box<RawRecordedOp>,
+    recorded_hold: &HeldExecutionMetadata,
+    op: &Op,
+    op_index: u64,
+    mutation: Option<OracleMutation>,
+    model: &mut Model,
+) -> PendingHeldOp {
+    // Exact replay preserves the recorded logical join even when cache state or
+    // a concurrent process crash lets the request finish before the store hold
+    // waiter wins. Pending operations are namespace-isolated, so delaying the
+    // already-completed result preserves the recorded causal boundary without
+    // executing the operation twice.
+    if op.is_mutating() {
+        model.apply_outcome(
+            op,
+            &OpOutcome::Ambiguous {
+                reason: AmbiguityReason::HeldInFlight,
+                status: None,
+            },
+            None,
+            mutation,
+            op_index,
+        );
+    }
+    let raw = *raw;
+    PendingHeldOp {
+        event_id: recorded_hold.event_id.clone(),
+        window_op: recorded_hold.window_op,
+        scheduled_release_op: recorded_hold
+            .scheduled_release_op
+            .unwrap_or(recorded_hold.actual_join_op),
+        release_op: recorded_hold.actual_join_op,
+        release_cause: recorded_hold.release_cause,
+        op_index,
+        namespace: op.namespace().to_string(),
+        holds_query_admission: op_uses_query_admission(op),
+        task: tokio::spawn(async move { raw }),
+    }
 }
 
 enum QuietDrainOp {
@@ -6590,6 +6687,10 @@ impl QuietPeriod<'_> {
         let mut post_commit_ack_lost = false;
         let mut dual_writer_stale_fencing_token = self.initial_dual_writer_stale_fencing_token;
         let mut drained_ops = 0u64;
+        let bookkeeping_store = self
+            .http_fault_context
+            .as_ref()
+            .map(|context| context.bookkeeping_store.clone());
 
         let quiet_start = quiet_event(
             self.scheduler,
@@ -6664,11 +6765,42 @@ impl QuietPeriod<'_> {
                 self.compactions,
             );
             post_commit_ack_lost |= step.post_commit_ack_lost;
-            assert!(
-                step.crash.is_none(),
-                "a quiesced foreground HoldCall cannot complete through a process crash"
-            );
+            let pending_crash = take_step_crash(&step, self.scheduler);
             violations.extend(step.violations);
+            if violations.is_empty() {
+                if let Some(crash) = pending_crash {
+                    let scheduler = self
+                        .scheduler
+                        .expect("quiesced held-call process crash requires a scheduler");
+                    let controller = scheduler
+                        .process_controller()
+                        .expect("quiesced held-call process crash requires a controller");
+                    let server_store = self.server.store.clone();
+                    let spawn_compaction_loop = self.server.shutdown_compaction.is_some();
+                    let recovery = restart_after_crash(
+                        self.server,
+                        &controller,
+                        scheduler,
+                        self.injector,
+                        self.http_fault_context,
+                        &server_store,
+                        bookkeeping_store.as_ref().expect(
+                            "quiesced held-call process crash requires a bookkeeping store",
+                        ),
+                        self.prefix,
+                        self.config,
+                        spawn_compaction_loop,
+                        self.client,
+                        self.model,
+                        *self.op_index,
+                        crash,
+                    )
+                    .await;
+                    violations.extend(recovery);
+                    *self.http_fault_context = None;
+                    shutdown_http_fault_injector(self.injector).await;
+                }
+            }
         }
         let deferred_drain_count = self.drain_ops.len();
         while violations.is_empty() {
@@ -11307,7 +11439,7 @@ mod outcome_tests {
     }
 
     #[tokio::test]
-    async fn replay_joins_terminal_hold_after_following_workload_record() {
+    async fn replay_preserves_terminal_join_when_hold_candidate_completes_early() {
         let source_root = tempfile::TempDir::new().unwrap();
         let source_env = RunnerEnv {
             seconds: 30,
@@ -11341,7 +11473,7 @@ mod outcome_tests {
                 boundary: Boundary::ObjectStore,
                 target: TargetSelector {
                     store_op: Some(StoreOp::Get),
-                    key_substring: Some("manifest.json".to_string()),
+                    key_substring: Some("never-matches-recorded-terminal-hold".to_string()),
                     ..TargetSelector::default()
                 },
                 kind: FaultKind::HoldCall { for_ops: 4 },
@@ -11361,23 +11493,6 @@ mod outcome_tests {
             None,
             Some(&schedule),
         );
-        let held_query = GeneratedQuery {
-            body: json!({
-                "sources": [{
-                    "type": "ann",
-                    "vector": [0.0, 0.0],
-                    "nprobe": 4
-                }],
-                "fusion": { "type": "none" },
-                "top_k": 1,
-                "candidate_k": 1,
-                "consistency": ConsistencyLevel::Strong
-            }),
-            class: QueryOracleClass::Membership {
-                consistency: ConsistencyLevel::Strong,
-            },
-            pattern_tags: Vec::new(),
-        };
         let source_records = vec![
             OpRecord {
                 index: 0,
@@ -11418,13 +11533,16 @@ mod outcome_tests {
             OpRecord {
                 index: 2,
                 wall_ms: 2,
-                op: Op::Query {
+                op: Op::Upsert {
                     ns: held_ns,
-                    q: held_query,
-                    as_of: None,
+                    vectors: vec![GenVector {
+                        id: "terminal-held-vector".to_string(),
+                        values: vec![1.0, 0.0],
+                        attributes: None,
+                    }],
                 },
                 method: "POST".to_string(),
-                path: "/query".to_string(),
+                path: "/vectors".to_string(),
                 status: StatusCode::OK.as_u16(),
                 response: json!({}),
                 outcome: "applied".to_string(),
@@ -11439,7 +11557,7 @@ mod outcome_tests {
                         release_cause: HoldReleaseCause::Quiesce,
                     }),
                 },
-                gen_after: None,
+                gen_after: Some(2),
                 duration_ms: 0,
                 violations: Vec::new(),
             },
@@ -11516,6 +11634,11 @@ mod outcome_tests {
             replay_workload[2].execution.hold,
             source_records[2].execution.hold
         );
+        assert_eq!(
+            replay_workload[2].gen_after,
+            Some(2),
+            "the terminal-held mutation must advance the authoritative manifest exactly once"
+        );
         assert!(replay_records.len() > 5);
         assert!(replay_records[5..]
             .iter()
@@ -11539,20 +11662,19 @@ mod outcome_tests {
             .iter()
             .position(|event| event.event_id == "quiet-02")
             .unwrap();
-        let held_release = timeline
-            .iter()
-            .position(|event| {
-                event.event_id == "sched-terminal-hold"
-                    && event.semantics == FaultSemantics::WindowEnd
-            })
-            .expect("terminal hold omitted its release timeline event");
+        assert!(
+            timeline
+                .iter()
+                .all(|event| event.event_id != "sched-terminal-hold"),
+            "the non-matching store selector must force the recorded hold's \
+             early-completion replay path: {timeline:#?}"
+        );
         let release_complete = timeline
             .iter()
             .position(|event| event.event_id == "quiet-03")
             .unwrap();
         assert!(quiet_start < environment_restored, "{timeline:#?}");
-        assert!(environment_restored < held_release, "{timeline:#?}");
-        assert!(held_release < release_complete, "{timeline:#?}");
+        assert!(environment_restored < release_complete, "{timeline:#?}");
     }
 
     #[tokio::test]
@@ -11838,7 +11960,7 @@ mod outcome_tests {
     }
 
     #[tokio::test]
-    async fn copy_source_vanish_clone_fails_loudly_and_preserves_source_at_quiescence() {
+    async fn copy_source_vanish_clone_fails_loudly_and_retains_safe_target() {
         let harness = TestHarness::new().await;
         let prefix = harness.prefix.clone();
         let source = format!("{prefix}-copy-vanish-source");
@@ -11953,11 +12075,32 @@ mod outcome_tests {
         .await;
         assert!(quiescent.is_empty(), "{quiescent:#?}");
         assert_eq!(source_manifest.vector_count(), 1);
-        assert!(!harness
-            .store
-            .exists(&format!("{target}/manifest.json"))
+        let target_status = client
+            .get(format!("{}/v1/namespaces/{target}", server.base_url))
+            .send()
             .await
-            .unwrap());
+            .unwrap();
+        assert!(target_status.status().is_success());
+        let target_status = target_status.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(target_status["vector_count"], 0);
+
+        let target_fetch = client
+            .post(format!(
+                "{}/v1/namespaces/{target}/vectors/get",
+                server.base_url
+            ))
+            .json(&json!({
+                "ids": ["one"],
+                "include_vector": true,
+                "consistency": "strong"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(target_fetch.status().is_success());
+        let target_fetch = target_fetch.json::<serde_json::Value>().await.unwrap();
+        assert!(target_fetch["results"].as_array().unwrap().is_empty());
+        assert_eq!(target_fetch["missing"], json!(["one"]));
 
         let fetch = client
             .post(format!(

@@ -10,17 +10,16 @@ use sha2::{Digest, Sha256};
 use tokio::task::AbortHandle;
 use ulid::Ulid;
 
-use crate::error::Result;
-use crate::time::Clock;
-
 use super::policy::CompiledPolicy;
 use super::policy_store::{PolicyPublication, PolicyRefresh};
 use super::{
-    Action, ApiKeyId, GrantActions, GrantScope, IssuedApiKey, LoadedPolicy, PolicyGrant,
-    PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot, PolicyStore, PolicyVersion, Principal,
-    PrincipalId, PrincipalKind, Resource, SecurityError, SecurityOperationError,
-    SecurityOperationResult,
+    Action, ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, LoadedPolicy,
+    PolicyGrant, PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot, PolicyStore,
+    PolicyVersion, Principal, PrincipalId, PrincipalKind, Resource, SecurityError,
+    SecurityOperationError, SecurityOperationResult,
 };
+use crate::error::Result;
+use crate::time::Clock;
 
 const POLICY_CAS_ATTEMPTS: usize = 5;
 
@@ -217,11 +216,9 @@ impl PolicyCache {
     pub(crate) async fn add_grant(
         &self,
         actor: &Principal,
-        principal_id: PrincipalId,
-        scope: GrantScope,
-        actions: GrantActions,
+        definition: GrantDefinition,
     ) -> SecurityOperationResult<(super::AllowDecision, PolicyVersion, PolicyGrant)> {
-        let grant = PolicyGrant::new(principal_id, scope, actions)?;
+        let grant = definition.into_policy_grant()?;
         let transition = self
             .publish_mutation(actor, |snapshot, now| {
                 Ok(snapshot.add_grant(&actor.id, now, grant.clone())?)
@@ -495,17 +492,17 @@ mod tests {
     use super::*;
 
     fn bootstrap_config() -> SecurityConfig {
-        SecurityConfig {
-            api_keys: vec![ApiKeyConfig {
-                key_id: "zpk1_install_origin".to_string(),
-                name: "install origin administrator".to_string(),
-                sha256_hex: "00".repeat(32),
-                actions: vec!["*".to_string()],
-                namespaces: vec!["*".to_string()],
-                expires_at: None,
-            }],
-            ..SecurityConfig::default()
-        }
+        let mut config = SecurityConfig::default();
+        config.set_cursor_hmac_key_hex("11".repeat(32));
+        config.api_keys = vec![ApiKeyConfig {
+            key_id: "zpk1_install_origin".to_string(),
+            name: "install origin administrator".to_string(),
+            sha256_hex: "00".repeat(32),
+            actions: vec!["*".to_string()],
+            namespaces: vec!["*".to_string()],
+            expires_at: None,
+        }];
+        config
     }
 
     #[test]

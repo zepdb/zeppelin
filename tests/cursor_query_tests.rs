@@ -1,7 +1,12 @@
 mod common;
 
-use common::server::{cleanup_ns, create_ns_api_with, start_test_server};
+use common::counting::counting_store;
+use common::harness::TestHarness;
+use common::server::{
+    cleanup_ns, create_ns_api_with, start_test_server, start_test_server_on_store,
+};
 use serde_json::{json, Value};
+use zeppelin::namespace::manager::NamespaceMetadata;
 
 async fn create_namespace(client: &reqwest::Client, base_url: &str) -> String {
     create_ns_api_with(
@@ -95,17 +100,6 @@ fn bounded_page_request(top_k: usize, candidate_k: usize, cursor: Value) -> Valu
     })
 }
 
-fn same_fingerprint_token_for_id(template: &str, id: &str) -> String {
-    let parts: Vec<&str> = template.split(':').collect();
-    assert_eq!(parts.len(), 4);
-    let id_hex = id
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("{}:{}:{}:{}", parts[0], parts[1], parts[2], id_hex)
-}
-
 #[tokio::test]
 async fn malformed_cursor_token_is_validation_error() {
     let (base_url, harness, admin_bearer) = start_test_server().await;
@@ -145,6 +139,119 @@ async fn malformed_cursor_token_is_validation_error() {
     assert!(body["error"].as_str().unwrap().contains("cursor"));
 
     cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn forged_cursor_is_rejected_before_query_execution_metrics() {
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
+    let ns = create_namespace(&client, &base_url).await;
+    upsert(
+        &client,
+        &base_url,
+        &ns,
+        json!([
+            {"id": "a", "values": [0.1, 0.0]},
+            {"id": "b", "values": [0.2, 0.0]},
+            {"id": "c", "values": [0.3, 0.0]}
+        ]),
+    )
+    .await;
+
+    let page = query(
+        &client,
+        &base_url,
+        &ns,
+        page_request(1, json!({"type": "none"})),
+    )
+    .await;
+    let mut forged = page["next_cursor"]
+        .as_str()
+        .expect("first page must return a cursor")
+        .to_string();
+    let final_byte = forged.pop().expect("cursor must contain an HMAC tag");
+    forged.push(if final_byte == '0' { '1' } else { '0' });
+
+    let query_counter = zeppelin::metrics::QUERIES_TOTAL.with_label_values(&[&ns]);
+    let before = query_counter.get();
+    let response = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&page_request(1, json!({"type": "after", "token": forged})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+    assert_eq!(
+        query_counter.get(),
+        before,
+        "an unauthenticated page marker must fail before query execution is counted"
+    );
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn all_forged_cursor_batch_stops_before_namespace_storage_io() {
+    let harness = TestHarness::new().await;
+    let (store, counter) = counting_store(&harness.store);
+    let (base_url, _cache, _cache_dir, admin_bearer) =
+        start_test_server_on_store(&harness, store, Some(harness.prefix.clone())).await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
+    let source_ns = create_namespace(&client, &base_url).await;
+    upsert(
+        &client,
+        &base_url,
+        &source_ns,
+        json!([
+            {"id": "a", "values": [0.1, 0.0]},
+            {"id": "b", "values": [0.2, 0.0]}
+        ]),
+    )
+    .await;
+    let page = query(
+        &client,
+        &base_url,
+        &source_ns,
+        page_request(1, json!({"type": "none"})),
+    )
+    .await;
+    let mut forged = page["next_cursor"]
+        .as_str()
+        .expect("first page must issue a cursor")
+        .to_string();
+    let final_byte = forged.pop().expect("cursor must contain an HMAC tag");
+    forged.push(if final_byte == '0' { '1' } else { '0' });
+
+    let missing_ns = format!("{}-forged-batch-missing", harness.prefix);
+    let missing_meta_key = NamespaceMetadata::s3_key(&missing_ns);
+    counter.reset();
+    let response = client
+        .post(format!("{base_url}/v1/namespaces/{missing_ns}/query/batch"))
+        .json(&json!({
+            "queries": [
+                page_request(1, json!({"type": "after", "token": forged})),
+                page_request(1, json!({"type": "after", "token": "zp3:forged"}))
+            ]
+        }))
+        .send()
+        .await
+        .expect("all-forged cursor batch must complete");
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    let results = body["results"].as_array().expect("batch results");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|entry| entry["ok"] == false));
+    assert_eq!(
+        counter.gets_matching(&missing_meta_key),
+        0,
+        "an all-invalid cursor batch must not look up namespace metadata"
+    );
+
+    cleanup_ns(&harness.store, &source_ns).await;
     harness.cleanup().await;
 }
 
@@ -258,6 +365,52 @@ async fn cursor_ignores_non_result_response_options() {
 
     assert_eq!(ids(&page1), vec!["a"]);
     assert_eq!(ids(&page2), vec!["b"]);
+
+    cleanup_ns(&harness.store, &ns).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn cursor_rejects_a_consistency_change_between_pages() {
+    let (base_url, harness, admin_bearer) = start_test_server().await;
+    let client = crate::common::server::client_with_bearer(&admin_bearer);
+    let ns = create_namespace(&client, &base_url).await;
+    upsert(
+        &client,
+        &base_url,
+        &ns,
+        json!([
+            {"id": "a", "values": [0.1, 0.0]},
+            {"id": "b", "values": [0.2, 0.0]}
+        ]),
+    )
+    .await;
+
+    let first = query(
+        &client,
+        &base_url,
+        &ns,
+        page_request(1, json!({"type": "none"})),
+    )
+    .await;
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("first page must issue a cursor");
+    let mut changed = page_request(1, json!({"type": "after", "token": cursor}));
+    changed["consistency"] = json!("eventual");
+    let response = client
+        .post(format!("{base_url}/v1/namespaces/{ns}/query"))
+        .json(&changed)
+        .send()
+        .await
+        .expect("changed-consistency cursor request must complete");
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "VALIDATION_ERROR");
+    assert!(body["error"]
+        .as_str()
+        .expect("cursor error message")
+        .contains("does not match query"));
 
     cleanup_ns(&harness.store, &ns).await;
     harness.cleanup().await;
@@ -521,12 +674,23 @@ async fn cursor_after_last_result_returns_empty_page() {
         page_request(1, json!({"type": "none"})),
     )
     .await;
-    let after_b = same_fingerprint_token_for_id(page1["next_cursor"].as_str().unwrap(), "b");
+    let cursor = page1["next_cursor"]
+        .as_str()
+        .expect("first page must return a server-authenticated cursor")
+        .to_string();
+    let deleted = client
+        .delete(format!("{base_url}/v1/namespaces/{ns}/vectors"))
+        .json(&json!({"ids": ["b"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 204);
+
     let empty = query(
         &client,
         &base_url,
         &ns,
-        page_request(1, json!({"type": "after", "token": after_b})),
+        page_request(1, json!({"type": "after", "token": cursor})),
     )
     .await;
 

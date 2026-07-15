@@ -47,8 +47,11 @@ pub const PHASE2_SCENARIOS: [&str; 14] = [
 /// Security Phase-1 scenarios measured and frozen after central auth lands.
 pub const SECURITY_PHASE1_SCENARIOS: [&str; 1] = ["secured_query"];
 
+/// Security Phase-4 scenarios measured after mandatory constraints land.
+pub const SECURITY_PHASE4_SCENARIOS: [&str; 1] = ["secured_filtered_query"];
+
 /// Complete Tier-1 catalog run by default and in gating CI.
-pub const ALL_SCENARIOS: [&str; 19] = [
+pub const ALL_SCENARIOS: [&str; 20] = [
     "warm_query_strong",
     "cold_query_strong",
     "upsert_single",
@@ -68,6 +71,7 @@ pub const ALL_SCENARIOS: [&str; 19] = [
     "hydration",
     "cold_query_sketch_adc",
     "secured_query",
+    "secured_filtered_query",
 ];
 
 /// Process-level runner configuration parsed from `ZEPPELIN_PERF_*`.
@@ -208,7 +212,16 @@ mod tests {
         let phase2_end = phase2_start + PHASE2_SCENARIOS.len();
         assert_eq!(&ALL_SCENARIOS[phase2_start..phase2_end], &PHASE2_SCENARIOS);
         assert_eq!(ALL_SCENARIOS[phase2_end], "cold_query_sketch_adc");
-        assert_eq!(&ALL_SCENARIOS[phase2_end + 1..], &SECURITY_PHASE1_SCENARIOS);
+        let phase1_security_start = phase2_end + 1;
+        let phase1_security_end = phase1_security_start + SECURITY_PHASE1_SCENARIOS.len();
+        assert_eq!(
+            &ALL_SCENARIOS[phase1_security_start..phase1_security_end],
+            &SECURITY_PHASE1_SCENARIOS
+        );
+        assert_eq!(
+            &ALL_SCENARIOS[phase1_security_end..],
+            &SECURITY_PHASE4_SCENARIOS
+        );
         assert!(
             ALL_SCENARIOS.contains(&"secured_query"),
             "the Phase 1 security gate requires a frozen secured_query scenario"
@@ -237,5 +250,34 @@ mod tests {
         assert_eq!(security.authn_authz_p50_delta_ns_max, 10_000);
         assert_eq!(security.added_get_ops, 0);
         assert_eq!(security.added_put_ops, 0);
+    }
+
+    #[test]
+    fn secured_filtered_query_contract_tracks_the_caller_filtered_baseline() {
+        let contract = contract::load_contract("secured_filtered_query").unwrap_or_else(|error| {
+            panic!("secured_filtered_query must have a valid checked-in contract: {error}")
+        });
+        let Some(security) = contract.assertions.security else {
+            panic!("secured_filtered_query must freeze security assertions");
+        };
+
+        assert_eq!(security.baseline_scenario, "filtered_query");
+        assert_eq!(
+            security.mandatory_filter,
+            Some(contract::FilterMeasure {
+                field: "cat".to_string(),
+                value: "c0".to_string(),
+            })
+        );
+        assert_eq!(security.query_p50_regression_percent_max, Some(5));
+        assert_eq!(security.added_get_ops, 0);
+        assert_eq!(security.added_put_ops, 0);
+        assert!(
+            matches!(
+                contract.run.measure,
+                contract::MeasureSpec::Query { filter: None, .. }
+            ),
+            "the secured scenario must supply its equivalent filter through policy"
+        );
     }
 }

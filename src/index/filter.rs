@@ -46,6 +46,23 @@ use std::collections::HashMap;
 
 use crate::types::{AttributeValue, Filter};
 
+/// Combines a server-owned mandatory filter with a caller-supplied filter.
+///
+/// Neither side is rewritten or simplified. When both filters exist, the
+/// policy filter remains the first child of an explicit conjunction so callers
+/// cannot replace, negate, or otherwise widen it. Supplying only one side
+/// preserves that filter exactly; supplying neither leaves filtering disabled.
+#[must_use]
+pub fn combine_filters(policy: Option<Filter>, caller: Option<Filter>) -> Option<Filter> {
+    match (policy, caller) {
+        (Some(policy), Some(caller)) => Some(Filter::And {
+            filters: vec![policy, caller],
+        }),
+        (Some(filter), None) | (None, Some(filter)) => Some(filter),
+        (None, None) => None,
+    }
+}
+
 /// Evaluates one recursive filter against one candidate's attributes.
 ///
 /// # Parameters

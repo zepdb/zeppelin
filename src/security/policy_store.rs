@@ -164,7 +164,7 @@ impl PolicyStore {
         candidate: PolicySnapshot,
         expected_head_etag: &str,
     ) -> Result<PolicyPublication> {
-        candidate.verify_checksum()?;
+        candidate.validate_for_use()?;
         let object_key = format!("{POLICY_ROOT}/policies/{}.json", Ulid::new());
         let snapshot_bytes = serde_json::to_vec(&candidate).map_err(|error| {
             SecurityError::InvalidPolicy(format!("policy snapshot encoding failed: {error}"))
@@ -229,7 +229,7 @@ impl PolicyStore {
             serde_json::from_slice(&snapshot_bytes).map_err(|error| {
                 SecurityError::InvalidPolicy(format!("policy snapshot JSON is invalid: {error}"))
             })?;
-        snapshot.verify_checksum()?;
+        snapshot.validate_for_use()?;
         if snapshot.version() != head.version() || snapshot.checksum() != head.checksum() {
             return Err(SecurityError::InvalidPolicy(
                 "policy head and snapshot identity disagree".to_string(),
@@ -262,6 +262,7 @@ impl PolicyStore {
             };
         }
         let snapshot = PolicySnapshot::from_bootstrap(config, now)?;
+        snapshot.validate_for_use()?;
         let object_key = format!("{POLICY_ROOT}/policies/{}.json", Ulid::new());
         let snapshot_bytes = serde_json::to_vec(&snapshot).map_err(|error| {
             SecurityError::InvalidPolicy(format!("policy snapshot encoding failed: {error}"))

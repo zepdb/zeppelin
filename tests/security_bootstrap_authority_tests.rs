@@ -17,6 +17,7 @@ use common::harness::TestHarness;
 const BOOTSTRAP_CONFIG: &str = r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_bootstrap"
@@ -96,7 +97,9 @@ async fn authoritative_policy_allows_enforced_restart_without_bootstrap_keys() {
         .await
         .expect("first boot must publish the authoritative policy");
 
-    let restart = Config::from_str("[security]\nmode = \"enforced\"\n")
+    let restart = Config::from_str(
+        "[security]\nmode = \"enforced\"\ncursor_hmac_key_hex = \"1111111111111111111111111111111111111111111111111111111111111111\"\n",
+    )
         .expect("S3 authority makes bootstrap credentials optional after first boot");
     let loaded = policy_store
         .load_or_bootstrap(&restart.security, boot_time)
@@ -115,7 +118,9 @@ async fn first_boot_rejects_missing_bootstrap_credentials() {
     let store = scoped_store(&harness);
     let policy_store = PolicyStore::new(store.clone());
     let boot_time = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
-    let empty = Config::from_str("[security]\nmode = \"enforced\"\n")
+    let empty = Config::from_str(
+        "[security]\nmode = \"enforced\"\ncursor_hmac_key_hex = \"1111111111111111111111111111111111111111111111111111111111111111\"\n",
+    )
         .expect("an empty recovery seam is syntactically valid");
 
     let error = policy_store
@@ -145,6 +150,7 @@ async fn first_boot_rejects_only_expired_bootstrap_credentials() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_expired"
@@ -201,6 +207,7 @@ async fn existing_policy_ignores_expired_drifted_config_and_warns_redacted() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_drifted"

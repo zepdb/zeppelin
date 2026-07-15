@@ -3418,11 +3418,18 @@ async fn run_gc_cycle_at_inner(
             Err(error) => return Err(error),
         },
     };
-    let mark_reachable = reachable_keys_with_retained_history_and_staging_keys(
+    let mut mark_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         &mark_manifest,
         &mark_staging.keys,
         &retained_history,
+    );
+    extend_scoped_artifact_roots(
+        namespace,
+        &mark_manifest,
+        &retained_history,
+        &listed_keys,
+        &mut mark_reachable,
     );
     let unknown_shape_skips = listed_keys
         .iter()
@@ -3649,17 +3656,24 @@ async fn run_gc_cycle_at_inner(
     };
     let sweep_retained_history =
         history_snapshot_reachable_keys(namespace, &sweep_history_snapshot);
-    let sweep_reachable = reachable_keys_with_retained_history_and_staging_keys(
+    let sweep_listed_keys = completed_inventory
+        .as_ref()
+        .map_or_else(|| listed_keys.clone(), NamespaceInventory::all_keys);
+    let mut sweep_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         &sweep_manifest,
         &sweep_staging.keys,
         &sweep_retained_history,
     );
+    extend_scoped_artifact_roots(
+        namespace,
+        &sweep_manifest,
+        &sweep_retained_history,
+        &sweep_listed_keys,
+        &mut sweep_reachable,
+    );
     let oldest_inflight_ms = oldest_inflight_ulid_ms(namespace, &sweep_staging.keys);
     let known_sizes = known_reclaimable_sizes(namespace, &sweep_manifest);
-    let sweep_listed_keys = completed_inventory
-        .as_ref()
-        .map_or_else(|| listed_keys.clone(), NamespaceInventory::all_keys);
 
     let mut retained_with_order = Vec::new();
     let mut deletable = Vec::new();
@@ -4106,13 +4120,48 @@ fn known_reclaimable_sizes(namespace: &str, manifest: &Manifest) -> BTreeMap<Str
     sizes
 }
 
+/// Extends exact manifest reachability with policy artifacts owned by a live segment.
+///
+/// Scoped ANN/BM25 artifacts are immutable derivatives whose descriptor cannot
+/// be listed in the manifest without turning each policy slice into authority.
+/// Their authority instead comes from the parent source segment: every listed
+/// known-shape scope key is protected while that source segment is live or PITR
+/// retained, and becomes ordinary GC input after the parent leaves all roots.
+fn extend_scoped_artifact_roots(
+    namespace: &str,
+    manifest: &Manifest,
+    retained_history: &BTreeSet<String>,
+    listed_keys: &BTreeSet<String>,
+    reachable: &mut BTreeSet<String>,
+) {
+    let mut parent_ids = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.id.clone())
+        .collect::<BTreeSet<_>>();
+    for key in retained_history {
+        if let Some((segment_id, path, _)) = parse_segment_key(namespace, key) {
+            if !path.contains('/') && is_known_segment_artifact_name(path) {
+                parent_ids.insert(segment_id.to_string());
+            }
+        }
+    }
+    for key in listed_keys {
+        let Some(parent_id) = scoped_artifact_parent_segment_id(namespace, key) else {
+            continue;
+        };
+        if parent_ids.contains(parent_id) {
+            reachable.insert(key.clone());
+        }
+    }
+}
+
 /// Parses only immutable artifact key shapes that GC is allowed to delete.
 ///
 /// Valid WAL keys are `<namespace>/wal/<ulid>.wal`. Valid segment keys live
-/// directly beneath `<namespace>/segments/seg_<ulid>/` and use the explicit
-/// metadata or numbered sidecar names recognized by
-/// `is_known_segment_artifact_name`. Extra path components, invalid ULIDs, and
-/// maintenance/control objects are rejected.
+/// directly beneath `<namespace>/segments/seg_<ulid>/` or in the explicit
+/// `security_scopes` derivative grammar. Invalid ULIDs, arbitrary nested paths,
+/// and maintenance/control objects are rejected.
 ///
 /// # Parameters
 ///
@@ -4147,19 +4196,87 @@ fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact>
             .map(|ulid| ParsedGcArtifact::WalFragment { ulid });
     }
 
-    let segment_prefix = format!("{namespace}/segments/");
-    let rest = key.strip_prefix(&segment_prefix)?;
-    let (segment_id, file_name) = rest.split_once('/')?;
-    if file_name.contains('/') {
-        return None;
-    }
-    let ulid_text = segment_id.strip_prefix("seg_")?;
-    let ulid = Ulid::from_string(ulid_text).ok()?;
-    if is_known_segment_artifact_name(file_name) {
+    let (_, path, ulid) = parse_segment_key(namespace, key)?;
+    if (!path.contains('/') && is_known_segment_artifact_name(path))
+        || is_known_scoped_artifact_path(path)
+    {
         Some(ParsedGcArtifact::SegmentArtifact { ulid })
     } else {
         None
     }
+}
+
+fn parse_segment_key<'a>(namespace: &str, key: &'a str) -> Option<(&'a str, &'a str, Ulid)> {
+    let segment_prefix = format!("{namespace}/segments/");
+    let rest = key.strip_prefix(&segment_prefix)?;
+    let (segment_id, path) = rest.split_once('/')?;
+    let ulid_text = segment_id.strip_prefix("seg_")?;
+    let ulid = Ulid::from_string(ulid_text).ok()?;
+    Some((segment_id, path, ulid))
+}
+
+fn scoped_artifact_parent_segment_id<'a>(namespace: &str, key: &'a str) -> Option<&'a str> {
+    let (segment_id, path, _) = parse_segment_key(namespace, key)?;
+    is_known_scoped_artifact_path(path).then_some(segment_id)
+}
+
+fn is_known_scoped_artifact_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("security_scopes/") else {
+        return false;
+    };
+    if let Some(digest) = rest
+        .strip_prefix("ann/")
+        .and_then(|name| name.strip_suffix(".json"))
+    {
+        return is_sha256_hex(digest);
+    }
+    if let Some(digest) = rest
+        .strip_prefix("fts/")
+        .and_then(|name| name.strip_suffix(".bin"))
+    {
+        return is_sha256_hex(digest);
+    }
+    let Some((artifact_id, file_name)) = rest
+        .strip_prefix("segments/")
+        .and_then(|nested| nested.split_once('/'))
+    else {
+        return false;
+    };
+    if file_name.contains('/') {
+        return false;
+    }
+    let Some(artifact_ulid) = artifact_id.strip_prefix("ann_") else {
+        return false;
+    };
+    if Ulid::from_string(artifact_ulid).is_err() {
+        return false;
+    }
+    is_known_segment_artifact_name(file_name) || is_known_tree_node_name(file_name)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_known_tree_node_name(file_name: &str) -> bool {
+    let Some(node_id) = file_name
+        .strip_prefix("node_")
+        .and_then(|name| name.strip_suffix(".bin"))
+    else {
+        return false;
+    };
+    if let Some(root_ulid) = node_id.strip_prefix("root_") {
+        return Ulid::from_string(root_ulid).is_ok();
+    }
+    let Some((depth, node_ulid)) = node_id
+        .strip_prefix("n_")
+        .and_then(|rest| rest.split_once('_'))
+    else {
+        return false;
+    };
+    !depth.is_empty()
+        && depth.bytes().all(|byte| byte.is_ascii_digit())
+        && Ulid::from_string(node_ulid).is_ok()
 }
 
 /// Checks the allowlist of immutable files permitted directly under a segment.
@@ -5245,6 +5362,76 @@ mod tests {
             assert!(
                 reachable.contains(&key),
                 "active lease staged key must be treated as reachable: {key}"
+            );
+        }
+    }
+
+    /// Scope artifacts published after compaction's prefix LIST remain owned by
+    /// their source segment and become collectable after that parent disappears.
+    #[test]
+    fn scoped_artifacts_follow_parent_segment_reachability() {
+        let source_id = format!("seg_{}", Ulid::from_parts(10_000, 7));
+        let artifact_id = format!("ann_{}", Ulid::from_parts(11_000, 8));
+        let digest = "ab".repeat(32);
+        let descriptor = format!("{NS}/segments/{source_id}/security_scopes/ann/{digest}.json");
+        let fts = format!("{NS}/segments/{source_id}/security_scopes/fts/{digest}.bin");
+        let cluster = format!(
+            "{NS}/segments/{source_id}/security_scopes/segments/{artifact_id}/cluster_0.bin"
+        );
+        let tree_node = format!(
+            "{NS}/segments/{source_id}/security_scopes/segments/{artifact_id}/node_root_{}.bin",
+            Ulid::from_parts(12_000, 9)
+        );
+        let listed = BTreeSet::from([
+            descriptor.clone(),
+            fts.clone(),
+            cluster.clone(),
+            tree_node.clone(),
+        ]);
+
+        for key in &listed {
+            assert!(
+                parse_gc_artifact_key(NS, key).is_some(),
+                "known scoped artifact must enter the GC grammar: {key}"
+            );
+        }
+
+        let mut live = Manifest::new();
+        live.segments.push(segment_ref(&source_id, 1));
+        let retained_history = BTreeSet::new();
+        let mut reachable = reachable_keys(NS, &live);
+        extend_scoped_artifact_roots(NS, &live, &retained_history, &listed, &mut reachable);
+        assert!(listed.is_subset(&reachable));
+
+        let removed = Manifest::new();
+        let mut unreachable = reachable_keys(NS, &removed);
+        extend_scoped_artifact_roots(NS, &removed, &retained_history, &listed, &mut unreachable);
+        assert!(listed.is_disjoint(&unreachable));
+        let candidates = mark_gc_candidates(
+            NS,
+            &listed,
+            &unreachable,
+            &[],
+            Utc::now(),
+            removed.version(),
+        );
+        assert_eq!(candidate_keys(&candidates), listed);
+    }
+
+    #[test]
+    fn scoped_gc_grammar_rejects_arbitrary_nested_keys() {
+        let source_id = format!("seg_{}", Ulid::from_parts(20_000, 1));
+        let artifact_id = format!("ann_{}", Ulid::from_parts(21_000, 2));
+        for key in [
+            format!("{NS}/segments/{source_id}/security_scopes/notes.txt"),
+            format!(
+                "{NS}/segments/{source_id}/security_scopes/segments/{artifact_id}/cluster_0.bin/extra"
+            ),
+            format!("{NS}/segments/{source_id}/security_scopes/ann/not-a-digest.json"),
+        ] {
+            assert!(
+                parse_gc_artifact_key(NS, &key).is_none(),
+                "unknown nested key must remain fail-closed: {key}"
             );
         }
     }

@@ -136,6 +136,7 @@ use tracing::{debug, instrument};
 use crate::cache::decoded_cache::DecodedArtifactCache;
 use crate::cache::manifest_cache::ManifestCache;
 use crate::cache::{with_cache_diagnostics, CacheDiagnostics, DiskCache};
+use crate::config::IndexingConfig;
 use crate::error::Result;
 use crate::fts::bm25::Bm25Params;
 use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
@@ -145,15 +146,34 @@ use crate::fts::wal_cache::WalFtsCache;
 use crate::fts::wal_scan::wal_bm25_scan;
 use crate::fts::FtsFieldConfig;
 use crate::index::distance::compute_distance;
-use crate::index::filter::evaluate_filter;
+use crate::index::filter::{combine_filters, evaluate_filter};
 use crate::index::topk::{partial_topk_by, TopK};
 use crate::index::HierarchicalIndex;
 use crate::index::IvfFlatIndex;
+use crate::retrieval_scope::{
+    scoped_ann_cache_key, scoped_fts_cache_key, segment_corpus_cache_key, ScopedAnnIndex,
+    ScopedFtsIndex, ScopedSegmentCorpus,
+};
 use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult};
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 use crate::wal::{FragmentCachePolicy, WalFragmentCache, WalReader};
+
+/// Compiles the policy-owned and caller-owned predicates for source execution.
+///
+/// The mandatory predicate is always conjoined with the caller predicate, so
+/// the caller can only narrow the policy-visible row set. Keeping composition
+/// at this domain query seam prevents an HTTP handler from accidentally
+/// mutating, exposing, or omitting the server-owned predicate while planning a
+/// particular source.
+#[must_use]
+pub fn compile_effective_filter(
+    mandatory_filter: Option<&Filter>,
+    caller_filter: Option<&Filter>,
+) -> Option<Filter> {
+    combine_filters(mandatory_filter.cloned(), caller_filter.cloned())
+}
 
 /// Carries one ranked query result set and the optional HTTP enrichments.
 ///
@@ -315,6 +335,11 @@ pub struct QueryExplainPlan {
     pub facets: Vec<String>,
     /// Projection details.
     pub projection: QueryExplainProjection,
+    /// Whether a server-owned mandatory filter constrained this execution.
+    ///
+    /// The predicate itself is deliberately never exposed because doing so can
+    /// reveal tenant or authorization topology.
+    pub policy_filter_applied: bool,
 }
 
 /// Identifies which request syntax and number of retrieval sources were used.
@@ -593,6 +618,14 @@ pub struct QueryParams<'a> {
     pub include_attributes: bool,
 }
 
+/// Mandatory-scope inputs required to derive a policy-local ANN artifact.
+#[derive(Clone, Copy)]
+pub(crate) struct ScopedAnnQuery<'a> {
+    pub(crate) mandatory_filter: &'a Filter,
+    pub(crate) indexing_config: &'a IndexingConfig,
+    pub(crate) decoded_artifact_cache: &'a Arc<DecodedArtifactCache>,
+}
+
 /// Orders ANN hits by distance ascending and then by ID ascending.
 ///
 /// # Parameters
@@ -786,10 +819,14 @@ fn query_underfill_reason(
 ///
 /// # Returns
 ///
-/// A cloned [`SegmentRef`] when `active_segment` names a retained descriptor;
-/// `None` when no active ID exists or the descriptor cannot be found. The
-/// current caller treats both cases as “no compacted segment” rather than
-/// reporting a malformed-manifest error.
+/// `Ok(Some)` with a cloned [`SegmentRef`] when `active_segment` names a retained
+/// descriptor, or `Ok(None)` when no active ID exists.
+///
+/// # Errors
+///
+/// Returns [`crate::error::ZeppelinError::Index`] when the active ID is present
+/// but its descriptor is absent. That malformed authoritative state must never
+/// be reinterpreted as an empty compacted view.
 ///
 /// # Consistency
 ///
@@ -806,14 +843,21 @@ fn query_underfill_reason(
 /// `as_ref`, `and_then`, and `find` borrow through nested optional state, then
 /// `cloned` creates an owned descriptor so async closures can share it without
 /// retaining an iterator borrow into the manifest.
-fn active_segment_ref(manifest: &Manifest) -> Option<SegmentRef> {
-    manifest.active_segment.as_ref().and_then(|segment_id| {
-        manifest
-            .segments
-            .iter()
-            .find(|segment| segment.id == *segment_id)
-            .cloned()
-    })
+fn active_segment_ref(manifest: &Manifest) -> Result<Option<SegmentRef>> {
+    let Some(segment_id) = manifest.active_segment.as_ref() else {
+        return Ok(None);
+    };
+    manifest
+        .segments
+        .iter()
+        .find(|segment| segment.id == *segment_id)
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| {
+            crate::error::ZeppelinError::Index(format!(
+                "active segment {segment_id} is missing from manifest segments"
+            ))
+        })
 }
 
 /// Decides whether suppression requires a wider second segment search.
@@ -1036,7 +1080,7 @@ pub async fn execute_query(params: QueryParams<'_>) -> Result<QueryResponse> {
         params.manifest_cache,
     )
     .await?;
-    execute_query_with_manifest_inner(params, manifest, None, false).await
+    execute_query_with_manifest_inner(params, manifest, None, None, false).await
 }
 
 /// Executes a vector query with a disposable decoded-WAL memo.
@@ -1056,7 +1100,7 @@ pub async fn execute_query_with_fragment_cache(
         params.manifest_cache,
     )
     .await?;
-    execute_query_with_manifest_inner(params, manifest, Some(fragment_cache), false).await
+    execute_query_with_manifest_inner(params, manifest, Some(fragment_cache), None, false).await
 }
 
 /// Executes a vector query against an already-selected manifest snapshot.
@@ -1095,8 +1139,9 @@ pub(crate) async fn execute_query_with_manifest(
     params: QueryParams<'_>,
     manifest: Manifest,
     fragment_cache: Option<&Arc<WalFragmentCache>>,
+    scoped_ann: Option<ScopedAnnQuery<'_>>,
 ) -> Result<QueryResponse> {
-    execute_query_with_manifest_inner(params, manifest, fragment_cache, false).await
+    execute_query_with_manifest_inner(params, manifest, fragment_cache, scoped_ann, false).await
 }
 
 /// Executes a supplied-snapshot vector query while collecting scoped diagnostics.
@@ -1128,8 +1173,9 @@ pub(crate) async fn execute_query_with_manifest_debug(
     params: QueryParams<'_>,
     manifest: Manifest,
     fragment_cache: Option<&Arc<WalFragmentCache>>,
+    scoped_ann: Option<ScopedAnnQuery<'_>>,
 ) -> Result<QueryResponse> {
-    execute_query_with_manifest_inner(params, manifest, fragment_cache, true).await
+    execute_query_with_manifest_inner(params, manifest, fragment_cache, scoped_ann, true).await
 }
 
 /// Selects normal or diagnostic vector execution for one supplied snapshot.
@@ -1168,17 +1214,24 @@ async fn execute_query_with_manifest_inner(
     params: QueryParams<'_>,
     manifest: Manifest,
     fragment_cache: Option<&Arc<WalFragmentCache>>,
+    scoped_ann: Option<ScopedAnnQuery<'_>>,
     emit_debug: bool,
 ) -> Result<QueryResponse> {
     if emit_debug {
         let diagnostics = Arc::new(CacheDiagnostics::default());
         return with_cache_diagnostics(Arc::clone(&diagnostics), async move {
-            execute_query_with_manifest_scoped(params, manifest, fragment_cache, Some(diagnostics))
-                .await
+            execute_query_with_manifest_scoped(
+                params,
+                manifest,
+                fragment_cache,
+                scoped_ann,
+                Some(diagnostics),
+            )
+            .await
         })
         .await;
     }
-    execute_query_with_manifest_scoped(params, manifest, fragment_cache, None).await
+    execute_query_with_manifest_scoped(params, manifest, fragment_cache, scoped_ann, None).await
 }
 
 /// Runs all vector-query phases against one immutable manifest view.
@@ -1263,6 +1316,7 @@ async fn execute_query_with_manifest_scoped(
     params: QueryParams<'_>,
     manifest: Manifest,
     fragment_cache: Option<&Arc<WalFragmentCache>>,
+    scoped_ann: Option<ScopedAnnQuery<'_>>,
     cache_diagnostics: Option<Arc<CacheDiagnostics>>,
 ) -> Result<QueryResponse> {
     let QueryParams {
@@ -1292,7 +1346,7 @@ async fn execute_query_with_manifest_scoped(
     }
     let eventual_skipped_wal =
         consistency == ConsistencyLevel::Eventual && !manifest.uncompacted_fragments().is_empty();
-    let segment_ref = active_segment_ref(&manifest);
+    let segment_ref = active_segment_ref(&manifest)?;
 
     // WAL work and segment search are independent — they share only the
     // manifest snapshot — so run them concurrently. Strong scans and scores
@@ -1352,8 +1406,7 @@ async fn execute_query_with_manifest_scoped(
     let segment_future = async {
         let segment_start = std::time::Instant::now();
         let (results, scanned, clusters_probed) = if let Some(seg_ref) = segment_ref.as_ref() {
-            let clusters_probed = nprobe.min(seg_ref.cluster_count);
-            let results = segment_search(
+            let output = segment_search(
                 store,
                 namespace,
                 seg_ref,
@@ -1366,9 +1419,10 @@ async fn execute_query_with_manifest_scoped(
                 rerank_coalesce_gap_bytes,
                 cache,
                 include_attributes,
+                scoped_ann,
             )
             .await?;
-            (results, 1, clusters_probed)
+            (output.results, 1, output.clusters_probed)
         } else {
             (Vec::new(), 0, 0)
         };
@@ -1416,8 +1470,10 @@ async fn execute_query_with_manifest_scoped(
                 rerank_coalesce_gap_bytes,
                 cache,
                 include_attributes,
+                scoped_ann,
             )
-            .await?;
+            .await?
+            .results;
             let segment_retry_ms = segment_retry_start.elapsed().as_millis() as u64;
             segment_ms += segment_retry_ms;
             debug!(
@@ -1812,6 +1868,12 @@ async fn wal_scan(
 /// borrowed across async search. Rust prevents another alias from mutating that
 /// metadata during the await, unlike an unsynchronized Java object or C struct.
 #[allow(clippy::too_many_arguments)]
+struct SegmentSearchOutput {
+    results: Vec<SearchResult>,
+    clusters_probed: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn segment_search(
     store: &ZeppelinStore,
     namespace: &str,
@@ -1825,7 +1887,27 @@ async fn segment_search(
     rerank_coalesce_gap_bytes: usize,
     cache: Option<&Arc<DiskCache>>,
     include_attributes: bool,
-) -> Result<Vec<SearchResult>> {
+    scoped_ann: Option<ScopedAnnQuery<'_>>,
+) -> Result<SegmentSearchOutput> {
+    if let Some(scoped_ann) = scoped_ann {
+        return scoped_segment_search(
+            store,
+            namespace,
+            segment_ref,
+            query,
+            top_k,
+            nprobe,
+            filter,
+            distance_metric,
+            oversample_factor,
+            rerank_coalesce_gap_bytes,
+            cache,
+            include_attributes,
+            scoped_ann,
+        )
+        .await;
+    }
+
     let segment_id = &segment_ref.id;
 
     // Use manifest metadata to determine index type — no S3 probe needed.
@@ -1846,7 +1928,10 @@ async fn segment_search(
             include_attributes,
         )
         .await?;
-        return Ok(results);
+        return Ok(SegmentSearchOutput {
+            results,
+            clusters_probed: nprobe.min(segment_ref.cluster_count),
+        });
     }
 
     // Use manifest metadata to skip cluster-count probing and quant detection.
@@ -1880,7 +1965,85 @@ async fn segment_search(
     )
     .await?;
 
-    Ok(results)
+    Ok(SegmentSearchOutput {
+        results,
+        clusters_probed: nprobe.min(segment_ref.cluster_count),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scoped_segment_search(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_ref: &SegmentRef,
+    query: &[f32],
+    top_k: usize,
+    nprobe: usize,
+    filter: Option<&Filter>,
+    distance_metric: DistanceMetric,
+    oversample_factor: usize,
+    rerank_coalesce_gap_bytes: usize,
+    cache: Option<&Arc<DiskCache>>,
+    include_attributes: bool,
+    scoped_ann: ScopedAnnQuery<'_>,
+) -> Result<SegmentSearchOutput> {
+    let corpus_key = segment_corpus_cache_key(namespace, segment_ref)?;
+    let ann_key = scoped_ann_cache_key(
+        namespace,
+        segment_ref,
+        scoped_ann.mandatory_filter,
+        scoped_ann.indexing_config,
+    )?;
+    let index = scoped_ann
+        .decoded_artifact_cache
+        .get_or_build_scoped_ann(&ann_key, || async {
+            ScopedAnnIndex::load_or_build(
+                crate::retrieval_scope::ScopedAnnBuildRequest {
+                    store,
+                    namespace,
+                    source_segment_id: &segment_ref.id,
+                    scope_cache_key: &ann_key,
+                    mandatory_filter: scoped_ann.mandatory_filter,
+                    config: scoped_ann.indexing_config,
+                    cache,
+                },
+                || async {
+                    scoped_ann
+                        .decoded_artifact_cache
+                        .get_or_build_segment_corpus(&corpus_key, || async {
+                            materialize_scoped_segment_corpus(
+                                store,
+                                namespace,
+                                segment_ref,
+                                query.len(),
+                                cache,
+                            )
+                            .await
+                        })
+                        .await
+                },
+            )
+            .await
+        })
+        .await?;
+    let result = index
+        .search(
+            query,
+            top_k,
+            nprobe,
+            filter,
+            distance_metric,
+            store,
+            cache,
+            oversample_factor,
+            rerank_coalesce_gap_bytes,
+            include_attributes,
+        )
+        .await?;
+    Ok(SegmentSearchOutput {
+        results: result.results,
+        clusters_probed: result.clusters_probed,
+    })
 }
 
 /// Executes one BM25/ranking-expression query against the current manifest.
@@ -2020,6 +2183,7 @@ pub async fn execute_bm25_query(
         fts_configs,
         top_k,
         filter,
+        None,
         consistency,
         last_as_prefix,
         fts_cache,
@@ -2049,7 +2213,8 @@ pub async fn execute_bm25_query(
 /// - `rank_by`: Validated lexical ranking expression.
 /// - `fts_configs`: Per-field tokenizer/BM25 configuration.
 /// - `top_k`: Maximum returned hits.
-/// - `filter`: Optional metadata predicate.
+/// - `filter`: Effective policy-and-caller candidate predicate.
+/// - `mandatory_filter`: Server-owned scope whose rows define BM25 corpus statistics.
 /// - `consistency`: WAL inclusion policy applied within the supplied snapshot.
 /// - `last_as_prefix`: Whether the final query token is a prefix.
 /// - `fts_cache`: Optional shared WAL lexical cache.
@@ -2084,6 +2249,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     top_k: usize,
     filter: Option<&Filter>,
+    mandatory_filter: Option<&Filter>,
     consistency: ConsistencyLevel,
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
@@ -2103,6 +2269,7 @@ pub(crate) async fn execute_bm25_query_with_manifest(
         fts_configs,
         top_k,
         filter,
+        mandatory_filter,
         consistency,
         last_as_prefix,
         fts_cache,
@@ -2154,6 +2321,7 @@ pub(crate) async fn execute_bm25_query_with_manifest_debug(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     top_k: usize,
     filter: Option<&Filter>,
+    mandatory_filter: Option<&Filter>,
     consistency: ConsistencyLevel,
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
@@ -2173,6 +2341,7 @@ pub(crate) async fn execute_bm25_query_with_manifest_debug(
         fts_configs,
         top_k,
         filter,
+        mandatory_filter,
         consistency,
         last_as_prefix,
         fts_cache,
@@ -2218,6 +2387,7 @@ async fn execute_bm25_query_with_manifest_inner(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     top_k: usize,
     filter: Option<&Filter>,
+    mandatory_filter: Option<&Filter>,
     consistency: ConsistencyLevel,
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
@@ -2241,6 +2411,7 @@ async fn execute_bm25_query_with_manifest_inner(
                 fts_configs,
                 top_k,
                 filter,
+                mandatory_filter,
                 consistency,
                 last_as_prefix,
                 fts_cache,
@@ -2265,6 +2436,7 @@ async fn execute_bm25_query_with_manifest_inner(
         fts_configs,
         top_k,
         filter,
+        mandatory_filter,
         consistency,
         last_as_prefix,
         fts_cache,
@@ -2314,9 +2486,9 @@ async fn execute_bm25_query_with_manifest_inner(
 ///
 /// Strong WAL replay yields both candidates and complete live override/delete
 /// sets. Eventual mode reads only deletes. Both branches use one manifest; an
-/// active segment is resolved from that value, never from object listing. As on
-/// the ANN path, an active ID with no matching retained descriptor is currently
-/// treated as no segment rather than a manifest error.
+/// active segment is resolved from that value, never from object listing. An
+/// active ID with no matching retained descriptor fails as malformed
+/// authoritative state.
 ///
 /// # Performance
 ///
@@ -2346,6 +2518,7 @@ async fn execute_bm25_query_with_manifest_scoped(
     fts_configs: &HashMap<String, FtsFieldConfig>,
     top_k: usize,
     filter: Option<&Filter>,
+    mandatory_filter: Option<&Filter>,
     consistency: ConsistencyLevel,
     last_as_prefix: bool,
     fts_cache: Option<&Arc<WalFtsCache>>,
@@ -2373,6 +2546,39 @@ async fn execute_bm25_query_with_manifest_scoped(
     }
     if let Some(cache) = fragment_cache {
         cache.evict_compacted(namespace, &active_ids);
+    }
+
+    // A row-scoped query must resolve the complete WAL visibility state before
+    // segment corpus statistics are computed. In particular, a latest WAL
+    // upsert that moves an ID outside the filter still suppresses the stale
+    // segment row before document counts and frequencies are derived. Keep the
+    // historical concurrent path byte-for-byte for unfiltered queries.
+    if let Some(mandatory_filter) = mandatory_filter {
+        let candidate_filter = filter.ok_or_else(|| {
+            crate::error::ZeppelinError::Index(
+                "policy-scoped BM25 execution is missing its compiled effective filter".into(),
+            )
+        })?;
+        return execute_filtered_bm25_query_with_manifest(
+            store,
+            wal_reader,
+            namespace,
+            rank_by,
+            fts_configs,
+            top_k,
+            mandatory_filter,
+            candidate_filter,
+            consistency,
+            last_as_prefix,
+            fragment_cache,
+            decoded_artifact_cache,
+            cache,
+            include_attributes,
+            &manifest,
+            cache_diagnostics,
+            eventual_skipped_wal,
+        )
+        .await;
     }
 
     // WAL BM25 work and segment BM25 search are independent — run them
@@ -2442,13 +2648,7 @@ async fn execute_bm25_query_with_manifest_scoped(
 
     let segment_future = async {
         let segment_start = std::time::Instant::now();
-        let segment_ref = manifest.active_segment.as_ref().and_then(|segment_id| {
-            manifest
-                .segments
-                .iter()
-                .find(|s| s.id == *segment_id)
-                .cloned()
-        });
+        let segment_ref = active_segment_ref(&manifest)?;
         let (results, scanned, clusters_probed) = match segment_ref {
             Some(seg_ref) => {
                 let clusters_probed = if seg_ref.has_global_fts {
@@ -2546,6 +2746,264 @@ async fn execute_bm25_query_with_manifest_scoped(
         facets: None,
         explain: None,
     })
+}
+
+/// Executes BM25 through a snapshot-bound policy-corpus artifact.
+///
+/// A bounded decoded-artifact cache retains the derived index by manifest,
+/// consistency mode, mandatory filter, and FTS configuration. Cache misses
+/// rebuild from the exact manifest-selected segment/WAL snapshot; caller
+/// filters narrow scored candidates but never alter policy-corpus statistics.
+#[allow(clippy::too_many_arguments)]
+async fn execute_filtered_bm25_query_with_manifest(
+    store: &ZeppelinStore,
+    wal_reader: &WalReader,
+    namespace: &str,
+    rank_by: &RankBy,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    top_k: usize,
+    mandatory_filter: &Filter,
+    candidate_filter: &Filter,
+    consistency: ConsistencyLevel,
+    last_as_prefix: bool,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
+    decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
+    cache: Option<&Arc<DiskCache>>,
+    include_attributes: bool,
+    manifest: &Manifest,
+    cache_diagnostics: Option<Arc<CacheDiagnostics>>,
+    eventual_skipped_wal: bool,
+) -> Result<QueryResponse> {
+    let segment_ref = active_segment_ref(manifest)?;
+    let scanned_segments = usize::from(segment_ref.is_some());
+    let clusters_probed = segment_ref
+        .as_ref()
+        .map_or(0, |segment| segment.cluster_count);
+    let scanned_fragments = if consistency == ConsistencyLevel::Strong {
+        manifest.uncompacted_fragments().len()
+    } else {
+        0
+    };
+    let artifact_start = std::time::Instant::now();
+    let artifact_key = scoped_fts_cache_key(
+        namespace,
+        manifest,
+        consistency,
+        mandatory_filter,
+        fts_configs,
+    )?;
+    let durable_source_segment_id = manifest
+        .uncompacted_fragments()
+        .is_empty()
+        .then(|| segment_ref.as_ref().map(|segment| segment.id.as_str()))
+        .flatten();
+    let index = match decoded_artifact_cache {
+        Some(decoded_artifact_cache) => {
+            decoded_artifact_cache
+                .get_or_build_scoped_fts(&artifact_key, || async {
+                    ScopedFtsIndex::load_or_build(
+                        store,
+                        namespace,
+                        durable_source_segment_id,
+                        &artifact_key,
+                        cache,
+                        || async {
+                            build_scoped_fts_snapshot(
+                                store,
+                                wal_reader,
+                                namespace,
+                                fts_configs,
+                                mandatory_filter,
+                                consistency,
+                                fragment_cache,
+                                Some(decoded_artifact_cache),
+                                cache,
+                                manifest,
+                            )
+                            .await
+                        },
+                    )
+                    .await
+                })
+                .await?
+        }
+        None => Arc::new(
+            ScopedFtsIndex::load_or_build(
+                store,
+                namespace,
+                durable_source_segment_id,
+                &artifact_key,
+                cache,
+                || async {
+                    build_scoped_fts_snapshot(
+                        store,
+                        wal_reader,
+                        namespace,
+                        fts_configs,
+                        mandatory_filter,
+                        consistency,
+                        fragment_cache,
+                        None,
+                        cache,
+                        manifest,
+                    )
+                    .await
+                },
+            )
+            .await?,
+        ),
+    };
+    let segment_ms = artifact_start.elapsed().as_millis() as u64;
+    let wal_ms = 0;
+    let merge_start = std::time::Instant::now();
+    let results = index.search(
+        rank_by,
+        fts_configs,
+        candidate_filter,
+        last_as_prefix,
+        top_k,
+        include_attributes,
+    )?;
+    let merge_ms = merge_start.elapsed().as_millis() as u64;
+    let debug = cache_diagnostics.map(|diagnostics| {
+        let cache_snapshot = diagnostics.snapshot();
+        QueryDebug {
+            wal_ms,
+            segment_ms,
+            merge_ms,
+            fragments_scanned: scanned_fragments,
+            segments_scanned: scanned_segments,
+            clusters_probed,
+            cache: QueryDebugCache {
+                hits: cache_snapshot.hits,
+                misses: cache_snapshot.misses,
+            },
+            consistency_effective: consistency,
+            underfill_reason: query_underfill_reason(
+                results.len(),
+                top_k,
+                consistency,
+                eventual_skipped_wal,
+                scanned_fragments,
+                scanned_segments,
+            ),
+        }
+    });
+
+    Ok(QueryResponse {
+        results,
+        scanned_fragments,
+        scanned_segments,
+        debug,
+        next_cursor: None,
+        groups: None,
+        facets: None,
+        explain: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_scoped_fts_snapshot(
+    store: &ZeppelinStore,
+    wal_reader: &WalReader,
+    namespace: &str,
+    fts_configs: &HashMap<String, FtsFieldConfig>,
+    mandatory_filter: &Filter,
+    consistency: ConsistencyLevel,
+    fragment_cache: Option<&Arc<WalFragmentCache>>,
+    decoded_artifact_cache: Option<&Arc<DecodedArtifactCache>>,
+    cache: Option<&Arc<DiskCache>>,
+    manifest: &Manifest,
+) -> Result<ScopedFtsIndex> {
+    let segment_ref = active_segment_ref(manifest)?;
+    let mut dimensions = 0;
+    let base_corpus = if let Some(segment_ref) = segment_ref.as_ref() {
+        let corpus = match decoded_artifact_cache {
+            Some(decoded_artifact_cache) => {
+                let corpus_key = segment_corpus_cache_key(namespace, segment_ref)?;
+                decoded_artifact_cache
+                    .get_or_build_segment_corpus(&corpus_key, || async {
+                        materialize_scoped_segment_corpus(store, namespace, segment_ref, 0, cache)
+                            .await
+                    })
+                    .await?
+            }
+            None => Arc::new(
+                materialize_scoped_segment_corpus(store, namespace, segment_ref, 0, cache).await?,
+            ),
+        };
+        dimensions = corpus.dimensions();
+        Some(corpus)
+    } else {
+        None
+    };
+
+    let mut strong_fragments = Vec::new();
+    let mut eventual_deleted_ids = HashSet::new();
+    match consistency {
+        ConsistencyLevel::Strong if !manifest.uncompacted_fragments().is_empty() => {
+            let refs = manifest.uncompacted_fragments().to_vec();
+            strong_fragments = wal_reader
+                .read_query_fragments_from_refs_unchecked(
+                    namespace,
+                    &refs,
+                    cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
+                    fragment_cache,
+                )
+                .await?;
+        }
+        ConsistencyLevel::Eventual if !manifest.uncompacted_fragments().is_empty() => {
+            eventual_deleted_ids = wal_reader
+                .read_delete_ids_from_refs_unchecked(
+                    namespace,
+                    manifest.uncompacted_fragments(),
+                    cache.map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite),
+                    fragment_cache,
+                )
+                .await?;
+        }
+        _ => {}
+    }
+
+    let mandatory_filter = mandatory_filter.clone();
+    let fts_configs = fts_configs.clone();
+    tokio::task::spawn_blocking(move || {
+        let base_len = base_corpus.as_ref().map_or(0, |corpus| corpus.rows().len());
+        let mut logical_rows: HashMap<String, crate::types::VectorEntry> =
+            HashMap::with_capacity(base_len);
+        if let Some(corpus) = base_corpus {
+            logical_rows.extend(
+                corpus
+                    .rows()
+                    .iter()
+                    .cloned()
+                    .map(|row| (row.id.clone(), row)),
+            );
+        }
+        for fragment in strong_fragments {
+            for deleted_id in &fragment.deletes {
+                logical_rows.remove(deleted_id);
+            }
+            for vector in &fragment.vectors {
+                logical_rows.insert(vector.id.clone(), vector.clone());
+            }
+        }
+        for deleted_id in eventual_deleted_ids {
+            logical_rows.remove(&deleted_id);
+        }
+        let corpus = ScopedSegmentCorpus::new(logical_rows.into_values().collect(), dimensions)?;
+        Ok(ScopedFtsIndex::build(
+            &corpus,
+            &mandatory_filter,
+            &fts_configs,
+        ))
+    })
+    .await
+    .map_err(|error| {
+        crate::error::ZeppelinError::from(crate::retrieval_scope::RetrievalScopeError::Worker(
+            error.to_string(),
+        ))
+    })?
 }
 
 /// Fetches one immutable query artifact through the optional disk cache.
@@ -3047,17 +3505,17 @@ async fn segment_bm25_search_global(
             continue;
         }
 
-        let (attrs, ids) = match cluster_data.get(&cluster_idx) {
+        let (attrs, cluster) = match cluster_data.get(&cluster_idx) {
             Some(data) => data,
             None => continue,
         };
 
         let pos = position as usize;
-        if pos >= ids.len() {
+        if pos >= cluster.ids.len() {
             continue;
         }
 
-        let id = ids[pos].clone();
+        let id = cluster.ids[pos].clone();
         let attr = attrs
             .as_ref()
             .and_then(|cluster_attrs| cluster_attrs.get(pos))
@@ -3098,6 +3556,28 @@ async fn segment_bm25_search_global(
     partial_topk_by(&mut results, top_k, bm25_result_cmp);
 
     Ok(results)
+}
+
+/// Rows needed to prove exact policy-visible membership for a segment scorer.
+type Bm25ClusterRows = HashMap<
+    u16,
+    (
+        Option<Vec<Option<HashMap<String, AttributeValue>>>>,
+        crate::index::ivf_flat::build::ClusterData,
+    ),
+>;
+
+/// Converts the manifest's complete cluster range into global-index addresses.
+fn all_bm25_cluster_addresses(segment_ref: &SegmentRef) -> Result<HashSet<u16>> {
+    (0..segment_ref.cluster_count)
+        .map(|cluster_idx| {
+            u16::try_from(cluster_idx).map_err(|_| {
+                crate::error::ZeppelinError::Index(format!(
+                    "BM25 cluster index does not fit global address space: {cluster_idx}"
+                ))
+            })
+        })
+        .collect()
 }
 
 #[allow(clippy::type_complexity)]
@@ -3181,15 +3661,7 @@ async fn fetch_bm25_cluster_attrs_and_ids(
     needed_clusters: &HashSet<u16>,
     load_attrs: bool,
     cache: Option<&Arc<DiskCache>>,
-) -> Result<
-    HashMap<
-        u16,
-        (
-            Option<Vec<Option<HashMap<String, AttributeValue>>>>,
-            Vec<String>,
-        ),
-    >,
-> {
+) -> Result<Bm25ClusterRows> {
     use crate::index::ivf_flat::build::{
         attrs_key, cluster_key, cluster_object_sections, deserialize_attrs, deserialize_cluster,
         deserialize_cluster_from_object,
@@ -3230,7 +3702,7 @@ async fn fetch_bm25_cluster_attrs_and_ids(
                 Ok(data) => deserialize_cluster(&data)?,
                 Err(e) => return Err(e),
             };
-            cluster_data.insert(cluster_idx, (attrs, cluster.ids));
+            cluster_data.insert(cluster_idx, (attrs, cluster));
         }
         return Ok(cluster_data);
     }
@@ -3290,7 +3762,7 @@ async fn fetch_bm25_cluster_attrs_and_ids(
                     None
                 };
                 let cluster = deserialize_cluster_from_object(&object_data, cluster_idx as usize)?;
-                cluster_data.insert(cluster_idx, (attrs, cluster.ids));
+                cluster_data.insert(cluster_idx, (attrs, cluster));
             }
         } else {
             if clusters.len() != 1 {
@@ -3310,11 +3782,80 @@ async fn fetch_bm25_cluster_attrs_and_ids(
                 None
             };
             let cluster = deserialize_cluster(&object_data)?;
-            cluster_data.insert(cluster_idx, (attrs, cluster.ids));
+            cluster_data.insert(cluster_idx, (attrs, cluster));
         }
     }
 
     Ok(cluster_data)
+}
+
+/// Decodes every logical row from one manifest-selected immutable segment.
+async fn materialize_scoped_segment_corpus(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_ref: &SegmentRef,
+    dimensions: usize,
+    cache: Option<&Arc<DiskCache>>,
+) -> Result<ScopedSegmentCorpus> {
+    let all_clusters = all_bm25_cluster_addresses(segment_ref)?;
+    let cluster_rows =
+        fetch_bm25_cluster_attrs_and_ids(store, namespace, segment_ref, &all_clusters, true, cache)
+            .await?;
+    let expected_vectors = segment_ref.vector_count;
+    tokio::task::spawn_blocking(move || {
+        assemble_scoped_segment_corpus(cluster_rows, expected_vectors, dimensions)
+    })
+    .await
+    .map_err(|error| {
+        crate::error::ZeppelinError::from(crate::retrieval_scope::RetrievalScopeError::Worker(
+            error.to_string(),
+        ))
+    })?
+}
+
+fn assemble_scoped_segment_corpus(
+    cluster_rows: Bm25ClusterRows,
+    expected_vectors: usize,
+    dimensions: usize,
+) -> Result<ScopedSegmentCorpus> {
+    let mut clusters: Vec<_> = cluster_rows.into_iter().collect();
+    clusters.sort_unstable_by_key(|(cluster_idx, _)| *cluster_idx);
+    let mut rows = Vec::with_capacity(expected_vectors);
+    for (cluster_idx, (attributes, cluster)) in clusters {
+        let attributes = attributes.ok_or_else(|| {
+            crate::error::ZeppelinError::Index(format!(
+                "scoped corpus cluster {cluster_idx} was loaded without attributes"
+            ))
+        })?;
+        if cluster.ids.len() != cluster.vectors.len() || cluster.ids.len() != attributes.len() {
+            return Err(crate::error::ZeppelinError::Index(format!(
+                "scoped corpus cluster {cluster_idx} row alignment mismatch: ids={}, vectors={}, attributes={}",
+                cluster.ids.len(),
+                cluster.vectors.len(),
+                attributes.len()
+            )));
+        }
+        rows.extend(
+            cluster
+                .ids
+                .into_iter()
+                .zip(cluster.vectors)
+                .zip(attributes)
+                .map(|((id, values), attributes)| crate::types::VectorEntry {
+                    id,
+                    values,
+                    attributes,
+                }),
+        );
+    }
+    if rows.len() != expected_vectors {
+        return Err(crate::error::ZeppelinError::Index(format!(
+            "scoped corpus materialized {} rows but manifest declares {}",
+            rows.len(),
+            expected_vectors
+        )));
+    }
+    ScopedSegmentCorpus::new(rows, dimensions)
 }
 
 /// Searches every legacy per-cluster inverted index when no global index exists.

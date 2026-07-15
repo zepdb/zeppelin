@@ -267,6 +267,22 @@
       "response": "batch_query.resp.json"
     },
     {
+      "name": "error_constraint_violation_403",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 403,
+      "request": "error_constraint_violation_403.req.json",
+      "response": "error_constraint_violation_403.resp.json"
+    },
+    {
+      "name": "error_cursor_policy_stale_400",
+      "method": "POST",
+      "path": "/v1/namespaces/contract-main/query",
+      "status": 400,
+      "request": "error_cursor_policy_stale_400.req.json",
+      "response": "error_cursor_policy_stale_400.resp.json"
+    },
+    {
       "name": "delete_vectors",
       "method": "DELETE",
       "path": "/v1/namespaces/contract-main/vectors",

@@ -32,7 +32,7 @@ use zeppelin::storage::ZeppelinStore;
 
 use super::contract::{
     capture_contract, check_contract, load_contract, ContractSpec, CostViolation, DepthMode,
-    SecurityAssertionSpec,
+    FilterMeasure, SecurityAssertionSpec,
 };
 use super::dataset::{generate, DatasetExpectations, DatasetSpec, GenVector, GeneratedDataset};
 use super::depth::{depth_store, CriticalPath, DepthTracker, OpSpan, SpanKind};
@@ -44,6 +44,8 @@ const SETUP_BATCH_SIZE: usize = 256;
 const COMPACTION_ATTEMPTS: usize = 4;
 const STABILITY_REPEATS: usize = 100;
 const MSGPACK_POSITIVE_FIXINT_MAX: u64 = 127;
+const PAIRED_QUERY_SAMPLES: usize = 21;
+const PAIRED_QUERY_WARMUP_PAIRS: usize = 2;
 
 /// Real wall time normalized to a stable six-digit RFC3339 fraction.
 ///
@@ -336,6 +338,27 @@ struct WorldState {
     eventual_wal_keys: Vec<String>,
     repeat_cache_keys: Vec<String>,
     measure_offset: usize,
+}
+
+struct QueryPrincipal {
+    bearer: String,
+    principal_id: String,
+    principal_kind: Value,
+    grant: Value,
+}
+
+struct PairedQueryPrincipals {
+    caller_filtered: QueryPrincipal,
+    policy_filtered: QueryPrincipal,
+}
+
+struct PairedQueryWorld<'a> {
+    server: &'a FullTestServer,
+    namespace: &'a str,
+    generated: &'a GeneratedDataset,
+    world: &'a WorldState,
+    counter: &'a GetCounter,
+    tracker: &'a DepthTracker,
 }
 
 /// Run and check the complete checked-in catalog (or an env-selected subset).
@@ -713,6 +736,27 @@ async fn run_scenario_inner(
         NamespaceCleanupGuard::new(instrumented_store.clone(), namespace.clone());
     create_namespace(&client, &setup_server, &namespace, spec).await;
     let mut world = setup_world(&client, &setup_server, &namespace, &generated, spec).await;
+    let paired_query_principals = create_paired_query_principals(
+        &client,
+        &setup_server,
+        &namespace,
+        spec.security_assertion
+            .as_ref()
+            .and_then(|security| security.mandatory_filter.as_ref()),
+    )
+    .await;
+    let operation_bearer = paired_query_principals
+        .as_ref()
+        .map_or(setup_server.admin_bearer.as_str(), |principals| {
+            principals.policy_filtered.bearer.as_str()
+        });
+    let operation_client = crate::common::server::client_with_bearer(operation_bearer);
+    let caller_filtered_bearer = paired_query_principals
+        .as_ref()
+        .map_or(setup_server.admin_bearer.as_str(), |principals| {
+            principals.caller_filtered.bearer.as_str()
+        });
+    let caller_filtered_client = crate::common::server::client_with_bearer(caller_filtered_bearer);
 
     let mut cold_server = None;
     match &spec.cache_state {
@@ -742,7 +786,7 @@ async fn run_scenario_inner(
                 match step {
                     Step::Measure => {
                         execute_measure_operation(
-                            &client,
+                            &operation_client,
                             &setup_server,
                             &namespace,
                             &generated,
@@ -833,8 +877,12 @@ async fn run_scenario_inner(
             .as_ref()
             .or(cold_server.as_ref())
             .unwrap_or(&setup_server);
-        let measured_client =
-            crate::common::server::client_with_bearer(&measured_server.admin_bearer);
+        let measured_bearer = paired_query_principals
+            .as_ref()
+            .map_or(measured_server.admin_bearer.as_str(), |principals| {
+                principals.policy_filtered.bearer.as_str()
+            });
+        let measured_client = crate::common::server::client_with_bearer(measured_bearer);
         let measured_namespace = measured_namespaces.get(repeat).unwrap_or(&namespace);
         if !world.eventual_wal_keys.is_empty() {
             // This frozen scenario explicitly invalidates the immutable WAL
@@ -901,24 +949,63 @@ async fn run_scenario_inner(
     }
 
     assert_fragment_window(final_server, &namespace, spec).await;
-    let security = spec.security_assertion.as_ref().map(|assertions| {
-        let measured = super::security::measure(
-            &config,
-            &setup_server.admin_bearer,
-            &namespace,
-            &per_repeat,
-            assertions,
+    let paired_query = if let Some(mandatory_filter) = spec
+        .security_assertion
+        .as_ref()
+        .and_then(|security| security.mandatory_filter.as_ref())
+    {
+        assert!(
+            cold_server.is_none(),
+            "paired filtered-query measurement requires one prepared warm server"
         );
+        Some(
+            measure_paired_filtered_query_latency(
+                &caller_filtered_client,
+                &operation_client,
+                &spec.measure,
+                mandatory_filter,
+                PairedQueryWorld {
+                    server: &setup_server,
+                    namespace: &namespace,
+                    generated: &generated,
+                    world: &world,
+                    counter: &counter,
+                    tracker: &tracker,
+                },
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let security = if let Some(assertions) = spec.security_assertion.as_ref() {
+        let security_store =
+            crate::common::server::scoped_test_security_store(&instrumented_store, &harness.prefix);
+        let measured = super::security::measure(super::security::SecurityMeasureInput {
+            config: &config,
+            measured_bearer: operation_bearer,
+            namespace: &namespace,
+            repeats: &per_repeat,
+            assertions,
+            security_store: &security_store,
+            clock: setup_server.clock.clone(),
+            paired_query,
+        })
+        .await;
         println!(
-            "secured_query security budget: mode={} credential={} p50_delta_ns={} added_get_ops={} added_put_ops={}",
+            "{} security budget: mode={} credential={} p50_delta_ns={} query_regression_bps={:?} added_get_ops={} added_put_ops={}",
+            spec.name,
             measured.security_mode,
             measured.credential_kind,
             measured.authn_authz_p50_delta_ns,
+            measured.query_p50_regression_basis_points,
             measured.added_get_ops,
             measured.added_put_ops
         );
-        measured
-    });
+        Some(measured)
+    } else {
+        None
+    };
 
     cleanup_guard.cleanup().await;
     harness.cleanup().await;
@@ -987,6 +1074,21 @@ pub(crate) async fn run_closed_loop_scenario(
     let cleanup_guard = NamespaceCleanupGuard::new(instrumented_store.clone(), namespace.clone());
     create_namespace(&client, &setup_server, &namespace, spec).await;
     let mut world = setup_world(&client, &setup_server, &namespace, &generated, spec).await;
+    let paired_query_principals = create_paired_query_principals(
+        &client,
+        &setup_server,
+        &namespace,
+        spec.security_assertion
+            .as_ref()
+            .and_then(|security| security.mandatory_filter.as_ref()),
+    )
+    .await;
+    let operation_bearer = paired_query_principals
+        .as_ref()
+        .map_or(setup_server.admin_bearer.as_str(), |principals| {
+            principals.policy_filtered.bearer.as_str()
+        });
+    let operation_client = crate::common::server::client_with_bearer(operation_bearer);
 
     let mut cold_server = None;
     match &spec.cache_state {
@@ -1016,7 +1118,7 @@ pub(crate) async fn run_closed_loop_scenario(
                 match step {
                     Step::Measure => {
                         execute_measure_operation(
-                            &client,
+                            &operation_client,
                             &setup_server,
                             &namespace,
                             &generated,
@@ -1053,7 +1155,7 @@ pub(crate) async fn run_closed_loop_scenario(
     )
     .await;
     let measured_server = cold_server.as_ref().unwrap_or(&setup_server);
-    let measured_client = crate::common::server::client_with_bearer(&measured_server.admin_bearer);
+    let measured_client = crate::common::server::client_with_bearer(operation_bearer);
 
     before_measure();
     counter.reset();
@@ -1552,9 +1654,13 @@ fn measured_sidecar_cache_keys(
 ) -> Vec<String> {
     let mut keys = Vec::new();
     match &spec.measure {
-        MeasureOp::Query {
-            filter: Some(_), ..
-        } => {
+        MeasureOp::Query { filter, .. }
+            if filter.is_some()
+                || spec
+                    .security_assertion
+                    .as_ref()
+                    .is_some_and(|security| security.mandatory_filter.is_some()) =>
+        {
             for cluster in 0..segment.cluster_count {
                 let owner = segment.cluster_owner(cluster);
                 if spec.server_config.bitmap_index {
@@ -1744,7 +1850,175 @@ fn scenario_config(spec: &ScenarioSpec) -> Config {
     // Keep asynchronous setup audit traffic outside each deterministic
     // measured window. Destructive barriers still force exactly one batch.
     config.security.audit_flush_secs = 60;
+    // `start_test_server_full` injects this same fixed test-only key into its
+    // cloned config. Retain it here so the post-measure CPU probe can load the
+    // production policy kernel without inventing a second cursor key.
+    config.security.set_cursor_hmac_key_hex("42".repeat(32));
     config
+}
+
+async fn create_paired_query_principals(
+    admin: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    mandatory_filter: Option<&FilterMeasure>,
+) -> Option<PairedQueryPrincipals> {
+    let mandatory_filter = mandatory_filter?;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let caller_filtered = create_query_principal(
+        admin,
+        server,
+        namespace,
+        &format!("service:perf-caller-{suffix}"),
+        "caller",
+        None,
+    )
+    .await;
+    let policy_filtered = create_query_principal(
+        admin,
+        server,
+        namespace,
+        &format!("service:perf-policy-{suffix}"),
+        "policy",
+        Some(mandatory_filter),
+    )
+    .await;
+
+    assert_eq!(
+        caller_filtered.principal_kind, policy_filtered.principal_kind,
+        "paired query principals must have the same principal kind"
+    );
+    assert_eq!(
+        caller_filtered.principal_kind, "service",
+        "paired query principals must both be service principals"
+    );
+    assert_ne!(
+        caller_filtered.principal_id, policy_filtered.principal_id,
+        "paired query credentials must belong to distinct principals"
+    );
+    for field in ["scope", "actions", "field_mask", "write_constraints"] {
+        assert_eq!(
+            caller_filtered.grant[field], policy_filtered.grant[field],
+            "paired query grants differ outside mandatory_filter at {field}"
+        );
+    }
+    assert_eq!(
+        caller_filtered.grant["mandatory_filter"],
+        Value::Null,
+        "caller-filtered principal must not carry a policy filter"
+    );
+    assert_eq!(
+        policy_filtered.grant["mandatory_filter"],
+        json!({
+            "op": "eq",
+            "field": mandatory_filter.field,
+            "value": mandatory_filter.value,
+        }),
+        "policy-filtered principal must carry exactly the paired caller filter"
+    );
+
+    Some(PairedQueryPrincipals {
+        caller_filtered,
+        policy_filtered,
+    })
+}
+
+async fn create_query_principal(
+    admin: &Client,
+    server: &FullTestServer,
+    namespace: &str,
+    principal_id: &str,
+    role: &str,
+    mandatory_filter: Option<&FilterMeasure>,
+) -> QueryPrincipal {
+    assert!(
+        matches!(role, "caller" | "policy"),
+        "paired query role must be caller or policy"
+    );
+
+    let response = admin
+        .post(format!("{}/v1/security/principals", server.base_url))
+        .json(&json!({
+            "principal_id": principal_id,
+            "kind": "service",
+            "display_name": format!("secured-filtered-query-{role}"),
+        }))
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("performance constrained-principal creation must complete: {error}")
+        });
+    let principal = assert_security_setup_status(response, 201, "principal creation").await;
+
+    let response = admin
+        .post(format!("{}/v1/security/keys", server.base_url))
+        .json(&json!({
+            "principal_id": principal_id,
+            "name": format!("secured-filtered-query-{role}"),
+        }))
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("performance constrained-key creation must complete: {error}")
+        });
+    let key = assert_security_setup_status(response, 201, "key creation").await;
+    let bearer = key["api_key"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("performance key creation must return api_key"));
+
+    let mut grant_request = json!({
+        "principal_id": principal_id,
+        "scope": {"kind": "namespace", "namespace": namespace},
+        "actions": {"kind": "selected", "actions": ["Query"]},
+    });
+    if let Some(filter) = mandatory_filter {
+        grant_request["mandatory_filter"] = json!({
+            "op": "eq",
+            "field": filter.field,
+            "value": filter.value,
+        });
+    }
+    let response = admin
+        .post(format!("{}/v1/security/grants", server.base_url))
+        .json(&grant_request)
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("performance constrained-grant creation must complete: {error}")
+        });
+    let grant = assert_security_setup_status(response, 201, "grant creation").await;
+
+    QueryPrincipal {
+        bearer,
+        principal_id: principal["principal"]["principal_id"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("principal creation must return principal_id")),
+        principal_kind: principal["principal"]["kind"].clone(),
+        grant: grant["grant"].clone(),
+    }
+}
+
+async fn assert_security_setup_status(
+    response: reqwest::Response,
+    expected: u16,
+    operation: &str,
+) -> Value {
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .unwrap_or_else(|error| panic!("performance security {operation} body failed: {error}"));
+    assert_eq!(
+        status.as_u16(),
+        expected,
+        "performance security {operation} failed: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!("performance security {operation} returned invalid JSON: {error}")
+    })
 }
 
 async fn prime_query(
@@ -1760,6 +2034,157 @@ async fn prime_query(
         "include_attributes": false,
     });
     let _ = post_query(client, server, namespace, body, None).await;
+}
+
+async fn measure_paired_filtered_query_latency(
+    caller_filtered_client: &Client,
+    policy_filtered_client: &Client,
+    policy_measure: &MeasureOp,
+    mandatory_filter: &FilterMeasure,
+    paired_world: PairedQueryWorld<'_>,
+) -> super::security::PairedQueryLatency {
+    let MeasureOp::Query {
+        consistency,
+        top_k,
+        query_index,
+        filter,
+    } = policy_measure
+    else {
+        panic!("mandatory-filter latency comparison requires a query measure");
+    };
+    assert!(
+        filter.is_none(),
+        "policy-filtered latency measure must not send a caller filter"
+    );
+    assert!(
+        !paired_world.world.repeat_cache_keys.is_empty(),
+        "paired filtered-query measurement requires explicit sidecar cache keys"
+    );
+    let caller_measure = MeasureOp::Query {
+        consistency,
+        top_k: *top_k,
+        query_index: *query_index,
+        filter: Some((
+            mandatory_filter.field.clone(),
+            mandatory_filter.value.clone(),
+        )),
+    };
+
+    for pair in 0..PAIRED_QUERY_WARMUP_PAIRS {
+        if pair % 2 == 0 {
+            let _ = observe_prepared_query_latency_ns(
+                caller_filtered_client,
+                &caller_measure,
+                &paired_world,
+            )
+            .await;
+            let _ = observe_prepared_query_latency_ns(
+                policy_filtered_client,
+                policy_measure,
+                &paired_world,
+            )
+            .await;
+        } else {
+            let _ = observe_prepared_query_latency_ns(
+                policy_filtered_client,
+                policy_measure,
+                &paired_world,
+            )
+            .await;
+            let _ = observe_prepared_query_latency_ns(
+                caller_filtered_client,
+                &caller_measure,
+                &paired_world,
+            )
+            .await;
+        }
+    }
+
+    let mut caller_filtered = Vec::with_capacity(PAIRED_QUERY_SAMPLES);
+    let mut policy_filtered = Vec::with_capacity(PAIRED_QUERY_SAMPLES);
+    for sample in 0..PAIRED_QUERY_SAMPLES {
+        if sample % 2 == 0 {
+            caller_filtered.push(
+                observe_prepared_query_latency_ns(
+                    caller_filtered_client,
+                    &caller_measure,
+                    &paired_world,
+                )
+                .await,
+            );
+            policy_filtered.push(
+                observe_prepared_query_latency_ns(
+                    policy_filtered_client,
+                    policy_measure,
+                    &paired_world,
+                )
+                .await,
+            );
+        } else {
+            policy_filtered.push(
+                observe_prepared_query_latency_ns(
+                    policy_filtered_client,
+                    policy_measure,
+                    &paired_world,
+                )
+                .await,
+            );
+            caller_filtered.push(
+                observe_prepared_query_latency_ns(
+                    caller_filtered_client,
+                    &caller_measure,
+                    &paired_world,
+                )
+                .await,
+            );
+        }
+    }
+
+    // These requests intentionally run after the frozen object-store census.
+    // Clear their instrumentation so no later diagnostic can mistake them for
+    // contracted storage operations.
+    await_tracker_idle(paired_world.tracker).await;
+    paired_world.counter.reset();
+    paired_world.tracker.reset();
+    super::security::PairedQueryLatency::from_observed_ns(caller_filtered, policy_filtered)
+}
+
+async fn observe_prepared_query_latency_ns(
+    client: &Client,
+    measure: &MeasureOp,
+    paired_world: &PairedQueryWorld<'_>,
+) -> u64 {
+    await_tracker_idle(paired_world.tracker).await;
+    paired_world.server.clear_decoded_artifact_cache();
+    for key in &paired_world.world.repeat_cache_keys {
+        paired_world
+            .server
+            .cache
+            .invalidate(key)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("failed to prepare paired query cache key {key}: {error}")
+            });
+    }
+    paired_world.counter.reset();
+    paired_world.tracker.reset();
+
+    let started = Instant::now();
+    let _ = execute_measure_operation(
+        client,
+        paired_world.server,
+        paired_world.namespace,
+        paired_world.generated,
+        measure,
+        paired_world.world,
+        0,
+        paired_world.tracker,
+    )
+    .await;
+    match u64::try_from(started.elapsed().as_nanos()) {
+        Ok(value) => value,
+        Err(error) => panic!("paired filtered-query latency exceeded u64 nanoseconds: {error}"),
+    }
 }
 
 fn measure_mutates(measure: &MeasureOp) -> bool {
@@ -2554,6 +2979,33 @@ fn stability_contract_violations(
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    #[tokio::test]
+    #[ignore = "requires TEST_BACKEND=minio for direct paired HTTP query measurement"]
+    async fn secured_filtered_query_directly_compares_actual_http_paths() {
+        require_minio();
+        let contract = load_or_panic("secured_filtered_query");
+        let spec = scenarios::build(&contract, 3);
+
+        let outcome = run_scenario(&spec, None).await;
+        let Some(security) = outcome.security.as_ref() else {
+            panic!("secured filtered query must emit security measurements");
+        };
+
+        assert_eq!(security.paired_query_samples, Some(PAIRED_QUERY_SAMPLES));
+        assert!(security
+            .caller_filtered_query_p50_ns
+            .is_some_and(|ns| ns > 0));
+        assert!(security
+            .policy_filtered_query_p50_ns
+            .is_some_and(|ns| ns > 0));
+        assert_eq!(security.added_get_ops, 0);
+        assert_eq!(security.added_put_ops, 0);
+        assert!(
+            check_contract(&contract, &outcome).is_empty(),
+            "direct policy-filter regression must remain within the frozen budget"
+        );
+    }
 
     #[tokio::test]
     async fn cold_clone_uses_the_manifest_version_reset_api() {

@@ -8,6 +8,7 @@ mod action;
 mod audit;
 mod audit_sink;
 mod authn;
+mod constraints;
 mod context;
 mod decision;
 mod kernel;
@@ -25,15 +26,18 @@ pub use audit::{
 };
 pub use audit_sink::{AuditClient, AuditRuntime, AuditSinkError};
 pub use authn::{ApiKeyAdapter, AuthenticationOutcome, AuthnFailure, CredentialAdapter};
+pub(crate) use constraints::filter_matches_write_scope;
+pub use constraints::{apply_field_mask, filter_references_denied_field};
 pub use context::RequestContext;
+pub(crate) use decision::CursorBindingKey;
 pub use decision::{
     AllowDecision, Decision, DecisionId, DenyDecision, DenyReason, FieldMask, Obligation,
     PolicyVersion, WriteConstraints,
 };
 pub use kernel::SecurityKernel;
 pub use policy::{
-    ApiKeyId, GrantActions, GrantScope, IssuedApiKey, KeyState, PolicyGrant, PolicyHead, PolicyKey,
-    PolicyPrincipal, PolicySnapshot,
+    ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, KeyState, PolicyGrant,
+    PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot,
 };
 pub use policy_store::{LoadedPolicy, PolicyStore};
 pub use principal::{AuthStrength, Principal, PrincipalId, PrincipalKind};
@@ -63,12 +67,24 @@ pub enum SecurityError {
     /// A configured API-key digest is not exactly 32 hexadecimal bytes.
     #[error("invalid API-key SHA-256 digest")]
     InvalidApiKeyDigest,
+    /// Enforced mode lacks the server-only key required for authenticated cursors.
+    #[error("missing required security.cursor_hmac_key_hex in enforced mode")]
+    MissingCursorHmacKey,
+    /// Cursor authentication material is not exactly 32 hexadecimal bytes.
+    #[error("invalid security.cursor_hmac_key_hex")]
+    InvalidCursorHmacKey,
     /// Credential authentication failed without exposing credential material.
     #[error("authentication failed: {0}")]
     Authentication(AuthnFailure),
     /// Central policy denied an authenticated operation.
     #[error("authorization denied: {}", .0.code())]
     Authorization(DenyReason),
+    /// An allowed operation attempted to violate server-owned data constraints.
+    #[error("security constraint violation")]
+    ConstraintViolation,
+    /// A continuation token was issued under a different policy version.
+    #[error("cursor policy version is stale")]
+    CursorPolicyStale,
     /// A registered route reached middleware without a central mapping.
     #[error("protected route has no security mapping")]
     UnmappedRoute,
@@ -139,7 +155,7 @@ impl SecurityOperationError {
 
     pub(crate) fn after_allow(error: crate::error::ZeppelinError, decision: AllowDecision) -> Self {
         Self {
-            decision: Some(Box::new(Decision::Allow(decision))),
+            decision: Some(Box::new(Decision::Allow(Box::new(decision)))),
             error: Box::new(error),
         }
     }
@@ -200,6 +216,8 @@ impl SecurityError {
                 | DenyReason::CredentialUnknown,
             ) => 401,
             Self::Authorization(_) => 403,
+            Self::ConstraintViolation => 403,
+            Self::CursorPolicyStale => 400,
             Self::InvalidNamespaceId | Self::InvalidSnapshotName => 400,
             Self::InvalidPolicyRequest(_) => 400,
             Self::PolicyConflict | Self::PolicyEntityAlreadyExists => 409,
@@ -208,6 +226,8 @@ impl SecurityError {
             | Self::InvalidPrincipalId
             | Self::DuplicatePrincipal
             | Self::InvalidApiKeyDigest
+            | Self::MissingCursorHmacKey
+            | Self::InvalidCursorHmacKey
             | Self::UnmappedRoute
             | Self::MissingPrincipal
             | Self::MissingRequestContext
@@ -229,6 +249,8 @@ impl SecurityError {
             Self::Authentication(failure) => failure.code(),
             Self::Authorization(DenyReason::ActionNotGranted) => "forbidden",
             Self::Authorization(reason) => reason.code(),
+            Self::ConstraintViolation => "constraint_violation",
+            Self::CursorPolicyStale => "cursor_policy_stale",
             Self::InvalidNamespaceId => "invalid_namespace",
             Self::InvalidSnapshotName => "invalid_snapshot",
             Self::InvalidPolicyRequest(_) => "invalid_security_request",
@@ -241,6 +263,8 @@ impl SecurityError {
             | Self::InvalidPrincipalId
             | Self::DuplicatePrincipal
             | Self::InvalidApiKeyDigest
+            | Self::MissingCursorHmacKey
+            | Self::InvalidCursorHmacKey
             | Self::MissingPrincipal
             | Self::MissingRequestContext
             | Self::MissingSourceIp
@@ -264,6 +288,10 @@ impl SecurityError {
                 | DenyReason::CredentialUnknown,
             ) => "authentication required".to_string(),
             Self::Authorization(_) => "access forbidden".to_string(),
+            Self::ConstraintViolation => "operation violates security constraints".to_string(),
+            Self::CursorPolicyStale => {
+                "cursor was issued under a different security policy; re-query required".to_string()
+            }
             Self::InvalidNamespaceId => "invalid namespace name".to_string(),
             Self::InvalidSnapshotName => "invalid snapshot name".to_string(),
             Self::InvalidPolicyRequest(_) => "invalid security request".to_string(),
@@ -278,6 +306,8 @@ impl SecurityError {
             | Self::InvalidPrincipalId
             | Self::DuplicatePrincipal
             | Self::InvalidApiKeyDigest
+            | Self::MissingCursorHmacKey
+            | Self::InvalidCursorHmacKey
             | Self::UnmappedRoute
             | Self::MissingPrincipal
             | Self::MissingRequestContext

@@ -31,7 +31,7 @@ pub fn build(contract: &ContractSpec, env_repeats: usize) -> ScenarioSpec {
         "performance-contract repeats must be greater than zero"
     );
     if let Some(security) = &contract.assertions.security {
-        assert_security_baseline_shape(contract, &security.baseline_scenario);
+        assert_security_baseline_shape(contract, security);
     }
 
     let measure = measure_op(&contract.run.measure);
@@ -47,7 +47,17 @@ pub fn build(contract: &ContractSpec, env_repeats: usize) -> ScenarioSpec {
 
     let namespace_options = contract.ns_config.as_ref();
     let bitmap_index = namespace_options.is_some_and(|config| config.bitmap_index);
-    let cache_state = cache_state(&contract.run.cache_state, &setup, &measure, bitmap_index);
+    let cache_state = cache_state(
+        &contract.run.cache_state,
+        &setup,
+        &measure,
+        bitmap_index,
+        contract
+            .assertions
+            .security
+            .as_ref()
+            .is_some_and(|security| security.mandatory_filter.is_some()),
+    );
     let repeats = if matches!(&cache_state, CacheState::Cold | CacheState::WarmHydrated)
         || matches!(
             &measure,
@@ -113,7 +123,11 @@ pub fn build(contract: &ContractSpec, env_repeats: usize) -> ScenarioSpec {
     }
 }
 
-fn assert_security_baseline_shape(contract: &ContractSpec, baseline_name: &str) {
+fn assert_security_baseline_shape(
+    contract: &ContractSpec,
+    security: &super::contract::SecurityAssertionSpec,
+) {
+    let baseline_name = &security.baseline_scenario;
     let baseline = super::contract::load_contract(baseline_name).unwrap_or_else(|error| {
         panic!("failed to load secured performance baseline {baseline_name:?}: {error}")
     });
@@ -133,9 +147,20 @@ fn assert_security_baseline_shape(contract: &ContractSpec, baseline_name: &str) 
         contract.run.cache_state, baseline.run.cache_state,
         "secured scenario must preserve its baseline cache state"
     );
+    let mut effective_measure = contract.run.measure.clone();
+    if let Some(mandatory_filter) = &security.mandatory_filter {
+        let MeasureSpec::Query { filter, .. } = &mut effective_measure else {
+            panic!("mandatory-filter performance scenarios must measure a query");
+        };
+        assert!(
+            filter.is_none(),
+            "mandatory-filter performance scenarios must not send a caller filter"
+        );
+        *filter = Some(mandatory_filter.clone());
+    }
     assert_eq!(
-        contract.run.measure, baseline.run.measure,
-        "secured scenario must preserve its baseline operation"
+        effective_measure, baseline.run.measure,
+        "secured scenario effective operation must preserve its baseline operation"
     );
 }
 
@@ -171,6 +196,7 @@ fn cache_state(
     setup: &SetupPlan,
     measure: &MeasureOp,
     bitmap_index: bool,
+    has_policy_filter: bool,
 ) -> CacheState {
     match contract {
         ContractCacheState::Cold => CacheState::Cold,
@@ -178,15 +204,20 @@ fn cache_state(
             let prime = if matches!(measure, MeasureOp::Compact { .. } | MeasureOp::Gc) {
                 Vec::new()
             } else if (bitmap_index
-                && matches!(
+                && (matches!(
                     measure,
                     MeasureOp::Query {
                         filter: Some(_),
                         ..
                     }
-                ))
+                ) || has_policy_filter))
                 || matches!(measure, MeasureOp::FtsQuery { .. })
             {
+                vec![Step::Measure]
+            } else if has_policy_filter {
+                // A warm security contract must prime the actual constrained
+                // principal path. A generic administrator query cannot create
+                // or load policy-scope retrieval artifacts.
                 vec![Step::Measure]
             } else if matches!(
                 setup,
@@ -334,5 +365,38 @@ fn default_nprobe(measure: &MeasureOp) -> usize {
         | MeasureOp::Compact { .. }
         | MeasureOp::Gc
         | MeasureOp::Hydrate { .. } => DEFAULT_WRITE_NPROBE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secured_filtered_query_builds_a_policy_only_filter_shape() {
+        let contract = super::super::contract::load_contract("secured_filtered_query")
+            .unwrap_or_else(|error| panic!("secured filtered contract must load: {error}"));
+        let spec = build(&contract, 8);
+
+        assert!(matches!(
+            spec.measure,
+            MeasureOp::Query { filter: None, .. }
+        ));
+        assert!(matches!(
+            spec.cache_state,
+            CacheState::Warm {
+                prime: ref steps
+            } if matches!(steps.as_slice(), [Step::Measure])
+        ));
+        let Some(security) = spec.security_assertion else {
+            panic!("secured filtered scenario must carry security assertions");
+        };
+        assert_eq!(
+            security.mandatory_filter,
+            Some(super::super::contract::FilterMeasure {
+                field: "cat".to_string(),
+                value: "c0".to_string(),
+            })
+        );
     }
 }

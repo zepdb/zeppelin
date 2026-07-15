@@ -19,6 +19,7 @@
       },
       "grouping": null,
       "path": "algebra_hybrid",
+      "policy_filter_applied": false,
       "projection": {
         "include_attributes": true
       },

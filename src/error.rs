@@ -247,6 +247,10 @@ pub enum ZeppelinError {
     #[error("index error: {0}")]
     Index(String),
 
+    /// A policy-scope retrieval artifact is malformed or failed construction.
+    #[error("retrieval scope error: {0}")]
+    RetrievalScope(#[from] crate::retrieval_scope::RetrievalScopeError),
+
     /// A persisted resident coarse-sketch artifact is corrupt or inconsistent.
     #[error("coarse sketch error: {0}")]
     CoarseSketch(String),
@@ -541,6 +545,7 @@ impl ZeppelinError {
             ZeppelinError::NamespaceDeleting { .. } => "NAMESPACE_DELETING",
             ZeppelinError::NamespaceDeleteIncomplete { .. } => "INTERNAL_ERROR",
             ZeppelinError::Index(_) => "INTERNAL_ERROR",
+            ZeppelinError::RetrievalScope(_) => "INTERNAL_ERROR",
             ZeppelinError::CoarseSketch(_) => "INTERNAL_ERROR",
             ZeppelinError::Rabitq(_) => "INTERNAL_ERROR",
             ZeppelinError::Membership(_) => "INTERNAL_ERROR",
@@ -665,6 +670,7 @@ impl ZeppelinError {
             | ZeppelinError::Serialization(_)
             | ZeppelinError::MalformedControlKey { .. }
             | ZeppelinError::Index(_)
+            | ZeppelinError::RetrievalScope(_)
             | ZeppelinError::CoarseSketch(_)
             | ZeppelinError::Rabitq(_)
             | ZeppelinError::Membership(_)
@@ -675,6 +681,9 @@ impl ZeppelinError {
             | ZeppelinError::FullTextSearch(_)
             | ZeppelinError::NamespaceDeleteIncomplete { .. } => {
                 "an internal error occurred".to_string()
+            }
+            ZeppelinError::IndexUnavailable(_) => {
+                "the requested FTS index is unavailable; contact the server operator".to_string()
             }
             ZeppelinError::Security(error) => error.client_message(),
             ZeppelinError::ChecksumMismatch { .. } => {
@@ -715,7 +724,6 @@ impl ZeppelinError {
             | ZeppelinError::NotImplemented { .. }
             | ZeppelinError::HydrationDisabled
             | ZeppelinError::FtsFieldNotConfigured { .. }
-            | ZeppelinError::IndexUnavailable(_)
             | ZeppelinError::QueryConcurrencyExhausted
             | ZeppelinError::RateLimitExceeded { .. } => self.to_string(),
         }
@@ -1036,6 +1044,17 @@ mod tests {
         assert!(
             !msg.contains("secret-bucket") && !msg.contains("internal"),
             "leaked storage detail: {msg}"
+        );
+    }
+
+    #[test]
+    fn index_unavailable_client_message_hides_manifest_counts() {
+        let error = ZeppelinError::IndexUnavailable(
+            "BM25 fallback would scan 413 clusters and 98,765 vectors (limit 7)".into(),
+        );
+        assert_eq!(
+            error.client_message(),
+            "the requested FTS index is unavailable; contact the server operator"
         );
     }
 

@@ -15,6 +15,7 @@ fn enforced_config() -> Config {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 readyz_public = false
 
 [[security.api_keys]]
@@ -33,6 +34,7 @@ fn enforced_config_with_expired_key() -> Config {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_admin"
@@ -272,6 +274,7 @@ async fn admin_actions_disjoint() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_writer"
@@ -313,6 +316,7 @@ async fn namespace_scoped_key_cannot_cross() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_admin"
@@ -385,6 +389,7 @@ async fn namespace_create_is_scoped_to_requested_name() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_creator"
@@ -422,6 +427,7 @@ async fn clone_requires_target_namespace_create_scope() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_cloner"
@@ -450,6 +456,7 @@ async fn clone_requires_source_read_and_namespace_create() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_clone_only"
@@ -464,6 +471,13 @@ name = "clone-reader"
 sha256_hex = "0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a"
 actions = ["NamespaceClone", "NamespaceRead"]
 namespaces = ["source"]
+
+[[security.api_keys]]
+key_id = "zpk1_clone_creator"
+name = "clone-creator-without-read"
+sha256_hex = "0f007385b6f9d4b7eeb2748605afe1a984a0a3bfa3f014d09e2a784ce9e5cd1a"
+actions = ["NamespaceClone", "NamespaceCreate"]
+namespaces = ["source", "target"]
 "#,
     )
     .unwrap();
@@ -473,6 +487,7 @@ namespaces = ["source"]
     for bearer in [
         "zpk1_clone_only.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "zpk1_clone_reader.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "zpk1_clone_creator.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     ] {
         let response = bearer_client(bearer)
             .post(format!("{base_url}/v1/namespaces/source/clone"))
@@ -511,6 +526,7 @@ async fn metrics_read_key_can_read_metrics() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_metrics"
@@ -540,6 +556,7 @@ async fn read_only_key_can_query_cannot_mutate() {
         r#"
 [security]
 mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [[security.api_keys]]
 key_id = "zpk1_admin"

@@ -10,17 +10,11 @@ use sha2::{Digest, Sha256};
 use crate::config::{ApiKeyConfig, SecurityConfig};
 
 use super::{
-    Action, AllowDecision, DenyReason, NamespaceId, PolicyVersion, Principal, PrincipalId,
-    PrincipalKind, Resource, SecurityError,
+    Action, AllowDecision, DenyReason, FieldMask, NamespaceId, PolicyVersion, Principal,
+    PrincipalId, PrincipalKind, Resource, SecurityError, WriteConstraints,
 };
 
 const SHA256_HEX_LEN: usize = 64;
-// A persisted `All` grant is intentionally frozen to the Phase 3 action
-// universe. Adding an Action makes this assignment fail to compile until a
-// policy-schema migration is designed; old immutable snapshots never widen
-// merely because a newer binary adds an action.
-const POLICY_ALL_V1: [Action; 21] = Action::ALL;
-
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledKey {
     pub(crate) principal: Principal,
@@ -34,7 +28,46 @@ pub(crate) struct CompiledKey {
 struct CompiledGrant {
     scope: GrantScope,
     actions: HashSet<Action>,
+    mandatory_filter: Option<crate::types::Filter>,
+    field_mask: Option<FieldMask>,
+    write_constraints: WriteConstraints,
 }
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CompiledAuthorization {
+    pub(crate) mandatory_filter: Option<crate::types::Filter>,
+    pub(crate) field_mask: Option<FieldMask>,
+    pub(crate) write_constraints: WriteConstraints,
+    pub(crate) attribute_admin: bool,
+}
+
+#[derive(Debug, Default)]
+struct CompiledNamespaceScope {
+    filter_conjuncts: BTreeSet<String>,
+    denied_fields: BTreeSet<String>,
+    write_constraints: WriteConstraints,
+}
+
+/// Namespace-scoped capabilities whose target availability can expose, mutate,
+/// or destroy a raw clone. `NamespaceCreate` and `NamespaceClone` are checked as
+/// the clone operation's explicit control permissions; process-wide actions do
+/// not depend on the source or target namespace.
+pub(crate) const DERIVED_NAMESPACE_ACTIONS: [Action; 14] = [
+    Action::NamespaceRead,
+    Action::NamespaceDelete,
+    Action::SnapshotRead,
+    Action::SnapshotWrite,
+    Action::SnapshotDelete,
+    Action::IndexConfigWrite,
+    Action::CompactionTrigger,
+    Action::CompactionStatusRead,
+    Action::HydrationTrigger,
+    Action::VectorFetch,
+    Action::VectorUpsert,
+    Action::VectorDelete,
+    Action::Query,
+    Action::AttributeAdmin,
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledPolicy {
@@ -50,6 +83,52 @@ impl CompiledPolicy {
         self.version
     }
 
+    /// Prove that publishing a raw namespace copy cannot broaden any principal's
+    /// current namespace-scoped observation or mutation authority.
+    ///
+    /// The proof is deliberately conservative. A target predicate is accepted
+    /// only when every syntactic source conjunct is retained; predicates that
+    /// are semantically equivalent but not structurally provable fail closed.
+    pub(crate) fn validate_namespace_copy_no_widening(
+        &self,
+        source: &NamespaceId,
+        target: &NamespaceId,
+    ) -> Result<(), SecurityError> {
+        for grants in self.grants.values() {
+            for action in DERIVED_NAMESPACE_ACTIONS {
+                let source_scope = compiled_namespace_scope(grants, action, source)?;
+                let target_scope = compiled_namespace_scope(grants, action, target)?;
+                let Some(target_scope) = target_scope else {
+                    continue;
+                };
+                let Some(source_scope) = source_scope else {
+                    return Err(SecurityError::ConstraintViolation);
+                };
+                if !source_scope
+                    .filter_conjuncts
+                    .is_subset(&target_scope.filter_conjuncts)
+                    || !source_scope
+                        .denied_fields
+                        .is_subset(&target_scope.denied_fields)
+                    || !source_scope
+                        .write_constraints
+                        .stamp()
+                        .iter()
+                        .all(|(field, value)| {
+                            target_scope.write_constraints.stamp().get(field) == Some(value)
+                        })
+                    || !source_scope
+                        .write_constraints
+                        .forbidden_fields()
+                        .is_subset(target_scope.write_constraints.forbidden_fields())
+                {
+                    return Err(SecurityError::ConstraintViolation);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub(crate) fn key(&self, key_id: &str) -> Option<&CompiledKey> {
         self.keys.get(key_id)
@@ -61,7 +140,7 @@ impl CompiledPolicy {
         now: DateTime<Utc>,
         action: Action,
         resource: &Resource,
-    ) -> Result<(), DenyReason> {
+    ) -> Result<CompiledAuthorization, DenyReason> {
         let grants = self.active_grants(principal, now)?;
         let matching_action = grants
             .iter()
@@ -70,22 +149,57 @@ impl CompiledPolicy {
         if matching_action.is_empty() {
             return Err(DenyReason::ActionNotGranted);
         }
-        if matching_action
+        let applicable = matching_action
             .iter()
-            .any(|grant| match (&grant.scope, resource.namespace()) {
-                (GrantScope::Global, _) => true,
-                (GrantScope::Namespace { namespace }, Some(resource_namespace)) => {
-                    namespace == resource_namespace
-                }
-                (GrantScope::Namespace { .. }, None) => false,
-            })
-        {
-            Ok(())
-        } else if resource.namespace().is_some() {
-            Err(DenyReason::NamespaceNotGranted)
-        } else {
-            Err(DenyReason::ActionNotGranted)
+            .copied()
+            .filter(|grant| grant_scope_matches(&grant.scope, resource))
+            .collect::<Vec<_>>();
+        if applicable.is_empty() {
+            return if resource.namespace().is_some() {
+                Err(DenyReason::NamespaceNotGranted)
+            } else {
+                Err(DenyReason::ActionNotGranted)
+            };
         }
+
+        let mut filters = Vec::new();
+        let mut field_mask = FieldMask::default();
+        let mut has_field_mask = false;
+        let mut write_constraints = WriteConstraints::none();
+        for grant in applicable {
+            if let Some(filter) = &grant.mandatory_filter {
+                filters.push(filter.clone());
+            }
+            if let Some(mask) = &grant.field_mask {
+                field_mask.union_from(mask);
+                has_field_mask = true;
+            }
+            write_constraints
+                .merge_from(&grant.write_constraints)
+                .unwrap_or_else(|error| {
+                    panic!("validated compiled policy carried conflicting stamps: {error}")
+                });
+        }
+        let mandatory_filter = match filters.len() {
+            0 => None,
+            1 => filters.pop(),
+            _ => Some(crate::types::Filter::And { filters }),
+        };
+        let field_mask = has_field_mask.then_some(field_mask);
+        let has_attribute_admin = grants.iter().any(|grant| {
+            grant.actions.contains(&Action::AttributeAdmin)
+                && grant_scope_matches(&grant.scope, resource)
+        });
+        if has_attribute_admin {
+            write_constraints = write_constraints.with_forbid_set_bypassed();
+        }
+
+        Ok(CompiledAuthorization {
+            mandatory_filter,
+            field_mask,
+            write_constraints,
+            attribute_admin: has_attribute_admin,
+        })
     }
 
     pub(crate) fn authorize_action(
@@ -137,6 +251,62 @@ impl CompiledPolicy {
             .map(Vec::as_slice)
             .ok_or(DenyReason::ActionNotGranted)
     }
+}
+
+fn compiled_namespace_scope(
+    grants: &[CompiledGrant],
+    action: Action,
+    namespace: &NamespaceId,
+) -> Result<Option<CompiledNamespaceScope>, SecurityError> {
+    let resource = Resource::Namespace(namespace.clone());
+    let applicable = grants.iter().filter(|grant| {
+        grant.actions.contains(&action) && grant_scope_matches(&grant.scope, &resource)
+    });
+    let mut matched = false;
+    let mut scope = CompiledNamespaceScope::default();
+    for grant in applicable {
+        matched = true;
+        if let Some(filter) = &grant.mandatory_filter {
+            collect_filter_conjuncts(filter, &mut scope.filter_conjuncts)?;
+        }
+        if let Some(mask) = &grant.field_mask {
+            scope
+                .denied_fields
+                .extend(mask.denied_fields().iter().cloned());
+        }
+        scope
+            .write_constraints
+            .merge_from(&grant.write_constraints)
+            .unwrap_or_else(|error| {
+                panic!("validated compiled policy carried conflicting stamps: {error}")
+            });
+    }
+    if grants.iter().any(|grant| {
+        grant.actions.contains(&Action::AttributeAdmin)
+            && grant_scope_matches(&grant.scope, &resource)
+    }) {
+        scope.write_constraints = scope.write_constraints.with_forbid_set_bypassed();
+    }
+    Ok(matched.then_some(scope))
+}
+
+fn collect_filter_conjuncts(
+    filter: &crate::types::Filter,
+    output: &mut BTreeSet<String>,
+) -> Result<(), SecurityError> {
+    if let crate::types::Filter::And { filters } = filter {
+        for filter in filters {
+            collect_filter_conjuncts(filter, output)?;
+        }
+        return Ok(());
+    }
+    let fingerprint = serde_json::to_string(filter).map_err(|error| {
+        SecurityError::InvalidPolicy(format!(
+            "mandatory filter fingerprint serialization failed: {error}"
+        ))
+    })?;
+    output.insert(fingerprint);
+    Ok(())
 }
 
 /// Validated public identifier carried before an API-key secret.
@@ -361,7 +531,10 @@ pub enum GrantScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GrantActions {
-    /// Every action in the exhaustive inventory, including destructive actions.
+    /// Every action in the frozen Phase 3 inventory, including destructive actions.
+    ///
+    /// Later capabilities such as `AttributeAdmin` require an explicit selected
+    /// grant so an immutable wildcard cannot silently widen after publication.
     All,
     /// A nonempty explicit set of action variants.
     Selected {
@@ -370,13 +543,82 @@ pub enum GrantActions {
     },
 }
 
+/// Complete caller-supplied definition for one grant publication.
+///
+/// The definition keeps transport parsing separate from policy validation while
+/// carrying all grant fields through the kernel and cache as one typed value.
+/// Validation still occurs inside the S3-authoritative publication path, after
+/// the kernel has selected policy authority.
+#[derive(Debug, Clone)]
+pub struct GrantDefinition {
+    principal_id: PrincipalId,
+    scope: GrantScope,
+    actions: GrantActions,
+    mandatory_filter: Option<crate::types::Filter>,
+    field_mask: Option<FieldMask>,
+    write_constraints: WriteConstraints,
+}
+
+impl GrantDefinition {
+    /// Collect one parsed grant request without publishing or validating it.
+    #[must_use]
+    pub fn new(
+        principal_id: PrincipalId,
+        scope: GrantScope,
+        actions: GrantActions,
+        mandatory_filter: Option<crate::types::Filter>,
+        field_mask: Option<FieldMask>,
+        write_constraints: WriteConstraints,
+    ) -> Self {
+        Self {
+            principal_id,
+            scope,
+            actions,
+            mandatory_filter,
+            field_mask,
+            write_constraints,
+        }
+    }
+
+    pub(crate) fn into_policy_grant(self) -> Result<PolicyGrant, SecurityError> {
+        let write_constraints =
+            (!self.write_constraints.is_empty()).then_some(self.write_constraints);
+        PolicyGrant::new_constrained(
+            self.principal_id,
+            self.scope,
+            self.actions,
+            self.mandatory_filter,
+            self.field_mask,
+            write_constraints,
+        )
+    }
+}
+
 /// One independently evaluated principal/scope/action binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyGrant {
     principal_id: PrincipalId,
     scope: GrantScope,
     actions: GrantActions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mandatory_filter: Option<crate::types::Filter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    field_mask: Option<FieldMask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write_constraints: Option<WriteConstraints>,
+}
+
+impl PartialEq for PolicyGrant {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_binding(other)
+            && filters_equal(
+                self.mandatory_filter.as_ref(),
+                other.mandatory_filter.as_ref(),
+            )
+            && self.field_mask == other.field_mask
+            && self.write_constraints == other.write_constraints
+    }
 }
 
 /// Transient result of one credential issuance. The plaintext appears only
@@ -434,6 +676,17 @@ impl PolicyGrant {
         scope: GrantScope,
         actions: GrantActions,
     ) -> Result<Self, SecurityError> {
+        Self::new_constrained(principal_id, scope, actions, None, None, None)
+    }
+
+    pub(crate) fn new_constrained(
+        principal_id: PrincipalId,
+        scope: GrantScope,
+        actions: GrantActions,
+        mandatory_filter: Option<crate::types::Filter>,
+        field_mask: Option<FieldMask>,
+        write_constraints: Option<WriteConstraints>,
+    ) -> Result<Self, SecurityError> {
         let actions = match actions {
             GrantActions::All => GrantActions::All,
             GrantActions::Selected { mut actions } => {
@@ -453,11 +706,18 @@ impl PolicyGrant {
                 GrantActions::Selected { actions }
             }
         };
-        Ok(Self {
+        let grant = Self {
             principal_id,
             scope,
             actions,
-        })
+            mandatory_filter,
+            field_mask,
+            write_constraints,
+        };
+        grant
+            .validate_constraints()
+            .map_err(SecurityError::InvalidPolicyRequest)?;
+        Ok(grant)
     }
 
     /// Borrow the principal receiving this grant.
@@ -476,6 +736,63 @@ impl PolicyGrant {
     #[must_use]
     pub fn actions(&self) -> &GrantActions {
         &self.actions
+    }
+
+    /// Borrow the server-owned predicate contributed by this grant.
+    #[must_use]
+    pub fn mandatory_filter(&self) -> Option<&crate::types::Filter> {
+        self.mandatory_filter.as_ref()
+    }
+
+    /// Borrow the response-field restrictions contributed by this grant.
+    #[must_use]
+    pub fn field_mask(&self) -> Option<&FieldMask> {
+        self.field_mask.as_ref()
+    }
+
+    /// Borrow the write restrictions contributed by this grant.
+    #[must_use]
+    pub fn write_constraints(&self) -> Option<&WriteConstraints> {
+        self.write_constraints.as_ref()
+    }
+
+    fn same_binding(&self, other: &Self) -> bool {
+        self.principal_id == other.principal_id
+            && self.scope == other.scope
+            && self.actions == other.actions
+    }
+
+    fn validate_constraints(&self) -> Result<(), String> {
+        if let Some(filter) = &self.mandatory_filter {
+            validate_policy_filter(filter)?;
+        }
+        if self.field_mask.as_ref().is_some_and(FieldMask::is_empty) {
+            return Err("field_mask.deny must not be empty".to_string());
+        }
+        if self
+            .write_constraints
+            .as_ref()
+            .is_some_and(WriteConstraints::is_empty)
+        {
+            return Err("write_constraints must not be empty".to_string());
+        }
+        if let GrantActions::Selected { actions } = &self.actions {
+            let constrained_attribute_admin = actions.contains(&Action::AttributeAdmin)
+                && !actions.contains(&Action::VectorUpsert)
+                && (self.mandatory_filter.is_some()
+                    || self.field_mask.is_some()
+                    || self
+                        .write_constraints
+                        .as_ref()
+                        .is_some_and(|constraints| !constraints.is_empty()));
+            if constrained_attribute_admin {
+                return Err(
+                    "AttributeAdmin grants carrying constraints must also include VectorUpsert"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -544,7 +861,7 @@ impl PolicyHead {
 }
 
 /// Complete immutable policy authority selected by [`PolicyHead`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicySnapshot {
     version: PolicyVersion,
@@ -659,7 +976,7 @@ impl PolicySnapshot {
         let mut grants: HashMap<PrincipalId, Vec<CompiledGrant>> = HashMap::new();
         for grant in &self.grants {
             let actions = match &grant.actions {
-                GrantActions::All => POLICY_ALL_V1.into_iter().collect(),
+                GrantActions::All => Action::POLICY_ALL_V1.into_iter().collect(),
                 GrantActions::Selected { actions } => actions.iter().copied().collect(),
             };
             grants
@@ -668,8 +985,15 @@ impl PolicySnapshot {
                 .push(CompiledGrant {
                     scope: grant.scope.clone(),
                     actions,
+                    mandatory_filter: grant.mandatory_filter.clone(),
+                    field_mask: grant.field_mask.clone(),
+                    write_constraints: grant
+                        .write_constraints
+                        .clone()
+                        .unwrap_or_else(WriteConstraints::none),
                 });
         }
+        validate_compiled_grant_conflicts(&grants)?;
         Ok(CompiledPolicy {
             version: self.version,
             principals: principals.keys().cloned().collect(),
@@ -835,13 +1159,27 @@ impl PolicySnapshot {
         {
             return Err(SecurityError::PolicyEntityNotFound);
         }
-        if self.grants.iter().any(|existing| existing == &grant) {
+        if self
+            .grants
+            .iter()
+            .any(|existing| existing.same_binding(&grant))
+        {
             return Err(SecurityError::PolicyEntityAlreadyExists);
         }
         let mut next = self.clone();
         next.grants.push(grant);
         next.grants.sort_by(grant_order);
         next.finalize_next(actor, now)?;
+        if let Err(error) = next.validate_for_use() {
+            return match error {
+                SecurityError::InvalidPolicy(message)
+                    if message.starts_with("conflicting server stamps for attribute ") =>
+                {
+                    Err(SecurityError::InvalidPolicyRequest(message))
+                }
+                other => Err(other),
+            };
+        }
         Ok(next)
     }
 
@@ -853,7 +1191,7 @@ impl PolicySnapshot {
     ) -> Result<Self, SecurityError> {
         let mut next = self.clone();
         let original_len = next.grants.len();
-        next.grants.retain(|existing| existing != grant);
+        next.grants.retain(|existing| !existing.same_binding(grant));
         if next.grants.len() == original_len {
             return Err(SecurityError::PolicyEntityNotFound);
         }
@@ -971,9 +1309,14 @@ impl PolicySnapshot {
                     ));
                 }
             }
-            let identity = serde_json::to_string(grant).map_err(|error| {
-                SecurityError::InvalidPolicy(format!("grant serialization failed: {error}"))
-            })?;
+            grant
+                .validate_constraints()
+                .map_err(SecurityError::InvalidPolicy)?;
+            let identity =
+                serde_json::to_string(&(&grant.principal_id, &grant.scope, &grant.actions))
+                    .map_err(|error| {
+                        SecurityError::InvalidPolicy(format!("grant serialization failed: {error}"))
+                    })?;
             if !grant_ids.insert(identity) {
                 return Err(SecurityError::InvalidPolicy(
                     "duplicate policy grant".to_string(),
@@ -1050,6 +1393,59 @@ impl PolicySnapshot {
     }
 }
 
+fn grant_scope_matches(scope: &GrantScope, resource: &Resource) -> bool {
+    match (scope, resource.namespace()) {
+        (GrantScope::Global, _) => true,
+        (GrantScope::Namespace { namespace }, Some(resource_namespace)) => {
+            namespace == resource_namespace
+        }
+        (GrantScope::Namespace { .. }, None) => false,
+    }
+}
+
+fn validate_compiled_grant_conflicts(
+    grants: &HashMap<PrincipalId, Vec<CompiledGrant>>,
+) -> Result<(), SecurityError> {
+    for principal_grants in grants.values() {
+        for (index, left) in principal_grants.iter().enumerate() {
+            for right in &principal_grants[index + 1..] {
+                if !grant_scopes_overlap(&left.scope, &right.scope)
+                    || left.actions.is_disjoint(&right.actions)
+                {
+                    continue;
+                }
+                for (field, left_value) in left.write_constraints.stamp() {
+                    if right
+                        .write_constraints
+                        .stamp()
+                        .get(field)
+                        .is_some_and(|right_value| right_value != left_value)
+                    {
+                        return Err(SecurityError::InvalidPolicy(format!(
+                            "conflicting server stamps for attribute {field}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn grant_scopes_overlap(left: &GrantScope, right: &GrantScope) -> bool {
+    match (left, right) {
+        (GrantScope::Global, _) | (_, GrantScope::Global) => true,
+        (
+            GrantScope::Namespace {
+                namespace: left_namespace,
+            },
+            GrantScope::Namespace {
+                namespace: right_namespace,
+            },
+        ) => left_namespace == right_namespace,
+    }
+}
+
 fn bootstrap_key(
     configured: &ApiKeyConfig,
     now: DateTime<Utc>,
@@ -1114,6 +1510,9 @@ fn bootstrap_key(
             principal_id: principal_id.clone(),
             scope,
             actions: actions.clone(),
+            mandatory_filter: None,
+            field_mask: None,
+            write_constraints: None,
         })
         .collect();
     Ok((principal, key, grants))
@@ -1149,6 +1548,116 @@ fn grant_order(left: &PolicyGrant, right: &PolicyGrant) -> std::cmp::Ordering {
                 },
             ) => left_actions.cmp(right_actions),
         })
+}
+
+fn filters_equal(
+    left: Option<&crate::types::Filter>,
+    right: Option<&crate::types::Filter>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            match (serde_json::to_value(left), serde_json::to_value(right)) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => false,
+            }
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+fn validate_policy_filter(filter: &crate::types::Filter) -> Result<(), String> {
+    use crate::types::Filter;
+
+    match filter {
+        Filter::Eq { field, value }
+        | Filter::NotEq { field, value }
+        | Filter::Contains { field, value } => {
+            validate_filter_field(field)?;
+            validate_filter_value(value)
+        }
+        Filter::Range {
+            field,
+            gte,
+            lte,
+            gt,
+            lt,
+        } => {
+            validate_filter_field(field)?;
+            let bounds = [*gte, *lte, *gt, *lt];
+            if bounds.iter().all(Option::is_none) {
+                return Err("mandatory range filter must contain a bound".to_string());
+            }
+            if bounds.into_iter().flatten().any(|value| !value.is_finite()) {
+                return Err("mandatory range filter bounds must be finite".to_string());
+            }
+            Ok(())
+        }
+        Filter::In { field, values } | Filter::NotIn { field, values } => {
+            validate_filter_field(field)?;
+            if values.is_empty() {
+                return Err("mandatory membership filter values must not be empty".to_string());
+            }
+            for value in values {
+                validate_filter_value(value)?;
+            }
+            Ok(())
+        }
+        Filter::And { filters } | Filter::Or { filters } => {
+            if filters.is_empty() {
+                return Err("mandatory logical filter must not be empty".to_string());
+            }
+            for filter in filters {
+                validate_policy_filter(filter)?;
+            }
+            Ok(())
+        }
+        Filter::Not { filter } => validate_policy_filter(filter),
+        Filter::ContainsAllTokens { field, tokens }
+        | Filter::ContainsTokenSequence { field, tokens } => {
+            validate_filter_field(field)?;
+            let analyzer = crate::fts::FtsFieldConfig::default();
+            if tokens.is_empty()
+                || tokens.iter().any(|token| {
+                    crate::fts::tokenizer::tokenize_text(token, &analyzer, false).is_empty()
+                })
+            {
+                return Err(
+                    "mandatory token filter entries must produce at least one token under the default analyzer"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_filter_field(field: &str) -> Result<(), String> {
+    if field.trim().is_empty() {
+        Err("mandatory filter field must not be empty".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_filter_value(value: &crate::types::AttributeValue) -> Result<(), String> {
+    match value {
+        crate::types::AttributeValue::Float(value) if !value.is_finite() => {
+            Err("mandatory filter values must contain only finite numbers".to_string())
+        }
+        crate::types::AttributeValue::FloatList(values)
+            if values.iter().any(|value| !value.is_finite()) =>
+        {
+            Err("mandatory filter values must contain only finite numbers".to_string())
+        }
+        crate::types::AttributeValue::String(_)
+        | crate::types::AttributeValue::Integer(_)
+        | crate::types::AttributeValue::Float(_)
+        | crate::types::AttributeValue::Bool(_)
+        | crate::types::AttributeValue::StringList(_)
+        | crate::types::AttributeValue::IntegerList(_)
+        | crate::types::AttributeValue::FloatList(_) => Ok(()),
+    }
 }
 
 fn valid_checksum(value: &str) -> bool {
@@ -1210,4 +1719,568 @@ fn write_canonical_json(value: &Value, output: &mut String) -> Result<(), Securi
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::str::FromStr;
+
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+
+    use super::{grant_order, CompiledPolicy, PolicyGrant, PolicySnapshot};
+    use crate::{
+        config::Config,
+        security::{
+            Action, DenyReason, FieldMask, GrantActions, GrantScope, NamespaceId, PrincipalId,
+            Resource, SecurityError, WriteConstraints,
+        },
+        types::{AttributeValue, Filter},
+    };
+
+    fn fixture<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
+        result.unwrap_or_else(|error| panic!("{context}: {error:?}"))
+    }
+
+    fn fixture_option<T>(value: Option<T>, context: &str) -> T {
+        value.unwrap_or_else(|| panic!("{context}: value was absent"))
+    }
+
+    fn fixture_error<T, E>(result: Result<T, E>, context: &str) -> E {
+        match result {
+            Ok(_) => panic!("{context}: operation unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    fn snapshot_with_grants(grants: Vec<PolicyGrant>) -> PolicySnapshot {
+        let config = fixture(
+            Config::from_str(
+                r#"
+[security]
+mode = "enforced"
+cursor_hmac_key_hex = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[security.api_keys]]
+key_id = "zpk1_reader"
+name = "reader"
+sha256_hex = "0000000000000000000000000000000000000000000000000000000000000000"
+actions = ["SystemRead"]
+namespaces = ["*"]
+"#,
+            ),
+            "policy unit config must parse",
+        );
+        let now = fixture_option(
+            Utc.with_ymd_and_hms(2026, 7, 14, 12, 0, 0).single(),
+            "fixed policy time must be valid",
+        );
+        let mut snapshot = fixture(
+            PolicySnapshot::from_bootstrap(&config.security, now),
+            "bootstrap snapshot must compile",
+        );
+        snapshot.grants = grants;
+        snapshot.grants.sort_by(grant_order);
+        snapshot.checksum.clear();
+        fixture(
+            snapshot.validate_structure(),
+            "fixture grants must be structurally valid",
+        );
+        snapshot.checksum = fixture(snapshot.compute_checksum(), "fixture checksum must compute");
+        snapshot
+    }
+
+    fn compiled_policy_with_grants(grants: Vec<PolicyGrant>) -> (CompiledPolicy, super::Principal) {
+        let snapshot = snapshot_with_grants(grants);
+        let compiled = fixture(snapshot.compile(), "fixture policy must compile");
+        let principal = fixture_option(compiled.key("zpk1_reader"), "fixture key must compile")
+            .principal
+            .clone();
+        (compiled, principal)
+    }
+
+    fn grant(value: serde_json::Value) -> PolicyGrant {
+        fixture(serde_json::from_value(value), "grant fixture must decode")
+    }
+
+    #[test]
+    fn constrained_grant_round_trips_strict_optional_schema() {
+        let value = json!({
+            "principal_id": "service:search",
+            "scope": {"kind": "namespace", "namespace": "tenant-acme"},
+            "actions": {"kind": "selected", "actions": ["Query", "VectorUpsert"]},
+            "mandatory_filter": {"op": "eq", "field": "tenant_id", "value": "acme"},
+            "field_mask": {"deny": ["salary", "ssn"]},
+            "write_constraints": {
+                "stamp": {"tenant_id": "acme"},
+                "forbid_set": ["is_public", "tenant_id"]
+            }
+        });
+
+        let grant: PolicyGrant = fixture(
+            serde_json::from_value(value.clone()),
+            "phase-4 grant schema must decode",
+        );
+        assert!(matches!(grant.mandatory_filter(), Some(Filter::Eq { .. })));
+        assert_eq!(
+            grant.field_mask(),
+            Some(&fixture(
+                FieldMask::new(BTreeSet::from(["salary".to_string(), "ssn".to_string()])),
+                "fixture mask must validate",
+            ))
+        );
+        assert_eq!(
+            grant.write_constraints(),
+            Some(&fixture(
+                WriteConstraints::new(
+                    BTreeMap::from([(
+                        "tenant_id".to_string(),
+                        AttributeValue::String("acme".to_string()),
+                    )]),
+                    BTreeSet::from(["is_public".to_string(), "tenant_id".to_string()]),
+                ),
+                "fixture write constraints must validate",
+            ))
+        );
+        assert_eq!(
+            fixture(serde_json::to_value(&grant), "grant JSON must encode"),
+            value
+        );
+    }
+
+    #[test]
+    fn all_applicable_grants_compile_into_one_non_widening_decision() {
+        let grants = vec![
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "global"},
+                "actions": {"kind": "selected", "actions": ["Query"]},
+                "mandatory_filter": {"op": "eq", "field": "tenant_id", "value": "acme"},
+                "field_mask": {"deny": ["ssn"]},
+                "write_constraints": {
+                    "stamp": {"tenant_id": "acme"},
+                    "forbid_set": ["is_public"]
+                }
+            })),
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "namespace", "namespace": "tenant-a"},
+                "actions": {"kind": "selected", "actions": ["Query"]},
+                "mandatory_filter": {"op": "eq", "field": "region", "value": "west"},
+                "field_mask": {"deny": ["salary"]},
+                "write_constraints": {"forbid_set": ["classification"]}
+            })),
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "namespace", "namespace": "tenant-b"},
+                "actions": {"kind": "selected", "actions": ["Query"]},
+                "mandatory_filter": {"op": "eq", "field": "region", "value": "east"}
+            })),
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "global"},
+                "actions": {"kind": "selected", "actions": ["VectorFetch"]},
+                "mandatory_filter": {"op": "eq", "field": "wrong_action", "value": true}
+            })),
+        ];
+        let (policy, principal) = compiled_policy_with_grants(grants);
+
+        let authorization = fixture(
+            policy.authorize(
+                &principal,
+                fixture_option(
+                    Utc.with_ymd_and_hms(2026, 7, 14, 12, 0, 1).single(),
+                    "fixed authorization time must exist",
+                ),
+                Action::Query,
+                &Resource::Namespace(fixture(
+                    NamespaceId::new("tenant-a"),
+                    "tenant-a namespace fixture must validate",
+                )),
+            ),
+            "tenant-a query must be granted",
+        );
+
+        assert_eq!(
+            fixture(
+                serde_json::to_value(&authorization.mandatory_filter),
+                "compiled filter must serialize",
+            ),
+            json!({"op": "and", "filters": [
+                {"op": "eq", "field": "tenant_id", "value": "acme"},
+                {"op": "eq", "field": "region", "value": "west"}
+            ]})
+        );
+        assert_eq!(
+            fixture_option(
+                authorization.field_mask.as_ref(),
+                "matching masks must aggregate",
+            )
+            .denied_fields(),
+            &BTreeSet::from(["salary".to_string(), "ssn".to_string()])
+        );
+        assert_eq!(
+            authorization.write_constraints.stamp(),
+            &BTreeMap::from([(
+                "tenant_id".to_string(),
+                AttributeValue::String("acme".to_string())
+            )])
+        );
+        assert_eq!(
+            authorization.write_constraints.forbidden_fields(),
+            &BTreeSet::from(["classification".to_string(), "is_public".to_string()])
+        );
+    }
+
+    #[test]
+    fn unconstrained_grant_retains_the_phase_three_wire_shape() {
+        let grant = fixture(
+            PolicyGrant::new(
+                fixture(
+                    PrincipalId::new("service:search"),
+                    "service search principal fixture must validate",
+                ),
+                GrantScope::Namespace {
+                    namespace: fixture(
+                        NamespaceId::new("tenant-acme"),
+                        "tenant-acme namespace fixture must validate",
+                    ),
+                },
+                GrantActions::Selected {
+                    actions: vec![Action::Query],
+                },
+            ),
+            "unconstrained grant must validate",
+        );
+
+        assert_eq!(
+            fixture(serde_json::to_value(grant), "grant JSON must encode"),
+            json!({
+                "principal_id": "service:search",
+                "scope": {"kind": "namespace", "namespace": "tenant-acme"},
+                "actions": {"kind": "selected", "actions": ["Query"]}
+            })
+        );
+    }
+
+    #[test]
+    fn grant_binding_identity_ignores_constraints_for_add_and_remove() {
+        let constrained = grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "namespace", "namespace": "tenant-a"},
+            "actions": {"kind": "selected", "actions": ["Query"]},
+            "mandatory_filter": {"op": "eq", "field": "tenant_id", "value": "acme"}
+        }));
+        let binding = fixture(
+            PolicyGrant::new(
+                fixture(
+                    PrincipalId::new("zpk1_reader"),
+                    "reader principal fixture must validate",
+                ),
+                GrantScope::Namespace {
+                    namespace: fixture(
+                        NamespaceId::new("tenant-a"),
+                        "tenant-a namespace fixture must validate",
+                    ),
+                },
+                GrantActions::Selected {
+                    actions: vec![Action::Query],
+                },
+            ),
+            "binding must validate",
+        );
+        let base = snapshot_with_grants(Vec::new());
+        let actor = fixture(
+            PrincipalId::new("system:test"),
+            "system test actor fixture must validate",
+        );
+        let now = fixture_option(
+            Utc.with_ymd_and_hms(2026, 7, 14, 12, 1, 0).single(),
+            "fixed mutation time must exist",
+        );
+        let added = fixture(
+            base.add_grant(&actor, now, constrained),
+            "first binding must publish",
+        );
+
+        assert!(matches!(
+            added.add_grant(&actor, now, binding.clone()),
+            Err(SecurityError::PolicyEntityAlreadyExists)
+        ));
+        let removed = fixture(
+            added.remove_grant(&actor, now, &binding),
+            "unconstrained binding must remove constrained grant",
+        );
+        assert!(removed.grants().is_empty());
+    }
+
+    #[test]
+    fn overlapping_applicable_grants_reject_conflicting_server_stamps() {
+        let snapshot = snapshot_with_grants(vec![
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "global"},
+                "actions": {"kind": "selected", "actions": ["VectorUpsert"]},
+                "write_constraints": {"stamp": {"tenant_id": "acme"}}
+            })),
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "namespace", "namespace": "tenant-a"},
+                "actions": {"kind": "selected", "actions": ["VectorUpsert"]},
+                "write_constraints": {"stamp": {"tenant_id": "other"}}
+            })),
+        ]);
+
+        let error = fixture_error(
+            snapshot.compile(),
+            "co-applicable conflicting stamps must reject the policy",
+        );
+        assert!(matches!(
+            error,
+            SecurityError::InvalidPolicy(message)
+                if message == "conflicting server stamps for attribute tenant_id"
+        ));
+    }
+
+    #[test]
+    fn attribute_admin_requires_selected_grant_and_bypasses_only_forbid_set() {
+        let write_grant = grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "global"},
+            "actions": {"kind": "all"},
+            "write_constraints": {
+                "stamp": {"tenant_id": "acme"},
+                "forbid_set": ["is_public", "tenant_id"]
+            }
+        }));
+        let admin_grant = grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "namespace", "namespace": "tenant-a"},
+            "actions": {"kind": "selected", "actions": ["AttributeAdmin"]}
+        }));
+        let (policy, principal) = compiled_policy_with_grants(vec![write_grant.clone()]);
+        let now = fixture_option(
+            Utc.with_ymd_and_hms(2026, 7, 14, 12, 2, 0).single(),
+            "fixed authorization time must exist",
+        );
+        let resource = Resource::Namespace(fixture(
+            NamespaceId::new("tenant-a"),
+            "tenant-a namespace fixture must validate",
+        ));
+
+        assert!(matches!(
+            policy.authorize(&principal, now, Action::AttributeAdmin, &resource),
+            Err(DenyReason::ActionNotGranted)
+        ));
+        let without_admin = fixture(
+            policy.authorize(&principal, now, Action::VectorUpsert, &resource),
+            "frozen All still grants VectorUpsert",
+        );
+        assert_eq!(
+            without_admin.write_constraints.forbidden_fields(),
+            &BTreeSet::from(["is_public".to_string(), "tenant_id".to_string()])
+        );
+
+        let (policy, principal) = compiled_policy_with_grants(vec![write_grant, admin_grant]);
+        let with_admin = fixture(
+            policy.authorize(&principal, now, Action::VectorUpsert, &resource),
+            "explicit AttributeAdmin must retain write authorization",
+        );
+        assert!(with_admin.write_constraints.forbidden_fields().is_empty());
+        assert_eq!(
+            with_admin.write_constraints.stamp(),
+            &BTreeMap::from([(
+                "tenant_id".to_string(),
+                AttributeValue::String("acme".to_string())
+            )])
+        );
+    }
+
+    #[test]
+    fn constrained_grant_constructor_rejects_widening_empty_filter_forms() {
+        let error = fixture_error(
+            PolicyGrant::new_constrained(
+                fixture(
+                    PrincipalId::new("zpk1_reader"),
+                    "reader principal fixture must validate",
+                ),
+                GrantScope::Global,
+                GrantActions::Selected {
+                    actions: vec![Action::Query],
+                },
+                Some(Filter::And {
+                    filters: Vec::new(),
+                }),
+                None,
+                None,
+            ),
+            "empty mandatory conjunction must not mean unrestricted access",
+        );
+        assert!(matches!(
+            error,
+            SecurityError::InvalidPolicyRequest(message)
+                if message == "mandatory logical filter must not be empty"
+        ));
+    }
+
+    #[test]
+    fn constrained_grant_constructor_rejects_tokens_empty_after_default_analysis() {
+        for token in [
+            "   ".to_string(),
+            "!!!".to_string(),
+            "the".to_string(),
+            "x".repeat(41),
+        ] {
+            for mandatory_filter in [
+                Filter::ContainsAllTokens {
+                    field: "content".to_string(),
+                    tokens: vec![token.clone()],
+                },
+                Filter::ContainsTokenSequence {
+                    field: "content".to_string(),
+                    tokens: vec![token.clone()],
+                },
+            ] {
+                let error = fixture_error(
+                    PolicyGrant::new_constrained(
+                        fixture(
+                            PrincipalId::new("zpk1_reader"),
+                            "reader principal fixture must validate",
+                        ),
+                        GrantScope::Global,
+                        GrantActions::Selected {
+                            actions: vec![Action::Query],
+                        },
+                        Some(mandatory_filter),
+                        None,
+                        None,
+                    ),
+                    "every mandatory token entry must survive default analysis",
+                );
+                assert!(matches!(
+                    error,
+                    SecurityError::InvalidPolicyRequest(message)
+                        if message
+                            == "mandatory token filter entries must produce at least one token under the default analyzer"
+                ));
+            }
+        }
+    }
+
+    fn namespace(name: &str) -> NamespaceId {
+        fixture(
+            NamespaceId::new(name.to_string()),
+            "clone namespace fixture must validate",
+        )
+    }
+
+    fn validate_clone(grants: Vec<PolicyGrant>) -> Result<(), SecurityError> {
+        let snapshot = snapshot_with_grants(grants);
+        let policy = fixture(snapshot.compile(), "clone policy fixture must compile");
+        policy.validate_namespace_copy_no_widening(&namespace("source"), &namespace("target"))
+    }
+
+    #[test]
+    fn derived_copy_allows_denied_or_equally_constrained_target_reads() {
+        let target_denied = validate_clone(vec![grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "namespace", "namespace": "source"},
+            "actions": {"kind": "selected", "actions": ["Query", "VectorFetch"]},
+            "mandatory_filter": {"op": "eq", "field": "tenant_id", "value": "acme"}
+        }))]);
+        assert!(target_denied.is_ok());
+
+        let equal = validate_clone(vec![grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "global"},
+            "actions": {"kind": "selected", "actions": ["Query", "VectorFetch"]},
+            "mandatory_filter": {"op": "eq", "field": "tenant_id", "value": "acme"},
+            "field_mask": {"deny": ["ssn"]}
+        }))]);
+        assert!(equal.is_ok());
+    }
+
+    #[test]
+    fn derived_copy_rejects_new_target_read_or_dropped_source_conjunct() {
+        let target_only = validate_clone(vec![grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "namespace", "namespace": "target"},
+            "actions": {"kind": "selected", "actions": ["VectorFetch"]}
+        }))]);
+        assert!(matches!(
+            target_only,
+            Err(SecurityError::ConstraintViolation)
+        ));
+
+        let dropped = validate_clone(vec![
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "global"},
+                "actions": {"kind": "selected", "actions": ["Query"]}
+            })),
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "namespace", "namespace": "source"},
+                "actions": {"kind": "selected", "actions": ["Query"]},
+                "mandatory_filter": {"op": "eq", "field": "tenant_id", "value": "acme"}
+            })),
+        ]);
+        assert!(matches!(dropped, Err(SecurityError::ConstraintViolation)));
+    }
+
+    #[test]
+    fn derived_copy_accepts_extra_target_conjunct_and_field_mask() {
+        let result = validate_clone(vec![
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "global"},
+                "actions": {"kind": "selected", "actions": ["Query"]},
+                "mandatory_filter": {"op": "eq", "field": "tenant_id", "value": "acme"},
+                "field_mask": {"deny": ["ssn"]}
+            })),
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "namespace", "namespace": "target"},
+                "actions": {"kind": "selected", "actions": ["Query"]},
+                "mandatory_filter": {"op": "eq", "field": "region", "value": "west"},
+                "field_mask": {"deny": ["salary"]}
+            })),
+        ]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn derived_copy_rejects_target_field_mask_that_drops_source_denial() {
+        let result = validate_clone(vec![
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "global"},
+                "actions": {"kind": "selected", "actions": ["Query"]}
+            })),
+            grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "namespace", "namespace": "source"},
+                "actions": {"kind": "selected", "actions": ["Query"]},
+                "field_mask": {"deny": ["ssn"]}
+            })),
+        ]);
+        assert!(matches!(result, Err(SecurityError::ConstraintViolation)));
+    }
+
+    #[test]
+    fn derived_copy_rejects_target_only_control_observation_and_write_oracles() {
+        for action in ["CompactionStatusRead", "CompactionTrigger", "VectorUpsert"] {
+            let result = validate_clone(vec![grant(json!({
+                "principal_id": "zpk1_reader",
+                "scope": {"kind": "namespace", "namespace": "target"},
+                "actions": {"kind": "selected", "actions": [action]},
+                "mandatory_filter": {"op": "eq", "field": "tenant_id", "value": "acme"}
+            }))]);
+            assert!(
+                matches!(result, Err(SecurityError::ConstraintViolation)),
+                "target-only {action} must not observe or mutate a raw clone"
+            );
+        }
+    }
 }

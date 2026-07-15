@@ -2,13 +2,34 @@
   "actions": {
     "actions": [
       "NamespaceRead",
-      "Query"
+      "Query",
+      "VectorUpsert"
     ],
     "kind": "selected"
+  },
+  "field_mask": {
+    "deny": [
+      "salary",
+      "ssn"
+    ]
+  },
+  "mandatory_filter": {
+    "field": "tenant_id",
+    "op": "eq",
+    "value": "acme"
   },
   "principal_id": "service:contract",
   "scope": {
     "kind": "namespace",
     "namespace": "contract-main"
+  },
+  "write_constraints": {
+    "forbid_set": [
+      "classification",
+      "is_public"
+    ],
+    "stamp": {
+      "tenant_id": "acme"
+    }
   }
 }

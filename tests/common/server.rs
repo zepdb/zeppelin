@@ -205,6 +205,7 @@ async fn test_security_runtime_with_admin_bearer(
 }
 
 fn inject_test_admin(config: &mut Config, existing_admin_bearer: Option<&str>) -> String {
+    config.security.set_cursor_hmac_key_hex("42".repeat(32));
     let secret = match existing_admin_bearer {
         Some(bearer) => {
             let secret = bearer

@@ -132,7 +132,7 @@
 //! every storage, decoding, and invariant failure explicit, while exhaustive
 //! `match` expressions force both consistency modes to be handled.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use axum::extract::{Extension, Path, State};
@@ -143,16 +143,21 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{info, instrument};
 
 use crate::error::ZeppelinError;
+use crate::index::filter::{combine_filters, evaluate_filter};
 use crate::index::ivf_flat::build::{
     attrs_key, cluster_key, deserialize_attrs, deserialize_cluster_from_object,
 };
 use crate::index::ivf_flat::membership::deserialize_membership;
+use crate::namespace::manager::NamespaceMetadata;
 use crate::query;
-use crate::security::{AllowDecision, AuditParams, NamespaceId};
+use crate::security::{
+    apply_field_mask, filter_matches_write_scope, filter_references_denied_field, AllowDecision,
+    AuditParams, FieldMask, NamespaceId, SecurityError,
+};
 use crate::server::{AppState, AuditRequest};
-use crate::types::{AttributeValue, ConsistencyLevel, VectorEntry, VectorId};
+use crate::types::{AttributeValue, ConsistencyLevel, Filter, VectorEntry, VectorId};
 use crate::wal::manifest::SegmentRef;
-use crate::wal::{FragmentCachePolicy, Manifest};
+use crate::wal::{FragmentCachePolicy, Manifest, ManifestAppendGuard};
 
 use super::ApiError;
 
@@ -175,7 +180,31 @@ use super::ApiError;
 pub struct UpsertVectorsRequest {
     /// Ordered entries to append as one WAL write; the handler rejects an empty
     /// or oversized batch and validates every ID, coordinate, and dimension.
-    pub vectors: Vec<VectorEntry>,
+    pub vectors: Vec<UpsertVectorInput>,
+}
+
+/// One row-oriented upsert input before server-owned identity resolution.
+#[derive(Debug, Deserialize)]
+pub struct UpsertVectorInput {
+    /// Existing caller-visible ID to update. A constrained create omits this
+    /// field and receives an opaque server-owned ID in the response.
+    #[serde(default)]
+    pub id: Option<VectorId>,
+    /// Dense coordinates validated against the namespace dimension.
+    pub values: Vec<f32>,
+    /// Optional metadata subject to policy stamps and write constraints.
+    #[serde(default)]
+    pub attributes: Option<HashMap<String, AttributeValue>>,
+}
+
+impl UpsertVectorInput {
+    fn into_vector_entry(self, id: VectorId) -> VectorEntry {
+        VectorEntry {
+            id,
+            values: self.values,
+            attributes: self.attributes,
+        }
+    }
 }
 
 /// MessagePack envelope accepting exactly one ingestion representation.
@@ -194,7 +223,7 @@ pub struct UpsertVectorsRequest {
 #[serde(deny_unknown_fields)]
 struct MessagePackUpsertRequest {
     /// Conventional row records, equivalent to JSON's `vectors` array.
-    vectors: Option<Vec<VectorEntry>>,
+    vectors: Option<Vec<UpsertVectorInput>>,
     /// Compact columnar records with all coordinates in one little-endian byte
     /// string.
     columnar: Option<ColumnarUpsertRequest>,
@@ -237,6 +266,20 @@ struct ColumnarUpsertRequest {
 pub struct UpsertVectorsResponse {
     /// Number of entries appended from the accepted request batch.
     pub upserted: usize,
+    /// Server-owned identities returned in request-index order for rows whose
+    /// input omitted `id`. Existing explicit-ID responses keep their historical
+    /// shape by omitting this empty collection.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub generated_ids: Vec<GeneratedVectorId>,
+}
+
+/// Correlates one server-owned vector ID with its request position.
+#[derive(Debug, Serialize)]
+pub struct GeneratedVectorId {
+    /// Zero-based index in the submitted `vectors` array.
+    pub index: usize,
+    /// Opaque stable ID used for future fetch, update, and delete operations.
+    pub id: VectorId,
 }
 
 /// Request body for appending vector tombstones by ID.
@@ -250,11 +293,16 @@ pub struct UpsertVectorsResponse {
 /// `{"ids":["item-7","item-8"]}` makes both IDs absent from later strong
 /// reads after the manifest commit, whether or not either ID existed before.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteVectorsRequest {
     /// Tombstone IDs stored in request order. The handler requires at least one
     /// ID and applies the shared configured length and ASCII syntax rules.
     /// Duplicate IDs remain accepted and retain their request order.
-    pub ids: Vec<VectorId>,
+    #[serde(default)]
+    pub ids: Option<Vec<VectorId>>,
+    /// Exact attribute predicate selecting live records to tombstone.
+    #[serde(default)]
+    pub filter: Option<Filter>,
 }
 
 /// Request body for ordered point lookup with explicit projection and freshness.
@@ -437,10 +485,11 @@ fn default_true() -> bool {
 /// references here; C would require an explicit ownership-transfer convention.
 /// The `?`-style conversions are written with `map_err` where the boundary must
 /// wrap a domain error as [`ApiError`].
-#[instrument(skip(state, _decision, headers, body), fields(namespace = %ns))]
+#[instrument(skip(state, decision, audit, headers, body), fields(namespace = %ns))]
 pub async fn upsert_vectors(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
+    Extension(audit): Extension<AuditRequest>,
     Path(ns): Path<String>,
     headers: HeaderMap,
     body: bytes::Bytes,
@@ -459,46 +508,85 @@ pub async fn upsert_vectors(
         }));
     }
 
-    for vec in &req.vectors {
-        if vec.id.is_empty() {
-            return Err(ApiError(ZeppelinError::Validation(
-                "vector id cannot be empty".into(),
-            )));
-        }
-        if vec.id.len() > state.config.server.max_vector_id_length {
-            return Err(ApiError(ZeppelinError::Validation(format!(
-                "vector id length {} exceeds maximum of {}",
-                vec.id.len(),
-                state.config.server.max_vector_id_length
-            ))));
-        }
-        if !is_valid_vector_id(&vec.id) {
-            return Err(ApiError(ZeppelinError::Validation(format!(
-                "vector id '{}' contains invalid characters; \
-                 only alphanumeric, dash, underscore, and dot are allowed",
-                vec.id
-            ))));
+    for vector in &req.vectors {
+        if let Some(id) = vector.id.as_ref() {
+            if id.is_empty() {
+                return Err(ApiError(ZeppelinError::Validation(
+                    "vector id cannot be empty".into(),
+                )));
+            }
+            if id.len() > state.config.server.max_vector_id_length {
+                return Err(ApiError(ZeppelinError::Validation(format!(
+                    "vector id length {} exceeds maximum of {}",
+                    id.len(),
+                    state.config.server.max_vector_id_length
+                ))));
+            }
+            if !is_valid_vector_id(id) {
+                return Err(ApiError(ZeppelinError::Validation(format!(
+                    "vector id '{id}' contains invalid characters; \
+                     only alphanumeric, dash, underscore, and dot are allowed"
+                ))));
+            }
         }
         // Reject NaN/inf before anything durable is written: one non-finite
         // value poisons distance orderings and k-means centroids permanently.
-        if let Some((dim_idx, kind)) = super::find_non_finite(&vec.values) {
+        if let Some((dim_idx, kind)) = super::find_non_finite(&vector.values) {
+            let identity = vector.id.as_deref().unwrap_or("<server-owned>");
             return Err(ApiError(ZeppelinError::Validation(format!(
                 "vector '{}' contains a non-finite value ({kind}) at dimension {dim_idx}",
-                vec.id
+                identity
             ))));
         }
     }
 
-    info!(count = req.vectors.len(), "upserting vectors");
+    let count = req.vectors.len();
+    let mut generated_ids = Vec::new();
+    let mut server_owned_ids = BTreeSet::new();
+    let mut vectors = Vec::with_capacity(count);
+    for (index, vector) in req.vectors.into_iter().enumerate() {
+        let id = match vector.id.as_ref() {
+            Some(id) => id.clone(),
+            None if decision.mandatory_filter.is_some() => {
+                let id = generate_server_owned_vector_id(state.config.server.max_vector_id_length)?;
+                generated_ids.push(GeneratedVectorId {
+                    index,
+                    id: id.clone(),
+                });
+                server_owned_ids.insert(id.clone());
+                id
+            }
+            None => {
+                return Err(ApiError(ZeppelinError::Validation(
+                    "vector id is required unless a mandatory write scope authorizes server-owned creation"
+                        .into(),
+                )));
+            }
+        };
+        vectors.push(vector.into_vector_entry(id));
+    }
+    audit.set_params(AuditParams::vector_upsert(
+        NamespaceId::new(ns.clone()).map_err(ZeppelinError::from)?,
+        count,
+        decision.is_attribute_admin_write(),
+    ));
 
-    // Validate namespace exists and check dimensions
-    let meta = state
-        .namespace_manager
-        .get(&ns)
-        .await
-        .map_err(ApiError::from)?;
+    info!(count, "upserting vectors");
 
-    for vec in &req.vectors {
+    // Derived-row security checks require metadata from authoritative S3, not
+    // a disposable registry snapshot. This also performs the one-time CAS
+    // migration for namespaces created before incarnation metadata existed.
+    let meta = if upsert_requires_existing_rows(&decision) {
+        state
+            .namespace_manager
+            .get_active_metadata_for_guarded_write(&ns)
+            .await
+    } else {
+        state.namespace_manager.get(&ns).await
+    }
+    .map_err(ApiError::from)?;
+
+    for vec in &vectors {
         if vec.values.len() != meta.dimensions {
             // Name the offending vector: in a 50k-vector batch, "expected
             // 128, got 64" alone leaves the client hunting for the bad entry.
@@ -511,15 +599,30 @@ pub async fn upsert_vectors(
         }
     }
 
-    let count = req.vectors.len();
+    let manifest_guard = apply_upsert_security_constraints(
+        &state,
+        &ns,
+        &meta,
+        &mut vectors,
+        &server_owned_ids,
+        &decision,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
     // WalWriter::append now does group commit internally (concurrent appends to
     // one namespace coalesce into a shared manifest CAS), so there is no
     // separate batch-writer path.
-    let (_, manifest) = state
-        .wal_writer
-        .append(&ns, req.vectors, vec![])
-        .await
-        .map_err(ApiError::from)?;
+    let (_, manifest) = match manifest_guard {
+        Some(guard) => {
+            state
+                .wal_writer
+                .append_upserts_if_manifest_unchanged(&ns, vectors, guard)
+                .await
+        }
+        None => state.wal_writer.append(&ns, vectors, vec![]).await,
+    }
+    .map_err(ApiError::from)?;
 
     // Write-through: insert fresh manifest so next query skips S3 GET.
     state.manifest_cache.insert(&ns, manifest);
@@ -527,8 +630,158 @@ pub async fn upsert_vectors(
     info!(upserted = count, "vectors upserted");
     Ok((
         StatusCode::OK,
-        Json(UpsertVectorsResponse { upserted: count }),
+        Json(UpsertVectorsResponse {
+            upserted: count,
+            generated_ids,
+        }),
     ))
+}
+
+/// Generates one opaque vector identity for a constrained create.
+fn generate_server_owned_vector_id(max_vector_id_length: usize) -> Result<VectorId, ApiError> {
+    let id = format!("zv1_{}", ulid::Ulid::new());
+    if id.len() > max_vector_id_length {
+        return Err(ApiError(ZeppelinError::Validation(format!(
+            "server.max_vector_id_length must be at least {} for server-owned vector identities",
+            id.len()
+        ))));
+    }
+    Ok(id)
+}
+
+/// Validates and narrows a whole upsert batch against one authoritative snapshot.
+async fn apply_upsert_security_constraints(
+    state: &AppState,
+    ns: &str,
+    meta: &NamespaceMetadata,
+    vectors: &mut [VectorEntry],
+    server_owned_ids: &BTreeSet<VectorId>,
+    decision: &AllowDecision,
+) -> Result<Option<ManifestAppendGuard>, ZeppelinError> {
+    let constraints = &decision.write_constraints;
+    if vectors.iter().any(|vector| {
+        vector.attributes.as_ref().is_some_and(|attributes| {
+            attributes
+                .keys()
+                .any(|field| constraints.forbidden_fields().contains(field))
+        })
+    }) {
+        return Err(crate::security::SecurityError::ConstraintViolation.into());
+    }
+
+    let needs_existing_rows = upsert_requires_existing_rows(decision);
+    let (existing_rows, guard) = if needs_existing_rows {
+        let expected_incarnation = required_namespace_incarnation(meta, ns)?;
+        let (manifest, storage_version) = Manifest::read_versioned_required_for_incarnation(
+            &state.store,
+            ns,
+            expected_incarnation,
+        )
+        .await?;
+        let guard = ManifestAppendGuard::new(ns, &manifest, storage_version)?;
+        let ids = vectors
+            .iter()
+            .map(|vector| vector.id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let response = fetch_vectors_by_id(
+            state,
+            ns,
+            &ids,
+            ConsistencyLevel::Strong,
+            FetchProjection {
+                include_vector: false,
+                include_attributes: true,
+                attribute_fields: None,
+            },
+            manifest,
+        )
+        .await?;
+        let rows = response
+            .results
+            .into_iter()
+            .map(|record| (record.id, record.attributes))
+            .collect::<HashMap<_, _>>();
+        (rows, Some(guard))
+    } else {
+        (HashMap::new(), None)
+    };
+
+    for vector in vectors {
+        let is_server_owned_create = server_owned_ids.contains(&vector.id);
+        if let Some(existing_attributes) = existing_rows.get(&vector.id) {
+            // A generated identity is a create capability, never an implicit
+            // update. Treat the vanishingly unlikely collision as a denied
+            // batch so it cannot overwrite an existing row.
+            if is_server_owned_create {
+                return Err(crate::security::SecurityError::ConstraintViolation.into());
+            }
+            if decision.mandatory_filter.as_ref().is_some_and(|filter| {
+                !existing_attributes
+                    .as_ref()
+                    .is_some_and(|attributes| filter_matches_write_scope(filter, attributes))
+            }) {
+                return Err(crate::security::SecurityError::ConstraintViolation.into());
+            }
+
+            if let Some(existing_attributes) = existing_attributes {
+                let attributes = vector.attributes.get_or_insert_with(HashMap::new);
+                for field in constraints.forbidden_fields() {
+                    if constraints.stamp().contains_key(field) {
+                        continue;
+                    }
+                    if let Some(value) = existing_attributes.get(field) {
+                        attributes.insert(field.clone(), value.clone());
+                    }
+                }
+            }
+        } else if decision.mandatory_filter.is_some() && !is_server_owned_create {
+            // Caller-chosen identities are update-only inside a mandatory
+            // scope. Denying both an absent ID and a hidden collision closes
+            // the write-side existence oracle; scoped creates receive an
+            // opaque server-owned identity above.
+            return Err(crate::security::SecurityError::ConstraintViolation.into());
+        }
+
+        if !constraints.stamp().is_empty() {
+            let attributes = vector.attributes.get_or_insert_with(HashMap::new);
+            for (field, value) in constraints.stamp() {
+                attributes.insert(field.clone(), value.clone());
+            }
+        }
+
+        if let Some(filter) = decision.mandatory_filter.as_ref() {
+            if !vector
+                .attributes
+                .as_ref()
+                .is_some_and(|attributes| filter_matches_write_scope(filter, attributes))
+            {
+                return Err(crate::security::SecurityError::ConstraintViolation.into());
+            }
+        }
+    }
+    Ok(guard)
+}
+
+/// Returns whether an upsert derives its accepted row from stored attributes.
+fn upsert_requires_existing_rows(decision: &AllowDecision) -> bool {
+    decision.mandatory_filter.is_some() || !decision.write_constraints.forbidden_fields().is_empty()
+}
+
+/// Returns the S3 metadata-backed namespace lifetime required by guarded writes.
+fn required_namespace_incarnation(
+    meta: &NamespaceMetadata,
+    namespace: &str,
+) -> Result<uuid::Uuid, ZeppelinError> {
+    meta.incarnation_id
+        .as_ref()
+        .map(|incarnation| incarnation.as_uuid())
+        .ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "guarded write for namespace {namespace} requires namespace incarnation metadata"
+            ))
+        })
 }
 
 /// Decodes an upsert body according to its normalized media type.
@@ -710,8 +963,8 @@ impl ColumnarUpsertRequest {
             .into_iter()
             .zip(self.values_f32_le.chunks_exact(self.dimensions))
             .zip(attributes)
-            .map(|((id, values), attributes)| VectorEntry {
-                id,
+            .map(|((id, values), attributes)| UpsertVectorInput {
+                id: Some(id),
                 values: values.to_vec(),
                 attributes,
             })
@@ -961,10 +1214,10 @@ where
 /// fragment without cloning every string. Rust prevents this handler from using
 /// that vector afterward. Java has no compiler-enforced move; C would need an
 /// explicit “callee now owns this allocation” rule.
-#[instrument(skip(state, _decision, audit, body), fields(namespace = %ns))]
+#[instrument(skip(state, decision, audit, body), fields(namespace = %ns))]
 pub async fn delete_vectors(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Extension(audit): Extension<AuditRequest>,
     Path(ns): Path<String>,
     body: bytes::Bytes,
@@ -974,42 +1227,232 @@ pub async fn delete_vectors(
             "invalid request body: {e}"
         )))
     })?;
-    if req.ids.is_empty() {
-        return Err(ApiError(ZeppelinError::Validation(
-            "ids array cannot be empty".into(),
-        )));
-    }
-    for id in &req.ids {
-        validate_vector_id_for_request(id, state.config.server.max_vector_id_length)
-            .map_err(ApiError::from)?;
-    }
-
-    info!(count = req.ids.len(), "deleting vectors");
-
-    // Validate namespace exists
-    state
-        .namespace_manager
-        .get(&ns)
-        .await
+    let selection = validate_delete_vectors_request(req, state.config.server.max_vector_id_length)
         .map_err(ApiError::from)?;
 
-    let count = req.ids.len();
+    if let (DeleteSelection::Filter(caller_filter), Some(mask)) =
+        (&selection, decision.field_mask.as_ref())
+    {
+        if filter_references_denied_field(caller_filter, mask.denied_fields()) {
+            return Err(ApiError(SecurityError::ConstraintViolation.into()));
+        }
+    }
+
+    let requires_guard =
+        decision.mandatory_filter.is_some() || matches!(&selection, DeleteSelection::Filter(_));
+    let meta = if requires_guard {
+        state
+            .namespace_manager
+            .get_active_metadata_for_guarded_write(&ns)
+            .await
+    } else {
+        state.namespace_manager.get(&ns).await
+    }
+    .map_err(ApiError::from)?;
+
+    let (delete_ids, guard) = match selection {
+        DeleteSelection::Ids(ids) if decision.mandatory_filter.is_none() => (ids, None),
+        DeleteSelection::Ids(ids) => {
+            let expected_incarnation =
+                required_namespace_incarnation(&meta, &ns).map_err(ApiError::from)?;
+            let (manifest, storage_version) = Manifest::read_versioned_required_for_incarnation(
+                &state.store,
+                &ns,
+                expected_incarnation,
+            )
+            .await
+            .map_err(ApiError::from)?;
+            let guard = ManifestAppendGuard::new(&ns, &manifest, storage_version)
+                .map_err(ApiError::from)?;
+            let filter = decision.mandatory_filter.as_ref().ok_or_else(|| {
+                ApiError(ZeppelinError::Index(
+                    "constrained ID delete lost its mandatory filter".into(),
+                ))
+            })?;
+            let ids = select_requested_ids_matching_filter(&state, &ns, &ids, filter, manifest)
+                .await
+                .map_err(ApiError::from)?;
+            (ids, Some(guard))
+        }
+        DeleteSelection::Filter(caller_filter) => {
+            let expected_incarnation =
+                required_namespace_incarnation(&meta, &ns).map_err(ApiError::from)?;
+            let (manifest, storage_version) = Manifest::read_versioned_required_for_incarnation(
+                &state.store,
+                &ns,
+                expected_incarnation,
+            )
+            .await
+            .map_err(ApiError::from)?;
+            let guard = ManifestAppendGuard::new(&ns, &manifest, storage_version)
+                .map_err(ApiError::from)?;
+            let effective_filter =
+                combine_filters(decision.mandatory_filter.clone(), Some(caller_filter))
+                    .ok_or_else(|| {
+                        ApiError(ZeppelinError::Index(
+                            "filter delete did not produce an effective filter".into(),
+                        ))
+                    })?;
+            let ids = select_all_ids_matching_filter(&state, &ns, &effective_filter, manifest)
+                .await
+                .map_err(ApiError::from)?;
+            (ids, Some(guard))
+        }
+    };
+
+    let count = delete_ids.len();
     audit.set_params(AuditParams::vector_delete(
         NamespaceId::new(ns.clone()).map_err(ZeppelinError::from)?,
-        &req.ids,
+        &delete_ids,
     ));
-    // Group commit lives in WalWriter::append — no separate batch-writer path.
-    let (_, manifest) = state
-        .wal_writer
-        .append(&ns, vec![], req.ids)
-        .await
-        .map_err(ApiError::from)?;
+    if delete_ids.is_empty() {
+        info!(deleted = 0, "no scoped vectors matched delete request");
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    info!(count, "deleting vectors");
+    let (_, manifest) = match guard {
+        Some(guard) => {
+            state
+                .wal_writer
+                .append_deletes_if_manifest_unchanged(&ns, delete_ids, guard)
+                .await
+        }
+        None => state.wal_writer.append(&ns, vec![], delete_ids).await,
+    }
+    .map_err(ApiError::from)?;
 
     // Write-through: insert fresh manifest so next query skips S3 GET.
     state.manifest_cache.insert(&ns, manifest);
 
     info!(deleted = count, "vectors deleted");
     Ok(StatusCode::NO_CONTENT)
+}
+
+enum DeleteSelection {
+    Ids(Vec<VectorId>),
+    Filter(Filter),
+}
+
+fn validate_delete_vectors_request(
+    req: DeleteVectorsRequest,
+    max_vector_id_length: usize,
+) -> Result<DeleteSelection, ZeppelinError> {
+    match (req.ids, req.filter) {
+        (Some(ids), None) => {
+            if ids.is_empty() {
+                return Err(ZeppelinError::Validation(
+                    "ids array cannot be empty".into(),
+                ));
+            }
+            for id in &ids {
+                validate_vector_id_for_request(id, max_vector_id_length)?;
+            }
+            Ok(DeleteSelection::Ids(ids))
+        }
+        (None, Some(filter)) => Ok(DeleteSelection::Filter(filter)),
+        (Some(_), Some(_)) | (None, None) => Err(ZeppelinError::Validation(
+            "delete request must contain exactly one of ids or filter".into(),
+        )),
+    }
+}
+
+async fn select_requested_ids_matching_filter(
+    state: &AppState,
+    ns: &str,
+    requested_ids: &[VectorId],
+    filter: &Filter,
+    manifest: Manifest,
+) -> Result<Vec<VectorId>, ZeppelinError> {
+    let unique_ids = requested_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let response = fetch_vectors_by_id(
+        state,
+        ns,
+        &unique_ids,
+        ConsistencyLevel::Strong,
+        FetchProjection {
+            include_vector: false,
+            include_attributes: true,
+            attribute_fields: None,
+        },
+        manifest,
+    )
+    .await?;
+    let matching = response
+        .results
+        .into_iter()
+        .filter(|record| {
+            record
+                .attributes
+                .as_ref()
+                .is_some_and(|attributes| evaluate_filter(filter, attributes))
+        })
+        .map(|record| record.id)
+        .collect::<HashSet<_>>();
+    Ok(requested_ids
+        .iter()
+        .filter(|id| matching.contains(*id))
+        .cloned()
+        .collect())
+}
+
+async fn select_all_ids_matching_filter(
+    state: &AppState,
+    ns: &str,
+    filter: &Filter,
+    manifest: Manifest,
+) -> Result<Vec<VectorId>, ZeppelinError> {
+    let mut ids = BTreeSet::new();
+    if let Some(segment) = active_segment(&manifest)? {
+        let membership_ref = segment.membership.as_ref().ok_or_else(|| {
+            ZeppelinError::Membership("filter delete requires segment membership artifact".into())
+        })?;
+        let membership = deserialize_membership(&state.store.get(&membership_ref.key).await?)?;
+        ids.extend(membership.entries.into_iter().map(|(id, _)| id));
+    }
+    let fragments = state
+        .wal_reader
+        .read_fragments_from_refs_unchecked(
+            ns,
+            manifest.uncompacted_fragments(),
+            FragmentCachePolicy::ReadWrite(&state.cache),
+        )
+        .await?;
+    for fragment in fragments {
+        ids.extend(fragment.vectors.into_iter().map(|vector| vector.id));
+        ids.extend(fragment.deletes);
+    }
+
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    let response = fetch_vectors_by_id(
+        state,
+        ns,
+        &ids,
+        ConsistencyLevel::Strong,
+        FetchProjection {
+            include_vector: false,
+            include_attributes: true,
+            attribute_fields: None,
+        },
+        manifest,
+    )
+    .await?;
+    Ok(response
+        .results
+        .into_iter()
+        .filter(|record| {
+            record
+                .attributes
+                .as_ref()
+                .is_some_and(|attributes| evaluate_filter(filter, attributes))
+        })
+        .map(|record| record.id)
+        .collect())
 }
 
 /// Fetches live records by ID under an explicit projection and consistency mode.
@@ -1085,10 +1528,10 @@ pub async fn delete_vectors(
 /// the resolver, guaranteeing one stable snapshot across awaits; Java would
 /// rely on convention not to swap a shared object, while C would require
 /// explicit lifetime management.
-#[instrument(skip(state, _decision, body), fields(namespace = %ns))]
+#[instrument(skip(state, decision, body), fields(namespace = %ns))]
 pub async fn get_vectors(
     State(state): State<AppState>,
-    Extension(_decision): Extension<AllowDecision>,
+    Extension(decision): Extension<AllowDecision>,
     Path(ns): Path<String>,
     body: bytes::Bytes,
 ) -> Result<Json<GetVectorsResponse>, ApiError> {
@@ -1115,15 +1558,37 @@ pub async fn get_vectors(
     .await
     .map_err(ApiError::from)?;
 
-    let projection = FetchProjection {
+    let caller_projection = FetchProjection {
         include_vector: req.include_vector,
         include_attributes: req.include_attributes,
         attribute_fields: req.attribute_fields.as_deref(),
     };
-    let response =
-        fetch_vectors_by_id(&state, &ns, &req.ids, req.consistency, projection, manifest)
-            .await
-            .map_err(ApiError::from)?;
+    let storage_projection = if decision.mandatory_filter.is_some() {
+        FetchProjection {
+            include_vector: req.include_vector,
+            include_attributes: true,
+            attribute_fields: None,
+        }
+    } else {
+        caller_projection
+    };
+    let response = fetch_vectors_by_id(
+        &state,
+        &ns,
+        &req.ids,
+        req.consistency,
+        storage_projection,
+        manifest,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    let response = apply_fetch_security_constraints(
+        &req.ids,
+        response,
+        caller_projection,
+        decision.mandatory_filter.as_ref(),
+        decision.field_mask.as_ref(),
+    );
 
     info!(
         found = response.results.len(),
@@ -1131,6 +1596,50 @@ pub async fn get_vectors(
         "vectors fetched"
     );
     Ok(Json(response))
+}
+
+/// Applies row scoping, caller projection, and field masking in request order.
+fn apply_fetch_security_constraints(
+    requested_ids: &[VectorId],
+    response: GetVectorsResponse,
+    caller_projection: FetchProjection<'_>,
+    mandatory_filter: Option<&crate::types::Filter>,
+    field_mask: Option<&FieldMask>,
+) -> GetVectorsResponse {
+    let mut found = response
+        .results
+        .into_iter()
+        .map(|record| (record.id.clone(), record))
+        .collect::<HashMap<_, _>>();
+    let mut results = Vec::with_capacity(found.len());
+    let mut missing = Vec::with_capacity(response.missing.len());
+
+    for id in requested_ids {
+        let Some(mut record) = found.remove(id) else {
+            missing.push(id.clone());
+            continue;
+        };
+        if mandatory_filter.is_some_and(|filter| {
+            !record
+                .attributes
+                .as_ref()
+                .is_some_and(|attributes| evaluate_filter(filter, attributes))
+        }) {
+            missing.push(id.clone());
+            continue;
+        }
+
+        record.attributes = project_attributes(record.attributes, caller_projection);
+        if let (Some(mask), Some(attributes)) = (field_mask, record.attributes.as_mut()) {
+            apply_field_mask(mask, attributes);
+            if attributes.is_empty() {
+                record.attributes = None;
+            }
+        }
+        results.push(record);
+    }
+
+    GetVectorsResponse { results, missing }
 }
 
 /// Validates the cross-field and per-ID contract for point lookup.
@@ -1329,6 +1838,47 @@ pub(crate) async fn fetch_vector_values_by_id(
     let values =
         fetch_vector_values_by_ids(state, ns, &[id.to_string()], consistency, manifest).await?;
     Ok(values.into_iter().next().map(|(_, values)| values))
+}
+
+/// Resolves a stored query seed while enforcing the current mandatory filter.
+pub(crate) async fn fetch_vector_values_by_id_scoped(
+    state: &AppState,
+    ns: &str,
+    id: &str,
+    consistency: ConsistencyLevel,
+    manifest: Manifest,
+    mandatory_filter: Option<&crate::types::Filter>,
+) -> Result<Option<Vec<f32>>, ZeppelinError> {
+    if mandatory_filter.is_none() {
+        return fetch_vector_values_by_id(state, ns, id, consistency, manifest).await;
+    }
+    let projection = FetchProjection {
+        include_vector: true,
+        include_attributes: true,
+        attribute_fields: None,
+    };
+    let response = fetch_vectors_by_id(
+        state,
+        ns,
+        &[id.to_string()],
+        consistency,
+        projection,
+        manifest,
+    )
+    .await?;
+    let Some(record) = response.results.into_iter().next() else {
+        return Ok(None);
+    };
+    if let Some(filter) = mandatory_filter {
+        let matches = record
+            .attributes
+            .as_ref()
+            .is_some_and(|attributes| evaluate_filter(filter, attributes));
+        if !matches {
+            return Ok(None);
+        }
+    }
+    Ok(record.values)
 }
 
 /// Resolves full vector coordinates for a set of IDs without HTTP response data.

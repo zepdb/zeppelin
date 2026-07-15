@@ -448,7 +448,7 @@ async fn clone_pruned_generation_returns_410_without_creating_target() {
 }
 
 #[tokio::test]
-async fn clone_copy_failure_cleans_target_and_allows_retry() {
+async fn clone_copy_failure_retains_activated_target_and_blocks_retry() {
     let harness = common::harness::TestHarness::new().await;
     let (failing_store, failures) = fail_copy_once_matching(&harness.store, "/wal/");
     let (base_url, _cache, _cache_dir, admin_bearer) =
@@ -489,15 +489,15 @@ async fn clone_copy_failure_cleans_target_and_allows_retry() {
         .send()
         .await
         .unwrap();
-    assert_eq!(get_target.status(), StatusCode::NOT_FOUND);
+    assert_eq!(get_target.status(), StatusCode::OK);
     assert!(
-        harness
+        !harness
             .store
             .list_prefix(&format!("{target}/"))
             .await
             .unwrap()
             .is_empty(),
-        "failed clone must remove target meta and partially copied objects"
+        "failed clone must retain the activated target instead of racing concurrent writes"
     );
     assert!(
         NamedSnapshot::list(&harness.store, &source)
@@ -510,10 +510,8 @@ async fn clone_copy_failure_cleans_target_and_allows_retry() {
 
     let (retry_status, retry_body) =
         clone_namespace(&client, &base_url, &source, &target, &generation).await;
-    assert_eq!(retry_status, StatusCode::CREATED);
-    assert_eq!(retry_body["target"], target);
-    let target_ids = query_ids(&client, &base_url, &target, [0.0, 0.0]).await;
-    assert_eq!(target_ids.first().unwrap(), "copy-me");
+    assert_eq!(retry_status, StatusCode::CONFLICT);
+    assert_eq!(retry_body["code"], "NAMESPACE_ALREADY_EXISTS");
 
     cleanup_ns(&harness.store, &source).await;
     cleanup_ns(&harness.store, &target).await;
@@ -521,7 +519,7 @@ async fn clone_copy_failure_cleans_target_and_allows_retry() {
 }
 
 #[tokio::test]
-async fn clone_copy_collision_surfaces_storage_error_and_cleans_target() {
+async fn clone_copy_collision_surfaces_storage_error_and_retains_target() {
     let (base_url, harness, admin_bearer) = start_test_server().await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
@@ -576,10 +574,10 @@ async fn clone_copy_collision_surfaces_storage_error_and_cleans_target() {
         .send()
         .await
         .unwrap();
-    assert_eq!(get_target.status(), StatusCode::NOT_FOUND);
+    assert_eq!(get_target.status(), StatusCode::OK);
     assert!(
-        !harness.store.exists(&target_key).await.unwrap(),
-        "clone cleanup should remove the colliding target-prefix object"
+        harness.store.exists(&target_key).await.unwrap(),
+        "clone failure must not destructively clean an activated target prefix"
     );
 
     cleanup_ns(&harness.store, &source).await;

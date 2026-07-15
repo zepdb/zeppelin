@@ -265,7 +265,7 @@ pub struct SearchResult {
 /// C would use a tagged union plus manually managed child pointers. Rust's enum
 /// makes the set of operations closed and frees the full tree through RAII.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Filter {
     /// Matches when the named field equals the supplied value under attribute comparison rules.
     Eq {
