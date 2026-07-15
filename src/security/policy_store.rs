@@ -1,5 +1,6 @@
 //! S3-authoritative loading and atomic bootstrap of security policy.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -10,7 +11,7 @@ use crate::config::SecurityConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::storage::{ConditionalPutOutcome, CreateOnlyOutcome, ZeppelinStore};
 
-use super::{PolicyHead, PolicySnapshot, SecurityError};
+use super::{Entitlements, Feature, PolicyHead, PolicySnapshot, SecurityError};
 
 const POLICY_ROOT: &str = "_security";
 const POLICY_HEAD_KEY: &str = "_security/heads/policy.json";
@@ -82,6 +83,7 @@ impl LoadedPolicy {
 #[derive(Clone)]
 pub struct PolicyStore {
     store: ZeppelinStore,
+    entitlements: Arc<Entitlements>,
 }
 
 pub(crate) enum PolicyRefresh {
@@ -97,8 +99,11 @@ pub(crate) enum PolicyPublication {
 impl PolicyStore {
     /// Bind policy authority to the exact reserved `_security/` keyspace.
     #[must_use]
-    pub fn new(store: ZeppelinStore) -> Self {
-        Self { store }
+    pub fn new(store: ZeppelinStore, entitlements: Arc<Entitlements>) -> Self {
+        Self {
+            store,
+            entitlements,
+        }
     }
 
     /// Load the active policy, or atomically bootstrap version 1 from config.
@@ -165,6 +170,7 @@ impl PolicyStore {
         expected_head_etag: &str,
     ) -> Result<PolicyPublication> {
         candidate.validate_for_use()?;
+        self.validate_entitlements(&candidate)?;
         let object_key = format!("{POLICY_ROOT}/policies/{}.json", Ulid::new());
         let snapshot_bytes = serde_json::to_vec(&candidate).map_err(|error| {
             SecurityError::InvalidPolicy(format!("policy snapshot encoding failed: {error}"))
@@ -230,6 +236,7 @@ impl PolicyStore {
                 SecurityError::InvalidPolicy(format!("policy snapshot JSON is invalid: {error}"))
             })?;
         snapshot.validate_for_use()?;
+        self.validate_entitlements(&snapshot)?;
         if snapshot.version() != head.version() || snapshot.checksum() != head.checksum() {
             return Err(SecurityError::InvalidPolicy(
                 "policy head and snapshot identity disagree".to_string(),
@@ -263,6 +270,7 @@ impl PolicyStore {
         }
         let snapshot = PolicySnapshot::from_bootstrap(config, now)?;
         snapshot.validate_for_use()?;
+        self.validate_entitlements(&snapshot)?;
         let object_key = format!("{POLICY_ROOT}/policies/{}.json", Ulid::new());
         let snapshot_bytes = serde_json::to_vec(&snapshot).map_err(|error| {
             SecurityError::InvalidPolicy(format!("policy snapshot encoding failed: {error}"))
@@ -300,6 +308,21 @@ impl PolicyStore {
                 self.load_current().await
             }
         }
+    }
+
+    fn validate_entitlements(&self, snapshot: &PolicySnapshot) -> Result<()> {
+        if snapshot.has_constraints() && !self.entitlements.has(Feature::Constraints) {
+            return Err(SecurityError::FeatureRequired(Feature::Constraints).into());
+        }
+        if self
+            .entitlements
+            .limits()
+            .max_principals
+            .is_some_and(|limit| snapshot.principal_count() > limit as usize)
+        {
+            return Err(SecurityError::LicenseLimitExceeded("max_principals").into());
+        }
+        Ok(())
     }
 }
 

@@ -1,0 +1,7 @@
+{
+  "code": "license_expired",
+  "error": "security management is frozen because the license expired",
+  "request_id": "contract-license_expired_403",
+  "retryable": false,
+  "status": 403
+}

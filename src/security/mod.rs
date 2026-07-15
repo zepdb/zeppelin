@@ -11,7 +11,9 @@ mod authn;
 mod constraints;
 mod context;
 mod decision;
+mod entitlements;
 mod kernel;
+mod license;
 mod policy;
 mod policy_cache;
 mod policy_store;
@@ -34,7 +36,15 @@ pub use decision::{
     AllowDecision, Decision, DecisionId, DenyDecision, DenyReason, FieldMask, Obligation,
     PolicyVersion, WriteConstraints,
 };
+pub use entitlements::{CustomerId, EntitlementLimits, EntitlementSource, Entitlements, Feature};
 pub use kernel::SecurityKernel;
+#[cfg(feature = "managed")]
+pub use license::ControlPlaneResolver;
+pub use license::{
+    canonical_payload_bytes, read_key_file, validate_license_payload, verify_signed_license_bytes,
+    EntitlementResolver, FileLicenseResolver, LicenseError, LicenseLimits, LicensePayload,
+    SignedLicense, LICENSE_PUBKEY,
+};
 pub use policy::{
     ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, KeyState, PolicyGrant,
     PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot,
@@ -100,6 +110,18 @@ pub enum SecurityError {
     /// A required mutation completed without durable audit acknowledgement.
     #[error("durable security audit evidence is unavailable")]
     AuditUnavailable,
+    /// The requested surface is not present in the resolved entitlement set.
+    #[error("feature is not licensed: {0}")]
+    FeatureNotLicensed(Feature),
+    /// Security management is frozen after the license-expiry grace period.
+    #[error("security management is frozen because the license expired")]
+    LicenseExpired,
+    /// An authoritative policy requires a missing enforcement capability.
+    #[error("authoritative security policy requires licensed feature: {0}")]
+    FeatureRequired(Feature),
+    /// An authoritative policy exceeds a signed license capacity limit.
+    #[error("authoritative security policy exceeds licensed limit: {0}")]
+    LicenseLimitExceeded(&'static str),
     /// An authoritative policy object violates its strict schema or invariants.
     #[error("invalid security policy: {0}")]
     InvalidPolicy(String),
@@ -215,7 +237,10 @@ impl SecurityError {
                 | DenyReason::CredentialExpired
                 | DenyReason::CredentialUnknown,
             ) => 401,
-            Self::Authorization(_) => 403,
+            Self::Authorization(_)
+            | Self::FeatureNotLicensed(_)
+            | Self::LicenseExpired
+            | Self::LicenseLimitExceeded(_) => 403,
             Self::ConstraintViolation => 403,
             Self::CursorPolicyStale => 400,
             Self::InvalidNamespaceId | Self::InvalidSnapshotName => 400,
@@ -238,7 +263,8 @@ impl SecurityError {
             | Self::PolicyHeadMissingEtag
             | Self::MissingBootstrapCredentials
             | Self::PolicyObjectCollision
-            | Self::PolicyVersionOverflow => 500,
+            | Self::PolicyVersionOverflow
+            | Self::FeatureRequired(_) => 500,
         }
     }
 
@@ -258,6 +284,10 @@ impl SecurityError {
             Self::PolicyEntityAlreadyExists => "security_entity_exists",
             Self::PolicyEntityNotFound => "security_entity_not_found",
             Self::AuditUnavailable => "audit_unavailable",
+            Self::FeatureNotLicensed(_) => "feature_not_licensed",
+            Self::LicenseExpired => "license_expired",
+            Self::FeatureRequired(_) => "security_internal",
+            Self::LicenseLimitExceeded(_) => "license_limit_exceeded",
             Self::UnmappedRoute => "unmapped_route",
             Self::UnknownAction(_)
             | Self::InvalidPrincipalId
@@ -302,6 +332,15 @@ impl SecurityError {
                 "operation may have completed, but durable audit evidence is unavailable"
                     .to_string()
             }
+            Self::FeatureNotLicensed(feature) => {
+                format!("feature is not licensed: {}", feature.as_str())
+            }
+            Self::LicenseExpired => {
+                "security management is frozen because the license expired".to_string()
+            }
+            Self::LicenseLimitExceeded(limit) => {
+                format!("licensed security limit exceeded: {limit}")
+            }
             Self::UnknownAction(_)
             | Self::InvalidPrincipalId
             | Self::DuplicatePrincipal
@@ -317,7 +356,8 @@ impl SecurityError {
             | Self::PolicyHeadMissingEtag
             | Self::MissingBootstrapCredentials
             | Self::PolicyObjectCollision
-            | Self::PolicyVersionOverflow => "an internal security error occurred".to_string(),
+            | Self::PolicyVersionOverflow
+            | Self::FeatureRequired(_) => "an internal security error occurred".to_string(),
         }
     }
 }

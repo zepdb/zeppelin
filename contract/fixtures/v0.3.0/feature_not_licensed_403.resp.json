@@ -1,0 +1,7 @@
+{
+  "code": "feature_not_licensed",
+  "error": "feature is not licensed: rbac",
+  "request_id": "contract-feature_not_licensed_403",
+  "retryable": false,
+  "status": 403
+}

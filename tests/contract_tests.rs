@@ -5,7 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{TimeZone, Utc};
-use common::server::{cleanup_ns, client_with_bearer, start_test_server_with_config};
+use common::server::{
+    cleanup_ns, client_with_bearer, expired_test_entitlements, start_test_server_with_config,
+    start_test_server_with_entitlements,
+};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -13,6 +16,7 @@ use zeppelin::config::{ApiKeyConfig, Config};
 use zeppelin::namespace::manager::{
     CompactionHealth, NamespaceIndexConfig, NamespaceMetadata, NamespaceState,
 };
+use zeppelin::security::Entitlements;
 use zeppelin::types::{DistanceMetric, IndexType};
 use zeppelin::wal::Manifest;
 
@@ -69,6 +73,8 @@ const FEATURE_GATED_ROUTED_OPERATIONS: &[(&str, &str)] = &[("get", "/debug/pprof
 const FIXTURE_CASES: &[&str] = &[
     "unauthenticated_401",
     "forbidden_403",
+    "feature_not_licensed_403",
+    "license_expired_403",
     "readyz_gated_401",
     "security_create_principal",
     "security_list_principals",
@@ -737,6 +743,7 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
 
     let mut fixtures =
         security_error_fixtures(&unauthenticated_client, &forbidden_client, &base_url).await;
+    fixtures.extend(entitlement_error_fixtures().await);
     fixtures.extend(security_admin_fixtures(&client, &base_url).await);
 
     fixtures.push(
@@ -1043,6 +1050,53 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
     drop(cache_dir);
 
     fixtures
+}
+
+async fn entitlement_error_fixtures() -> Vec<Fixture> {
+    let request = json!({
+        "principal_id": "zpk1_test_admin",
+        "name": "contract-license-probe"
+    });
+    let (community_url, community_harness, _cache, community_cache_dir, community_bearer) =
+        start_test_server_with_entitlements(Config::default(), Entitlements::community()).await;
+    let community = capture_json(
+        &client_with_bearer(&community_bearer),
+        &community_url,
+        "feature_not_licensed_403",
+        "post",
+        "/v1/security/keys",
+        "/v1/security/keys",
+        403,
+        request.clone(),
+        request.clone(),
+        &[],
+        &[],
+    )
+    .await;
+    community_harness.cleanup().await;
+    drop(community_cache_dir);
+
+    let expired = expired_test_entitlements();
+    let (expired_url, expired_harness, _cache, expired_cache_dir, expired_bearer) =
+        start_test_server_with_entitlements(Config::default(), expired).await;
+    let frozen = capture_json(
+        &client_with_bearer(&expired_bearer),
+        &expired_url,
+        "license_expired_403",
+        "post",
+        "/v1/security/keys",
+        "/v1/security/keys",
+        403,
+        request.clone(),
+        request,
+        &[],
+        &[],
+    )
+    .await;
+    expired_harness.cleanup().await;
+    drop(expired_cache_dir);
+
+    vec![community, frozen]
 }
 
 async fn security_error_fixtures(
@@ -1513,6 +1567,7 @@ fn fixture_from_response(
     replacements: &[(String, String)],
 ) -> Fixture {
     normalize_contract_value(&mut response, replacements, &[]);
+    normalize_fixture_order(name, &mut response);
     Fixture {
         name,
         method,
@@ -2059,6 +2114,7 @@ async fn capture_json(
     let (status, mut response) =
         send_json(client, base_url, method, actual_path, name, actual_request).await;
     normalize_contract_value(&mut response, replacements, cursor_tokens);
+    normalize_fixture_order(name, &mut response);
     assert_eq!(
         status, expected_status,
         "fixture {name} expected status {expected_status}, got {status}: {response}"
@@ -2070,6 +2126,15 @@ async fn capture_json(
         status,
         request: canonical_request,
         response,
+    }
+}
+
+fn normalize_fixture_order(name: &str, response: &mut Value) {
+    if name == "security_list_keys" {
+        response["keys"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("security_list_keys response must contain a key array"))
+            .sort_by(|left, right| left["key_id"].as_str().cmp(&right["key_id"].as_str()));
     }
 }
 
@@ -2370,6 +2435,14 @@ fn assert_response_contract_shape(fixture: &Fixture) {
             "forbidden_403" => {
                 assert_eq!(fixture.response["code"], "forbidden");
                 assert_eq!(fixture.response["error"], "access forbidden");
+                assert_eq!(fixture.response["retryable"], false);
+            }
+            "feature_not_licensed_403" => {
+                assert_eq!(fixture.response["code"], "feature_not_licensed");
+                assert_eq!(fixture.response["retryable"], false);
+            }
+            "license_expired_403" => {
+                assert_eq!(fixture.response["code"], "license_expired");
                 assert_eq!(fixture.response["retryable"], false);
             }
             "error_constraint_violation_403" => {

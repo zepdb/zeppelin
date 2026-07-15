@@ -11,8 +11,8 @@ use zeppelin::config::Config;
 use zeppelin::error::ZeppelinError;
 use zeppelin::metrics::AUTHZ_DENIALS_TOTAL;
 use zeppelin::security::{
-    Action, ApiKeyId, Decision, DenyReason, KeyState, PolicyHead, PolicySnapshot, RequestContext,
-    Resource, SecurityKernel,
+    Action, ApiKeyId, Decision, DenyReason, Entitlements, Feature, KeyState, PolicyHead,
+    PolicySnapshot, RequestContext, Resource, SecurityKernel,
 };
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::{Clock, TimeSource};
@@ -25,12 +25,17 @@ use common::harness::TestHarness;
 use common::server::{
     client_with_bearer, start_test_server_full,
     start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer, test_admin_bearer,
+    test_entitlements,
 };
 
 fn scoped_store(harness: &TestHarness) -> ZeppelinStore {
     let scoped_backend =
         PrefixStore::new(harness.store.inner(), Path::from(harness.prefix.clone()));
     ZeppelinStore::new(Arc::new(scoped_backend))
+}
+
+fn full_entitlements() -> Arc<Entitlements> {
+    Arc::new(test_entitlements(Feature::ALL))
 }
 
 #[derive(Debug)]
@@ -264,19 +269,28 @@ async fn delayed_initial_snapshot_load_does_not_reset_freshness_origin() {
     config.security.policy_refresh_secs = 1;
     let admin_bearer = test_admin_bearer(&mut config);
     let clock = Clock::system();
-    let (_seed_kernel, seed_adapter) =
-        SecurityKernel::from_store(store.clone(), &config.security, clock.clone())
-            .await
-            .expect("seed policy runtime must bootstrap");
+    let (_seed_kernel, seed_adapter) = SecurityKernel::from_resolved_entitlements(
+        store.clone(),
+        &config.security,
+        clock.clone(),
+        full_entitlements(),
+    )
+    .await
+    .expect("seed policy runtime must bootstrap");
     let principal = seed_adapter
         .authenticate_bearer(&format!("Bearer {admin_bearer}"), clock.now())
         .expect("bootstrap administrator must authenticate");
 
     let delayed = delay_get_matching(&store, "_security/policies/", Duration::from_millis(2_250));
     let load_started = Instant::now();
-    let (kernel, _adapter) = SecurityKernel::from_store(delayed, &config.security, clock.clone())
-        .await
-        .expect("delayed policy runtime must load the authoritative snapshot");
+    let (kernel, _adapter) = SecurityKernel::from_resolved_entitlements(
+        delayed,
+        &config.security,
+        clock.clone(),
+        full_entitlements(),
+    )
+    .await
+    .expect("delayed policy runtime must load the authoritative snapshot");
     assert!(
         load_started.elapsed() >= Duration::from_secs(2),
         "fault seam must consume the complete 2x refresh budget"
@@ -640,9 +654,14 @@ async fn mutation_reauthorization_uses_fresh_clock_after_overlap_expiry() {
     let initial_now = Utc::now();
     let clock_source = Arc::new(AdjustableSecurityClock::new(initial_now));
     let clock = Clock::from_source(clock_source.clone());
-    let (kernel, adapter) = SecurityKernel::from_store(store, &config.security, clock.clone())
-        .await
-        .expect("S3 policy runtime must start");
+    let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
+        store,
+        &config.security,
+        clock.clone(),
+        full_entitlements(),
+    )
+    .await
+    .expect("S3 policy runtime must start");
     let actor = adapter
         .authenticate_bearer(&format!("Bearer {admin_bearer}"), initial_now)
         .expect("bootstrap administrator must authenticate");
@@ -898,9 +917,14 @@ async fn revoked_credential_cannot_authorize_captured_principal() {
     let mut config = Config::default();
     let admin_bearer = test_admin_bearer(&mut config);
     let clock = Clock::system();
-    let (kernel, adapter) = SecurityKernel::from_store(store, &config.security, clock.clone())
-        .await
-        .expect("S3 policy runtime must start");
+    let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
+        store,
+        &config.security,
+        clock.clone(),
+        full_entitlements(),
+    )
+    .await
+    .expect("S3 policy runtime must start");
     let principal = adapter
         .authenticate_bearer(&format!("Bearer {admin_bearer}"), clock.now())
         .expect("bootstrap administrator must authenticate");
@@ -1751,14 +1775,22 @@ async fn security_admin_read_surfaces_cache_swap_denial_for_handler_audit() {
     config.security.policy_refresh_secs = 1;
     let admin_bearer = test_admin_bearer(&mut config);
     let clock = Clock::system();
-    let (reader_kernel, reader_adapter) =
-        SecurityKernel::from_store(store.clone(), &config.security, clock.clone())
-            .await
-            .expect("reader policy cache must start");
-    let (writer_kernel, writer_adapter) =
-        SecurityKernel::from_store(store, &config.security, clock.clone())
-            .await
-            .expect("writer policy cache must start");
+    let (reader_kernel, reader_adapter) = SecurityKernel::from_resolved_entitlements(
+        store.clone(),
+        &config.security,
+        clock.clone(),
+        full_entitlements(),
+    )
+    .await
+    .expect("reader policy cache must start");
+    let (writer_kernel, writer_adapter) = SecurityKernel::from_resolved_entitlements(
+        store,
+        &config.security,
+        clock.clone(),
+        full_entitlements(),
+    )
+    .await
+    .expect("writer policy cache must start");
     let actor = reader_adapter
         .authenticate_bearer(&format!("Bearer {admin_bearer}"), clock.now())
         .expect("reader actor must authenticate against V1");

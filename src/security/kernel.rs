@@ -13,9 +13,9 @@ use chrono::{DateTime, Utc};
 
 use super::{
     policy_cache::PolicyCache, Action, AllowDecision, ApiKeyAdapter, Decision, DenyDecision,
-    DenyReason, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, NamespaceId, PolicyGrant,
-    PolicyPrincipal, PolicySnapshot, PolicyStore, Principal, PrincipalId, PrincipalKind,
-    RequestContext, Resource, SecurityError, SecurityOperationResult,
+    DenyReason, Entitlements, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, NamespaceId,
+    PolicyGrant, PolicyPrincipal, PolicySnapshot, PolicyStore, Principal, PrincipalId,
+    PrincipalKind, RequestContext, Resource, SecurityError, SecurityOperationResult,
 };
 
 #[derive(Debug)]
@@ -42,11 +42,19 @@ pub struct SecurityKernel {
     mode: SecurityMode,
     authority: SecurityAuthority,
     cursor_binding_key: super::CursorBindingKey,
+    entitlements: Arc<Entitlements>,
 }
 
 impl SecurityKernel {
     /// Compile validated boot configuration into typed, immutable grants.
     pub fn from_config(config: &SecurityConfig) -> Result<Self, SecurityError> {
+        Self::from_config_with_entitlements(config, Arc::new(Entitlements::community()))
+    }
+
+    fn from_config_with_entitlements(
+        config: &SecurityConfig,
+        entitlements: Arc<Entitlements>,
+    ) -> Result<Self, SecurityError> {
         let cursor_binding_key = if config.mode == SecurityMode::OpenUnsafe {
             super::CursorBindingKey::default()
         } else {
@@ -91,23 +99,57 @@ impl SecurityKernel {
             mode: config.mode,
             authority: SecurityAuthority::Bootstrap(grants),
             cursor_binding_key,
+            entitlements,
         })
     }
 
-    /// Build authentication and authorization over one shared policy cache.
-    pub async fn from_store(
+    /// Compose the configured authority selected by verified entitlements.
+    ///
+    /// Community mode keeps boot-config authentication and namespace grants
+    /// without constructing the licensed S3 policy registry. Licensed RBAC
+    /// selects the S3-authoritative policy store and refresh path.
+    pub async fn from_resolved_entitlements(
         store: ZeppelinStore,
         config: &SecurityConfig,
         clock: Clock,
+        entitlements: Arc<Entitlements>,
+    ) -> ZeppelinResult<(Arc<Self>, Arc<ApiKeyAdapter>)> {
+        if !entitlements.has(super::Feature::Rbac) {
+            let now = clock.now();
+            if config.mode == SecurityMode::Enforced
+                && !config
+                    .api_keys
+                    .iter()
+                    .any(|key| key.expires_at.is_none_or(|expires_at| expires_at > now))
+            {
+                return Err(SecurityError::MissingBootstrapCredentials.into());
+            }
+            return Ok((
+                Arc::new(Self::from_config_with_entitlements(config, entitlements)?),
+                Arc::new(ApiKeyAdapter::from_config(config)?),
+            ));
+        }
+        Self::from_store(store, config, clock, entitlements).await
+    }
+
+    /// Build authentication and authorization over one shared policy cache.
+    pub(crate) async fn from_store(
+        store: ZeppelinStore,
+        config: &SecurityConfig,
+        clock: Clock,
+        entitlements: Arc<Entitlements>,
     ) -> ZeppelinResult<(Arc<Self>, Arc<ApiKeyAdapter>)> {
         if config.mode == SecurityMode::OpenUnsafe {
             return Ok((
-                Arc::new(Self::from_config(config)?),
+                Arc::new(Self::from_config_with_entitlements(
+                    config,
+                    Arc::clone(&entitlements),
+                )?),
                 Arc::new(ApiKeyAdapter::from_config(config)?),
             ));
         }
 
-        let policy_store = PolicyStore::new(store);
+        let policy_store = PolicyStore::new(store, Arc::clone(&entitlements));
         let cursor_binding_key =
             super::CursorBindingKey::from_config_hex(config.cursor_hmac_key_hex())?;
         let loaded = policy_store.load_or_bootstrap(config, clock.now()).await?;
@@ -122,9 +164,16 @@ impl SecurityKernel {
                 mode: config.mode,
                 authority: SecurityAuthority::Policy(Arc::clone(&cache)),
                 cursor_binding_key,
+                entitlements,
             }),
             Arc::new(ApiKeyAdapter::from_policy_cache(cache)),
         ))
+    }
+
+    /// Borrow the boot-resolved feature authority used by composition roots.
+    #[must_use]
+    pub fn entitlements(&self) -> &Entitlements {
+        &self.entitlements
     }
 
     /// Decide whether one principal may perform an action on a resource.

@@ -1391,6 +1391,24 @@ impl PolicySnapshot {
     pub fn grants(&self) -> &[PolicyGrant] {
         &self.grants
     }
+
+    /// Return whether any policy binding carries server-owned data constraints.
+    #[must_use]
+    pub fn has_constraints(&self) -> bool {
+        self.grants.iter().any(|grant| {
+            grant.mandatory_filter().is_some()
+                || grant.field_mask().is_some()
+                || grant
+                    .write_constraints()
+                    .is_some_and(|constraints| !constraints.is_empty())
+        })
+    }
+
+    /// Return the number of stable principals in this snapshot.
+    #[must_use]
+    pub fn principal_count(&self) -> usize {
+        self.principals.len()
+    }
 }
 
 fn grant_scope_matches(scope: &GrantScope, resource: &Resource) -> bool {

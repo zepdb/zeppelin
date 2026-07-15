@@ -46,19 +46,19 @@ use tokio::net::TcpListener;
 
 use zeppelin::config::Config;
 use zeppelin::security::AuditRuntime;
-use zeppelin::startup::{build_app, init_logging, resolve_config_path, shutdown_background_tasks};
+use zeppelin::startup::{
+    build_app, init_logging, resolve_config_path, shutdown_background_tasks, BackgroundTasks,
+};
 
 /// Drain owned process services while preserving the primary server result.
 async fn settle_server_and_backgrounds(
     server_result: Result<(), Box<dyn std::error::Error>>,
     audit_runtime: AuditRuntime,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-    compaction_handle: std::thread::JoinHandle<()>,
+    background_tasks: BackgroundTasks,
     shutdown_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let audit_result = audit_runtime.shutdown().await;
-    let background_result =
-        shutdown_background_tasks(shutdown_tx, compaction_handle, shutdown_timeout).await;
+    let background_result = shutdown_background_tasks(background_tasks, shutdown_timeout).await;
 
     if let Err(server_error) = server_result {
         if let Err(audit_error) = &audit_result {
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging(&config);
 
     // Build application (router + background tasks)
-    let (app, shutdown_tx, compaction_handle, audit_runtime) = build_app(config.clone()).await?;
+    let (app, background_tasks, audit_runtime) = build_app(config.clone()).await?;
 
     // Bind and serve
     let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -175,8 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     settle_server_and_backgrounds(
         server_result,
         audit_runtime,
-        shutdown_tx,
-        compaction_handle,
+        background_tasks,
         Duration::from_secs(config.server.shutdown_timeout_secs),
     )
     .await?;
@@ -196,6 +195,7 @@ mod tests {
     use tokio::sync::watch;
 
     use zeppelin::security::{AuditRecord, AuditRuntime};
+    use zeppelin::startup::BackgroundTasks;
     use zeppelin::storage::ZeppelinStore;
 
     use super::settle_server_and_backgrounds;
@@ -209,7 +209,10 @@ mod tests {
             .submit_buffered(AuditRecord::open_unsafe_boot(Utc::now(), audit.node_id()))
             .unwrap();
 
-        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, mut observer_rx) = watch::channel(false);
+        let license_observer = tokio::spawn(async move {
+            let _ = observer_rx.changed().await;
+        });
         let joined = Arc::new(AtomicBool::new(false));
         let joined_by_thread = Arc::clone(&joined);
         let background = std::thread::spawn(move || {
@@ -218,12 +221,12 @@ mod tests {
         });
         let primary: Result<(), Box<dyn std::error::Error>> =
             Err(Box::new(std::io::Error::other("primary serve failure")));
+        let backgrounds = BackgroundTasks::from_parts(shutdown_tx, background, license_observer);
 
         let result = settle_server_and_backgrounds(
             primary,
             audit_runtime,
-            shutdown_tx,
-            background,
+            backgrounds,
             Duration::from_secs(1),
         )
         .await;

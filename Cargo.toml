@@ -9,6 +9,7 @@ rust-version = "1.85"
 [features]
 default = []
 profiling = ["dep:pprof"]
+managed = []
 
 [[bin]]
 name = "zeppelin"
@@ -17,6 +18,12 @@ path = "src/main.rs"
 [[bin]]
 name = "quant_bakeoff"
 path = "src/bin/quant_bakeoff.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "zeppelin_license"
+path = "src/bin/zeppelin_license.rs"
 test = false
 bench = false
 
@@ -60,6 +67,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 sha2 = "0.10"
 subtle = "2"
 base64 = "0.22"
+ed25519-dalek = "2"
 
 # Metrics
 prometheus = { version = "0.14", default-features = false }

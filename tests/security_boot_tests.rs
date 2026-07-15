@@ -350,7 +350,7 @@ mode = "open_unsafe"
     config.cache.dir = temp.path().join("cache");
     config.compaction.interval_secs = 3_600;
 
-    let (_router, shutdown_tx, compaction_handle, audit_runtime) = build_app(config).await.unwrap();
+    let (_router, background_tasks, audit_runtime) = build_app(config).await.unwrap();
 
     assert_eq!(
         zeppelin::metrics::SECURITY_MODE
@@ -366,7 +366,7 @@ mode = "open_unsafe"
     );
 
     audit_runtime.shutdown().await.unwrap();
-    shutdown_background_tasks(shutdown_tx, compaction_handle, Duration::from_secs(1))
+    shutdown_background_tasks(background_tasks, Duration::from_secs(1))
         .await
         .unwrap();
 }

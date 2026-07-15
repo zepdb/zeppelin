@@ -110,6 +110,12 @@ impl AuditClient {
         &self.node_id
     }
 
+    /// Return whether this boot-composed sink can settle durable obligations.
+    #[must_use]
+    pub(crate) const fn supports_durability(&self) -> bool {
+        self.sender.is_some()
+    }
+
     /// Emits and queues one record without waiting for object storage.
     ///
     /// Authentication failures and authorization denials use this method so a
@@ -580,6 +586,7 @@ mod tests {
         else {
             panic!("valid in-memory audit runtime should start");
         };
+        assert!(client.supports_durability());
 
         for index in 0..257 {
             let mut record = AuditRecord::open_unsafe_boot(Utc::now(), "node-a");
@@ -674,6 +681,7 @@ mod tests {
         };
 
         assert_eq!(client.node_id(), "node-a");
+        assert!(!client.supports_durability());
         assert_eq!(
             client.flush().await,
             Err(AuditSinkError::DurabilityDisabled)

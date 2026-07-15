@@ -1,19 +1,20 @@
 //! Production security hot-path measurement for the frozen secured query.
 
 use std::hint::black_box;
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::http::Method;
 use serde::Serialize;
 use zeppelin::config::{Config, SecurityMode};
 use zeppelin::security::{
-    classify_route, CredentialAdapter, Decision, NamespaceId, RequestContext, Resource, RouteClass,
-    SecurityKernel,
+    classify_route, CredentialAdapter, Decision, Feature, NamespaceId, RequestContext, Resource,
+    RouteClass, SecurityKernel,
 };
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
 
-use crate::common::server::bearer_headers;
+use crate::common::server::{bearer_headers, test_entitlements};
 
 use super::contract::{load_contract, SecurityAssertionSpec};
 use super::scenario::RepeatCounters;
@@ -130,12 +131,14 @@ pub async fn measure(input: SecurityMeasureInput<'_>) -> SecurityMeasurement {
         "secured_query must produce object-store counters"
     );
 
-    let (kernel, adapter) =
-        SecurityKernel::from_store(security_store.clone(), &config.security, clock.clone())
-            .await
-            .unwrap_or_else(|error| {
-                panic!("secured performance security authority must load: {error}")
-            });
+    let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
+        security_store.clone(),
+        &config.security,
+        clock.clone(),
+        Arc::new(test_entitlements(Feature::ALL)),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("secured performance security authority must load: {error}"));
     let headers = bearer_headers(measured_bearer);
     let now = clock.now();
     let context = RequestContext::at("secured-query-perf", now);

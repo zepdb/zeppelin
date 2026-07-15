@@ -235,6 +235,12 @@ mod inner {
             &["mode"]
         ).unwrap();
 
+        /// Seconds until the signed license expires; negative values mean expired.
+        pub static ref LICENSE_EXPIRY_SECONDS: IntGauge = register_int_gauge!(
+            "zeppelin_license_expiry_seconds",
+            "Seconds until signed license expiry; negative after expiry"
+        ).unwrap();
+
         /// Authentication failures partitioned only by the bounded failure-reason enum.
         pub static ref AUTH_FAILURES_TOTAL: IntCounterVec = register_int_counter_vec!(
             "zeppelin_auth_failures_total",
@@ -428,6 +434,7 @@ pub fn init() {
     lazy_static::initialize(&FTS_QUERIES_TOTAL);
     lazy_static::initialize(&RATE_LIMITED_TOTAL);
     lazy_static::initialize(&SECURITY_MODE);
+    lazy_static::initialize(&LICENSE_EXPIRY_SECONDS);
     lazy_static::initialize(&AUTH_FAILURES_TOTAL);
     lazy_static::initialize(&AUTHZ_DENIALS_TOTAL);
     lazy_static::initialize(&AUDIT_RECORDS_TOTAL);

@@ -1224,8 +1224,10 @@ components:
       description: |
         The authenticated principal is not authorized for the requested action or
         resource, or the operation violates a server-owned mandatory filter,
-        field mask, or write constraint (403). The canonical error envelope
-        carries a stable denial or `constraint_violation` code.
+        field mask, or write constraint (403). Security-management routes also
+        use this envelope for `feature_not_licensed` when Rbac is absent and
+        `license_expired` when the post-expiry management grace has elapsed.
+        Expiry never disables Rbac, Constraints, or AuditS3 enforcement.
       content:
         application/json:
           schema:

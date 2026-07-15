@@ -8,11 +8,12 @@ use object_store::path::Path;
 use object_store::prefix::PrefixStore;
 use zeppelin::config::Config;
 use zeppelin::error::ZeppelinError;
-use zeppelin::security::{PolicyStore, SecurityError};
+use zeppelin::security::{Feature, PolicyStore, SecurityError};
 use zeppelin::storage::ZeppelinStore;
 
 use common::fault_injection::synchronize_create_pair_matching;
 use common::harness::TestHarness;
+use common::server::test_entitlements;
 
 const BOOTSTRAP_CONFIG: &str = r#"
 [security]
@@ -28,6 +29,10 @@ namespaces = ["*"]
 "#;
 
 const DRIFTED_DIGEST: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+fn policy_store(store: ZeppelinStore) -> PolicyStore {
+    PolicyStore::new(store, Arc::new(test_entitlements(Feature::ALL)))
+}
 
 #[derive(Clone)]
 struct CapturedLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -56,8 +61,8 @@ async fn concurrent_first_boot_loser_reads_winners_authoritative_head() {
     let harness = TestHarness::new().await;
     let (store, race) =
         synchronize_create_pair_matching(&scoped_store(&harness), "_security/heads/policy.json");
-    let first = PolicyStore::new(store.clone());
-    let second = PolicyStore::new(store.clone());
+    let first = policy_store(store.clone());
+    let second = policy_store(store.clone());
     let config = Config::from_str(BOOTSTRAP_CONFIG).expect("valid bootstrap config");
     let boot_time = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
 
@@ -89,7 +94,7 @@ async fn concurrent_first_boot_loser_reads_winners_authoritative_head() {
 #[tokio::test]
 async fn authoritative_policy_allows_enforced_restart_without_bootstrap_keys() {
     let harness = TestHarness::new().await;
-    let policy_store = PolicyStore::new(scoped_store(&harness));
+    let policy_store = policy_store(scoped_store(&harness));
     let boot_time = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
     let bootstrap = Config::from_str(BOOTSTRAP_CONFIG).expect("valid bootstrap config");
     let published = policy_store
@@ -116,7 +121,7 @@ async fn authoritative_policy_allows_enforced_restart_without_bootstrap_keys() {
 async fn first_boot_rejects_missing_bootstrap_credentials() {
     let harness = TestHarness::new().await;
     let store = scoped_store(&harness);
-    let policy_store = PolicyStore::new(store.clone());
+    let policy_store = policy_store(store.clone());
     let boot_time = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
     let empty = Config::from_str(
         "[security]\nmode = \"enforced\"\ncursor_hmac_key_hex = \"1111111111111111111111111111111111111111111111111111111111111111\"\n",
@@ -144,7 +149,7 @@ async fn first_boot_rejects_missing_bootstrap_credentials() {
 async fn first_boot_rejects_only_expired_bootstrap_credentials() {
     let harness = TestHarness::new().await;
     let store = scoped_store(&harness);
-    let policy_store = PolicyStore::new(store.clone());
+    let policy_store = policy_store(store.clone());
     let boot_time = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
     let expired = Config::from_str(
         r#"
@@ -196,7 +201,7 @@ async fn existing_policy_ignores_expired_drifted_config_and_warns_redacted() {
         .expect("bootstrap-authority test binary must not install another tracing subscriber");
 
     let harness = TestHarness::new().await;
-    let policy_store = PolicyStore::new(scoped_store(&harness));
+    let policy_store = policy_store(scoped_store(&harness));
     let boot_time = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
     let bootstrap = Config::from_str(BOOTSTRAP_CONFIG).expect("valid bootstrap config");
     let published = policy_store
