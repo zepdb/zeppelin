@@ -345,6 +345,7 @@ struct AuditRequestState {
     decision: AuditRequestDecision,
     params: AuditParams,
     constraint_denial: bool,
+    approval_principal_id: Option<PrincipalId>,
 }
 
 #[derive(Clone)]
@@ -367,6 +368,7 @@ impl AuditRequest {
                 decision: AuditRequestDecision::Allow(Box::new(decision)),
                 params,
                 constraint_denial: false,
+                approval_principal_id: None,
             })),
         }
     }
@@ -384,6 +386,13 @@ impl AuditRequest {
             .lock()
             .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"))
             .params = params;
+    }
+
+    fn set_approval_principal(&self, principal_id: PrincipalId) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|_| panic!("audit request annotation lock poisoned"))
+            .approval_principal_id = Some(principal_id);
     }
 
     /// Mark a top-level-success batch response that contains authorization denials.
@@ -418,7 +427,6 @@ impl AuditRequest {
         state.action = action;
         state.resource = resource;
         state.decision = AuditRequestDecision::Deny(decision);
-        state.params = AuditParams::AuthzDenial;
         state.constraint_denial = false;
     }
 }
@@ -806,6 +814,7 @@ fn audited_action(action: Action) -> bool {
             | Action::VectorDelete
             | Action::SecurityAdminRead
             | Action::SecurityAdminWrite
+            | Action::CredentialDelegate
     )
 }
 
@@ -984,7 +993,7 @@ async fn finish_audited_request(
     } else {
         audit.params
     };
-    let record = AuditRecord::decision_outcome(
+    let mut record = AuditRecord::decision_outcome(
         state.clock.now(),
         context.request_id.clone(),
         decision_id,
@@ -997,6 +1006,7 @@ async fn finish_audited_request(
         params,
         state.audit.node_id(),
     );
+    record.approval_principal_id = audit.approval_principal_id;
 
     if success && durable_audit {
         if let Err(error) = state.audit.submit_durable(record).await {
@@ -1094,7 +1104,7 @@ pub async fn authorize(
             .security
             .authorize(&principal, action, &resource, &context)
     };
-    let allow = match decision {
+    let mut allow = match decision {
         Decision::Allow(allow) => *allow,
         Decision::Deny(deny) => {
             emit_authorization_denial(
@@ -1102,6 +1112,44 @@ pub async fn authorize(
             );
             return ApiError(SecurityError::Authorization(deny.reason).into()).into_response();
         }
+    };
+
+    let approval_principal = if allow
+        .obligations
+        .contains(&crate::security::Obligation::Approval)
+    {
+        match authorize_approval(
+            &state,
+            request.headers(),
+            &principal,
+            ApprovalCheck {
+                action,
+                resource: &resource,
+                context: &context,
+                expected_policy_version: allow.policy_version,
+                source_ip: source.ip,
+            },
+        ) {
+            Ok((approver, approval)) => {
+                allow.mandatory_filter = crate::index::filter::combine_filters(
+                    allow.mandatory_filter.take(),
+                    approval.mandatory_filter,
+                );
+                Some(approver)
+            }
+            Err(()) => {
+                let deny = DenyDecision::for_policy(
+                    DenyReason::ObligationUnsatisfied,
+                    allow.policy_version,
+                );
+                emit_authorization_denial(
+                    &state, &principal, action, &resource, &context, source.ip, &deny,
+                );
+                return ApiError(SecurityError::ApprovalRequired.into()).into_response();
+            }
+        }
+    } else {
+        None
     };
 
     if action != Action::NamespaceClone
@@ -1177,6 +1225,9 @@ pub async fn authorize(
         )
     });
     request.extensions_mut().insert::<AllowDecision>(allow);
+    if let (Some(audit_request), Some(approver)) = (&audit_request, approval_principal) {
+        audit_request.set_approval_principal(approver.id);
+    }
     if let Some(audit_request) = &audit_request {
         request.extensions_mut().insert(audit_request.clone());
     }
@@ -1195,6 +1246,175 @@ pub async fn authorize(
         }
         None => response,
     }
+}
+
+struct ApprovalCheck<'a> {
+    action: Action,
+    resource: &'a Resource,
+    context: &'a RequestContext,
+    expected_policy_version: crate::security::PolicyVersion,
+    source_ip: IpAddr,
+}
+
+fn authorize_approval(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    actor: &Principal,
+    check: ApprovalCheck<'_>,
+) -> Result<(Principal, AllowDecision), ()> {
+    let ApprovalCheck {
+        action,
+        resource,
+        context,
+        expected_policy_version,
+        source_ip,
+    } = check;
+    let mut values = headers.get_all("x-zeppelin-approval").iter();
+    let value = values.next().ok_or(())?;
+    if values.next().is_some() {
+        emit_approval_authn_failure(
+            state,
+            action,
+            resource,
+            context,
+            expected_policy_version,
+            source_ip,
+            crate::security::AuthnFailure::CredentialUnknown,
+        );
+        return Err(());
+    }
+    let credential = value.to_str().map_err(|_| {
+        emit_approval_authn_failure(
+            state,
+            action,
+            resource,
+            context,
+            expected_policy_version,
+            source_ip,
+            crate::security::AuthnFailure::CredentialUnknown,
+        );
+    })?;
+    if !credential.starts_with("zpk1_") {
+        emit_approval_authn_failure(
+            state,
+            action,
+            resource,
+            context,
+            expected_policy_version,
+            source_ip,
+            crate::security::AuthnFailure::CredentialUnknown,
+        );
+        return Err(());
+    }
+    let authorization = axum::http::HeaderValue::from_str(&format!("Bearer {credential}"))
+        .map_err(|_| {
+            emit_approval_authn_failure(
+                state,
+                action,
+                resource,
+                context,
+                expected_policy_version,
+                source_ip,
+                crate::security::AuthnFailure::CredentialUnknown,
+            );
+        })?;
+    let mut approval_headers = axum::http::HeaderMap::new();
+    approval_headers.insert(axum::http::header::AUTHORIZATION, authorization);
+    let authentication = state
+        .credential_adapter
+        .authenticate_with_policy(&approval_headers, context.now);
+    if !authentication.policy_fresh || authentication.policy_version != expected_policy_version {
+        let deny =
+            DenyDecision::for_policy(DenyReason::SecurityStale, authentication.policy_version);
+        emit_authorization_denial(
+            state,
+            &Principal::anonymous(),
+            action,
+            resource,
+            context,
+            source_ip,
+            &deny,
+        );
+        return Err(());
+    }
+    let approver = authentication.result.map_err(|failure| {
+        emit_approval_authn_failure(
+            state,
+            action,
+            resource,
+            context,
+            authentication.policy_version,
+            source_ip,
+            failure,
+        );
+    })?;
+    if approver.id == actor.id
+        || actor
+            .delegation_parent
+            .as_ref()
+            .is_some_and(|parent| parent == &approver.id)
+    {
+        let deny =
+            DenyDecision::for_policy(DenyReason::ObligationUnsatisfied, expected_policy_version);
+        emit_authorization_denial(
+            state, &approver, action, resource, context, source_ip, &deny,
+        );
+        return Err(());
+    }
+    let approval = match state
+        .security
+        .authorize(&approver, action, resource, context)
+    {
+        Decision::Allow(approval) => approval,
+        Decision::Deny(deny) => {
+            emit_authorization_denial(
+                state, &approver, action, resource, context, source_ip, &deny,
+            );
+            return Err(());
+        }
+    };
+    if approval
+        .obligations
+        .contains(&crate::security::Obligation::Approval)
+        || approval.policy_version != expected_policy_version
+    {
+        let reason = if approval.policy_version != expected_policy_version {
+            DenyReason::SecurityStale
+        } else {
+            DenyReason::ObligationUnsatisfied
+        };
+        let deny = DenyDecision::for_policy(reason, approval.policy_version);
+        emit_authorization_denial(
+            state, &approver, action, resource, context, source_ip, &deny,
+        );
+        return Err(());
+    }
+    Ok((approver, *approval))
+}
+
+fn emit_approval_authn_failure(
+    state: &AppState,
+    action: Action,
+    resource: &Resource,
+    context: &RequestContext,
+    policy_version: crate::security::PolicyVersion,
+    source_ip: IpAddr,
+    failure: crate::security::AuthnFailure,
+) {
+    crate::metrics::AUTH_FAILURES_TOTAL
+        .with_label_values(&[failure.code()])
+        .inc();
+    let record = AuditRecord::authn_failure(
+        state.clock.now(),
+        context.request_id.clone(),
+        action,
+        ResourceRef::from(resource),
+        policy_version,
+        source_ip,
+        failure,
+        state.audit.node_id(),
+    );
+    submit_buffered_audit(&state.audit, record);
 }
 
 /// Return whether one action has a handler that consumes row/data constraints.
@@ -2008,6 +2228,12 @@ async fn feature_not_licensed() -> Result<(), ApiError> {
     ))
 }
 
+async fn delegation_not_licensed() -> Result<(), ApiError> {
+    Err(ApiError(
+        SecurityError::FeatureNotLicensed(Feature::Delegation).into(),
+    ))
+}
+
 async fn enforce_security_management_license(
     State(state): State<AppState>,
     request: Request<axum::body::Body>,
@@ -2034,8 +2260,8 @@ fn license_gated_security_mutation(
 }
 
 fn security_routes(state: &AppState) -> Router<AppState> {
-    if !state.security.entitlements().has(Feature::Rbac) {
-        return Router::new()
+    let rbac_routes = if !state.security.entitlements().has(Feature::Rbac) {
+        Router::new()
             .route(
                 "/v1/security/principals",
                 secure_route(get(feature_not_licensed).post(feature_not_licensed), state),
@@ -2064,54 +2290,80 @@ fn security_routes(state: &AppState) -> Router<AppState> {
             .route(
                 "/v1/security/policy",
                 secure_route(get(feature_not_licensed), state),
-            );
-    }
-
-    Router::new()
-        .route(
-            "/v1/security/principals",
-            secure_route(get(security_handler::list_principals), state).merge(secure_route(
-                license_gated_security_mutation(post(security_handler::create_principal), state),
-                state,
-            )),
-        )
-        .route(
-            "/v1/security/keys",
-            secure_route(get(security_handler::list_keys), state).merge(secure_route(
-                license_gated_security_mutation(post(security_handler::create_key), state),
-                state,
-            )),
-        )
-        .route(
-            "/v1/security/keys/:key_id",
-            secure_route(
-                license_gated_security_mutation(delete(security_handler::revoke_key), state),
-                state,
-            ),
-        )
-        .route(
-            "/v1/security/keys/:key_id/rotate",
-            secure_route(
-                license_gated_security_mutation(post(security_handler::rotate_key), state),
-                state,
-            ),
-        )
-        .route(
-            "/v1/security/grants",
-            secure_route(get(security_handler::list_grants), state)
-                .merge(secure_route(
-                    license_gated_security_mutation(post(security_handler::create_grant), state),
-                    state,
-                ))
-                .merge(secure_route(
-                    license_gated_security_mutation(delete(security_handler::delete_grant), state),
+            )
+    } else {
+        Router::new()
+            .route(
+                "/v1/security/principals",
+                secure_route(get(security_handler::list_principals), state).merge(secure_route(
+                    license_gated_security_mutation(
+                        post(security_handler::create_principal),
+                        state,
+                    ),
                     state,
                 )),
+            )
+            .route(
+                "/v1/security/keys",
+                secure_route(get(security_handler::list_keys), state).merge(secure_route(
+                    license_gated_security_mutation(post(security_handler::create_key), state),
+                    state,
+                )),
+            )
+            .route(
+                "/v1/security/keys/:key_id",
+                secure_route(
+                    license_gated_security_mutation(delete(security_handler::revoke_key), state),
+                    state,
+                ),
+            )
+            .route(
+                "/v1/security/keys/:key_id/rotate",
+                secure_route(
+                    license_gated_security_mutation(post(security_handler::rotate_key), state),
+                    state,
+                ),
+            )
+            .route(
+                "/v1/security/grants",
+                secure_route(get(security_handler::list_grants), state)
+                    .merge(secure_route(
+                        license_gated_security_mutation(
+                            post(security_handler::create_grant),
+                            state,
+                        ),
+                        state,
+                    ))
+                    .merge(secure_route(
+                        license_gated_security_mutation(
+                            delete(security_handler::delete_grant),
+                            state,
+                        ),
+                        state,
+                    )),
+            )
+            .route(
+                "/v1/security/policy",
+                secure_route(get(security_handler::get_policy), state),
+            )
+    };
+
+    let token_routes = if state.security.entitlements().has(Feature::Delegation) {
+        Router::new().route(
+            "/v1/security/tokens",
+            secure_route(
+                license_gated_security_mutation(post(security_handler::mint_token), state),
+                state,
+            ),
         )
-        .route(
-            "/v1/security/policy",
-            secure_route(get(security_handler::get_policy), state),
+    } else {
+        Router::new().route(
+            "/v1/security/tokens",
+            secure_route(post(delegation_not_licensed), state),
         )
+    };
+
+    rbac_routes.merge(token_routes)
 }
 
 /// Builds the complete Axum service from initialized Zeppelin dependencies.
@@ -2391,7 +2643,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_two_audited_action_inventory_is_exact() {
+    fn phase_seven_audited_action_inventory_is_exact() {
         let audited = Action::ALL
             .into_iter()
             .filter(|action| audited_action(*action))
@@ -2413,12 +2665,13 @@ mod tests {
                 Action::VectorDelete,
                 Action::SecurityAdminRead,
                 Action::SecurityAdminWrite,
+                Action::CredentialDelegate,
             ]
         );
     }
 
     #[test]
-    fn phase_two_must_audit_action_inventory_is_exact() {
+    fn phase_seven_must_audit_action_inventory_is_exact() {
         let must_audit = Action::ALL
             .into_iter()
             .filter(|action| {
@@ -2438,6 +2691,7 @@ mod tests {
                 Action::VectorDelete,
                 Action::SecurityAdminRead,
                 Action::SecurityAdminWrite,
+                Action::CredentialDelegate,
             ]
         );
         assert!(must_audit.into_iter().all(audited_action));

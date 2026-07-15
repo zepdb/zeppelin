@@ -56,11 +56,13 @@ pub enum Action {
     /// This capability is evaluated by the kernel during vector-write
     /// authorization and is deliberately not mapped to an HTTP route.
     AttributeAdmin,
+    /// Mint one strictly narrowed, short-lived delegated credential.
+    CredentialDelegate,
 }
 
 impl Action {
     /// Every action in declaration order for completeness tests and parsing.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::SystemRead,
         Self::MetricsRead,
         Self::RuntimeConfigRead,
@@ -83,6 +85,7 @@ impl Action {
         Self::SecurityAdminRead,
         Self::SecurityAdminWrite,
         Self::AttributeAdmin,
+        Self::CredentialDelegate,
     ];
 
     /// Frozen Phase 3 wildcard expansion used by persisted `GrantActions::All`.
@@ -90,6 +93,64 @@ impl Action {
     /// Adding a new action must never silently widen an immutable policy grant.
     /// `AttributeAdmin` therefore requires an explicit selected grant.
     pub(crate) const POLICY_ALL_V1: [Self; 21] = [
+        Self::SystemRead,
+        Self::MetricsRead,
+        Self::RuntimeConfigRead,
+        Self::RuntimeConfigWrite,
+        Self::NamespaceCreate,
+        Self::NamespaceRead,
+        Self::NamespaceDelete,
+        Self::SnapshotRead,
+        Self::SnapshotWrite,
+        Self::SnapshotDelete,
+        Self::NamespaceClone,
+        Self::IndexConfigWrite,
+        Self::CompactionTrigger,
+        Self::CompactionStatusRead,
+        Self::HydrationTrigger,
+        Self::VectorFetch,
+        Self::VectorUpsert,
+        Self::VectorDelete,
+        Self::Query,
+        Self::SecurityAdminRead,
+        Self::SecurityAdminWrite,
+    ];
+
+    /// Safe expansion used when publishing a new Phase 7 wildcard request.
+    ///
+    /// Persisted Phase 3 `All` grants must continue to compile through
+    /// [`Self::POLICY_ALL_V1`]. New wildcard requests are normalized to this
+    /// explicit set before publication so they do not gain security-policy
+    /// mutation or later privileged capabilities.
+    pub(crate) const POLICY_SAFE_ALL_V2: [Self; 20] = [
+        Self::SystemRead,
+        Self::MetricsRead,
+        Self::RuntimeConfigRead,
+        Self::RuntimeConfigWrite,
+        Self::NamespaceCreate,
+        Self::NamespaceRead,
+        Self::NamespaceDelete,
+        Self::SnapshotRead,
+        Self::SnapshotWrite,
+        Self::SnapshotDelete,
+        Self::NamespaceClone,
+        Self::IndexConfigWrite,
+        Self::CompactionTrigger,
+        Self::CompactionStatusRead,
+        Self::HydrationTrigger,
+        Self::VectorFetch,
+        Self::VectorUpsert,
+        Self::VectorDelete,
+        Self::Query,
+        Self::SecurityAdminRead,
+    ];
+
+    /// Explicit administrator expansion used only while converting boot config.
+    ///
+    /// This is deliberately distinct from persisted `GrantActions::All`: a
+    /// bootstrap `actions = ["*"]` must retain policy-administration authority,
+    /// while a policy wildcard must never acquire privileged security actions.
+    pub(crate) const BOOTSTRAP_ADMIN_V1: [Self; 21] = [
         Self::SystemRead,
         Self::MetricsRead,
         Self::RuntimeConfigRead,
@@ -139,7 +200,46 @@ impl Action {
             Self::SecurityAdminRead => "SecurityAdminRead",
             Self::SecurityAdminWrite => "SecurityAdminWrite",
             Self::AttributeAdmin => "AttributeAdmin",
+            Self::CredentialDelegate => "CredentialDelegate",
         }
+    }
+
+    /// Return whether execution destroys authoritative or user-addressable state.
+    #[must_use]
+    pub const fn is_destructive(self) -> bool {
+        matches!(
+            self,
+            Self::NamespaceDelete
+                | Self::SnapshotDelete
+                | Self::VectorDelete
+                | Self::SecurityAdminWrite
+        )
+    }
+
+    /// Return whether a delegated token can bind this action to its namespace list.
+    ///
+    /// Global/control-plane actions and compound namespace creation are excluded:
+    /// their real authorization resource cannot be represented by Phase 7's
+    /// namespace-only narrowing shape.
+    #[must_use]
+    pub const fn is_delegatable(self) -> bool {
+        matches!(
+            self,
+            Self::NamespaceRead
+                | Self::NamespaceDelete
+                | Self::SnapshotRead
+                | Self::SnapshotWrite
+                | Self::SnapshotDelete
+                | Self::IndexConfigWrite
+                | Self::CompactionTrigger
+                | Self::CompactionStatusRead
+                | Self::HydrationTrigger
+                | Self::VectorFetch
+                | Self::VectorUpsert
+                | Self::VectorDelete
+                | Self::Query
+                | Self::AttributeAdmin
+        )
     }
 }
 
@@ -159,7 +259,7 @@ mod tests {
     use super::Action;
 
     #[test]
-    fn action_inventory_has_exact_phase_four_variants() {
+    fn action_inventory_has_exact_phase_seven_variants() {
         let names = Action::ALL.map(Action::as_str).to_vec();
 
         assert_eq!(
@@ -187,6 +287,7 @@ mod tests {
                 "SecurityAdminRead",
                 "SecurityAdminWrite",
                 "AttributeAdmin",
+                "CredentialDelegate",
             ]
         );
     }
@@ -200,5 +301,21 @@ mod tests {
         assert!(Action::ALL.contains(&Action::AttributeAdmin));
         assert!(!Action::POLICY_ALL_V1.contains(&Action::AttributeAdmin));
         assert_eq!(Action::POLICY_ALL_V1.len(), 21);
+    }
+
+    #[test]
+    fn phase_seven_safe_all_excludes_privileged_security_actions_without_rewriting_legacy_all() {
+        assert!(matches!(
+            "CredentialDelegate".parse::<Action>(),
+            Ok(Action::CredentialDelegate)
+        ));
+        assert!(Action::ALL.contains(&Action::CredentialDelegate));
+        assert!(!Action::POLICY_ALL_V1.contains(&Action::CredentialDelegate));
+        assert!(Action::ALL.contains(&Action::SecurityAdminWrite));
+        assert!(Action::POLICY_ALL_V1.contains(&Action::SecurityAdminWrite));
+        assert!(!Action::POLICY_SAFE_ALL_V2.contains(&Action::CredentialDelegate));
+        assert!(!Action::POLICY_SAFE_ALL_V2.contains(&Action::SecurityAdminWrite));
+        assert_eq!(Action::POLICY_ALL_V1.len(), 21);
+        assert_eq!(Action::POLICY_SAFE_ALL_V2.len(), 20);
     }
 }

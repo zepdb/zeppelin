@@ -238,6 +238,12 @@ pub struct SecurityConfig {
     /// Optional signed-license path used by the later entitlement phase.
     #[serde(default)]
     pub license_path: String,
+    /// Ed25519 seed file used only when delegated credentials are licensed.
+    #[serde(default)]
+    pub token_signing_key_path: String,
+    /// Maximum lifetime accepted for one minted delegated token.
+    #[serde(default = "default_delegated_token_max_ttl_secs")]
+    pub delegated_token_max_ttl_secs: u64,
     /// Server-only 256-bit key authenticating opaque query cursors.
     ///
     /// The TOML value is lowercase or uppercase hexadecimal. It is omitted
@@ -265,6 +271,11 @@ impl std::fmt::Debug for SecurityConfig {
             .field("audit_s3", &self.audit_s3)
             .field("audit_flush_secs", &self.audit_flush_secs)
             .field("license_path", &self.license_path)
+            .field("token_signing_key_path", &self.token_signing_key_path)
+            .field(
+                "delegated_token_max_ttl_secs",
+                &self.delegated_token_max_ttl_secs,
+            )
             .field("cursor_hmac_key_hex", &cursor_hmac_key)
             .field("api_keys", &self.api_keys)
             .finish()
@@ -280,6 +291,8 @@ impl Default for SecurityConfig {
             audit_s3: default_security_audit_s3(),
             audit_flush_secs: default_security_audit_flush_secs(),
             license_path: String::new(),
+            token_signing_key_path: String::new(),
+            delegated_token_max_ttl_secs: default_delegated_token_max_ttl_secs(),
             cursor_hmac_key_hex: String::new(),
             api_keys: Vec::new(),
         }
@@ -334,6 +347,10 @@ const fn default_security_audit_s3() -> bool {
 /// Returns the bounded audit flush interval used when the operator omits it.
 const fn default_security_audit_flush_secs() -> u64 {
     2
+}
+
+const fn default_delegated_token_max_ttl_secs() -> u64 {
+    3_600
 }
 
 fn missing_security_section_error() -> ZeppelinError {
@@ -773,6 +790,39 @@ mod tests {
         let serialized = serde_json::to_string(&missing.security).unwrap();
         assert!(!serialized.contains("cursor_hmac_key_hex"));
         assert!(!serialized.contains(&secret));
+    }
+
+    #[test]
+    fn bootstrap_wildcards_cannot_be_mixed_with_named_authority() {
+        let mut actions = Config::default();
+        actions.security.set_cursor_hmac_key_hex("ab".repeat(32));
+        actions.security.api_keys.push(ApiKeyConfig {
+            key_id: "zpk1_mixed_actions".to_string(),
+            name: "mixed actions".to_string(),
+            sha256_hex: "cd".repeat(32),
+            actions: vec!["*".to_string(), "Query".to_string()],
+            namespaces: vec!["*".to_string()],
+            expires_at: None,
+        });
+        assert_config_error_contains(
+            actions.validate().map(|()| actions),
+            &["actions must not mix"],
+        );
+
+        let mut namespaces = Config::default();
+        namespaces.security.set_cursor_hmac_key_hex("ab".repeat(32));
+        namespaces.security.api_keys.push(ApiKeyConfig {
+            key_id: "zpk1_mixed_namespaces".to_string(),
+            name: "mixed namespaces".to_string(),
+            sha256_hex: "ef".repeat(32),
+            actions: vec!["Query".to_string()],
+            namespaces: vec!["*".to_string(), "tenant-a".to_string()],
+            expires_at: None,
+        });
+        assert_config_error_contains(
+            namespaces.validate().map(|()| namespaces),
+            &["namespaces must not mix"],
+        );
     }
 
     /// Exercises each independent validation rule with one focused mutation.
@@ -2557,6 +2607,11 @@ impl Config {
         if self.security.audit_flush_secs == 0 {
             violations.push("security.audit_flush_secs must be greater than zero".to_string());
         }
+        if self.security.delegated_token_max_ttl_secs == 0 {
+            violations.push(
+                "security.delegated_token_max_ttl_secs must be greater than zero".to_string(),
+            );
+        }
         if self.security.mode == SecurityMode::Enforced && !self.security.audit_s3 {
             violations
                 .push("security.audit_s3 must be true when security.mode is enforced".to_string());
@@ -2611,6 +2666,11 @@ impl Config {
                     "security.api_keys[{index}].actions must contain at least one Action name or \"*\""
                 ));
             } else {
+                if key.actions.iter().any(|action| action == "*") && key.actions.len() != 1 {
+                    violations.push(format!(
+                        "security.api_keys[{index}].actions must not mix \"*\" with named actions"
+                    ));
+                }
                 for action in &key.actions {
                     if action != "*" && crate::security::Action::from_str(action).is_err() {
                         violations.push(format!(
@@ -2624,6 +2684,13 @@ impl Config {
                     "security.api_keys[{index}].namespaces must contain at least one namespace name or \"*\""
                 ));
             } else {
+                if key.namespaces.iter().any(|namespace| namespace == "*")
+                    && key.namespaces.len() != 1
+                {
+                    violations.push(format!(
+                        "security.api_keys[{index}].namespaces must not mix \"*\" with named namespaces"
+                    ));
+                }
                 for namespace in &key.namespaces {
                     if namespace != "*"
                         && crate::security::NamespaceId::new(namespace.clone()).is_err()

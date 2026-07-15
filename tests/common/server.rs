@@ -404,6 +404,22 @@ async fn test_security_runtime_with_admin_bearer(
     entitlements: Arc<Entitlements>,
 ) -> (Arc<SecurityKernel>, Arc<ApiKeyAdapter>, String) {
     let admin_bearer = inject_test_admin(config, existing_admin_bearer);
+    let delegation_key = if entitlements.has(Feature::Delegation)
+        && config.security.token_signing_key_path.is_empty()
+    {
+        let file = tempfile::NamedTempFile::new().expect("delegation test key file");
+        std::fs::write(file.path(), "09".repeat(32)).expect("write delegation test seed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600))
+                .expect("restrict delegation test seed permissions");
+        }
+        config.security.token_signing_key_path = file.path().to_string_lossy().into_owned();
+        Some(file)
+    } else {
+        None
+    };
     let (security, credential_adapter) = SecurityKernel::from_resolved_entitlements(
         store.clone(),
         &config.security,
@@ -412,6 +428,7 @@ async fn test_security_runtime_with_admin_bearer(
     )
     .await
     .expect("test security authority must compose");
+    drop(delegation_key);
     (security, credential_adapter, admin_bearer)
 }
 
@@ -1213,6 +1230,28 @@ pub async fn start_test_server_full_without_rate_limit_override(
         None,
         100 * 1024 * 1024,
         None,
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
+/// Starts a full server with a reused administrator and exact configured limits.
+pub async fn start_test_server_full_without_rate_limit_override_and_admin_bearer(
+    store: ZeppelinStore,
+    namespace_name_prefix: Option<String>,
+    config: Config,
+    admin_bearer: &str,
+) -> FullTestServer {
+    start_test_server_full_with_disk_cache_max_bytes_inner(
+        store,
+        namespace_name_prefix,
+        config,
+        false,
+        None,
+        100 * 1024 * 1024,
+        Some(admin_bearer),
         None,
         None,
         false,

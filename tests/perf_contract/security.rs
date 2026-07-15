@@ -8,8 +8,9 @@ use axum::http::Method;
 use serde::Serialize;
 use zeppelin::config::{Config, SecurityMode};
 use zeppelin::security::{
-    classify_route, CredentialAdapter, Decision, Feature, NamespaceId, RequestContext, Resource,
-    RouteClass, SecurityKernel,
+    classify_route, Action, CredentialAdapter, Decision, DelegationNarrowing, Feature,
+    GrantActions, GrantDefinition, GrantScope, NamespaceId, RequestContext, Resource, RouteClass,
+    SecurityKernel, WriteConstraints,
 };
 use zeppelin::storage::ZeppelinStore;
 use zeppelin::time::Clock;
@@ -35,6 +36,10 @@ pub struct SecurityMeasurement {
     pub baseline_loop_p50_ns: u64,
     pub authn_authz_p50_ns: u64,
     pub authn_authz_p50_delta_ns: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegated_authn_authz_p50_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegated_authn_authz_p50_delta_ns: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paired_query_samples: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,9 +136,26 @@ pub async fn measure(input: SecurityMeasureInput<'_>) -> SecurityMeasurement {
         "secured_query must produce object-store counters"
     );
 
+    let delegation_key = tempfile::NamedTempFile::new()
+        .unwrap_or_else(|error| panic!("delegated performance signing key failed: {error}"));
+    std::fs::write(delegation_key.path(), "71".repeat(32))
+        .unwrap_or_else(|error| panic!("delegated performance signing key write failed: {error}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            delegation_key.path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap_or_else(|error| {
+            panic!("delegated performance signing key permissions failed: {error}")
+        });
+    }
+    let mut security_config = config.security.clone();
+    security_config.token_signing_key_path = delegation_key.path().to_string_lossy().into_owned();
     let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
         security_store.clone(),
-        &config.security,
+        &security_config,
         clock.clone(),
         Arc::new(test_entitlements(Feature::ALL)),
     )
@@ -226,6 +248,87 @@ pub async fn measure(input: SecurityMeasureInput<'_>) -> SecurityMeasurement {
     let authn_authz_p50_ns = median(&mut secured_samples);
     let authn_authz_p50_delta_ns = authn_authz_p50_ns.saturating_sub(baseline_loop_p50_ns);
 
+    let (delegated_authn_authz_p50_ns, delegated_authn_authz_p50_delta_ns) =
+        if assertions.delegated_authn_authz_p50_delta_ns_max.is_some() {
+            kernel
+                .add_grant(
+                    &preflight_principal,
+                    GrantDefinition::new(
+                        preflight_principal.id.clone(),
+                        GrantScope::Global,
+                        GrantActions::Selected {
+                            actions: vec![Action::CredentialDelegate],
+                        },
+                        None,
+                        None,
+                        WriteConstraints::none(),
+                        Vec::new(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("delegated performance grant publication failed: {error}")
+                });
+            let narrowed = DelegationNarrowing::new(
+                vec![query_action],
+                vec![
+                    NamespaceId::new(namespace.to_string()).unwrap_or_else(|error| {
+                        panic!("delegated performance namespace must validate: {error}")
+                    }),
+                ],
+                None,
+                "Phase 7 token verification performance gate".to_string(),
+            )
+            .unwrap_or_else(|error| panic!("delegated performance narrowing failed: {error}"));
+            let (token, _) = kernel
+                .mint_delegated_token(&preflight_principal, narrowed, 300, now)
+                .unwrap_or_else(|error| panic!("delegated performance mint failed: {error}"));
+            let token_headers = bearer_headers(token.token());
+            for _ in 0..WARMUP_OPERATIONS {
+                let principal = adapter
+                    .authenticate(black_box(&token_headers), now)
+                    .expect("delegated performance token must authenticate");
+                let decision = kernel.authorize(&principal, query_action, &resource, &context);
+                assert!(matches!(decision, Decision::Allow(_)));
+                black_box(decision);
+            }
+            let mut delegated_baseline = Vec::with_capacity(SAMPLES);
+            let mut delegated_secured = Vec::with_capacity(SAMPLES);
+            for sample in 0..SAMPLES {
+                let (baseline, secured) = if sample % 2 == 0 {
+                    (
+                        measure_baseline(&token_headers, &resource, &context),
+                        measure_secured(
+                            &token_headers,
+                            now,
+                            adapter.as_ref(),
+                            kernel.as_ref(),
+                            &resource,
+                            &context,
+                        ),
+                    )
+                } else {
+                    let secured = measure_secured(
+                        &token_headers,
+                        now,
+                        adapter.as_ref(),
+                        kernel.as_ref(),
+                        &resource,
+                        &context,
+                    );
+                    let baseline = measure_baseline(&token_headers, &resource, &context);
+                    (baseline, secured)
+                };
+                delegated_baseline.push(baseline);
+                delegated_secured.push(secured);
+            }
+            let baseline = median(&mut delegated_baseline);
+            let secured = median(&mut delegated_secured);
+            (Some(secured), Some(secured.saturating_sub(baseline)))
+        } else {
+            (None, None)
+        };
+
     assert_eq!(
         paired_query.is_some(),
         assertions.mandatory_filter.is_some(),
@@ -251,6 +354,8 @@ pub async fn measure(input: SecurityMeasureInput<'_>) -> SecurityMeasurement {
         baseline_loop_p50_ns,
         authn_authz_p50_ns,
         authn_authz_p50_delta_ns,
+        delegated_authn_authz_p50_ns,
+        delegated_authn_authz_p50_delta_ns,
         paired_query_samples: paired_query.map(|measurement| measurement.samples),
         caller_filtered_query_p50_ns: paired_query
             .map(|measurement| measurement.caller_filtered_p50_ns),

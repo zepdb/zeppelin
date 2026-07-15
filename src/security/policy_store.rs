@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use ulid::Ulid;
 
 use crate::config::SecurityConfig;
@@ -15,6 +16,18 @@ use super::{Entitlements, Feature, PolicyHead, PolicySnapshot, SecurityError};
 
 const POLICY_ROOT: &str = "_security";
 const POLICY_HEAD_KEY: &str = "_security/heads/policy.json";
+const PHASE_SEVEN_MIGRATION_ATTEMPTS: usize = 5;
+
+#[derive(Serialize)]
+struct PhaseSevenMigrationRecord<'a> {
+    migration: &'static str,
+    state: &'static str,
+    old_version: u64,
+    old_checksum: &'a str,
+    candidate_version: u64,
+    candidate_checksum: &'a str,
+    created_at: DateTime<Utc>,
+}
 
 /// One verified authoritative policy observation and its CAS capability.
 #[derive(Debug, Clone)]
@@ -118,7 +131,7 @@ impl PolicyStore {
         config: &SecurityConfig,
         now: DateTime<Utc>,
     ) -> Result<LoadedPolicy> {
-        let policy = match self.load_current().await {
+        let mut policy = match self.load_current_unmigrated().await {
             Ok(policy) => policy,
             Err(ZeppelinError::NotFound { key })
                 if key == POLICY_HEAD_KEY || key.ends_with(&format!("/{POLICY_HEAD_KEY}")) =>
@@ -127,6 +140,7 @@ impl PolicyStore {
             }
             Err(error) => return Err(error),
         };
+        policy = self.ensure_phase_seven_migrated(policy, now).await?;
         if bootstrap_config_drifted(config, policy.snapshot(), now)? {
             tracing::warn!(
                 policy_version = policy.snapshot().version().get(),
@@ -138,15 +152,25 @@ impl PolicyStore {
         Ok(policy)
     }
 
-    /// Read and verify the current head and its referenced immutable snapshot.
-    pub async fn load_current(&self) -> Result<LoadedPolicy> {
+    // Transitional raw load used only inside the bounded Phase 7 migration path.
+    async fn load_current_unmigrated(&self) -> Result<LoadedPolicy> {
         let (head_bytes, head_etag) = self.store.get_with_meta(POLICY_HEAD_KEY).await?;
         let observed_at = Instant::now();
         self.load_head_bytes(head_bytes, head_etag, observed_at)
             .await
     }
 
-    pub(crate) async fn refresh(&self, head_etag: &str) -> Result<PolicyRefresh> {
+    /// Read the authoritative head and return only a fully migrated, compilable snapshot.
+    pub async fn load_current(&self, now: DateTime<Utc>) -> Result<LoadedPolicy> {
+        let loaded = self.load_current_unmigrated().await?;
+        self.ensure_phase_seven_migrated(loaded, now).await
+    }
+
+    pub(crate) async fn refresh(
+        &self,
+        head_etag: &str,
+        now: DateTime<Utc>,
+    ) -> Result<PolicyRefresh> {
         let head = self
             .store
             .get_if_none_match(POLICY_HEAD_KEY, head_etag)
@@ -156,11 +180,76 @@ impl PolicyStore {
         let observed_at = Instant::now();
         match head {
             None => Ok(PolicyRefresh::Unchanged { observed_at }),
-            Some((head_bytes, next_etag)) => self
-                .load_head_bytes(head_bytes, next_etag, observed_at)
-                .await
-                .map(Box::new)
-                .map(|loaded| PolicyRefresh::Changed { loaded }),
+            Some((head_bytes, next_etag)) => {
+                let loaded = self
+                    .load_head_bytes(head_bytes, next_etag, observed_at)
+                    .await?;
+                let loaded = self.ensure_phase_seven_migrated(loaded, now).await?;
+                Ok(PolicyRefresh::Changed {
+                    loaded: Box::new(loaded),
+                })
+            }
+        }
+    }
+
+    async fn ensure_phase_seven_migrated(
+        &self,
+        mut loaded: LoadedPolicy,
+        now: DateTime<Utc>,
+    ) -> Result<LoadedPolicy> {
+        for _ in 0..PHASE_SEVEN_MIGRATION_ATTEMPTS {
+            if !loaded.snapshot().requires_phase_seven_all_migration() {
+                return Ok(loaded);
+            }
+            let candidate = loaded.snapshot().migrate_phase_seven_all(now)?;
+            self.record_phase_seven_migration_candidate(loaded.snapshot(), &candidate)
+                .await?;
+            loaded = match self.publish(candidate, loaded.head_etag()).await? {
+                PolicyPublication::Published(published) => *published,
+                PolicyPublication::Conflict => self.load_current_unmigrated().await?,
+            };
+        }
+        Err(SecurityError::PolicyConflict.into())
+    }
+
+    async fn record_phase_seven_migration_candidate(
+        &self,
+        previous: &PolicySnapshot,
+        candidate: &PolicySnapshot,
+    ) -> Result<()> {
+        let record = PhaseSevenMigrationRecord {
+            migration: "phase7-safe-all-v2",
+            state: "candidate",
+            old_version: previous.version().get(),
+            old_checksum: previous.checksum(),
+            candidate_version: candidate.version().get(),
+            candidate_checksum: candidate.checksum(),
+            created_at: candidate.created_at(),
+        };
+        let body = serde_json::to_vec(&record).map_err(|error| {
+            SecurityError::InvalidPolicy(format!(
+                "Phase 7 migration record encoding failed: {error}"
+            ))
+        })?;
+        let key = format!(
+            "_security/migrations/phase7-safe-all-v2/{}-{}.json",
+            previous.checksum(),
+            candidate.checksum()
+        );
+        match self
+            .store
+            .put_create_outcome(&key, Bytes::from(body.clone()))
+            .await?
+        {
+            CreateOnlyOutcome::Created { .. } => Ok(()),
+            CreateOnlyOutcome::AlreadyExists => {
+                let existing = self.store.get(&key).await?;
+                if existing.as_ref() == body.as_slice() {
+                    Ok(())
+                } else {
+                    Err(SecurityError::PolicyObjectCollision.into())
+                }
+            }
         }
     }
 
@@ -203,7 +292,7 @@ impl PolicyStore {
                 LoadedPolicy::from_publication(head, candidate, head_etag, observed_at),
             ))),
             ConditionalPutOutcome::Updated { e_tag: None } => {
-                let loaded = self.load_current().await?;
+                let loaded = self.load_current_unmigrated().await?;
                 if loaded.snapshot().version() != candidate.version()
                     || loaded.snapshot().checksum() != candidate.checksum()
                 {
@@ -235,7 +324,11 @@ impl PolicyStore {
             serde_json::from_slice(&snapshot_bytes).map_err(|error| {
                 SecurityError::InvalidPolicy(format!("policy snapshot JSON is invalid: {error}"))
             })?;
-        snapshot.validate_for_use()?;
+        if snapshot.requires_phase_seven_all_migration() {
+            snapshot.verify_checksum()?;
+        } else {
+            snapshot.validate_for_use()?;
+        }
         self.validate_entitlements(&snapshot)?;
         if snapshot.version() != head.version() || snapshot.checksum() != head.checksum() {
             return Err(SecurityError::InvalidPolicy(
@@ -258,7 +351,7 @@ impl PolicyStore {
             .iter()
             .all(|key| key.expires_at.is_some_and(|expires_at| expires_at <= now))
         {
-            return match self.load_current().await {
+            return match self.load_current_unmigrated().await {
                 Ok(policy) => Ok(policy),
                 Err(ZeppelinError::NotFound { key })
                     if key == POLICY_HEAD_KEY || key.ends_with(&format!("/{POLICY_HEAD_KEY}")) =>
@@ -305,7 +398,7 @@ impl PolicyStore {
                 observed_at,
             )),
             CreateOnlyOutcome::Created { e_tag: None } | CreateOnlyOutcome::AlreadyExists => {
-                self.load_current().await
+                self.load_current_unmigrated().await
             }
         }
     }
@@ -313,6 +406,9 @@ impl PolicyStore {
     fn validate_entitlements(&self, snapshot: &PolicySnapshot) -> Result<()> {
         if snapshot.has_constraints() && !self.entitlements.has(Feature::Constraints) {
             return Err(SecurityError::FeatureRequired(Feature::Constraints).into());
+        }
+        if snapshot.has_delegation_features() && !self.entitlements.has(Feature::Delegation) {
+            return Err(SecurityError::FeatureRequired(Feature::Delegation).into());
         }
         if self
             .entitlements
@@ -381,7 +477,70 @@ fn normalized_bootstrap_semantics(snapshot: &PolicySnapshot) -> Result<serde_jso
                 key.remove("created_at");
             }
         }
+        if field == "grants" {
+            normalize_grant_action_partitions(entries)?;
+        }
         entries.sort_by_key(serde_json::Value::to_string);
     }
     Ok(value)
+}
+
+fn normalize_grant_action_partitions(entries: &mut Vec<serde_json::Value>) -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut grouped: BTreeMap<
+        String,
+        (serde_json::Map<String, serde_json::Value>, BTreeSet<String>),
+    > = BTreeMap::new();
+    for entry in entries.drain(..) {
+        let mut grant = entry.as_object().cloned().ok_or_else(|| {
+            SecurityError::InvalidPolicy(
+                "policy drift comparison expected grant object".to_string(),
+            )
+        })?;
+        let actions = grant.remove("actions").ok_or_else(|| {
+            SecurityError::InvalidPolicy(
+                "policy drift comparison expected grant actions".to_string(),
+            )
+        })?;
+        let selected = actions
+            .as_object()
+            .and_then(|actions| actions.get("actions"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                SecurityError::InvalidPolicy(
+                    "policy drift comparison requires migrated selected actions".to_string(),
+                )
+            })?;
+        let binding = serde_json::Value::Object(grant.clone()).to_string();
+        let (_, merged) = grouped
+            .entry(binding)
+            .or_insert_with(|| (grant, BTreeSet::new()));
+        for action in selected {
+            merged.insert(
+                action
+                    .as_str()
+                    .ok_or_else(|| {
+                        SecurityError::InvalidPolicy(
+                            "policy drift comparison expected action string".to_string(),
+                        )
+                    })?
+                    .to_string(),
+            );
+        }
+    }
+    *entries = grouped
+        .into_values()
+        .map(|(mut grant, actions)| {
+            grant.insert(
+                "actions".to_string(),
+                serde_json::json!({
+                    "kind": "selected",
+                    "actions": actions.into_iter().collect::<Vec<_>>()
+                }),
+            );
+            serde_json::Value::Object(grant)
+        })
+        .collect();
+    Ok(())
 }

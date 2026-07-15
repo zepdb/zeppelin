@@ -435,6 +435,7 @@ impl AllowDecision {
                 | Action::VectorDelete
                 | Action::SecurityAdminRead
                 | Action::SecurityAdminWrite
+                | Action::CredentialDelegate
         ) {
             vec![Obligation::DurableAudit]
         } else {
@@ -460,6 +461,12 @@ impl AllowDecision {
         }
     }
 
+    pub(crate) fn require_approval(&mut self) {
+        if !self.obligations.contains(&Obligation::Approval) {
+            self.obligations.push(Obligation::Approval);
+        }
+    }
+
     /// Return whether this decision exercised the AttributeAdmin exception.
     #[must_use]
     pub(crate) const fn is_attribute_admin_write(&self) -> bool {
@@ -475,7 +482,7 @@ mod tests {
     use crate::{security::Action, types::AttributeValue};
 
     #[test]
-    fn phase_two_durable_audit_obligation_inventory_is_exact() {
+    fn durable_audit_obligation_inventory_is_exact_through_phase_seven() {
         let durable = Action::ALL
             .into_iter()
             .filter(|action| {
@@ -495,6 +502,7 @@ mod tests {
                 Action::VectorDelete,
                 Action::SecurityAdminRead,
                 Action::SecurityAdminWrite,
+                Action::CredentialDelegate,
             ]
         );
     }

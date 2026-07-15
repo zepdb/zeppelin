@@ -115,6 +115,14 @@
       "response": "security_delete_grant.resp.json"
     },
     {
+      "name": "security_mint_token",
+      "method": "POST",
+      "path": "/v1/security/tokens",
+      "status": 201,
+      "request": "security_mint_token.req.json",
+      "response": "security_mint_token.resp.json"
+    },
+    {
       "name": "security_get_policy",
       "method": "GET",
       "path": "/v1/security/policy",

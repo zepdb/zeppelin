@@ -35,7 +35,11 @@ fn scoped_store(harness: &TestHarness) -> ZeppelinStore {
 }
 
 fn full_entitlements() -> Arc<Entitlements> {
-    Arc::new(test_entitlements(Feature::ALL))
+    Arc::new(test_entitlements(
+        Feature::ALL
+            .into_iter()
+            .filter(|feature| *feature != Feature::Delegation),
+    ))
 }
 
 #[derive(Debug)]

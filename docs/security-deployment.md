@@ -45,6 +45,9 @@ mode = "enforced"
 audit_s3 = true
 audit_flush_secs = 2
 cursor_hmac_key_hex = "<64 random hexadecimal characters>"
+# Required only when the Delegation entitlement is active.
+token_signing_key_path = "/run/secrets/zeppelin-delegation-ed25519-seed"
+delegated_token_max_ttl_secs = 3600
 ```
 
 Enforced mode refuses to start when `audit_s3 = false`, and every mode rejects a
@@ -56,6 +59,27 @@ outstanding cursors. Keep audit persistence enabled. A successful
 `audit_unavailable` response is intentionally ambiguous: the domain operation
 may already have occurred. Reconcile authoritative S3 state and the audit prefix
 before retrying a destructive request.
+
+Delegation-enabled nodes fail boot unless `token_signing_key_path` names a
+mode-`0600` file containing exactly 32 bytes encoded as 64 hexadecimal
+characters. Treat that seed as a signing secret: provision it from the
+deployment secret manager, do not place it in TOML or a container image, and
+prefer a distinct seed per independently operated node. At boot Zeppelin
+publishes the derived public key as an immutable
+`_security/signers/<signer-id>.json` object. A create-only reservation under
+`_security/signer-slots/00.json` through `31.json` is the S3-authoritative active
+inventory, so concurrent boots cannot oversubscribe the fixed 32 combined node
+and rotation slots. Request-path verification uses only the disposable cache
+derived from those reservations. Retire an old signer before a deployment would
+exceed that budget; startup fails loudly when no reservation is available.
+Rotate by installing a new seed and restarting the node, which creates a new
+signer ID. Retain the prior public-key object only through the configured
+maximum token lifetime, then delete its reservation and public-key object from
+S3. Delete the reservation first when immediately revoking a compromised seed;
+outstanding tokens become unverifiable after the signer-refresh bound. Never
+retain retired signer objects or reservations indefinitely. KMS-backed signing
+custody is a managed-service follow-up; this file contract does not silently
+fall back to an in-process generated key.
 
 The first constrained upsert or scoped delete against a pre-Phase-4 namespace
 repairs its lifetime identity with conditional S3 writes. If `meta.json` lacks

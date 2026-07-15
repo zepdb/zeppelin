@@ -13,8 +13,8 @@ use thiserror::Error;
 use crate::config::SecurityConfig;
 
 use super::{
-    policy_cache::PolicyCache, ApiKeyId, KeyState, PolicyVersion, Principal, PrincipalId,
-    SecurityError,
+    delegation::DelegationVerifier, policy_cache::PolicyCache, ApiKeyId, KeyState, PolicyVersion,
+    Principal, PrincipalId, SecurityError,
 };
 
 const SECRET_LEN: usize = 43;
@@ -108,6 +108,7 @@ enum ApiKeySource {
 /// Named API-key adapter backed only by hashed credential material.
 pub struct ApiKeyAdapter {
     source: ApiKeySource,
+    delegation: Option<Arc<DelegationVerifier>>,
 }
 
 impl ApiKeyAdapter {
@@ -131,12 +132,24 @@ impl ApiKeyAdapter {
         }
         Ok(Self {
             source: ApiKeySource::Bootstrap(keys),
+            delegation: None,
         })
     }
 
     pub(crate) fn from_policy_cache(cache: Arc<PolicyCache>) -> Self {
         Self {
             source: ApiKeySource::Policy(cache),
+            delegation: None,
+        }
+    }
+
+    pub(crate) fn from_policy_cache_with_delegation(
+        cache: Arc<PolicyCache>,
+        delegation: Arc<DelegationVerifier>,
+    ) -> Self {
+        Self {
+            source: ApiKeySource::Policy(cache),
+            delegation: Some(delegation),
         }
     }
 
@@ -161,6 +174,24 @@ impl ApiKeyAdapter {
         authorization: &str,
         now: DateTime<Utc>,
     ) -> AuthenticationOutcome {
+        if authorization.starts_with("Bearer zpt1_") {
+            let (result, policy_version, policy_fresh) = self.delegation.as_ref().map_or_else(
+                || {
+                    let (policy_version, policy_fresh) = self.current_policy_freshness();
+                    (
+                        Err(AuthnFailure::CredentialUnknown),
+                        policy_version,
+                        policy_fresh,
+                    )
+                },
+                |delegation| delegation.verify_authorization(authorization),
+            );
+            return AuthenticationOutcome {
+                result,
+                policy_version,
+                policy_fresh,
+            };
+        }
         let candidate = credential_candidate(authorization);
         let digest: [u8; 32] = Sha256::digest(candidate.secret.as_bytes()).into();
         let decoded = URL_SAFE_NO_PAD.decode(candidate.secret);
@@ -233,6 +264,13 @@ impl ApiKeyAdapter {
             }
         }
     }
+
+    fn current_policy_freshness(&self) -> (PolicyVersion, bool) {
+        match &self.source {
+            ApiKeySource::Bootstrap(_) => (PolicyVersion::BOOT, true),
+            ApiKeySource::Policy(cache) => cache.freshness(),
+        }
+    }
 }
 
 impl CredentialAdapter for ApiKeyAdapter {
@@ -258,10 +296,7 @@ impl CredentialAdapter for ApiKeyAdapter {
     }
 
     fn policy_freshness(&self) -> (PolicyVersion, bool) {
-        match &self.source {
-            ApiKeySource::Bootstrap(_) => (PolicyVersion::BOOT, true),
-            ApiKeySource::Policy(cache) => cache.freshness(),
-        }
+        self.current_policy_freshness()
     }
 }
 

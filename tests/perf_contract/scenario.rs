@@ -993,11 +993,12 @@ async fn run_scenario_inner(
         })
         .await;
         println!(
-            "{} security budget: mode={} credential={} p50_delta_ns={} query_regression_bps={:?} added_get_ops={} added_put_ops={}",
+            "{} security budget: mode={} credential={} p50_delta_ns={} delegated_p50_delta_ns={:?} query_regression_bps={:?} added_get_ops={} added_put_ops={}",
             spec.name,
             measured.security_mode,
             measured.credential_kind,
             measured.authn_authz_p50_delta_ns,
+            measured.delegated_authn_authz_p50_delta_ns,
             measured.query_p50_regression_basis_points,
             measured.added_get_ops,
             measured.added_put_ops

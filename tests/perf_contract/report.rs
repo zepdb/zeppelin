@@ -666,6 +666,11 @@ fn build_report(artifacts: &RunArtifacts, scenarios: &BTreeMap<String, ScenarioR
                 "- authn+authz p50 delta: {} ns\n",
                 security.authn_authz_p50_delta_ns
             ));
+            if let Some(delegated) = security.delegated_authn_authz_p50_delta_ns {
+                out.push_str(&format!(
+                    "- delegated-token authn+authz p50 delta: {delegated} ns\n"
+                ));
+            }
             out.push_str(&format!(
                 "- object-store delta vs `{}`: GET {:+}, PUT {:+}\n",
                 markdown_cell(&security.baseline_scenario),

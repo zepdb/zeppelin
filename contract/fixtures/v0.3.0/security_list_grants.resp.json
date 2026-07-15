@@ -49,7 +49,30 @@
     },
     {
       "actions": {
-        "kind": "all"
+        "actions": [
+          "SystemRead",
+          "MetricsRead",
+          "RuntimeConfigRead",
+          "RuntimeConfigWrite",
+          "NamespaceCreate",
+          "NamespaceRead",
+          "NamespaceDelete",
+          "SnapshotRead",
+          "SnapshotWrite",
+          "SnapshotDelete",
+          "NamespaceClone",
+          "IndexConfigWrite",
+          "CompactionTrigger",
+          "CompactionStatusRead",
+          "HydrationTrigger",
+          "VectorFetch",
+          "VectorUpsert",
+          "VectorDelete",
+          "Query",
+          "SecurityAdminRead",
+          "SecurityAdminWrite"
+        ],
+        "kind": "selected"
       },
       "principal_id": "zpk1_test_admin",
       "scope": {

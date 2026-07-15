@@ -36,6 +36,7 @@ reason = "Phase 1 measured security freeze against warm_query_strong"
 [assert.security]
 baseline_scenario = "warm_query_strong"
 authn_authz_p50_delta_ns_max = 10000
+delegated_authn_authz_p50_delta_ns_max = 80000
 added_get_ops = 0
 added_put_ops = 0
 

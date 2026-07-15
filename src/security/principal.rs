@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{ApiKeyId, SecurityError};
+use super::{ApiKeyId, DelegationContext, SecurityError};
 
 /// Stable, validated identifier for a security principal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -57,10 +57,12 @@ pub enum AuthStrength {
     Anonymous,
     /// A named high-entropy API key was verified.
     ApiKey,
+    /// A short-lived Ed25519 token narrowed from a current parent principal.
+    DelegatedToken,
 }
 
 /// Authenticated identity passed to central authorization.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Principal {
     /// Stable identity used in policy and audit.
     pub id: PrincipalId,
@@ -76,6 +78,9 @@ pub struct Principal {
     pub api_key_id: Option<ApiKeyId>,
     /// Parent identity for delegated credentials.
     pub delegation_parent: Option<PrincipalId>,
+    /// Signed narrowing and token identity for delegated request authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationContext>,
 }
 
 impl Principal {
@@ -111,6 +116,22 @@ impl Principal {
             expires_at,
             api_key_id: Some(api_key_id),
             delegation_parent: None,
+            delegation: None,
+        }
+    }
+
+    pub(crate) fn delegated(context: DelegationContext) -> Self {
+        let token_id = context.token_id().to_string();
+        let parent = context.parent_principal().clone();
+        Self {
+            id: PrincipalId(token_id.clone()),
+            kind: PrincipalKind::Agent,
+            display_name: token_id,
+            auth_strength: AuthStrength::DelegatedToken,
+            expires_at: Some(context.expires_at()),
+            api_key_id: None,
+            delegation_parent: Some(parent),
+            delegation: Some(context),
         }
     }
 
@@ -125,6 +146,7 @@ impl Principal {
             expires_at: None,
             api_key_id: None,
             delegation_parent: None,
+            delegation: None,
         }
     }
 

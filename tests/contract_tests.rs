@@ -47,6 +47,7 @@ const ROUTED_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/v1/security/grants"),
     ("delete", "/v1/security/grants"),
     ("get", "/v1/security/policy"),
+    ("post", "/v1/security/tokens"),
     ("post", "/v1/namespaces"),
     ("get", "/v1/namespaces/{ns}"),
     ("delete", "/v1/namespaces/{ns}"),
@@ -85,6 +86,7 @@ const FIXTURE_CASES: &[&str] = &[
     "security_create_grant",
     "security_list_grants",
     "security_delete_grant",
+    "security_mint_token",
     "security_get_policy",
     "error_constraint_violation_403",
     "error_cursor_policy_stale_400",
@@ -269,6 +271,11 @@ fn openapi_security_admin_contract_is_exact_and_redacted() {
             &[200, 400, 401, 403, 404, 409, 415, 422, 429],
         ),
         ("get", "/v1/security/policy", &[200, 401, 403, 429]),
+        (
+            "post",
+            "/v1/security/tokens",
+            &[201, 400, 401, 403, 415, 422, 429],
+        ),
     ];
     for (method, path, expected) in expected_statuses {
         let actual = documented_statuses(api, method, path);
@@ -308,9 +315,17 @@ fn openapi_security_admin_contract_is_exact_and_redacted() {
     assert!(errors.contains("- cursor_policy_stale"));
 
     let all_actions = component_schema_block(api, "SecurityAllGrantActions");
-    assert!(all_actions.contains("AttributeAdmin is excluded"));
+    assert!(all_actions.contains("AttributeAdmin"));
+    assert!(all_actions.contains("are excluded"));
+    assert!(all_actions.contains("CredentialDelegate"));
+    assert!(all_actions.contains("SecurityAdminWrite"));
     let grant = component_schema_block(api, "SecurityGrantMutationRequest");
-    for constraint in ["mandatory_filter:", "field_mask:", "write_constraints:"] {
+    for constraint in [
+        "mandatory_filter:",
+        "field_mask:",
+        "write_constraints:",
+        "require_approval:",
+    ] {
         assert!(
             grant.contains(constraint),
             "grant schema missing {constraint}"
@@ -320,6 +335,43 @@ fn openapi_security_admin_contract_is_exact_and_redacted() {
     assert!(!removal.contains("mandatory_filter:"));
     assert!(!removal.contains("field_mask:"));
     assert!(!removal.contains("write_constraints:"));
+    assert!(!removal.contains("require_approval:"));
+
+    let mint = component_schema_block(api, "MintDelegatedTokenRequest");
+    for contract in [
+        "additionalProperties: false",
+        "required: [actions, namespaces, purpose, expires_in_secs]",
+        "minItems: 1",
+        "maxLength: 512",
+        "delegated_token_max_ttl_secs",
+    ] {
+        assert!(mint.contains(contract), "mint schema missing {contract}");
+    }
+    let minted = component_schema_block(api, "MintDelegatedTokenResponse");
+    assert!(minted.contains("required: [policy_version, token_id, token, expires_at]"));
+    assert!(minted.contains("returned by a later read"));
+    let delegated_actions = component_schema_block(api, "DelegatedSecurityAction");
+    assert!(delegated_actions.contains("VectorDelete"));
+    assert!(!delegated_actions.contains("SecurityAdminWrite"));
+    assert!(!delegated_actions.contains("CredentialDelegate"));
+    for (method, path) in [
+        ("post", "/v1/security/principals"),
+        ("post", "/v1/security/keys"),
+        ("delete", "/v1/security/keys/{key_id}"),
+        ("post", "/v1/security/keys/{key_id}/rotate"),
+        ("post", "/v1/security/grants"),
+        ("delete", "/v1/security/grants"),
+        ("delete", "/v1/namespaces/{ns}"),
+        ("delete", "/v1/namespaces/{ns}/snapshots/{name}"),
+        ("delete", "/v1/namespaces/{ns}/vectors"),
+    ] {
+        assert!(
+            operation_block(api, method, path).contains("#/components/parameters/ZeppelinApproval"),
+            "{method} {path} must document its optional approval credential"
+        );
+    }
+    assert!(api.contains("name: X-Zeppelin-Approval"));
+    assert!(api.contains("must be redacted from"));
 
     let policy_filter = component_schema_block(api, "SecurityPolicyFilter");
     assert!(policy_filter.contains("publication-time fail-closed"));
@@ -1363,6 +1415,67 @@ async fn security_admin_fixtures(client: &reqwest::Client, base_url: &str) -> Ve
         .await,
     );
 
+    let (status, response) = send_json(
+        client,
+        base_url,
+        "post",
+        "/v1/security/grants",
+        "setup_contract_delegation_grant",
+        json!({
+            "principal_id": "zpk1_test_admin",
+            "scope": {"kind": "global"},
+            "actions": {"kind": "selected", "actions": ["CredentialDelegate"]}
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "contract delegation grant setup failed: {response}"
+    );
+    let mint_request = json!({
+        "actions": ["Query"],
+        "namespaces": ["contract-main"],
+        "mandatory_filter": {"op": "eq", "field": "tenant_id", "value": "acme"},
+        "purpose": "contract fixture delegated retrieval",
+        "expires_in_secs": 300
+    });
+    let (status, mint_response) = send_json(
+        client,
+        base_url,
+        "post",
+        "/v1/security/tokens",
+        "security_mint_token",
+        mint_request.clone(),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "fixture security_mint_token expected status 201, got {status}: {mint_response}"
+    );
+    let minted_token = response_string(&mint_response, "token", "security_mint_token");
+    let minted_token_id = response_string(&mint_response, "token_id", "security_mint_token");
+    security_replacements.splice(
+        0..0,
+        [
+            (minted_token, "zpt1_contract_token.signature".to_string()),
+            (
+                minted_token_id,
+                "zdt1_00000000000000000000000000".to_string(),
+            ),
+        ],
+    );
+    let mut mint_response = mint_response;
+    normalize_contract_value(&mut mint_response, &security_replacements, &[]);
+    fixtures.push(fixture_from_response(
+        "security_mint_token",
+        "post",
+        "/v1/security/tokens",
+        201,
+        mint_request,
+        mint_response,
+        &[],
+    ));
+
     let (status, policy_response) = send_json(
         client,
         base_url,
@@ -2217,7 +2330,7 @@ fn normalize_contract_value(
         Value::Object(object) => {
             for (key, child) in object {
                 match key.as_str() {
-                    "created_at" | "updated_at" | "revokes_at" => {
+                    "created_at" | "updated_at" | "revokes_at" | "expires_at" => {
                         if child.is_string() {
                             *child = json!("2026-01-01T00:00:00+00:00");
                         }

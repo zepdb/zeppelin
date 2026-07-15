@@ -31,6 +31,7 @@ struct CompiledGrant {
     mandatory_filter: Option<crate::types::Filter>,
     field_mask: Option<FieldMask>,
     write_constraints: WriteConstraints,
+    require_approval: HashSet<Action>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -39,6 +40,7 @@ pub(crate) struct CompiledAuthorization {
     pub(crate) field_mask: Option<FieldMask>,
     pub(crate) write_constraints: WriteConstraints,
     pub(crate) attribute_admin: bool,
+    pub(crate) require_approval: bool,
 }
 
 #[derive(Debug, Default)]
@@ -134,6 +136,32 @@ impl CompiledPolicy {
         self.keys.get(key_id)
     }
 
+    #[must_use]
+    pub(crate) fn credential_is_active(&self, principal: &Principal, now: DateTime<Utc>) -> bool {
+        let Some(key_id) = principal.api_key_id.as_ref() else {
+            return false;
+        };
+        self.delegated_parent_credential_is_active(&principal.id, key_id, now)
+    }
+
+    #[must_use]
+    pub(crate) fn delegated_parent_credential_is_active(
+        &self,
+        parent_principal: &PrincipalId,
+        key_id: &ApiKeyId,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let Some(key) = self.keys.get(key_id.as_str()) else {
+            return false;
+        };
+        key.principal.id == *parent_principal
+            && self.principals.contains(parent_principal)
+            && !(key.state == KeyState::Revoked
+                && key.revokes_at.is_none_or(|revokes_at| revokes_at <= now))
+            && key.state != KeyState::Expired
+            && key.expires_at.is_none_or(|expires_at| expires_at > now)
+    }
+
     pub(crate) fn authorize(
         &self,
         principal: &Principal,
@@ -142,6 +170,51 @@ impl CompiledPolicy {
         resource: &Resource,
     ) -> Result<CompiledAuthorization, DenyReason> {
         let grants = self.active_grants(principal, now)?;
+        Self::authorize_grants(grants, action, resource)
+    }
+
+    pub(crate) fn authorize_delegated_parent(
+        &self,
+        parent_principal: &PrincipalId,
+        action: Action,
+        resource: &Resource,
+    ) -> Result<CompiledAuthorization, DenyReason> {
+        if !self.principals.contains(parent_principal) {
+            return Err(DenyReason::CredentialUnknown);
+        }
+        let grants = self
+            .grants
+            .get(parent_principal)
+            .map(Vec::as_slice)
+            .ok_or(DenyReason::ActionNotGranted)?;
+        Self::authorize_grants(grants, action, resource)
+    }
+
+    pub(crate) fn authorize_delegated_parent_action(
+        &self,
+        parent_principal: &PrincipalId,
+        action: Action,
+    ) -> Result<(), DenyReason> {
+        if !self.principals.contains(parent_principal) {
+            return Err(DenyReason::CredentialUnknown);
+        }
+        let grants = self
+            .grants
+            .get(parent_principal)
+            .map(Vec::as_slice)
+            .ok_or(DenyReason::ActionNotGranted)?;
+        if grants.iter().any(|grant| grant.actions.contains(&action)) {
+            Ok(())
+        } else {
+            Err(DenyReason::ActionNotGranted)
+        }
+    }
+
+    fn authorize_grants(
+        grants: &[CompiledGrant],
+        action: Action,
+        resource: &Resource,
+    ) -> Result<CompiledAuthorization, DenyReason> {
         let matching_action = grants
             .iter()
             .filter(|grant| grant.actions.contains(&action))
@@ -166,6 +239,9 @@ impl CompiledPolicy {
         let mut field_mask = FieldMask::default();
         let mut has_field_mask = false;
         let mut write_constraints = WriteConstraints::none();
+        let require_approval = applicable
+            .iter()
+            .any(|grant| grant.require_approval.contains(&action));
         for grant in applicable {
             if let Some(filter) = &grant.mandatory_filter {
                 filters.push(filter.clone());
@@ -199,6 +275,7 @@ impl CompiledPolicy {
             field_mask,
             write_constraints,
             attribute_admin: has_attribute_admin,
+            require_approval,
         })
     }
 
@@ -557,6 +634,7 @@ pub struct GrantDefinition {
     mandatory_filter: Option<crate::types::Filter>,
     field_mask: Option<FieldMask>,
     write_constraints: WriteConstraints,
+    require_approval: Vec<Action>,
 }
 
 impl GrantDefinition {
@@ -569,6 +647,7 @@ impl GrantDefinition {
         mandatory_filter: Option<crate::types::Filter>,
         field_mask: Option<FieldMask>,
         write_constraints: WriteConstraints,
+        require_approval: Vec<Action>,
     ) -> Self {
         Self {
             principal_id,
@@ -577,6 +656,7 @@ impl GrantDefinition {
             mandatory_filter,
             field_mask,
             write_constraints,
+            require_approval,
         }
     }
 
@@ -590,6 +670,7 @@ impl GrantDefinition {
             self.mandatory_filter,
             self.field_mask,
             write_constraints,
+            self.require_approval,
         )
     }
 }
@@ -607,6 +688,8 @@ pub struct PolicyGrant {
     field_mask: Option<FieldMask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     write_constraints: Option<WriteConstraints>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    require_approval: Vec<Action>,
 }
 
 impl PartialEq for PolicyGrant {
@@ -618,6 +701,7 @@ impl PartialEq for PolicyGrant {
             )
             && self.field_mask == other.field_mask
             && self.write_constraints == other.write_constraints
+            && self.require_approval == other.require_approval
     }
 }
 
@@ -676,7 +760,7 @@ impl PolicyGrant {
         scope: GrantScope,
         actions: GrantActions,
     ) -> Result<Self, SecurityError> {
-        Self::new_constrained(principal_id, scope, actions, None, None, None)
+        Self::new_constrained(principal_id, scope, actions, None, None, None, Vec::new())
     }
 
     pub(crate) fn new_constrained(
@@ -686,9 +770,12 @@ impl PolicyGrant {
         mandatory_filter: Option<crate::types::Filter>,
         field_mask: Option<FieldMask>,
         write_constraints: Option<WriteConstraints>,
+        mut require_approval: Vec<Action>,
     ) -> Result<Self, SecurityError> {
         let actions = match actions {
-            GrantActions::All => GrantActions::All,
+            GrantActions::All => GrantActions::Selected {
+                actions: Action::POLICY_SAFE_ALL_V2.to_vec(),
+            },
             GrantActions::Selected { mut actions } => {
                 if actions.is_empty() {
                     return Err(SecurityError::InvalidPolicyRequest(
@@ -706,6 +793,14 @@ impl PolicyGrant {
                 GrantActions::Selected { actions }
             }
         };
+        require_approval.sort_unstable();
+        let original_approval_len = require_approval.len();
+        require_approval.dedup();
+        if require_approval.len() != original_approval_len {
+            return Err(SecurityError::InvalidPolicyRequest(
+                "require_approval actions must be unique".to_string(),
+            ));
+        }
         let grant = Self {
             principal_id,
             scope,
@@ -713,6 +808,7 @@ impl PolicyGrant {
             mandatory_filter,
             field_mask,
             write_constraints,
+            require_approval,
         };
         grant
             .validate_constraints()
@@ -736,6 +832,12 @@ impl PolicyGrant {
     #[must_use]
     pub fn actions(&self) -> &GrantActions {
         &self.actions
+    }
+
+    /// Borrow destructive actions that require a second authorized principal.
+    #[must_use]
+    pub fn require_approval(&self) -> &[Action] {
+        &self.require_approval
     }
 
     /// Borrow the server-owned predicate contributed by this grant.
@@ -763,6 +865,26 @@ impl PolicyGrant {
     }
 
     fn validate_constraints(&self) -> Result<(), String> {
+        if !self
+            .require_approval
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+        {
+            return Err("require_approval actions must be sorted and unique".to_string());
+        }
+        let granted_actions = match &self.actions {
+            GrantActions::All => Action::POLICY_ALL_V1.into_iter().collect::<HashSet<_>>(),
+            GrantActions::Selected { actions } => actions.iter().copied().collect(),
+        };
+        if self
+            .require_approval
+            .iter()
+            .any(|action| !action.is_destructive() || !granted_actions.contains(action))
+        {
+            return Err(
+                "require_approval must name destructive actions in the same grant".to_string(),
+            );
+        }
         if let Some(filter) = &self.mandatory_filter {
             validate_policy_filter(filter)?;
         }
@@ -939,6 +1061,77 @@ impl PolicySnapshot {
         self.compile().map(|_| ())
     }
 
+    #[must_use]
+    pub(crate) fn requires_phase_seven_all_migration(&self) -> bool {
+        self.grants
+            .iter()
+            .any(|grant| matches!(grant.actions, GrantActions::All))
+    }
+
+    pub(crate) fn migrate_phase_seven_all(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Self, SecurityError> {
+        self.verify_checksum()?;
+        if !self.requires_phase_seven_all_migration() {
+            return Ok(self.clone());
+        }
+
+        let mut grants = Vec::with_capacity(self.grants.len().saturating_mul(2));
+        for grant in &self.grants {
+            if !matches!(grant.actions, GrantActions::All) {
+                grants.push(grant.clone());
+                continue;
+            }
+
+            let mut safe = grant.clone();
+            safe.actions = GrantActions::Selected {
+                actions: Action::POLICY_SAFE_ALL_V2.to_vec(),
+            };
+            safe.require_approval
+                .retain(|action| Action::POLICY_SAFE_ALL_V2.contains(action));
+            grants.push(safe);
+
+            if matches!(grant.scope, GrantScope::Global) {
+                let mut security_admin = grant.clone();
+                security_admin.actions = GrantActions::Selected {
+                    actions: vec![Action::SecurityAdminWrite],
+                };
+                security_admin
+                    .require_approval
+                    .retain(|action| *action == Action::SecurityAdminWrite);
+                grants.push(security_admin);
+            }
+        }
+        grants.sort_by(grant_order);
+        let mut deduplicated: Vec<PolicyGrant> = Vec::with_capacity(grants.len());
+        for grant in grants {
+            if let Some(existing) = deduplicated
+                .iter_mut()
+                .find(|existing| existing.same_binding(&grant))
+            {
+                if existing != &grant {
+                    merge_migrated_grant_constraints(existing, grant)?;
+                }
+                continue;
+            }
+            deduplicated.push(grant);
+        }
+
+        let mut migrated = Self {
+            version: self.version.checked_next()?,
+            created_at: now,
+            created_by: PrincipalId::new("system:phase7-all-migration")?,
+            checksum: String::new(),
+            principals: self.principals.clone(),
+            keys: self.keys.clone(),
+            grants: deduplicated,
+        };
+        migrated.validate_structure()?;
+        migrated.checksum = migrated.compute_checksum()?;
+        Ok(migrated)
+    }
+
     pub(crate) fn compile(&self) -> Result<CompiledPolicy, SecurityError> {
         self.verify_checksum()?;
         let principals = self
@@ -976,7 +1169,11 @@ impl PolicySnapshot {
         let mut grants: HashMap<PrincipalId, Vec<CompiledGrant>> = HashMap::new();
         for grant in &self.grants {
             let actions = match &grant.actions {
-                GrantActions::All => Action::POLICY_ALL_V1.into_iter().collect(),
+                GrantActions::All => {
+                    return Err(SecurityError::InvalidPolicy(
+                        "unmigrated legacy All grant cannot be compiled".to_string(),
+                    ));
+                }
                 GrantActions::Selected { actions } => actions.iter().copied().collect(),
             };
             grants
@@ -991,6 +1188,7 @@ impl PolicySnapshot {
                         .write_constraints
                         .clone()
                         .unwrap_or_else(WriteConstraints::none),
+                    require_approval: grant.require_approval.iter().copied().collect(),
                 });
         }
         validate_compiled_grant_conflicts(&grants)?;
@@ -1152,12 +1350,21 @@ impl PolicySnapshot {
         now: DateTime<Utc>,
         grant: PolicyGrant,
     ) -> Result<Self, SecurityError> {
-        if !self
+        let principal = self
             .principals
             .iter()
-            .any(|principal| principal.principal_id == grant.principal_id)
-        {
-            return Err(SecurityError::PolicyEntityNotFound);
+            .find(|principal| principal.principal_id == grant.principal_id)
+            .ok_or(SecurityError::PolicyEntityNotFound)?;
+        if matches!(
+            &grant.actions,
+            GrantActions::Selected { actions } if actions.contains(&Action::CredentialDelegate)
+        ) && !matches!(
+            principal.kind,
+            PrincipalKind::Human | PrincipalKind::Service
+        ) {
+            return Err(SecurityError::InvalidPolicyRequest(
+                "CredentialDelegate grants require a human or service principal".to_string(),
+            ));
         }
         if self
             .grants
@@ -1232,6 +1439,11 @@ impl PolicySnapshot {
                 ));
             }
         }
+        let principal_kinds = self
+            .principals
+            .iter()
+            .map(|principal| (principal.principal_id.as_str(), principal.kind))
+            .collect::<BTreeMap<_, _>>();
 
         let mut key_ids = BTreeSet::new();
         for key in &self.keys {
@@ -1308,6 +1520,17 @@ impl PolicySnapshot {
                         "explicit grant actions must be nonempty and unique".to_string(),
                     ));
                 }
+                if actions.contains(&Action::CredentialDelegate)
+                    && !matches!(
+                        principal_kinds.get(grant.principal_id.as_str()),
+                        Some(PrincipalKind::Human | PrincipalKind::Service)
+                    )
+                {
+                    return Err(SecurityError::InvalidPolicy(
+                        "CredentialDelegate grants require a human or service principal"
+                            .to_string(),
+                    ));
+                }
             }
             grant
                 .validate_constraints()
@@ -1338,16 +1561,7 @@ impl PolicySnapshot {
         let value = serde_json::to_value(content).map_err(|error| {
             SecurityError::InvalidPolicy(format!("policy canonicalization failed: {error}"))
         })?;
-        let mut canonical = String::new();
-        write_canonical_json(&value, &mut canonical)?;
-        let digest = Sha256::digest(canonical.as_bytes());
-        let mut encoded = String::with_capacity(SHA256_HEX_LEN);
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        for byte in digest {
-            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-        Ok(encoded)
+        canonical_policy_checksum(&value)
     }
 
     /// Return the monotonic snapshot version.
@@ -1404,11 +1618,38 @@ impl PolicySnapshot {
         })
     }
 
+    /// Return whether this snapshot activates Phase 7 delegation or approval policy.
+    #[must_use]
+    pub fn has_delegation_features(&self) -> bool {
+        self.grants.iter().any(|grant| {
+            !grant.require_approval.is_empty()
+                || matches!(
+                    &grant.actions,
+                    GrantActions::Selected { actions }
+                        if actions.contains(&Action::CredentialDelegate)
+                )
+        })
+    }
+
     /// Return the number of stable principals in this snapshot.
     #[must_use]
     pub fn principal_count(&self) -> usize {
         self.principals.len()
     }
+}
+
+/// Hash one policy checksum payload with Zeppelin's canonical JSON writer.
+pub fn canonical_policy_checksum(value: &Value) -> Result<String, SecurityError> {
+    let mut canonical = String::new();
+    write_canonical_json(value, &mut canonical)?;
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut encoded = String::with_capacity(SHA256_HEX_LEN);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    Ok(encoded)
 }
 
 fn grant_scope_matches(scope: &GrantScope, resource: &Resource) -> bool {
@@ -1468,6 +1709,11 @@ fn bootstrap_key(
     configured: &ApiKeyConfig,
     now: DateTime<Utc>,
 ) -> Result<(PolicyPrincipal, PolicyKey, Vec<PolicyGrant>), SecurityError> {
+    if configured.actions.iter().any(|action| action == "*") && configured.actions.len() != 1 {
+        return Err(SecurityError::InvalidPolicyRequest(
+            "bootstrap actions must not mix '*' with named actions".to_string(),
+        ));
+    }
     let key_id = ApiKeyId::new(configured.key_id.clone())?;
     let principal_id = PrincipalId::new(configured.key_id.clone())?;
     let principal = PolicyPrincipal {
@@ -1495,7 +1741,9 @@ fn bootstrap_key(
     };
 
     let actions = if configured.actions.iter().any(|action| action == "*") {
-        GrantActions::All
+        GrantActions::Selected {
+            actions: Action::BOOTSTRAP_ADMIN_V1.to_vec(),
+        }
     } else {
         let mut actions = configured
             .actions
@@ -1531,6 +1779,7 @@ fn bootstrap_key(
             mandatory_filter: None,
             field_mask: None,
             write_constraints: None,
+            require_approval: Vec::new(),
         })
         .collect();
     Ok((principal, key, grants))
@@ -1568,6 +1817,32 @@ fn grant_order(left: &PolicyGrant, right: &PolicyGrant) -> std::cmp::Ordering {
         })
 }
 
+fn merge_migrated_grant_constraints(
+    existing: &mut PolicyGrant,
+    incoming: PolicyGrant,
+) -> Result<(), SecurityError> {
+    existing.mandatory_filter = crate::index::filter::combine_filters(
+        existing.mandatory_filter.take(),
+        incoming.mandatory_filter,
+    );
+    match (&mut existing.field_mask, incoming.field_mask) {
+        (Some(existing), Some(incoming)) => existing.union_from(&incoming),
+        (slot @ None, Some(incoming)) => *slot = Some(incoming),
+        (Some(_) | None, None) => {}
+    }
+    match (&mut existing.write_constraints, incoming.write_constraints) {
+        (Some(existing), Some(incoming)) => existing.merge_from(&incoming)?,
+        (slot @ None, Some(incoming)) => *slot = Some(incoming),
+        (Some(_) | None, None) => {}
+    }
+    existing.require_approval.extend(incoming.require_approval);
+    existing.require_approval.sort_unstable();
+    existing.require_approval.dedup();
+    existing
+        .validate_constraints()
+        .map_err(SecurityError::InvalidPolicy)
+}
+
 fn filters_equal(
     left: Option<&crate::types::Filter>,
     right: Option<&crate::types::Filter>,
@@ -1584,7 +1859,7 @@ fn filters_equal(
     }
 }
 
-fn validate_policy_filter(filter: &crate::types::Filter) -> Result<(), String> {
+pub(crate) fn validate_policy_filter(filter: &crate::types::Filter) -> Result<(), String> {
     use crate::types::Filter;
 
     match filter {
@@ -1752,7 +2027,7 @@ mod tests {
         config::Config,
         security::{
             Action, DenyReason, FieldMask, GrantActions, GrantScope, NamespaceId, PrincipalId,
-            Resource, SecurityError, WriteConstraints,
+            PrincipalKind, Resource, SecurityError, WriteConstraints,
         },
         types::{AttributeValue, Filter},
     };
@@ -2066,7 +2341,7 @@ namespaces = ["*"]
         let write_grant = grant(json!({
             "principal_id": "zpk1_reader",
             "scope": {"kind": "global"},
-            "actions": {"kind": "all"},
+            "actions": {"kind": "selected", "actions": ["VectorUpsert"]},
             "write_constraints": {
                 "stamp": {"tenant_id": "acme"},
                 "forbid_set": ["is_public", "tenant_id"]
@@ -2093,7 +2368,7 @@ namespaces = ["*"]
         ));
         let without_admin = fixture(
             policy.authorize(&principal, now, Action::VectorUpsert, &resource),
-            "frozen All still grants VectorUpsert",
+            "selected write grant must authorize VectorUpsert",
         );
         assert_eq!(
             without_admin.write_constraints.forbidden_fields(),
@@ -2132,6 +2407,7 @@ namespaces = ["*"]
                 }),
                 None,
                 None,
+                Vec::new(),
             ),
             "empty mandatory conjunction must not mean unrestricted access",
         );
@@ -2173,6 +2449,7 @@ namespaces = ["*"]
                         Some(mandatory_filter),
                         None,
                         None,
+                        Vec::new(),
                     ),
                     "every mandatory token entry must survive default analysis",
                 );
@@ -2299,6 +2576,216 @@ namespaces = ["*"]
                 matches!(result, Err(SecurityError::ConstraintViolation)),
                 "target-only {action} must not observe or mutate a raw clone"
             );
+        }
+    }
+
+    #[test]
+    fn checksum_valid_persisted_approval_invariants_are_revalidated() {
+        let valid = grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "global"},
+            "actions": {"kind": "selected", "actions": ["NamespaceDelete", "VectorDelete"]},
+            "require_approval": ["NamespaceDelete"]
+        }));
+        for invalid in [
+            vec![Action::NamespaceDelete, Action::NamespaceDelete],
+            vec![Action::VectorDelete, Action::NamespaceDelete],
+            vec![Action::Query],
+            vec![Action::SnapshotDelete],
+        ] {
+            let mut snapshot = snapshot_with_grants(vec![valid.clone()]);
+            snapshot.grants[0].require_approval = invalid;
+            snapshot.checksum.clear();
+            snapshot.checksum = fixture(
+                snapshot.compute_checksum(),
+                "malformed approval fixture checksum must compute",
+            );
+            assert!(matches!(
+                snapshot.validate_for_use(),
+                Err(SecurityError::InvalidPolicy(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn phase_seven_migration_rewrites_legacy_all_before_compile() {
+        let legacy = grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "global"},
+            "actions": {"kind": "all"}
+        }));
+        let snapshot = snapshot_with_grants(vec![legacy]);
+        assert!(snapshot.requires_phase_seven_all_migration());
+        assert!(snapshot.compile().is_err());
+
+        let migrated = fixture(
+            snapshot.migrate_phase_seven_all(fixture_option(
+                Utc.with_ymd_and_hms(2026, 7, 14, 13, 0, 0).single(),
+                "migration timestamp must exist",
+            )),
+            "legacy wildcard migration must succeed",
+        );
+        assert!(!migrated.requires_phase_seven_all_migration());
+        assert_eq!(migrated.version().get(), snapshot.version().get() + 1);
+        assert!(migrated.grants().iter().any(|grant| matches!(
+            grant.actions(),
+            GrantActions::Selected { actions }
+                if actions == Action::POLICY_SAFE_ALL_V2.as_slice()
+        )));
+        assert!(migrated.grants().iter().any(|grant| matches!(
+            grant.actions(),
+            GrantActions::Selected { actions }
+                if actions == &[Action::SecurityAdminWrite]
+        )));
+        let compiled = fixture(migrated.compile(), "migrated policy must compile");
+        let principal = fixture_option(compiled.key("zpk1_reader"), "reader key must compile")
+            .principal
+            .clone();
+        assert!(compiled
+            .authorize(
+                &principal,
+                fixture_option(
+                    Utc.with_ymd_and_hms(2026, 7, 14, 13, 0, 1).single(),
+                    "authorization timestamp must exist",
+                ),
+                Action::SecurityAdminWrite,
+                &Resource::SecurityPolicy,
+            )
+            .is_ok());
+        assert!(compiled
+            .authorize(
+                &principal,
+                fixture_option(
+                    Utc.with_ymd_and_hms(2026, 7, 14, 13, 0, 1).single(),
+                    "authorization timestamp must exist",
+                ),
+                Action::CredentialDelegate,
+                &Resource::SecurityPolicy,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn phase_seven_migration_merges_overlapping_safe_grant_constraints() {
+        let legacy = grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "global"},
+            "actions": {"kind": "all"},
+            "mandatory_filter": {"op": "eq", "field": "tenant", "value": "a"},
+            "field_mask": {"deny": ["ssn"]},
+            "write_constraints": {
+                "stamp": {"tenant": "a"},
+                "forbid_set": ["classification"]
+            },
+            "require_approval": ["NamespaceDelete"]
+        }));
+        let safe_actions = fixture(
+            serde_json::to_value(Action::POLICY_SAFE_ALL_V2),
+            "safe action list must encode",
+        );
+        let overlapping = grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "global"},
+            "actions": {"kind": "selected", "actions": safe_actions},
+            "mandatory_filter": {"op": "eq", "field": "region", "value": "west"},
+            "field_mask": {"deny": ["salary"]},
+            "write_constraints": {
+                "stamp": {"region": "west"},
+                "forbid_set": ["owner"]
+            },
+            "require_approval": ["VectorDelete"]
+        }));
+        let snapshot = snapshot_with_grants(vec![legacy, overlapping]);
+        let migrated = fixture(
+            snapshot.migrate_phase_seven_all(fixture_option(
+                Utc.with_ymd_and_hms(2026, 7, 14, 13, 2, 0).single(),
+                "migration timestamp must exist",
+            )),
+            "overlapping wildcard migration must succeed",
+        );
+        let safe = fixture_option(
+            migrated.grants().iter().find(|grant| {
+                matches!(
+                    grant.actions(),
+                    GrantActions::Selected { actions }
+                        if actions == Action::POLICY_SAFE_ALL_V2.as_slice()
+                )
+            }),
+            "merged safe grant must exist",
+        );
+        let filter = fixture(
+            serde_json::to_value(safe.mandatory_filter()),
+            "merged filter must encode",
+        );
+        assert_eq!(filter["op"], "and");
+        assert_eq!(filter["filters"].as_array().map(Vec::len), Some(2));
+        let mask = fixture_option(safe.field_mask(), "merged field mask must exist");
+        assert_eq!(
+            mask.denied_fields(),
+            &BTreeSet::from(["salary".to_string(), "ssn".to_string()])
+        );
+        let writes = fixture_option(
+            safe.write_constraints(),
+            "merged write constraints must exist",
+        );
+        assert_eq!(writes.stamp().len(), 2);
+        assert_eq!(
+            writes.forbidden_fields(),
+            &BTreeSet::from(["classification".to_string(), "owner".to_string()])
+        );
+        assert_eq!(
+            safe.require_approval(),
+            &[Action::NamespaceDelete, Action::VectorDelete]
+        );
+        fixture(migrated.compile(), "merged migration must compile");
+    }
+
+    #[test]
+    fn new_all_binding_round_trips_as_safe_selected_for_add_and_remove() {
+        let principal_id = fixture(
+            PrincipalId::new("zpk1_reader"),
+            "reader principal fixture must validate",
+        );
+        let created = fixture(
+            PolicyGrant::new(principal_id.clone(), GrantScope::Global, GrantActions::All),
+            "new wildcard must normalize",
+        );
+        let removed = fixture(
+            PolicyGrant::new(principal_id, GrantScope::Global, GrantActions::All),
+            "removal wildcard must normalize identically",
+        );
+        assert_eq!(created, removed);
+        assert!(matches!(
+            created.actions(),
+            GrantActions::Selected { actions }
+                if actions == Action::POLICY_SAFE_ALL_V2.as_slice()
+                    && !actions.contains(&Action::SecurityAdminWrite)
+                    && !actions.contains(&Action::CredentialDelegate)
+        ));
+    }
+
+    #[test]
+    fn credential_delegate_grants_reject_agent_and_internal_principals() {
+        let grant = grant(json!({
+            "principal_id": "zpk1_reader",
+            "scope": {"kind": "global"},
+            "actions": {"kind": "selected", "actions": ["CredentialDelegate"]}
+        }));
+        for kind in [PrincipalKind::Agent, PrincipalKind::Internal] {
+            let mut snapshot = snapshot_with_grants(Vec::new());
+            snapshot.principals[0].kind = kind;
+            let error = fixture_error(
+                snapshot.add_grant(
+                    &fixture(PrincipalId::new("system:test"), "test actor must validate"),
+                    fixture_option(
+                        Utc.with_ymd_and_hms(2026, 7, 14, 13, 5, 0).single(),
+                        "grant timestamp must exist",
+                    ),
+                    grant.clone(),
+                ),
+                "non-parent principal kind must reject delegation grant",
+            );
+            assert!(matches!(error, SecurityError::InvalidPolicyRequest(_)));
         }
     }
 }

@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ZeppelinError;
 use crate::security::{
-    Action, AllowDecision, ApiKeyId, AuditParams, Decision, FieldMask, GrantActions,
-    GrantDefinition, GrantScope, KeyState, PolicyGrant, PolicyPrincipal, PolicyVersion, Principal,
-    PrincipalId, PrincipalKind, ResourceRef, SecurityError, SecurityOperationError,
-    WriteConstraints,
+    Action, AllowDecision, ApiKeyId, AuditParams, Decision, DelegationNarrowing, FieldMask,
+    GrantActions, GrantDefinition, GrantScope, KeyState, NamespaceId, PolicyGrant, PolicyPrincipal,
+    PolicyVersion, Principal, PrincipalId, PrincipalKind, ResourceRef, SecurityError,
+    SecurityOperationError, WriteConstraints,
 };
 use crate::server::{AppState, AuditRequest};
 use crate::types::Filter;
@@ -132,6 +132,8 @@ pub struct GrantMutationRequest {
     field_mask: Option<FieldMask>,
     #[serde(default)]
     write_constraints: WriteConstraints,
+    #[serde(default)]
+    require_approval: Vec<Action>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +170,89 @@ pub struct PolicyMetadataResponse {
     principals: usize,
     keys: usize,
     grants: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Strict narrowing and lifetime requested for one delegated credential.
+pub struct MintTokenRequest {
+    actions: Vec<Action>,
+    namespaces: Vec<String>,
+    #[serde(default)]
+    mandatory_filter: Option<Filter>,
+    purpose: String,
+    expires_in_secs: u64,
+}
+
+#[derive(Serialize)]
+/// One-time delegated bearer response.
+pub struct MintTokenResponse {
+    policy_version: PolicyVersion,
+    token_id: String,
+    token: String,
+    expires_at: DateTime<Utc>,
+}
+
+/// Mint one parent-attributed credential after the kernel proves narrowing.
+pub async fn mint_token(
+    State(state): State<AppState>,
+    Extension(_decision): Extension<AllowDecision>,
+    Extension(principal): Extension<Principal>,
+    Extension(audit): Extension<AuditRequest>,
+    Json(request): Json<MintTokenRequest>,
+) -> Result<(StatusCode, Json<MintTokenResponse>), ApiError> {
+    let purpose = request.purpose.clone();
+    audit.set_params(AuditParams::DelegationMint {
+        token_id: None,
+        parent_principal: principal.id.clone(),
+        purpose: purpose.clone(),
+    });
+    let namespaces = request
+        .namespaces
+        .into_iter()
+        .map(NamespaceId::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            ApiError(ZeppelinError::from(SecurityError::InvalidPolicyRequest(
+                "invalid delegated namespace".to_string(),
+            )))
+        })?;
+    let narrowed = DelegationNarrowing::new(
+        request.actions,
+        namespaces,
+        request.mandatory_filter,
+        request.purpose,
+    )
+    .map_err(|error| ApiError(error.into()))?;
+    let (issued, authorization) = state
+        .security
+        .mint_delegated_token(
+            &principal,
+            narrowed,
+            request.expires_in_secs,
+            state.clock.now(),
+        )
+        .map_err(|error| security_operation_api_error(&audit, Action::CredentialDelegate, error))?;
+    let policy_version = authorization.policy_version;
+    audit.set_allow(
+        Action::CredentialDelegate,
+        ResourceRef::SecurityPolicy,
+        authorization,
+    );
+    audit.set_params(AuditParams::DelegationMint {
+        token_id: Some(issued.token_id().to_string()),
+        parent_principal: principal.id.clone(),
+        purpose,
+    });
+    Ok((
+        StatusCode::CREATED,
+        Json(MintTokenResponse {
+            policy_version,
+            token_id: issued.token_id().to_string(),
+            token: issued.token().to_string(),
+            expires_at: issued.expires_at(),
+        }),
+    ))
 }
 
 /// CAS-publish a new principal and durably audit the version transition.
@@ -424,6 +509,7 @@ pub async fn create_grant(
         request.mandatory_filter,
         request.field_mask,
         request.write_constraints,
+        request.require_approval,
     );
     let (authorization, new_version, grant) = state
         .security

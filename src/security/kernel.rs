@@ -1,6 +1,7 @@
 //! Pure-CPU phase-1 authorization over validated boot grants.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,8 +13,9 @@ use crate::time::Clock;
 use chrono::{DateTime, Utc};
 
 use super::{
-    policy_cache::PolicyCache, Action, AllowDecision, ApiKeyAdapter, Decision, DenyDecision,
-    DenyReason, Entitlements, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, NamespaceId,
+    delegation::DelegationAuthority, policy_cache::PolicyCache, Action, AllowDecision,
+    ApiKeyAdapter, Decision, DelegationNarrowing, DenyDecision, DenyReason, Entitlements,
+    GrantActions, GrantDefinition, GrantScope, IssuedApiKey, IssuedDelegatedToken, NamespaceId,
     PolicyGrant, PolicyPrincipal, PolicySnapshot, PolicyStore, Principal, PrincipalId,
     PrincipalKind, RequestContext, Resource, SecurityError, SecurityOperationResult,
 };
@@ -43,6 +45,7 @@ pub struct SecurityKernel {
     authority: SecurityAuthority,
     cursor_binding_key: super::CursorBindingKey,
     entitlements: Arc<Entitlements>,
+    delegation: Option<Arc<DelegationAuthority>>,
 }
 
 impl SecurityKernel {
@@ -62,10 +65,15 @@ impl SecurityKernel {
         };
         let mut grants = HashMap::new();
         for key in &config.api_keys {
+            if key.actions.iter().any(|action| action == "*") && key.actions.len() != 1 {
+                return Err(SecurityError::InvalidPolicyRequest(
+                    "bootstrap actions must not mix '*' with named actions".to_string(),
+                ));
+            }
             let principal_id = PrincipalId::new(key.key_id.clone())?;
             let mut actions = HashSet::new();
             if key.actions.iter().any(|action| action == "*") {
-                actions.extend(Action::POLICY_ALL_V1);
+                actions.extend(Action::BOOTSTRAP_ADMIN_V1);
             } else {
                 for action in &key.actions {
                     actions.insert(Action::from_str(action)?);
@@ -100,6 +108,7 @@ impl SecurityKernel {
             authority: SecurityAuthority::Bootstrap(grants),
             cursor_binding_key,
             entitlements,
+            delegation: None,
         })
     }
 
@@ -114,6 +123,17 @@ impl SecurityKernel {
         clock: Clock,
         entitlements: Arc<Entitlements>,
     ) -> ZeppelinResult<(Arc<Self>, Arc<ApiKeyAdapter>)> {
+        if entitlements.has(super::Feature::Delegation) && !entitlements.has(super::Feature::Rbac) {
+            return Err(crate::error::ZeppelinError::Config(
+                "delegation entitlement requires the rbac entitlement".to_string(),
+            ));
+        }
+        if config.mode == SecurityMode::OpenUnsafe && entitlements.has(super::Feature::Delegation) {
+            return Err(crate::error::ZeppelinError::Config(
+                "delegation requires security.mode = enforced so every token has authoritative parent grants"
+                    .to_string(),
+            ));
+        }
         if !entitlements.has(super::Feature::Rbac) {
             let now = clock.now();
             if config.mode == SecurityMode::Enforced
@@ -149,7 +169,7 @@ impl SecurityKernel {
             ));
         }
 
-        let policy_store = PolicyStore::new(store, Arc::clone(&entitlements));
+        let policy_store = PolicyStore::new(store.clone(), Arc::clone(&entitlements));
         let cursor_binding_key =
             super::CursorBindingKey::from_config_hex(config.cursor_hmac_key_hex())?;
         let loaded = policy_store.load_or_bootstrap(config, clock.now()).await?;
@@ -157,16 +177,39 @@ impl SecurityKernel {
             policy_store,
             loaded,
             Duration::from_secs(config.policy_refresh_secs),
-            clock,
+            clock.clone(),
         )?;
+        let delegation = if entitlements.has(super::Feature::Delegation) {
+            Some(
+                DelegationAuthority::compose(
+                    store,
+                    Arc::clone(&cache),
+                    clock,
+                    PathBuf::from(&config.token_signing_key_path),
+                    config.delegated_token_max_ttl_secs,
+                    Duration::from_secs(config.policy_refresh_secs),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let adapter = match &delegation {
+            Some(authority) => Arc::new(ApiKeyAdapter::from_policy_cache_with_delegation(
+                Arc::clone(&cache),
+                authority.verifier(),
+            )),
+            None => Arc::new(ApiKeyAdapter::from_policy_cache(Arc::clone(&cache))),
+        };
         Ok((
             Arc::new(Self {
                 mode: config.mode,
-                authority: SecurityAuthority::Policy(Arc::clone(&cache)),
+                authority: SecurityAuthority::Policy(cache),
                 cursor_binding_key,
                 entitlements,
+                delegation,
             }),
-            Arc::new(ApiKeyAdapter::from_policy_cache(cache)),
+            adapter,
         ))
     }
 
@@ -190,6 +233,9 @@ impl SecurityKernel {
         }
         if principal.is_anonymous() {
             return Decision::Deny(DenyDecision::boot(DenyReason::Unauthenticated));
+        }
+        if principal.delegation.is_some() {
+            return self.authorize_delegated(principal, action, resource, context.now);
         }
         match &self.authority {
             SecurityAuthority::Bootstrap(grants) => {
@@ -242,6 +288,9 @@ impl SecurityKernel {
                         if action == Action::VectorUpsert && attribute_admin {
                             allow.mark_attribute_admin_write();
                         }
+                        if constraints.require_approval {
+                            allow.require_approval();
+                        }
                         Decision::Allow(Box::new(allow))
                     }
                     Err(reason) => Decision::Deny(DenyDecision::for_policy(reason, version)),
@@ -263,6 +312,9 @@ impl SecurityKernel {
         }
         if principal.is_anonymous() {
             return Decision::Deny(DenyDecision::boot(DenyReason::Unauthenticated));
+        }
+        if principal.delegation.is_some() {
+            return self.authorize_delegated_action(principal, action, context.now);
         }
         match &self.authority {
             SecurityAuthority::Bootstrap(grants) => {
@@ -298,6 +350,233 @@ impl SecurityKernel {
                 Decision::Allow(Box::new(AllowDecision::for_policy(action, version)))
             }
         }
+    }
+
+    fn authorize_delegated(
+        &self,
+        principal: &Principal,
+        action: Action,
+        resource: &Resource,
+        now: DateTime<Utc>,
+    ) -> Decision {
+        let Some(delegation) = principal.delegation.as_ref() else {
+            return Decision::Deny(DenyDecision::boot(DenyReason::CredentialUnknown));
+        };
+        let SecurityAuthority::Policy(cache) = &self.authority else {
+            return Decision::Deny(DenyDecision::boot(DenyReason::CredentialUnknown));
+        };
+        let cached = cache.current();
+        let version = cached.policy.version();
+        if !cache.is_fresh(&cached) {
+            return Decision::Deny(DenyDecision::for_policy(DenyReason::SecurityStale, version));
+        }
+        if !cached.policy.delegated_parent_credential_is_active(
+            delegation.parent_principal(),
+            delegation.parent_api_key_id(),
+            now,
+        ) {
+            return Decision::Deny(DenyDecision::for_policy(
+                DenyReason::CredentialUnknown,
+                version,
+            ));
+        }
+        if let Some(namespace) = resource.namespace() {
+            if !delegation.narrowed().allows(action, namespace) {
+                let reason = if delegation.narrowed().actions().contains(&action) {
+                    DenyReason::NamespaceNotGranted
+                } else {
+                    DenyReason::ActionNotGranted
+                };
+                return Decision::Deny(DenyDecision::for_policy(reason, version));
+            }
+        } else if !delegation.narrowed().actions().contains(&action) {
+            return Decision::Deny(DenyDecision::for_policy(
+                DenyReason::ActionNotGranted,
+                version,
+            ));
+        }
+        for delegated_action in delegation.narrowed().actions() {
+            for namespace in delegation.narrowed().namespaces() {
+                if let Err(reason) = cached.policy.authorize_delegated_parent(
+                    delegation.parent_principal(),
+                    *delegated_action,
+                    &Resource::Namespace(namespace.clone()),
+                ) {
+                    return Decision::Deny(DenyDecision::for_policy(reason, version));
+                }
+            }
+        }
+        match cached.policy.authorize_delegated_parent(
+            delegation.parent_principal(),
+            action,
+            resource,
+        ) {
+            Ok(constraints) => {
+                let mut allow = AllowDecision::for_policy(action, version);
+                allow.cursor_binding_key = self.cursor_binding_key;
+                allow.mandatory_filter = crate::index::filter::combine_filters(
+                    constraints.mandatory_filter,
+                    delegation.narrowed().mandatory_filter().cloned(),
+                );
+                allow.field_mask = constraints.field_mask;
+                allow.write_constraints = constraints.write_constraints;
+                if action == Action::VectorUpsert
+                    && constraints.attribute_admin
+                    && delegation
+                        .narrowed()
+                        .actions()
+                        .contains(&Action::AttributeAdmin)
+                {
+                    allow.mark_attribute_admin_write();
+                }
+                if constraints.require_approval || action.is_destructive() {
+                    allow.require_approval();
+                }
+                Decision::Allow(Box::new(allow))
+            }
+            Err(reason) => Decision::Deny(DenyDecision::for_policy(reason, version)),
+        }
+    }
+
+    fn authorize_delegated_action(
+        &self,
+        principal: &Principal,
+        action: Action,
+        now: DateTime<Utc>,
+    ) -> Decision {
+        let Some(delegation) = principal.delegation.as_ref() else {
+            return Decision::Deny(DenyDecision::boot(DenyReason::CredentialUnknown));
+        };
+        let SecurityAuthority::Policy(cache) = &self.authority else {
+            return Decision::Deny(DenyDecision::boot(DenyReason::CredentialUnknown));
+        };
+        let cached = cache.current();
+        let version = cached.policy.version();
+        if !cache.is_fresh(&cached) {
+            return Decision::Deny(DenyDecision::for_policy(DenyReason::SecurityStale, version));
+        }
+        if !cached.policy.delegated_parent_credential_is_active(
+            delegation.parent_principal(),
+            delegation.parent_api_key_id(),
+            now,
+        ) {
+            return Decision::Deny(DenyDecision::for_policy(
+                DenyReason::CredentialUnknown,
+                version,
+            ));
+        }
+        if !delegation.narrowed().actions().contains(&action) {
+            return Decision::Deny(DenyDecision::for_policy(
+                DenyReason::ActionNotGranted,
+                version,
+            ));
+        }
+        match cached
+            .policy
+            .authorize_delegated_parent_action(delegation.parent_principal(), action)
+        {
+            Ok(()) => Decision::Allow(Box::new(AllowDecision::for_policy(action, version))),
+            Err(reason) => Decision::Deny(DenyDecision::for_policy(reason, version)),
+        }
+    }
+
+    /// Mint one short-lived credential only after proving structural narrowing.
+    pub fn mint_delegated_token(
+        &self,
+        parent: &Principal,
+        narrowed: DelegationNarrowing,
+        requested_ttl_secs: u64,
+        now: DateTime<Utc>,
+    ) -> SecurityOperationResult<(IssuedDelegatedToken, AllowDecision)> {
+        if parent.delegation.is_some() {
+            return Err(SecurityError::DelegationChainingForbidden.into());
+        }
+        if !matches!(
+            parent.kind,
+            super::PrincipalKind::Human | super::PrincipalKind::Service
+        ) {
+            return Err(SecurityError::DelegationPrincipalKindForbidden.into());
+        }
+        let Some(authority) = &self.delegation else {
+            return Err(SecurityError::FeatureNotLicensed(super::Feature::Delegation).into());
+        };
+        let SecurityAuthority::Policy(cache) = &self.authority else {
+            return Err(SecurityError::FeatureRequired(super::Feature::Rbac).into());
+        };
+        let cached = cache.current();
+        let policy_version = cached.policy.version();
+        if !cache.is_fresh(&cached) {
+            return Err(super::SecurityOperationError::denied(
+                DenyDecision::for_policy(DenyReason::SecurityStale, policy_version),
+            ));
+        }
+        if !cached.policy.credential_is_active(parent, now) {
+            return Err(super::SecurityOperationError::denied(
+                DenyDecision::for_policy(DenyReason::CredentialUnknown, policy_version),
+            ));
+        }
+        let constraints = cached
+            .policy
+            .authorize(
+                parent,
+                now,
+                Action::CredentialDelegate,
+                &Resource::SecurityPolicy,
+            )
+            .map_err(|reason| {
+                super::SecurityOperationError::denied(DenyDecision::for_policy(
+                    reason,
+                    policy_version,
+                ))
+            })?;
+        let mut allow = AllowDecision::for_policy(Action::CredentialDelegate, policy_version);
+        allow.mandatory_filter = constraints.mandatory_filter;
+        allow.field_mask = constraints.field_mask;
+        allow.write_constraints = constraints.write_constraints;
+        if allow.mandatory_filter.is_some()
+            || allow.field_mask.is_some()
+            || !allow.write_constraints.is_empty()
+        {
+            return Err(super::SecurityOperationError::after_allow(
+                SecurityError::ConstraintViolation.into(),
+                allow,
+            ));
+        }
+        for action in narrowed.actions() {
+            for namespace in narrowed.namespaces() {
+                let parent_allows = cached
+                    .policy
+                    .authorize(
+                        parent,
+                        now,
+                        *action,
+                        &Resource::Namespace(namespace.clone()),
+                    )
+                    .is_ok();
+                if !narrowed.effective_allows(*action, namespace, parent_allows) {
+                    return Err(super::SecurityOperationError::denied_with_error(
+                        DenyDecision::for_policy(DenyReason::ActionNotGranted, policy_version),
+                        SecurityError::DelegationScopeExceeded.into(),
+                    ));
+                }
+            }
+        }
+        let parent_api_key_id = parent.api_key_id.clone().ok_or_else(|| {
+            super::SecurityOperationError::denied(DenyDecision::for_policy(
+                DenyReason::CredentialUnknown,
+                policy_version,
+            ))
+        })?;
+        authority
+            .mint(
+                parent.id.clone(),
+                parent_api_key_id,
+                narrowed,
+                requested_ttl_secs,
+                now,
+            )
+            .map(|issued| (issued, allow.clone()))
+            .map_err(|error| super::SecurityOperationError::after_allow(error.into(), allow))
     }
 
     /// Fail closed unless one verified policy version proves that a raw namespace
@@ -483,7 +762,13 @@ impl SecurityKernel {
     #[doc(hidden)]
     pub async fn refresh_authoritative_policy_for_test(&self) -> ZeppelinResult<()> {
         match &self.authority {
-            SecurityAuthority::Policy(cache) => cache.refresh_once().await,
+            SecurityAuthority::Policy(cache) => {
+                cache.refresh_once().await?;
+                if let Some(delegation) = &self.delegation {
+                    delegation.refresh_signers_once().await?;
+                }
+                Ok(())
+            }
             SecurityAuthority::Bootstrap(_) => Err(SecurityError::InvalidPolicyRequest(
                 "authoritative policy refresh requires S3 policy authority".to_string(),
             )

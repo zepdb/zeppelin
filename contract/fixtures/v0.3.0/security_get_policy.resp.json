@@ -2,9 +2,9 @@
   "checksum": "0000000000000000000000000000000000000000000000000000000000000000",
   "created_at": "2026-01-01T00:00:00+00:00",
   "created_by": "zpk1_test_admin",
-  "grants": 2,
+  "grants": 3,
   "keys": 4,
   "object_key": "_security/policies/contract-policy.json",
-  "policy_version": 7,
+  "policy_version": 8,
   "principals": 3
 }

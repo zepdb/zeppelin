@@ -206,6 +206,9 @@ pub struct SecurityAssertionSpec {
     pub mandatory_filter: Option<FilterMeasure>,
     /// Maximum median CPU cost of production authn plus authz per request.
     pub authn_authz_p50_delta_ns_max: u64,
+    /// Maximum median added CPU for Ed25519 token authentication plus authz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_authn_authz_p50_delta_ns_max: Option<u64>,
     /// Maximum added constrained-policy CPU as a percentage of query p50.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_p50_regression_percent_max: Option<u64>,
@@ -514,6 +517,15 @@ fn validate_contract(scenario: &str, contract: &ContractSpec) -> Result<(), Stri
                     "secured_query authn_authz_p50_delta_ns_max must be in 1..=10000".to_string(),
                 );
             }
+            if security
+                .delegated_authn_authz_p50_delta_ns_max
+                .is_none_or(|budget| budget == 0 || budget > 80_000)
+            {
+                return Err(
+                    "secured_query delegated_authn_authz_p50_delta_ns_max must be in 1..=80000"
+                        .to_string(),
+                );
+            }
             if security.added_get_ops != 0 || security.added_put_ops != 0 {
                 return Err(
                     "secured_query must freeze zero added object-store GETs and PUTs".to_string(),
@@ -531,6 +543,12 @@ fn validate_contract(scenario: &str, contract: &ContractSpec) -> Result<(), Stri
             return Err("secured_query requires assert.security".to_string());
         }
         ("secured_filtered_query", Some(security)) => {
+            if security.delegated_authn_authz_p50_delta_ns_max.is_some() {
+                return Err(
+                    "secured_filtered_query must leave the Phase 7 delegated-token budget to secured_query"
+                        .to_string(),
+                );
+            }
             if security.baseline_scenario != "filtered_query" {
                 return Err(
                     "secured_filtered_query security baseline_scenario must be filtered_query"
@@ -765,6 +783,29 @@ fn check_security_budget(
                     expected: format!("<= {}", expected.authn_authz_p50_delta_ns_max),
                     actual: actual.authn_authz_p50_delta_ns.to_string(),
                 });
+            }
+            match (
+                expected.delegated_authn_authz_p50_delta_ns_max,
+                actual.delegated_authn_authz_p50_delta_ns,
+            ) {
+                (Some(maximum), Some(measured)) if measured > maximum => {
+                    violations.push(CostViolation::SecurityBudget {
+                        metric: "delegated_authn_authz_p50_delta_ns".to_string(),
+                        expected: format!("<= {maximum}"),
+                        actual: measured.to_string(),
+                    });
+                }
+                (Some(_), None) => violations.push(CostViolation::SecurityBudget {
+                    metric: "delegated_authn_authz_p50_delta_ns".to_string(),
+                    expected: "present".to_string(),
+                    actual: "missing".to_string(),
+                }),
+                (None, Some(measured)) => violations.push(CostViolation::SecurityBudget {
+                    metric: "delegated_authn_authz_p50_delta_ns".to_string(),
+                    expected: "absent".to_string(),
+                    actual: measured.to_string(),
+                }),
+                (Some(_), Some(_)) | (None, None) => {}
             }
             let validated_query_regression = validate_direct_query_evidence(actual);
             if let Err(error) = &validated_query_regression {
@@ -1897,6 +1938,7 @@ total = { exact = 0 }
             baseline_scenario: "warm_query_strong".to_string(),
             mandatory_filter: None,
             authn_authz_p50_delta_ns_max: 10_000,
+            delegated_authn_authz_p50_delta_ns_max: Some(80_000),
             query_p50_regression_percent_max: None,
             added_get_ops: 0,
             added_put_ops: 0,
@@ -1911,6 +1953,8 @@ total = { exact = 0 }
             baseline_loop_p50_ns: 1,
             authn_authz_p50_ns: 10_002,
             authn_authz_p50_delta_ns: 10_001,
+            delegated_authn_authz_p50_ns: Some(70_001),
+            delegated_authn_authz_p50_delta_ns: Some(70_000),
             paired_query_samples: None,
             caller_filtered_query_p50_ns: None,
             policy_filtered_query_p50_ns: None,
@@ -1937,6 +1981,7 @@ total = { exact = 0 }
                 value: "c0".to_string(),
             }),
             authn_authz_p50_delta_ns_max: 10_000,
+            delegated_authn_authz_p50_delta_ns_max: None,
             query_p50_regression_percent_max: Some(5),
             added_get_ops: 0,
             added_put_ops: 0,
@@ -1955,6 +2000,8 @@ total = { exact = 0 }
             baseline_loop_p50_ns: 1,
             authn_authz_p50_ns: 1_001,
             authn_authz_p50_delta_ns: 1_000,
+            delegated_authn_authz_p50_ns: None,
+            delegated_authn_authz_p50_delta_ns: None,
             paired_query_samples: Some(paired.samples),
             caller_filtered_query_p50_ns: Some(paired.caller_filtered_p50_ns),
             policy_filtered_query_p50_ns: Some(paired.policy_filtered_p50_ns),
@@ -1981,6 +2028,7 @@ total = { exact = 0 }
                 value: "c0".to_string(),
             }),
             authn_authz_p50_delta_ns_max: 10_000,
+            delegated_authn_authz_p50_delta_ns_max: None,
             query_p50_regression_percent_max: Some(5),
             added_get_ops: 0,
             added_put_ops: 0,
@@ -1995,6 +2043,8 @@ total = { exact = 0 }
             baseline_loop_p50_ns: 1,
             authn_authz_p50_ns: 1_001,
             authn_authz_p50_delta_ns: 1_000,
+            delegated_authn_authz_p50_ns: None,
+            delegated_authn_authz_p50_delta_ns: None,
             paired_query_samples: None,
             caller_filtered_query_p50_ns: None,
             policy_filtered_query_p50_ns: None,

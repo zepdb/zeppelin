@@ -247,6 +247,8 @@ paths:
 
     post:
       operationId: createSecurityPrincipal
+      parameters:
+        - $ref: "#/components/parameters/ZeppelinApproval"
       summary: Create a security principal
       description: |
         CAS-publishes a new stable principal in the next immutable policy
@@ -306,6 +308,8 @@ paths:
 
     post:
       operationId: createSecurityKey
+      parameters:
+        - $ref: "#/components/parameters/ZeppelinApproval"
       summary: Issue an API key
       description: |
         Generates a high-entropy API key for an existing principal and
@@ -348,6 +352,8 @@ paths:
 
     delete:
       operationId: revokeSecurityKey
+      parameters:
+        - $ref: "#/components/parameters/ZeppelinApproval"
       summary: Revoke an API key
       description: |
         CAS-publishes a revoked state and writes the new policy through to the
@@ -380,6 +386,8 @@ paths:
 
     post:
       operationId: rotateSecurityKey
+      parameters:
+        - $ref: "#/components/parameters/ZeppelinApproval"
       summary: Rotate an API key
       description: |
         Issues a replacement credential and marks its predecessor revoked at the
@@ -438,6 +446,8 @@ paths:
 
     post:
       operationId: createSecurityGrant
+      parameters:
+        - $ref: "#/components/parameters/ZeppelinApproval"
       summary: Create a security grant
       description: |
         CAS-publishes one exact grant. Scope and actions are strict tagged
@@ -479,6 +489,8 @@ paths:
 
     delete:
       operationId: deleteSecurityGrant
+      parameters:
+        - $ref: "#/components/parameters/ZeppelinApproval"
       summary: Remove a security grant
       description: CAS-removes the grant binding that matches the supplied principal, scope, and actions.
       tags: [Security]
@@ -534,6 +546,43 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SecurityPolicyMetadataResponse"
+
+  /v1/security/tokens:
+    post:
+      operationId: mintDelegatedSecurityToken
+      summary: Mint a narrowed delegated token
+      description: |
+        Mints one short-lived Ed25519 `zpt1_` bearer whose effective authority
+        is always the current parent's grants intersected with this request.
+        Actions, namespaces, and the optional mandatory filter only narrow;
+        parent authority is checked at mint and again on every use. The token is
+        returned exactly once and cannot mint another delegated token.
+      tags: [Security]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MintDelegatedTokenRequest"
+      responses:
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "201":
+          description: Delegated bearer minted and returned exactly once
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MintDelegatedTokenResponse"
+        "400":
+          $ref: "#/components/responses/SecurityRequestError"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
 
   /v1/namespaces:
     post:
@@ -609,6 +658,8 @@ paths:
 
     delete:
       operationId: deleteNamespace
+      parameters:
+        - $ref: "#/components/parameters/ZeppelinApproval"
       summary: Delete namespace
       description: |
         Marks a namespace as deleting and starts resumable background cleanup.
@@ -720,6 +771,8 @@ paths:
 
     delete:
       operationId: deleteNamespaceSnapshot
+      parameters:
+        - $ref: "#/components/parameters/ZeppelinApproval"
       summary: Delete namespace snapshot
       description: |
         Releases a named snapshot pin. The generation it pinned then falls
@@ -992,6 +1045,8 @@ paths:
 
     delete:
       operationId: deleteVectors
+      parameters:
+        - $ref: "#/components/parameters/ZeppelinApproval"
       summary: Delete vectors
       description: |
         Delete vectors by an explicit ID list or by an exact attribute filter.
@@ -1209,6 +1264,19 @@ components:
       schema:
         $ref: "#/components/schemas/SecurityKeyId"
       description: Stable public API-key identifier; never includes the secret suffix.
+    ZeppelinApproval:
+      name: X-Zeppelin-Approval
+      in: header
+      required: false
+      description: |
+        Raw `zpk1_...` credential for an independent secondary approver when
+        the effective policy requires two-person approval. Do not prefix this
+        value with `Bearer`. This credential is secret and must be redacted from
+        logs, traces, diagnostics, and error responses.
+      schema:
+        type: string
+        pattern: '^zpk1_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
+        writeOnly: true
 
   responses:
     UnauthorizedError:
@@ -1668,6 +1736,26 @@ components:
         - SecurityAdminRead
         - SecurityAdminWrite
         - AttributeAdmin
+        - CredentialDelegate
+
+    DelegatedSecurityAction:
+      type: string
+      description: Namespace-bound action representable by a Phase 7 delegated token.
+      enum:
+        - NamespaceRead
+        - NamespaceDelete
+        - SnapshotRead
+        - SnapshotWrite
+        - SnapshotDelete
+        - IndexConfigWrite
+        - CompactionTrigger
+        - CompactionStatusRead
+        - HydrationTrigger
+        - VectorFetch
+        - VectorUpsert
+        - VectorDelete
+        - Query
+        - AttributeAdmin
 
     SecurityGrantScope:
       oneOf:
@@ -1712,8 +1800,9 @@ components:
     SecurityAllGrantActions:
       type: object
       description: |
-        Grants the frozen baseline action inventory. AttributeAdmin is excluded
-        and must always be named explicitly in a selected action grant.
+        Grants the frozen baseline action inventory. AttributeAdmin,
+        CredentialDelegate, and SecurityAdminWrite are excluded and must always
+        be named explicitly in a selected action grant.
       additionalProperties: false
       required: [kind]
       properties:
@@ -1755,6 +1844,8 @@ components:
           $ref: "#/components/schemas/SecurityFieldMask"
         write_constraints:
           $ref: "#/components/schemas/SecurityWriteConstraints"
+        require_approval:
+          $ref: "#/components/schemas/SecurityApprovalActions"
 
     SecurityGrantMutationRequest:
       type: object
@@ -1782,6 +1873,19 @@ components:
           $ref: "#/components/schemas/SecurityFieldMask"
         write_constraints:
           $ref: "#/components/schemas/SecurityWriteConstraints"
+        require_approval:
+          $ref: "#/components/schemas/SecurityApprovalActions"
+
+    SecurityApprovalActions:
+      type: array
+      description: |
+        Destructive actions in this same grant that require a distinct
+        authorized zpk1 approver through X-Zeppelin-Approval.
+      minItems: 1
+      uniqueItems: true
+      items:
+        type: string
+        enum: [NamespaceDelete, SnapshotDelete, VectorDelete, SecurityAdminWrite]
 
     SecurityGrantRemovalRequest:
       type: object
@@ -1871,6 +1975,62 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SecurityGrant"
+
+    MintDelegatedTokenRequest:
+      type: object
+      additionalProperties: false
+      required: [actions, namespaces, purpose, expires_in_secs]
+      properties:
+        actions:
+          type: array
+          minItems: 1
+          maxItems: 14
+          uniqueItems: true
+          description: Explicit namespace-bound signed action ceiling.
+          items:
+            $ref: "#/components/schemas/DelegatedSecurityAction"
+        namespaces:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 255
+        mandatory_filter:
+          $ref: "#/components/schemas/SecurityPolicyFilter"
+        purpose:
+          type: string
+          minLength: 1
+          maxLength: 512
+          pattern: ".*\\S.*"
+          description: Mandatory redaction-safe operator purpose recorded in audit.
+        expires_in_secs:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Requested lifetime, bounded by security.delegated_token_max_ttl_secs.
+
+    MintDelegatedTokenResponse:
+      type: object
+      additionalProperties: false
+      required: [policy_version, token_id, token, expires_at]
+      properties:
+        policy_version:
+          type: integer
+          format: uint64
+          minimum: 1
+        token_id:
+          type: string
+          pattern: "^zdt1_[0-9A-HJKMNP-TV-Z]{26}$"
+        token:
+          type: string
+          pattern: "^zpt1_[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"
+          description: One-time bearer secret; never returned by a later read.
+        expires_at:
+          type: string
+          format: date-time
 
     SecurityPolicyMetadataResponse:
       type: object

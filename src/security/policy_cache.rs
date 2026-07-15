@@ -92,7 +92,10 @@ impl PolicyCache {
 
     pub(crate) async fn refresh_once(&self) -> Result<()> {
         let observed = self.current();
-        let refresh = self.store.refresh(&observed.head_etag).await?;
+        let refresh = self
+            .store
+            .refresh(&observed.head_etag, self.clock.now())
+            .await?;
         match refresh {
             PolicyRefresh::Unchanged { observed_at } => {
                 let mut current = self
@@ -310,11 +313,11 @@ impl PolicyCache {
     {
         let mut latest_authorization = None;
         for _attempt in 0..POLICY_CAS_ATTEMPTS {
-            let base = self.store.load_current().await.map_err(|error| {
+            let now = self.clock.now();
+            let base = self.store.load_current(now).await.map_err(|error| {
                 SecurityOperationError::from(error)
                     .with_fallback_allow(latest_authorization.clone())
             })?;
-            let now = self.clock.now();
             let authorization = authorize_policy_write(base.snapshot(), actor, now)
                 .map_err(|error| error.with_fallback_allow(latest_authorization.clone()))?;
             latest_authorization = Some(authorization.clone());

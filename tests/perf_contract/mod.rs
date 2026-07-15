@@ -248,6 +248,10 @@ mod tests {
             .expect("secured_query must freeze security assertions");
         assert_eq!(security.baseline_scenario, "warm_query_strong");
         assert_eq!(security.authn_authz_p50_delta_ns_max, 10_000);
+        assert_eq!(
+            security.delegated_authn_authz_p50_delta_ns_max,
+            Some(80_000)
+        );
         assert_eq!(security.added_get_ops, 0);
         assert_eq!(security.added_put_ops, 0);
     }

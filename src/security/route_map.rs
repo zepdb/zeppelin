@@ -114,6 +114,11 @@ pub static ROUTE_ACTIONS: &[RouteAction] = &[
     },
     RouteAction {
         method: Method::POST,
+        path: "/v1/security/tokens",
+        class: RouteClass::Protected(Action::CredentialDelegate),
+    },
+    RouteAction {
+        method: Method::POST,
         path: "/v1/namespaces",
         class: RouteClass::Protected(Action::NamespaceCreate),
     },
@@ -253,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_three_security_route_inventory_is_exact() {
+    fn security_route_inventory_is_exact_through_phase_seven() {
         let routes = ROUTE_ACTIONS
             .iter()
             .filter(|entry| entry.path.starts_with("/v1/security"))
@@ -282,6 +287,7 @@ mod tests {
                 ("POST", "/v1/security/grants", "SecurityAdminWrite"),
                 ("DELETE", "/v1/security/grants", "SecurityAdminWrite"),
                 ("GET", "/v1/security/policy", "SecurityAdminRead"),
+                ("POST", "/v1/security/tokens", "CredentialDelegate"),
             ]
         );
     }

@@ -11,6 +11,7 @@ mod authn;
 mod constraints;
 mod context;
 mod decision;
+mod delegation;
 mod entitlements;
 mod kernel;
 mod license;
@@ -36,6 +37,7 @@ pub use decision::{
     AllowDecision, Decision, DecisionId, DenyDecision, DenyReason, FieldMask, Obligation,
     PolicyVersion, WriteConstraints,
 };
+pub use delegation::{DelegationContext, DelegationNarrowing, IssuedDelegatedToken};
 pub use entitlements::{CustomerId, EntitlementLimits, EntitlementSource, Entitlements, Feature};
 pub use kernel::SecurityKernel;
 #[cfg(feature = "managed")]
@@ -46,8 +48,8 @@ pub use license::{
     SignedLicense, LICENSE_PUBKEY,
 };
 pub use policy::{
-    ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, KeyState, PolicyGrant,
-    PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot,
+    canonical_policy_checksum, ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey,
+    KeyState, PolicyGrant, PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot,
 };
 pub use policy_store::{LoadedPolicy, PolicyStore};
 pub use principal::{AuthStrength, Principal, PrincipalId, PrincipalKind};
@@ -143,6 +145,33 @@ pub enum SecurityError {
     /// A security-policy mutation request is structurally invalid.
     #[error("invalid security policy request: {0}")]
     InvalidPolicyRequest(String),
+    /// Delegation was licensed but no private signing-key path was configured.
+    #[error("missing required security.token_signing_key_path for delegation")]
+    MissingDelegationSigningKey,
+    /// The delegated-token signing seed is not exactly 32 hexadecimal bytes.
+    #[error("invalid delegation signing key")]
+    InvalidDelegationSigningKey,
+    /// The private signing-key file is not restricted to mode 0600.
+    #[error("delegation signing key must have 0600 permissions")]
+    DelegationSigningKeyPermissions,
+    /// An immutable signer document collided with different key material.
+    #[error("delegation signer object collision")]
+    DelegationSignerCollision,
+    /// A published signer document is malformed or invalid.
+    #[error("invalid delegation signer document")]
+    InvalidDelegationSigner,
+    /// A requested delegated scope is not a subset of current parent authority.
+    #[error("delegated scope exceeds current parent authority")]
+    DelegationScopeExceeded,
+    /// Delegated credentials cannot mint further delegated credentials.
+    #[error("delegation chains are forbidden")]
+    DelegationChainingForbidden,
+    /// Only human and service principals may act as delegation parents.
+    #[error("principal kind cannot mint delegated credentials")]
+    DelegationPrincipalKindForbidden,
+    /// A two-person obligation lacked one distinct authorized API-key approver.
+    #[error("independent approval is required")]
+    ApprovalRequired,
     /// A bounded policy-head CAS retry loop could not publish its mutation.
     #[error("security policy changed concurrently; retry")]
     PolicyConflict,
@@ -172,6 +201,16 @@ impl SecurityOperationError {
         Self {
             decision: Some(Box::new(Decision::Deny(decision))),
             error: Box::new(SecurityError::Authorization(reason).into()),
+        }
+    }
+
+    pub(crate) fn denied_with_error(
+        decision: DenyDecision,
+        error: crate::error::ZeppelinError,
+    ) -> Self {
+        Self {
+            decision: Some(Box::new(Decision::Deny(decision))),
+            error: Box::new(error),
         }
     }
 
@@ -242,9 +281,11 @@ impl SecurityError {
             | Self::LicenseExpired
             | Self::LicenseLimitExceeded(_) => 403,
             Self::ConstraintViolation => 403,
+            Self::DelegationChainingForbidden | Self::DelegationPrincipalKindForbidden => 403,
+            Self::ApprovalRequired => 403,
             Self::CursorPolicyStale => 400,
             Self::InvalidNamespaceId | Self::InvalidSnapshotName => 400,
-            Self::InvalidPolicyRequest(_) => 400,
+            Self::InvalidPolicyRequest(_) | Self::DelegationScopeExceeded => 400,
             Self::PolicyConflict | Self::PolicyEntityAlreadyExists => 409,
             Self::PolicyEntityNotFound => 404,
             Self::UnknownAction(_)
@@ -264,7 +305,12 @@ impl SecurityError {
             | Self::MissingBootstrapCredentials
             | Self::PolicyObjectCollision
             | Self::PolicyVersionOverflow
-            | Self::FeatureRequired(_) => 500,
+            | Self::FeatureRequired(_)
+            | Self::MissingDelegationSigningKey
+            | Self::InvalidDelegationSigningKey
+            | Self::DelegationSigningKeyPermissions
+            | Self::DelegationSignerCollision
+            | Self::InvalidDelegationSigner => 500,
         }
     }
 
@@ -280,6 +326,10 @@ impl SecurityError {
             Self::InvalidNamespaceId => "invalid_namespace",
             Self::InvalidSnapshotName => "invalid_snapshot",
             Self::InvalidPolicyRequest(_) => "invalid_security_request",
+            Self::DelegationScopeExceeded => "delegation_scope_exceeds_parent",
+            Self::DelegationChainingForbidden => "delegation_chaining_forbidden",
+            Self::DelegationPrincipalKindForbidden => "delegation_parent_kind_forbidden",
+            Self::ApprovalRequired => "approval_required",
             Self::PolicyConflict => "security_conflict",
             Self::PolicyEntityAlreadyExists => "security_entity_exists",
             Self::PolicyEntityNotFound => "security_entity_not_found",
@@ -303,7 +353,12 @@ impl SecurityError {
             | Self::PolicyHeadMissingEtag
             | Self::MissingBootstrapCredentials
             | Self::PolicyObjectCollision
-            | Self::PolicyVersionOverflow => "security_internal",
+            | Self::PolicyVersionOverflow
+            | Self::MissingDelegationSigningKey
+            | Self::InvalidDelegationSigningKey
+            | Self::DelegationSigningKeyPermissions
+            | Self::DelegationSignerCollision
+            | Self::InvalidDelegationSigner => "security_internal",
         }
     }
 
@@ -325,6 +380,16 @@ impl SecurityError {
             Self::InvalidNamespaceId => "invalid namespace name".to_string(),
             Self::InvalidSnapshotName => "invalid snapshot name".to_string(),
             Self::InvalidPolicyRequest(_) => "invalid security request".to_string(),
+            Self::DelegationScopeExceeded => {
+                "delegated scope exceeds current parent authority".to_string()
+            }
+            Self::DelegationChainingForbidden => {
+                "delegated credentials cannot mint further tokens".to_string()
+            }
+            Self::DelegationPrincipalKindForbidden => {
+                "principal kind cannot mint delegated credentials".to_string()
+            }
+            Self::ApprovalRequired => "independent approval is required".to_string(),
             Self::PolicyConflict => "security policy changed concurrently; retry".to_string(),
             Self::PolicyEntityAlreadyExists => "security policy entity already exists".to_string(),
             Self::PolicyEntityNotFound => "security policy entity not found".to_string(),
@@ -357,7 +422,12 @@ impl SecurityError {
             | Self::MissingBootstrapCredentials
             | Self::PolicyObjectCollision
             | Self::PolicyVersionOverflow
-            | Self::FeatureRequired(_) => "an internal security error occurred".to_string(),
+            | Self::FeatureRequired(_)
+            | Self::MissingDelegationSigningKey
+            | Self::InvalidDelegationSigningKey
+            | Self::DelegationSigningKeyPermissions
+            | Self::DelegationSignerCollision
+            | Self::InvalidDelegationSigner => "an internal security error occurred".to_string(),
         }
     }
 }

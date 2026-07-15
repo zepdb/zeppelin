@@ -341,6 +341,16 @@ pub enum AuditParams {
         /// Newly published authoritative version.
         new_version: PolicyVersion,
     },
+    /// A parent minted one short-lived, purpose-bound delegated credential.
+    DelegationMint {
+        /// Stable token identifier on success; never the bearer or signature.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_id: Option<String>,
+        /// Parent principal whose current grants remain authoritative.
+        parent_principal: PrincipalId,
+        /// Mandatory operator-supplied purpose.
+        purpose: String,
+    },
     /// The process booted with explicit unsafe-open security mode.
     OpenUnsafeBoot,
     /// The process booted with a verified but expired license.
@@ -386,6 +396,9 @@ pub struct AuditRecord {
     pub principal_kind: PrincipalKind,
     /// Parent principal for delegated credentials.
     pub delegation_parent: Option<PrincipalId>,
+    /// Independent principal that satisfied a two-person approval obligation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_principal_id: Option<PrincipalId>,
     /// Exhaustive operation evaluated by central authorization.
     pub action: Action,
     /// Typed target of the operation.
@@ -428,6 +441,7 @@ impl AuditRecord {
             principal_id: principal.id.clone(),
             principal_kind: principal.kind,
             delegation_parent: principal.delegation_parent.clone(),
+            approval_principal_id: None,
             action,
             resource,
             policy_version,

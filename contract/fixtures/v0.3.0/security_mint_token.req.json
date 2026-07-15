@@ -1,0 +1,15 @@
+{
+  "actions": [
+    "Query"
+  ],
+  "expires_in_secs": 300,
+  "mandatory_filter": {
+    "field": "tenant_id",
+    "op": "eq",
+    "value": "acme"
+  },
+  "namespaces": [
+    "contract-main"
+  ],
+  "purpose": "contract fixture delegated retrieval"
+}
