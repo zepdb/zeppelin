@@ -332,7 +332,6 @@ async fn direct_kernel_composition_installs_delegation_signer_on_input_store() {
 #[tokio::test]
 async fn verifier_discovers_signer_published_after_verifier_boot() {
     let harness = TestHarness::new().await;
-    let store = scoped_test_security_store(&harness.store, &harness.prefix);
     let verifier_key = delegation_signing_key(0x41);
     let signer_key = delegation_signing_key(0x42);
 
@@ -340,14 +339,16 @@ async fn verifier_discovers_signer_published_after_verifier_boot() {
     verifier_config.security.policy_refresh_secs = 1;
     verifier_config.security.token_signing_key_path =
         verifier_key.path().to_string_lossy().into_owned();
-    let verifier = start_test_server_full(store.clone(), None, verifier_config, false, None).await;
+    let verifier_store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let verifier = start_test_server_full(verifier_store, None, verifier_config, false, None).await;
 
     let mut signer_config = Config::default();
     signer_config.security.policy_refresh_secs = 1;
     signer_config.security.token_signing_key_path =
         signer_key.path().to_string_lossy().into_owned();
+    let signer_store = scoped_test_security_store(&harness.store, &harness.prefix);
     let signer = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
-        store,
+        signer_store,
         None,
         signer_config,
         false,
@@ -418,7 +419,6 @@ async fn verifier_discovers_signer_published_after_verifier_boot() {
 #[tokio::test]
 async fn concurrent_signer_registration_enforces_inventory_cap_atomically() {
     let harness = TestHarness::new().await;
-    let store = scoped_test_security_store(&harness.store, &harness.prefix);
     let mut base_config = Config::default();
     let _admin_bearer = test_admin_bearer(&mut base_config);
     let entitlements = Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation]));
@@ -430,7 +430,7 @@ async fn concurrent_signer_registration_enforces_inventory_cap_atomically() {
         let mut config = base_config.clone();
         config.security.token_signing_key_path = signing_key.path().to_string_lossy().into_owned();
         SecurityKernel::from_resolved_entitlements(
-            store.clone(),
+            scoped_test_security_store(&harness.store, &harness.prefix),
             &config.security,
             Clock::system(),
             Arc::clone(&entitlements),
@@ -447,13 +447,13 @@ async fn concurrent_signer_registration_enforces_inventory_cap_atomically() {
         signing_keys[32].path().to_string_lossy().into_owned();
     let (left, right) = tokio::join!(
         SecurityKernel::from_resolved_entitlements(
-            store.clone(),
+            scoped_test_security_store(&harness.store, &harness.prefix),
             &left_config.security,
             Clock::system(),
             Arc::clone(&entitlements),
         ),
         SecurityKernel::from_resolved_entitlements(
-            store.clone(),
+            scoped_test_security_store(&harness.store, &harness.prefix),
             &right_config.security,
             Clock::system(),
             Arc::clone(&entitlements),
@@ -472,7 +472,7 @@ async fn concurrent_signer_registration_enforces_inventory_cap_atomically() {
     overflow_config.security.token_signing_key_path =
         signing_keys[33].path().to_string_lossy().into_owned();
     let overflow = SecurityKernel::from_resolved_entitlements(
-        store,
+        scoped_test_security_store(&harness.store, &harness.prefix),
         &overflow_config.security,
         Clock::system(),
         entitlements,
