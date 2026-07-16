@@ -3,8 +3,9 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -35,6 +36,13 @@ impl AdjustableDelegationClock {
             .unwrap_or_else(|_| panic!("delegation test clock poisoned"));
         *now += duration;
     }
+
+    fn set(&self, now: DateTime<Utc>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|_| panic!("delegation test clock poisoned")) = now;
+    }
 }
 
 impl TimeSource for AdjustableDelegationClock {
@@ -44,6 +52,26 @@ impl TimeSource for AdjustableDelegationClock {
             .lock()
             .unwrap_or_else(|_| panic!("delegation test clock poisoned"))
     }
+}
+
+#[derive(Deserialize)]
+struct DelegatedTokenTimeBounds {
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+fn delegated_token_time_bounds(token: &str) -> (DateTime<Utc>, DateTime<Utc>) {
+    let (encoded_payload, _) = token
+        .strip_prefix("zpt1_")
+        .expect("delegated token prefix")
+        .split_once('.')
+        .expect("delegated token payload and signature");
+    let payload = URL_SAFE_NO_PAD
+        .decode(encoded_payload)
+        .expect("delegated token payload must be base64url");
+    let bounds: DelegatedTokenTimeBounds =
+        serde_json::from_slice(&payload).expect("delegated token payload must be JSON");
+    (bounds.issued_at, bounds.expires_at)
 }
 
 fn delegation_signing_key(seed_byte: u8) -> tempfile::NamedTempFile {
@@ -1017,16 +1045,26 @@ async fn expired_token_401_and_backward_clock_jump_does_not_resurrect() {
             "actions": ["Query"],
             "namespaces": [namespace],
             "purpose": "short-lived retrieval",
-            "expires_in_secs": 2
+            "expires_in_secs": 30
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(minted.status(), 201, "{}", minted.text().await.unwrap());
-    let token = minted.json::<serde_json::Value>().await.unwrap()["token"]
+    let old_mint = minted.json::<serde_json::Value>().await.unwrap();
+    let token = old_mint["token"].as_str().unwrap().to_string();
+    let old_response_expires_at = old_mint["expires_at"]
         .as_str()
-        .unwrap()
-        .to_string();
+        .expect("mint response expires_at")
+        .parse::<DateTime<Utc>>()
+        .expect("mint response expires_at must be RFC 3339");
+    let (old_issued_at, old_expires_at) = delegated_token_time_bounds(&token);
+    assert_eq!(old_response_expires_at, old_expires_at);
+    assert_eq!(
+        old_expires_at - old_issued_at,
+        Duration::seconds(30),
+        "old token must retain its requested signed TTL"
+    );
     let agent = client_with_bearer(&token);
 
     source.advance(Duration::milliseconds(1_500));
@@ -1046,25 +1084,52 @@ async fn expired_token_401_and_backward_clock_jump_does_not_resurrect() {
         first_observation.text().await.unwrap()
     );
 
-    source.advance(Duration::seconds(-1));
-    tokio::time::sleep(StdDuration::from_millis(600)).await;
-    for _ in 0..2 {
-        let response = agent
-            .post(format!(
-                "{}/v1/namespaces/{namespace}/query",
-                server.base_url
-            ))
-            .json(&json!({"vector": [1.0, 0.0], "top_k": 1}))
-            .send()
+    // Drive expiry through the injected clock rather than a narrow real-time
+    // sleep, using an explicit source instant beyond the signed expiry.
+    source.set(old_expires_at + Duration::seconds(60));
+    let expired_before_backjump = agent
+        .post(format!(
+            "{}/v1/namespaces/{namespace}/query",
+            server.base_url
+        ))
+        .json(&json!({"vector": [1.0, 0.0], "top_k": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired_before_backjump.status(), 401);
+    assert_eq!(
+        expired_before_backjump
+            .json::<serde_json::Value>()
             .await
-            .unwrap();
-        assert_eq!(response.status(), 401);
-        assert_eq!(
-            response.json::<serde_json::Value>().await.unwrap()["code"],
-            "credential_expired"
-        );
-        source.advance(Duration::seconds(-20));
-    }
+            .unwrap()["code"],
+        "credential_expired"
+    );
+
+    let source_inside_old_validity = old_issued_at
+        + Duration::milliseconds((old_expires_at - old_issued_at).num_milliseconds() / 2);
+    assert!(old_issued_at < source_inside_old_validity);
+    assert!(source_inside_old_validity < old_expires_at);
+    // Return to a source instant proven strictly inside the old token's signed
+    // validity interval. A naive verifier would accept it, so this 401 proves
+    // the verifier's monotonic floor prevents resurrection.
+    source.set(source_inside_old_validity);
+    let old_after_backjump = agent
+        .post(format!(
+            "{}/v1/namespaces/{namespace}/query",
+            server.base_url
+        ))
+        .json(&json!({"vector": [1.0, 0.0], "top_k": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old_after_backjump.status(), 401);
+    assert_eq!(
+        old_after_backjump
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["code"],
+        "credential_expired"
+    );
 
     let minted_after_backjump = parent
         .post(format!("{}/v1/security/tokens", server.base_url))
@@ -1072,19 +1137,29 @@ async fn expired_token_401_and_backward_clock_jump_does_not_resurrect() {
             "actions": ["Query"],
             "namespaces": [namespace],
             "purpose": "mint uses the verifier monotonic floor",
-            "expires_in_secs": 1
+            "expires_in_secs": 30
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(minted_after_backjump.status(), 201);
-    let fresh_token = minted_after_backjump
+    let fresh_mint = minted_after_backjump
         .json::<serde_json::Value>()
         .await
-        .unwrap()["token"]
+        .unwrap();
+    let fresh_token = fresh_mint["token"].as_str().unwrap().to_string();
+    let response_expires_at = fresh_mint["expires_at"]
         .as_str()
-        .unwrap()
-        .to_string();
+        .expect("mint response expires_at")
+        .parse::<DateTime<Utc>>()
+        .expect("mint response expires_at must be RFC 3339");
+    let (fresh_issued_at, fresh_expires_at) = delegated_token_time_bounds(&fresh_token);
+    assert_eq!(response_expires_at, fresh_expires_at);
+    assert_eq!(
+        fresh_expires_at - fresh_issued_at,
+        Duration::seconds(30),
+        "fresh token must retain its requested signed TTL"
+    );
     let fresh_agent = client_with_bearer(&fresh_token);
     let immediate = fresh_agent
         .post(format!(
@@ -1102,8 +1177,33 @@ async fn expired_token_401_and_backward_clock_jump_does_not_resurrect() {
         immediate.text().await.unwrap()
     );
 
-    source.advance(Duration::seconds(-20));
-    tokio::time::sleep(StdDuration::from_millis(1_100)).await;
+    // A fresh token minted while the injected source is behind the verifier's
+    // floor starts valid, then an explicit source instant beyond its signed
+    // expiry expires it without depending on scheduler timing.
+    source.set(fresh_expires_at + Duration::seconds(60));
+    let expired_after_forward_jump = fresh_agent
+        .post(format!(
+            "{}/v1/namespaces/{namespace}/query",
+            server.base_url
+        ))
+        .json(&json!({"vector": [1.0, 0.0], "top_k": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired_after_forward_jump.status(), 401);
+    assert_eq!(
+        expired_after_forward_jump
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["code"],
+        "credential_expired"
+    );
+
+    let source_inside_fresh_validity = fresh_issued_at
+        + Duration::milliseconds((fresh_expires_at - fresh_issued_at).num_milliseconds() / 2);
+    assert!(fresh_issued_at < source_inside_fresh_validity);
+    assert!(source_inside_fresh_validity < fresh_expires_at);
+    source.set(source_inside_fresh_validity);
     let first_use_after_backjump = fresh_agent
         .post(format!(
             "{}/v1/namespaces/{namespace}/query",
