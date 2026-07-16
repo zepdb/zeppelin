@@ -2,14 +2,16 @@
 //!
 //! Query and namespace-clone handlers accept an `as_of` string naming an exact
 //! manifest generation, an RFC3339 timestamp, or a named snapshot. This module
-//! translates that user-facing selector into one retained
+//! translates that user-facing selector into one retained or current-live
 //! [`crate::wal::manifest::Manifest`] read directly from object storage. It does
 //! not use the live manifest cache: PITR correctness depends on the
 //! authoritative live-generation boundary and immutable history objects in
 //! S3/MinIO.
 //!
 //! A named snapshot is a durable pin to one generation, not a second manifest.
-//! Numeric and snapshot targets require that exact history object to remain.
+//! Numeric and snapshot targets require that exact history object to remain,
+//! except that the authoritative current generation resolves from the live
+//! body during the post-CAS history-publication window.
 //! Timestamp targets scan retained generations in order and choose the newest
 //! generation whose `updated_at` is at or before the requested time. The scan
 //! does not assume timestamps increase with generation, so writer clock skew
@@ -24,23 +26,22 @@
 //!    enforcement.
 //! 3. Read `resolve_history_at_or_before_timestamp` for the full clock-skew-safe
 //!    history scan.
-//! 4. Finish with `live_manifest_version` and `point_in_time_not_retained` for
-//!    the authority boundary and caller-facing failure.
+//! 4. Finish with `point_in_time_not_retained` for caller-facing failure.
 //!
 //! ## Resolution flow
 //!
 //! ```text
 //! as_of string
 //!    |
-//!    +-- snapshot:name --> read immutable pin --> exact history generation
+//!    +-- snapshot:name --> read immutable pin --> exact retained/current generation
 //!    |
-//!    +-- unsigned integer ---------------------> exact history generation
+//!    +-- unsigned integer ---------------------> exact retained/current generation
 //!    |
 //!    +-- RFC3339 time --> list sorted history --> newest updated_at <= time
 //!                                      |
 //!                                      | ignore generations ahead of live
 //!                                      v
-//!                         retained historical Manifest
+//!                      retained or current-live Manifest
 //! ```
 //!
 //! ## Invariants
@@ -48,8 +49,9 @@
 //! - The current live manifest version caps every historical target. A stray
 //!   history object ahead of live state is never exposed.
 //! - Generation zero is unpublished and cannot be queried.
-//! - Missing/pruned exact history returns `PointInTimeNotRetained`; it never
-//!   falls back to a nearby generation.
+//! - Missing/pruned historical state returns `PointInTimeNotRetained`; it never
+//!   falls back to a nearby generation. Only an exact match to current live
+//!   authority may resolve without a physical history copy.
 //! - A key returned by history LIST but missing at GET is a storage invariant
 //!   error, not normal retention.
 //! - Resolving history is read-only and cannot make that generation live.
@@ -197,9 +199,13 @@ async fn read_retained_history_generation(
     generation: u64,
     target: &str,
 ) -> Result<Manifest, ZeppelinError> {
-    let live_version = live_manifest_version(store, namespace).await?;
+    let live = Manifest::read_required(store, namespace).await?;
+    let live_version = live.version();
     if generation == 0 || generation > live_version {
         return Err(point_in_time_not_retained(namespace, target));
+    }
+    if generation == live_version {
+        return Ok(live);
     }
 
     Manifest::read_history(store, namespace, generation)
@@ -207,7 +213,7 @@ async fn read_retained_history_generation(
         .ok_or_else(|| point_in_time_not_retained(namespace, target))
 }
 
-/// Selects the newest retained generation not later than a timestamp.
+/// Selects the newest retained or live generation not later than a timestamp.
 ///
 /// The history list is generation-sorted. This function scans all eligible
 /// entries rather than assuming `updated_at` is monotonic, so clock skew can
@@ -222,7 +228,8 @@ async fn read_retained_history_generation(
 ///
 /// # Returns
 ///
-/// The highest-generation retained manifest with `updated_at <= timestamp`.
+/// The highest-generation retained or authoritative live manifest with
+/// `updated_at <= timestamp`.
 ///
 /// # Errors
 ///
@@ -237,7 +244,8 @@ async fn read_retained_history_generation(
 /// # Consistency
 ///
 /// Entries with a generation greater than the current live version are ignored
-/// even if their timestamps qualify.
+/// even if their timestamps qualify. The current live body is considered after
+/// retained history because it is not physically snapshotted until superseded.
 ///
 /// # Performance
 ///
@@ -255,7 +263,8 @@ async fn resolve_history_at_or_before_timestamp(
     timestamp: DateTime<Utc>,
     target: &str,
 ) -> Result<Manifest, ZeppelinError> {
-    let live_version = live_manifest_version(store, namespace).await?;
+    let live = Manifest::read_required(store, namespace).await?;
+    let live_version = live.version();
     let history = Manifest::list_history(store, namespace).await?;
     let reads = stream::iter(
         history
@@ -277,40 +286,11 @@ async fn resolve_history_at_or_before_timestamp(
             selected = Some(manifest);
         }
     }
+    if live.updated_at <= timestamp {
+        selected = Some(live);
+    }
 
     selected.ok_or_else(|| point_in_time_not_retained(namespace, target))
-}
-
-/// Reads the authoritative live generation for a namespace.
-///
-/// # Parameters
-///
-/// - `store`: Object-store boundary for the live manifest GET.
-/// - `namespace`: Namespace whose visibility boundary is required.
-///
-/// # Returns
-///
-/// The live manifest's generation. Published legacy manifests can report zero.
-///
-/// # Errors
-///
-/// Propagates object-store and manifest decoding failures.
-///
-/// # Consistency
-///
-/// Reads S3/MinIO directly rather than a TTL cache because this value fences
-/// historical generations from stray objects ahead of live publication.
-///
-/// # Examples
-///
-/// A published legacy manifest returns zero, making every positive PITR target
-/// unretained. A missing live object fails as an integrity error. A live
-/// generation 12 returns 12.
-async fn live_manifest_version(
-    store: &ZeppelinStore,
-    namespace: &str,
-) -> Result<u64, ZeppelinError> {
-    Ok(Manifest::read_required(store, namespace).await?.version())
 }
 
 /// Builds the stable domain error for an unavailable point-in-time target.

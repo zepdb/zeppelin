@@ -161,6 +161,12 @@ pub struct HierarchicalIndex {
     pub(crate) segment_id: String,
     /// Manifest-declared fields whose leaf clusters may have bitmap sidecars.
     pub(crate) bitmap_fields: Vec<String>,
+    /// Exact routing-node identifiers written by this build.
+    ///
+    /// Metadata-only loads of legacy segments leave this empty. Manifest
+    /// publication records the populated build-time inventory so receipts and
+    /// clones root every lazily fetched internal node.
+    pub(crate) routing_node_ids: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +434,12 @@ impl HierarchicalIndex {
     /// A string slice used with [`tree_meta_key`] and [`tree_node_key`].
     pub fn segment_id(&self) -> &str {
         &self.segment_id
+    }
+
+    /// Borrow the exact routing-node inventory produced by this build.
+    #[must_use]
+    pub(crate) fn routing_node_ids(&self) -> &[String] {
+        &self.routing_node_ids
     }
 
     /// Loads an existing hierarchical index handle from its metadata object.

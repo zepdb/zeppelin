@@ -126,6 +126,22 @@ async fn query_as_of_generation_timestamp_and_snapshot_read_historical_manifest(
     let (live_status, live) = query(&client, &base_url, &ns, None, [10.0, 10.0]).await;
     assert_eq!(live_status, 200);
     assert_eq!(first_id(&live), "new");
+    let current_timestamp = Manifest::read(&harness.store, &ns)
+        .await
+        .unwrap()
+        .unwrap()
+        .updated_at
+        .to_rfc3339();
+    let (status, by_current_timestamp) = query(
+        &client,
+        &base_url,
+        &ns,
+        Some(&current_timestamp),
+        [10.0, 10.0],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(first_id(&by_current_timestamp), "new");
 
     let generation = g1_version.to_string();
     let (status, by_generation) =
@@ -288,7 +304,7 @@ async fn query_as_of_eventual_reads_historical_compacted_manifest() {
 }
 
 #[tokio::test]
-async fn query_as_of_ignores_history_generation_ahead_of_live_manifest() {
+async fn query_as_of_failed_live_put_never_exposes_candidate_generation() {
     let (base_url, harness, admin_bearer) = start_test_server().await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);
     let ns = create_ns_api_with(
@@ -322,8 +338,13 @@ async fn query_as_of_ignores_history_generation_ahead_of_live_manifest() {
         Manifest::read_history(&harness.store, &ns, orphan_generation)
             .await
             .unwrap()
-            .is_some()
+            .is_none()
     );
+    assert!(!harness
+        .store
+        .exists(&Manifest::history_key(&ns, orphan_generation))
+        .await
+        .unwrap());
 
     let generation = orphan_generation.to_string();
     let (status, error) = query(&client, &base_url, &ns, Some(&generation), [0.0, 0.0]).await;

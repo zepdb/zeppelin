@@ -8,15 +8,17 @@ use std::time::Duration;
 
 use crate::config::{SecurityConfig, SecurityMode};
 use crate::error::Result as ZeppelinResult;
+use crate::storage::store::ObjectSigner;
 use crate::storage::ZeppelinStore;
 use crate::time::Clock;
 use chrono::{DateTime, Utc};
 
 use super::{
-    delegation::DelegationAuthority, policy_cache::PolicyCache, Action, AllowDecision,
-    ApiKeyAdapter, Decision, DelegationNarrowing, DenyDecision, DenyReason, Entitlements,
-    GrantActions, GrantDefinition, GrantScope, IssuedApiKey, IssuedDelegatedToken, NamespaceId,
-    PolicyGrant, PolicyPrincipal, PolicySnapshot, PolicyStore, PreservationLockId,
+    delegation::{DelegationAuthority, PublishedObjectSigner},
+    policy_cache::PolicyCache,
+    Action, AllowDecision, ApiKeyAdapter, Decision, DelegationNarrowing, DenyDecision, DenyReason,
+    Entitlements, GrantActions, GrantDefinition, GrantScope, IssuedApiKey, IssuedDelegatedToken,
+    NamespaceId, PolicyGrant, PolicyPrincipal, PolicySnapshot, PolicyStore, PreservationLockId,
     PreservationLockRecord, PreservationService, Principal, PrincipalId, PrincipalKind,
     RequestContext, Resource, SecurityError, SecurityOperationResult,
 };
@@ -47,7 +49,31 @@ pub struct SecurityKernel {
     cursor_binding_key: super::CursorBindingKey,
     entitlements: Arc<Entitlements>,
     delegation: Option<Arc<DelegationAuthority>>,
+    audit_signer: Option<Arc<PublishedObjectSigner>>,
     preservation: Option<Arc<PreservationService>>,
+}
+
+pub(crate) struct ReceiptPolicyLookup<'a> {
+    pub verifier: &'a Principal,
+    pub context: &'a RequestContext,
+    pub receipt_principal: &'a super::PrincipalId,
+    pub delegation_parent: Option<&'a super::PrincipalId>,
+    pub namespace: &'a super::NamespaceId,
+    pub version: super::PolicyVersion,
+    pub checksum: Option<&'a str>,
+}
+
+/// Outcome of the privileged historical-policy lookup used by receipt verification.
+pub(crate) enum ReceiptPolicyResolution {
+    /// The verifier lacks `SecurityAdminRead`, so predicate consistency is intentionally skipped.
+    Unchecked,
+    /// The exact immutable policy generation authorized the receipt principal.
+    Resolved {
+        filter: Option<crate::types::Filter>,
+        delegated: bool,
+    },
+    /// A privileged verifier could not resolve or authorize the receipt's claimed policy state.
+    Diverged { delegated: bool },
 }
 
 impl SecurityKernel {
@@ -114,6 +140,7 @@ impl SecurityKernel {
             cursor_binding_key,
             entitlements,
             delegation: None,
+            audit_signer: None,
             preservation: None,
         })
     }
@@ -140,6 +167,13 @@ impl SecurityKernel {
                 "preservation entitlement requires the rbac entitlement".to_string(),
             ));
         }
+        if entitlements.has(super::Feature::Receipts)
+            && !entitlements.has(super::Feature::Delegation)
+        {
+            return Err(crate::error::ZeppelinError::Config(
+                "receipts entitlement requires the delegation signer entitlement".to_string(),
+            ));
+        }
         if config.mode == SecurityMode::OpenUnsafe && entitlements.has(super::Feature::Delegation) {
             return Err(crate::error::ZeppelinError::Config(
                 "delegation requires security.mode = enforced so every token has authoritative parent grants"
@@ -163,8 +197,21 @@ impl SecurityKernel {
             {
                 return Err(SecurityError::MissingBootstrapCredentials.into());
             }
+            let audit_signer = if entitlements.has(super::Feature::AuditS3) {
+                Some(
+                    PublishedObjectSigner::compose(
+                        store,
+                        PathBuf::from(&config.token_signing_key_path),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let mut kernel = Self::from_config_with_entitlements(config, entitlements)?;
+            kernel.audit_signer = audit_signer;
             return Ok((
-                Arc::new(Self::from_config_with_entitlements(config, entitlements)?),
+                Arc::new(kernel),
                 Arc::new(ApiKeyAdapter::from_config(config)?),
             ));
         }
@@ -179,11 +226,22 @@ impl SecurityKernel {
         entitlements: Arc<Entitlements>,
     ) -> ZeppelinResult<(Arc<Self>, Arc<ApiKeyAdapter>)> {
         if config.mode == SecurityMode::OpenUnsafe {
+            let audit_signer = if entitlements.has(super::Feature::AuditS3) {
+                Some(
+                    PublishedObjectSigner::compose(
+                        store,
+                        PathBuf::from(&config.token_signing_key_path),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let mut kernel =
+                Self::from_config_with_entitlements(config, Arc::clone(&entitlements))?;
+            kernel.audit_signer = audit_signer;
             return Ok((
-                Arc::new(Self::from_config_with_entitlements(
-                    config,
-                    Arc::clone(&entitlements),
-                )?),
+                Arc::new(kernel),
                 Arc::new(ApiKeyAdapter::from_config(config)?),
             ));
         }
@@ -207,6 +265,17 @@ impl SecurityKernel {
                     PathBuf::from(&config.token_signing_key_path),
                     config.delegated_token_max_ttl_secs,
                     Duration::from_secs(config.policy_refresh_secs),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let audit_signer = if delegation.is_none() && entitlements.has(super::Feature::AuditS3) {
+            Some(
+                PublishedObjectSigner::compose(
+                    store.clone(),
+                    PathBuf::from(&config.token_signing_key_path),
                 )
                 .await?,
             )
@@ -239,6 +308,7 @@ impl SecurityKernel {
                 cursor_binding_key,
                 entitlements,
                 delegation,
+                audit_signer,
                 preservation,
             }),
             adapter,
@@ -249,6 +319,24 @@ impl SecurityKernel {
     #[must_use]
     pub fn entitlements(&self) -> &Entitlements {
         &self.entitlements
+    }
+
+    /// Install this kernel's published node signer on another wrapper of the same backend.
+    pub fn install_object_signer(&self, store: &ZeppelinStore) -> ZeppelinResult<()> {
+        if let Some(authority) = &self.delegation {
+            let signer: Arc<dyn ObjectSigner> = authority.clone();
+            return store.install_object_signer(signer);
+        }
+        if let Some(audit_signer) = &self.audit_signer {
+            let signer: Arc<dyn ObjectSigner> = audit_signer.clone();
+            return store.install_object_signer(signer);
+        }
+        if self.entitlements.has(super::Feature::Receipts)
+            || self.entitlements.has(super::Feature::AuditS3)
+        {
+            return Err(super::SecurityError::FeatureRequired(super::Feature::Delegation).into());
+        }
+        Ok(())
     }
 
     /// Borrow the composed preservation module for maintenance integration.
@@ -387,8 +475,10 @@ impl SecurityKernel {
                 {
                     Ok(constraints) => {
                         let mut allow = AllowDecision::for_policy(action, version);
+                        allow.policy_checksum = Some(cached.snapshot.checksum().to_string());
                         allow.cursor_binding_key = self.cursor_binding_key;
                         let attribute_admin = constraints.attribute_admin;
+                        allow.policy_filter = constraints.mandatory_filter.clone();
                         allow.mandatory_filter = constraints.mandatory_filter;
                         allow.field_mask = constraints.field_mask;
                         allow.write_constraints = constraints.write_constraints;
@@ -520,7 +610,9 @@ impl SecurityKernel {
         ) {
             Ok(constraints) => {
                 let mut allow = AllowDecision::for_policy(action, version);
+                allow.policy_checksum = Some(cached.snapshot.checksum().to_string());
                 allow.cursor_binding_key = self.cursor_binding_key;
+                allow.policy_filter = constraints.mandatory_filter.clone();
                 allow.mandatory_filter = crate::index::filter::combine_filters(
                     constraints.mandatory_filter,
                     delegation.narrowed().mandatory_filter().cloned(),
@@ -637,6 +729,7 @@ impl SecurityKernel {
                 ))
             })?;
         let mut allow = AllowDecision::for_policy(Action::CredentialDelegate, policy_version);
+        allow.policy_filter = constraints.mandatory_filter.clone();
         allow.mandatory_filter = constraints.mandatory_filter;
         allow.field_mask = constraints.field_mask;
         allow.write_constraints = constraints.write_constraints;
@@ -859,6 +952,51 @@ impl SecurityKernel {
             )
             .into()),
         }
+    }
+
+    /// Resolve the historical policy-filter component for a receipt verifier.
+    ///
+    /// Only a caller lacking `SecurityAdminRead` receives `Unchecked`. Once a
+    /// caller is privileged, missing or inconsistent historical evidence is a
+    /// divergence rather than a silent downgrade. The route never reveals the
+    /// predicate itself.
+    pub(crate) async fn receipt_policy_filter(
+        &self,
+        lookup: ReceiptPolicyLookup<'_>,
+    ) -> ZeppelinResult<ReceiptPolicyResolution> {
+        if !matches!(
+            self.authorize(
+                lookup.verifier,
+                Action::SecurityAdminRead,
+                &Resource::SecurityPolicy,
+                lookup.context,
+            ),
+            Decision::Allow(_)
+        ) {
+            return Ok(ReceiptPolicyResolution::Unchecked);
+        }
+        let delegated = lookup.delegation_parent.is_some();
+        let SecurityAuthority::Policy(cache) = &self.authority else {
+            return Ok(ReceiptPolicyResolution::Diverged { delegated });
+        };
+        let Some(checksum) = lookup.checksum else {
+            return Ok(ReceiptPolicyResolution::Diverged { delegated });
+        };
+        let policy_principal = lookup.delegation_parent.unwrap_or(lookup.receipt_principal);
+        Ok(
+            match cache
+                .historical_query_filter(
+                    lookup.version,
+                    checksum,
+                    policy_principal,
+                    lookup.namespace,
+                )
+                .await?
+            {
+                Some(filter) => ReceiptPolicyResolution::Resolved { filter, delegated },
+                None => ReceiptPolicyResolution::Diverged { delegated },
+            },
+        )
     }
 
     /// Force one authoritative policy-head refresh for integration harnesses.

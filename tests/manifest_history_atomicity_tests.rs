@@ -1,7 +1,7 @@
 mod common;
 
 use common::counting::counting_store;
-use common::fault_injection::fail_put_once_matching;
+use common::fault_injection::{fail_put_once_matching, synchronize_cas_pair_matching};
 use common::harness::TestHarness;
 use ulid::Ulid;
 use zeppelin::error::ZeppelinError;
@@ -117,7 +117,7 @@ async fn write_history_failure_does_not_advance_live_manifest_and_retry_is_clean
 }
 
 #[tokio::test]
-async fn conditional_pointer_failure_orphan_history_can_be_overwritten_on_retry() {
+async fn failed_live_put_does_not_reserve_the_candidate_history_generation() {
     let harness = TestHarness::new().await;
     let ns = harness.key("manifest-history-pointer-failure");
 
@@ -142,31 +142,124 @@ async fn conditional_pointer_failure_orphan_history_can_be_overwritten_on_retry(
     assert_eq!(live.version(), 1);
     assert!(live.fragments.is_empty());
 
-    let orphan = Manifest::read_history(&harness.store, &ns, 2)
+    let predecessor = Manifest::read_history(&harness.store, &ns, 1)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(orphan.version(), 2);
-    assert_eq!(orphan.fragments.len(), 1);
-    assert_eq!(orphan.fragments[0].vector_count, 7);
+    assert_eq!(predecessor.to_bytes().unwrap(), live.to_bytes().unwrap());
+    assert!(!harness
+        .store
+        .exists(&Manifest::history_key(&ns, 2))
+        .await
+        .unwrap());
 
-    manifest.add_fragment(fragment(4, 11));
-    manifest
+    let mut divergent = live.clone();
+    divergent.add_fragment(fragment(4, 11));
+    let version2 = divergent
         .write_conditional(&failing_store, &ns, &version)
         .await
-        .unwrap();
+        .expect("a divergent retry must remain free to publish generation two");
+    assert_eq!(divergent.version(), 2);
+    assert_eq!(divergent.fragments.len(), 1);
+    assert_eq!(divergent.fragments[0].vector_count, 11);
+
+    divergent.add_fragment(fragment(5, 13));
+    divergent
+        .write_conditional(&failing_store, &ns, &version2)
+        .await
+        .expect("the next publication must retain generation two first");
 
     let live = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
-    assert_eq!(live.version(), 2);
+    assert_eq!(live.version(), 3);
     assert_eq!(live.fragments.len(), 2);
-    assert_eq!(live.fragments[1].vector_count, 11);
+    assert_eq!(live.fragments[1].vector_count, 13);
 
     let history = Manifest::read_history(&harness.store, &ns, 2)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(history.version(), live.version());
-    assert_eq!(history.fragments, live.fragments);
+    assert_eq!(history.version(), 2);
+    assert_eq!(history.fragments.len(), 1);
+    assert_eq!(history.fragments[0].vector_count, 11);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn competing_candidates_share_predecessor_history_and_one_wins_live_cas() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("manifest-history-orphan-toctou");
+    Manifest::new().write(&harness.store, &ns).await.unwrap();
+
+    let (mut winner, winner_version) = Manifest::read_versioned(&harness.store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    let (mut stale, stale_version) = Manifest::read_versioned(&harness.store, &ns)
+        .await
+        .unwrap()
+        .unwrap();
+    winner.add_fragment(fragment(30, 7));
+    stale.add_fragment(fragment(31, 11));
+
+    let base = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    let predecessor_key = Manifest::history_key(&ns, 1);
+    let (race_store, cas) = synchronize_cas_pair_matching(&harness.store, Manifest::s3_key(&ns));
+    cas.enable();
+    let winner_store = race_store.clone();
+    let stale_store = race_store;
+    let winner_ns = ns.clone();
+    let stale_ns = ns.clone();
+    let ((winner_result, winner), (stale_result, stale)) = tokio::join!(
+        async move {
+            let result = winner
+                .write_conditional(&winner_store, &winner_ns, &winner_version)
+                .await;
+            (result, winner)
+        },
+        async move {
+            let result = stale
+                .write_conditional(&stale_store, &stale_ns, &stale_version)
+                .await;
+            (result, stale)
+        }
+    );
+    assert_eq!(cas.arrivals(), 2);
+    assert_eq!(cas.conflicts(), 1);
+
+    let (committed, rejected) = match (winner_result, stale_result) {
+        (Ok(_), Err(ZeppelinError::ManifestConflict { .. })) => (winner, stale),
+        (Err(ZeppelinError::ManifestConflict { .. }), Ok(_)) => (stale, winner),
+        (winner_result, stale_result) => panic!(
+            "exactly one candidate must win the live CAS: winner={winner_result:?}, stale={stale_result:?}"
+        ),
+    };
+
+    let live = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    let history = Manifest::read_history(&harness.store, &ns, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.to_bytes().unwrap(), committed.to_bytes().unwrap());
+    assert_eq!(
+        history.to_bytes().unwrap(),
+        base.to_bytes().unwrap(),
+        "both candidates must share the immutable predecessor history"
+    );
+    assert_ne!(live.fragments, rejected.fragments);
+    assert_eq!(
+        harness.store.get(&predecessor_key).await.unwrap(),
+        base.to_bytes().unwrap()
+    );
+    let committed_history = Manifest::read_history(&harness.store, &ns, 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        committed_history.to_bytes().unwrap(),
+        live.to_bytes().unwrap(),
+        "only the winning candidate becomes immutable history generation two"
+    );
 
     harness.cleanup().await;
 }

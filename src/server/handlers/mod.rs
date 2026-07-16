@@ -75,6 +75,8 @@ pub mod config;
 pub mod namespace;
 /// Vector similarity, BM25, hybrid, and batch query endpoints.
 pub mod query;
+/// Signed receipt verification and manifest-root inspection endpoints.
+pub mod receipt;
 /// Security principal, credential, grant, and policy administration endpoints.
 pub mod security;
 /// Vector upsert, lookup, and delete endpoints.
@@ -449,28 +451,42 @@ pub async fn health_check() -> Json<Value> {
 ///
 /// # Errors
 ///
-/// The error return represents an unreachable or failing storage backend. No
-/// raw backend diagnostic is returned, and no partial mutation can occur
-/// because the probe only lists.
+/// The error return represents an unavailable durable audit actor or an
+/// unreachable storage backend. No raw backend diagnostic is returned, and no
+/// partial mutation can occur because the storage probe only lists.
 ///
 /// # Side Effects
 ///
-/// Performs one object-store list request and logs the full backend failure on
-/// error. `/readyz` bypasses rate-limit charging.
+/// Checks the process-local durable-audit health latch, then performs one
+/// object-store list request. It logs either full failure and `/readyz` bypasses
+/// rate-limit charging.
 ///
 /// # Consistency
 ///
-/// A successful probe is point-in-time connectivity evidence, not authoritative
-/// namespace state and not a promise that a later request cannot fail.
+/// Success means the audit actor has not failed and S3 is reachable at that
+/// instant; it is not authoritative namespace state or a promise that a later
+/// request cannot fail.
 ///
 /// # Examples
 ///
-/// A healthy MinIO bucket returns 200 even when `__healthcheck__` contains no
-/// objects. If credentials or networking fail, operators receive 503 while the
-/// detailed endpoint error remains only in server logs.
+/// A healthy audit actor and MinIO bucket return 200 even when
+/// `__healthcheck__` contains no objects. Audit lease loss, credentials, or
+/// networking failures return 503 while detailed diagnostics remain in logs.
 pub async fn readiness_check(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !state.audit.is_healthy() {
+        tracing::error!("readiness check failed: durable audit writer is unavailable");
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "s3_connected": true,
+                "audit_writer_healthy": false,
+                "error": "durable audit writer is unavailable",
+            })),
+        ));
+    }
     match state.store.list_prefix("__healthcheck__").await {
         Ok(_) => Ok(Json(json!({"status": "ready", "s3_connected": true}))),
         Err(e) => {

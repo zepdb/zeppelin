@@ -1,0 +1,9 @@
+{
+  "consistency": "strong",
+  "receipt": true,
+  "top_k": 2,
+  "vector": [
+    0.0,
+    0.0
+  ]
+}

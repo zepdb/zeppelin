@@ -180,6 +180,88 @@ pub struct PauseCasStore {
     release: Arc<tokio::sync::Semaphore>,
 }
 
+/// Controller for a one-shot matching GET pause.
+#[derive(Clone, Debug)]
+pub struct PauseGetHandle {
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl PauseGetHandle {
+    /// Wait until the first matching GET is blocked before reaching storage.
+    pub async fn wait_until_paused(&self) {
+        loop {
+            let notified = self.entered.notified();
+            if self.arrivals.load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Allow the paused GET to reach the authoritative backend.
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+/// Object-store decorator that pauses the first matching full-object GET.
+#[derive(Debug)]
+pub struct PauseGetStore {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+/// Object-store decorator that pauses after the first matching GET snapshots storage.
+#[derive(Debug)]
+pub struct PauseAfterGetStore {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+/// Controller for a one-shot matching create-only PUT pause.
+#[derive(Clone, Debug)]
+pub struct PauseCreateHandle {
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl PauseCreateHandle {
+    /// Wait until the first matching create is blocked before reaching storage.
+    pub async fn wait_until_paused(&self) {
+        loop {
+            let notified = self.entered.notified();
+            if self.arrivals.load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Allow the paused create to reach the authoritative backend.
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+/// Object-store decorator that pauses the first matching create-only PUT.
+#[derive(Debug)]
+pub struct PauseCreateStore {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    arrivals: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
 /// Controller for inspecting a deterministic two-writer create-only race.
 #[derive(Clone, Debug)]
 pub struct CreatePairBarrierHandle {
@@ -255,6 +337,81 @@ pub fn pause_first_cas_matching(
     (
         ZeppelinStore::new(Arc::new(wrapper)),
         PauseCasHandle {
+            arrivals,
+            entered,
+            release,
+        },
+    )
+}
+
+/// Wrap a store with a one-shot pause before the first matching GET reaches S3.
+pub fn pause_first_get_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+) -> (ZeppelinStore, PauseGetHandle) {
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let wrapper = PauseGetStore {
+        inner: store.inner(),
+        needle: needle.into(),
+        arrivals: Arc::clone(&arrivals),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    (
+        ZeppelinStore::new(Arc::new(wrapper)),
+        PauseGetHandle {
+            arrivals,
+            entered,
+            release,
+        },
+    )
+}
+
+/// Wrap a store with a one-shot pause after the first matching GET reaches S3.
+pub fn pause_first_after_get_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+) -> (ZeppelinStore, PauseGetHandle) {
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let wrapper = PauseAfterGetStore {
+        inner: store.inner(),
+        needle: needle.into(),
+        arrivals: Arc::clone(&arrivals),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    (
+        ZeppelinStore::new(Arc::new(wrapper)),
+        PauseGetHandle {
+            arrivals,
+            entered,
+            release,
+        },
+    )
+}
+
+/// Wrap a store with a one-shot pause before the first matching create reaches S3.
+pub fn pause_first_create_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+) -> (ZeppelinStore, PauseCreateHandle) {
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let wrapper = PauseCreateStore {
+        inner: store.inner(),
+        needle: needle.into(),
+        arrivals: Arc::clone(&arrivals),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    (
+        ZeppelinStore::new(Arc::new(wrapper)),
+        PauseCreateHandle {
             arrivals,
             entered,
             release,
@@ -454,6 +611,73 @@ pub fn fail_get_after_successful_cas_matching(
     let (failing, handle) =
         FailGetAfterSuccessfulCasStore::wrap(store.inner(), cas_needle, get_needle);
     (ZeppelinStore::new(Arc::new(failing)), handle)
+}
+
+/// Controller for one enabled CAS-ETag reconciliation failure.
+#[derive(Clone, Debug)]
+pub struct CasEtagReconciliationFailureHandle {
+    enabled: Arc<AtomicBool>,
+    etags_stripped: Arc<AtomicUsize>,
+    failures_injected: Arc<AtomicUsize>,
+}
+
+impl CasEtagReconciliationFailureHandle {
+    /// Arm the fault after startup has established the authoritative head.
+    pub fn enable(&self) {
+        self.enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// Return the number of successful CAS responses whose ETag was removed.
+    #[must_use]
+    pub fn etags_stripped(&self) -> usize {
+        self.etags_stripped.load(Ordering::SeqCst)
+    }
+
+    /// Return the number of reconciliation GET failures injected.
+    #[must_use]
+    pub fn failures_injected(&self) -> usize {
+        self.failures_injected.load(Ordering::SeqCst)
+    }
+}
+
+/// Object-store decorator that removes one successful matching CAS ETag and
+/// fails the exact-key GET used to reconcile that committed write.
+#[derive(Debug)]
+pub struct FailCasEtagReconciliationStore {
+    inner: Arc<dyn ObjectStore>,
+    needle: String,
+    enabled: Arc<AtomicBool>,
+    remaining: AtomicUsize,
+    armed: AtomicBool,
+    etags_stripped: Arc<AtomicUsize>,
+    failures_injected: Arc<AtomicUsize>,
+}
+
+/// Wrap a store in a disabled one-shot CAS-ETag reconciliation fault.
+pub fn fail_cas_etag_reconciliation_once_matching(
+    store: &ZeppelinStore,
+    needle: impl Into<String>,
+) -> (ZeppelinStore, CasEtagReconciliationFailureHandle) {
+    let enabled = Arc::new(AtomicBool::new(false));
+    let etags_stripped = Arc::new(AtomicUsize::new(0));
+    let failures_injected = Arc::new(AtomicUsize::new(0));
+    let wrapper = FailCasEtagReconciliationStore {
+        inner: store.inner(),
+        needle: needle.into(),
+        enabled: Arc::clone(&enabled),
+        remaining: AtomicUsize::new(1),
+        armed: AtomicBool::new(false),
+        etags_stripped: Arc::clone(&etags_stripped),
+        failures_injected: Arc::clone(&failures_injected),
+    };
+    (
+        ZeppelinStore::new(Arc::new(wrapper)),
+        CasEtagReconciliationFailureHandle {
+            enabled,
+            etags_stripped,
+            failures_injected,
+        },
+    )
 }
 
 /// Object-store decorator that fails the first matching DELETE.
@@ -945,6 +1169,12 @@ impl fmt::Display for FailGetAfterSuccessfulCasStore {
     }
 }
 
+impl fmt::Display for FailCasEtagReconciliationStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FailCasEtagReconciliationStore({})", self.inner)
+    }
+}
+
 impl fmt::Display for FailDeleteOnceStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "FailDeleteOnceStore({})", self.inner)
@@ -1032,6 +1262,24 @@ impl fmt::Display for PauseCasStore {
     }
 }
 
+impl fmt::Display for PauseGetStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PauseGetStore({})", self.inner)
+    }
+}
+
+impl fmt::Display for PauseAfterGetStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PauseAfterGetStore({})", self.inner)
+    }
+}
+
+impl fmt::Display for PauseCreateStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PauseCreateStore({})", self.inner)
+    }
+}
+
 #[async_trait]
 impl ObjectStore for PauseCasStore {
     async fn put_opts(
@@ -1050,6 +1298,185 @@ impl ObjectStore for PauseCasStore {
                 .acquire()
                 .await
                 .expect("pause CAS semaphore must remain open");
+            permit.forget();
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PauseGetStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        let should_pause = location.as_ref().contains(&self.needle)
+            && self.arrivals.fetch_add(1, Ordering::SeqCst) == 0;
+        if should_pause {
+            self.entered.notify_waiters();
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("pause GET semaphore must remain open");
+            permit.forget();
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PauseAfterGetStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        let should_pause = location.as_ref().contains(&self.needle)
+            && self.arrivals.fetch_add(1, Ordering::SeqCst) == 0;
+        let result = self.inner.get_opts(location, options).await;
+        if should_pause {
+            self.entered.notify_waiters();
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("pause-after GET semaphore must remain open");
+            permit.forget();
+        }
+        result
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PauseCreateStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        let should_pause = location.as_ref().contains(&self.needle)
+            && matches!(&opts.mode, PutMode::Create)
+            && self.arrivals.fetch_add(1, Ordering::SeqCst) == 0;
+        if should_pause {
+            self.entered.notify_waiters();
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("pause create semaphore must remain open");
             permit.forget();
         }
         self.inner.put_opts(location, payload, opts).await
@@ -1516,6 +1943,82 @@ impl ObjectStore for FailGetAfterSuccessfulCasStore {
                 store: "fail_get_after_successful_cas",
                 source: Box::new(std::io::Error::other(format!(
                     "injected post-CAS GET failure for {location}"
+                ))),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &Path) -> OsResult<ObjectMeta> {
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &Path) -> OsResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, OsResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OsResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FailCasEtagReconciliationStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OsResult<PutResult> {
+        let matching_update =
+            location.as_ref().contains(&self.needle) && matches!(&opts.mode, PutMode::Update(_));
+        let mut result = self.inner.put_opts(location, payload, opts).await?;
+        if matching_update
+            && self.enabled.load(Ordering::SeqCst)
+            && self
+                .remaining
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            result.e_tag = None;
+            self.etags_stripped.fetch_add(1, Ordering::SeqCst);
+            self.armed.store(true, Ordering::SeqCst);
+        }
+        Ok(result)
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOpts,
+    ) -> OsResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        if location.as_ref().contains(&self.needle)
+            && self
+                .armed
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.failures_injected.fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "fail_cas_etag_reconciliation",
+                source: Box::new(std::io::Error::other(format!(
+                    "injected CAS ETag reconciliation GET failure for {location}"
                 ))),
             });
         }

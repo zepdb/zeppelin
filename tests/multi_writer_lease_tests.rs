@@ -14,7 +14,9 @@
 
 mod common;
 
+use common::fault_injection::pause_first_get_matching;
 use common::harness::TestHarness;
+use common::server::test_security_runtime;
 use common::vectors::random_vectors;
 
 use std::collections::HashMap;
@@ -23,7 +25,7 @@ use std::time::Duration;
 
 use zeppelin::compaction::background::compact_namespace_under_lease;
 use zeppelin::compaction::Compactor;
-use zeppelin::config::{CompactionConfig, IndexingConfig};
+use zeppelin::config::{CompactionConfig, Config, IndexingConfig};
 use zeppelin::error::ZeppelinError;
 use zeppelin::types::VectorEntry;
 use zeppelin::wal::lease::{Lease, LeaseManager};
@@ -609,6 +611,157 @@ async fn test_stolen_lease_aborts_compaction_before_cas() {
         manifest.active_segment.is_none(),
         "A2: aborted compaction must not have set an active segment"
     );
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn stolen_lease_aborts_legacy_receipt_hydration_before_cas() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("legacy-receipt-lease-stolen");
+    let store = harness.store.clone();
+    let mut security_config = Config::default();
+    let (security, _adapter, _bearer) = test_security_runtime(
+        &store,
+        &mut security_config,
+        &zeppelin::time::Clock::system(),
+    )
+    .await;
+    security
+        .install_object_signer(&store)
+        .expect("receipt signer must install on the test store");
+
+    common::write_active_namespace_metadata(
+        &store,
+        &ns,
+        16,
+        zeppelin::types::DistanceMetric::Euclidean,
+    )
+    .await;
+    Manifest::new().write(&store, &ns).await.unwrap();
+    WalWriter::new(store.clone())
+        .append(&ns, prefixed_vectors("legacy", 20, 16), vec![])
+        .await
+        .unwrap();
+    slow_compactor(&store, Duration::ZERO)
+        .compact(&ns)
+        .await
+        .expect("fixture compaction must publish one signed segment");
+
+    let current = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    let downgraded_version = current.version();
+    let retained_sketch_key = current.segments[0]
+        .sketch
+        .as_ref()
+        .expect("fixture segment must carry a coarse sketch")
+        .key
+        .clone();
+    let mut legacy = serde_json::to_value(current).unwrap();
+    let object = legacy.as_object_mut().unwrap();
+    for field in [
+        "artifact_hashes",
+        "merkle_root",
+        "root_signature",
+        "root_signer_node",
+    ] {
+        assert!(
+            object.remove(field).is_some(),
+            "manifest must contain {field}"
+        );
+    }
+    let legacy_bytes = bytes::Bytes::from(serde_json::to_vec(&legacy).unwrap());
+    store
+        .put(&Manifest::s3_key(&ns), legacy_bytes.clone())
+        .await
+        .unwrap();
+    store
+        .put(
+            &Manifest::history_key(&ns, downgraded_version),
+            legacy_bytes,
+        )
+        .await
+        .expect("legacy fixture must keep current history byte-identical to live authority");
+
+    let (new_fragment, _) = WalWriter::new(store.clone())
+        .append(&ns, prefixed_vectors("legacy-wal", 5, 16), vec![])
+        .await
+        .expect("WAL-present hydration fixture must append after legacy downgrade");
+    let before = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    let legacy_version = before.version();
+    assert!(before
+        .fragments
+        .iter()
+        .any(|fragment| fragment.id == new_fragment.id));
+    assert!(before.merkle_root().is_none());
+
+    // A fresh gateway has no process-local PUT hashes for the retained segment.
+    // The coarse-sketch GET is not part of compaction input loading, so pausing
+    // it pins the execution inside legacy receipt hydration with WAL work done
+    // and before the final lease-lost check/publication CAS.
+    let (victim_store, hydration_pause) =
+        pause_first_get_matching(&store, retained_sketch_key.clone());
+    security
+        .install_object_signer(&victim_store)
+        .expect("receipt signer must install on the victim gateway");
+
+    let lease_manager = Arc::new(LeaseManager::new(
+        victim_store.clone(),
+        "legacy-victim".to_string(),
+        Duration::from_millis(600),
+    ));
+    let compactor = Arc::new(slow_compactor(&victim_store, Duration::ZERO));
+    let compaction = {
+        let compactor = Arc::clone(&compactor);
+        let lease_manager = Arc::clone(&lease_manager);
+        let ns = ns.clone();
+        tokio::spawn(async move {
+            compact_namespace_under_lease(
+                &compactor,
+                &lease_manager,
+                &ns,
+                &HashMap::new(),
+                zeppelin::wal::FragmentCachePolicy::Bypass,
+            )
+            .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(30), hydration_pause.wait_until_paused())
+        .await
+        .expect("compaction must reach WAL-present legacy receipt hydration");
+    let lease_key = format!("{ns}/lease.json");
+    let victim: Lease = serde_json::from_slice(&store.get(&lease_key).await.unwrap()).unwrap();
+    let mut thief = serde_json::to_value(victim).unwrap();
+    thief["holder_id"] = serde_json::Value::from("legacy-thief");
+    thief["fencing_token"] =
+        serde_json::Value::from(thief["fencing_token"].as_u64().unwrap().saturating_add(1));
+    thief["expires_at"] =
+        serde_json::Value::from((chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339());
+    store
+        .put(
+            &lease_key,
+            bytes::Bytes::from(serde_json::to_vec(&thief).unwrap()),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    hydration_pause.release();
+
+    let error = compaction
+        .await
+        .expect("legacy hydration task must not panic")
+        .expect_err("stolen legacy hydration lease must abort publication");
+    assert!(
+        matches!(
+            error,
+            ZeppelinError::LeaseExpired { .. } | ZeppelinError::FencingTokenStale { .. }
+        ),
+        "unexpected stolen-hydration error: {error}"
+    );
+    let after = Manifest::read(&store, &ns).await.unwrap().unwrap();
+    assert_eq!(after.version(), legacy_version);
+    assert!(after.merkle_root().is_none());
+    assert!(after.root_signature().is_none());
 
     harness.cleanup().await;
 }

@@ -7,7 +7,7 @@
 //! filter, and build configuration, so eviction or restart can increase work
 //! but cannot widen visibility.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
@@ -27,9 +27,9 @@ use crate::fts::tokenizer::tokenize_text;
 use crate::fts::FtsFieldConfig;
 use crate::index::filter::evaluate_filter;
 use crate::index::hierarchical::build::build_hierarchical;
-use crate::index::hierarchical::search::search_hierarchical;
+use crate::index::hierarchical::search::search_hierarchical_with_trace;
 use crate::index::ivf_flat::build::build_ivf_flat;
-use crate::index::ivf_flat::search::search_ivf_flat;
+use crate::index::ivf_flat::search::search_ivf_flat_with_trace;
 use crate::index::topk::partial_topk_by;
 use crate::index::{HierarchicalIndex, IvfFlatIndex};
 use crate::storage::{CreateOnlyOutcome, ZeppelinStore};
@@ -39,8 +39,8 @@ use crate::types::{
 use crate::wal::manifest::SegmentRef;
 use crate::wal::Manifest;
 
-const CACHE_KEY_VERSION: &str = "v1";
-const SCOPED_ANN_DESCRIPTOR_VERSION: u32 = 2;
+const CACHE_KEY_VERSION: &str = "v2";
+const SCOPED_ANN_DESCRIPTOR_VERSION: u32 = 4;
 const SCOPED_FTS_ARTIFACT_VERSION: u32 = 1;
 const SCOPED_FTS_MAGIC: &[u8; 5] = b"ZSFT1";
 
@@ -163,6 +163,10 @@ impl ScopedSegmentCorpus {
 pub(crate) struct ScopedAnnIndex {
     artifact: ScopedAnnArtifact,
     dimensions: usize,
+    receipt_artifacts: BTreeMap<String, [u8; 32]>,
+    receipt_descriptor_key: String,
+    receipt_routing_key: Option<String>,
+    receipt_sketch_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -187,6 +191,10 @@ pub(crate) struct ScopedAnnBuildRequest<'a> {
 pub(crate) struct ScopedAnnSearch {
     pub(crate) results: Vec<SearchResult>,
     pub(crate) clusters_probed: usize,
+    pub(crate) probed_centroids: Vec<usize>,
+    pub(crate) scanned_clusters: Vec<usize>,
+    pub(crate) probed_routing_nodes: Vec<String>,
+    pub(crate) touched_artifacts: BTreeSet<String>,
 }
 
 impl ScopedAnnIndex {
@@ -212,8 +220,11 @@ impl ScopedAnnIndex {
         let artifact_namespace = location.artifact_namespace();
         let descriptor_key = location.ann_descriptor_key(scope_cache_key)?;
         if let Some(bytes) = read_optional_immutable(store, cache, &descriptor_key).await? {
-            return ScopedAnnDescriptor::from_bytes(&bytes, scope_cache_key, &artifact_namespace)?
-                .load(store, cache)
+            let descriptor =
+                ScopedAnnDescriptor::from_bytes(&bytes, scope_cache_key, &artifact_namespace)?;
+            let receipt_artifacts = descriptor.receipt_artifacts(&descriptor_key, &bytes);
+            return descriptor
+                .load(store, cache, receipt_artifacts, descriptor_key.clone())
                 .await;
         }
 
@@ -229,7 +240,7 @@ impl ScopedAnnIndex {
             artifact_id.clone(),
         )
         .await?;
-        let descriptor = match &built_artifact {
+        let mut descriptor = match &built_artifact {
             ScopedAnnArtifact::Empty => {
                 ScopedAnnDescriptor::empty(scope_cache_key, artifact_namespace.clone(), dimensions)
             }
@@ -246,6 +257,7 @@ impl ScopedAnnIndex {
                 index,
             ),
         };
+        descriptor.capture_artifact_hashes(store).await?;
         let descriptor_bytes = descriptor.to_bytes()?;
         match store
             .put_create_outcome(&descriptor_key, descriptor_bytes.clone())
@@ -256,21 +268,47 @@ impl ScopedAnnIndex {
                     cache.put(&descriptor_key, &descriptor_bytes).await?;
                     descriptor.warm_bootstrap(store, cache).await?;
                 }
+                let receipt_artifacts =
+                    descriptor.receipt_artifacts(&descriptor_key, &descriptor_bytes);
+                store.forget_known_content_hashes(descriptor.artifact_hashes.keys());
                 Ok(Self {
                     artifact: built_artifact,
                     dimensions: descriptor.dimensions,
+                    receipt_artifacts,
+                    receipt_descriptor_key: descriptor_key,
+                    receipt_routing_key: descriptor.routing_key(),
+                    receipt_sketch_key: descriptor
+                        .bootstrap
+                        .is_none()
+                        .then(|| {
+                            descriptor
+                                .sketch
+                                .as_ref()
+                                .map(|artifact| artifact.key.clone())
+                        })
+                        .flatten(),
                 })
             }
             CreateOnlyOutcome::AlreadyExists => {
+                store.forget_known_content_hashes(descriptor.artifact_hashes.keys());
                 let bytes = store.get(&descriptor_key).await?;
                 if let Some(cache) = cache {
                     cache.put(&descriptor_key, &bytes).await?;
                 }
-                ScopedAnnDescriptor::from_bytes(&bytes, scope_cache_key, &artifact_namespace)?
-                    .load(store, cache)
+                let descriptor =
+                    ScopedAnnDescriptor::from_bytes(&bytes, scope_cache_key, &artifact_namespace)?;
+                let receipt_artifacts = descriptor.receipt_artifacts(&descriptor_key, &bytes);
+                descriptor
+                    .load(store, cache, receipt_artifacts, descriptor_key)
                     .await
             }
         }
+    }
+
+    /// Borrow exact descriptor and child-object hashes for receipt evidence.
+    #[must_use]
+    pub(crate) fn receipt_artifacts(&self) -> &BTreeMap<String, [u8; 32]> {
+        &self.receipt_artifacts
     }
 
     /// Searches the published scope artifact without a whole-segment scan.
@@ -294,52 +332,72 @@ impl ScopedAnnIndex {
                 actual: query.len(),
             });
         }
-        let (results, clusters_probed) = match &self.artifact {
-            ScopedAnnArtifact::Empty => {
-                return Ok(ScopedAnnSearch {
-                    results: Vec::new(),
-                    clusters_probed: 0,
-                });
-            }
-            ScopedAnnArtifact::Flat(index) => {
-                let clusters_probed = nprobe.min(index.num_clusters());
-                let results = search_ivf_flat(
-                    index,
-                    query,
-                    top_k,
-                    nprobe,
-                    filter,
-                    distance_metric,
-                    store,
-                    oversample_factor,
-                    cache,
-                    include_attributes,
-                    rerank_coalesce_gap_bytes,
-                )
-                .await?;
-                (results, clusters_probed)
-            }
-            ScopedAnnArtifact::Hierarchical(index) => {
-                let clusters_probed = nprobe.min(index.num_leaf_clusters());
-                let results = search_hierarchical(
-                    index,
-                    query,
-                    top_k,
-                    nprobe,
-                    filter,
-                    distance_metric,
-                    store,
-                    oversample_factor,
-                    cache,
-                    include_attributes,
-                )
-                .await?;
-                (results, clusters_probed)
-            }
-        };
+        let (results, probed_centroids, scanned_clusters, probed_routing_nodes, touched_artifacts) =
+            match &self.artifact {
+                ScopedAnnArtifact::Empty => (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeSet::new(),
+                ),
+                ScopedAnnArtifact::Flat(index) => {
+                    let output = search_ivf_flat_with_trace(
+                        index,
+                        query,
+                        top_k,
+                        nprobe,
+                        filter,
+                        distance_metric,
+                        store,
+                        oversample_factor,
+                        cache,
+                        include_attributes,
+                        rerank_coalesce_gap_bytes,
+                    )
+                    .await?;
+                    (
+                        output.results,
+                        output.probed_centroids,
+                        output.scanned_clusters,
+                        Vec::new(),
+                        output.touched_artifacts,
+                    )
+                }
+                ScopedAnnArtifact::Hierarchical(index) => {
+                    let output = search_hierarchical_with_trace(
+                        index,
+                        query,
+                        top_k,
+                        nprobe,
+                        filter,
+                        distance_metric,
+                        store,
+                        oversample_factor,
+                        cache,
+                        include_attributes,
+                    )
+                    .await?;
+                    (
+                        output.results,
+                        output.probed_centroids.clone(),
+                        output.probed_centroids,
+                        output.probed_routing_nodes,
+                        output.touched_artifacts,
+                    )
+                }
+            };
+        let mut touched_artifacts = touched_artifacts;
+        touched_artifacts.insert(self.receipt_descriptor_key.clone());
+        touched_artifacts.extend(self.receipt_routing_key.iter().cloned());
+        touched_artifacts.extend(self.receipt_sketch_key.iter().cloned());
         Ok(ScopedAnnSearch {
             results,
-            clusters_probed,
+            clusters_probed: probed_centroids.len(),
+            probed_centroids,
+            scanned_clusters,
+            probed_routing_nodes,
+            touched_artifacts,
         })
     }
 
@@ -478,12 +536,36 @@ struct ScopedAnnDescriptor {
     vector_count: usize,
     quantization: crate::index::quantization::QuantizationType,
     bitmap_fields: Vec<String>,
+    num_clusters: usize,
     cluster_objects: Vec<crate::wal::manifest::ClusterDataObjectRef>,
     sketch: Option<crate::wal::manifest::SketchRef>,
     bootstrap: Option<crate::wal::manifest::BootstrapRef>,
+    membership: Option<crate::wal::manifest::MembershipRef>,
+    routing_node_ids: Vec<String>,
+    artifact_hashes: BTreeMap<String, [u8; 32]>,
 }
 
 impl ScopedAnnDescriptor {
+    fn routing_key(&self) -> Option<String> {
+        let artifact_id = self.artifact_id.as_ref()?;
+        match self.kind {
+            ScopedAnnKind::Empty => None,
+            ScopedAnnKind::Flat => Some(self.bootstrap.as_ref().map_or_else(
+                || {
+                    crate::index::ivf_flat::build::centroids_key(
+                        &self.artifact_namespace,
+                        artifact_id,
+                    )
+                },
+                |artifact| artifact.key.clone(),
+            )),
+            ScopedAnnKind::Hierarchical => Some(crate::index::hierarchical::tree_meta_key(
+                &self.artifact_namespace,
+                artifact_id,
+            )),
+        }
+    }
+
     fn empty(scope_cache_key: &str, artifact_namespace: String, dimensions: usize) -> Self {
         Self {
             version: SCOPED_ANN_DESCRIPTOR_VERSION,
@@ -495,9 +577,13 @@ impl ScopedAnnDescriptor {
             vector_count: 0,
             quantization: crate::index::quantization::QuantizationType::None,
             bitmap_fields: Vec::new(),
+            num_clusters: 0,
             cluster_objects: Vec::new(),
             sketch: None,
             bootstrap: None,
+            membership: None,
+            routing_node_ids: Vec::new(),
+            artifact_hashes: BTreeMap::new(),
         }
     }
 
@@ -517,9 +603,13 @@ impl ScopedAnnDescriptor {
             vector_count: index.num_vectors,
             quantization: index.quantization,
             bitmap_fields: index.bitmap_fields.clone(),
+            num_clusters: index.centroids.len(),
             cluster_objects: index.cluster_objects.clone(),
             sketch: index.sketch_ref.clone(),
             bootstrap: index.bootstrap_ref.clone(),
+            membership: index.membership_ref.clone(),
+            routing_node_ids: Vec::new(),
+            artifact_hashes: BTreeMap::new(),
         }
     }
 
@@ -539,10 +629,50 @@ impl ScopedAnnDescriptor {
             vector_count: index.meta.total_vectors,
             quantization: index.meta.quantization,
             bitmap_fields: index.bitmap_fields.clone(),
+            num_clusters: index.meta.num_leaf_clusters,
             cluster_objects: Vec::new(),
             sketch: None,
             bootstrap: None,
+            membership: None,
+            routing_node_ids: index.routing_node_ids().to_vec(),
+            artifact_hashes: BTreeMap::new(),
         }
+    }
+
+    async fn capture_artifact_hashes(&mut self, store: &ZeppelinStore) -> Result<()> {
+        let Some(artifact_id) = self.artifact_id.as_ref() else {
+            return Ok(());
+        };
+        let prefix = format!("{}/segments/{artifact_id}/", self.artifact_namespace);
+        let keys = store.list_prefix(&prefix).await?;
+        if keys.is_empty() {
+            return Err(scope_integrity(format!(
+                "scoped ANN artifact {artifact_id} published no objects"
+            )));
+        }
+        for key in keys {
+            let content_hash = store.known_content_hash(&key).ok_or_else(|| {
+                scope_integrity(format!(
+                    "scoped ANN artifact {key} lacks its publication content hash"
+                ))
+            })?;
+            self.artifact_hashes.insert(key, content_hash);
+        }
+        self.validate_artifact_hashes()?;
+        Ok(())
+    }
+
+    fn receipt_artifacts(
+        &self,
+        descriptor_key: &str,
+        descriptor_bytes: &[u8],
+    ) -> BTreeMap<String, [u8; 32]> {
+        let mut artifacts = self.artifact_hashes.clone();
+        artifacts.insert(
+            descriptor_key.to_string(),
+            <[u8; 32]>::from(Sha256::digest(descriptor_bytes)),
+        );
+        artifacts
     }
 
     fn to_bytes(&self) -> Result<Bytes> {
@@ -582,22 +712,39 @@ impl ScopedAnnDescriptor {
                 if descriptor.vector_count == 0
                     && descriptor.cluster_objects.is_empty()
                     && descriptor.sketch.is_none()
-                    && descriptor.bootstrap.is_none() => {}
+                    && descriptor.bootstrap.is_none()
+                    && descriptor.membership.is_none()
+                    && descriptor.routing_node_ids.is_empty()
+                    && descriptor.num_clusters == 0
+                    && descriptor.artifact_hashes.is_empty() => {}
             (ScopedAnnKind::Flat, Some(_)) if descriptor.vector_count > 0 => {
-                if descriptor.sketch.is_none() || descriptor.bootstrap.is_none() {
+                if descriptor.num_clusters == 0
+                    || descriptor.sketch.is_none()
+                    || descriptor.bootstrap.is_none()
+                    || descriptor.membership.is_none()
+                    || !descriptor.routing_node_ids.is_empty()
+                {
                     return Err(scope_integrity(
-                        "nonempty scoped flat ANN descriptor is missing routing artifacts",
+                        "nonempty scoped flat ANN descriptor is missing or mixing routing artifacts",
                     ));
                 }
                 descriptor.validate_artifact_keys()?;
+                descriptor.validate_artifact_hashes()?;
             }
             (ScopedAnnKind::Hierarchical, Some(artifact_id))
                 if descriptor.vector_count > 0
+                    && descriptor.num_clusters > 0
                     && descriptor.cluster_objects.is_empty()
                     && descriptor.sketch.is_none()
                     && descriptor.bootstrap.is_none() =>
             {
                 validate_scoped_artifact_id(artifact_id)?;
+                if descriptor.routing_node_ids.is_empty() || descriptor.membership.is_some() {
+                    return Err(scope_integrity(
+                        "nonempty scoped hierarchical ANN descriptor has no exact routing-node inventory",
+                    ));
+                }
+                descriptor.validate_artifact_hashes()?;
             }
             _ => {
                 return Err(scope_integrity(
@@ -635,11 +782,120 @@ impl ScopedAnnDescriptor {
         Ok(())
     }
 
+    fn validate_artifact_hashes(&self) -> Result<()> {
+        let artifact_id = self
+            .artifact_id
+            .as_ref()
+            .ok_or_else(|| scope_integrity("nonempty scoped ANN descriptor has no artifact id"))?;
+        let prefix = format!("{}/segments/{artifact_id}/", self.artifact_namespace);
+        if self.artifact_hashes.is_empty()
+            || self
+                .artifact_hashes
+                .keys()
+                .any(|key| !key.starts_with(&prefix))
+        {
+            return Err(scope_integrity(
+                "scoped ANN descriptor has an incomplete or out-of-prefix hash inventory",
+            ));
+        }
+        let required = self.required_artifact_keys(artifact_id);
+        if let Some(missing) = required
+            .iter()
+            .find(|key| !self.artifact_hashes.contains_key(*key))
+        {
+            return Err(scope_integrity(format!(
+                "scoped ANN descriptor hash inventory omits referenced artifact {missing}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn required_artifact_keys(&self, artifact_id: &str) -> BTreeSet<String> {
+        let mut required = BTreeSet::new();
+        match self.kind {
+            ScopedAnnKind::Empty => {}
+            ScopedAnnKind::Flat => {
+                required.extend(self.cluster_objects.iter().map(|object| object.key.clone()));
+                required.extend(self.sketch.iter().map(|artifact| artifact.key.clone()));
+                required.extend(self.bootstrap.iter().map(|artifact| artifact.key.clone()));
+                required.extend(self.membership.iter().map(|artifact| artifact.key.clone()));
+                for cluster_idx in 0..self.num_clusters {
+                    required.insert(crate::index::ivf_flat::build::attrs_key(
+                        &self.artifact_namespace,
+                        artifact_id,
+                        cluster_idx,
+                    ));
+                    if !self.bitmap_fields.is_empty() {
+                        required.insert(crate::index::bitmap::bitmap_key(
+                            &self.artifact_namespace,
+                            artifact_id,
+                            cluster_idx,
+                        ));
+                    }
+                }
+            }
+            ScopedAnnKind::Hierarchical => {
+                required.insert(crate::index::hierarchical::tree_meta_key(
+                    &self.artifact_namespace,
+                    artifact_id,
+                ));
+                required.extend(self.routing_node_ids.iter().map(|node_id| {
+                    crate::index::hierarchical::tree_node_key(
+                        &self.artifact_namespace,
+                        artifact_id,
+                        node_id,
+                    )
+                }));
+                for cluster_idx in 0..self.num_clusters {
+                    required.insert(crate::index::ivf_flat::build::cluster_key(
+                        &self.artifact_namespace,
+                        artifact_id,
+                        cluster_idx,
+                    ));
+                    required.insert(crate::index::ivf_flat::build::attrs_key(
+                        &self.artifact_namespace,
+                        artifact_id,
+                        cluster_idx,
+                    ));
+                    if !self.bitmap_fields.is_empty() {
+                        required.insert(crate::index::bitmap::bitmap_key(
+                            &self.artifact_namespace,
+                            artifact_id,
+                            cluster_idx,
+                        ));
+                    }
+                }
+            }
+        }
+        if self.quantization == crate::index::quantization::QuantizationType::Product {
+            required.insert(crate::index::quantization::pq::pq_codebook_key(
+                &self.artifact_namespace,
+                artifact_id,
+            ));
+            for cluster_idx in 0..self.num_clusters {
+                required.insert(crate::index::quantization::pq::pq_cluster_key(
+                    &self.artifact_namespace,
+                    artifact_id,
+                    cluster_idx,
+                ));
+            }
+        }
+        required
+    }
+
     async fn load(
         self,
         store: &ZeppelinStore,
         cache: Option<&Arc<DiskCache>>,
+        receipt_artifacts: BTreeMap<String, [u8; 32]>,
+        receipt_descriptor_key: String,
     ) -> Result<ScopedAnnIndex> {
+        let receipt_routing_key = self.routing_key();
+        let receipt_sketch_key = self
+            .bootstrap
+            .is_none()
+            .then(|| self.sketch.as_ref().map(|artifact| artifact.key.clone()))
+            .flatten();
         let artifact = match (self.kind, self.artifact_id.as_ref()) {
             (ScopedAnnKind::Empty, None) => ScopedAnnArtifact::Empty,
             (ScopedAnnKind::Flat, Some(artifact_id)) => {
@@ -671,6 +927,7 @@ impl ScopedAnnDescriptor {
                         .await?;
                 if index.meta.dim != self.dimensions
                     || index.meta.total_vectors != self.vector_count
+                    || index.meta.num_leaf_clusters != self.num_clusters
                     || index.meta.quantization != self.quantization
                 {
                     return Err(scope_integrity(
@@ -678,6 +935,7 @@ impl ScopedAnnDescriptor {
                     ));
                 }
                 index.bitmap_fields = self.bitmap_fields;
+                index.routing_node_ids = self.routing_node_ids;
                 ScopedAnnArtifact::Hierarchical(Box::new(index))
             }
             _ => {
@@ -689,6 +947,10 @@ impl ScopedAnnDescriptor {
         Ok(ScopedAnnIndex {
             artifact,
             dimensions: self.dimensions,
+            receipt_artifacts,
+            receipt_descriptor_key,
+            receipt_routing_key,
+            receipt_sketch_key,
         })
     }
 
@@ -707,6 +969,8 @@ impl ScopedAnnDescriptor {
 pub(crate) struct ScopedFtsIndex {
     rows: Vec<ScopedFtsRow>,
     index: InvertedIndex,
+    #[serde(skip)]
+    receipt_artifacts: BTreeMap<String, [u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -746,7 +1010,11 @@ impl ScopedFtsIndex {
         let attribute_refs: Vec<Option<&HashMap<String, AttributeValue>>> =
             rows.iter().map(|row| Some(&row.attributes)).collect();
         let index = InvertedIndex::build(&attribute_refs, fts_configs);
-        Self { rows, index }
+        Self {
+            rows,
+            index,
+            receipt_artifacts: BTreeMap::new(),
+        }
     }
 
     /// Loads or create-publishes a stable segment snapshot.
@@ -771,7 +1039,10 @@ impl ScopedFtsIndex {
         let object_key = ScopedArtifactLocation::new(namespace, source_segment_id)
             .fts_object_key(scope_cache_key)?;
         if let Some(bytes) = read_optional_immutable(store, cache, &object_key).await? {
-            return decode_scoped_fts(bytes, scope_cache_key.to_string()).await;
+            let content_hash = <[u8; 32]>::from(Sha256::digest(&bytes));
+            let mut index = decode_scoped_fts(bytes, scope_cache_key.to_string()).await?;
+            index.receipt_artifacts.insert(object_key, content_hash);
+            return Ok(index);
         }
 
         let built = build().await?;
@@ -781,6 +1052,10 @@ impl ScopedFtsIndex {
                 if let Some(cache) = cache {
                     cache.put(&object_key, &bytes).await?;
                 }
+                let mut built = built;
+                built
+                    .receipt_artifacts
+                    .insert(object_key, <[u8; 32]>::from(Sha256::digest(&bytes)));
                 Ok(built)
             }
             CreateOnlyOutcome::AlreadyExists => {
@@ -788,9 +1063,18 @@ impl ScopedFtsIndex {
                 if let Some(cache) = cache {
                     cache.put(&object_key, &winner).await?;
                 }
-                decode_scoped_fts(winner, scope_cache_key.to_string()).await
+                let content_hash = <[u8; 32]>::from(Sha256::digest(&winner));
+                let mut index = decode_scoped_fts(winner, scope_cache_key.to_string()).await?;
+                index.receipt_artifacts.insert(object_key, content_hash);
+                Ok(index)
             }
         }
+    }
+
+    /// Borrow the exact persisted policy-scope artifact used by this query.
+    #[must_use]
+    pub(crate) fn receipt_artifacts(&self) -> &BTreeMap<String, [u8; 32]> {
+        &self.receipt_artifacts
     }
 
     fn to_bytes(&self, scope_cache_key: &str) -> Result<Bytes> {
@@ -1198,6 +1482,95 @@ mod tests {
     }
 
     #[test]
+    fn scoped_ann_hash_inventory_cannot_omit_flat_children_or_hierarchical_nodes() {
+        let artifact_namespace = "ns/segments/source/security_scopes".to_string();
+
+        let flat_id = format!("ann_{}", ulid::Ulid::new());
+        let flat_prefix = format!("{artifact_namespace}/segments/{flat_id}");
+        let cluster_key = format!("{flat_prefix}/cluster_group_0.bin");
+        let mut flat = ScopedAnnDescriptor {
+            version: SCOPED_ANN_DESCRIPTOR_VERSION,
+            scope_cache_key: "flat-scope".to_string(),
+            artifact_namespace: artifact_namespace.clone(),
+            artifact_id: Some(flat_id.clone()),
+            kind: ScopedAnnKind::Flat,
+            dimensions: 2,
+            vector_count: 1,
+            quantization: crate::index::quantization::QuantizationType::None,
+            bitmap_fields: Vec::new(),
+            num_clusters: 1,
+            cluster_objects: vec![crate::wal::manifest::ClusterDataObjectRef {
+                key: cluster_key.clone(),
+                clusters: vec![0],
+                live_offset: 0,
+                live_len: 0,
+                size_bytes: 1,
+            }],
+            sketch: Some(crate::wal::manifest::SketchRef {
+                key: format!("{flat_prefix}/coarse_sketch.bin"),
+                version: 1,
+                code_dims: 1,
+                bytes_per_vector: 1,
+                size_bytes: 1,
+                rotation_seed: None,
+            }),
+            bootstrap: Some(crate::wal::manifest::BootstrapRef {
+                key: format!("{flat_prefix}/bootstrap.bin"),
+                size_bytes: 1,
+            }),
+            membership: Some(crate::wal::manifest::MembershipRef {
+                key: format!("{flat_prefix}/membership.bin"),
+                size_bytes: 1,
+                entry_count: 1,
+            }),
+            routing_node_ids: Vec::new(),
+            artifact_hashes: BTreeMap::new(),
+        };
+        for key in flat.required_artifact_keys(&flat_id) {
+            flat.artifact_hashes.insert(key, [1; 32]);
+        }
+        assert!(flat.validate_artifact_hashes().is_ok());
+        flat.artifact_hashes.remove(&cluster_key);
+        assert!(flat.validate_artifact_hashes().is_err());
+
+        let hierarchical_id = format!("ann_{}", ulid::Ulid::new());
+        let hierarchical_prefix = format!("{artifact_namespace}/segments/{hierarchical_id}");
+        let node_id = format!("root_{}", ulid::Ulid::new());
+        let node_key = crate::index::hierarchical::tree_node_key(
+            &artifact_namespace,
+            &hierarchical_id,
+            &node_id,
+        );
+        let mut hierarchical = ScopedAnnDescriptor {
+            version: SCOPED_ANN_DESCRIPTOR_VERSION,
+            scope_cache_key: "hierarchical-scope".to_string(),
+            artifact_namespace,
+            artifact_id: Some(hierarchical_id.clone()),
+            kind: ScopedAnnKind::Hierarchical,
+            dimensions: 2,
+            vector_count: 1,
+            quantization: crate::index::quantization::QuantizationType::None,
+            bitmap_fields: Vec::new(),
+            num_clusters: 1,
+            cluster_objects: Vec::new(),
+            sketch: None,
+            bootstrap: None,
+            membership: None,
+            routing_node_ids: vec![node_id],
+            artifact_hashes: BTreeMap::new(),
+        };
+        for key in hierarchical.required_artifact_keys(&hierarchical_id) {
+            hierarchical.artifact_hashes.insert(key, [2; 32]);
+        }
+        assert!(hierarchical.validate_artifact_hashes().is_ok());
+        assert!(hierarchical
+            .artifact_hashes
+            .contains_key(&format!("{hierarchical_prefix}/tree_meta.json")));
+        hierarchical.artifact_hashes.remove(&node_key);
+        assert!(hierarchical.validate_artifact_hashes().is_err());
+    }
+
+    #[test]
     fn boxed_scoped_ann_counts_heap_allocated_index_handle() {
         let index = ScopedAnnIndex {
             artifact: ScopedAnnArtifact::Hierarchical(Box::new(HierarchicalIndex {
@@ -1214,8 +1587,13 @@ mod tests {
                 namespace: String::new(),
                 segment_id: String::new(),
                 bitmap_fields: Vec::new(),
+                routing_node_ids: Vec::new(),
             })),
             dimensions: 2,
+            receipt_artifacts: BTreeMap::new(),
+            receipt_descriptor_key: String::new(),
+            receipt_routing_key: None,
+            receipt_sketch_key: None,
         };
 
         assert!(

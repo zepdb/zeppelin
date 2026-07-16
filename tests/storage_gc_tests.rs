@@ -323,12 +323,15 @@ impl ObjectStore for PutOnNthDeleteStore {
 }
 
 /// Transparent real-store race seam that publishes a concurrent manifest
-/// immediately after the pending-delete drain writes its history snapshot and
-/// immediately before its stale live-manifest CAS.
+/// immediately after the pending-delete drain retains its predecessor history
+/// and immediately before its stale live-manifest CAS. The concurrent writer
+/// publishes its live manifest followed by its own immutable history snapshot,
+/// matching the production publication order.
 #[derive(Debug)]
 struct PublishManifestOnHistoryWriteStore {
     inner: Arc<dyn ObjectStore>,
     trigger_history_key: Path,
+    concurrent_history_key: Path,
     manifest_key: Path,
     concurrent_history: Bytes,
     concurrent_manifest: Bytes,
@@ -358,6 +361,7 @@ impl PublishManifestOnHistoryWriteStore {
     fn wrap(
         inner: Arc<dyn ObjectStore>,
         trigger_history_key: String,
+        concurrent_history_key: String,
         manifest_key: String,
         concurrent_history: Bytes,
         concurrent_manifest: Bytes,
@@ -374,6 +378,8 @@ impl PublishManifestOnHistoryWriteStore {
                 inner,
                 trigger_history_key: Path::parse(trigger_history_key)
                     .expect("trigger history key must be valid"),
+                concurrent_history_key: Path::parse(concurrent_history_key)
+                    .expect("concurrent history key must be valid"),
                 manifest_key: Path::parse(manifest_key).expect("manifest key must be valid"),
                 concurrent_history,
                 concurrent_manifest,
@@ -410,14 +416,14 @@ impl ObjectStore for PublishManifestOnHistoryWriteStore {
         {
             self.inner
                 .put(
-                    &self.trigger_history_key,
-                    PutPayload::from(self.concurrent_history.clone()),
+                    &self.manifest_key,
+                    PutPayload::from(self.concurrent_manifest.clone()),
                 )
                 .await?;
             self.inner
                 .put(
-                    &self.manifest_key,
-                    PutPayload::from(self.concurrent_manifest.clone()),
+                    &self.concurrent_history_key,
+                    PutPayload::from(self.concurrent_history.clone()),
                 )
                 .await?;
         }
@@ -445,7 +451,7 @@ impl ObjectStore for PublishManifestOnHistoryWriteStore {
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
             {
-                self.inner.delete(&self.trigger_history_key).await?;
+                self.inner.delete(&self.concurrent_history_key).await?;
             }
         }
         self.inner.get_opts(location, options).await
@@ -1452,11 +1458,37 @@ async fn pending_delete_drain_1001_retains_only_the_uncertain_batch() {
             .iter()
             .map(Vec::len)
             .collect::<Vec<_>>(),
+        Vec::<usize>::new(),
+        "the repaired predecessor history must pin the uncertain batch"
+    );
+    assert_eq!(retry.objects_deleted, 0);
+    assert_eq!(retry.entries_pruned, 0);
+    assert_eq!(retry.entries_retained, 1_000);
+
+    store
+        .delete(&Manifest::history_key(&namespace, 2))
+        .await
+        .unwrap();
+    control.reset_observed_operations();
+    let after_retention = drain_pending_deletes_at(
+        &controlled_store,
+        &namespace,
+        &unsafe_short_gc(0),
+        now + chrono::Duration::seconds(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        control
+            .delete_batches()
+            .iter()
+            .map(Vec::len)
+            .collect::<Vec<_>>(),
         vec![1_000]
     );
-    assert_eq!(retry.objects_deleted, 1_000);
-    assert_eq!(retry.entries_pruned, 1_000);
-    assert_eq!(retry.entries_retained, 0);
+    assert_eq!(after_retention.objects_deleted, 1_000);
+    assert_eq!(after_retention.entries_pruned, 1_000);
+    assert_eq!(after_retention.entries_retained, 0);
 
     harness.cleanup().await;
 }
@@ -2864,9 +2896,11 @@ async fn gc_runner_pending_cas_retry_refreshes_history_and_invalidates_idle_on_t
     let mut concurrent = Manifest::new_at(now);
     concurrent.pending_deletes.push(concurrent_key.clone());
     let concurrent_body = manifest_json_bytes_with_version(&concurrent, 4);
+    let missing_predecessor_history = Manifest::history_key(&namespace, 3);
     let history_four = Manifest::history_key(&namespace, 4);
     let (publishing_store, publication) = PublishManifestOnHistoryWriteStore::wrap(
         store.inner(),
+        missing_predecessor_history,
         history_four.clone(),
         Manifest::s3_key(&namespace),
         concurrent_body.clone(),
@@ -2998,6 +3032,7 @@ async fn gc_runner_pending_cas_retry_skips_history_refresh_for_empty_or_young_qu
         let concurrent_body = manifest_json_bytes_with_version(&concurrent, 4);
         let (publishing_store, publication) = PublishManifestOnHistoryWriteStore::wrap(
             store.inner(),
+            Manifest::history_key(&namespace, 3),
             Manifest::history_key(&namespace, 4),
             Manifest::s3_key(&namespace),
             concurrent_body.clone(),
@@ -5177,10 +5212,10 @@ async fn gc_runner_idle_gate_reconciles_history_published_during_late_inventory_
         "history published after prune but before inventory LIST must force one reconciliation cycle"
     );
     assert!(
-        Manifest::read_history(&store, &namespace, 2)
+        !store
+            .exists(&Manifest::history_key(&namespace, 2))
             .await
-            .unwrap()
-            .is_none(),
+            .unwrap(),
         "the reconciliation cycle must apply keep-count retention to the displaced generation"
     );
 
@@ -5260,10 +5295,10 @@ async fn gc_runner_idle_gate_reconciles_history_published_after_prune_observatio
         "history published after prune's LIST but before the retained-history scan must force reconciliation"
     );
     assert!(
-        Manifest::read_history(&store, &namespace, 2)
+        !store
+            .exists(&Manifest::history_key(&namespace, 2))
             .await
-            .unwrap()
-            .is_none(),
+            .unwrap(),
         "reconciliation must apply keep-count retention to the displaced generation"
     );
 

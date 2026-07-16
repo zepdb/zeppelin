@@ -204,7 +204,9 @@ mod tests {
     async fn primary_server_error_still_drains_audit_and_joins_backgrounds() {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let (audit, audit_runtime) =
-            AuditRuntime::start(store.clone(), "main-error-test", Duration::from_secs(60)).unwrap();
+            AuditRuntime::start(store.clone(), "main-error-test", Duration::from_secs(60))
+                .await
+                .unwrap();
         audit
             .submit_buffered(AuditRecord::open_unsafe_boot(Utc::now(), audit.node_id()))
             .unwrap();

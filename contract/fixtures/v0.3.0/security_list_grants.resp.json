@@ -69,6 +69,7 @@
           "VectorUpsert",
           "VectorDelete",
           "Query",
+          "ReceiptVerify",
           "SecurityAdminRead",
           "SecurityAdminWrite",
           "PreservationAdmin",

@@ -110,10 +110,11 @@ async fn start_parity_server(mut config: Config) -> ParityServer {
     let query_knob_bounds = QueryKnobBounds::from_config(&config);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let (audit, audit_runtime, _audit_node_id) =
-        common::server::start_test_audit(&config, &store, Some(&harness.prefix));
+        common::server::start_test_audit(&config, &store, Some(&harness.prefix), &security).await;
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security),
         security,
         audit,
         credential_adapter,

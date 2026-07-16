@@ -303,6 +303,29 @@ impl PolicyCache {
         ))
     }
 
+    /// Resolve the policy-owned query filter from one immutable generation.
+    pub(crate) async fn historical_query_filter(
+        &self,
+        version: PolicyVersion,
+        checksum: &str,
+        principal_id: &PrincipalId,
+        namespace: &super::NamespaceId,
+    ) -> Result<Option<Option<crate::types::Filter>>> {
+        let Some(snapshot) = self.store.load_version(version, checksum).await? else {
+            return Ok(None);
+        };
+        let compiled = snapshot.compile()?;
+        let authorization = compiled.authorize_delegated_parent(
+            principal_id,
+            Action::Query,
+            &Resource::Namespace(namespace.clone()),
+        );
+        Ok(match authorization {
+            Ok(constraints) => Some(constraints.mandatory_filter),
+            Err(_) => None,
+        })
+    }
+
     async fn publish_mutation<F>(
         &self,
         actor: &Principal,

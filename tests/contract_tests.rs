@@ -68,6 +68,8 @@ const ROUTED_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/v1/namespaces/{ns}/vectors/get"),
     ("post", "/v1/namespaces/{ns}/query"),
     ("post", "/v1/namespaces/{ns}/query/batch"),
+    ("post", "/v1/verify"),
+    ("get", "/v1/namespaces/{ns}/manifest/root"),
 ];
 
 // OpenAPI describes this build-time optional route even when the current test
@@ -116,6 +118,10 @@ const FIXTURE_CASES: &[&str] = &[
     "query_facets",
     "query_explain_plan",
     "query_explain_full",
+    "query_with_receipt",
+    "verify_receipt",
+    "verify_receipt_invalid",
+    "get_manifest_root",
     "batch_query",
     "compact_status",
     "compact_namespace_accepted",
@@ -988,6 +994,7 @@ async fn build_contract_fixtures() -> Vec<Fixture> {
     );
 
     fixtures.extend(query_fixtures(&client, &base_url, &main_ns, &replacements).await);
+    fixtures.extend(receipt_fixtures(&client, &base_url, &main_ns, &replacements).await);
     fixtures
         .extend(phase4_security_error_fixtures(&client, &base_url, &main_ns, &replacements).await);
 
@@ -2215,6 +2222,173 @@ async fn query_fixtures(
     );
 
     fixtures
+}
+
+async fn receipt_fixtures(
+    client: &reqwest::Client,
+    base_url: &str,
+    ns: &str,
+    replacements: &[(String, String)],
+) -> Vec<Fixture> {
+    let query_path = format!("/v1/namespaces/{ns}/query");
+    let query_request = json!({
+        "vector": [0.0, 0.0],
+        "top_k": 2,
+        "consistency": "strong",
+        "receipt": true
+    });
+    let (query_status, mut query_response) = send_json(
+        client,
+        base_url,
+        "post",
+        &query_path,
+        "query_with_receipt",
+        query_request.clone(),
+    )
+    .await;
+    assert_eq!(query_status, 200, "query_with_receipt: {query_response}");
+    let actual_receipt = query_response["receipt"].clone();
+    let actual_results = query_response["results"].clone();
+    normalize_contract_value(&mut query_response, replacements, &[]);
+    normalize_receipt_fixture(&mut query_response["receipt"]);
+    let canonical_receipt = query_response["receipt"].clone();
+    let canonical_results = query_response["results"].clone();
+
+    let verify_request = json!({
+        "receipt": actual_receipt.clone(),
+        "results": actual_results.clone(),
+        "query": query_request.clone(),
+        "refetch": false
+    });
+    let (verify_status, verify_response) = send_json(
+        client,
+        base_url,
+        "post",
+        "/v1/verify",
+        "verify_receipt",
+        verify_request,
+    )
+    .await;
+    assert_eq!(verify_status, 200, "verify_receipt: {verify_response}");
+
+    let mut invalid_results = actual_results.clone();
+    invalid_results[0]["id"] = json!("tampered-contract-id");
+    let (invalid_status, invalid_response) = send_json(
+        client,
+        base_url,
+        "post",
+        "/v1/verify",
+        "verify_receipt_invalid",
+        json!({
+            "receipt": actual_receipt,
+            "results": invalid_results,
+            "query": query_request.clone()
+        }),
+    )
+    .await;
+    assert_eq!(
+        invalid_status, 200,
+        "verify_receipt_invalid: {invalid_response}"
+    );
+
+    let root_path = format!("/v1/namespaces/{ns}/manifest/root");
+    let (root_status, mut root_response) = send_json(
+        client,
+        base_url,
+        "get",
+        &root_path,
+        "get_manifest_root",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(root_status, 200, "get_manifest_root: {root_response}");
+    normalize_contract_value(&mut root_response, replacements, &[]);
+    root_response["merkle_root"] = json!(vec![0_u8; 32]);
+    root_response["manifest_state_digest"] = json!(vec![0_u8; 32]);
+    root_response["manifest_binding_version"] = json!("v1");
+    root_response["signer_node"] = json!("zsn1_contract");
+    root_response["signature"] = json!(vec![0_u8; 64]);
+
+    vec![
+        Fixture {
+            name: "query_with_receipt",
+            method: "post",
+            path: "/v1/namespaces/contract-main/query".to_string(),
+            status: 200,
+            request: query_request.clone(),
+            response: query_response,
+        },
+        Fixture {
+            name: "verify_receipt",
+            method: "post",
+            path: "/v1/verify".to_string(),
+            status: 200,
+            request: json!({
+                "receipt": canonical_receipt.clone(),
+                "results": canonical_results.clone(),
+                "query": query_request.clone(),
+                "refetch": false
+            }),
+            response: verify_response,
+        },
+        Fixture {
+            name: "verify_receipt_invalid",
+            method: "post",
+            path: "/v1/verify".to_string(),
+            status: 200,
+            request: json!({
+                "receipt": canonical_receipt,
+                "results": [{"id": "tampered-contract-id", "score": 0.0, "attributes": null}],
+                "query": query_request
+            }),
+            response: invalid_response,
+        },
+        Fixture {
+            name: "get_manifest_root",
+            method: "get",
+            path: "/v1/namespaces/contract-main/manifest/root".to_string(),
+            status: 200,
+            request: Value::Null,
+            response: root_response,
+        },
+    ]
+}
+
+fn normalize_receipt_fixture(receipt: &mut Value) {
+    receipt["receipt_id"] = json!("01J00000000000000000000000");
+    receipt["decision_id"] = json!("01J00000000000000000000001");
+    receipt["issued_at"] = json!("2026-01-01T00:00:00+00:00");
+    receipt["signer_node"] = json!("zsn1_contract");
+    receipt["manifest_signer_node"] = json!("zsn1_contract");
+    receipt["signature"] = json!(vec![0_u8; 64]);
+    receipt["manifest_root_signature"] = json!(vec![0_u8; 64]);
+    receipt["query_hash"] = json!(vec![0_u8; 32]);
+    if receipt["policy_checksum"].is_string() {
+        receipt["policy_checksum"] = json!("0".repeat(64));
+    }
+    receipt["manifest_root"] = json!(vec![0_u8; 32]);
+    receipt["manifest_state_digest"] = json!(vec![0_u8; 32]);
+    receipt["manifest_binding_version"] = json!("v1");
+    receipt["result_digest"] = json!(vec![0_u8; 32]);
+    if receipt["enforced_filter_hash"].is_array() {
+        receipt["enforced_filter_hash"] = json!(vec![0_u8; 32]);
+    }
+    if receipt["policy_filter_hash"].is_array() {
+        receipt["policy_filter_hash"] = json!(vec![0_u8; 32]);
+    }
+    if let Some(touched) = receipt["touched"].as_array_mut() {
+        for (index, artifact) in touched.iter_mut().enumerate() {
+            artifact["key"] = json!(format!(
+                "contract-main/wal/01J0000000000000000000000{index}.wal"
+            ));
+            artifact["content_hash"] = json!(vec![0_u8; 32]);
+            if let Some(steps) = artifact["merkle_path"]["steps"].as_array_mut() {
+                for step in steps {
+                    step["hash"] = json!(vec![0_u8; 32]);
+                }
+            }
+        }
+    }
 }
 
 async fn error_fixtures(

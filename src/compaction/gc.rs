@@ -740,6 +740,13 @@ pub fn reachable_keys_with_staging(
     for segment in &manifest.segments {
         if segment.hierarchical {
             keys.insert(tree_meta_key(namespace, &segment.id));
+            for node_id in manifest.hierarchical_routing_nodes(&segment.id) {
+                keys.insert(crate::index::hierarchical::tree_node_key(
+                    namespace,
+                    &segment.id,
+                    node_id,
+                ));
+            }
         } else {
             keys.insert(centroids_key(namespace, &segment.id));
         }
@@ -2901,7 +2908,7 @@ async fn read_versioned_manifest_from_inventory(
                 )));
             }
             let manifest = Manifest::from_bytes_for_namespace(&bytes, namespace)?;
-            let version = ManifestVersion::for_manifest(get_etag, &manifest);
+            let version = ManifestVersion::for_manifest(get_etag, &manifest, bytes, false);
             Ok(Some((manifest, version)))
         }
         Err(ZeppelinError::NotFound { .. }) if listed.is_none() => Ok(None),
@@ -4170,7 +4177,9 @@ fn extend_scoped_artifact_roots(
         .collect::<BTreeSet<_>>();
     for key in retained_history {
         if let Some((segment_id, path, _)) = parse_segment_key(namespace, key) {
-            if !path.contains('/') && is_known_segment_artifact_name(path) {
+            if !path.contains('/')
+                && (is_known_segment_artifact_name(path) || is_known_tree_node_name(path))
+            {
                 parent_ids.insert(segment_id.to_string());
             }
         }
@@ -4226,7 +4235,8 @@ fn parse_gc_artifact_key(namespace: &str, key: &str) -> Option<ParsedGcArtifact>
     }
 
     let (_, path, ulid) = parse_segment_key(namespace, key)?;
-    if (!path.contains('/') && is_known_segment_artifact_name(path))
+    if (!path.contains('/')
+        && (is_known_segment_artifact_name(path) || is_known_tree_node_name(path)))
         || is_known_scoped_artifact_path(path)
     {
         Some(ParsedGcArtifact::SegmentArtifact { ulid })
@@ -4733,7 +4743,7 @@ mod tests {
     use crate::fts::global_index::global_fts_key;
     use crate::fts::inverted_index::fts_index_key;
     use crate::index::bitmap::bitmap_key;
-    use crate::index::hierarchical::tree_meta_key;
+    use crate::index::hierarchical::{tree_meta_key, tree_node_key};
     use crate::index::ivf_flat::build::{attrs_key, bootstrap_key, centroids_key, cluster_key};
     use crate::index::ivf_flat::membership::membership_key;
     use crate::index::ivf_flat::sketch::sketch_key;
@@ -5060,6 +5070,9 @@ mod tests {
         hierarchical.hierarchical = true;
         hierarchical.quantization = QuantizationType::Scalar;
         hierarchical_manifest.segments.push(hierarchical);
+        let hierarchical_node = format!("root_{}", Ulid::from_parts(2_500, 1));
+        hierarchical_manifest
+            .set_hierarchical_routing_nodes("seg_tree", vec![hierarchical_node.clone()]);
 
         let mut multi_manifest = Manifest::new();
         let mut first = segment_ref("seg_first", 2);
@@ -5148,6 +5161,7 @@ mod tests {
                 manifest: hierarchical_manifest,
                 present: vec![
                     tree_meta_key(NS, "seg_tree"),
+                    tree_node_key(NS, "seg_tree", &hierarchical_node),
                     attrs_key(NS, "seg_tree", 0),
                     sq_calibration_key(NS, "seg_tree"),
                     sq_cluster_key(NS, "seg_tree", 0),
@@ -5463,6 +5477,36 @@ mod tests {
                 "unknown nested key must remain fail-closed: {key}"
             );
         }
+    }
+
+    #[test]
+    fn direct_hierarchical_nodes_enter_pending_delete_and_orphan_gc_grammar() {
+        let now = Utc::now();
+        let segment_ulid = ulid_seconds_ago(30, 301);
+        let node_ulid = ulid_seconds_ago(29, 302);
+        let segment_id = format!("seg_{segment_ulid}");
+        let node_id = format!("n_2_{node_ulid}");
+        let key = crate::index::hierarchical::tree_node_key(NS, &segment_id, &node_id);
+
+        assert!(
+            parse_gc_artifact_key(NS, &key).is_some(),
+            "a direct routing node must be a production GC artifact"
+        );
+        assert!(
+            pending_delete_horizon_satisfied(NS, &key, now, 5),
+            "an old direct routing node must drain from pending_deletes"
+        );
+
+        let listed = BTreeSet::from([key.clone()]);
+        let marked = mark_gc_candidates(
+            NS,
+            &listed,
+            &BTreeSet::new(),
+            &[],
+            now,
+            Manifest::new().version(),
+        );
+        assert_eq!(candidate_keys(&marked), listed);
     }
 
     /// Creates a deterministic-entropy ULID with a wall-clock-relative timestamp.

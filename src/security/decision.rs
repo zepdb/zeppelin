@@ -397,11 +397,20 @@ pub struct AllowDecision {
     pub decision_id: DecisionId,
     /// Authoritative policy version used for the evaluation.
     pub policy_version: PolicyVersion,
+    /// Checksum of the exact immutable policy snapshot used for this decision.
+    #[serde(skip, default)]
+    pub(crate) policy_checksum: Option<String>,
     /// Server-only key authenticating cursor version, shape, and marker fields.
     #[serde(skip, default)]
     pub(crate) cursor_binding_key: CursorBindingKey,
     /// Server-owned filter ANDed with any caller filter.
     pub mandatory_filter: Option<Filter>,
+    /// Policy-owned component before any delegated-token narrowing is applied.
+    ///
+    /// This remains server-only so retrieval receipts can bind and later
+    /// verify the historical policy predicate without exposing it.
+    #[serde(skip, default)]
+    pub(crate) policy_filter: Option<Filter>,
     /// Server-owned response projection restrictions.
     pub field_mask: Option<FieldMask>,
     /// Server-owned write attribute constraints.
@@ -446,8 +455,10 @@ impl AllowDecision {
         Self {
             decision_id: DecisionId::new(),
             policy_version,
+            policy_checksum: None,
             cursor_binding_key: CursorBindingKey::default(),
             mandatory_filter: None,
+            policy_filter: None,
             field_mask: None,
             write_constraints: WriteConstraints::none(),
             attribute_admin_write: false,

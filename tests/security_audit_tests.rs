@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::HeaderMap;
-use chrono::{DateTime, Utc};
+use bytes::Bytes;
+use chrono::{DateTime, TimeZone, Utc};
 use futures::future::join_all;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -14,9 +15,11 @@ use zeppelin::metrics::{
     AUDIT_FLUSH_FAILURES_TOTAL, AUDIT_RECORDS_TOTAL, AUTHZ_DENIALS_TOTAL, AUTH_FAILURES_TOTAL,
 };
 use zeppelin::security::Feature;
-use zeppelin::security::{AuthenticationOutcome, AuthnFailure, CredentialAdapter, PolicyVersion};
+use zeppelin::security::{
+    verify_audit_day, AuthenticationOutcome, AuthnFailure, CredentialAdapter, PolicyVersion,
+};
 use zeppelin::storage::ZeppelinStore;
-use zeppelin::time::Clock;
+use zeppelin::time::{Clock, TimeSource};
 
 use common::counting::counting_store;
 use common::fault_injection::{delay_delete_matching, fail_put_once_matching};
@@ -56,6 +59,15 @@ struct AdvancingFailureAdapter {
 }
 
 struct BecomesStaleDuringAuthenticationAdapter;
+
+#[derive(Debug)]
+struct FixedAuditClock(DateTime<Utc>);
+
+impl TimeSource for FixedAuditClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
 
 impl CredentialAdapter for BecomesStaleDuringAuthenticationAdapter {
     fn authenticate_with_policy(
@@ -530,12 +542,16 @@ async fn open_unsafe_boot_is_audited() {
     let harness = TestHarness::new().await;
     let mut config = Config::default();
     config.security.mode = SecurityMode::OpenUnsafe;
+    let audit_now = Utc
+        .with_ymd_and_hms(2020, 1, 14, 12, 0, 0)
+        .single()
+        .expect("historical open-unsafe audit timestamp must exist");
     let server = start_test_server_full_with_entitlements(
         harness.store.clone(),
         Some(harness.prefix.clone()),
         config,
-        Clock::system(),
-        test_entitlements([Feature::Rbac, Feature::AuditS3]),
+        Clock::from_source(Arc::new(FixedAuditClock(audit_now))),
+        test_entitlements([Feature::AuditS3]),
     )
     .await;
 
@@ -548,8 +564,22 @@ async fn open_unsafe_boot_is_audited() {
     assert_eq!(boots.len(), 1);
     assert_eq!(boots[0]["principal_id"], "anonymous");
     assert_eq!(boots[0]["outcome"], "success");
+    let boot_timestamp = DateTime::parse_from_rfc3339(
+        boots[0]["ts"]
+            .as_str()
+            .expect("open-unsafe audit timestamp must be a string"),
+    )
+    .expect("open-unsafe audit timestamp must be RFC 3339")
+    .with_timezone(&Utc);
+    assert_eq!(boot_timestamp, audit_now);
 
+    let audit_node_id = server.audit_node_id.clone();
     server.shutdown().await;
+    let verification = verify_audit_day(&harness.store, audit_now.date_naive(), &audit_node_id)
+        .await
+        .expect("historical open-unsafe audit day verification must execute");
+    assert!(verification.valid, "{verification:?}");
+    assert_eq!(verification.verified_records, 1);
     harness.cleanup().await;
 }
 
@@ -630,5 +660,66 @@ async fn metrics_have_no_principal_labels() {
     assert!(!metrics.contains("principal_id="));
 
     server.shutdown().await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_harness_audit_chain_anchor_detects_persisted_record_drop() {
+    let harness = TestHarness::new().await;
+    let server = start_test_server_full(
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+        audit_config(),
+        false,
+        None,
+    )
+    .await;
+    let node_id = server.audit_node_id.clone();
+    let day = server.clock.now().date_naive();
+    let response = reqwest::Client::new()
+        .get(format!("{}/readyz", server.base_url))
+        .header("x-request-id", "audit-chain-integration")
+        .send()
+        .await
+        .expect("audited integration request must complete");
+    assert_eq!(response.status(), 401);
+    server.shutdown().await;
+
+    let baseline = verify_audit_day(&harness.store, day, &node_id)
+        .await
+        .expect("signed audit chain must verify");
+    assert!(baseline.valid, "{baseline:?}");
+    assert!(baseline.verified_records > 0);
+
+    let prefix = format!("_audit/{}/{node_id}/", day.format("%Y-%m-%d"));
+    let mut keys = harness
+        .store
+        .list_prefix(&prefix)
+        .await
+        .expect("audit chain objects must list");
+    keys.sort();
+    let first = keys
+        .first()
+        .expect("audit chain must contain one JSONL object");
+    let original = harness
+        .store
+        .get(first)
+        .await
+        .expect("audit chain object must read");
+    harness
+        .store
+        .put(first, Bytes::new())
+        .await
+        .expect("out-of-band record drop must be injected");
+    let broken = verify_audit_day(&harness.store, day, &node_id)
+        .await
+        .expect("mutated audit chain verification must execute");
+    assert!(!broken.valid, "record drop must diverge: {broken:?}");
+    harness
+        .store
+        .put(first, original)
+        .await
+        .expect("audit chain object must be restored");
+
     harness.cleanup().await;
 }

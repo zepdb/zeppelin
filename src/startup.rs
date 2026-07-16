@@ -115,7 +115,7 @@ use crate::cache::{
 };
 use crate::compaction::background::{start_compaction_thread, CompactionThreadOptions};
 use crate::compaction::Compactor;
-use crate::config::{Config, CpuBudget, SecurityMode};
+use crate::config::{Config, CpuBudget, SecurityMode, StorageBackend};
 use crate::error::{Result as ZeppelinResult, ZeppelinError};
 use crate::fts::wal_cache::WalFtsCache;
 use crate::namespace::NamespaceManager;
@@ -428,6 +428,13 @@ async fn build_app_with_entitlement_resolver(
     let clock = Clock::system();
     let entitlements = resolve_entitlements(resolver).await?;
     observe_license_expiry(&entitlements, clock.now());
+    let durable_audit_enabled = config.security.audit_s3 && entitlements.has(Feature::AuditS3);
+    if durable_audit_enabled && config.storage.backend != StorageBackend::S3 {
+        return Err(Box::new(ZeppelinError::Config(
+            "durable audit requires an S3-compatible backend with ETag conditional PUT support"
+                .to_string(),
+        )));
+    }
 
     let mut storage_available = true;
     match ZeppelinStore::probe_configured_endpoint(&config.storage, STORAGE_STARTUP_TIMEOUT).await {
@@ -485,26 +492,31 @@ async fn build_app_with_entitlement_resolver(
         Arc::clone(&entitlements),
     )
     .await?;
-    let node_id = format!("zeppelin-{}", uuid::Uuid::new_v4());
-    let (audit, audit_runtime) = if config.security.audit_s3 && entitlements.has(Feature::AuditS3) {
-        AuditRuntime::start(
+    if durable_audit_enabled || entitlements.has(Feature::Receipts) {
+        security.install_object_signer(&store)?;
+    }
+    let audit_now = clock.now();
+    let (audit, audit_runtime) = if durable_audit_enabled {
+        AuditRuntime::start_for_published_signer_at(
             store.clone(),
-            node_id.clone(),
             Duration::from_secs(config.security.audit_flush_secs),
-        )?
+            audit_now,
+        )
+        .await?
     } else {
-        AuditRuntime::tracing_only(node_id.clone())?
+        AuditRuntime::tracing_only(format!("zeppelin-{}", uuid::Uuid::new_v4()))?
     };
+    let node_id = audit.node_id().to_string();
     if config.security.mode == SecurityMode::OpenUnsafe {
-        let record = AuditRecord::open_unsafe_boot(clock.now(), audit.node_id());
+        let record = AuditRecord::open_unsafe_boot(audit_now, audit.node_id());
         audit.submit_buffered(record)?;
     }
     if entitlements
-        .expiry_seconds(clock.now())
+        .expiry_seconds(audit_now)
         .is_some_and(|seconds| seconds < 0)
     {
         audit.submit_buffered(AuditRecord::license_expired_boot(
-            clock.now(),
+            audit_now,
             audit.node_id(),
         ))?;
     }
@@ -686,10 +698,12 @@ async fn build_app_with_entitlement_resolver(
         shutdown_tx.subscribe(),
     );
     let credential_adapter: Arc<dyn crate::security::CredentialAdapter> = credential_adapter;
+    let receipts = crate::server::ReceiptCapability::compose(&security);
     let state = AppState {
         store,
         clock,
         security,
+        receipts,
         audit,
         credential_adapter,
         namespace_manager,
@@ -847,7 +861,7 @@ mod tests {
     //! restores the previous values for later tests.
 
     use super::*;
-    use crate::config::{ApiKeyConfig, StorageBackend};
+    use crate::config::ApiKeyConfig;
     use crate::security::{canonical_payload_bytes, LicenseLimits, LicensePayload, SignedLicense};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
@@ -959,7 +973,20 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let key_id = "zpk1_license_startup";
+        let token_signing_key_path = root.path().join("token-signing.key");
+        std::fs::write(&token_signing_key_path, "11".repeat(32)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &token_signing_key_path,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
         config.security.set_cursor_hmac_key_hex("42".repeat(32));
+        config.security.token_signing_key_path =
+            token_signing_key_path.to_string_lossy().into_owned();
         config.security.api_keys.push(ApiKeyConfig {
             key_id: key_id.to_string(),
             name: "license-startup-admin".to_string(),
@@ -1111,7 +1138,7 @@ mod tests {
         std::fs::write(
             &license_path,
             serde_json::to_vec(&signed_license(
-                vec![Feature::Rbac, Feature::Constraints, Feature::AuditS3],
+                vec![Feature::Rbac, Feature::Constraints],
                 Utc::now() - ChronoDuration::days(1),
                 Utc::now() + ChronoDuration::days(30),
             ))
@@ -1155,8 +1182,12 @@ mod tests {
         clear_license_startup_store(&cleanup_config).await;
     }
 
-    /// Expired signed startup retains licensed sinks, exports a negative gauge,
-    /// and writes the boot event durably.
+    /// Expired signed startup exports a negative gauge and, on real S3/MinIO,
+    /// retains the licensed durable sink and persists the boot event.
+    ///
+    /// The local filesystem backend does not implement ETag conditional PUT.
+    /// That branch must reject this configuration explicitly instead of
+    /// silently weakening the single-writer audit protocol.
     #[tokio::test]
     async fn expired_file_boot_exports_metric_and_durable_audit() {
         let _startup_guard = LICENSE_STARTUP_LOCK.lock().await;
@@ -1176,9 +1207,23 @@ mod tests {
         clear_license_startup_store(&config).await;
         let storage_config = config.storage.clone();
         let cleanup_config = config.clone();
-        let (router, background_tasks, audit_runtime) = build_app(config).await.unwrap();
+        let startup = build_app(config).await;
 
         assert!(crate::metrics::LICENSE_EXPIRY_SECONDS.get() < 0);
+        if storage_config.backend != StorageBackend::S3 {
+            let error = match startup {
+                Ok(_) => panic!("local durable-audit startup unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.to_string(),
+                "config error: durable audit requires an S3-compatible backend with ETag conditional PUT support"
+            );
+            clear_license_startup_store(&cleanup_config).await;
+            return;
+        }
+
+        let (router, background_tasks, audit_runtime) = startup.unwrap();
         drop(router);
         audit_runtime.shutdown().await.unwrap();
         shutdown_background_tasks(background_tasks, Duration::from_secs(1))

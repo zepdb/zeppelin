@@ -144,7 +144,6 @@ use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use crate::compaction::background::run_compaction_with_lease;
-use crate::compaction::gc::reachable_keys;
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
@@ -1730,8 +1729,14 @@ async fn materialize_clone_manifest(
     mut manifest: Manifest,
 ) -> Result<Manifest, ZeppelinError> {
     manifest.pending_deletes.clear();
+    if manifest.receipt_artifacts(source).is_err() {
+        manifest
+            .hydrate_receipt_artifacts(&state.store, source)
+            .await?;
+    }
     let copies = clone_copy_map(source, target, &manifest)?;
     rewrite_manifest_stored_keys(source, target, &mut manifest)?;
+    manifest.rewrite_receipt_artifacts_for_clone(source, target)?;
     manifest.fencing_token = 0;
     manifest.updated_at = state.clock.now();
     manifest.reset_version_for_clone();
@@ -1768,14 +1773,16 @@ async fn materialize_clone_manifest(
 ///
 /// # Examples
 ///
-/// `source/wal/01.wal` maps to `restore/wal/01.wal`; segment sidecars and
-/// quantization artifacts are expanded by [`reachable_keys`] in the same way.
+/// `source/wal/01.wal` maps to `restore/wal/01.wal`; the manifest's exact,
+/// hydrated receipt inventory supplies every segment sidecar and hierarchical
+/// routing node.
 fn clone_copy_map(
     source: &str,
     target: &str,
     manifest: &Manifest,
 ) -> Result<BTreeMap<String, String>, ZeppelinError> {
-    reachable_keys(source, manifest)
+    let source_keys = manifest.receipt_artifacts(source)?.keys().cloned();
+    source_keys
         .into_iter()
         .map(|source_key| {
             let target_key = rewrite_namespace_key(source, target, &source_key)?;
@@ -2181,7 +2188,9 @@ pub async fn compact_namespace(
         .await
         .map_err(ApiError::from)?;
 
-    if before.uncompacted_fragments().is_empty() {
+    let receipt_upgrade_available =
+        state.store.object_signer_node().is_some() && before.receipt_upgrade_needed(&ns);
+    if before.uncompacted_fragments().is_empty() && !receipt_upgrade_available {
         return Ok((
             StatusCode::OK,
             Json(CompactNamespaceResponse::from_status(

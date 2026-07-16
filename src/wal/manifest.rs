@@ -25,20 +25,24 @@
 //! build next Manifest in memory
 //!                  |
 //!                  v
-//! write history candidate (immutable once referenced)
+//! retain authoritative live generation N as immutable history N
 //!                  |
 //!                  v
-//! publish live manifest.json -------- live PUT fails
+//! publish candidate N+1 ------------ live PUT fails
 //!                  |                       |
 //!                  | success               v
-//!                  v                 history may be orphaned;
-//! readers discover new artifacts      a retry may replace it
+//!                  v                 no speculative N+1 history exists;
+//! retain CAS winner as history N+1     a divergent retry remains possible
 //! ```
 //!
-//! History is written first so a successful live publication always has an
-//! addressable generation. A failure of the final live PUT can leave an
-//! unreferenced history object. The retry logic distinguishes such an orphan
-//! from history already referenced by an equal-or-newer live manifest.
+//! The authoritative predecessor is written first so it is retained before a
+//! successful replacement makes it historical. Competing writers with the same
+//! live ETag create the same predecessor bytes; their divergent candidates are
+//! never written to history before CAS. The CAS winner is snapshotted only
+//! after its live publication succeeds. History is never overwritten, and a
+//! failed live PUT cannot reserve or wedge the next generation. A writer that
+//! observes a live generation whose history snapshot is missing repairs those
+//! exact ETag-bound bytes before it may advance authority again.
 //!
 //! ## Compare-and-swap publication
 //!
@@ -129,6 +133,8 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::ops::Range;
 use ulid::Ulid;
 
@@ -579,10 +585,123 @@ pub struct Manifest {
     ///
     /// The fence is CAS-published before destruction evidence is finalized.
     /// Normal manifest writers reject a fenced base, while writers holding an
-    /// older ETag lose to the fence CAS. This field must remain last because
-    /// MessagePack encodes structs as positional arrays.
+    /// older ETag lose to the fence CAS. This field retains its historical
+    /// position; newer persisted fields append after it because MessagePack
+    /// encodes structs as positional arrays.
     #[serde(default)]
     deletion_fence: Option<ManifestDeletionFence>,
+    /// SHA-256 inventory for every immutable artifact visible through this generation.
+    ///
+    /// Old manifests decode as empty and remain queryable, but receipt issuance
+    /// fails loudly until compaction replaces their reachable artifact set.
+    #[serde(default)]
+    artifact_hashes: BTreeMap<String, [u8; 32]>,
+    /// Canonical Merkle root over `artifact_hashes` in sorted-key order.
+    #[serde(default)]
+    merkle_root: Option<[u8; 32]>,
+    /// Ed25519 signature over root, execution-state digest, generation, and fencing token.
+    #[serde(default)]
+    root_signature: Option<Vec<u8>>,
+    /// Published signer identity used by `root_signature`.
+    #[serde(default)]
+    root_signer_node: Option<String>,
+    /// Exact hierarchical routing-node IDs keyed by owning segment ID.
+    ///
+    /// Routing nodes are fetched lazily by production search and therefore
+    /// must be explicit manifest-rooted artifacts. Legacy manifests decode
+    /// empty and are populated only by an explicit compaction upgrade.
+    #[serde(default)]
+    hierarchical_routing_nodes: BTreeMap<String, Vec<String>>,
+    /// Canonical digest of the query-routing manifest projection.
+    ///
+    /// This field retains its persisted position because MessagePack encodes
+    /// structs as positional arrays. It excludes the artifact hashes and
+    /// signature envelope, which are bound separately by the Merkle root
+    /// signature.
+    #[serde(default)]
+    receipt_state_digest: Option<[u8; 32]>,
+    /// Version of the stable projection encoded by `receipt_state_digest`.
+    ///
+    /// This field remains last because MessagePack encodes structs as
+    /// positional arrays. A new query-relevant manifest field requires a new
+    /// binding version rather than changing the v1 projection in place.
+    #[serde(default)]
+    receipt_binding_version: Option<ReceiptBindingVersion>,
+}
+
+/// Stable manifest execution projection version used by signed receipts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptBindingVersion {
+    /// Original field-by-field query-routing projection.
+    V1,
+}
+
+#[derive(Serialize)]
+struct FragmentExecutionBindingV1 {
+    id: String,
+    vector_count: usize,
+    delete_count: usize,
+    sequence_number: u64,
+    size_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct SketchExecutionBindingV1<'a> {
+    key: &'a str,
+    version: u32,
+    code_dims: usize,
+    bytes_per_vector: usize,
+    size_bytes: u64,
+    rotation_seed: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ClusterObjectExecutionBindingV1<'a> {
+    key: &'a str,
+    clusters: &'a [usize],
+    live_offset: u64,
+    live_len: u64,
+    size_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct BootstrapExecutionBindingV1<'a> {
+    key: &'a str,
+    size_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct SegmentExecutionBindingV1<'a> {
+    id: &'a str,
+    vector_count: usize,
+    cluster_count: usize,
+    quantization: &'static str,
+    hierarchical: bool,
+    bitmap_fields: &'a [String],
+    fts_fields: &'a [String],
+    has_global_fts: bool,
+    cluster_owners: &'a [String],
+    sketch: Option<SketchExecutionBindingV1<'a>>,
+    cluster_objects: Vec<ClusterObjectExecutionBindingV1<'a>>,
+    bootstrap: Option<BootstrapExecutionBindingV1<'a>>,
+}
+
+#[derive(Serialize)]
+struct HierarchicalRoutingExecutionBindingV1<'a> {
+    segment_id: &'a str,
+    node_ids: &'a [String],
+}
+
+#[derive(Serialize)]
+struct ManifestExecutionBindingV1<'a> {
+    format: &'static str,
+    namespace: &'a str,
+    namespace_incarnation: Option<[u8; 16]>,
+    fragments: Vec<FragmentExecutionBindingV1>,
+    segments: Vec<SegmentExecutionBindingV1<'a>>,
+    active_segment: Option<&'a str>,
+    hierarchical_routing_nodes: Vec<HierarchicalRoutingExecutionBindingV1<'a>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -687,12 +806,31 @@ enum HistorySnapshotWrite {
     },
 }
 
-/// Error family used when conflicting history is already live and immutable.
-enum ReferencedHistoryConflict {
-    /// Surface a persisted-format/invariant error to unconditional writers.
-    Serialization,
-    /// Surface an optimistic-concurrency conflict to conditional writers.
-    ManifestConflict,
+/// Canonical bytes signed by each Merkle-rooted manifest generation.
+pub(crate) fn manifest_root_signing_bytes(
+    merkle_root: [u8; 32],
+    manifest_version: u64,
+    fencing_token: u64,
+    binding_version: ReceiptBindingVersion,
+    state_digest: [u8; 32],
+) -> Result<Vec<u8>> {
+    #[derive(Serialize)]
+    struct RootBinding {
+        merkle_root: [u8; 32],
+        manifest_version: u64,
+        fencing_token: u64,
+        binding_version: ReceiptBindingVersion,
+        state_digest: [u8; 32],
+    }
+
+    serde_json::to_vec(&RootBinding {
+        merkle_root,
+        manifest_version,
+        fencing_token,
+        binding_version,
+        state_digest,
+    })
+    .map_err(|error| ZeppelinError::Serialization(format!("manifest root signing failed: {error}")))
 }
 
 impl Manifest {
@@ -728,6 +866,13 @@ impl Manifest {
             namespace: None,
             namespace_incarnation: None,
             deletion_fence: None,
+            artifact_hashes: BTreeMap::new(),
+            merkle_root: None,
+            root_signature: None,
+            root_signer_node: None,
+            hierarchical_routing_nodes: BTreeMap::new(),
+            receipt_state_digest: None,
+            receipt_binding_version: None,
         }
     }
 
@@ -808,6 +953,407 @@ impl Manifest {
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Return the writer-fencing generation bound into the signed root.
+    #[must_use]
+    pub const fn fencing_token(&self) -> u64 {
+        self.fencing_token
+    }
+
+    /// Return the fully hashed immutable inventory used for receipt proofs.
+    pub fn receipt_artifacts(
+        &self,
+        namespace: &str,
+    ) -> std::result::Result<&BTreeMap<String, [u8; 32]>, crate::security::SecurityError> {
+        if self.segments.iter().any(|segment| {
+            segment.hierarchical && self.hierarchical_routing_nodes(&segment.id).is_empty()
+        }) {
+            return Err(crate::security::SecurityError::ReceiptsUnavailableUnhashed);
+        }
+        let reachable = self.receipt_reachable_keys(namespace);
+        if reachable.len() != self.artifact_hashes.len()
+            || reachable
+                .iter()
+                .any(|key| !self.artifact_hashes.contains_key(key))
+        {
+            return Err(crate::security::SecurityError::ReceiptsUnavailableUnhashed);
+        }
+        Ok(&self.artifact_hashes)
+    }
+
+    /// Return whether an explicit compaction must upgrade receipt metadata.
+    #[must_use]
+    pub(crate) fn receipt_upgrade_needed(&self, namespace: &str) -> bool {
+        self.receipt_artifacts(namespace).is_err()
+            || self.merkle_root.is_none()
+            || self.root_signature.is_none()
+            || self.root_signer_node.is_none()
+            || self.receipt_binding_version.is_none()
+            || self.recompute_receipt_state_digest(namespace).ok() != self.receipt_state_digest
+    }
+
+    /// Read and hash every currently reachable immutable artifact missing from
+    /// a legacy manifest's receipt inventory.
+    ///
+    /// This is called only by an explicit compaction upgrade. Query execution
+    /// never performs backfill I/O and therefore continues to fail closed until
+    /// the upgraded generation is CAS-published.
+    pub(crate) async fn hydrate_receipt_artifacts(
+        &mut self,
+        store: &ZeppelinStore,
+        namespace: &str,
+    ) -> Result<()> {
+        for segment in self.segments.clone() {
+            if segment.hierarchical && self.hierarchical_routing_nodes(&segment.id).is_empty() {
+                let node_ids =
+                    crate::index::hierarchical::build::discover_hierarchical_routing_nodes(
+                        store,
+                        namespace,
+                        &segment.id,
+                    )
+                    .await?;
+                if node_ids.is_empty() {
+                    return Err(ZeppelinError::Index(format!(
+                        "hierarchical segment {} has no routing-node inventory",
+                        segment.id
+                    )));
+                }
+                self.set_hierarchical_routing_nodes(&segment.id, node_ids);
+            }
+        }
+        let reachable = self.receipt_reachable_keys(namespace);
+        self.artifact_hashes
+            .retain(|key, _| reachable.contains(key));
+        for key in reachable {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.artifact_hashes.entry(key)
+            {
+                // Fresh artifacts already have an exact hash computed beside
+                // their successful PUT. Reuse it so ordinary compaction keeps
+                // the Phase 10 zero-extra-I/O contract. Only retained legacy
+                // artifacts unknown to this process require a storage read.
+                if let Some(content_hash) = store.known_content_hash(entry.key()) {
+                    entry.insert(content_hash);
+                } else {
+                    let body = store.get(entry.key()).await?;
+                    entry.insert(<[u8; 32]>::from(Sha256::digest(&body)));
+                }
+            }
+        }
+        self.merkle_root = None;
+        self.root_signature = None;
+        self.root_signer_node = None;
+        self.receipt_state_digest = None;
+        self.receipt_binding_version = None;
+        Ok(())
+    }
+
+    /// Rewrite exact receipt inventory keys after byte-identical clone copies.
+    pub(crate) fn rewrite_receipt_artifacts_for_clone(
+        &mut self,
+        source: &str,
+        target: &str,
+    ) -> Result<()> {
+        let source_prefix = format!("{source}/");
+        let mut rewritten = BTreeMap::new();
+        for (key, content_hash) in std::mem::take(&mut self.artifact_hashes) {
+            let suffix = key.strip_prefix(&source_prefix).ok_or_else(|| {
+                ZeppelinError::Index(format!(
+                    "clone receipt artifact key {key:?} is outside source prefix {source_prefix:?}"
+                ))
+            })?;
+            rewritten.insert(format!("{target}/{suffix}"), content_hash);
+        }
+        self.artifact_hashes = rewritten;
+        self.merkle_root = None;
+        self.root_signature = None;
+        self.root_signer_node = None;
+        self.receipt_state_digest = None;
+        self.receipt_binding_version = None;
+        Ok(())
+    }
+
+    /// Return the canonical root carried by this manifest generation.
+    #[must_use]
+    pub const fn merkle_root(&self) -> Option<[u8; 32]> {
+        self.merkle_root
+    }
+
+    /// Return the canonical query-routing state digest carried by this generation.
+    #[must_use]
+    pub const fn receipt_state_digest(&self) -> Option<[u8; 32]> {
+        self.receipt_state_digest
+    }
+
+    /// Return the stable projection version carried by this generation.
+    #[must_use]
+    pub const fn receipt_binding_version(&self) -> Option<ReceiptBindingVersion> {
+        self.receipt_binding_version
+    }
+
+    /// Recompute the domain-separated query-routing projection digest.
+    pub(crate) fn recompute_receipt_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
+        let binding_version = self.receipt_binding_version.ok_or_else(|| {
+            ZeppelinError::Serialization(
+                "manifest receipt binding version is unavailable".to_string(),
+            )
+        })?;
+        self.compute_receipt_state_digest(namespace, binding_version)
+    }
+
+    fn compute_receipt_state_digest(
+        &self,
+        namespace: &str,
+        binding_version: ReceiptBindingVersion,
+    ) -> Result<[u8; 32]> {
+        self.validate_namespace_binding(namespace)?;
+        let bytes = match binding_version {
+            ReceiptBindingVersion::V1 => serde_json::to_vec(&self.execution_binding_v1(namespace)),
+        };
+        let bytes = bytes.map_err(|error| {
+            ZeppelinError::Serialization(format!(
+                "manifest execution binding serialization failed: {error}"
+            ))
+        })?;
+        Ok(Sha256::digest(bytes).into())
+    }
+
+    fn execution_binding_v1<'a>(&'a self, namespace: &'a str) -> ManifestExecutionBindingV1<'a> {
+        let fragments = self
+            .fragments
+            .iter()
+            .map(|fragment| FragmentExecutionBindingV1 {
+                id: fragment.id.to_string(),
+                vector_count: fragment.vector_count,
+                delete_count: fragment.delete_count,
+                sequence_number: fragment.sequence_number,
+                size_bytes: fragment.size_bytes,
+            })
+            .collect();
+        let segments = self
+            .segments
+            .iter()
+            .map(|segment| SegmentExecutionBindingV1 {
+                id: &segment.id,
+                vector_count: segment.vector_count,
+                cluster_count: segment.cluster_count,
+                quantization: match segment.quantization {
+                    crate::index::quantization::QuantizationType::None => "none",
+                    crate::index::quantization::QuantizationType::Scalar => "scalar",
+                    crate::index::quantization::QuantizationType::Product => "product",
+                },
+                hierarchical: segment.hierarchical,
+                bitmap_fields: &segment.bitmap_fields,
+                fts_fields: &segment.fts_fields,
+                has_global_fts: segment.has_global_fts,
+                cluster_owners: &segment.cluster_owners,
+                sketch: segment
+                    .sketch
+                    .as_ref()
+                    .map(|sketch| SketchExecutionBindingV1 {
+                        key: &sketch.key,
+                        version: sketch.version,
+                        code_dims: sketch.code_dims,
+                        bytes_per_vector: sketch.bytes_per_vector,
+                        size_bytes: sketch.size_bytes,
+                        rotation_seed: sketch.rotation_seed,
+                    }),
+                cluster_objects: segment
+                    .cluster_objects
+                    .iter()
+                    .map(|object| ClusterObjectExecutionBindingV1 {
+                        key: &object.key,
+                        clusters: &object.clusters,
+                        live_offset: object.live_offset,
+                        live_len: object.live_len,
+                        size_bytes: object.size_bytes,
+                    })
+                    .collect(),
+                bootstrap: segment.bootstrap.as_ref().map(|bootstrap| {
+                    BootstrapExecutionBindingV1 {
+                        key: &bootstrap.key,
+                        size_bytes: bootstrap.size_bytes,
+                    }
+                }),
+            })
+            .collect();
+        let hierarchical_routing_nodes = self
+            .hierarchical_routing_nodes
+            .iter()
+            .map(
+                |(segment_id, node_ids)| HierarchicalRoutingExecutionBindingV1 {
+                    segment_id,
+                    node_ids,
+                },
+            )
+            .collect();
+
+        ManifestExecutionBindingV1 {
+            format: "zeppelin-manifest-execution-v1",
+            namespace,
+            namespace_incarnation: self.namespace_incarnation.map(|incarnation| incarnation.0),
+            fragments,
+            segments,
+            active_segment: self.active_segment.as_deref(),
+            hierarchical_routing_nodes,
+        }
+    }
+
+    /// Borrow the node signature carried by this manifest generation.
+    #[must_use]
+    pub fn root_signature(&self) -> Option<&[u8]> {
+        self.root_signature.as_deref()
+    }
+
+    /// Borrow the published signer identity carried by this manifest generation.
+    #[must_use]
+    pub fn root_signer_node(&self) -> Option<&str> {
+        self.root_signer_node.as_deref()
+    }
+
+    /// Record the exact routing-node inventory produced for one segment.
+    pub(crate) fn set_hierarchical_routing_nodes(
+        &mut self,
+        segment_id: &str,
+        mut node_ids: Vec<String>,
+    ) {
+        node_ids.sort();
+        node_ids.dedup();
+        self.hierarchical_routing_nodes
+            .insert(segment_id.to_string(), node_ids);
+    }
+
+    /// Borrow the manifest-owned routing-node IDs for one hierarchical segment.
+    #[must_use]
+    pub(crate) fn hierarchical_routing_nodes(&self, segment_id: &str) -> &[String] {
+        self.hierarchical_routing_nodes
+            .get(segment_id)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn receipt_reachable_keys(&self, namespace: &str) -> std::collections::BTreeSet<String> {
+        let mut reachable = crate::compaction::gc::reachable_keys(namespace, self);
+        for segment in &self.segments {
+            if segment.hierarchical {
+                for node_id in self.hierarchical_routing_nodes(&segment.id) {
+                    reachable.insert(crate::index::hierarchical::tree_node_key(
+                        namespace,
+                        &segment.id,
+                        node_id,
+                    ));
+                }
+            }
+            if segment.has_global_fts {
+                for cluster_idx in 0..segment.cluster_count {
+                    reachable.remove(&crate::fts::inverted_index::fts_index_key(
+                        namespace,
+                        segment.cluster_owner(cluster_idx),
+                        cluster_idx,
+                    ));
+                }
+            }
+            if segment.quantization != crate::index::quantization::QuantizationType::Scalar {
+                continue;
+            }
+
+            // Hierarchical SQ embeds calibration in tree_meta.json and codes
+            // in each ordinary cluster object. The conservative GC inventory
+            // protects legacy sidecar names too, but receipts bind only real
+            // published objects.
+            if segment.hierarchical {
+                reachable.remove(&crate::index::quantization::sq::sq_calibration_key(
+                    namespace,
+                    &segment.id,
+                ));
+                for cluster_idx in 0..segment.cluster_count {
+                    reachable.remove(&crate::index::quantization::sq::sq_cluster_key(
+                        namespace,
+                        segment.cluster_owner(cluster_idx),
+                        cluster_idx,
+                    ));
+                }
+                continue;
+            }
+
+            // GC deliberately protects every legacy SQ sidecar that might
+            // exist, even when a newer manifest proves that the equivalent SQ
+            // bytes are embedded in a bootstrap or co-located cluster object.
+            // Receipts need the exact published artifact inventory instead of
+            // that conservative sweep superset, otherwise they would commit
+            // nonexistent keys. A carried cluster from a pre-co-location
+            // segment keeps its old standalone sidecar; rewritten and grouped
+            // clusters bind only the object that actually contains the codes.
+            if segment.bootstrap.is_some() {
+                reachable.remove(&crate::index::quantization::sq::sq_calibration_key(
+                    namespace,
+                    &segment.id,
+                ));
+            }
+            for cluster_idx in 0..segment.cluster_count {
+                let owner = segment.cluster_owner(cluster_idx);
+                let codes_are_colocated = !segment.cluster_objects.is_empty()
+                    || (segment.bootstrap.is_some() && owner == segment.id);
+                if codes_are_colocated {
+                    reachable.remove(&crate::index::quantization::sq::sq_cluster_key(
+                        namespace,
+                        owner,
+                        cluster_idx,
+                    ));
+                }
+            }
+        }
+        for pending in &self.pending_deletes {
+            reachable.remove(pending);
+        }
+        reachable
+    }
+
+    fn finalize_receipt_root(&mut self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
+        let reachable = self.receipt_reachable_keys(namespace);
+        self.artifact_hashes
+            .retain(|key, _| reachable.contains(key));
+        for key in &reachable {
+            if !self.artifact_hashes.contains_key(key) {
+                if let Some(content_hash) = store.known_content_hash(key) {
+                    self.artifact_hashes.insert(key.clone(), content_hash);
+                }
+            }
+        }
+
+        if reachable
+            .iter()
+            .any(|key| !self.artifact_hashes.contains_key(key))
+        {
+            self.merkle_root = None;
+            self.root_signature = None;
+            self.root_signer_node = None;
+            self.receipt_state_digest = None;
+            self.receipt_binding_version = None;
+            return Ok(());
+        }
+
+        let root = crate::security::MerkleTree::build(&self.artifact_hashes)?.root();
+        let binding_version = ReceiptBindingVersion::V1;
+        let state_digest = self.compute_receipt_state_digest(namespace, binding_version)?;
+        self.merkle_root = Some(root);
+        self.receipt_state_digest = Some(state_digest);
+        self.receipt_binding_version = Some(binding_version);
+        let payload = manifest_root_signing_bytes(
+            root,
+            self.version,
+            self.fencing_token,
+            binding_version,
+            state_digest,
+        )?;
+        if let Some((signer_node, signature)) = store.sign_object(&payload) {
+            self.root_signer_node = Some(signer_node);
+            self.root_signature = Some(signature);
+        } else {
+            self.root_signer_node = None;
+            self.root_signature = None;
+        }
+        Ok(())
     }
 
     /// Resets the persisted generation before cloning into another namespace.
@@ -1098,6 +1644,7 @@ impl Manifest {
             self.active_segment = None;
         }
         self.segments.retain(|segment| segment.id != segment_id);
+        self.prune_hierarchical_routing_nodes();
         self.updated_at = now;
     }
 
@@ -1152,6 +1699,18 @@ impl Manifest {
             }
             self.segments = pruned;
         }
+        self.prune_hierarchical_routing_nodes();
+    }
+
+    fn prune_hierarchical_routing_nodes(&mut self) {
+        let retained = self
+            .segments
+            .iter()
+            .filter(|segment| segment.hierarchical)
+            .map(|segment| segment.id.as_str())
+            .collect::<HashSet<_>>();
+        self.hierarchical_routing_nodes
+            .retain(|segment_id, _| retained.contains(segment_id.as_str()));
     }
 
     /// Borrows all fragment descriptors currently visible in this manifest.
@@ -1408,10 +1967,10 @@ impl Manifest {
 
     /// Publishes this candidate without overwriting a concurrent live manifest.
     ///
-    /// The method first reads the current live generation, chooses one greater
-    /// than both that value and `self.version`, writes the corresponding history
-    /// snapshot, and finally publishes the live object. Existing manifests use
-    /// the ETag from the discovery read; absent manifests use create-only PUT.
+    /// The method first reads the current live generation, retains that exact
+    /// predecessor, chooses a generation greater than both the live value and
+    /// `self.version`, and finally publishes the replacement. Existing manifests
+    /// use the ETag from the discovery read; absent manifests use create-only PUT.
     /// Use [`Manifest::write_conditional`] when the caller already holds a
     /// versioned read capability.
     ///
@@ -1423,20 +1982,22 @@ impl Manifest {
     ///
     /// # Returns
     ///
-    /// `Ok(())` after both history and live objects are written. Only then is
-    /// `self.version` advanced to the committed generation.
+    /// `Ok(())` after predecessor retention, replacement live publication, and
+    /// immutable history for the CAS winner. Only then is `self.version`
+    /// advanced to the committed generation.
     ///
     /// # Errors
     ///
     /// Returns on read, missing ETag, generation overflow, serialization,
-    /// history, live PUT, or concurrent-publication conflict. A history object
-    /// can already exist if the final live PUT fails; `self.version` remains
-    /// unchanged so a retry can reconcile that orphan.
+    /// predecessor-history, live PUT, or concurrent-publication conflict. A
+    /// failed live PUT cannot reserve the speculative generation;
+    /// `self.version` remains unchanged and a divergent retry stays possible.
     ///
     /// # Side Effects
     ///
-    /// Performs one generation-discovery GET, at least one history operation,
-    /// and one conditional or create-only live-manifest PUT on the success path.
+    /// Performs one generation-discovery GET, a predecessor-history operation
+    /// when needed, one conditional or create-only live-manifest PUT, and one
+    /// immutable winner-history operation on the success path.
     ///
     /// # Consistency
     ///
@@ -1445,9 +2006,9 @@ impl Manifest {
     ///
     /// # Examples
     ///
-    /// Namespace bootstrap writes an empty generation 1. If its history write
-    /// fails, the live manifest is untouched. If the later live PUT fails,
-    /// history generation 1 may exist without being authoritative.
+    /// Namespace bootstrap writes generation 1 directly. Replacing it first
+    /// retains authoritative history 1. If the candidate-2 live PUT fails, a
+    /// different candidate 2 can reuse the same history 1 and retry safely.
     pub async fn write(&mut self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
         if self.deletion_fence.is_some() {
             return Err(ZeppelinError::NamespaceDeleting {
@@ -1467,25 +2028,27 @@ impl Manifest {
         let current_version = current
             .as_ref()
             .map_or(0, |(manifest, _)| manifest.version());
+        if let Some((live, version)) = &current {
+            if !version.history_confirmed {
+                let data = version.history_snapshot_bytes(namespace, live.version())?;
+                Self::write_immutable_history_snapshot(store, namespace, live.version(), data)
+                    .await?;
+            }
+        }
         let base_version = self.version.max(current_version);
         let mut committed = self.clone();
         committed.version = Self::checked_next_version(base_version)?;
         committed.namespace = Some(namespace.to_string());
+        committed.finalize_receipt_root(store, namespace)?;
         let data = committed.to_bytes()?;
-        Self::write_history_snapshot_for_commit(
-            store,
-            namespace,
-            &committed,
-            data.clone(),
-            ReferencedHistoryConflict::Serialization,
-        )
-        .await?;
         match current {
             Some((_, version)) => {
                 let etag = version.require_etag(namespace, "manifest recovery write")?;
-                store.put_if_match(&key, data, etag, namespace).await?;
+                store
+                    .put_if_match(&key, data.clone(), etag, namespace)
+                    .await?;
             }
-            None => match store.put_create_outcome(&key, data).await? {
+            None => match store.put_create_outcome(&key, data.clone()).await? {
                 CreateOnlyOutcome::Created { .. } => {}
                 CreateOnlyOutcome::AlreadyExists => {
                     return Err(ZeppelinError::ManifestConflict {
@@ -1494,6 +2057,8 @@ impl Manifest {
                 }
             },
         }
+        Self::write_immutable_history_snapshot(store, namespace, committed.version(), data).await?;
+        store.forget_known_content_hashes(committed.artifact_hashes.keys());
         *self = committed;
         Ok(())
     }
@@ -1538,7 +2103,7 @@ impl Manifest {
         match store.get_with_meta(&key).await {
             Ok((data, etag)) => {
                 let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
-                let version = ManifestVersion::for_manifest(etag, &manifest);
+                let version = ManifestVersion::for_manifest(etag, &manifest, data, false);
                 Ok(Some((manifest, version)))
             }
             Err(crate::error::ZeppelinError::NotFound { .. }) => Ok(None),
@@ -1559,7 +2124,7 @@ impl Manifest {
         let key = Self::s3_key(namespace);
         let (data, etag) = store.get_with_meta(&key).await?;
         let manifest = Self::from_bytes_for_namespace(&data, namespace)?;
-        let version = ManifestVersion::for_manifest(etag, &manifest);
+        let version = ManifestVersion::for_manifest(etag, &manifest, data, false);
         Ok((manifest, version))
     }
 
@@ -1618,13 +2183,13 @@ impl Manifest {
     /// Publishes the next generation using ETag compare-and-swap when available.
     ///
     /// ```text
-    /// candidate version N
+    /// authoritative live N
     ///         |
     ///         v
-    /// create history N+1
+    /// create immutable history N
     ///         |
     ///         v
-    /// PUT live manifest if ETag matches ---- mismatch
+    /// PUT candidate N+1 if ETag matches ---- mismatch
     ///         |                                |
     ///         v                                v
     /// candidate becomes N+1            reload authoritative state
@@ -1645,15 +2210,16 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// Returns on generation overflow, serialization, history I/O, live PUT, or
-    /// ETag conflict. A failure after history creation can leave an orphaned
-    /// generation, but does not advance `self.version`. Uploaded data artifacts
-    /// referenced only by this candidate also remain invisible.
+    /// Returns on generation overflow, serialization, predecessor-history I/O,
+    /// live PUT, or ETag conflict. A failed live PUT never creates history for
+    /// the speculative generation and does not advance `self.version`. Uploaded
+    /// data artifacts referenced only by this candidate also remain invisible.
     ///
     /// # Side Effects
     ///
-    /// Creates or reconciles the immutable history object before attempting one
-    /// ETag-conditional live PUT, or a create-only PUT when the ETag is absent.
+    /// Creates or validates immutable history for an unconfirmed authoritative
+    /// predecessor, attempts one ETag-conditional or create-only live PUT, then
+    /// creates or validates immutable history for the committed winner.
     ///
     /// # Consistency
     ///
@@ -1696,22 +2262,23 @@ impl Manifest {
         version: &ManifestVersion,
     ) -> Result<ManifestVersion> {
         let key = Self::s3_key(namespace);
+        if self.version() > 0 && !version.history_confirmed {
+            let data = version.history_snapshot_bytes(namespace, self.version())?;
+            Self::write_immutable_history_snapshot(store, namespace, self.version(), data).await?;
+        }
         let next_version = self.next_committed_version()?;
         let mut committed = self.clone();
         committed.version = next_version;
         committed.namespace = Some(namespace.to_string());
+        committed.finalize_receipt_root(store, namespace)?;
         let data = committed.to_bytes()?;
-        Self::write_history_snapshot_for_commit(
-            store,
-            namespace,
-            &committed,
-            data.clone(),
-            ReferencedHistoryConflict::ManifestConflict,
-        )
-        .await?;
         let new_etag = match &version.e_tag {
-            Some(etag) => store.put_if_match(&key, data, etag, namespace).await?,
-            None => match store.put_create_outcome(&key, data).await? {
+            Some(etag) => {
+                store
+                    .put_if_match(&key, data.clone(), etag, namespace)
+                    .await?
+            }
+            None => match store.put_create_outcome(&key, data.clone()).await? {
                 CreateOnlyOutcome::Created { e_tag } => e_tag,
                 CreateOnlyOutcome::AlreadyExists => {
                     return Err(ZeppelinError::ManifestConflict {
@@ -1720,7 +2287,10 @@ impl Manifest {
                 }
             },
         };
-        let new_version = ManifestVersion::for_manifest(new_etag, &committed);
+        Self::write_immutable_history_snapshot(store, namespace, committed.version(), data.clone())
+            .await?;
+        let new_version = ManifestVersion::for_manifest(new_etag, &committed, data, true);
+        store.forget_known_content_hashes(committed.artifact_hashes.keys());
         *self = committed;
         Ok(new_version)
     }
@@ -1795,7 +2365,9 @@ impl Manifest {
     /// # Returns
     ///
     /// Descriptors sorted by numeric generation. An empty vector means no
-    /// history objects are retained.
+    /// history objects are retained. A crash between live CAS and the matching
+    /// history PUT can transiently omit the current generation until the next
+    /// writer repairs it from its version-bound live bytes.
     ///
     /// # Errors
     ///
@@ -1880,8 +2452,8 @@ impl Manifest {
     ///
     /// # Returns
     ///
-    /// `Some(manifest)` when retained or `None` when that generation key is
-    /// absent.
+    /// `Some(manifest)` when the physical immutable history object is retained,
+    /// or `None` when that generation key is absent.
     ///
     /// # Errors
     ///
@@ -1891,13 +2463,14 @@ impl Manifest {
     ///
     /// # Consistency
     ///
-    /// History objects are immutable once referenced by the live manifest.
-    /// Reading history does not make it the namespace's current live state.
+    /// History objects are immutable once created. Reading history never
+    /// substitutes the mutable live-manifest key for a missing physical object.
     ///
     /// # Examples
     ///
     /// Reading generation 4 may return a view with fewer fragments than the live
-    /// generation 9. A missing generation returns `None`, never the nearest one.
+    /// generation 9. A missing generation returns `None`, never the live or
+    /// nearest retained generation.
     pub async fn read_history(
         store: &ZeppelinStore,
         namespace: &str,
@@ -2087,68 +2660,52 @@ impl Manifest {
         })
     }
 
-    /// Ensures the candidate history object is safe to pair with a live commit.
+    /// Retains the authoritative live generation before it is superseded.
     ///
-    /// A unique or byte-identical history object is accepted. Different bytes
-    /// at the same generation are immutable if the live manifest already
-    /// references that generation or a newer one. Otherwise the object is an
-    /// orphan from a failed live PUT and can be replaced by this retry.
+    /// Competing writers that share one live ETag also share these exact bytes,
+    /// so they can idempotently create the same immutable history object while
+    /// keeping their divergent next-generation candidates out of history. A
+    /// failed live PUT therefore cannot reserve or wedge the next generation.
     ///
     /// # Parameters
     ///
     /// - `store`: Borrowed storage abstraction.
-    /// - `namespace`: Namespace receiving the candidate generation.
-    /// - `committed`: Borrowed candidate with its nonzero generation assigned.
-    /// - `data`: Owned encoding of `committed`, reused when replacing an orphan.
-    /// - `referenced_conflict`: Selects the public error appropriate to the
-    ///   unconditional or conditional caller.
+    /// - `namespace`: Namespace whose live generation is about to be replaced.
+    /// - `version`: Nonzero predecessor or committed-winner generation.
+    /// - `data`: Exact ETag-bound predecessor bytes or exact CAS-winning bytes.
     ///
     /// # Errors
     ///
-    /// Propagates storage and serialization failures. Conflicting referenced
-    /// history becomes either a serialization invariant error or a manifest CAS
-    /// conflict as selected by the caller.
+    /// Propagates storage and serialization failures. Different bytes already
+    /// stored at the selected generation are an immutable-history invariant
+    /// failure, never an optimistic-concurrency retry.
     ///
     /// # Side Effects
     ///
-    /// May create a history object, read the live manifest, or overwrite an
-    /// orphaned history object. It does not publish the live manifest.
+    /// May create or read one history object. It never overwrites history and
+    /// does not publish the replacement live manifest.
     ///
     /// # Consistency
     ///
-    /// A history object reachable from the live manifest is never overwritten.
+    /// The source bytes are either an authoritative ETag-bound predecessor or
+    /// an already published CAS winner, never a speculative successor. Every
+    /// retained history object is write-once.
     ///
     /// # Examples
     ///
-    /// If generation 8 history exists after generation 7's live PUT failed, a
-    /// retry based on live generation 7 may replace it. Once live generation 8
-    /// exists, different bytes for history 8 are rejected.
-    async fn write_history_snapshot_for_commit(
+    /// Writers A and B both read live generation 7 and may create identical
+    /// history 7. If A's candidate-8 PUT fails, B may still publish a different
+    /// candidate 8 because no speculative history-8 object was created.
+    async fn write_immutable_history_snapshot(
         store: &ZeppelinStore,
         namespace: &str,
-        committed: &Self,
+        version: u64,
         data: Bytes,
-        referenced_conflict: ReferencedHistoryConflict,
     ) -> Result<()> {
-        match Self::try_write_history_snapshot(store, namespace, committed).await? {
+        match Self::try_write_history_snapshot(store, namespace, version, data).await? {
             HistorySnapshotWrite::Stored => Ok(()),
             HistorySnapshotWrite::AlreadyExistsWithDifferentBytes { key } => {
-                let live_version = Self::read(store, namespace)
-                    .await?
-                    .map_or(0, |live| live.version());
-                if live_version >= committed.version() {
-                    return match referenced_conflict {
-                        ReferencedHistoryConflict::Serialization => {
-                            Err(Self::history_snapshot_mismatch_error(&key))
-                        }
-                        ReferencedHistoryConflict::ManifestConflict => {
-                            Err(ZeppelinError::ManifestConflict {
-                                namespace: namespace.to_string(),
-                            })
-                        }
-                    };
-                }
-                store.put(&key, data).await.map(|_| ())
+                Err(Self::history_snapshot_mismatch_error(&key))
             }
         }
     }
@@ -2191,9 +2748,9 @@ impl Manifest {
     async fn try_write_history_snapshot(
         store: &ZeppelinStore,
         namespace: &str,
-        committed: &Self,
+        version: u64,
+        data: Bytes,
     ) -> Result<HistorySnapshotWrite> {
-        let version = committed.version();
         if version == 0 {
             return Err(ZeppelinError::Serialization(
                 "manifest history requires a committed nonzero version".to_string(),
@@ -2201,7 +2758,6 @@ impl Manifest {
         }
 
         let key = Self::history_key(namespace, version);
-        let data = committed.to_bytes()?;
         match store.put_if_not_exists(&key, data.clone(), namespace).await {
             Ok(()) => Ok(HistorySnapshotWrite::Stored),
             Err(ZeppelinError::NamespaceAlreadyExists { .. }) => {
@@ -2461,10 +3017,17 @@ impl NamedSnapshot {
             ));
         }
         let key = Self::key(namespace, name)?;
-        if Manifest::read_history(store, namespace, generation)
+        let retained = Manifest::read_history(store, namespace, generation)
             .await?
-            .is_none()
-        {
+            .is_some();
+        let current = if retained {
+            false
+        } else {
+            Manifest::read(store, namespace)
+                .await?
+                .is_some_and(|live| live.version() == generation)
+        };
+        if !retained && !current {
             return Err(ZeppelinError::Validation(format!(
                 "snapshot generation {generation} is not retained for namespace {namespace}"
             )));
@@ -2826,13 +3389,24 @@ pub struct ManifestVersion {
     e_tag: Option<String>,
     /// Whether the same authoritative read observed a governed-deletion fence.
     deletion_fenced: bool,
+    /// Exact live bytes paired with this ETag for predecessor-history repair.
+    history_snapshot: Option<Bytes>,
+    /// Whether this process observed matching history publication succeed.
+    history_confirmed: bool,
 }
 
 impl ManifestVersion {
-    pub(crate) fn for_manifest(e_tag: Option<String>, manifest: &Manifest) -> Self {
+    pub(crate) fn for_manifest(
+        e_tag: Option<String>,
+        manifest: &Manifest,
+        history_snapshot: Bytes,
+        history_confirmed: bool,
+    ) -> Self {
         Self {
             e_tag,
             deletion_fenced: manifest.deletion_fence.is_some(),
+            history_snapshot: Some(history_snapshot),
+            history_confirmed,
         }
     }
 
@@ -2840,7 +3414,23 @@ impl ManifestVersion {
         Self {
             e_tag: None,
             deletion_fenced: false,
+            history_snapshot: None,
+            history_confirmed: false,
         }
+    }
+
+    fn history_snapshot_bytes(&self, namespace: &str, version: u64) -> Result<Bytes> {
+        let data = self.history_snapshot.clone().ok_or_else(|| {
+            ZeppelinError::Index(format!(
+                "manifest predecessor history for namespace {namespace} requires bytes bound to the authoritative version"
+            ))
+        })?;
+        let history = ManifestHistoryRef {
+            version,
+            key: Manifest::history_key(namespace, version),
+        };
+        Manifest::decode_history_body(&data, namespace, &history)?;
+        Ok(data)
     }
 
     /// Borrow the backend ETag carried by this observation, when available.
@@ -2905,6 +3495,8 @@ mod tests {
             ManifestVersion {
                 e_tag: Some(String::new()),
                 deletion_fenced: false,
+                history_snapshot: None,
+                history_confirmed: false,
             },
         ] {
             let error = version
@@ -2913,6 +3505,7 @@ mod tests {
             assert!(matches!(error, ZeppelinError::Index(_)));
         }
     }
+
     use object_store::memory::InMemory;
     use std::sync::Arc;
 
@@ -2946,6 +3539,152 @@ mod tests {
             bootstrap: None,
             membership: None,
         }
+    }
+
+    #[test]
+    fn receipt_state_digest_binds_query_routing_topology() {
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(7))
+            .expect("receipt topology fixture must bind one incarnation");
+        manifest.fragments = vec![
+            FragmentRef {
+                id: Ulid::from(1_u128),
+                vector_count: 1,
+                delete_count: 0,
+                sequence_number: 0,
+                size_bytes: 10,
+            },
+            FragmentRef {
+                id: Ulid::from(2_u128),
+                vector_count: 1,
+                delete_count: 0,
+                sequence_number: 1,
+                size_bytes: 11,
+            },
+        ];
+        manifest.segments = vec![make_segment("segment-a"), make_segment("segment-b")];
+        manifest.active_segment = Some("segment-b".to_string());
+        manifest
+            .hierarchical_routing_nodes
+            .insert("segment-b".to_string(), vec!["node-0".to_string()]);
+        manifest.receipt_binding_version = Some(ReceiptBindingVersion::V1);
+        let baseline = manifest
+            .recompute_receipt_state_digest("topology")
+            .expect("baseline receipt topology must encode");
+
+        let mut reordered = manifest.clone();
+        reordered.fragments.swap(0, 1);
+        assert_ne!(
+            reordered
+                .recompute_receipt_state_digest("topology")
+                .unwrap(),
+            baseline
+        );
+
+        let mut rebound = manifest.clone();
+        rebound.active_segment = Some("segment-a".to_string());
+        assert_ne!(
+            rebound.recompute_receipt_state_digest("topology").unwrap(),
+            baseline
+        );
+
+        let mut descriptor_changed = manifest.clone();
+        descriptor_changed.segments[0].cluster_count += 1;
+        assert_ne!(
+            descriptor_changed
+                .recompute_receipt_state_digest("topology")
+                .unwrap(),
+            baseline
+        );
+
+        let mut routing_changed = manifest.clone();
+        routing_changed
+            .hierarchical_routing_nodes
+            .get_mut("segment-b")
+            .unwrap()
+            .push("node-1".to_string());
+        assert_ne!(
+            routing_changed
+                .recompute_receipt_state_digest("topology")
+                .unwrap(),
+            baseline
+        );
+
+        let mut separately_bound = manifest;
+        separately_bound.updated_at += chrono::Duration::seconds(1);
+        separately_bound.next_sequence += 1;
+        separately_bound.fencing_token += 1;
+        separately_bound.segments[0].membership = Some(MembershipRef {
+            key: "topology/segments/segment-a/membership.bin".to_string(),
+            size_bytes: 1,
+            entry_count: 1,
+        });
+        assert_eq!(
+            separately_bound
+                .recompute_receipt_state_digest("topology")
+                .unwrap(),
+            baseline,
+            "timestamps, replay allocator, fencing, and write-only membership use separate bindings"
+        );
+    }
+
+    #[test]
+    fn receipt_binding_v1_uses_an_explicit_stable_segment_projection() {
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(9))
+            .expect("stable projection fixture must bind one incarnation");
+        manifest.fragments = vec![FragmentRef {
+            id: Ulid::from(9_u128),
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 4,
+            size_bytes: 5,
+        }];
+        manifest.segments = vec![make_segment("segment-stable")];
+        let binding = serde_json::to_value(manifest.execution_binding_v1("stable"))
+            .expect("stable v1 execution projection must encode");
+        let fragment = binding["fragments"][0]
+            .as_object()
+            .expect("v1 fragment projection must be an object");
+        assert_eq!(
+            fragment.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "delete_count",
+                "id",
+                "sequence_number",
+                "size_bytes",
+                "vector_count",
+            ],
+            "v1 must not inherit future serde-default FragmentRef fields"
+        );
+        let segment = binding["segments"][0]
+            .as_object()
+            .expect("v1 segment projection must be an object");
+        let keys = segment.keys().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "bitmap_fields",
+                "bootstrap",
+                "cluster_count",
+                "cluster_objects",
+                "cluster_owners",
+                "fts_fields",
+                "has_global_fts",
+                "hierarchical",
+                "id",
+                "quantization",
+                "sketch",
+                "vector_count",
+            ],
+            "v1 must not inherit future serde-default SegmentRef fields"
+        );
+        assert!(
+            !segment.contains_key("membership"),
+            "write-path-only membership is deliberately outside query execution v1"
+        );
     }
 
     /// Sketch refs written before v4 decode with no invented rotation seed.
@@ -4269,5 +5008,35 @@ mod tests {
         assert_eq!(manifest.active_segment, None);
         assert_eq!(manifest.segments.len(), 1);
         assert_eq!(manifest.segments[0].id, "seg_old");
+    }
+
+    #[test]
+    fn routing_node_inventory_is_pruned_with_removed_and_capped_segments() {
+        let mut manifest = Manifest::new();
+        let mut first = make_segment("seg_first");
+        first.hierarchical = true;
+        let mut second = make_segment("seg_second");
+        second.hierarchical = true;
+        let mut third = make_segment("seg_third");
+        third.hierarchical = true;
+
+        manifest.add_segment_with_limits(first, 1_000, 1);
+        manifest.set_hierarchical_routing_nodes("seg_first", vec!["node-first".to_string()]);
+        manifest.add_segment_with_limits(second, 1_000, 1);
+        manifest.set_hierarchical_routing_nodes("seg_second", vec!["node-second".to_string()]);
+        manifest.add_segment_with_limits(third, 1_000, 1);
+        manifest.set_hierarchical_routing_nodes("seg_third", vec!["node-third".to_string()]);
+
+        assert!(manifest.hierarchical_routing_nodes("seg_first").is_empty());
+        assert_eq!(
+            manifest.hierarchical_routing_nodes("seg_second"),
+            ["node-second".to_string()]
+        );
+        manifest.remove_segment("seg_second");
+        assert!(manifest.hierarchical_routing_nodes("seg_second").is_empty());
+        assert_eq!(
+            manifest.hierarchical_routing_nodes("seg_third"),
+            ["node-third".to_string()]
+        );
     }
 }

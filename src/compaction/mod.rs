@@ -1162,16 +1162,56 @@ impl Compactor {
         let processed_deletes: HashSet<String> = HashSet::new();
 
         // 1. Read manifest to get fragment list (snapshot for segment building)
-        let manifest = Manifest::read(&self.store, namespace)
-            .await?
-            .ok_or_else(|| ZeppelinError::ManifestNotFound {
-                namespace: namespace.to_string(),
-            })?;
+        let (mut manifest, manifest_version) =
+            Manifest::read_versioned_required(&self.store, namespace)
+                .await
+                .map_err(|error| match error {
+                    ZeppelinError::NotFound { .. } => ZeppelinError::ManifestNotFound {
+                        namespace: namespace.to_string(),
+                    },
+                    error => error,
+                })?;
         let indexing_config = self.effective_indexing_config(namespace).await?;
         let rewrite_for_index_config = manifest_needs_index_rewrite(&manifest, &indexing_config);
 
         // 2. If no uncompacted fragments → no-op
         if manifest.uncompacted_fragments().is_empty() && !rewrite_for_index_config {
+            if self.store.object_signer_node().is_some()
+                && manifest.receipt_upgrade_needed(namespace)
+            {
+                check_lease_lost(namespace, lease_lost.as_deref())?;
+                if let Some(token) = fencing_token {
+                    if manifest.fencing_token > token {
+                        return Err(ZeppelinError::FencingTokenStale {
+                            namespace: namespace.to_string(),
+                            our_token: token,
+                            manifest_token: manifest.fencing_token,
+                        });
+                    }
+                    manifest.fencing_token = token;
+                }
+                manifest
+                    .hydrate_receipt_artifacts(&self.store, namespace)
+                    .await?;
+                // The legacy inventory may require arbitrarily many S3 GETs.
+                // Reuse the publication-delay hook here so takeover tests can
+                // hold this exact hydration-to-CAS window open.
+                if let Some(delay) = self.test_pre_cas_delay {
+                    warn!(
+                        delay_ms = delay.as_millis() as u64,
+                        "test hook: delaying legacy receipt upgrade before final CAS"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                // Hydration is not lease-protected work by itself. A heartbeat
+                // can observe takeover while those reads are in flight, so the
+                // stale writer must recheck immediately before its CAS.
+                check_lease_lost(namespace, lease_lost.as_deref())?;
+                manifest
+                    .write_conditional(&self.store, namespace, &manifest_version)
+                    .await?;
+                info!("upgraded legacy manifest receipt inventory");
+            }
             debug!("no uncompacted fragments, skipping");
             return Ok(CompactionResult {
                 segment_id: None,
@@ -1479,6 +1519,7 @@ impl Compactor {
             bootstrap_ref,
             membership_ref,
             cluster_objects,
+            routing_node_ids,
         ) = if let Some(old_membership) = bounded_incremental.as_ref() {
             match self
                 .incremental_build_bounded(
@@ -1535,6 +1576,7 @@ impl Compactor {
                         Some(bootstrap_ref),
                         Some(membership_ref),
                         cluster_objects,
+                        Vec::new(),
                     )
                 }
                 Err(error @ ZeppelinError::CoarseSketch(_)) => {
@@ -1575,6 +1617,7 @@ impl Compactor {
                         index.bootstrap_ref.clone(),
                         index.membership_ref.clone(),
                         index.cluster_objects.clone(),
+                        Vec::new(),
                     )
                 }
             }
@@ -1634,6 +1677,7 @@ impl Compactor {
                         Some(bootstrap_ref),
                         Some(membership_ref),
                         cluster_objects,
+                        Vec::new(),
                     )
                 }
                 Err(error @ ZeppelinError::CoarseSketch(_)) => {
@@ -1663,6 +1707,7 @@ impl Compactor {
                         index.bootstrap_ref.clone(),
                         index.membership_ref.clone(),
                         index.cluster_objects.clone(),
+                        Vec::new(),
                     )
                 }
             }
@@ -1685,6 +1730,7 @@ impl Compactor {
                 None,
                 None,
                 Vec::new(),
+                h_index.routing_node_ids().to_vec(),
             )
         } else {
             let index = build_ivf_flat(
@@ -1705,6 +1751,7 @@ impl Compactor {
                 index.bootstrap_ref.clone(),
                 index.membership_ref.clone(),
                 index.cluster_objects.clone(),
+                Vec::new(),
             )
         };
         let build_elapsed = build_start.elapsed();
@@ -1976,8 +2023,31 @@ impl Compactor {
                 self.config.max_old_segments,
                 manifest_stamp,
             );
+            if is_hierarchical {
+                fresh_manifest
+                    .set_hierarchical_routing_nodes(&segment_id, routing_node_ids.clone());
+            }
             fresh_manifest.remove_compacted_fragments_at(&compacted_ids, manifest_stamp);
             merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
+
+            // A legacy generation may retain old immutable segments alongside
+            // the new segment. A restarted process has no local hash knowledge
+            // for those retained objects, so complete the exact post-compaction
+            // inventory now. This makes one explicit compaction sufficient for
+            // upgrade instead of requiring a second no-WAL pass.
+            if self.store.object_signer_node().is_some()
+                && fresh_manifest.receipt_upgrade_needed(namespace)
+            {
+                fresh_manifest
+                    .hydrate_receipt_artifacts(&self.store, namespace)
+                    .await?;
+            }
+
+            // Manifest reads, inventory hydration, and candidate mutation can
+            // all outlive the lease observation at the top of this attempt.
+            // Recheck at the final publication boundary; ETag CAS remains the
+            // independent second layer against a concurrent manifest writer.
+            check_lease_lost(namespace, lease_lost.as_deref())?;
 
             // Layer 2: CAS.
             match fresh_manifest

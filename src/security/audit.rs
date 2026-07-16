@@ -7,6 +7,7 @@
 //! The durable sink serializes these values as one JSON object per line.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::num::NonZeroU64;
 
 use chrono::{DateTime, Utc};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
@@ -380,6 +381,11 @@ pub enum AuditParams {
         /// Stable active lock identities; never returned in the HTTP error.
         lock_ids: Vec<String>,
     },
+    /// One opted-in query issued a signed structural retrieval receipt.
+    ReceiptIssued {
+        /// Stable receipt identity; query text and policy predicate are excluded.
+        receipt_id: String,
+    },
     /// The process booted with explicit unsafe-open security mode.
     OpenUnsafeBoot,
     /// The process booted with a verified but expired license.
@@ -425,6 +431,33 @@ impl AuditParams {
     }
 }
 
+/// One-based position in a durable `(node, UTC day)` audit chain.
+///
+/// Request-path records carry no position until the single audit writer stages
+/// them. Persisted records always carry `Some`; recovery and verification reject
+/// a missing value explicitly instead of guessing a count from an unbounded
+/// historical scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AuditChainPosition(NonZeroU64);
+
+impl AuditChainPosition {
+    /// Construct a non-zero chain position.
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the one-based numeric position.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// Complete structured evidence for one security-relevant event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -458,8 +491,11 @@ pub struct AuditRecord {
     pub params: AuditParams,
     /// Process node identifier used to partition durable audit objects.
     pub node_id: String,
-    /// Reserved per-node hash-chain link; always absent until Phase 10.
+    /// Per-node/day hash-chain link assigned by the durable writer.
     pub prev_hash: Option<String>,
+    /// One-based per-node/day position assigned atomically with `prev_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_position: Option<AuditChainPosition>,
 }
 
 impl AuditRecord {
@@ -495,6 +531,7 @@ impl AuditRecord {
             params,
             node_id: node_id.into(),
             prev_hash: None,
+            chain_position: None,
         }
     }
 

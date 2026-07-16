@@ -91,10 +91,11 @@ use object_store::{
     Attribute, AttributeValue, Attributes, BackoffConfig, ClientOptions, GetOptions, ObjectStore,
     PutMode, PutOptions, PutPayload, RetryConfig, UpdateVersion,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::{debug, instrument};
 
@@ -103,6 +104,29 @@ use crate::error::{Result, ZeppelinError};
 
 /// Maximum number of exact keys accepted by one S3 DeleteObjects request.
 pub(crate) const DELETE_MANY_MAX_KEYS: usize = 1_000;
+
+/// Hard process bound for transient successful-PUT hashes awaiting publication.
+const CONTENT_HASH_CACHE_MAX_ENTRIES: usize = 65_536;
+
+#[derive(Debug, Default)]
+struct ContentHashCache {
+    entries: BTreeMap<String, [u8; 32]>,
+}
+
+impl ContentHashCache {
+    fn insert(&mut self, key: String, content_hash: [u8; 32]) {
+        if !self.entries.contains_key(&key) && self.entries.len() >= CONTENT_HASH_CACHE_MAX_ENTRIES
+        {
+            // The cache is only a zero-readback optimization. Evicting one
+            // unpublished hash cannot change authority: receipt hydration will
+            // hash the immutable body from S3 if that key is later committed.
+            if let Some(oldest_key) = self.entries.keys().next().cloned() {
+                self.entries.remove(&oldest_key);
+            }
+        }
+        self.entries.insert(key, content_hash);
+    }
+}
 
 /// Shared object-storage gateway used by every Zeppelin domain layer.
 ///
@@ -123,6 +147,17 @@ pub struct ZeppelinStore {
     inner: Arc<dyn ObjectStore>,
     /// Prefix-cleanup behavior selected when the backend is constructed.
     prefix_delete_mode: PrefixDeleteMode,
+    /// Transient hashes of exact bodies accepted by local immutable PUTs.
+    content_hashes: Arc<Mutex<ContentHashCache>>,
+    /// Node signer installed once by the security composition root.
+    object_signer: Arc<RwLock<Option<Arc<dyn ObjectSigner>>>>,
+}
+
+/// Process-local signer backed by a public key published under `_security/signers/`.
+pub(crate) trait ObjectSigner: Send + Sync {
+    fn signer_node(&self) -> &str;
+    fn sign(&self, message: &[u8]) -> Vec<u8>;
+    fn publication_store(&self) -> ZeppelinStore;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,6 +471,8 @@ impl ZeppelinStore {
         Ok(Self {
             inner: store,
             prefix_delete_mode,
+            content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
+            object_signer: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -575,6 +612,8 @@ impl ZeppelinStore {
         Self {
             inner: store,
             prefix_delete_mode: PrefixDeleteMode::LegacyPerKeyUnordered32,
+            content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
+            object_signer: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -589,7 +628,80 @@ impl ZeppelinStore {
         Self {
             inner: store,
             prefix_delete_mode: PrefixDeleteMode::NativeBatch,
+            content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
+            object_signer: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Install the one node signer shared by manifests, receipts, and audit anchors.
+    pub(crate) fn install_object_signer(&self, signer: Arc<dyn ObjectSigner>) -> Result<()> {
+        let mut current = self
+            .object_signer
+            .write()
+            .unwrap_or_else(|_| panic!("object signer lock poisoned"));
+        if let Some(existing) = current.as_ref() {
+            if existing.signer_node() != signer.signer_node() {
+                return Err(ZeppelinError::Config(
+                    "object signer was initialized with different node key material".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        *current = Some(signer);
+        Ok(())
+    }
+
+    /// Return the SHA-256 computed from an exact body accepted by a prior local PUT.
+    #[must_use]
+    pub(crate) fn known_content_hash(&self, key: &str) -> Option<[u8; 32]> {
+        self.content_hashes
+            .lock()
+            .unwrap_or_else(|_| panic!("content-hash cache lock poisoned"))
+            .entries
+            .get(key)
+            .copied()
+    }
+
+    /// Consume transient hashes after the manifest that owns them is published.
+    pub(crate) fn forget_known_content_hashes<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a String>,
+    ) {
+        let mut cache = self
+            .content_hashes
+            .lock()
+            .unwrap_or_else(|_| panic!("content-hash cache lock poisoned"));
+        for key in keys {
+            cache.entries.remove(key);
+        }
+    }
+
+    /// Sign one canonical domain payload with the published node key.
+    #[must_use]
+    pub(crate) fn object_signer_node(&self) -> Option<String> {
+        self.object_signer
+            .read()
+            .unwrap_or_else(|_| panic!("object signer lock poisoned"))
+            .as_ref()
+            .map(|signer| signer.signer_node().to_string())
+    }
+
+    /// Sign one canonical domain payload with the published node key.
+    pub(crate) fn sign_object(&self, message: &[u8]) -> Option<(String, Vec<u8>)> {
+        self.object_signer
+            .read()
+            .unwrap_or_else(|_| panic!("object signer lock poisoned"))
+            .as_ref()
+            .map(|signer| (signer.signer_node().to_string(), signer.sign(message)))
+    }
+
+    /// Return the exact S3 view holding the authoritative signer inventory.
+    pub(crate) fn signer_publication_store(&self) -> Option<Self> {
+        self.object_signer
+            .read()
+            .unwrap_or_else(|_| panic!("object signer lock poisoned"))
+            .as_ref()
+            .map(|signer| signer.publication_store())
     }
 
     /// Returns a shared handle to the raw backend for test instrumentation.
@@ -665,7 +777,13 @@ impl ZeppelinStore {
     /// later conditional manifest update references it.
     #[instrument(skip(self, data), fields(key = key, size = data.len()))]
     pub async fn put(&self, key: &str, data: Bytes) -> Result<Option<String>> {
-        self.put_result(key, data).await.map(|result| result.e_tag)
+        let content_hash = Sha256::digest(&data).into();
+        let result = self.put_result(key, data).await?;
+        self.content_hashes
+            .lock()
+            .unwrap_or_else(|_| panic!("content-hash cache lock poisoned"))
+            .insert(key.to_string(), content_hash);
+        Ok(result.e_tag)
     }
 
     /// Creates an immutable object and refuses to replace an existing key.
@@ -2334,5 +2452,24 @@ mod tests {
             store.get(key).await.unwrap(),
             Bytes::from_static(b"first\n")
         );
+    }
+
+    #[test]
+    fn transient_content_hash_cache_is_hard_bounded_and_consumable() {
+        let mut cache = ContentHashCache::default();
+        for index in 0..=CONTENT_HASH_CACHE_MAX_ENTRIES {
+            cache.insert(format!("artifact-{index:08}"), [index as u8; 32]);
+        }
+        assert_eq!(cache.entries.len(), CONTENT_HASH_CACHE_MAX_ENTRIES);
+
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        store
+            .content_hashes
+            .lock()
+            .unwrap()
+            .insert("published".to_string(), [7; 32]);
+        assert_eq!(store.known_content_hash("published"), Some([7; 32]));
+        store.forget_known_content_hashes([&"published".to_string()]);
+        assert_eq!(store.known_content_hash("published"), None);
     }
 }

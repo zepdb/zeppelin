@@ -67,11 +67,12 @@ async fn start_batch_server(mut config: Config, counted: bool) -> BatchApiServer
         config.cache.wal_fragment_cache_max_mb * 1024 * 1024,
     ));
     let (audit, audit_runtime, _audit_node_id) =
-        common::server::start_test_audit(&config, &store, Some(&harness.prefix));
+        common::server::start_test_audit(&config, &store, Some(&harness.prefix), &security).await;
 
     let app = build_router(AppState {
         store: store.clone(),
         clock: clock.clone(),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security),
         security,
         audit,
         credential_adapter,

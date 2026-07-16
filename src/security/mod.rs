@@ -6,6 +6,7 @@
 
 mod action;
 mod audit;
+mod audit_chain;
 mod audit_sink;
 mod authn;
 mod constraints;
@@ -15,18 +16,24 @@ mod delegation;
 mod entitlements;
 mod kernel;
 mod license;
+mod merkle;
 mod policy;
 mod policy_cache;
 mod policy_store;
 mod preservation;
 mod principal;
+mod receipt;
 mod resource;
 mod route_map;
 
 pub use action::Action;
 pub use audit::{
-    AuditOutcome, AuditParams, AuditRecord, AuditedVectorIds, IndexConfigValues,
-    PreservationBlockedSurface, ResourceRef, RuntimeConfigValues, MAX_AUDITED_VECTOR_IDS,
+    AuditChainPosition, AuditOutcome, AuditParams, AuditRecord, AuditedVectorIds,
+    IndexConfigValues, PreservationBlockedSurface, ResourceRef, RuntimeConfigValues,
+    MAX_AUDITED_VECTOR_IDS,
+};
+pub use audit_chain::{
+    verify_audit_day, AuditChainDivergence, AuditChainVerification, AuditDayAnchor,
 };
 pub use audit_sink::{AuditClient, AuditRuntime, AuditSinkError};
 pub use authn::{ApiKeyAdapter, AuthenticationOutcome, AuthnFailure, CredentialAdapter};
@@ -48,6 +55,7 @@ pub use license::{
     EntitlementResolver, FileLicenseResolver, LicenseError, LicenseLimits, LicensePayload,
     SignedLicense, LICENSE_PUBKEY,
 };
+pub use merkle::{MerklePath, MerkleSide, MerkleStep, MerkleTree};
 pub use policy::{
     canonical_policy_checksum, ApiKeyId, GrantActions, GrantDefinition, GrantScope, IssuedApiKey,
     KeyState, PolicyGrant, PolicyHead, PolicyKey, PolicyPrincipal, PolicySnapshot,
@@ -58,6 +66,12 @@ pub use preservation::{
     PreservationReasonKind, PreservationScope, PreservationService, PreservationState,
 };
 pub use principal::{AuthStrength, Principal, PrincipalId, PrincipalKind};
+pub(crate) use receipt::{issue_receipt, verify_receipt, ReceiptIssue};
+pub use receipt::{
+    PolicyFilterCheck, ReceiptDivergence, RetrievalReceipt, TouchedArtifact, TraversalMetric,
+    TraversalParams, TraversalSourceKind, TraversalSourceParams, VerificationMode,
+    VerifyReceiptRequest, VerifyReceiptResponse,
+};
 pub use resource::{NamespaceId, Resource, SnapshotName};
 pub use route_map::{classify_route, RouteAction, RouteClass, ROUTE_ACTIONS};
 
@@ -183,6 +197,12 @@ pub enum SecurityError {
     /// Authoritative preservation state is stale or unavailable.
     #[error("authoritative preservation state is unavailable")]
     PreservationStateUnavailable,
+    /// A receipt or Merkle proof violates its canonical schema or invariants.
+    #[error("invalid retrieval receipt: {0}")]
+    InvalidReceipt(String),
+    /// The selected namespace still references artifacts written before hashes existed.
+    #[error("retrieval receipts are unavailable until every reachable artifact is hashed")]
+    ReceiptsUnavailableUnhashed,
     /// A preservation request violates the strict public schema or bounds.
     #[error("invalid preservation request: {0}")]
     InvalidPreservationRequest(String),
@@ -307,12 +327,14 @@ impl SecurityError {
             Self::DelegationChainingForbidden | Self::DelegationPrincipalKindForbidden => 403,
             Self::ApprovalRequired => 403,
             Self::PreservationLocked => 409,
+            Self::ReceiptsUnavailableUnhashed => 409,
             Self::PreservationStateUnavailable => 503,
             Self::CursorPolicyStale => 400,
             Self::InvalidNamespaceId | Self::InvalidSnapshotName => 400,
             Self::InvalidPolicyRequest(_)
             | Self::DelegationScopeExceeded
-            | Self::InvalidPreservationRequest(_) => 400,
+            | Self::InvalidPreservationRequest(_)
+            | Self::InvalidReceipt(_) => 400,
             Self::PolicyConflict | Self::PolicyEntityAlreadyExists | Self::PreservationConflict => {
                 409
             }
@@ -361,8 +383,10 @@ impl SecurityError {
             Self::DelegationPrincipalKindForbidden => "delegation_parent_kind_forbidden",
             Self::ApprovalRequired => "approval_required",
             Self::PreservationLocked => "preservation_locked",
+            Self::ReceiptsUnavailableUnhashed => "receipts_unavailable_unhashed",
             Self::PreservationStateUnavailable => "preservation_state_unavailable",
             Self::InvalidPreservationRequest(_) => "invalid_preservation_request",
+            Self::InvalidReceipt(_) => "invalid_receipt",
             Self::PreservationLockNotFound => "preservation_lock_not_found",
             Self::PreservationConflict => "preservation_conflict",
             Self::PolicyConflict => "security_conflict",
@@ -429,10 +453,14 @@ impl SecurityError {
             Self::PreservationLocked => {
                 "operation is blocked by an active preservation lock".to_string()
             }
+            Self::ReceiptsUnavailableUnhashed => {
+                "retrieval receipts require a fully hashed namespace; compact and retry".to_string()
+            }
             Self::PreservationStateUnavailable => {
                 "preservation state is unavailable; destructive operation denied".to_string()
             }
             Self::InvalidPreservationRequest(_) => "invalid preservation request".to_string(),
+            Self::InvalidReceipt(_) => "invalid retrieval receipt".to_string(),
             Self::PreservationLockNotFound => "active preservation lock not found".to_string(),
             Self::PreservationConflict => {
                 "preservation state changed concurrently; retry".to_string()

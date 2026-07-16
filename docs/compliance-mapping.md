@@ -9,7 +9,7 @@ and applicable-law decisions.
 | Reference control | Zeppelin mechanism | Phase | Deployment responsibility |
 |---|---|---:|---|
 | SOC 2 CC6.1-CC6.3 logical access | Authenticated principals, S3-authoritative RBAC policy, fail-closed route authorization, constrained grants | 1, 3, 4 | Define roles, approve grants, rotate credentials, and review access |
-| SOC 2 CC7.2 monitoring | Structured authorization events and durable S3 audit batches | 2 | Retain, export, alert on, and review audit evidence |
+| SOC 2 CC7.2 monitoring | Structured authorization events, durable S3 audit batches, per-node/day hash chains, and signed terminal anchors | 2, 10 | Retain, export, verify, alert on, and review audit evidence |
 | HIPAA 45 CFR 164.312(a)(2)(i) unique user identification | Stable `PrincipalId` values and separately issued credentials | 3 | Issue individual identities; do not share human credentials |
 | HIPAA 45 CFR 164.312(b) audit controls | Redaction-safe durable audit records with decision and request identity | 2 | Configure retention and operational review appropriate to the environment |
 | GDPR Article 17 erasure requests | Governed namespace destruction record written before manifest removal | 8 | Validate the request, scope, lawful basis, downstream copies, and retention exceptions |
@@ -60,6 +60,21 @@ fails afterward, the same tombstone/evidence pair resumes without emitting a
 second destruction record. Every physical cleanup pass rechecks fresh active
 locks and retains the tombstone when a lock was activated mid-protocol.
 
-Phase 8 records are durable but not yet part of a signed audit hash chain.
-Phase 10 adds cryptographic chain and checkpoint strengthening; until then,
-bucket immutability, retention, and access policies remain deployment controls.
+Phase 10 links ordinary audit records within each node/day stream, reserves a
+create-only terminal slot against late writers, and signs a terminal anchor at
+day rollover or graceful shutdown. This detects mutation,
+removal, and reordering when the verifier retains a trusted checkpoint. Bucket
+immutability, retention, access policy, and external anchor custody remain
+deployment controls; a hash chain alone cannot prevent replacement of both the
+stream and its anchor by an actor with unrestricted bucket authority.
+
+Structural retrieval receipts additionally bind the exact canonical query and
+result digests, production traversal evidence for every ANN or BM25 source, the
+historical policy-owned filter hash, a manifest-rooted Merkle inventory, and a
+separately rooted receipt-signed inventory for lazy policy-scope ANN/BM25
+artifacts. A signed, persisted binding version selects the stable field-by-field
+query-routing projection, preventing schema evolution from reinterpreting old
+receipt digests. Privileged verification may resolve the named immutable policy
+generation; unprivileged verification explicitly reports that check as
+unchecked. These receipts provide tamper evidence, not a claim of deterministic
+replay, semantic completeness, or exact recall.

@@ -2,6 +2,7 @@ mod common;
 
 use std::collections::BTreeSet;
 
+use bytes::Bytes;
 use chrono::{Duration, Utc};
 use common::fault_injection::{
     assert_snapshot_on_copy, fail_copy_once_matching, fail_put_once_matching,
@@ -106,6 +107,15 @@ fn fragment(id: u128) -> FragmentRef {
     }
 }
 
+fn manifest_json_bytes_with_version(manifest: &Manifest, version: u64) -> Bytes {
+    let mut value = serde_json::to_value(manifest).expect("manifest must serialize");
+    value
+        .as_object_mut()
+        .expect("manifest must serialize as an object")
+        .insert("version".to_string(), json!(version));
+    Bytes::from(serde_json::to_vec(&value).expect("manifest json must serialize"))
+}
+
 async fn rewrite_history_updated_at(
     store: &ZeppelinStore,
     ns: &str,
@@ -157,7 +167,23 @@ async fn clone_as_of_ignores_history_generation_ahead_of_live_manifest() {
         Manifest::read_history(&harness.store, &source, orphan_generation)
             .await
             .unwrap()
-            .is_some()
+            .is_none(),
+        "a failed live PUT must not publish speculative future history"
+    );
+    harness
+        .store
+        .put(
+            &Manifest::history_key(&source, orphan_generation),
+            manifest_json_bytes_with_version(&pending, orphan_generation),
+        )
+        .await
+        .unwrap();
+    assert!(
+        Manifest::read_history(&harness.store, &source, orphan_generation)
+            .await
+            .unwrap()
+            .is_some(),
+        "the fixture must inject an unreferenced future history object"
     );
 
     let (status, body) = clone_namespace(
@@ -412,7 +438,7 @@ async fn clone_target_exists_returns_409() {
 }
 
 #[tokio::test]
-async fn clone_pruned_generation_returns_410_without_creating_target() {
+async fn clone_current_generation_uses_live_manifest_when_history_copy_is_missing() {
     let (base_url, harness, admin_bearer) = start_test_server().await;
     let client = crate::common::server::client_with_bearer(&admin_bearer);
     let source = create_ns_api_with(
@@ -433,17 +459,18 @@ async fn clone_pruned_generation_returns_410_without_creating_target() {
         .unwrap();
 
     let (status, body) = clone_namespace(&client, &base_url, &source, &target, "1").await;
-    assert_eq!(status, StatusCode::GONE);
-    assert_eq!(body["code"], "POINT_IN_TIME_NOT_RETAINED");
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["generation"], 1);
 
     let get_target = client
         .get(format!("{base_url}/v1/namespaces/{target}"))
         .send()
         .await
         .unwrap();
-    assert_eq!(get_target.status(), StatusCode::NOT_FOUND);
+    assert_eq!(get_target.status(), StatusCode::OK);
 
     cleanup_ns(&harness.store, &source).await;
+    cleanup_ns(&harness.store, &target).await;
     harness.cleanup().await;
 }
 

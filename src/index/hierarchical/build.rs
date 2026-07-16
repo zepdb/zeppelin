@@ -86,7 +86,7 @@
 //! independent object PUT futures concurrently without spawning detached tasks.
 
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use tracing::{debug, info};
 use ulid::Ulid;
 
@@ -243,6 +243,7 @@ pub async fn build_hierarchical(
     // Mutable counter for assigning global leaf cluster indexes.
     let mut next_cluster_idx: usize = 0;
     let mut num_levels: usize = 0;
+    let mut routing_node_ids = Vec::new();
 
     // Build the tree recursively.
     let root_result = build_subtree(
@@ -258,6 +259,7 @@ pub async fn build_hierarchical(
         &mut next_cluster_idx,
         1, // current depth
         &mut num_levels,
+        &mut routing_node_ids,
     )
     .await?;
 
@@ -277,10 +279,12 @@ pub async fn build_hierarchical(
             store
                 .put(&tree_node_key(namespace, segment_id, &root_id), node_data)
                 .await?;
+            routing_node_ids.push(root_id.clone());
             num_levels = 1;
             root_id
         }
     };
+    routing_node_ids.sort();
 
     info!(
         num_leaf_clusters = next_cluster_idx,
@@ -350,6 +354,7 @@ pub async fn build_hierarchical(
         namespace: namespace.to_string(),
         segment_id: segment_id.to_string(),
         bitmap_fields,
+        routing_node_ids,
     })
 }
 
@@ -426,6 +431,7 @@ async fn build_subtree(
     next_cluster_idx: &mut usize,
     depth: usize,
     max_depth: &mut usize,
+    routing_node_ids: &mut Vec<String>,
 ) -> Result<BuildResult> {
     // Base case: small enough to be a leaf cluster.
     if vectors.len() <= leaf_size {
@@ -513,6 +519,7 @@ async fn build_subtree(
             next_cluster_idx,
             depth + 1,
             max_depth,
+            routing_node_ids,
         ))
         .await?;
 
@@ -540,6 +547,7 @@ async fn build_subtree(
     store
         .put(&tree_node_key(namespace, segment_id, &node_id), node_data)
         .await?;
+    routing_node_ids.push(node_id.clone());
 
     if depth > *max_depth {
         *max_depth = depth;
@@ -908,5 +916,40 @@ pub async fn load_hierarchical(
         namespace: namespace.to_string(),
         segment_id: segment_id.to_string(),
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
+        routing_node_ids: Vec::new(),
     })
+}
+
+/// Discover every routing node reachable from a legacy tree root.
+///
+/// Current builders return this inventory directly. Explicit receipt upgrade
+/// uses this bounded traversal only for older manifests that predate the
+/// persisted inventory; query execution never substitutes prefix listing for
+/// manifest authority.
+pub(crate) async fn discover_hierarchical_routing_nodes(
+    store: &ZeppelinStore,
+    namespace: &str,
+    segment_id: &str,
+) -> Result<Vec<String>> {
+    let index = load_hierarchical(store, namespace, segment_id, None).await?;
+    let mut pending = VecDeque::from([index.meta.root_node_id.clone()]);
+    let mut seen = BTreeSet::new();
+
+    while let Some(node_id) = pending.pop_front() {
+        if !seen.insert(node_id.clone()) {
+            return Err(ZeppelinError::Index(format!(
+                "hierarchical routing graph repeats node {node_id}"
+            )));
+        }
+        let key = tree_node_key(namespace, segment_id, &node_id);
+        let bytes = store.get(&key).await?;
+        let node = super::deserialize_tree_node(&bytes)?;
+        for child in node.children {
+            if child.parse::<usize>().is_err() {
+                pending.push_back(child);
+            }
+        }
+    }
+
+    Ok(seen.into_iter().collect())
 }

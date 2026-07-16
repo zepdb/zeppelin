@@ -45,7 +45,7 @@ mode = "enforced"
 audit_s3 = true
 audit_flush_secs = 2
 cursor_hmac_key_hex = "<64 random hexadecimal characters>"
-# Required only when the Delegation entitlement is active.
+# Required when Delegation or durable AuditS3 is active.
 token_signing_key_path = "/run/secrets/zeppelin-delegation-ed25519-seed"
 delegated_token_max_ttl_secs = 3600
 ```
@@ -60,7 +60,8 @@ outstanding cursors. Keep audit persistence enabled. A successful
 may already have occurred. Reconcile authoritative S3 state and the audit prefix
 before retrying a destructive request.
 
-Delegation-enabled nodes fail boot unless `token_signing_key_path` names a
+Delegation-enabled nodes and nodes with durable `audit_s3` fail boot unless
+`token_signing_key_path` names a
 mode-`0600` file containing exactly 32 bytes encoded as 64 hexadecimal
 characters. Treat that seed as a signing secret: provision it from the
 deployment secret manager, do not place it in TOML or a container image, and
@@ -73,13 +74,48 @@ and rotation slots. Request-path verification uses only the disposable cache
 derived from those reservations. Retire an old signer before a deployment would
 exceed that budget; startup fails loudly when no reservation is available.
 Rotate by installing a new seed and restarting the node, which creates a new
-signer ID. Retain the prior public-key object only through the configured
-maximum token lifetime, then delete its reservation and public-key object from
-S3. Delete the reservation first when immediately revoking a compromised seed;
-outstanding tokens become unverifiable after the signer-refresh bound. Never
-retain retired signer objects or reservations indefinitely. KMS-backed signing
+signer ID. Retain the prior reservation and public-key object through the
+longest of the maximum token lifetime, promised receipt-verification window,
+and audit-evidence retention window. Deleting the reservation ends production
+trust immediately: outstanding tokens, receipts, manifest roots, and audit
+anchors signed by that key become unverifiable. Delete the reservation first
+when immediately revoking a compromised seed; outstanding credentials and
+evidence become unverifiable after the signer-refresh bound. The 32-slot limit
+therefore bounds active nodes, rotations, and promised verification windows;
+do not promise indefinite verification with this v1 registry. KMS-backed signing
 custody is a managed-service follow-up; this file contract does not silently
 fall back to an in-process generated key.
+
+Each durable audit `node-id` is a signer ID plus an immutable stream epoch. The
+S3-authoritative mutable head at
+`_security/audit-writers/<signer-id>.json` records the current epoch, its open
+UTC day, and a CAS-renewed writer lease. Startup claims that lease before making
+the writer available; a second live process with the same seed fails startup.
+After a crash, wait for lease expiry and restart with the same seed: Zeppelin
+resumes the head's last unanchored day and tail, including across midnight. A
+sealed head rotates to a fresh epoch on the next boot, so multiple clean starts
+on one day never try to replace an immutable anchor. Keep the node seed stable
+through crash recovery; before rotation, gracefully stop and anchor the old
+stream. A new seed intentionally creates a separate signer and stream lineage.
+Lease-renewal failures fence further writes. Transient object-store renewal
+errors are retried only while the locally held lease remains valid. Typed
+authority, serialization, or immutable-integrity failures from the periodic
+renewal timer terminate the actor immediately, even before local lease expiry;
+lease loss or expiry marks `/readyz` unavailable and increments the audit
+flush-failure metric.
+Writer-head CAS loss or reconciliation divergence during day rollover is an
+authority failure, not a transient storage error, and terminates the actor
+immediately. An occupied terminal slot that is neither the expected seal nor a
+valid chain continuation is likewise a fatal immutable-object conflict.
+Malformed or chain-divergent immutable bytes already present in the target UTC
+day are a fatal serialization/integrity failure; only genuine object-store
+transport failures remain retryable before the day-head CAS.
+If an expired writer's already-in-flight batch wins a deterministic chain slot
+after takeover, the successor detects the divergent immutable bytes, fails its
+durable request, terminates its audit actor, and marks `/readyz` unavailable.
+After that successor lease expires, restart with the same seed to adopt the S3
+winner; callers must retry every durable request that received the explicit
+failure.
 
 The first constrained upsert or scoped delete against a pre-Phase-4 namespace
 repairs its lifetime identity with conditional S3 writes. If `meta.json` lacks
@@ -112,6 +148,94 @@ and test that records can be enumerated and parsed. Do not base authorization or
 data recovery on process-local tracing or Prometheus counters; S3 remains the
 durable evidence store.
 
+Every record carries the canonical SHA-256 hash of the previous record and a
+one-based `chain_position` in that node's UTC-day stream. Before the writer is
+made available at boot, Zeppelin performs one LIST and (for a non-empty stream)
+one GET of only the last immutable batch; the final position and record hash are
+the complete recovery state. A tail produced before Phase 10 has no
+`chain_position` and is rejected explicitly. Preserve that legacy evidence and
+either start the upgraded binary with a fresh node stream or perform an audited
+offline migration; Zeppelin never guesses a count or falls back to replaying the
+whole day during startup.
+
+Graceful day rollover and process shutdown first reserve the create-only object
+slot for `chain_position + 1` with a terminal-seal document, then create a
+signed terminal anchor at `_audit/anchors/<yyyy-mm-dd>/<node-id>.json`. The seal
+uses the same deterministic key a late record batch would need, so an expired
+writer cannot land evidence after the anchor's committed tail. If Zeppelin
+crashes after the seal but before the anchor, the next lease holder validates
+the seal, completes the exact anchor, and rotates the stream before accepting
+requests. Run
+`zeppelin_audit_verify --config <path> --day <yyyy-mm-dd> --node <node-id>`
+against retained evidence; a missing anchor, removed or reordered record,
+mutated body, absent/invalid terminal seal, or invalid signature produces a
+nonzero exit and the first divergence. Abrupt termination before the seal can
+temporarily leave the current day without an anchor. After the S3 writer lease
+expires, restarting with the same node seed resumes that stream; its next
+graceful day rollover or shutdown seals and anchors it. A failed recovery or a
+seed rotation performed before recovery remains an evidence gap to investigate,
+not a condition the verifier silently accepts. Object Lock or an externally
+retained anchor is still required to make the chain resistant to an operator
+who can replace the entire stream and its checkpoint.
+
+Audit startup captures one application-clock instant for initial chain-day
+selection and boot-record timestamps. The signer-scoped S3 lease still expires
+against real wall time because it coordinates independent processes; changing
+an application evidence clock cannot extend writer authority.
+
+The licensed Receipts feature uses the same published node key to sign manifest
+roots and opt-in query receipts. A receipt is a structural proof of the exact
+authorized retrieval context: principal and delegation parent, policy version,
+mandatory-filter hashes, canonical query and result digests, per-source
+traversal controls and centroid/leaf indexes captured by the production search
+path, and the immutable artifact inventory committed by the named manifest.
+The manifest signature also binds a domain-separated execution-state digest:
+namespace/incarnation, ordered WAL fragments, complete segment descriptors,
+active-segment selection, and hierarchical routing-node inventory. Reusing the
+same artifact bytes under different query-routing topology therefore invalidates
+the signature and retained-history check. The manifest and receipt carry an
+explicit binding version. Version 1 is a field-by-field projection rather than
+a serialization of the evolvable manifest structs, so a future serde-default
+metadata field cannot silently change retained v1 receipt verification.
+Policy-scoped ANN and BM25 preserve their normal hidden-corpus-isolated execution
+path. When that path consumes lazily published `security_scopes` artifacts, the
+receipt carries a second exact Merkle inventory (`derived_root` and
+`derived_touched`) over those immutable bytes. The outer receipt signature binds
+both inventories, and `refetch=true` re-downloads both; derived artifacts never
+bypass scoped retrieval or masquerade as manifest-rooted objects. It does
+not prove semantic completeness, exact recall, or deterministic replay.
+`verification_mode` remains `structural` until a separate cross-architecture
+byte-identity gate permits stronger claims.
+
+`POST /v1/verify` requires the exact original JSON query as well as the result
+array. A verifier with current `SecurityAdminRead` authority resolves the exact
+immutable historical policy generation and checks the policy-owned filter hash.
+For delegated receipts it reports that only the historical policy component was
+checked because the token-narrowing predicate remains intentionally redacted.
+When the named manifest history generation is retained, verification rebuilds
+its canonical artifact inventory and Merkle root and requires its exact fencing
+token, signer, and signature to match the receipt. A decodable but internally
+inconsistent or re-fenced history body is `manifest_history` divergence, never
+a successfully checked generation. History objects are create-only and never
+overwritten. Writers retain the exact ETag-bound predecessor before live CAS
+and publish history for the winner only after CAS succeeds. A failed live PUT
+therefore creates no speculative future-generation history and a divergent
+retry can safely compete for that generation.
+
+Pre-Phase-10 manifests remain readable but cannot issue receipts while any
+reachable artifact lacks a recorded content hash. Explicitly compact the
+namespace, then retry. A fully compacted legacy namespace performs a one-time
+upgrade pass that reads and hashes its current immutable artifacts and CAS-publishes
+a new signed manifest generation; query execution never performs this work.
+Zeppelin returns
+`receipts_unavailable_unhashed` instead of backfilling through extra reads on a
+query. Old receipts remain structurally verifiable after history pruning from
+their signatures and Merkle paths only while the signing key's authoritative
+slot and public-key object are retained. Manifest-history checking is then
+reported as unavailable, and `refetch=true` can fail once garbage collection
+has removed the named artifacts. Retain signer trust, history, and immutable
+artifacts for at least the receipt-verification window your deployment promises.
+
 ## S3 public-access and transport controls
 
 - Enable all four S3 Block Public Access settings at the account and bucket
@@ -140,11 +264,14 @@ Run Zeppelin with a workload identity scoped to its bucket, rather than an
 account-wide S3 role. Namespace data prefixes need the read, write, list, and
 delete operations used by normal lifecycle, compaction, snapshots, and garbage
 collection. `_security/` needs read/write access and conditional object writes
-for authoritative security state. Narrow bucket-level `ListBucket` permission
-with prefix conditions.
+for authoritative security state. That includes conditional create/update on
+the mutable `_security/audit-writers/` heads; these lease/head documents are not
+audit evidence and must remain outside Object Lock retention. Narrow
+bucket-level `ListBucket` permission with prefix conditions.
 
 For `_audit/`, grant `PutObject` as the only write authority; Zeppelin sends
-create-only conditional requests and must never overwrite an existing key.
+create-only conditional requests for JSONL batches, terminal slots, and signed
+anchors and must never overwrite an existing key.
 Grant no delete authority when the deployment requires write-once evidence. The
 process may also need read/list access for collision verification, evidence
 checks, and operations; those permissions do not require `DeleteObject`. Deny

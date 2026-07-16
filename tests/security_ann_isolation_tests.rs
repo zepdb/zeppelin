@@ -18,6 +18,7 @@ mod common;
 
 use std::collections::BTreeSet;
 
+use bytes::Bytes;
 use common::counting::counting_store;
 use common::harness::TestHarness;
 use common::server::{
@@ -28,6 +29,9 @@ use common::server::{
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use zeppelin::config::Config;
+use zeppelin::index::hierarchical::{
+    deserialize_tree_node, tree_meta_key, tree_node_key, TreeMeta,
+};
 use zeppelin::wal::Manifest;
 
 const DIMENSIONS: usize = 2;
@@ -353,6 +357,158 @@ async fn scoped_ann_preserves_hierarchical_index_configuration() {
     );
 
     server.shutdown().await;
+    cleanup_ns(&harness.store, &namespace).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn scoped_hierarchical_traversal_rejects_paired_node_inventory_omission() {
+    let harness = TestHarness::new().await;
+    let mut config = isolation_config();
+    config.indexing.leaf_size = Some(1);
+    let server = start_test_server_full(
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+        config.clone(),
+        false,
+        None,
+    )
+    .await;
+    let admin_bearer = server.admin_bearer.clone();
+    let admin = client_with_bearer(&admin_bearer);
+    let namespace = create_namespace_with_hierarchical(&admin, &server.base_url, true).await;
+    let constrained = constrained_query_client(&admin, &server.base_url, &namespace).await;
+    let rows = (0..128)
+        .map(|row| {
+            json!({
+                "id": format!("acme-tree-{row:03}"),
+                "values": [row as f32, (row % 7) as f32],
+                "attributes": {"tenant_id": VISIBLE_TENANT}
+            })
+        })
+        .collect::<Vec<_>>();
+    upsert(&admin, &server.base_url, &namespace, &rows).await;
+    server
+        .compactor
+        .compact(&namespace)
+        .await
+        .expect("multi-level hierarchical fixture compaction must succeed");
+
+    let manifest = Manifest::read(&harness.store, &namespace)
+        .await
+        .expect("multi-level fixture manifest must read")
+        .expect("multi-level fixture manifest must exist");
+    let active_id = manifest.active_segment.as_deref().unwrap();
+    let scope_prefix = format!("{namespace}/segments/{active_id}/security_scopes/");
+    let _ = query(
+        &constrained,
+        &server.base_url,
+        &namespace,
+        ann_body(NLIST, None),
+    )
+    .await;
+    let descriptor_key = harness
+        .store
+        .list_prefix(&scope_prefix)
+        .await
+        .expect("scoped descriptor listing must succeed")
+        .into_iter()
+        .find(|key| key.contains("/ann/") && key.ends_with(".json"))
+        .expect("scoped hierarchical query must publish one descriptor");
+    let mut descriptor: Value = serde_json::from_slice(
+        &harness
+            .store
+            .get(&descriptor_key)
+            .await
+            .expect("scoped descriptor must read"),
+    )
+    .expect("scoped descriptor must decode");
+    let artifact_namespace = descriptor["artifact_namespace"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let artifact_id = descriptor["artifact_id"].as_str().unwrap().to_string();
+    let meta: TreeMeta = serde_json::from_slice(
+        &harness
+            .store
+            .get(&tree_meta_key(&artifact_namespace, &artifact_id))
+            .await
+            .expect("scoped tree metadata must read"),
+    )
+    .expect("scoped tree metadata must decode");
+    let root = deserialize_tree_node(
+        &harness
+            .store
+            .get(&tree_node_key(
+                &artifact_namespace,
+                &artifact_id,
+                &meta.root_node_id,
+            ))
+            .await
+            .expect("scoped root routing node must read"),
+    )
+    .expect("scoped root routing node must decode");
+    let omitted_node = root
+        .children
+        .iter()
+        .find(|child| child.parse::<usize>().is_err())
+        .expect("fixture must contain a root-reachable internal child")
+        .clone();
+    let omitted_key = tree_node_key(&artifact_namespace, &artifact_id, &omitted_node);
+    let routing_ids = descriptor["routing_node_ids"].as_array_mut().unwrap();
+    let original_len = routing_ids.len();
+    routing_ids.retain(|node| node.as_str() != Some(omitted_node.as_str()));
+    assert_eq!(routing_ids.len(), original_len - 1);
+    assert!(descriptor["artifact_hashes"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&omitted_key)
+        .is_some());
+
+    server.shutdown().await;
+    harness
+        .store
+        .put(
+            &descriptor_key,
+            Bytes::from(serde_json::to_vec(&descriptor).unwrap()),
+        )
+        .await
+        .expect("paired-omission descriptor tamper must succeed");
+    let (store, counter) = counting_store(&harness.store);
+    let restarted = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
+        store,
+        Some(harness.prefix.clone()),
+        config,
+        false,
+        None,
+        100 * 1024 * 1024,
+        &admin_bearer,
+    )
+    .await;
+    counter.reset();
+    let response = constrained
+        .post(format!(
+            "{}/v1/namespaces/{namespace}/query",
+            restarted.base_url
+        ))
+        .json(&ann_body(NLIST, None))
+        .send()
+        .await
+        .expect("paired-omission query must complete loudly");
+    let body = expect_status(
+        response,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "paired routing-node inventory omission",
+    )
+    .await;
+    assert_eq!(body["code"], "INTERNAL_ERROR", "{body}");
+    assert_eq!(
+        counter.gets_matching(&omitted_key),
+        0,
+        "traversal must reject the parent-discovered node before consuming omitted bytes"
+    );
+
+    restarted.shutdown().await;
     cleanup_ns(&harness.store, &namespace).await;
     harness.cleanup().await;
 }

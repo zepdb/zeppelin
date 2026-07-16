@@ -47,6 +47,8 @@ pub enum Action {
     VectorDelete,
     /// Execute a single or batched retrieval query.
     Query,
+    /// Verify a signed structural retrieval receipt.
+    ReceiptVerify,
     /// Inspect security principals, credentials, grants, and active policy metadata.
     SecurityAdminRead,
     /// Create or change security principals, credentials, grants, and policy.
@@ -66,7 +68,7 @@ pub enum Action {
 
 impl Action {
     /// Every action in declaration order for completeness tests and parsing.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::SystemRead,
         Self::MetricsRead,
         Self::RuntimeConfigRead,
@@ -86,6 +88,7 @@ impl Action {
         Self::VectorUpsert,
         Self::VectorDelete,
         Self::Query,
+        Self::ReceiptVerify,
         Self::SecurityAdminRead,
         Self::SecurityAdminWrite,
         Self::AttributeAdmin,
@@ -156,7 +159,7 @@ impl Action {
     /// This is deliberately distinct from persisted `GrantActions::All`: a
     /// bootstrap `actions = ["*"]` must retain policy-administration authority,
     /// while a policy wildcard must never acquire privileged security actions.
-    pub(crate) const BOOTSTRAP_ADMIN_V1: [Self; 21] = [
+    pub(crate) const BOOTSTRAP_ADMIN_V1: [Self; 22] = [
         Self::SystemRead,
         Self::MetricsRead,
         Self::RuntimeConfigRead,
@@ -176,6 +179,7 @@ impl Action {
         Self::VectorUpsert,
         Self::VectorDelete,
         Self::Query,
+        Self::ReceiptVerify,
         Self::SecurityAdminRead,
         Self::SecurityAdminWrite,
     ];
@@ -203,6 +207,7 @@ impl Action {
             Self::VectorUpsert => "VectorUpsert",
             Self::VectorDelete => "VectorDelete",
             Self::Query => "Query",
+            Self::ReceiptVerify => "ReceiptVerify",
             Self::SecurityAdminRead => "SecurityAdminRead",
             Self::SecurityAdminWrite => "SecurityAdminWrite",
             Self::AttributeAdmin => "AttributeAdmin",
@@ -268,7 +273,7 @@ mod tests {
     use super::Action;
 
     #[test]
-    fn action_inventory_has_exact_phase_eight_variants() {
+    fn action_inventory_has_exact_phase_ten_variants() {
         let names = Action::ALL.map(Action::as_str).to_vec();
 
         assert_eq!(
@@ -293,6 +298,7 @@ mod tests {
                 "VectorUpsert",
                 "VectorDelete",
                 "Query",
+                "ReceiptVerify",
                 "SecurityAdminRead",
                 "SecurityAdminWrite",
                 "AttributeAdmin",

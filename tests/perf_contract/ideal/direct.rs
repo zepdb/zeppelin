@@ -270,7 +270,7 @@ fn assert_group_commit_warm_shape(sample: &IdealSample) {
     assert_eq!(
         sample.physical_operations.len(),
         3,
-        "warm group commit must write one WAL, one history, and one live manifest: {:?}",
+        "warm group commit must write one WAL, one live manifest, and one history: {:?}",
         sample.physical_operations
     );
     let expected = [
@@ -282,15 +282,15 @@ fn assert_group_commit_warm_shape(sample: &IdealSample) {
         ),
         (
             "put",
-            PhysicalRequest::PutCreate,
-            SpanOutcome::Success,
-            "<generation>.msgpack",
-        ),
-        (
-            "put",
             PhysicalRequest::PutUpdate,
             SpanOutcome::Success,
             "manifest.json",
+        ),
+        (
+            "put",
+            PhysicalRequest::PutCreate,
+            SpanOutcome::Success,
+            "<generation>.msgpack",
         ),
     ];
     for (operation, (verb, request, outcome, key)) in
@@ -305,7 +305,7 @@ fn assert_group_commit_warm_shape(sample: &IdealSample) {
 
 fn assert_group_commit_conflict_shape(sample: &IdealSample) {
     assert_eq!(
-        sample.total_get_ops, 3,
+        sample.total_get_ops, 2,
         "a stale group-commit memo must validate history and rebuild from S3"
     );
     assert_eq!(sample.physical_operations.len(), 7);
@@ -315,6 +315,18 @@ fn assert_group_commit_conflict_shape(sample: &IdealSample) {
             PhysicalRequest::PutOverwrite,
             SpanOutcome::Success,
             "<wal>.wal",
+        ),
+        (
+            "put",
+            PhysicalRequest::PutUpdate,
+            SpanOutcome::Precondition,
+            "manifest.json",
+        ),
+        (
+            "get",
+            PhysicalRequest::GetFull,
+            SpanOutcome::Success,
+            "manifest.json",
         ),
         (
             "put",
@@ -329,14 +341,8 @@ fn assert_group_commit_conflict_shape(sample: &IdealSample) {
             "<generation>.msgpack",
         ),
         (
-            "get",
-            PhysicalRequest::GetFull,
-            SpanOutcome::Success,
-            "manifest.json",
-        ),
-        (
-            "get",
-            PhysicalRequest::GetFull,
+            "put",
+            PhysicalRequest::PutUpdate,
             SpanOutcome::Success,
             "manifest.json",
         ),
@@ -345,12 +351,6 @@ fn assert_group_commit_conflict_shape(sample: &IdealSample) {
             PhysicalRequest::PutCreate,
             SpanOutcome::Success,
             "<generation>.msgpack",
-        ),
-        (
-            "put",
-            PhysicalRequest::PutUpdate,
-            SpanOutcome::Success,
-            "manifest.json",
         ),
     ];
     for (operation, (verb, request, outcome, key)) in
@@ -365,10 +365,10 @@ fn assert_group_commit_conflict_shape(sample: &IdealSample) {
 
 fn assert_group_commit_missing_put_etag_shape(sample: &IdealSample) {
     assert_eq!(
-        sample.total_get_ops, 1,
-        "a missing prior CAS ETag must keep the next group commit cold"
+        sample.total_get_ops, 2,
+        "a missing prior CAS ETag must keep the next group commit cold and validate predecessor history"
     );
-    assert_eq!(sample.physical_operations.len(), 4);
+    assert_eq!(sample.physical_operations.len(), 6);
     let expected = [
         (
             "put",
@@ -385,6 +385,12 @@ fn assert_group_commit_missing_put_etag_shape(sample: &IdealSample) {
         (
             "put",
             PhysicalRequest::PutCreate,
+            SpanOutcome::Precondition,
+            "<generation>.msgpack",
+        ),
+        (
+            "get",
+            PhysicalRequest::GetFull,
             SpanOutcome::Success,
             "<generation>.msgpack",
         ),
@@ -393,6 +399,12 @@ fn assert_group_commit_missing_put_etag_shape(sample: &IdealSample) {
             PhysicalRequest::PutUpdate,
             SpanOutcome::Success,
             "manifest.json",
+        ),
+        (
+            "put",
+            PhysicalRequest::PutCreate,
+            SpanOutcome::Success,
+            "<generation>.msgpack",
         ),
     ];
     for (operation, (verb, request, outcome, key)) in

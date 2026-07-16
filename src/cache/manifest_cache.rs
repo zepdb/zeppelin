@@ -795,7 +795,7 @@ impl ManifestCache {
         match conditional {
             Some((data, next_etag)) => {
                 let manifest = Manifest::from_bytes_for_namespace(&data, namespace)?;
-                let version = ManifestVersion::for_manifest(next_etag, &manifest);
+                let version = ManifestVersion::for_manifest(next_etag, &manifest, data, false);
                 #[cfg(test)]
                 self.wait_before_remote_replacement().await;
                 let now = Instant::now();

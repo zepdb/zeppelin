@@ -1845,6 +1845,7 @@ pub(crate) fn validate_vector_id_for_request(
 /// function accepts owned [`VectorId`] values that can safely survive awaits.
 /// The returned `Vec<f32>` owns its buffer and is independent of temporary WAL
 /// or cluster decode values.
+#[allow(dead_code)]
 pub(crate) async fn fetch_vector_values_by_id(
     state: &AppState,
     ns: &str,
@@ -1852,12 +1853,29 @@ pub(crate) async fn fetch_vector_values_by_id(
     consistency: ConsistencyLevel,
     manifest: Manifest,
 ) -> Result<Option<Vec<f32>>, ZeppelinError> {
-    let values =
-        fetch_vector_values_by_ids(state, ns, &[id.to_string()], consistency, manifest).await?;
-    Ok(values.into_iter().next().map(|(_, values)| values))
+    Ok(
+        fetch_vector_values_by_id_with_trace(state, ns, id, consistency, manifest)
+            .await?
+            .0,
+    )
+}
+
+/// Resolves one vector while retaining the exact segment artifacts consumed.
+pub(crate) async fn fetch_vector_values_by_id_with_trace(
+    state: &AppState,
+    ns: &str,
+    id: &str,
+    consistency: ConsistencyLevel,
+    manifest: Manifest,
+) -> Result<(Option<Vec<f32>>, BTreeSet<String>), ZeppelinError> {
+    let (values, touched) =
+        fetch_vector_values_by_ids_with_trace(state, ns, &[id.to_string()], consistency, manifest)
+            .await?;
+    Ok((values.into_iter().next().map(|(_, values)| values), touched))
 }
 
 /// Resolves a stored query seed while enforcing the current mandatory filter.
+#[allow(dead_code)]
 pub(crate) async fn fetch_vector_values_by_id_scoped(
     state: &AppState,
     ns: &str,
@@ -1866,15 +1884,36 @@ pub(crate) async fn fetch_vector_values_by_id_scoped(
     manifest: Manifest,
     mandatory_filter: Option<&crate::types::Filter>,
 ) -> Result<Option<Vec<f32>>, ZeppelinError> {
+    Ok(fetch_vector_values_by_id_scoped_with_trace(
+        state,
+        ns,
+        id,
+        consistency,
+        manifest,
+        mandatory_filter,
+    )
+    .await?
+    .0)
+}
+
+/// Resolves a scoped query seed and returns its exact immutable segment reads.
+pub(crate) async fn fetch_vector_values_by_id_scoped_with_trace(
+    state: &AppState,
+    ns: &str,
+    id: &str,
+    consistency: ConsistencyLevel,
+    manifest: Manifest,
+    mandatory_filter: Option<&crate::types::Filter>,
+) -> Result<(Option<Vec<f32>>, BTreeSet<String>), ZeppelinError> {
     if mandatory_filter.is_none() {
-        return fetch_vector_values_by_id(state, ns, id, consistency, manifest).await;
+        return fetch_vector_values_by_id_with_trace(state, ns, id, consistency, manifest).await;
     }
     let projection = FetchProjection {
         include_vector: true,
         include_attributes: true,
         attribute_fields: None,
     };
-    let response = fetch_vectors_by_id(
+    let (response, touched) = fetch_vectors_by_id_with_trace(
         state,
         ns,
         &[id.to_string()],
@@ -1884,7 +1923,7 @@ pub(crate) async fn fetch_vector_values_by_id_scoped(
     )
     .await?;
     let Some(record) = response.results.into_iter().next() else {
-        return Ok(None);
+        return Ok((None, touched));
     };
     if let Some(filter) = mandatory_filter {
         let matches = record
@@ -1892,10 +1931,10 @@ pub(crate) async fn fetch_vector_values_by_id_scoped(
             .as_ref()
             .is_some_and(|attributes| evaluate_filter(filter, attributes));
         if !matches {
-            return Ok(None);
+            return Ok((None, touched));
         }
     }
-    Ok(record.values)
+    Ok((record.values, touched))
 }
 
 /// Resolves full vector coordinates for a set of IDs without HTTP response data.
@@ -1948,6 +1987,7 @@ pub(crate) async fn fetch_vector_values_by_id_scoped(
 /// directly into the result map. Java would normally retain references to the
 /// record's fields; C would need to detach pointers and prevent double free.
 /// Rust statically makes the consumed record unusable.
+#[allow(dead_code)]
 pub(crate) async fn fetch_vector_values_by_ids(
     state: &AppState,
     ns: &str,
@@ -1955,13 +1995,29 @@ pub(crate) async fn fetch_vector_values_by_ids(
     consistency: ConsistencyLevel,
     manifest: Manifest,
 ) -> Result<HashMap<VectorId, Vec<f32>>, ZeppelinError> {
+    Ok(
+        fetch_vector_values_by_ids_with_trace(state, ns, ids, consistency, manifest)
+            .await?
+            .0,
+    )
+}
+
+/// Resolves vectors while retaining the exact immutable segment reads.
+pub(crate) async fn fetch_vector_values_by_ids_with_trace(
+    state: &AppState,
+    ns: &str,
+    ids: &[VectorId],
+    consistency: ConsistencyLevel,
+    manifest: Manifest,
+) -> Result<(HashMap<VectorId, Vec<f32>>, BTreeSet<String>), ZeppelinError> {
     let projection = FetchProjection {
         include_vector: true,
         include_attributes: false,
         attribute_fields: None,
     };
-    let response = fetch_vectors_by_id(state, ns, ids, consistency, projection, manifest).await?;
-    response
+    let (response, touched) =
+        fetch_vectors_by_id_with_trace(state, ns, ids, consistency, projection, manifest).await?;
+    let values = response
         .results
         .into_iter()
         .map(|record| {
@@ -1973,7 +2029,8 @@ pub(crate) async fn fetch_vector_values_by_ids(
             })?;
             Ok((record.id, values))
         })
-        .collect()
+        .collect::<Result<HashMap<_, _>, ZeppelinError>>()?;
+    Ok((values, touched))
 }
 
 /// Merges WAL and active-segment state into ordered projected point results.
@@ -2051,6 +2108,22 @@ async fn fetch_vectors_by_id(
     projection: FetchProjection<'_>,
     manifest: Manifest,
 ) -> Result<GetVectorsResponse, ZeppelinError> {
+    Ok(
+        fetch_vectors_by_id_with_trace(state, ns, ids, consistency, projection, manifest)
+            .await?
+            .0,
+    )
+}
+
+/// Point lookup plus the exact manifest-owned segment artifacts it consumed.
+async fn fetch_vectors_by_id_with_trace(
+    state: &AppState,
+    ns: &str,
+    ids: &[VectorId],
+    consistency: ConsistencyLevel,
+    projection: FetchProjection<'_>,
+    manifest: Manifest,
+) -> Result<(GetVectorsResponse, BTreeSet<String>), ZeppelinError> {
     let active_ids: Vec<ulid::Ulid> = manifest
         .uncompacted_fragments()
         .iter()
@@ -2092,7 +2165,7 @@ async fn fetch_vectors_by_id(
         .filter(|id| !found.contains_key(id.as_str()) && !deleted.contains(id.as_str()))
         .cloned()
         .collect();
-    let segment_records =
+    let (segment_records, touched) =
         fetch_segment_records(state, ns, &manifest, &segment_ids, projection).await?;
     found.extend(segment_records);
 
@@ -2105,7 +2178,7 @@ async fn fetch_vectors_by_id(
         }
     }
 
-    Ok(GetVectorsResponse { results, missing })
+    Ok((GetVectorsResponse { results, missing }, touched))
 }
 
 /// Replays all visible uncompacted WAL operations into lookup overlay state.
@@ -2292,16 +2365,17 @@ async fn fetch_segment_records(
     manifest: &Manifest,
     ids: &[VectorId],
     projection: FetchProjection<'_>,
-) -> Result<HashMap<VectorId, GetVectorRecord>, ZeppelinError> {
+) -> Result<(HashMap<VectorId, GetVectorRecord>, BTreeSet<String>), ZeppelinError> {
     if ids.is_empty() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), BTreeSet::new()));
     }
     let Some(segment) = active_segment(manifest)? else {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), BTreeSet::new()));
     };
     let membership_ref = segment.membership.as_ref().ok_or_else(|| {
         ZeppelinError::Membership("fetch by id requires segment membership artifact".into())
     })?;
+    let mut touched = BTreeSet::from([membership_ref.key.clone()]);
     let membership_bytes = state.store.get(&membership_ref.key).await?;
     let membership = deserialize_membership(&membership_bytes)?;
     if membership.cluster_count as usize != segment.cluster_count {
@@ -2326,7 +2400,7 @@ async fn fetch_segment_records(
     }
 
     if !projection.include_vector && !projection.include_attributes {
-        return Ok(ids_by_cluster
+        let records = ids_by_cluster
             .into_values()
             .flatten()
             .map(|id| {
@@ -2339,13 +2413,20 @@ async fn fetch_segment_records(
                     },
                 )
             })
-            .collect());
+            .collect();
+        return Ok((records, touched));
     }
 
     let mut records = HashMap::new();
     for (cluster_idx, cluster_ids) in ids_by_cluster {
+        touched.insert(segment_cluster_artifact_key(ns, segment, cluster_idx));
         let cluster = fetch_segment_cluster(state, ns, segment, cluster_idx).await?;
         let attrs = if projection.include_attributes {
+            touched.insert(attrs_key(
+                ns,
+                segment.cluster_owner(cluster_idx),
+                cluster_idx,
+            ));
             Some(fetch_segment_attrs(state, ns, segment, cluster_idx, cluster.ids.len()).await?)
         } else {
             None
@@ -2377,7 +2458,7 @@ async fn fetch_segment_records(
         }
     }
 
-    Ok(records)
+    Ok((records, touched))
 }
 
 /// Resolves the manifest's active segment ID to its retained descriptor.
@@ -2484,14 +2565,19 @@ async fn fetch_segment_cluster(
     segment: &SegmentRef,
     cluster_idx: usize,
 ) -> Result<crate::index::ivf_flat::build::ClusterData, ZeppelinError> {
-    let key = segment
+    let key = segment_cluster_artifact_key(ns, segment, cluster_idx);
+    let data = state.store.get(&key).await?;
+    deserialize_cluster_from_object(&data, cluster_idx)
+}
+
+/// Resolves the sole manifest-selected object key containing one cluster.
+fn segment_cluster_artifact_key(ns: &str, segment: &SegmentRef, cluster_idx: usize) -> String {
+    segment
         .cluster_objects
         .iter()
         .find(|object| object.clusters.contains(&cluster_idx))
         .map(|object| object.key.clone())
-        .unwrap_or_else(|| cluster_key(ns, segment.cluster_owner(cluster_idx), cluster_idx));
-    let data = state.store.get(&key).await?;
-    deserialize_cluster_from_object(&data, cluster_idx)
+        .unwrap_or_else(|| cluster_key(ns, segment.cluster_owner(cluster_idx), cluster_idx))
 }
 
 /// Loads and validates the row-aligned attribute sidecar for one cluster.

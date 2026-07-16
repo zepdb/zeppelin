@@ -87,8 +87,8 @@
 //! [`QuantizationType`] forces each encoding to choose a scan path.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use tracing::debug;
 
@@ -116,6 +116,33 @@ use crate::index::bitmap::{bitmap_key, ClusterBitmapIndex};
 /// The outer vector position matches vector, ID, code, and bitmap row indexes;
 /// an inner `None` means that row has no attributes.
 type ClusterAttrs = Vec<Option<HashMap<String, AttributeValue>>>;
+
+#[derive(Clone, Default)]
+struct ArtifactReadTrace(Arc<Mutex<BTreeSet<String>>>);
+
+impl ArtifactReadTrace {
+    fn record(&self, key: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|_| panic!("hierarchical artifact-read trace lock poisoned"))
+            .insert(key.to_string());
+    }
+
+    fn snapshot(&self) -> BTreeSet<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|_| panic!("hierarchical artifact-read trace lock poisoned"))
+            .clone()
+    }
+}
+
+tokio::task_local! {
+    static ARTIFACT_READ_TRACE: ArtifactReadTrace;
+}
+
+fn record_artifact_read(key: &str) {
+    let _outside_receipt_traced_search = ARTIFACT_READ_TRACE.try_with(|trace| trace.record(key));
+}
 
 /// Owned internal result retained between leaf scanning and final projection.
 ///
@@ -208,11 +235,13 @@ async fn fetch_with_cache(
     store: &ZeppelinStore,
     key: &str,
 ) -> Result<bytes::Bytes> {
-    if let Some(c) = cache {
+    let bytes = if let Some(c) = cache {
         c.get_or_fetch(key, || store.get(key)).await
     } else {
         store.get(key).await
-    }
+    }?;
+    record_artifact_read(key);
+    Ok(bytes)
 }
 
 /// Searches one hierarchical segment with mixed-depth beam traversal.
@@ -302,6 +331,91 @@ pub async fn search_hierarchical(
     cache: Option<&Arc<DiskCache>>,
     include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
+    Ok(search_hierarchical_with_trace(
+        index,
+        query,
+        top_k,
+        beam_width,
+        filter,
+        distance_metric,
+        store,
+        oversample_factor,
+        cache,
+        include_attributes,
+    )
+    .await?
+    .results)
+}
+
+/// Results plus the exact leaf-cluster traversal selected by beam search.
+pub(crate) struct HierarchicalSearchOutput {
+    pub(crate) results: Vec<SearchResult>,
+    pub(crate) probed_centroids: Vec<usize>,
+    pub(crate) probed_routing_nodes: Vec<String>,
+    pub(crate) touched_artifacts: BTreeSet<String>,
+}
+
+fn require_inventoried_routing_node(
+    routing_inventory: Option<&HashSet<&str>>,
+    node_id: &str,
+) -> Result<()> {
+    if routing_inventory.is_some_and(|inventory| !inventory.contains(node_id)) {
+        return Err(ZeppelinError::Index(format!(
+            "hierarchical traversal discovered routing node {node_id} outside the authoritative inventory"
+        )));
+    }
+    Ok(())
+}
+
+/// Execute hierarchical search while retaining production leaf selections.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_hierarchical_with_trace(
+    index: &HierarchicalIndex,
+    query: &[f32],
+    top_k: usize,
+    beam_width: usize,
+    filter: Option<&Filter>,
+    distance_metric: DistanceMetric,
+    store: &ZeppelinStore,
+    oversample_factor: usize,
+    cache: Option<&Arc<DiskCache>>,
+    include_attributes: bool,
+) -> Result<HierarchicalSearchOutput> {
+    let trace = ArtifactReadTrace::default();
+    let mut output = ARTIFACT_READ_TRACE
+        .scope(
+            trace.clone(),
+            search_hierarchical_with_trace_inner(
+                index,
+                query,
+                top_k,
+                beam_width,
+                filter,
+                distance_metric,
+                store,
+                oversample_factor,
+                cache,
+                include_attributes,
+            ),
+        )
+        .await?;
+    output.touched_artifacts = trace.snapshot();
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search_hierarchical_with_trace_inner(
+    index: &HierarchicalIndex,
+    query: &[f32],
+    top_k: usize,
+    beam_width: usize,
+    filter: Option<&Filter>,
+    distance_metric: DistanceMetric,
+    store: &ZeppelinStore,
+    oversample_factor: usize,
+    cache: Option<&Arc<DiskCache>>,
+    include_attributes: bool,
+) -> Result<HierarchicalSearchOutput> {
     if query.len() != index.meta.dim {
         return Err(ZeppelinError::DimensionMismatch {
             expected: index.meta.dim,
@@ -310,15 +424,28 @@ pub async fn search_hierarchical(
     }
 
     if top_k == 0 {
-        return Ok(Vec::new());
+        return Ok(HierarchicalSearchOutput {
+            results: Vec::new(),
+            probed_centroids: Vec::new(),
+            probed_routing_nodes: Vec::new(),
+            touched_artifacts: BTreeSet::new(),
+        });
     }
 
     let ns = &index.namespace;
     let seg = &index.segment_id;
     let effective_beam = beam_width.max(1);
+    let routing_inventory = (!index.routing_node_ids.is_empty()).then(|| {
+        index
+            .routing_node_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>()
+    });
 
     // --- Navigate the tree with beam search ---
     // Start at root.
+    require_inventoried_routing_node(routing_inventory.as_ref(), &index.meta.root_node_id)?;
     let root_key = tree_node_key(ns, seg, &index.meta.root_node_id);
     let root_data = fetch_with_cache(cache, store, &root_key).await?;
     let root_node = deserialize_tree_node(&root_data)?;
@@ -362,7 +489,7 @@ pub async fn search_hierarchical(
             cache,
         )
         .await?;
-        return finalize_candidates(
+        let results = finalize_candidates(
             ns,
             seg,
             candidates,
@@ -372,7 +499,13 @@ pub async fn search_hierarchical(
             cache,
             include_attributes,
         )
-        .await;
+        .await?;
+        return Ok(HierarchicalSearchOutput {
+            results,
+            probed_centroids: cluster_indices,
+            probed_routing_nodes: vec![index.meta.root_node_id.clone()],
+            touched_artifacts: BTreeSet::new(),
+        });
     }
 
     // Partition root beam into leaf clusters vs internal nodes.
@@ -392,6 +525,8 @@ pub async fn search_hierarchical(
     }
 
     let mut accumulated: Vec<Candidate> = Vec::new();
+    let mut probed_centroids = root_leaf_clusters.clone();
+    let mut probed_routing_nodes = vec![index.meta.root_node_id.clone()];
 
     // Scan any leaf clusters found at root level.
     if !root_leaf_clusters.is_empty() {
@@ -417,7 +552,7 @@ pub async fn search_hierarchical(
 
     if current_ids.is_empty() {
         // All root beam entries were leaf clusters — return results.
-        return finalize_candidates(
+        let results = finalize_candidates(
             ns,
             seg,
             accumulated,
@@ -427,13 +562,23 @@ pub async fn search_hierarchical(
             cache,
             include_attributes,
         )
-        .await;
+        .await?;
+        return Ok(HierarchicalSearchOutput {
+            results,
+            probed_centroids,
+            probed_routing_nodes,
+            touched_artifacts: BTreeSet::new(),
+        });
     }
 
     loop {
         let mut next_beam: Vec<(String, f32, bool)> = Vec::new(); // (child_id, dist, is_leaf)
 
         // Parallel prefetch all beam nodes at this level.
+        for node_id in &current_ids {
+            require_inventoried_routing_node(routing_inventory.as_ref(), node_id)?;
+        }
+        probed_routing_nodes.extend(current_ids.iter().cloned());
         let node_results = futures::future::join_all(current_ids.iter().map(|node_id| {
             let nkey = tree_node_key(ns, seg, node_id);
             async move { (node_id.clone(), fetch_with_cache(cache, store, &nkey).await) }
@@ -480,6 +625,7 @@ pub async fn search_hierarchical(
 
         // Scan any leaf clusters found at this level.
         if !leaf_clusters.is_empty() {
+            probed_centroids.extend(leaf_clusters.iter().copied());
             let leaf_candidates = scan_leaf_clusters(
                 index,
                 &leaf_clusters,
@@ -497,7 +643,7 @@ pub async fn search_hierarchical(
 
         if internal_ids.is_empty() {
             // No more internal nodes to descend — return merged results.
-            return finalize_candidates(
+            let results = finalize_candidates(
                 ns,
                 seg,
                 accumulated,
@@ -507,7 +653,17 @@ pub async fn search_hierarchical(
                 cache,
                 include_attributes,
             )
-            .await;
+            .await?;
+            let mut seen = HashSet::new();
+            probed_centroids.retain(|cluster| seen.insert(*cluster));
+            let mut seen_nodes = HashSet::new();
+            probed_routing_nodes.retain(|node| seen_nodes.insert(node.clone()));
+            return Ok(HierarchicalSearchOutput {
+                results,
+                probed_centroids,
+                probed_routing_nodes,
+                touched_artifacts: BTreeSet::new(),
+            });
         }
 
         current_ids = internal_ids;

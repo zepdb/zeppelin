@@ -18,6 +18,7 @@ use tokio::task::AbortHandle;
 use ulid::Ulid;
 
 use crate::error::{Result as ZeppelinResult, ZeppelinError};
+use crate::storage::store::ObjectSigner;
 use crate::storage::{CreateOnlyOutcome, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::Filter;
@@ -323,6 +324,54 @@ pub(crate) struct DelegationAuthority {
     verifier: Arc<DelegationVerifier>,
 }
 
+/// Published node signer used by signed audit anchors when delegation itself
+/// is not licensed (for example enforced audit in `open_unsafe` mode).
+pub(crate) struct PublishedObjectSigner {
+    signing_key: SigningKey,
+    signer_node: String,
+    publication_store: ZeppelinStore,
+}
+
+impl PublishedObjectSigner {
+    pub(crate) async fn compose(
+        store: ZeppelinStore,
+        key_path: PathBuf,
+    ) -> ZeppelinResult<Arc<Self>> {
+        let signing_key = tokio::task::spawn_blocking(move || read_signing_key(&key_path))
+            .await
+            .map_err(|error| {
+                ZeppelinError::Config(format!(
+                    "audit signing-key task failed during boot: {error}"
+                ))
+            })??;
+        let signer_node = signer_node_id(&signing_key.verifying_key());
+        publish_signer(&store, &signer_node, &signing_key.verifying_key()).await?;
+        claim_signer_slot(&store, &signer_node).await?;
+        let signer = Arc::new(Self {
+            signing_key,
+            signer_node,
+            publication_store: store.clone(),
+        });
+        let object_signer: Arc<dyn ObjectSigner> = signer.clone();
+        store.install_object_signer(object_signer)?;
+        Ok(signer)
+    }
+}
+
+impl ObjectSigner for PublishedObjectSigner {
+    fn signer_node(&self) -> &str {
+        &self.signer_node
+    }
+
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        self.signing_key.sign(message).to_bytes().to_vec()
+    }
+
+    fn publication_store(&self) -> ZeppelinStore {
+        self.publication_store.clone()
+    }
+}
+
 impl DelegationAuthority {
     pub(crate) async fn compose(
         store: ZeppelinStore,
@@ -343,7 +392,7 @@ impl DelegationAuthority {
         publish_signer(&store, &signer_node, &signing_key.verifying_key()).await?;
         claim_signer_slot(&store, &signer_node).await?;
         let signers = load_signers(&store).await?;
-        let signer_cache = SignerCache::start(store, signers, refresh_interval)?;
+        let signer_cache = SignerCache::start(store.clone(), signers, refresh_interval)?;
         let monotonic_wall = MonotonicWall::new(clock.now());
         let verifier = Arc::new(DelegationVerifier {
             signer_cache,
@@ -352,12 +401,15 @@ impl DelegationAuthority {
             max_ttl: StdDuration::from_secs(max_ttl_secs),
             monotonic_wall: Mutex::new(monotonic_wall),
         });
-        Ok(Arc::new(Self {
+        let authority = Arc::new(Self {
             signing_key,
             signer_node,
             max_ttl: StdDuration::from_secs(max_ttl_secs),
             verifier,
-        }))
+        });
+        let shared_signer: Arc<dyn ObjectSigner> = authority.clone();
+        store.install_object_signer(shared_signer)?;
+        Ok(authority)
     }
 
     pub(crate) fn verifier(&self) -> Arc<DelegationVerifier> {
@@ -424,6 +476,20 @@ impl DelegationAuthority {
             token,
             expires_at,
         })
+    }
+}
+
+impl ObjectSigner for DelegationAuthority {
+    fn signer_node(&self) -> &str {
+        &self.signer_node
+    }
+
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        self.signing_key.sign(message).to_bytes().to_vec()
+    }
+
+    fn publication_store(&self) -> ZeppelinStore {
+        self.verifier.signer_cache.store.clone()
     }
 }
 
@@ -825,6 +891,28 @@ async fn load_signers(store: &ZeppelinStore) -> ZeppelinResult<HashMap<String, V
         return Err(SecurityError::InvalidDelegationSigner.into());
     }
     Ok(signers)
+}
+
+pub(crate) async fn verify_published_signature(
+    store: &ZeppelinStore,
+    node_id: &str,
+    message: &[u8],
+    signature: &[u8],
+) -> ZeppelinResult<bool> {
+    if !node_id.starts_with("zsn1_") {
+        return Ok(false);
+    }
+    let publication_store = store
+        .signer_publication_store()
+        .unwrap_or_else(|| store.clone());
+    let signers = load_signers_allow_empty(&publication_store).await?;
+    let Some(verifying_key) = signers.get(node_id) else {
+        return Ok(false);
+    };
+    let Ok(signature) = Signature::from_slice(signature) else {
+        return Ok(false);
+    };
+    Ok(verifying_key.verify(message, &signature).is_ok())
 }
 
 async fn load_signers_allow_empty(

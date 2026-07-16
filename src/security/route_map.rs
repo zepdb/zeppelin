@@ -217,6 +217,16 @@ pub static ROUTE_ACTIONS: &[RouteAction] = &[
         path: "/v1/namespaces/:ns/query/batch",
         class: RouteClass::Protected(Action::Query),
     },
+    RouteAction {
+        method: Method::POST,
+        path: "/v1/verify",
+        class: RouteClass::Protected(Action::ReceiptVerify),
+    },
+    RouteAction {
+        method: Method::GET,
+        path: "/v1/namespaces/:ns/manifest/root",
+        class: RouteClass::Protected(Action::NamespaceRead),
+    },
 ];
 
 /// Classify a registered route, applying the configurable readiness exception.
@@ -273,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn security_route_inventory_is_exact_through_phase_eight() {
+    fn security_route_inventory_is_exact_through_phase_ten() {
         let routes = ROUTE_ACTIONS
             .iter()
             .filter(|entry| entry.path.starts_with("/v1/security"))

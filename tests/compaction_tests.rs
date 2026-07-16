@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use common::counting::{counting_store, ArtifactClass};
+use common::fault_injection::fail_put_once_matching;
 use common::harness::TestHarness;
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 
@@ -240,6 +241,54 @@ async fn test_compact_single_fragment() {
     let seg_id = &manifest.segments[0].id;
     let centroids_key = format!("{ns}/segments/{seg_id}/centroids.bin");
     assert_s3_object_exists(store, &centroids_key).await;
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn test_failed_live_manifest_put_does_not_wedge_a_divergent_compaction_retry() {
+    let harness = TestHarness::new().await;
+    let ns = harness.key("compact-divergent-history-retry");
+    Manifest::new().write(&harness.store, &ns).await.unwrap();
+    common::write_active_namespace_metadata(&harness.store, &ns, 16, DistanceMetric::Euclidean)
+        .await;
+    WalWriter::new(harness.store.clone())
+        .append(&ns, random_vectors(50, 16), vec![])
+        .await
+        .unwrap();
+
+    let base = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    let candidate_version = base.version() + 1;
+    let (faulted_store, failure) = fail_put_once_matching(&harness.store, Manifest::s3_key(&ns));
+    let first = test_compactor(&faulted_store).compact(&ns).await;
+    assert!(first.is_err(), "the injected live PUT must fail loudly");
+    assert_eq!(failure.failures_injected(), 1);
+
+    let after_failure = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(after_failure.to_bytes().unwrap(), base.to_bytes().unwrap());
+    assert!(after_failure.active_segment.is_none());
+    assert_eq!(after_failure.uncompacted_fragments().len(), 1);
+    let retained_base = Manifest::read_history(&harness.store, &ns, base.version())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained_base.to_bytes().unwrap(), base.to_bytes().unwrap());
+    assert!(!harness
+        .store
+        .exists(&Manifest::history_key(&ns, candidate_version))
+        .await
+        .unwrap());
+
+    let result = test_compactor(&faulted_store)
+        .compact(&ns)
+        .await
+        .expect("a rebuilt compaction candidate must publish at the unreserved generation");
+    assert_eq!(result.vectors_compacted, 50);
+    assert_eq!(result.fragments_removed, 1);
+    let committed = Manifest::read(&harness.store, &ns).await.unwrap().unwrap();
+    assert_eq!(committed.version(), candidate_version);
+    assert!(committed.active_segment.is_some());
+    assert!(committed.uncompacted_fragments().is_empty());
 
     harness.cleanup().await;
 }
@@ -2190,7 +2239,12 @@ async fn test_background_compaction_accepts_missing_manifest_while_deleting() {
 #[tokio::test]
 async fn test_background_compaction_discovery_is_delimited_and_prefix_scoped() {
     let harness = TestHarness::new().await;
-    let (store, counter) = counting_store(&harness.store);
+    let isolated_store =
+        zeppelin::storage::ZeppelinStore::new(Arc::new(object_store::prefix::PrefixStore::new(
+            harness.store.inner(),
+            object_store::path::Path::from(harness.prefix.clone()),
+        )));
+    let (store, counter) = counting_store(&isolated_store);
     let namespace_manager = Arc::new(zeppelin::namespace::NamespaceManager::new(store.clone()));
     let ns = format!("{}-registered-loop", harness.prefix);
     let outside_ns = format!("outside-{}-registered-loop", uuid::Uuid::new_v4());

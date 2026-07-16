@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use axum::Router;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use dashmap::DashMap;
 use object_store::path::Path;
 use object_store::prefix::PrefixStore;
@@ -159,31 +159,50 @@ pub fn scoped_test_security_store(store: &ZeppelinStore, scope: &str) -> Zeppeli
     )))
 }
 
-pub fn start_test_audit(
+pub async fn start_test_audit(
     config: &Config,
     store: &ZeppelinStore,
     cleanup_scope: Option<&str>,
+    security: &SecurityKernel,
 ) -> (AuditClient, AuditRuntime, String) {
     let entitlements = test_entitlements(Feature::ALL);
-    start_test_audit_with_entitlements(config, store, cleanup_scope, &entitlements)
+    start_test_audit_with_entitlements(
+        config,
+        store,
+        cleanup_scope,
+        &entitlements,
+        security,
+        Utc::now(),
+    )
+    .await
 }
 
-fn start_test_audit_with_entitlements(
+async fn start_test_audit_with_entitlements(
     config: &Config,
     store: &ZeppelinStore,
     cleanup_scope: Option<&str>,
     entitlements: &Entitlements,
+    security: &SecurityKernel,
+    audit_now: DateTime<Utc>,
 ) -> (AuditClient, AuditRuntime, String) {
     let node_id = match cleanup_scope {
         Some(scope) => format!("test-node-{scope}-{}", uuid::Uuid::new_v4()),
         None => format!("test-node-{}", uuid::Uuid::new_v4()),
     };
-    let (client, runtime) = if config.security.audit_s3 && entitlements.has(Feature::AuditS3) {
-        AuditRuntime::start(
+    let durable_audit_enabled = config.security.audit_s3 && entitlements.has(Feature::AuditS3);
+    if durable_audit_enabled || entitlements.has(Feature::Receipts) {
+        security
+            .install_object_signer(store)
+            .expect("test signing capability must be shared with the application store");
+    }
+    let (client, runtime) = if durable_audit_enabled {
+        AuditRuntime::start_at(
             store.clone(),
             node_id.clone(),
             Duration::from_secs(config.security.audit_flush_secs),
+            audit_now,
         )
+        .await
         .expect("test audit runtime must start")
     } else {
         AuditRuntime::tracing_only(node_id.clone())
@@ -191,10 +210,7 @@ fn start_test_audit_with_entitlements(
     };
     if config.security.mode == SecurityMode::OpenUnsafe {
         client
-            .submit_buffered(AuditRecord::open_unsafe_boot(
-                Clock::system().now(),
-                client.node_id(),
-            ))
+            .submit_buffered(AuditRecord::open_unsafe_boot(audit_now, client.node_id()))
             .expect("open_unsafe test boot audit must be accepted");
     }
     (client, runtime, node_id)
@@ -404,7 +420,8 @@ async fn test_security_runtime_with_admin_bearer(
     entitlements: Arc<Entitlements>,
 ) -> (Arc<SecurityKernel>, Arc<ApiKeyAdapter>, String) {
     let admin_bearer = inject_test_admin(config, existing_admin_bearer);
-    let delegation_key = if entitlements.has(Feature::Delegation)
+    let delegation_key = if (entitlements.has(Feature::Delegation)
+        || entitlements.has(Feature::AuditS3))
         && config.security.token_signing_key_path.is_empty()
     {
         let file = tempfile::NamedTempFile::new().expect("delegation test key file");
@@ -621,6 +638,9 @@ async fn start_test_server_with_config_inner(
         Arc::clone(&entitlements),
     )
     .await;
+    security
+        .install_object_signer(&harness.store)
+        .expect("receipt signer must be shared with the application store");
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -640,10 +660,14 @@ async fn start_test_server_with_config_inner(
         &harness.store,
         Some(&harness.prefix),
         &entitlements,
-    );
+        &security,
+        clock.now(),
+    )
+    .await;
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -687,12 +711,15 @@ pub async fn start_test_server_on_store(
     let mut config = Config::default();
     configure_test_server_limits(&mut config);
     let clock = Clock::system();
-    let security_store = namespace_name_prefix.as_deref().map_or_else(
-        || store.clone(),
-        |scope| scoped_test_security_store(&store, scope),
-    );
+    // Custom application-store wrappers still share the harness's underlying
+    // backend. Keep policy authority isolated by the harness's random prefix
+    // independently of whether the application enforces a namespace prefix.
+    let security_store = scoped_test_security_store(&store, &harness.prefix);
     let (security, credential_adapter, admin_bearer) =
         test_security_runtime(&security_store, &mut config, &clock).await;
+    security
+        .install_object_signer(&store)
+        .expect("receipt signer must be shared with the application store");
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -708,10 +735,11 @@ pub async fn start_test_server_on_store(
     let lease_manager = lease_manager(&config, &store, &clock);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let (audit, audit_runtime, _audit_node_id) =
-        start_test_audit(&config, &store, Some(&harness.prefix));
+        start_test_audit(&config, &store, Some(&harness.prefix), &security).await;
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -762,6 +790,9 @@ pub async fn start_test_server_with_compactor(
     let security_store = scoped_test_security_store(&harness.store, &harness.prefix);
     let (security, credential_adapter, admin_bearer) =
         test_security_runtime(&security_store, &mut config, &clock).await;
+    security
+        .install_object_signer(&harness.store)
+        .expect("receipt signer must be shared with the application store");
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -779,10 +810,11 @@ pub async fn start_test_server_with_compactor(
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let (audit, audit_runtime, _audit_node_id) =
-        start_test_audit(&config, &harness.store, Some(&harness.prefix));
+        start_test_audit(&config, &harness.store, Some(&harness.prefix), &security).await;
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security),
         security: Arc::clone(&security),
         audit,
         credential_adapter,
@@ -834,6 +866,9 @@ pub async fn start_test_server_with_compaction(
     let security_store = scoped_test_security_store(&harness.store, &harness.prefix);
     let (security, credential_adapter, admin_bearer) =
         test_security_runtime(&security_store, &mut config, &clock).await;
+    security
+        .install_object_signer(&harness.store)
+        .expect("receipt signer must be shared with the application store");
 
     let cache_dir = tempfile::TempDir::new().unwrap();
     let cache = Arc::new(
@@ -880,10 +915,11 @@ pub async fn start_test_server_with_compaction(
     let hydrator = maybe_hydrator(&config, &harness.store, &cache);
     let trusted_proxies = Arc::from(parse_trusted_proxies(&config.server.trusted_proxies).unwrap());
     let (audit, audit_runtime, _audit_node_id) =
-        start_test_audit(&config, &harness.store, Some(&harness.prefix));
+        start_test_audit(&config, &harness.store, Some(&harness.prefix), &security).await;
     let state = AppState {
         store: harness.store.clone(),
         clock: clock.clone(),
+        receipts: zeppelin::server::ReceiptCapability::compose(&security),
         security,
         audit,
         credential_adapter,
@@ -994,8 +1030,9 @@ pub async fn create_ns_api_with(
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 201, "create namespace failed");
+    let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 201, "create namespace failed: {body}");
     body["name"].as_str().unwrap().to_string()
 }
 
@@ -1328,6 +1365,9 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         Arc::clone(&entitlements),
     )
     .await;
+    security
+        .install_object_signer(&store)
+        .expect("receipt signer must be shared with the application store");
     let credential_adapter: Arc<dyn CredentialAdapter> =
         credential_adapter_override.unwrap_or(credential_adapter);
 
@@ -1392,12 +1432,16 @@ async fn start_test_server_full_with_disk_cache_max_bytes_inner(
         &store,
         namespace_name_prefix.as_deref(),
         &entitlements,
-    );
+        &security,
+        clock.now(),
+    )
+    .await;
     let workload_credentials = WorkloadCredentialRegistry::with_admin(&admin_bearer);
     let state_security = Arc::clone(&security);
     let state = AppState {
         store: store.clone(),
         clock: clock.clone(),
+        receipts: zeppelin::server::ReceiptCapability::compose(&state_security),
         security: state_security,
         audit: audit.clone(),
         credential_adapter,

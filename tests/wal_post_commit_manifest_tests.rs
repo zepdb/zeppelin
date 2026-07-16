@@ -1,5 +1,6 @@
 mod common;
 
+use chrono::Utc;
 use common::counting::counting_store;
 use common::fault_injection::{fail_after_put_once_matching, fail_put_once_matching};
 use common::harness::TestHarness;
@@ -90,7 +91,7 @@ async fn terminal_manifest_write_error_clears_group_commit_memo() {
         .unwrap();
 
     let failed_history = Manifest::history_key(&namespace, 3);
-    let (faulted_store, failure) = fail_put_once_matching(&harness.store, failed_history);
+    let (faulted_store, failure) = fail_put_once_matching(&harness.store, &failed_history);
     let (faulted_store, counter) = counting_store(&faulted_store);
     let writer = WalWriter::new(faulted_store);
 
@@ -106,6 +107,21 @@ async fn terminal_manifest_write_error_clears_group_commit_memo() {
         )
         .await
         .unwrap();
+
+    // Advance authority outside the writer and remove that winner's history.
+    // The writer's memo first conflicts, then its cold retry must repair the
+    // exact predecessor before another CAS. Failing that repair is terminal
+    // and must leave the group-commit memo empty.
+    let (mut concurrent, version) = Manifest::read_versioned(&harness.store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    concurrent.updated_at = Utc::now();
+    concurrent
+        .write_conditional(&harness.store, &namespace, &version)
+        .await
+        .unwrap();
+    harness.store.delete(&failed_history).await.unwrap();
 
     let failed = writer
         .append(
@@ -145,6 +161,80 @@ async fn terminal_manifest_write_error_clears_group_commit_memo() {
         .unwrap()
         .unwrap();
     assert_eq!(live.fragments.len(), 2);
+
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_live_manifest_put_does_not_wedge_a_divergent_wal_retry() {
+    let harness = TestHarness::new().await;
+    let namespace = harness.key("wal-divergent-history-retry");
+    Manifest::new()
+        .write(&harness.store, &namespace)
+        .await
+        .unwrap();
+
+    let (faulted_store, failure) =
+        fail_put_once_matching(&harness.store, Manifest::s3_key(&namespace));
+    let writer = WalWriter::new(faulted_store);
+    let first = writer
+        .append(
+            &namespace,
+            vec![VectorEntry {
+                id: "failed-candidate".to_string(),
+                values: vec![1.0, 0.0, 0.0, 0.0],
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await;
+    assert!(first.is_err(), "the injected live PUT must fail loudly");
+    assert_eq!(failure.failures_injected(), 1);
+
+    let live_one = Manifest::read(&harness.store, &namespace)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(live_one.version(), 1);
+    assert!(live_one.fragments.is_empty());
+    let history_one = Manifest::read_history(&harness.store, &namespace, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        history_one.to_bytes().unwrap(),
+        live_one.to_bytes().unwrap()
+    );
+    assert!(!harness
+        .store
+        .exists(&Manifest::history_key(&namespace, 2))
+        .await
+        .unwrap());
+
+    let (fragment, live_two) = writer
+        .append(
+            &namespace,
+            vec![VectorEntry {
+                id: "divergent-retry".to_string(),
+                values: vec![0.0, 1.0, 0.0, 0.0],
+                attributes: None,
+            }],
+            vec![],
+        )
+        .await
+        .expect("a rebuilt WAL candidate must publish at the unreserved generation");
+    assert_eq!(live_two.version(), 2);
+    assert_eq!(live_two.fragments.len(), 1);
+    assert_eq!(live_two.fragments[0].id, fragment.id);
+    assert_eq!(
+        WalReader::new(harness.store.clone())
+            .read_uncompacted_fragments(&namespace)
+            .await
+            .unwrap()[0]
+            .vectors[0]
+            .id,
+        "divergent-retry"
+    );
 
     harness.cleanup().await;
 }
