@@ -187,7 +187,7 @@ impl SecurityKernel {
                     .to_string(),
             ));
         }
-        if !entitlements.has(super::Feature::Rbac) {
+        let (kernel, adapter) = if !entitlements.has(super::Feature::Rbac) {
             let now = clock.now();
             if config.mode == SecurityMode::Enforced
                 && !config
@@ -200,7 +200,7 @@ impl SecurityKernel {
             let audit_signer = if entitlements.has(super::Feature::AuditS3) {
                 Some(
                     PublishedObjectSigner::compose(
-                        store,
+                        store.signer_detached_clone(),
                         PathBuf::from(&config.token_signing_key_path),
                     )
                     .await?,
@@ -210,12 +210,20 @@ impl SecurityKernel {
             };
             let mut kernel = Self::from_config_with_entitlements(config, entitlements)?;
             kernel.audit_signer = audit_signer;
-            return Ok((
+            (
                 Arc::new(kernel),
                 Arc::new(ApiKeyAdapter::from_config(config)?),
-            ));
-        }
-        Self::from_store(store, config, clock, entitlements).await
+            )
+        } else {
+            Self::from_store(store.clone(), config, clock, entitlements).await?
+        };
+
+        // Composition historically leaves the caller's application store ready
+        // to sign manifests and audit evidence. Keep that public contract at
+        // this root while each long-lived authority keeps only its detached
+        // store view, preventing the installed signer from closing a cycle.
+        kernel.install_object_signer(&store)?;
+        Ok((kernel, adapter))
     }
 
     /// Build authentication and authorization over one shared policy cache.
@@ -225,11 +233,16 @@ impl SecurityKernel {
         clock: Clock,
         entitlements: Arc<Entitlements>,
     ) -> ZeppelinResult<(Arc<Self>, Arc<ApiKeyAdapter>)> {
+        // Authority-side caches retain their store view for background refresh.
+        // Keep that view detached from the application signer slot: the signer
+        // itself can retain those caches, so sharing the slot would create a
+        // cycle that outlives a server shutdown.
+        let authority_store = store.signer_detached_clone();
         if config.mode == SecurityMode::OpenUnsafe {
             let audit_signer = if entitlements.has(super::Feature::AuditS3) {
                 Some(
                     PublishedObjectSigner::compose(
-                        store,
+                        authority_store,
                         PathBuf::from(&config.token_signing_key_path),
                     )
                     .await?,
@@ -246,7 +259,7 @@ impl SecurityKernel {
             ));
         }
 
-        let policy_store = PolicyStore::new(store.clone(), Arc::clone(&entitlements));
+        let policy_store = PolicyStore::new(authority_store.clone(), Arc::clone(&entitlements));
         let cursor_binding_key =
             super::CursorBindingKey::from_config_hex(config.cursor_hmac_key_hex())?;
         let loaded = policy_store.load_or_bootstrap(config, clock.now()).await?;
@@ -259,7 +272,7 @@ impl SecurityKernel {
         let delegation = if entitlements.has(super::Feature::Delegation) {
             Some(
                 DelegationAuthority::compose(
-                    store.clone(),
+                    authority_store.clone(),
                     Arc::clone(&cache),
                     clock.clone(),
                     PathBuf::from(&config.token_signing_key_path),
@@ -274,7 +287,7 @@ impl SecurityKernel {
         let audit_signer = if delegation.is_none() && entitlements.has(super::Feature::AuditS3) {
             Some(
                 PublishedObjectSigner::compose(
-                    store.clone(),
+                    authority_store.clone(),
                     PathBuf::from(&config.token_signing_key_path),
                 )
                 .await?,
@@ -285,7 +298,7 @@ impl SecurityKernel {
         let preservation = if entitlements.has(super::Feature::Preservation) {
             Some(
                 PreservationService::start(
-                    store,
+                    authority_store,
                     clock,
                     Duration::from_secs(config.policy_refresh_secs),
                 )

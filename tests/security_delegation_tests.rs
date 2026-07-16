@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
 use bytes::Bytes;
-use chrono::Duration;
+use chrono::{Duration, Utc};
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use zeppelin::config::{Config, SecurityMode};
 use zeppelin::security::{
-    canonical_policy_checksum, Action, DelegationNarrowing, Feature, NamespaceId, PolicyStore,
-    SecurityKernel,
+    canonical_policy_checksum, verify_audit_day, Action, AuditRecord, AuditRuntime,
+    DelegationNarrowing, Feature, NamespaceId, PolicyStore, SecurityKernel,
 };
 use zeppelin::time::{Clock, TimeSource};
 
@@ -282,6 +282,51 @@ async fn delegation_signing_key_contract_fails_loud_at_boot() {
             .contains("invalid delegation signing key"),
         "{invalid_error}"
     );
+}
+
+#[tokio::test]
+async fn direct_kernel_composition_installs_delegation_signer_on_input_store() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let mut config = Config::default();
+    let _admin_bearer = test_admin_bearer(&mut config);
+    let key = delegation_signing_key(0x53);
+    config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
+
+    let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
+        store.clone(),
+        &config.security,
+        Clock::system(),
+        Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation])),
+    )
+    .await
+    .expect("direct kernel composition must publish a delegation signer");
+
+    let (client, runtime) =
+        AuditRuntime::start_for_published_signer(store.clone(), StdDuration::from_secs(60))
+            .await
+            .expect("direct kernel composition must install signing on its input store");
+    let node_id = client.node_id().to_string();
+    let now = Utc::now();
+    client
+        .submit_durable(AuditRecord::open_unsafe_boot(now, &node_id))
+        .await
+        .expect("input-store signer must durably sign audit evidence");
+    runtime
+        .shutdown()
+        .await
+        .expect("signed audit writer must seal its chain");
+
+    let verification = verify_audit_day(&store, now.date_naive(), &node_id)
+        .await
+        .expect("signed audit chain must verify");
+    assert!(verification.valid, "{verification:?}");
+    assert_eq!(verification.verified_records, 1);
+
+    drop(adapter);
+    drop(kernel);
+    drop(store);
+    harness.cleanup().await;
 }
 
 #[tokio::test]

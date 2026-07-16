@@ -633,6 +633,21 @@ impl ZeppelinStore {
         }
     }
 
+    /// Clone this gateway for authority-side reads without retaining an installed signer.
+    ///
+    /// Long-lived policy, signer, and preservation caches need the same authoritative
+    /// object-store view, but must not share the application store's signer slot. A signer
+    /// can itself retain one of those caches; sharing that slot would form a reference cycle.
+    #[must_use]
+    pub(crate) fn signer_detached_clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            prefix_delete_mode: self.prefix_delete_mode,
+            content_hashes: Arc::clone(&self.content_hashes),
+            object_signer: Arc::new(RwLock::new(None)),
+        }
+    }
+
     /// Install the one node signer shared by manifests, receipts, and audit anchors.
     pub(crate) fn install_object_signer(&self, signer: Arc<dyn ObjectSigner>) -> Result<()> {
         let mut current = self

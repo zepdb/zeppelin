@@ -350,10 +350,8 @@ impl PublishedObjectSigner {
         let signer = Arc::new(Self {
             signing_key,
             signer_node,
-            publication_store: store.clone(),
+            publication_store: store,
         });
-        let object_signer: Arc<dyn ObjectSigner> = signer.clone();
-        store.install_object_signer(object_signer)?;
         Ok(signer)
     }
 }
@@ -407,8 +405,6 @@ impl DelegationAuthority {
             max_ttl: StdDuration::from_secs(max_ttl_secs),
             verifier,
         });
-        let shared_signer: Arc<dyn ObjectSigner> = authority.clone();
-        store.install_object_signer(shared_signer)?;
         Ok(authority)
     }
 

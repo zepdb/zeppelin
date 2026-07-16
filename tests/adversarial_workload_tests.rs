@@ -375,6 +375,42 @@ async fn restartable_server_exposes_hard_abort() {
     harness.cleanup().await;
 }
 
+/// A completed full server must not retain policy-refresh work after its
+/// harness deletes the scoped security objects.
+#[tokio::test]
+async fn full_server_shutdown_stops_policy_refresh_before_harness_cleanup() {
+    use std::time::Duration;
+
+    let harness = common::harness::TestHarness::new().await;
+    let prefix = harness.prefix.clone();
+    let (store, counter) = common::counting::counting_store(&harness.store);
+    let mut config = zeppelin::config::Config::default();
+    config.security.policy_refresh_secs = 1;
+    let server =
+        common::server::start_test_server_full(store, Some(prefix.clone()), config, false, None)
+            .await;
+
+    server.shutdown().await;
+    harness.cleanup().await;
+    counter.reset();
+
+    let policy_head = format!("{prefix}/_security/heads/policy.json");
+    let refresh_after_cleanup = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if counter.gets_matching(&policy_head) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    assert!(
+        refresh_after_cleanup.is_err(),
+        "policy refresh survived server shutdown and accessed deleted {policy_head}"
+    );
+}
+
 #[tokio::test]
 async fn wall_clock_jump_does_not_expire_compaction_upload_window() {
     use std::sync::Arc;
