@@ -312,39 +312,37 @@ impl S3Tracker {
                     continue;
                 }
             };
-            // A failed live-manifest PUT can leave the next generation's
-            // history object unreferenced. Production deliberately replaces
-            // that orphan on retry, so immutability begins only once the live
-            // manifest reaches the history generation.
-            if entry.version <= manifest.version() {
-                let hash = xxh3_64(&bytes);
-                let key = (namespace.to_string(), entry.version);
-                if let Some(previous) = self.history_hashes.get(&key).copied() {
-                    if previous != hash {
-                        if fault_window_active {
-                            eprintln!(
-                                "tolerated immutable-history byte mismatch in active fault \
-                                 window for {namespace}: key={}",
-                                entry.key
-                            );
-                        } else {
-                            violations.push(violation(
-                                ViolationId::I21FencingViolation,
-                                op_index,
-                                namespace,
-                                "same-generation manifest history fork observed",
-                                json!({
-                                    "generation": entry.version,
-                                    "key": entry.key,
-                                    "previous_hash": previous,
-                                    "current_hash": hash,
-                                }),
-                            ));
-                        }
+            // Every observed history object is write-once, including an
+            // unreferenced future-generation object injected by a fault. Product
+            // publication stores only the authoritative predecessor, but the
+            // oracle independently enforces immutability for the whole prefix.
+            let hash = xxh3_64(&bytes);
+            let key = (namespace.to_string(), entry.version);
+            if let Some(previous) = self.history_hashes.get(&key).copied() {
+                if previous != hash {
+                    if fault_window_active {
+                        eprintln!(
+                            "tolerated immutable-history byte mismatch in active fault \
+                             window for {namespace}: key={}",
+                            entry.key
+                        );
+                    } else {
+                        violations.push(violation(
+                            ViolationId::I21FencingViolation,
+                            op_index,
+                            namespace,
+                            "same-generation manifest history fork observed",
+                            json!({
+                                "generation": entry.version,
+                                "key": entry.key,
+                                "previous_hash": previous,
+                                "current_hash": hash,
+                            }),
+                        ));
                     }
-                } else {
-                    self.history_hashes.insert(key, hash);
                 }
+            } else {
+                self.history_hashes.insert(key, hash);
             }
             let history_manifest = match Manifest::from_bytes(&bytes) {
                 Ok(manifest) => manifest,
@@ -1115,58 +1113,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacing_unreferenced_history_after_failed_live_put_is_not_a_fork() {
-        let inner = ZeppelinStore::new(Arc::new(InMemory::new()));
-        Manifest::new().write(&inner, "ns").await.unwrap();
-        let (mut orphan_candidate, first_version) = Manifest::read_versioned(&inner, "ns")
+    async fn replacing_unreferenced_history_is_a_fork() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        Manifest::new().write(&store, "ns").await.unwrap();
+        let live_one = store.get(&Manifest::s3_key("ns")).await.unwrap();
+        let (mut generation_two, version) = Manifest::read_versioned(&store, "ns")
             .await
             .unwrap()
             .expect("generation one must exist");
-        orphan_candidate.fencing_token = 1;
-
-        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
-            profile: FaultProfile::Crash,
-            events: vec![FaultEvent {
-                id: "fail-live-manifest-put".to_string(),
-                start_op: 0,
-                end_op: None,
-                boundary: Boundary::ObjectStore,
-                target: TargetSelector {
-                    store_op: Some(StoreOp::Put),
-                    key_substring: Some("ns/manifest.json".to_string()),
-                    ..TargetSelector::default()
-                },
-                kind: FaultKind::PreFail {
-                    error: InjectedErrorKind::Http500,
-                },
-            }],
-        });
-        let faulted = store_fault_proxy(&inner, scheduler);
-        assert!(orphan_candidate
-            .write_conditional(&faulted, "ns", &first_version)
+        generation_two.fencing_token = 1;
+        generation_two
+            .write_conditional(&store, "ns", &version)
             .await
-            .is_err());
+            .unwrap();
+        let history_key = Manifest::history_key("ns", 2);
+        store
+            .put(&history_key, generation_two.to_bytes().unwrap())
+            .await
+            .unwrap();
+        store.put(&Manifest::s3_key("ns"), live_one).await.unwrap();
 
         let mut tracker = S3Tracker::default();
         let before_replacement = tracker
-            .check_namespace(&inner, "ns", 1, &json!({ "manifest_generation": 1 }), false)
+            .check_namespace(&store, "ns", 1, &json!({ "manifest_generation": 1 }), false)
             .await;
         assert!(before_replacement.is_empty(), "{before_replacement:#?}");
 
-        let (mut committed, second_version) = Manifest::read_versioned(&inner, "ns")
-            .await
-            .unwrap()
-            .expect("generation one must remain live");
-        committed.fencing_token = 2;
-        committed
-            .write_conditional(&inner, "ns", &second_version)
+        generation_two.fencing_token = 2;
+        store
+            .put(&history_key, generation_two.to_bytes().unwrap())
             .await
             .unwrap();
-
         let after_replacement = tracker
-            .check_namespace(&inner, "ns", 2, &json!({ "manifest_generation": 2 }), false)
+            .check_namespace(&store, "ns", 2, &json!({ "manifest_generation": 1 }), false)
             .await;
-        assert!(after_replacement.is_empty(), "{after_replacement:#?}");
+        assert!(
+            after_replacement
+                .iter()
+                .any(|violation| violation.id == ViolationId::I21FencingViolation),
+            "{after_replacement:#?}"
+        );
     }
 
     #[tokio::test]

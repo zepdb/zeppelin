@@ -56,6 +56,10 @@ impl Coverage {
                 self.record_security_oracle("I24");
             }
             Op::AuditBarrierOp { .. } => self.record_security_oracle("I25"),
+            Op::QueryWithReceipt { .. }
+            | Op::VerifyReceipt { .. }
+            | Op::TamperArtifactThenVerify { .. }
+            | Op::AuditChainCheck { .. } => self.record_security_oracle("I29"),
             _ => {}
         }
     }
@@ -267,6 +271,32 @@ impl AdversarialGenerator {
             };
             generator.pending.extend(security_program.scripted_ops());
             generator.security_program = Some(security_program);
+            let receipt_namespace = generator.namespaces[0].clone();
+            let receipt_query = Self::fixed_membership_query(
+                &receipt_namespace,
+                vec![0.0; receipt_namespace.spec.dims],
+                8,
+                receipt_namespace.spec.num_centroids,
+                &["receipt"],
+            );
+            generator.pending.extend([
+                Op::QueryWithReceipt {
+                    actor: ActorSel::ADMIN,
+                    ns: receipt_namespace.name.clone(),
+                    q: receipt_query,
+                },
+                Op::VerifyReceipt {
+                    actor: ActorSel::ADMIN,
+                    ns: receipt_namespace.name.clone(),
+                },
+                Op::TamperArtifactThenVerify {
+                    actor: ActorSel::ADMIN,
+                    ns: receipt_namespace.name,
+                },
+                Op::AuditChainCheck {
+                    actor: ActorSel::ADMIN,
+                },
+            ]);
         }
         generator.enqueue_phase2_script(exact_ns, &exact_vectors);
         generator.enqueue_sketch_adc_script(namespace_count);

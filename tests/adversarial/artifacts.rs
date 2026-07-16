@@ -388,12 +388,13 @@ impl SeedArtifacts {
                 .unwrap_or_else(|error| panic!("failed to list S3 keys for {ns}: {error}"));
             keys.sort();
             for key in keys {
-                let size = store
-                    .head(&key)
-                    .await
-                    .unwrap_or_else(|error| panic!("failed to head S3 key {key}: {error}"))
-                    .size;
-                output.push_str(&format!("{key}\t{size}\n"));
+                match store.head(&key).await {
+                    Ok(metadata) => output.push_str(&format!("{key}\t{}\n", metadata.size)),
+                    Err(ZeppelinError::NotFound { .. }) => {
+                        output.push_str(&format!("{key}\tmissing_after_list\n"));
+                    }
+                    Err(error) => panic!("failed to head S3 key {key}: {error}"),
+                }
             }
         }
         fs::write(self.dir.join("s3-final.txt"), output)
@@ -923,8 +924,8 @@ mod tests {
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(seed.dir.join("config.json")).unwrap()).unwrap();
         assert_eq!(config["principals"].as_array().unwrap().len(), 5);
-        assert_eq!(config["security_ops"].as_array().unwrap().len(), 19);
-        assert_eq!(config["protected_assumptions"].as_array().unwrap().len(), 7);
+        assert_eq!(config["security_ops"].as_array().unwrap().len(), 23);
+        assert_eq!(config["protected_assumptions"].as_array().unwrap().len(), 9);
         assert!(!config["security_program"].is_null());
 
         let mut authz = record(0);
@@ -988,7 +989,9 @@ mod tests {
             &Coverage::default(),
         );
         assert!(report.contains("## Authorization Summary"));
-        assert!(report.contains("| 7 | 0 | 1 | 0 | 0 | pass | pass | pass | pass | pass | pass |"));
+        assert!(report.contains(
+            "| 7 | 0 | 1 | 0 | 0 | pass | pass | pass | pass | pass | pass | pass | pass |"
+        ));
     }
 
     #[test]
@@ -1797,6 +1800,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn s3_final_records_key_deleted_after_list() {
+        let temp_dir = tempfile::tempdir().expect("failed to create artifact temp dir");
+        let ops = BufWriter::new(
+            File::create(temp_dir.path().join("ops.jsonl")).expect("failed to create ops file"),
+        );
+        let artifacts = SeedArtifacts {
+            dir: temp_dir.path().to_path_buf(),
+            ops,
+            op_count: 0,
+            next_op_index: 0,
+            pending_ops: BTreeMap::new(),
+            fault_contracts: BTreeMap::new(),
+        };
+        let ns = "ns";
+        let key = format!("{ns}/meta.json");
+        let inner = Arc::new(InMemory::new());
+        let seed_store = ZeppelinStore::new(inner.clone());
+        seed_store
+            .put(&key, Bytes::from_static(b"{}"))
+            .await
+            .expect("failed to seed listed key");
+        let capture_store = ZeppelinStore::new(Arc::new(DeleteOnListStore {
+            inner,
+            delete_on_list: Arc::new(Mutex::new(BTreeSet::from([key.clone()]))),
+        }));
+
+        artifacts
+            .write_s3_final(&capture_store, &[ns.to_string()])
+            .await;
+
+        let final_inventory = fs::read_to_string(temp_dir.path().join("s3-final.txt"))
+            .expect("s3-final.txt should be written");
+        assert_eq!(
+            final_inventory,
+            format!("# {ns}\n{key}\tmissing_after_list\n")
+        );
+    }
+
     #[derive(Debug)]
     struct DeleteOnListStore {
         inner: Arc<dyn ObjectStore>,
@@ -1991,10 +2033,10 @@ fn build_report(
     }) {
         out.push_str("## Authorization Summary\n\n");
         out.push_str(
-            "| seed | allow | forbidden | unauthorized | staleness resolutions | I22 | I23 | I24 | I25 | I26 | I27 | I28 |\n",
+            "| seed | allow | forbidden | unauthorized | staleness resolutions | I22 | I23 | I24 | I25 | I26 | I27 | I28 | I29 |\n",
         );
         out.push_str(
-            "| --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- | --- |\n",
+            "| --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- | --- | --- |\n",
         );
         for seed in seeds {
             let records = read_ops(&seed.dir);
@@ -2029,7 +2071,7 @@ fn build_report(
                 }
             };
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 seed.seed,
                 allow,
                 forbidden,
@@ -2042,6 +2084,7 @@ fn build_report(
                 oracle_status(ViolationId::I26SecurityStateSanity),
                 oracle_status(ViolationId::I27ConstraintDrop),
                 oracle_status(ViolationId::I28PreservationBypass),
+                oracle_status(ViolationId::I29ReceiptIntegrity),
             ));
         }
         out.push('\n');
@@ -2364,7 +2407,7 @@ fn build_report(
     out.push('\n');
 
     out.push_str("## Security Oracle Coverage\n\n");
-    for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28"] {
+    for oracle in ["I22", "I23", "I24", "I25", "I26", "I27", "I28", "I29"] {
         let count = coverage
             .security_oracle_counts
             .get(oracle)

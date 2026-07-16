@@ -47,6 +47,7 @@ pub enum ViolationId {
     I26SecurityStateSanity,
     I27ConstraintDrop,
     I28PreservationBypass,
+    I29ReceiptIntegrity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +183,73 @@ fn check_security_operation(
     }
 
     match &rec.op {
+        Op::QueryWithReceipt { .. } => {
+            let receipt = rec.response.get("receipt");
+            if rec.status != 200
+                || receipt.and_then(|value| value.get("verification_mode"))
+                    != Some(&serde_json::Value::String("structural".to_string()))
+                || rec
+                    .response
+                    .get("results")
+                    .and_then(serde_json::Value::as_array)
+                    .is_none()
+            {
+                findings.push(SecurityFinding {
+                    id: ViolationId::I29ReceiptIntegrity,
+                    detail: "receipt query did not return one structural signed receipt"
+                        .to_string(),
+                    evidence: serde_json::json!({"status": rec.status, "response": rec.response}),
+                });
+            }
+        }
+        Op::VerifyReceipt { .. } => {
+            if rec.status != 200
+                || rec
+                    .response
+                    .get("valid")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            {
+                findings.push(SecurityFinding {
+                    id: ViolationId::I29ReceiptIntegrity,
+                    detail: "stored receipt failed live structural verification".to_string(),
+                    evidence: serde_json::json!({"status": rec.status, "response": rec.response}),
+                });
+            }
+        }
+        Op::TamperArtifactThenVerify { .. } => {
+            if rec.status != 200
+                || rec
+                    .response
+                    .get("valid")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(false)
+                || rec.response.get("first_divergence")
+                    != Some(&serde_json::Value::String("artifact_refetch".to_string()))
+            {
+                findings.push(SecurityFinding {
+                    id: ViolationId::I29ReceiptIntegrity,
+                    detail: "authoritative artifact corruption was not rejected at refetch"
+                        .to_string(),
+                    evidence: serde_json::json!({"status": rec.status, "response": rec.response}),
+                });
+            }
+        }
+        Op::AuditChainCheck { .. } => {
+            if rec.status != 200
+                || rec
+                    .response
+                    .get("valid")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            {
+                findings.push(SecurityFinding {
+                    id: ViolationId::I29ReceiptIntegrity,
+                    detail: "quiet audit-chain link check diverged".to_string(),
+                    evidence: serde_json::json!({"status": rec.status, "response": rec.response}),
+                });
+            }
+        }
         Op::DeleteUnderLock { lock, .. } => {
             let modeled_locked = model
                 .security

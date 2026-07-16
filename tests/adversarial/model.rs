@@ -88,10 +88,13 @@ pub enum OracleMutation {
     DelegationParentDesync,
     DelegationNarrowingBypass,
     PreservationBypass,
+    ReceiptForgedSignature,
+    ReceiptWrongMerklePath,
+    AuditChainRecordDrop,
 }
 
 impl OracleMutation {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 28] = [
         Self::DropDelete,
         Self::SkewScore,
         Self::PhantomId,
@@ -117,6 +120,9 @@ impl OracleMutation {
         Self::DelegationParentDesync,
         Self::DelegationNarrowingBypass,
         Self::PreservationBypass,
+        Self::ReceiptForgedSignature,
+        Self::ReceiptWrongMerklePath,
+        Self::AuditChainRecordDrop,
     ];
 
     #[must_use]
@@ -147,6 +153,9 @@ impl OracleMutation {
             "delegation-parent-desync" => Self::DelegationParentDesync,
             "delegation-narrowing-bypass" => Self::DelegationNarrowingBypass,
             "preservation-bypass" => Self::PreservationBypass,
+            "receipt-forged-signature" => Self::ReceiptForgedSignature,
+            "receipt-wrong-merkle-path" => Self::ReceiptWrongMerklePath,
+            "audit-chain-record-drop" => Self::AuditChainRecordDrop,
             other => panic!("unknown ZEPPELIN_ADVERSARIAL_SELFTEST mutation: {other}"),
         }
     }
@@ -179,6 +188,9 @@ impl OracleMutation {
             Self::DelegationParentDesync => "delegation-parent-desync",
             Self::DelegationNarrowingBypass => "delegation-narrowing-bypass",
             Self::PreservationBypass => "preservation-bypass",
+            Self::ReceiptForgedSignature => "receipt-forged-signature",
+            Self::ReceiptWrongMerklePath => "receipt-wrong-merkle-path",
+            Self::AuditChainRecordDrop => "audit-chain-record-drop",
         }
     }
 
@@ -195,6 +207,9 @@ impl OracleMutation {
                 | Self::DelegationParentDesync
                 | Self::DelegationNarrowingBypass
                 | Self::PreservationBypass
+                | Self::ReceiptForgedSignature
+                | Self::ReceiptWrongMerklePath
+                | Self::AuditChainRecordDrop
         )
     }
 }
@@ -204,6 +219,16 @@ pub struct Model {
     pub namespaces: BTreeMap<String, NsModel>,
     #[serde(default)]
     pub security: SecurityPolicyModel,
+    /// Authoritative manifest roots observed at completed logical-op boundaries.
+    #[serde(default)]
+    pub published_roots: BTreeMap<String, Vec<PublishedRootObservation>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishedRootObservation {
+    pub logical_index: u64,
+    pub manifest_version: u64,
+    pub manifest_root: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -303,6 +328,49 @@ pub enum NsIndeterminate {
 }
 
 impl Model {
+    pub fn observe_published_root(
+        &mut self,
+        namespace: &str,
+        logical_index: u64,
+        manifest_version: u64,
+        manifest_root: [u8; 32],
+    ) {
+        let observations = self
+            .published_roots
+            .entry(namespace.to_string())
+            .or_default();
+        if observations.last().is_some_and(|observation| {
+            observation.manifest_version == manifest_version
+                && observation.manifest_root == manifest_root
+        }) {
+            return;
+        }
+        observations.push(PublishedRootObservation {
+            logical_index,
+            manifest_version,
+            manifest_root,
+        });
+    }
+
+    #[must_use]
+    pub fn root_was_published_at_or_before(
+        &self,
+        namespace: &str,
+        logical_index: u64,
+        manifest_version: u64,
+        manifest_root: [u8; 32],
+    ) -> bool {
+        self.published_roots
+            .get(namespace)
+            .is_some_and(|observations| {
+                observations.iter().any(|observation| {
+                    observation.logical_index <= logical_index
+                        && observation.manifest_version == manifest_version
+                        && observation.manifest_root == manifest_root
+                })
+            })
+    }
+
     #[must_use]
     pub fn namespace_names(&self) -> Vec<String> {
         self.namespaces.keys().cloned().collect()
@@ -537,6 +605,10 @@ impl Model {
             | Op::ExportProbe { .. }
             | Op::SecurityAdminProbe { .. }
             | Op::AuditBarrierOp { .. }
+            | Op::QueryWithReceipt { .. }
+            | Op::VerifyReceipt { .. }
+            | Op::TamperArtifactThenVerify { .. }
+            | Op::AuditChainCheck { .. }
             | Op::CreateLock { .. }
             | Op::ReleaseLock { .. }
             | Op::DeleteUnderLock { .. }
@@ -841,6 +913,10 @@ impl Model {
             | Op::ExportProbe { .. }
             | Op::SecurityAdminProbe { .. }
             | Op::AuditBarrierOp { .. }
+            | Op::QueryWithReceipt { .. }
+            | Op::VerifyReceipt { .. }
+            | Op::TamperArtifactThenVerify { .. }
+            | Op::AuditChainCheck { .. }
             | Op::CreateLock { .. }
             | Op::ReleaseLock { .. }
             | Op::DeleteUnderLock { .. }

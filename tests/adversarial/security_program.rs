@@ -171,6 +171,10 @@ impl SecurityProgramConfig {
                 "export_probe",
                 "security_admin_probe",
                 "audit_barrier",
+                "query_with_receipt",
+                "verify_receipt",
+                "tamper_artifact_then_verify",
+                "audit_chain_check",
                 "mint_token",
                 "use_token",
                 "token_exceed_scope_probe",
@@ -193,6 +197,8 @@ impl SecurityProgramConfig {
                 "delegation-narrows-parent",
                 "delegation-parent-revocation",
                 "preservation-blocks-destruction",
+                "receipt-integrity",
+                "audit-chain-integrity",
             ]
             .into_iter()
             .map(str::to_string)
@@ -1730,13 +1736,19 @@ fn simple_operation_requirement(op: &Op) -> Option<GrantRequirement<'_>> {
             namespace: Some(ns),
             unconstrained: false,
         }),
-        Op::Query { ns, .. } | Op::BatchQuery { ns, .. } | Op::PaginateAll { ns, .. } => {
-            Some(GrantRequirement {
-                action: Action::Query,
-                namespace: Some(ns),
-                unconstrained: false,
-            })
-        }
+        Op::Query { ns, .. }
+        | Op::BatchQuery { ns, .. }
+        | Op::PaginateAll { ns, .. }
+        | Op::QueryWithReceipt { ns, .. } => Some(GrantRequirement {
+            action: Action::Query,
+            namespace: Some(ns),
+            unconstrained: false,
+        }),
+        Op::VerifyReceipt { .. } | Op::TamperArtifactThenVerify { .. } => Some(GrantRequirement {
+            action: Action::ReceiptVerify,
+            namespace: None,
+            unconstrained: true,
+        }),
         Op::InvalidProbe { ns, probe, .. } => Some(GrantRequirement {
             action: if probe.is_write_shaped() {
                 Action::VectorUpsert
@@ -1862,7 +1874,8 @@ fn simple_operation_requirement(op: &Op) -> Option<GrantRequirement<'_>> {
         | Op::CompactInline { .. }
         | Op::CloneNamespace { .. }
         | Op::UseRevokedCredential { .. }
-        | Op::ExportProbe { .. } => None,
+        | Op::ExportProbe { .. }
+        | Op::AuditChainCheck { .. } => None,
     }
 }
 
