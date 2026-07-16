@@ -898,10 +898,11 @@ pub(crate) async fn verify_published_signature(
     if !node_id.starts_with("zsn1_") {
         return Ok(false);
     }
-    let publication_store = store
-        .signer_publication_store()
-        .unwrap_or_else(|| store.clone());
-    let signers = load_signers_allow_empty(&publication_store).await?;
+    // Verification uses the explicit signer-inventory view captured when the
+    // application store installed its signer. That detached S3 wrapper remains
+    // valid after the live signing root has ended.
+    let inventory_store = store.signer_inventory_store();
+    let signers = load_signers_allow_empty(&inventory_store).await?;
     let Some(verifying_key) = signers.get(node_id) else {
         return Ok(false);
     };

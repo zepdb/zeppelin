@@ -386,11 +386,11 @@ pub(crate) fn issue_receipt(issue: ReceiptIssue<'_>) -> ZeppelinResult<Retrieval
         manifest_fencing_token: manifest.fencing_token(),
     };
     receipt.signer_node = store
-        .object_signer_node()
+        .object_signer_node()?
         .ok_or(SecurityError::ReceiptsUnavailableUnhashed)?;
     let unsigned = receipt.unsigned_bytes()?;
     let (signer_node, signature) = store
-        .sign_object(&unsigned)
+        .sign_object(&unsigned)?
         .ok_or(SecurityError::ReceiptsUnavailableUnhashed)?;
     if signer_node != receipt.signer_node {
         return Err(ZeppelinError::Config(

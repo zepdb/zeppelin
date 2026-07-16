@@ -1346,7 +1346,7 @@ impl Manifest {
             binding_version,
             state_digest,
         )?;
-        if let Some((signer_node, signature)) = store.sign_object(&payload) {
+        if let Some((signer_node, signature)) = store.sign_object(&payload)? {
             self.root_signer_node = Some(signer_node);
             self.root_signature = Some(signature);
         } else {

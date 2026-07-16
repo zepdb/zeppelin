@@ -2188,8 +2188,12 @@ pub async fn compact_namespace(
         .await
         .map_err(ApiError::from)?;
 
-    let receipt_upgrade_available =
-        state.store.object_signer_node().is_some() && before.receipt_upgrade_needed(&ns);
+    let receipt_upgrade_available = state
+        .store
+        .object_signer_node()
+        .map_err(ApiError::from)?
+        .is_some()
+        && before.receipt_upgrade_needed(&ns);
     if before.uncompacted_fragments().is_empty() && !receipt_upgrade_available {
         return Ok((
             StatusCode::OK,

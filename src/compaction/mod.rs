@@ -1176,7 +1176,7 @@ impl Compactor {
 
         // 2. If no uncompacted fragments → no-op
         if manifest.uncompacted_fragments().is_empty() && !rewrite_for_index_config {
-            if self.store.object_signer_node().is_some()
+            if self.store.object_signer_node()?.is_some()
                 && manifest.receipt_upgrade_needed(namespace)
             {
                 check_lease_lost(namespace, lease_lost.as_deref())?;
@@ -2035,7 +2035,7 @@ impl Compactor {
             // for those retained objects, so complete the exact post-compaction
             // inventory now. This makes one explicit compaction sufficient for
             // upgrade instead of requiring a second no-WAL pass.
-            if self.store.object_signer_node().is_some()
+            if self.store.object_signer_node()?.is_some()
                 && fresh_manifest.receipt_upgrade_needed(namespace)
             {
                 fresh_manifest

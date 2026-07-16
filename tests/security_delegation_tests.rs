@@ -285,7 +285,7 @@ async fn delegation_signing_key_contract_fails_loud_at_boot() {
 }
 
 #[tokio::test]
-async fn direct_kernel_composition_installs_delegation_signer_on_input_store() {
+async fn direct_kernel_composition_supports_offline_audit_verification_after_root_ends() {
     let harness = TestHarness::new().await;
     let store = scoped_test_security_store(&harness.store, &harness.prefix);
     let mut config = Config::default();
@@ -317,14 +317,121 @@ async fn direct_kernel_composition_installs_delegation_signer_on_input_store() {
         .await
         .expect("signed audit writer must seal its chain");
 
+    // Verification uses the published signer inventory after the live signing
+    // roots have ended; it must not retain or require either root.
+    drop(adapter);
+    drop(kernel);
     let verification = verify_audit_day(&store, now.date_naive(), &node_id)
         .await
-        .expect("signed audit chain must verify");
+        .expect("offline signed audit chain must verify from authoritative storage");
     assert!(verification.valid, "{verification:?}");
     assert_eq!(verification.verified_records, 1);
 
+    drop(store);
+    harness.cleanup().await;
+}
+
+/// Full servers publish signer inventory through a scoped security wrapper but
+/// write audit evidence through the raw application wrapper. The durable
+/// verifier must retain that explicit inventory view after the security graph
+/// ends rather than infer it from the raw audit store.
+#[tokio::test]
+async fn split_security_inventory_verifies_raw_audit_after_root_ends() {
+    let harness = TestHarness::new().await;
+    let app_store = harness.store.clone();
+    let security_store = scoped_test_security_store(&app_store, &harness.prefix);
+    let mut config = Config::default();
+    config.security.mode = SecurityMode::OpenUnsafe;
+    let key = delegation_signing_key(0x55);
+    config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
+    let entitlements = Arc::new(test_entitlements([Feature::AuditS3]));
+    let (kernel, adapter) = SecurityKernel::from_resolved_entitlements(
+        security_store,
+        &config.security,
+        Clock::system(),
+        entitlements,
+    )
+    .await
+    .expect("scoped security kernel must publish its signer inventory");
+    kernel
+        .install_object_signer(&app_store)
+        .expect("raw application store must receive the scoped signer");
+
+    let now = Utc::now();
+    let node_id = format!("test-node-{}-split-inventory", harness.prefix);
+    let (client, runtime) = AuditRuntime::start_at(
+        app_store.clone(),
+        node_id.clone(),
+        StdDuration::from_secs(60),
+        now,
+    )
+    .await
+    .expect("raw application audit writer must start");
+    client
+        .submit_durable(AuditRecord::open_unsafe_boot(now, &node_id))
+        .await
+        .expect("raw application audit record must become durable");
+    runtime
+        .shutdown()
+        .await
+        .expect("raw application audit writer must seal its chain");
+
     drop(adapter);
     drop(kernel);
+    let verification = verify_audit_day(&app_store, now.date_naive(), &node_id)
+        .await
+        .expect("raw application audit verification must execute after roots end");
+    assert!(verification.valid, "{verification:?}");
+    assert_eq!(verification.verified_records, 1);
+
+    drop(app_store);
+    harness.cleanup().await;
+}
+
+/// A crash replacement composes before Rust drops the old server graph. The
+/// same-key signer slot must move to the replacement root before that drop.
+#[tokio::test]
+async fn overlapping_kernel_composition_rebinds_same_node_signer_to_replacement_root() {
+    let harness = TestHarness::new().await;
+    let store = scoped_test_security_store(&harness.store, &harness.prefix);
+    let mut config = Config::default();
+    let _admin_bearer = test_admin_bearer(&mut config);
+    let key = delegation_signing_key(0x54);
+    config.security.token_signing_key_path = key.path().to_string_lossy().into_owned();
+    let entitlements = Arc::new(test_entitlements([Feature::Rbac, Feature::Delegation]));
+
+    let (old_kernel, old_adapter) = SecurityKernel::from_resolved_entitlements(
+        store.clone(),
+        &config.security,
+        Clock::system(),
+        Arc::clone(&entitlements),
+    )
+    .await
+    .expect("original kernel must install its published signer");
+    let (replacement_kernel, replacement_adapter) = SecurityKernel::from_resolved_entitlements(
+        store.clone(),
+        &config.security,
+        Clock::system(),
+        entitlements,
+    )
+    .await
+    .expect("replacement kernel must compose before the original drops");
+
+    drop(old_kernel);
+    let (_client, runtime) =
+        AuditRuntime::start_for_published_signer(store.clone(), StdDuration::from_secs(60))
+            .await
+            .expect("replacement root must keep the application signer live after handoff");
+    runtime
+        .shutdown()
+        .await
+        .expect("replacement signer must seal its empty audit stream");
+
+    // Adapters retain their policy caches independently of the kernel roots.
+    // Release both before the harness deletes their scoped authoritative state.
+    drop(old_adapter);
+    drop(replacement_adapter);
+    drop(replacement_kernel);
     drop(store);
     harness.cleanup().await;
 }

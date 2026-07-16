@@ -390,6 +390,10 @@ async fn full_server_shutdown_stops_policy_refresh_before_harness_cleanup() {
         common::server::start_test_server_full(store, Some(prefix.clone()), config, false, None)
             .await;
 
+    // The adversarial crash/restart path retains a clone while it replaces the
+    // old server. That clone must not keep the old server's policy cache alive.
+    let retained_application_store = server.store.clone();
+
     server.shutdown().await;
     harness.cleanup().await;
     counter.reset();
@@ -409,6 +413,49 @@ async fn full_server_shutdown_stops_policy_refresh_before_harness_cleanup() {
         refresh_after_cleanup.is_err(),
         "policy refresh survived server shutdown and accessed deleted {policy_head}"
     );
+
+    drop(retained_application_store);
+}
+
+/// An aborted server must release its policy-refresh cache even while crash
+/// recovery retains its application-store clone for the replacement server.
+#[tokio::test]
+async fn full_server_abort_stops_policy_refresh_with_retained_application_store() {
+    use std::time::Duration;
+
+    let harness = common::harness::TestHarness::new().await;
+    let prefix = harness.prefix.clone();
+    let (store, counter) = common::counting::counting_store(&harness.store);
+    let mut config = zeppelin::config::Config::default();
+    config.security.policy_refresh_secs = 1;
+    let mut server =
+        common::server::start_test_server_full(store, Some(prefix.clone()), config, false, None)
+            .await;
+    let retained_application_store = server.store.clone();
+
+    server.abort();
+    drop(server);
+    tokio::task::yield_now().await;
+    harness.cleanup().await;
+    counter.reset();
+
+    let policy_head = format!("{prefix}/_security/heads/policy.json");
+    let refresh_after_cleanup = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if counter.gets_matching(&policy_head) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    assert!(
+        refresh_after_cleanup.is_err(),
+        "policy refresh survived server abort and accessed deleted {policy_head}"
+    );
+
+    drop(retained_application_store);
 }
 
 #[tokio::test]

@@ -271,11 +271,14 @@ async fn resolve_writer_head(
     lease_duration: Duration,
     initial_day: NaiveDate,
 ) -> Result<LoadedAuditWriterHead, AuditSinkError> {
-    let signer_node = store.object_signer_node().ok_or_else(|| {
-        AuditSinkError::Serialization(
-            "durable audit requires a stable published node signer identity".to_string(),
-        )
-    })?;
+    let signer_node = store
+        .object_signer_node()
+        .map_err(|error| AuditSinkError::Serialization(error.to_string()))?
+        .ok_or_else(|| {
+            AuditSinkError::Serialization(
+                "durable audit requires a stable published node signer identity".to_string(),
+            )
+        })?;
     let key = writer_head_key(&signer_node);
     let lease_owner = format!("audit-writer-{}", ulid::Ulid::new());
     for _attempt in 0..WRITER_HEAD_RETRIES {
@@ -1201,9 +1204,14 @@ async fn write_anchor(
     node_id: &str,
     chain_state: &AuditChainState,
 ) -> Result<(), AuditSinkError> {
-    let signer_node = store.object_signer_node().ok_or_else(|| {
-        AuditSinkError::Serialization("audit anchor signing capability is unavailable".to_string())
-    })?;
+    let signer_node = store
+        .object_signer_node()
+        .map_err(|error| AuditSinkError::Serialization(error.to_string()))?
+        .ok_or_else(|| {
+            AuditSinkError::Serialization(
+                "audit anchor signing capability is unavailable".to_string(),
+            )
+        })?;
     let mut anchor = AuditDayAnchor {
         day: day.format("%Y-%m-%d").to_string(),
         node_id: node_id.to_string(),
@@ -1215,9 +1223,12 @@ async fn write_anchor(
     let unsigned = anchor
         .unsigned_bytes()
         .map_err(|error| AuditSinkError::Serialization(error.to_string()))?;
-    let (observed_signer, signature) = store.sign_object(&unsigned).ok_or_else(|| {
-        AuditSinkError::Serialization("audit anchor signer became unavailable".to_string())
-    })?;
+    let (observed_signer, signature) = store
+        .sign_object(&unsigned)
+        .map_err(|error| AuditSinkError::Serialization(error.to_string()))?
+        .ok_or_else(|| {
+            AuditSinkError::Serialization("audit anchor signer became unavailable".to_string())
+        })?;
     if observed_signer != anchor.signer_node {
         return Err(AuditSinkError::Serialization(
             "audit anchor signer changed during shutdown".to_string(),

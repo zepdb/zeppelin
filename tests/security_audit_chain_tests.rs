@@ -1,5 +1,6 @@
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeppelin::config::Config;
 use zeppelin::security::{
-    verify_audit_day, AuditClient, AuditRecord, AuditRuntime, AuditSinkError,
+    verify_audit_day, AuditClient, AuditRecord, AuditRuntime, AuditSinkError, SecurityKernel,
 };
 use zeppelin::storage::{ConditionalPutOutcome, ZeppelinStore};
 use zeppelin::time::Clock;
@@ -45,7 +46,7 @@ fn stream_signer(stream_id: &str) -> &str {
 async fn install_real_storage_signer_on(
     harness: &TestHarness,
     additional_stores: &[&ZeppelinStore],
-) {
+) -> Arc<SecurityKernel> {
     let mut config = Config::default();
     let key_file = tempfile::NamedTempFile::new().expect("unique test signer file must create");
     let seed = Sha256::digest(harness.prefix.as_bytes());
@@ -72,10 +73,11 @@ async fn install_real_storage_signer_on(
             .install_object_signer(store)
             .expect("test signer must install on the fault-wrapped real object storage");
     }
+    security
 }
 
-async fn install_real_storage_signer(harness: &TestHarness) {
-    install_real_storage_signer_on(harness, &[]).await;
+async fn install_real_storage_signer(harness: &TestHarness) -> Arc<SecurityKernel> {
+    install_real_storage_signer_on(harness, &[]).await
 }
 
 async fn mutate_writer_head(
@@ -134,7 +136,7 @@ async fn lease_timer_reconciliation_failure_fails_health_before_expiry() {
     let writer_head_prefix = "_security/audit-writers/";
     let (fault_store, fault) =
         fail_cas_etag_reconciliation_once_matching(&harness.store, writer_head_prefix);
-    install_real_storage_signer_on(&harness, &[&fault_store]).await;
+    let _security = install_real_storage_signer_on(&harness, &[&fault_store]).await;
     let (client, runtime) =
         AuditRuntime::start_for_published_signer(fault_store, Duration::from_secs(1))
             .await
@@ -166,7 +168,7 @@ async fn lease_timer_reconciliation_failure_fails_health_before_expiry() {
 #[tokio::test]
 async fn local_writer_uses_explicit_application_clock_day() {
     let harness = TestHarness::new().await;
-    install_real_storage_signer(&harness).await;
+    let _security = install_real_storage_signer(&harness).await;
     let node_id = format!("test-node-{}-explicit-audit-day", harness.prefix);
     let timestamp = Utc
         .with_ymd_and_hms(2020, 1, 14, 12, 0, 0)
@@ -203,7 +205,7 @@ async fn local_writer_uses_explicit_application_clock_day() {
 #[tokio::test]
 async fn production_writer_uses_explicit_application_clock_day() {
     let harness = TestHarness::new().await;
-    install_real_storage_signer(&harness).await;
+    let _security = install_real_storage_signer(&harness).await;
     let timestamp = Utc
         .with_ymd_and_hms(2020, 1, 15, 12, 0, 0)
         .single()
@@ -288,7 +290,7 @@ async fn cleanup_production_audit(store: &ZeppelinStore, signer: &str, stream_id
 #[tokio::test]
 async fn production_head_uses_real_storage_for_exclusion_and_empty_rotation() {
     let harness = TestHarness::new().await;
-    install_real_storage_signer(&harness).await;
+    let _security = install_real_storage_signer(&harness).await;
     let (client, runtime) =
         AuditRuntime::start_for_published_signer(harness.store.clone(), Duration::from_secs(60))
             .await
@@ -332,7 +334,7 @@ async fn production_head_uses_real_storage_for_exclusion_and_empty_rotation() {
 #[tokio::test]
 async fn production_head_resumes_a_crash_then_rotates_on_real_storage() {
     let harness = TestHarness::new().await;
-    install_real_storage_signer(&harness).await;
+    let _security = install_real_storage_signer(&harness).await;
     let (client, runtime) =
         AuditRuntime::start_for_published_signer(harness.store.clone(), Duration::from_secs(60))
             .await
@@ -382,7 +384,8 @@ async fn delayed_stale_batch_takeover_fails_successor_health_and_recovers_eviden
     let harness = TestHarness::new().await;
     let (stale_store, stale_pause) = pause_first_create_matching(&harness.store, "_audit/");
     let (successor_store, successor_pause) = pause_first_create_matching(&harness.store, "_audit/");
-    install_real_storage_signer_on(&harness, &[&stale_store, &successor_store]).await;
+    let _security =
+        install_real_storage_signer_on(&harness, &[&stale_store, &successor_store]).await;
 
     let (stale_client, stale_runtime) =
         AuditRuntime::start_for_published_signer(stale_store, Duration::from_secs(60))
@@ -466,7 +469,7 @@ async fn delayed_stale_batch_takeover_fails_successor_health_and_recovers_eviden
 #[tokio::test]
 async fn writer_head_loss_during_day_rollover_fails_health_immediately() {
     let harness = TestHarness::new().await;
-    install_real_storage_signer(&harness).await;
+    let _security = install_real_storage_signer(&harness).await;
     let (client, runtime) =
         AuditRuntime::start_for_published_signer(harness.store.clone(), Duration::from_secs(60))
             .await
@@ -509,7 +512,7 @@ async fn writer_head_loss_during_day_rollover_fails_health_immediately() {
 #[tokio::test]
 async fn invalid_occupied_terminal_slot_fails_health_immediately() {
     let harness = TestHarness::new().await;
-    install_real_storage_signer(&harness).await;
+    let _security = install_real_storage_signer(&harness).await;
     let (client, runtime) =
         AuditRuntime::start_for_published_signer(harness.store.clone(), Duration::from_secs(60))
             .await
@@ -563,7 +566,7 @@ async fn invalid_occupied_terminal_slot_fails_health_immediately() {
 #[tokio::test]
 async fn corrupt_target_day_tail_fails_health_instead_of_retrying_storage() {
     let harness = TestHarness::new().await;
-    install_real_storage_signer(&harness).await;
+    let _security = install_real_storage_signer(&harness).await;
     let (client, runtime) =
         AuditRuntime::start_for_published_signer(harness.store.clone(), Duration::from_secs(60))
             .await
@@ -611,7 +614,7 @@ async fn corrupt_target_day_tail_fails_health_instead_of_retrying_storage() {
 #[tokio::test]
 async fn production_head_recovers_across_midnight_on_real_storage() {
     let harness = TestHarness::new().await;
-    install_real_storage_signer(&harness).await;
+    let _security = install_real_storage_signer(&harness).await;
     let (client, runtime) =
         AuditRuntime::start_for_published_signer(harness.store.clone(), Duration::from_secs(60))
             .await
@@ -672,7 +675,7 @@ async fn production_head_recovers_across_midnight_on_real_storage() {
 #[tokio::test]
 async fn production_head_repairs_a_terminal_slot_without_an_anchor_on_real_storage() {
     let harness = TestHarness::new().await;
-    install_real_storage_signer(&harness).await;
+    let _security = install_real_storage_signer(&harness).await;
     let (client, runtime) =
         AuditRuntime::start_for_published_signer(harness.store.clone(), Duration::from_secs(60))
             .await
@@ -758,7 +761,7 @@ async fn production_head_repairs_a_terminal_slot_without_an_anchor_on_real_stora
 #[tokio::test]
 async fn deterministic_batch_slot_rejects_divergent_writers_on_real_storage() {
     let harness = TestHarness::new().await;
-    install_real_storage_signer(&harness).await;
+    let _security = install_real_storage_signer(&harness).await;
     let node_id = format!("test-node-{}-audit-divergent", harness.prefix);
     let (left, left_runtime) = AuditRuntime::start(
         harness.store.clone(),

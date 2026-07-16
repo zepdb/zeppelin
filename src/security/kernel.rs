@@ -221,7 +221,8 @@ impl SecurityKernel {
         // Composition historically leaves the caller's application store ready
         // to sign manifests and audit evidence. Keep that public contract at
         // this root while each long-lived authority keeps only its detached
-        // store view, preventing the installed signer from closing a cycle.
+        // store view. The application slot is weak, so disposable store clones
+        // cannot retain security caches after their live components end.
         kernel.install_object_signer(&store)?;
         Ok((kernel, adapter))
     }
@@ -234,9 +235,9 @@ impl SecurityKernel {
         entitlements: Arc<Entitlements>,
     ) -> ZeppelinResult<(Arc<Self>, Arc<ApiKeyAdapter>)> {
         // Authority-side caches retain their store view for background refresh.
-        // Keep that view detached from the application signer slot: the signer
-        // itself can retain those caches, so sharing the slot would create a
-        // cycle that outlives a server shutdown.
+        // Keep that view detached from the application signing capability; the
+        // application's weak signer slot independently prevents disposable
+        // store clones from retaining those caches.
         let authority_store = store.signer_detached_clone();
         if config.mode == SecurityMode::OpenUnsafe {
             let audit_signer = if entitlements.has(super::Feature::AuditS3) {

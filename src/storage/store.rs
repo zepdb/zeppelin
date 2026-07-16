@@ -95,7 +95,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Range;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use tracing::{debug, instrument};
 
@@ -149,8 +149,9 @@ pub struct ZeppelinStore {
     prefix_delete_mode: PrefixDeleteMode,
     /// Transient hashes of exact bodies accepted by local immutable PUTs.
     content_hashes: Arc<Mutex<ContentHashCache>>,
-    /// Node signer installed once by the security composition root.
-    object_signer: Arc<RwLock<Option<Arc<dyn ObjectSigner>>>>,
+    /// Signing root and immutable signer-inventory view installed together by
+    /// the live security composition root.
+    object_signer: Arc<RwLock<ObjectSignerBinding>>,
 }
 
 /// Process-local signer backed by a public key published under `_security/signers/`.
@@ -158,6 +159,29 @@ pub(crate) trait ObjectSigner: Send + Sync {
     fn signer_node(&self) -> &str;
     fn sign(&self, message: &[u8]) -> Vec<u8>;
     fn publication_store(&self) -> ZeppelinStore;
+}
+
+/// Explicit view used to find the authoritative published signer inventory.
+///
+/// `CallerStore` is selected only for a fresh detached store with no installed
+/// signer. Once a signer is installed, `Installed` records its publication
+/// scope as a detached wrapper so verification never needs the live signer.
+#[derive(Clone, Default)]
+enum SignerInventoryView {
+    #[default]
+    CallerStore,
+    Installed(ZeppelinStore),
+}
+
+/// Shared application-store signing state.
+///
+/// The signer is deliberately weak, while the inventory view is a detached
+/// object-store wrapper with fresh signing state. Keeping them under one lock
+/// makes same-node replacement update both views atomically.
+#[derive(Default)]
+struct ObjectSignerBinding {
+    signer: Option<Weak<dyn ObjectSigner>>,
+    inventory_view: SignerInventoryView,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -472,7 +496,7 @@ impl ZeppelinStore {
             inner: store,
             prefix_delete_mode,
             content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
-            object_signer: Arc::new(RwLock::new(None)),
+            object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
         })
     }
 
@@ -613,7 +637,7 @@ impl ZeppelinStore {
             inner: store,
             prefix_delete_mode: PrefixDeleteMode::LegacyPerKeyUnordered32,
             content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
-            object_signer: Arc::new(RwLock::new(None)),
+            object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
         }
     }
 
@@ -629,41 +653,90 @@ impl ZeppelinStore {
             inner: store,
             prefix_delete_mode: PrefixDeleteMode::NativeBatch,
             content_hashes: Arc::new(Mutex::new(ContentHashCache::default())),
-            object_signer: Arc::new(RwLock::new(None)),
+            object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
         }
     }
 
-    /// Clone this gateway for authority-side reads without retaining an installed signer.
+    /// Clone this gateway for authority-side reads without inheriting application signing.
     ///
     /// Long-lived policy, signer, and preservation caches need the same authoritative
-    /// object-store view, but must not share the application store's signer slot. A signer
-    /// can itself retain one of those caches; sharing that slot would form a reference cycle.
+    /// object-store view, but do not need application signing capability. The application
+    /// slot is also weak, so neither view can retain those caches after their security root ends.
+    /// The clone also resets any installed signer-inventory view, preventing a
+    /// self-reference through the application store's shared binding.
     #[must_use]
     pub(crate) fn signer_detached_clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
             prefix_delete_mode: self.prefix_delete_mode,
             content_hashes: Arc::clone(&self.content_hashes),
-            object_signer: Arc::new(RwLock::new(None)),
+            object_signer: Arc::new(RwLock::new(ObjectSignerBinding::default())),
         }
     }
 
     /// Install the one node signer shared by manifests, receipts, and audit anchors.
+    ///
+    /// The slot borrows the live security root. Reinstalling the same node
+    /// rebinds it to a replacement root during crash recovery; a different
+    /// live node remains a configuration error. Once the bound root ends, an
+    /// installed signer becomes an explicit lifecycle error rather than keeping
+    /// security caches alive through otherwise disposable store clones.
     pub(crate) fn install_object_signer(&self, signer: Arc<dyn ObjectSigner>) -> Result<()> {
-        let mut current = self
+        let mut binding = self
             .object_signer
             .write()
             .unwrap_or_else(|_| panic!("object signer lock poisoned"));
-        if let Some(existing) = current.as_ref() {
+        if let Some(existing) = binding.signer.as_ref().and_then(Weak::upgrade) {
             if existing.signer_node() != signer.signer_node() {
                 return Err(ZeppelinError::Config(
                     "object signer was initialized with different node key material".to_string(),
                 ));
             }
-            return Ok(());
         }
-        *current = Some(signer);
+        let inventory_store = signer.publication_store().signer_detached_clone();
+        binding.signer = Some(Arc::downgrade(&signer));
+        binding.inventory_view = SignerInventoryView::Installed(inventory_store);
         Ok(())
+    }
+
+    fn resolve_object_signer(&self) -> Result<Option<Arc<dyn ObjectSigner>>> {
+        let signer = self
+            .object_signer
+            .read()
+            .unwrap_or_else(|_| panic!("object signer lock poisoned"))
+            .signer
+            .clone();
+        signer
+            .map(|signer| {
+                signer.upgrade().ok_or_else(|| {
+                    ZeppelinError::Config(
+                        "object signer root ended while the application store remains live"
+                            .to_string(),
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    /// Return the explicit S3 view selected for published-signature verification.
+    ///
+    /// An installed signer contributes a detached copy of its publication view
+    /// at installation time. That copy carries only object-store wrapper state,
+    /// not the live signer, authority, or policy cache. A fresh detached store
+    /// deliberately uses its own caller view rather than choosing an alternate
+    /// store at verification time.
+    #[must_use]
+    pub(crate) fn signer_inventory_store(&self) -> Self {
+        let inventory_view = self
+            .object_signer
+            .read()
+            .unwrap_or_else(|_| panic!("object signer lock poisoned"))
+            .inventory_view
+            .clone();
+        match inventory_view {
+            SignerInventoryView::CallerStore => self.signer_detached_clone(),
+            SignerInventoryView::Installed(store) => store,
+        }
     }
 
     /// Return the SHA-256 computed from an exact body accepted by a prior local PUT.
@@ -692,31 +765,17 @@ impl ZeppelinStore {
     }
 
     /// Sign one canonical domain payload with the published node key.
-    #[must_use]
-    pub(crate) fn object_signer_node(&self) -> Option<String> {
-        self.object_signer
-            .read()
-            .unwrap_or_else(|_| panic!("object signer lock poisoned"))
-            .as_ref()
-            .map(|signer| signer.signer_node().to_string())
+    pub(crate) fn object_signer_node(&self) -> Result<Option<String>> {
+        Ok(self
+            .resolve_object_signer()?
+            .map(|signer| signer.signer_node().to_string()))
     }
 
     /// Sign one canonical domain payload with the published node key.
-    pub(crate) fn sign_object(&self, message: &[u8]) -> Option<(String, Vec<u8>)> {
-        self.object_signer
-            .read()
-            .unwrap_or_else(|_| panic!("object signer lock poisoned"))
-            .as_ref()
-            .map(|signer| (signer.signer_node().to_string(), signer.sign(message)))
-    }
-
-    /// Return the exact S3 view holding the authoritative signer inventory.
-    pub(crate) fn signer_publication_store(&self) -> Option<Self> {
-        self.object_signer
-            .read()
-            .unwrap_or_else(|_| panic!("object signer lock poisoned"))
-            .as_ref()
-            .map(|signer| signer.publication_store())
+    pub(crate) fn sign_object(&self, message: &[u8]) -> Result<Option<(String, Vec<u8>)>> {
+        Ok(self
+            .resolve_object_signer()?
+            .map(|signer| (signer.signer_node().to_string(), signer.sign(message))))
     }
 
     /// Returns a shared handle to the raw backend for test instrumentation.
@@ -2440,10 +2499,46 @@ fn parse_endpoint_port(port: &str) -> Result<u16> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+
+    struct TestObjectSigner {
+        signer_node: String,
+        signature_tag: String,
+        publication_store: ZeppelinStore,
+    }
+
+    impl ObjectSigner for TestObjectSigner {
+        fn signer_node(&self) -> &str {
+            &self.signer_node
+        }
+
+        fn sign(&self, message: &[u8]) -> Vec<u8> {
+            [self.signature_tag.as_bytes(), message].concat()
+        }
+
+        fn publication_store(&self) -> ZeppelinStore {
+            self.publication_store.clone()
+        }
+    }
+
+    fn test_object_signer(store: &ZeppelinStore, signer_node: &str) -> Arc<dyn ObjectSigner> {
+        test_object_signer_with_signature_tag(store, signer_node, signer_node)
+    }
+
+    fn test_object_signer_with_signature_tag(
+        store: &ZeppelinStore,
+        signer_node: &str,
+        signature_tag: &str,
+    ) -> Arc<dyn ObjectSigner> {
+        Arc::new(TestObjectSigner {
+            signer_node: signer_node.to_string(),
+            signature_tag: signature_tag.to_string(),
+            publication_store: store.signer_detached_clone(),
+        })
+    }
 
     /// A create-only write reports the original collision and preserves the first body.
     #[tokio::test]
@@ -2486,5 +2581,143 @@ mod tests {
         assert_eq!(store.known_content_hash("published"), Some([7; 32]));
         store.forget_known_content_hashes([&"published".to_string()]);
         assert_eq!(store.known_content_hash("published"), None);
+    }
+
+    #[test]
+    fn live_object_signer_rejects_a_different_node_and_expired_root_can_be_replaced() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let first = test_object_signer(&store, "node-one");
+        let replacement = test_object_signer(&store, "node-two");
+        store
+            .install_object_signer(Arc::clone(&first))
+            .expect("first signer must install");
+
+        let conflict = store
+            .install_object_signer(Arc::clone(&replacement))
+            .expect_err("a live different signer must be rejected");
+        assert!(
+            conflict.to_string().contains("different node key material"),
+            "unexpected conflict: {conflict}"
+        );
+
+        drop(first);
+        store
+            .install_object_signer(Arc::clone(&replacement))
+            .expect("an expired signer root must allow replacement");
+        assert_eq!(
+            store
+                .object_signer_node()
+                .expect("replacement signer is live"),
+            Some("node-two".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn same_node_rebinds_signer_and_inventory_view_before_the_old_root_drops() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let old_inventory = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let replacement_inventory = ZeppelinStore::new(Arc::new(InMemory::new()));
+        old_inventory
+            .put_create("old-inventory", Bytes::from_static(b"old"))
+            .await
+            .expect("old inventory fixture must write");
+        replacement_inventory
+            .put_create("replacement-inventory", Bytes::from_static(b"replacement"))
+            .await
+            .expect("replacement inventory fixture must write");
+        let old = test_object_signer_with_signature_tag(&old_inventory, "node-one", "old:");
+        let replacement = test_object_signer_with_signature_tag(
+            &replacement_inventory,
+            "node-one",
+            "replacement:",
+        );
+        store
+            .install_object_signer(Arc::clone(&old))
+            .expect("original signer must install");
+        store
+            .install_object_signer(Arc::clone(&replacement))
+            .expect("same-node replacement must rebind before the original drops");
+
+        drop(old);
+        assert_eq!(
+            store
+                .sign_object(b"canonical payload")
+                .expect("replacement root must remain live"),
+            Some((
+                "node-one".to_string(),
+                b"replacement:canonical payload".to_vec()
+            ))
+        );
+        assert_eq!(
+            store
+                .signer_inventory_store()
+                .get("replacement-inventory")
+                .await
+                .expect("same-node replacement must rebind its inventory view"),
+            Bytes::from_static(b"replacement")
+        );
+    }
+
+    #[test]
+    fn expired_object_signer_fails_loudly_instead_of_silently_unsigned() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let signer = test_object_signer(&store, "node-one");
+        store
+            .install_object_signer(Arc::clone(&signer))
+            .expect("signer must install");
+        drop(signer);
+
+        let error = store
+            .sign_object(b"canonical payload")
+            .expect_err("an installed signer whose root ended must fail loudly");
+        assert!(
+            error
+                .to_string()
+                .contains("object signer root ended while the application store remains live"),
+            "unexpected signer lifecycle error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signer_detached_clone_resets_the_installed_inventory_view() {
+        let application = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let publication = ZeppelinStore::new(Arc::new(InMemory::new()));
+        application
+            .put_create("caller-view", Bytes::from_static(b"caller"))
+            .await
+            .expect("caller fixture must write");
+        publication
+            .put_create("published-view", Bytes::from_static(b"published"))
+            .await
+            .expect("publication fixture must write");
+        let signer = test_object_signer(&publication, "node-one");
+        application
+            .install_object_signer(Arc::clone(&signer))
+            .expect("signer must install its publication view");
+
+        assert_eq!(
+            application
+                .signer_inventory_store()
+                .get("published-view")
+                .await
+                .expect("application must retain the installed inventory view"),
+            Bytes::from_static(b"published")
+        );
+
+        let detached = application.signer_detached_clone();
+        assert_eq!(
+            detached
+                .object_signer_node()
+                .expect("detached clone must not resolve an application signer"),
+            None
+        );
+        assert_eq!(
+            detached
+                .signer_inventory_store()
+                .get("caller-view")
+                .await
+                .expect("detached clone must use its explicit caller view"),
+            Bytes::from_static(b"caller")
+        );
     }
 }
