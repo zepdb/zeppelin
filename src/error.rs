@@ -320,6 +320,10 @@ pub enum ZeppelinError {
     #[error("security error: {0}")]
     Security(#[from] crate::security::SecurityError),
 
+    /// Durable security-audit delivery or lifecycle management failed.
+    #[error("audit sink error: {0}")]
+    AuditSink(#[from] crate::security::AuditSinkError),
+
     /// Signed-license parsing or verification failed during composition.
     #[error("license error: {0}")]
     License(#[from] crate::security::LicenseError),
@@ -561,6 +565,7 @@ impl ZeppelinError {
             ZeppelinError::NotImplemented { .. } => "NOT_IMPLEMENTED",
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
             ZeppelinError::Security(error) => error.code(),
+            ZeppelinError::AuditSink(_) => "INTERNAL_ERROR",
             ZeppelinError::License(_) => "INTERNAL_ERROR",
             ZeppelinError::Io(_) => "INTERNAL_ERROR",
             ZeppelinError::Cache(_) => "INTERNAL_ERROR",
@@ -689,6 +694,7 @@ impl ZeppelinError {
             | ZeppelinError::Membership(_)
             | ZeppelinError::KMeansConvergence { .. }
             | ZeppelinError::Config(_)
+            | ZeppelinError::AuditSink(_)
             | ZeppelinError::License(_)
             | ZeppelinError::Io(_)
             | ZeppelinError::Cache(_)
@@ -749,6 +755,16 @@ impl ZeppelinError {
 /// Regression tests for public classification, redaction, and conversion contracts.
 mod tests {
     use super::*;
+
+    /// Verifies audit-writer failures retain a typed top-level classification.
+    #[test]
+    fn audit_sink_error_converts_to_typed_zeppelin_error() {
+        let error = ZeppelinError::from(crate::security::AuditSinkError::WriterAlreadyActive);
+        assert!(matches!(error, ZeppelinError::AuditSink(_)));
+        assert_eq!(error.status_code(), 500);
+        assert_eq!(error.error_code(), "INTERNAL_ERROR");
+        assert_eq!(error.client_message(), "an internal error occurred");
+    }
 
     /// Verifies an internal S3 key miss is a redacted server failure, not a client 404.
     #[test]

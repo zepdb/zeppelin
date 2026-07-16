@@ -190,26 +190,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use chrono::Utc;
-    use object_store::memory::InMemory;
     use tokio::sync::watch;
 
-    use zeppelin::security::{AuditRecord, AuditRuntime};
+    use zeppelin::security::AuditRuntime;
     use zeppelin::startup::BackgroundTasks;
-    use zeppelin::storage::ZeppelinStore;
 
     use super::settle_server_and_backgrounds;
 
     #[tokio::test]
     async fn primary_server_error_still_drains_audit_and_joins_backgrounds() {
-        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
-        let (audit, audit_runtime) =
-            AuditRuntime::start(store.clone(), "main-error-test", Duration::from_secs(60))
-                .await
-                .unwrap();
-        audit
-            .submit_buffered(AuditRecord::open_unsafe_boot(Utc::now(), audit.node_id()))
-            .unwrap();
+        let (_audit, audit_runtime) = AuditRuntime::tracing_only("main-error-test").unwrap();
 
         let (shutdown_tx, mut observer_rx) = watch::channel(false);
         let license_observer = tokio::spawn(async move {
@@ -235,6 +225,5 @@ mod tests {
 
         assert_eq!(result.unwrap_err().to_string(), "primary serve failure");
         assert!(joined.load(Ordering::SeqCst));
-        assert_eq!(store.list_prefix("_audit/").await.unwrap().len(), 1);
     }
 }

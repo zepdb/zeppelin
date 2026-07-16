@@ -359,9 +359,7 @@ pub fn init_logging(config: &Config) {
 /// The tuple return transfers unique responsibility for the audit runtime,
 /// background-task and audit-runtime owners to `main`; Rust prevents draining
 /// or joining either owner twice.
-pub async fn build_app(
-    config: Config,
-) -> Result<(Router, BackgroundTasks, AuditRuntime), Box<dyn std::error::Error>> {
+pub async fn build_app(config: Config) -> ZeppelinResult<(Router, BackgroundTasks, AuditRuntime)> {
     let resolver = Arc::new(FileLicenseResolver::new(
         config.security.license_path.clone(),
     ));
@@ -377,10 +375,10 @@ pub async fn build_app(
 async fn build_app_with_entitlement_resolver(
     config: Config,
     resolver: Arc<dyn EntitlementResolver>,
-) -> Result<(Router, BackgroundTasks, AuditRuntime), Box<dyn std::error::Error>> {
+) -> ZeppelinResult<(Router, BackgroundTasks, AuditRuntime)> {
     if let Err(error) = config.validate() {
         tracing::error!(error = %error, "invalid configuration; refusing to boot");
-        return Err(Box::new(error));
+        return Err(error);
     }
     config.warn_if_unsafe_gc_horizon_override();
 
@@ -430,10 +428,10 @@ async fn build_app_with_entitlement_resolver(
     observe_license_expiry(&entitlements, clock.now());
     let durable_audit_enabled = config.security.audit_s3 && entitlements.has(Feature::AuditS3);
     if durable_audit_enabled && config.storage.backend != StorageBackend::S3 {
-        return Err(Box::new(ZeppelinError::Config(
+        return Err(ZeppelinError::Config(
             "durable audit requires an S3-compatible backend with ETag conditional PUT support"
                 .to_string(),
-        )));
+        ));
     }
 
     let mut storage_available = true;
@@ -447,7 +445,7 @@ async fn build_app_with_entitlement_resolver(
                 bucket = %config.storage.bucket,
                 "storage health probe failed; refusing to boot"
             );
-            return Err(Box::new(error));
+            return Err(error);
         }
         Err(error) => {
             storage_available = false;
@@ -471,7 +469,7 @@ async fn build_app_with_entitlement_resolver(
                     bucket = %config.storage.bucket,
                     "storage health probe failed; refusing to boot"
                 );
-                return Err(Box::new(error));
+                return Err(error);
             }
             Err(error) => {
                 storage_available = false;
@@ -547,7 +545,7 @@ async fn build_app_with_entitlement_resolver(
                     bucket = %config.storage.bucket,
                     "failed to scan namespaces on startup; refusing to boot"
                 );
-                return Err(Box::new(error));
+                return Err(error);
             }
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -566,7 +564,7 @@ async fn build_app_with_entitlement_resolver(
                     bucket = %config.storage.bucket,
                     "failed to scan namespaces on startup; refusing to boot"
                 );
-                return Err(Box::new(error));
+                return Err(error);
             }
             Err(_elapsed) => {
                 tracing::warn!(
