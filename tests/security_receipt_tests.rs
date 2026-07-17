@@ -157,6 +157,107 @@ async fn verify_query_receipt(
 }
 
 #[tokio::test]
+async fn eventual_receipt_proves_only_delete_bearing_wal_that_query_consumed() {
+    let harness = TestHarness::new().await;
+    let server = start_test_server_full(
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+        Config::default(),
+        false,
+        None,
+    )
+    .await;
+    let client = client_with_bearer(&server.admin_bearer);
+    let namespace = create_ns_api_with(
+        &client,
+        &server.base_url,
+        json!({"dimensions": 2, "distance_metric": "euclidean"}),
+    )
+    .await;
+    let upsert = client
+        .post(format!(
+            "{}/v1/namespaces/{namespace}/vectors",
+            server.base_url
+        ))
+        .json(&json!({
+            "vectors": [
+                {"id": "keep", "values": [0.0, 0.0]},
+                {"id": "delete-me", "values": [1.0, 1.0]}
+            ]
+        }))
+        .send()
+        .await
+        .expect("eventual receipt fixture upsert must complete");
+    assert_eq!(upsert.status(), StatusCode::OK);
+    let delete = client
+        .delete(format!(
+            "{}/v1/namespaces/{namespace}/vectors",
+            server.base_url
+        ))
+        .json(&json!({"ids": ["delete-me"]}))
+        .send()
+        .await
+        .expect("eventual receipt fixture delete must complete");
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let manifest = Manifest::read(&harness.store, &namespace)
+        .await
+        .expect("eventual receipt manifest must read")
+        .expect("eventual receipt manifest must exist");
+    let delete_free = manifest
+        .uncompacted_fragments()
+        .iter()
+        .find(|fragment| fragment.delete_count == 0)
+        .expect("fixture must retain one delete-free WAL fragment");
+    let delete_bearing = manifest
+        .uncompacted_fragments()
+        .iter()
+        .find(|fragment| fragment.delete_count > 0)
+        .expect("fixture must retain one delete-bearing WAL fragment");
+    let delete_free_key = WalFragment::s3_key(&namespace, &delete_free.id);
+    let delete_bearing_key = WalFragment::s3_key(&namespace, &delete_bearing.id);
+
+    let query_document = json!({
+        "vector": [0.0, 0.0],
+        "top_k": 2,
+        "consistency": "eventual",
+        "receipt": true
+    });
+    let response = client
+        .post(format!(
+            "{}/v1/namespaces/{namespace}/query",
+            server.base_url
+        ))
+        .json(&query_document)
+        .send()
+        .await
+        .expect("eventual receipt query must complete");
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .expect("eventual receipt query must return JSON");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let touched = body["receipt"]["touched"]
+        .as_array()
+        .expect("eventual receipt must carry touched proofs")
+        .iter()
+        .map(|artifact| artifact["key"].as_str().unwrap())
+        .collect::<HashSet<_>>();
+
+    assert!(
+        touched.contains(delete_bearing_key.as_str()),
+        "Eventual query consumed the delete-bearing WAL fragment"
+    );
+    assert!(
+        !touched.contains(delete_free_key.as_str()),
+        "Eventual query skipped the delete-free WAL fragment"
+    );
+
+    cleanup_ns(&harness.store, &namespace).await;
+}
+
+#[tokio::test]
 async fn v2_origin_receipt_verifies_and_rejects_origin_table_tamper() {
     let harness = TestHarness::new().await;
     let config = Config::default();

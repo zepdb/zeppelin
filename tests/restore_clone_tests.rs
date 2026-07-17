@@ -364,7 +364,7 @@ async fn clone_compacted_generation_is_writable_and_survives_source_delete() {
         .unwrap();
     let target_prefix = format!("{target}/");
     let source_prefix = format!("{source}/");
-    for key in reachable_keys(&target, &target_manifest) {
+    for key in reachable_keys(&target, &target_manifest).unwrap() {
         assert!(key.starts_with(&target_prefix), "target key escaped: {key}");
         assert!(
             !key.starts_with(&source_prefix),
@@ -573,6 +573,7 @@ async fn clone_copy_collision_surfaces_storage_error_and_retains_target() {
         .unwrap()
         .unwrap();
     let source_key = reachable_keys(&source, &source_manifest)
+        .unwrap()
         .into_iter()
         .next()
         .expect("source manifest must reference a copyable artifact");

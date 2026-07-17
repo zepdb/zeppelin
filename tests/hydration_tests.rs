@@ -10,7 +10,9 @@ use common::server::{create_ns_api_fts, start_test_server_with_compactor};
 use common::vectors::{random_vectors, simple_attributes, with_attributes};
 use serde_json::json;
 use tempfile::TempDir;
-use zeppelin::cache::hydration::{HydrationConfig, SegmentHydrator, SessionWindowPolicy};
+use zeppelin::cache::hydration::{
+    HydrationConfig, HydrationTarget, SegmentHydrator, SessionWindowPolicy,
+};
 use zeppelin::cache::DiskCache;
 use zeppelin::compaction::Compactor;
 use zeppelin::config::{
@@ -32,6 +34,8 @@ struct HydrationFixture {
     namespace: String,
     query: Vec<f32>,
     segment: SegmentRef,
+    manifest: Manifest,
+    target: HydrationTarget,
 }
 
 fn base_indexing_config() -> IndexingConfig {
@@ -125,6 +129,9 @@ async fn hydration_fixture_with(
         !segment.cluster_objects.is_empty(),
         "fixture must create grouped cluster objects"
     );
+    let target = HydrationTarget::from_active_manifest(&manifest)
+        .expect("hydration fixture manifest must have a valid local origin")
+        .expect("hydration fixture manifest must have an active segment");
 
     HydrationFixture {
         harness,
@@ -133,6 +140,8 @@ async fn hydration_fixture_with(
         namespace,
         query,
         segment,
+        manifest,
+        target,
     }
 }
 
@@ -157,10 +166,14 @@ fn bitmap_keys(namespace: &str, segment: &SegmentRef) -> Vec<String> {
         .collect()
 }
 
-async fn wait_for_cached_keys(cache: &DiskCache, keys: &[String]) {
+async fn wait_for_cached_keys(cache: &DiskCache, target: &HydrationTarget, keys: &[String]) {
+    let cache_keys = keys
+        .iter()
+        .map(|key| target.cache_key(key))
+        .collect::<Vec<_>>();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if futures::future::join_all(keys.iter().map(|key| cache.get(key)))
+            if futures::future::join_all(cache_keys.iter().map(|key| cache.get(key)))
                 .await
                 .into_iter()
                 .all(|entry| entry.is_some())
@@ -299,12 +312,12 @@ fn metric_gauge_value(name: &str, labels: &[(&str, &str)]) -> f64 {
         .unwrap_or(0.0)
 }
 
-async fn wait_for_cached_segment(cache: &DiskCache, segment: &SegmentRef) {
+async fn wait_for_cached_segment(cache: &DiskCache, target: &HydrationTarget) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let mut all_cached = true;
-            for object in &segment.cluster_objects {
-                match cache.get(&object.key).await {
+            for object in &target.segment().cluster_objects {
+                match cache.get(&target.cache_key(&object.key)).await {
                     Some(bytes) if bytes.len() as u64 == object.size_bytes => {}
                     _ => {
                         all_cached = false;
@@ -320,6 +333,23 @@ async fn wait_for_cached_segment(cache: &DiskCache, segment: &SegmentRef) {
     })
     .await
     .expect("segment objects should hydrate");
+}
+
+fn target_with_segment(fixture: &HydrationFixture, segment: SegmentRef) -> HydrationTarget {
+    let mut manifest = fixture.manifest.clone();
+    let active_id = manifest
+        .active_segment
+        .as_deref()
+        .expect("hydration fixture must have an active segment");
+    let descriptor = manifest
+        .segments
+        .iter_mut()
+        .find(|candidate| candidate.id == active_id)
+        .expect("hydration fixture active descriptor must be present");
+    *descriptor = segment;
+    HydrationTarget::from_active_manifest(&manifest)
+        .expect("modified hydration fixture must retain a valid origin")
+        .expect("modified hydration fixture must retain an active segment")
 }
 
 async fn wait_for_metric_increase(name: &str, labels: &[(&str, &str)], before: f64) {
@@ -418,10 +448,10 @@ async fn test_hot_namespace_hydrates_active_segment() {
         test_hydration_config(0.5),
     );
 
-    hydrator.observe_query(&fixture.namespace, &fixture.segment);
-    hydrator.observe_query(&fixture.namespace, &fixture.segment);
-    hydrator.observe_query(&fixture.namespace, &fixture.segment);
-    wait_for_cached_segment(&cache, &fixture.segment).await;
+    hydrator.observe_query(&fixture.target);
+    hydrator.observe_query(&fixture.target);
+    hydrator.observe_query(&fixture.target);
+    wait_for_cached_segment(&cache, &fixture.target).await;
 
     fixture.counter.reset();
     let wal_reader = WalReader::new(fixture.store.clone());
@@ -452,8 +482,8 @@ async fn test_hydration_includes_attrs_sidecars() {
     let hydrator = start_test_hydrator(&fixture, cache.clone(), 0.5);
     let attrs_keys = attrs_keys(&fixture.namespace, &fixture.segment);
 
-    hydrator.observe_query(&fixture.namespace, &fixture.segment);
-    wait_for_cached_keys(&cache, &attrs_keys).await;
+    hydrator.observe_query(&fixture.target);
+    wait_for_cached_keys(&cache, &fixture.target, &attrs_keys).await;
 
     fixture.counter.reset();
     let filter = category_filter();
@@ -494,8 +524,8 @@ async fn test_hydration_includes_bitmap_sidecars() {
     assert!(!bitmap_keys.is_empty(), "bitmap keys must be planned");
     sidecar_keys.extend(bitmap_keys);
 
-    hydrator.observe_query(&fixture.namespace, &fixture.segment);
-    wait_for_cached_keys(&cache, &sidecar_keys).await;
+    hydrator.observe_query(&fixture.target);
+    wait_for_cached_keys(&cache, &fixture.target, &sidecar_keys).await;
 
     fixture.counter.reset();
     let filter = category_filter();
@@ -535,8 +565,8 @@ async fn test_hydration_includes_global_fts_index() {
     let hydrator = start_test_hydrator(&fixture, cache.clone(), 0.5);
     let global_key = global_fts_key(&fixture.namespace, &fixture.segment.id);
 
-    hydrator.observe_query(&fixture.namespace, &fixture.segment);
-    wait_for_cached_keys(&cache, std::slice::from_ref(&global_key)).await;
+    hydrator.observe_query(&fixture.target);
+    wait_for_cached_keys(&cache, &fixture.target, std::slice::from_ref(&global_key)).await;
 
     fixture.counter.reset();
     let wal_reader = WalReader::new(fixture.store.clone());
@@ -607,7 +637,7 @@ async fn test_capacity_counts_sidecars() {
         &[("reason", "capacity")],
     );
     fixture.counter.reset();
-    hydrator.observe_query(&fixture.namespace, &fixture.segment);
+    hydrator.observe_query(&fixture.target);
     wait_for_metric_increase(
         "zeppelin_hydration_skipped_total",
         &[("reason", "capacity")],
@@ -621,7 +651,10 @@ async fn test_capacity_counts_sidecars() {
         "sidecar-aware capacity refusal must not fetch cluster objects"
     );
     for object in &fixture.segment.cluster_objects {
-        assert_eq!(cache.get(&object.key).await, None);
+        assert_eq!(
+            cache.get(&fixture.target.cache_key(&object.key)).await,
+            None
+        );
     }
 
     fixture.harness.cleanup().await;
@@ -641,7 +674,7 @@ async fn test_capacity_refusal_sets_gauge() {
     let (_cache_dir, cache) = test_cache(1);
     let hydrator = start_test_hydrator(&fixture, cache, 0.5);
 
-    hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    hydrator.request_hydration(&fixture.target);
     wait_for_gauge_value(
         "zeppelin_hydration_refused",
         &[("namespace", &fixture.namespace), ("reason", "capacity")],
@@ -670,7 +703,7 @@ async fn test_capacity_refusal_clears_on_fit() {
     .await;
     let (_small_dir, small_cache) = test_cache(1);
     let refusing_hydrator = start_test_hydrator(&fixture, small_cache, 0.5);
-    refusing_hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    refusing_hydrator.request_hydration(&fixture.target);
     wait_for_gauge_value(
         "zeppelin_hydration_refused",
         &[("namespace", &fixture.namespace), ("reason", "capacity")],
@@ -680,8 +713,8 @@ async fn test_capacity_refusal_clears_on_fit() {
 
     let (_fit_dir, fit_cache) = test_cache(512 * 1024 * 1024);
     let fitting_hydrator = start_test_hydrator(&fixture, fit_cache.clone(), 0.5);
-    fitting_hydrator.request_hydration(&fixture.namespace, &fixture.segment);
-    wait_for_cached_segment(&fit_cache, &fixture.segment).await;
+    fitting_hydrator.request_hydration(&fixture.target);
+    wait_for_cached_segment(&fit_cache, &fixture.target).await;
     wait_for_gauge_value(
         "zeppelin_hydration_refused",
         &[("namespace", &fixture.namespace), ("reason", "capacity")],
@@ -708,7 +741,7 @@ async fn test_refusal_logs_once_per_generation() {
         .with_label_values(&[fixture.namespace.as_str(), "capacity"]);
     let before = log_counter.get();
 
-    hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    hydrator.request_hydration(&fixture.target);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if log_counter.get() > before {
@@ -721,7 +754,7 @@ async fn test_refusal_logs_once_per_generation() {
     .expect("refusal log counter should increase");
     let after_first = log_counter.get();
 
-    hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    hydrator.request_hydration(&fixture.target);
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         log_counter.get(),
@@ -744,7 +777,7 @@ async fn test_refused_namespace_queries_correct() {
     .await;
     let (_cache_dir, cache) = test_cache(1);
     let hydrator = start_test_hydrator(&fixture, cache.clone(), 0.5);
-    hydrator.request_hydration(&fixture.namespace, &fixture.segment);
+    hydrator.request_hydration(&fixture.target);
     wait_for_gauge_value(
         "zeppelin_hydration_refused",
         &[("namespace", &fixture.namespace), ("reason", "capacity")],
@@ -793,8 +826,8 @@ async fn test_no_sidecar_keys_hydrated_when_not_configured() {
         .collect::<Vec<_>>();
     expected_keys.extend(attrs_keys(&fixture.namespace, &fixture.segment));
 
-    hydrator.observe_query(&fixture.namespace, &fixture.segment);
-    wait_for_cached_keys(&cache, &expected_keys).await;
+    hydrator.observe_query(&fixture.target);
+    wait_for_cached_keys(&cache, &fixture.target, &expected_keys).await;
 
     assert_eq!(
         bitmap_keys(&fixture.namespace, &fixture.segment),
@@ -802,7 +835,11 @@ async fn test_no_sidecar_keys_hydrated_when_not_configured() {
     );
     assert_eq!(
         cache
-            .get(&global_fts_key(&fixture.namespace, &fixture.segment.id))
+            .get(
+                &fixture
+                    .target
+                    .cache_key(&global_fts_key(&fixture.namespace, &fixture.segment.id,))
+            )
             .await,
         None
     );
@@ -851,7 +888,9 @@ async fn test_query_handler_triggers_hydration_when_enabled() {
         .await
         .unwrap()
         .unwrap();
-    let segment = active_segment_ref(&manifest).clone();
+    let target = HydrationTarget::from_active_manifest(&manifest)
+        .expect("query hydration manifest must have a valid origin")
+        .expect("query hydration manifest must have an active segment");
 
     for _ in 0..3 {
         client
@@ -868,7 +907,7 @@ async fn test_query_handler_triggers_hydration_when_enabled() {
             .error_for_status()
             .unwrap();
     }
-    wait_for_cached_segment(&cache, &segment).await;
+    wait_for_cached_segment(&cache, &target).await;
 
     harness
         .store
@@ -925,6 +964,9 @@ async fn test_bm25_query_handler_triggers_hydration_when_enabled() {
         .unwrap()
         .unwrap();
     let segment = active_segment_ref(&manifest).clone();
+    let target = HydrationTarget::from_active_manifest(&manifest)
+        .expect("BM25 hydration manifest must have a valid origin")
+        .expect("BM25 hydration manifest must have an active segment");
     assert!(
         segment.has_global_fts,
         "fixture must build a global FTS sidecar"
@@ -936,7 +978,7 @@ async fn test_bm25_query_handler_triggers_hydration_when_enabled() {
     );
     for key in &attr_sidecars {
         assert_eq!(
-            cache.get(key).await,
+            cache.get(&target.cache_key(key)).await,
             None,
             "BM25 hydration evidence must start cold for attrs sidecars"
         );
@@ -961,7 +1003,7 @@ async fn test_bm25_query_handler_triggers_hydration_when_enabled() {
             response.text().await.unwrap()
         );
     }
-    wait_for_cached_keys(&cache, &attr_sidecars).await;
+    wait_for_cached_keys(&cache, &target, &attr_sidecars).await;
 
     harness
         .store
@@ -989,7 +1031,10 @@ async fn test_hydration_disabled_is_inert() {
     }
 
     for object in &fixture.segment.cluster_objects {
-        assert_eq!(cache.get(&object.key).await, None);
+        assert_eq!(
+            cache.get(&fixture.target.cache_key(&object.key)).await,
+            None
+        );
     }
 
     fixture.harness.cleanup().await;
@@ -1009,13 +1054,14 @@ async fn test_incremental_segment_refuses_hydration() {
     );
     let mut segment = fixture.segment.clone();
     segment.cluster_owners = vec!["older-segment".to_string(); segment.cluster_count];
+    let target = target_with_segment(&fixture, segment);
 
     let before = metric_value(
         "zeppelin_hydration_skipped_total",
         &[("reason", "incremental_segment")],
     );
     fixture.counter.reset();
-    hydrator.observe_query(&fixture.namespace, &segment);
+    hydrator.observe_query(&target);
     wait_for_metric_increase(
         "zeppelin_hydration_skipped_total",
         &[("reason", "incremental_segment")],
@@ -1047,13 +1093,14 @@ async fn test_size_mismatch_aborts_hydration() {
     let mut segment = fixture.segment.clone();
     segment.cluster_objects[0].size_bytes += 1;
     let bad_key = segment.cluster_objects[0].key.clone();
+    let target = target_with_segment(&fixture, segment);
 
     let before = metric_value("zeppelin_hydration_failures_total", &[]);
-    hydrator.observe_query(&fixture.namespace, &segment);
+    hydrator.observe_query(&target);
     wait_for_metric_increase("zeppelin_hydration_failures_total", &[], before).await;
 
     assert_eq!(
-        cache.get(&bad_key).await,
+        cache.get(&target.cache_key(&bad_key)).await,
         None,
         "size-mismatched object must be evicted after failed hydration"
     );
@@ -1079,7 +1126,7 @@ async fn test_capacity_refusal_baseline() {
         &[("reason", "capacity")],
     );
     fixture.counter.reset();
-    hydrator.observe_query(&fixture.namespace, &fixture.segment);
+    hydrator.observe_query(&fixture.target);
     wait_for_metric_increase(
         "zeppelin_hydration_skipped_total",
         &[("reason", "capacity")],
@@ -1093,7 +1140,10 @@ async fn test_capacity_refusal_baseline() {
         "capacity-refused hydration must not fetch cluster objects"
     );
     for object in &fixture.segment.cluster_objects {
-        assert_eq!(cache.get(&object.key).await, None);
+        assert_eq!(
+            cache.get(&fixture.target.cache_key(&object.key)).await,
+            None
+        );
     }
 
     fixture.harness.cleanup().await;

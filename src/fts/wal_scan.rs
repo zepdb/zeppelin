@@ -70,7 +70,6 @@
 //! borrow. Iterator pipelines build query states and term inputs without
 //! virtual dispatch, while `TopK` owns only the best bounded set.
 
-use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -83,8 +82,9 @@ use crate::fts::wal_cache::WalFtsCache;
 use crate::fts::FtsFieldConfig;
 use crate::index::filter::evaluate_filter;
 use crate::index::topk::TopK;
+use crate::namespace::branching::ArtifactOrigin;
 use crate::types::{AttributeValue, Filter, SearchResult};
-use crate::wal::fragment::WalFragment;
+use crate::wal::reader::LocatedWalFragment;
 
 /// Ephemeral token statistics keyed first by document ID and then field name.
 ///
@@ -186,7 +186,10 @@ pub struct WalBm25ScanResult {
 /// # Parameters
 ///
 /// - `fragments`: Manifest-selected, decoded immutable fragments in ascending
-///   replay sequence. Reversing the slice changes update/delete outcomes.
+///   replay sequence, each retaining its resolved physical origin identity.
+///   Reversing the slice changes update/delete outcomes.
+/// - `logical_origin`: Exact target namespace lifetime whose manifest made the
+///   fragment sequence visible. Derived-cache ownership is scoped to this value.
 /// - `rank_by`: Borrowed lexical ranking expression. BM25 leaves identify field
 ///   and query text; sum, max, and product nodes combine per-field scores.
 /// - `fts_configs`: Validated tokenization and BM25 settings keyed by field.
@@ -289,8 +292,9 @@ pub struct WalBm25ScanResult {
 /// after top-k selection, avoiding Java-style eager object copies and manual C
 /// ownership bookkeeping.
 #[allow(clippy::too_many_arguments)]
-pub fn wal_bm25_scan<F>(
-    fragments: &[F],
+pub(crate) fn wal_bm25_scan(
+    fragments: &[LocatedWalFragment],
+    logical_origin: &ArtifactOrigin,
     rank_by: &RankBy,
     fts_configs: &HashMap<String, FtsFieldConfig>,
     last_as_prefix: bool,
@@ -298,10 +302,7 @@ pub fn wal_bm25_scan<F>(
     filter: Option<&Filter>,
     include_attributes: bool,
     top_k: Option<usize>,
-) -> WalBm25ScanResult
-where
-    F: Borrow<WalFragment>,
-{
+) -> WalBm25ScanResult {
     let frag_count = fragments.len();
 
     if fragments.is_empty() {
@@ -320,7 +321,7 @@ where
         HashMap::new();
 
     for fragment in fragments {
-        let fragment = fragment.borrow();
+        let fragment = fragment.fragment.as_ref();
         for del_id in &fragment.deletes {
             deleted_ids.insert(del_id.clone());
             latest_vectors.remove(del_id.as_str());
@@ -403,8 +404,13 @@ where
     if let Some(cache) = fts_cache {
         // Cache hits avoid tokenizer CPU but still clone owned maps.
         for fragment in fragments {
-            let fragment = fragment.borrow();
-            let cached = cache.get_or_tokenize(fragment, fts_configs, &fields_needed);
+            let cached = cache.get_or_tokenize(
+                logical_origin,
+                &fragment.identity,
+                fragment.fragment.as_ref(),
+                fts_configs,
+                &fields_needed,
+            );
             for ((doc_id, field_name), token_data) in &cached.doc_field_data {
                 // Exclude IDs whose final operation is a delete. Notice that an
                 // older version of a still-live ID also passes this membership
@@ -623,8 +629,19 @@ mod tests {
     //! downstream WAL/segment merge.
 
     use super::*;
+    use crate::namespace::{NamespaceId, NamespaceIncarnationId};
     use crate::types::VectorEntry;
+    use crate::wal::fragment::WalFragment;
+    use crate::wal::manifest::LocatedFragmentIdentity;
+    use std::sync::Arc;
     use ulid::Ulid;
+
+    fn origin(namespace: &str, incarnation: u128) -> ArtifactOrigin {
+        ArtifactOrigin {
+            namespace: NamespaceId::parse(namespace).unwrap(),
+            incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(incarnation)),
+        }
+    }
 
     /// Builds a fragment fixture with an independent ULID cache key.
     ///
@@ -637,12 +654,27 @@ mod tests {
     ///
     /// A decoded fragment with an unused dummy checksum. Vector/delete overlap
     /// is not validated because the fixture bypasses production constructors.
-    fn make_fragment(vectors: Vec<VectorEntry>, deletes: Vec<String>) -> WalFragment {
-        WalFragment {
-            id: Ulid::new(),
-            vectors,
-            deletes,
-            checksum: 0,
+    fn make_fragment(vectors: Vec<VectorEntry>, deletes: Vec<String>) -> LocatedWalFragment {
+        make_fragment_at(origin("physical", 1), Ulid::new(), vectors, deletes)
+    }
+
+    fn make_fragment_at(
+        physical_origin: ArtifactOrigin,
+        id: Ulid,
+        vectors: Vec<VectorEntry>,
+        deletes: Vec<String>,
+    ) -> LocatedWalFragment {
+        LocatedWalFragment {
+            identity: LocatedFragmentIdentity {
+                physical_origin,
+                id,
+            },
+            fragment: Arc::new(WalFragment {
+                id,
+                vectors,
+                deletes,
+                checksum: 0,
+            }),
         }
     }
 
@@ -709,6 +741,7 @@ mod tests {
 
         let result = wal_bm25_scan(
             &fragments,
+            &origin("logical", 100),
             &rank_by,
             &make_configs(),
             false,
@@ -749,6 +782,7 @@ mod tests {
         // The first scan exercises the tokenization-and-insert miss path.
         let result1 = wal_bm25_scan(
             &fragments,
+            &origin("logical", 100),
             &rank_by,
             &make_configs(),
             false,
@@ -763,6 +797,7 @@ mod tests {
         // The identical second scan exercises the deep-cloned hit path.
         let result2 = wal_bm25_scan(
             &fragments,
+            &origin("logical", 100),
             &rank_by,
             &make_configs(),
             false,
@@ -799,6 +834,7 @@ mod tests {
 
         let result = wal_bm25_scan(
             &fragments,
+            &origin("logical", 100),
             &rank_by,
             &make_configs(),
             false,
@@ -819,7 +855,8 @@ mod tests {
     /// reported.
     fn test_wal_scan_empty_fragments() {
         let result = wal_bm25_scan(
-            &[] as &[WalFragment],
+            &[] as &[LocatedWalFragment],
+            &origin("logical", 100),
             &RankBy::Bm25 {
                 field: "content".to_string(),
                 query: "cat".to_string(),
@@ -850,6 +887,7 @@ mod tests {
 
         let result = wal_bm25_scan(
             &fragments,
+            &origin("logical", 100),
             &rank_by,
             &make_configs(),
             false,
@@ -910,9 +948,56 @@ mod tests {
         );
 
         let result = wal_bm25_scan(
-            &fragments, &rank_by, &configs, false, None, None, true, None,
+            &fragments,
+            &origin("logical", 100),
+            &rank_by,
+            &configs,
+            false,
+            None,
+            None,
+            true,
+            None,
         );
         assert_eq!(result.results.len(), 1);
         assert!(result.results[0].score > 0.0);
+    }
+
+    #[test]
+    fn cached_scan_keeps_equal_ulids_from_different_origins_distinct() {
+        let shared_id = Ulid::new();
+        let fragments = vec![
+            make_fragment_at(
+                origin("source", 1),
+                shared_id,
+                vec![make_vec_entry("source-doc", "apple")],
+                Vec::new(),
+            ),
+            make_fragment_at(
+                origin("target", 2),
+                shared_id,
+                vec![make_vec_entry("target-doc", "banana")],
+                Vec::new(),
+            ),
+        ];
+        let cache = WalFtsCache::new();
+
+        let result = wal_bm25_scan(
+            &fragments,
+            &origin("logical", 100),
+            &RankBy::Bm25 {
+                field: "content".to_string(),
+                query: "banana".to_string(),
+            },
+            &make_configs(),
+            false,
+            Some(&cache),
+            None,
+            false,
+            None,
+        );
+
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].id, "target-doc");
+        assert_eq!(cache.len(), 2);
     }
 }

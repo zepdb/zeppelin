@@ -3040,6 +3040,8 @@ pub async fn build_ivf_flat(
         num_vectors: vectors.len(),
         dim,
         namespace: namespace.to_string(),
+        physical_namespace: namespace.to_string(),
+        physical_origin: None,
         segment_id: segment_id.to_string(),
         quantization,
         sq_calibration,
@@ -3141,11 +3143,72 @@ pub async fn load_ivf_flat_from_manifest(
     bootstrap_ref: Option<BootstrapRef>,
     cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
 ) -> Result<IvfFlatIndex> {
+    load_ivf_flat_from_manifest_routed(
+        store,
+        namespace,
+        namespace,
+        None,
+        None,
+        segment_id,
+        num_vectors,
+        quantization,
+        cluster_owners,
+        cluster_objects,
+        sketch_ref,
+        bootstrap_ref,
+        cache,
+    )
+    .await
+}
+
+/// Loads one descriptor using the manifest-resolved physical artifact owner.
+pub(crate) async fn load_ivf_flat_from_located_manifest(
+    store: &ZeppelinStore,
+    located: crate::wal::manifest::LocatedSegmentRef<'_>,
+    cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
+) -> Result<IvfFlatIndex> {
+    let segment = located.segment;
+    load_ivf_flat_from_manifest_routed(
+        store,
+        located.logical_namespace,
+        located.physical_namespace(),
+        Some(located.logical_origin.as_origin()),
+        Some(located.physical_origin.as_origin()),
+        &segment.id,
+        segment.vector_count,
+        segment.quantization,
+        segment.cluster_owners.clone(),
+        segment.cluster_objects.clone(),
+        segment.sketch.clone(),
+        segment.bootstrap.clone(),
+        cache,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_ivf_flat_from_manifest_routed(
+    store: &ZeppelinStore,
+    logical_namespace: &str,
+    physical_namespace: &str,
+    logical_origin: Option<&crate::namespace::branching::ArtifactOrigin>,
+    physical_origin: Option<&crate::namespace::branching::ArtifactOrigin>,
+    segment_id: &str,
+    num_vectors: usize,
+    quantization: QuantizationType,
+    cluster_owners: Vec<String>,
+    cluster_objects: Vec<ClusterDataObjectRef>,
+    sketch_ref: Option<crate::wal::manifest::SketchRef>,
+    bootstrap_ref: Option<BootstrapRef>,
+    cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
+) -> Result<IvfFlatIndex> {
     let metadata = match bootstrap_ref.as_ref() {
         Some(bootstrap_ref) => {
             load_bootstrap_artifacts(
                 store,
-                namespace,
+                logical_namespace,
+                physical_origin,
+                logical_origin,
                 bootstrap_ref,
                 sketch_ref.as_ref(),
                 num_vectors,
@@ -3154,14 +3217,24 @@ pub async fn load_ivf_flat_from_manifest(
             .await?
         }
         None => {
-            let ckey = centroids_key(namespace, segment_id);
+            let ckey = centroids_key(physical_namespace, segment_id);
+            let cache_key = super::artifact_cache_key(physical_origin, &ckey);
             let data = match cache {
                 Some(c) => {
-                    let data = c.get_or_fetch(&ckey, || store.get(&ckey)).await?;
+                    let data = c.get_or_fetch(&cache_key, || store.get(&ckey)).await?;
                     // This load path is only used for the manifest's active segment;
                     // pin its centroids (unpinning the previous segment's).
-                    c.pin_scoped(&format!("{namespace}:centroids"), &ckey).await;
-                    c.unpin_scoped(&format!("{namespace}:bootstrap")).await;
+                    c.pin_scoped(
+                        &super::cache_pin_scope(logical_origin, logical_namespace, "centroids"),
+                        &cache_key,
+                    )
+                    .await;
+                    c.unpin_scoped(&super::cache_pin_scope(
+                        logical_origin,
+                        logical_namespace,
+                        "bootstrap",
+                    ))
+                    .await;
                     data
                 }
                 None => store.get(&ckey).await?,
@@ -3174,7 +3247,9 @@ pub async fn load_ivf_flat_from_manifest(
                 .transpose()?;
             let resident_sketch = load_resident_sketch(
                 store,
-                namespace,
+                logical_namespace,
+                physical_origin,
+                logical_origin,
                 sketch_ref.as_ref(),
                 &centroids_data.centroids,
                 num_vectors,
@@ -3193,7 +3268,8 @@ pub async fn load_ivf_flat_from_manifest(
         build_cluster_object_lookup(metadata.centroids.len(), &cluster_objects)?;
 
     info!(
-        namespace = namespace,
+        namespace = logical_namespace,
+        physical_namespace,
         segment_id = segment_id,
         num_vectors = num_vectors,
         num_clusters = metadata.centroids.len(),
@@ -3206,7 +3282,9 @@ pub async fn load_ivf_flat_from_manifest(
         centroids: metadata.centroids,
         num_vectors,
         dim: metadata.dim,
-        namespace: namespace.to_string(),
+        namespace: logical_namespace.to_string(),
+        physical_namespace: physical_namespace.to_string(),
+        physical_origin: physical_origin.cloned(),
         segment_id: segment_id.to_string(),
         quantization,
         sq_calibration: metadata.sq_calibration,
@@ -3262,9 +3340,12 @@ pub async fn load_ivf_flat_from_manifest(
 ///
 /// The cold path performs one GET and decodes both child artifacts. Decoded hits
 /// clone only [`Arc`] handles and the small SQ calibration value.
+#[allow(clippy::too_many_arguments)]
 async fn load_bootstrap_artifacts(
     store: &ZeppelinStore,
     namespace: &str,
+    physical_origin: Option<&crate::namespace::branching::ArtifactOrigin>,
+    logical_origin: Option<&crate::namespace::branching::ArtifactOrigin>,
     bootstrap_ref: &BootstrapRef,
     sketch_ref: Option<&crate::wal::manifest::SketchRef>,
     expected_vector_count: usize,
@@ -3278,8 +3359,9 @@ async fn load_bootstrap_artifacts(
     };
 
     if let Some(c) = cache {
-        if let Some(decoded) = c.get_decoded::<DecodedBootstrap>(&bootstrap_ref.key)? {
-            pin_bootstrap_metadata(c, namespace, &bootstrap_ref.key).await;
+        let cache_key = super::artifact_cache_key(physical_origin, &bootstrap_ref.key);
+        if let Some(decoded) = c.get_decoded::<DecodedBootstrap>(&cache_key)? {
+            pin_bootstrap_metadata(c, logical_origin, namespace, &cache_key).await;
             return metadata_from_decoded_bootstrap(
                 &bootstrap_ref.key,
                 decoded,
@@ -3290,14 +3372,15 @@ async fn load_bootstrap_artifacts(
         }
     }
     if let Some(c) = cache {
+        let cache_key = super::artifact_cache_key(physical_origin, &bootstrap_ref.key);
         // Process-wide decoded reuse is only for disk-cache-backed query paths;
         // cache-less callers are cold by construction and fetch S3 bytes.
         if let Some(decoded) = bootstrap_decoded_cache()
-            .get(&bootstrap_ref.key)
+            .get(&cache_key)
             .and_then(|entry| entry.value().upgrade())
         {
-            c.insert_decoded(&bootstrap_ref.key, Arc::clone(&decoded));
-            pin_bootstrap_metadata(c, namespace, &bootstrap_ref.key).await;
+            c.insert_decoded(&cache_key, Arc::clone(&decoded));
+            pin_bootstrap_metadata(c, logical_origin, namespace, &cache_key).await;
             return metadata_from_decoded_bootstrap(
                 &bootstrap_ref.key,
                 decoded,
@@ -3310,10 +3393,11 @@ async fn load_bootstrap_artifacts(
 
     let data = match cache {
         Some(c) => {
+            let cache_key = super::artifact_cache_key(physical_origin, &bootstrap_ref.key);
             let data = c
-                .get_or_fetch(&bootstrap_ref.key, || store.get(&bootstrap_ref.key))
+                .get_or_fetch(&cache_key, || store.get(&bootstrap_ref.key))
                 .await?;
-            pin_bootstrap_metadata(c, namespace, &bootstrap_ref.key).await;
+            pin_bootstrap_metadata(c, logical_origin, namespace, &cache_key).await;
             data
         }
         None => store.get(&bootstrap_ref.key).await?,
@@ -3360,8 +3444,9 @@ async fn load_bootstrap_artifacts(
         resident_sketch: Arc::clone(&sketch),
     });
     if let Some(c) = cache {
-        bootstrap_decoded_cache().insert(bootstrap_ref.key.clone(), Arc::downgrade(&decoded));
-        c.insert_decoded(&bootstrap_ref.key, decoded);
+        let cache_key = super::artifact_cache_key(physical_origin, &bootstrap_ref.key);
+        bootstrap_decoded_cache().insert(cache_key.clone(), Arc::downgrade(&decoded));
+        c.insert_decoded(&cache_key, decoded);
     }
 
     Ok(LoadedIndexMetadata {
@@ -3448,15 +3533,29 @@ fn metadata_from_decoded_bootstrap(
 /// old role pins are released before the combined object is pinned.
 async fn pin_bootstrap_metadata(
     cache: &crate::cache::DiskCache,
+    logical_origin: Option<&crate::namespace::branching::ArtifactOrigin>,
     namespace: &str,
     bootstrap_key: &str,
 ) {
-    cache.unpin_scoped(&format!("{namespace}:centroids")).await;
     cache
-        .unpin_scoped(&format!("{namespace}:coarse_sketch"))
+        .unpin_scoped(&super::cache_pin_scope(
+            logical_origin,
+            namespace,
+            "centroids",
+        ))
         .await;
     cache
-        .pin_scoped(&format!("{namespace}:bootstrap"), bootstrap_key)
+        .unpin_scoped(&super::cache_pin_scope(
+            logical_origin,
+            namespace,
+            "coarse_sketch",
+        ))
+        .await;
+    cache
+        .pin_scoped(
+            &super::cache_pin_scope(logical_origin, namespace, "bootstrap"),
+            bootstrap_key,
+        )
         .await;
 }
 
@@ -3489,9 +3588,12 @@ async fn pin_bootstrap_metadata(
 ///
 /// A decoded hit performs no GET and shares the allocation. A cold path
 /// performs one GET and one complete sketch decode.
+#[allow(clippy::too_many_arguments)]
 async fn load_resident_sketch(
     store: &ZeppelinStore,
     namespace: &str,
+    physical_origin: Option<&crate::namespace::branching::ArtifactOrigin>,
+    logical_origin: Option<&crate::namespace::branching::ArtifactOrigin>,
     sketch_ref: Option<&crate::wal::manifest::SketchRef>,
     centroids: &[Vec<f32>],
     expected_vector_count: usize,
@@ -3502,23 +3604,31 @@ async fn load_resident_sketch(
     };
 
     if let Some(c) = cache {
-        if let Some(sketch) = c.get_decoded::<ResidentSketch>(&sketch_ref.key)? {
+        let cache_key = super::artifact_cache_key(physical_origin, &sketch_ref.key);
+        if let Some(sketch) = c.get_decoded::<ResidentSketch>(&cache_key)? {
             sketch.validate_reference(sketch_ref)?;
             sketch.validate_vector_count(expected_vector_count)?;
             sketch.validate_centroid_shape(centroids)?;
-            c.pin_scoped(&format!("{namespace}:coarse_sketch"), &sketch_ref.key)
-                .await;
+            c.pin_scoped(
+                &super::cache_pin_scope(logical_origin, namespace, "coarse_sketch"),
+                &cache_key,
+            )
+            .await;
             return Ok(Some(sketch));
         }
     }
 
     let data = match cache {
         Some(c) => {
+            let cache_key = super::artifact_cache_key(physical_origin, &sketch_ref.key);
             let data = c
-                .get_or_fetch(&sketch_ref.key, || store.get(&sketch_ref.key))
+                .get_or_fetch(&cache_key, || store.get(&sketch_ref.key))
                 .await?;
-            c.pin_scoped(&format!("{namespace}:coarse_sketch"), &sketch_ref.key)
-                .await;
+            c.pin_scoped(
+                &super::cache_pin_scope(logical_origin, namespace, "coarse_sketch"),
+                &cache_key,
+            )
+            .await;
             data
         }
         None => store.get(&sketch_ref.key).await?,
@@ -3530,7 +3640,8 @@ async fn load_resident_sketch(
         expected_vector_count,
     )?);
     if let Some(c) = cache {
-        c.insert_decoded(&sketch_ref.key, Arc::clone(&sketch));
+        let cache_key = super::artifact_cache_key(physical_origin, &sketch_ref.key);
+        c.insert_decoded(&cache_key, Arc::clone(&sketch));
     }
     Ok(Some(sketch))
 }
@@ -3701,6 +3812,8 @@ pub async fn load_ivf_flat(
         num_vectors,
         dim,
         namespace: namespace.to_string(),
+        physical_namespace: namespace.to_string(),
+        physical_origin: None,
         segment_id: segment_id.to_string(),
         quantization,
         sq_calibration,

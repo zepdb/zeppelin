@@ -150,7 +150,7 @@ pub mod hydration;
 pub mod manifest_cache;
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -336,6 +336,47 @@ struct CacheEntry {
     last_accessed: Instant,
 }
 
+/// Process-local ownership for scoped cache pins.
+///
+/// `scope_keys` records the one physical cache key retained by each logical
+/// scope. `key_refcounts` is the inverse ownership count, so two branched
+/// namespaces can retain the same immutable physical artifact independently.
+/// Both maps live behind one async mutex to make rotation and release one
+/// atomic state transition.
+#[derive(Default)]
+struct ScopedPinState {
+    scope_keys: HashMap<String, String>,
+    key_refcounts: HashMap<String, usize>,
+}
+
+impl ScopedPinState {
+    fn add_key_owner(&mut self, key: &str) {
+        let count = self.key_refcounts.entry(key.to_string()).or_default();
+        *count = match count.checked_add(1) {
+            Some(next) => next,
+            None => panic!("scoped pin owner count overflowed"),
+        };
+    }
+
+    #[must_use]
+    fn remove_key_owner(&mut self, key: &str) -> bool {
+        let last_owner = {
+            let Some(count) = self.key_refcounts.get_mut(key) else {
+                panic!("scoped pin must have an owner count");
+            };
+            *count = match count.checked_sub(1) {
+                Some(next) => next,
+                None => panic!("scoped pin owner count must be positive"),
+            };
+            *count == 0
+        };
+        if last_owner {
+            self.key_refcounts.remove(key);
+        }
+        last_owner
+    }
+}
+
 /// Shared façade over an optional memory cache and a persistent local disk cache.
 ///
 /// Files are stored at `{dir}/{filename}`, with `/` in the object key replaced
@@ -369,11 +410,10 @@ pub struct DiskCache {
     entries: Arc<DashMap<String, CacheEntry>>,
     /// Object keys that approximate-LRU eviction must skip when selecting.
     pinned: Arc<RwLock<HashSet<String>>>,
-    /// One pinned key per scope (namespace): pinning a new key for a scope
-    /// unpins the scope's previous key. Used for active-segment index
-    /// metadata (centroids / tree meta) that must survive LRU pressure but
-    /// release automatically on segment rotation.
-    scoped_pins: DashMap<String, String>,
+    /// One pinned key per logical scope plus the inverse owner count for each
+    /// physical key. Pinning a new key rotates only that scope; a physical key
+    /// remains pinned while any other scope still owns it.
+    scoped_pins: Mutex<ScopedPinState>,
     /// Sum of indexed disk-entry sizes; external filesystem changes may make
     /// it differ temporarily from bytes physically present in the directory.
     total_size: Arc<AtomicU64>,
@@ -525,7 +565,7 @@ impl DiskCache {
             max_size_bytes,
             entries: Arc::new(DashMap::new()),
             pinned: Arc::new(RwLock::new(HashSet::new())),
-            scoped_pins: DashMap::new(),
+            scoped_pins: Mutex::new(ScopedPinState::default()),
             total_size: Arc::new(AtomicU64::new(0)),
             decoded: DashMap::new(),
             memory: memory.map(Arc::new),
@@ -1193,11 +1233,10 @@ impl DiskCache {
 
     /// Rotates one logical scope to a new pinned cache key.
     ///
-    /// In normal serialized lifecycle use, a scope has one current key. Pinning
-    /// the same key repairs/mirrors its memory pin and otherwise returns quickly.
-    /// Pinning a new key removes the old key from disk and memory pin sets and
-    /// drops the old decoded value before retaining the replacement. Separate
-    /// scopes do not intentionally rotate one another.
+    /// A scope has one current key. Pinning the same key repairs/mirrors its
+    /// disk and memory pins. Pinning a new key releases the old physical key
+    /// only when no other logical scope retains it, then retains the
+    /// replacement.
     ///
     /// # Parameters
     ///
@@ -1207,8 +1246,9 @@ impl DiskCache {
     ///
     /// # Side Effects
     ///
-    /// Updates the scope map, both pin sets, decoded entries for a rotated old
-    /// key, and structured logs. No local or object-store I/O occurs.
+    /// Updates the scope ownership maps, both pin sets, decoded entries for an
+    /// unowned rotated key, and structured logs. No local or object-store I/O
+    /// occurs.
     ///
     /// # Consistency
     ///
@@ -1218,50 +1258,52 @@ impl DiskCache {
     ///
     /// # Performance
     ///
-    /// Re-pinning the current key uses one DashMap lookup and a shared async
-    /// pin-set read. Rotation allocates two strings and takes the pin-set write
-    /// lock; it does not scan cache entries.
+    /// Scoped transitions are serialized by one async mutex and update
+    /// constant-time hash-map entries. Rotation allocates two strings and takes
+    /// the pin-set write lock; it does not scan cache entries or scopes.
     ///
     /// # Examples
     ///
     /// Scope `photos:centroids` initially points to segment 7. After compaction
-    /// makes segment 8 active, rotating the scope unpins segment 7, drops its
-    /// decoded centroids, and retains segment 8 instead.
+    /// makes segment 8 active, rotating the scope releases segment 7 if this
+    /// was its last owner, drops its decoded centroids, and retains segment 8.
     ///
     /// # Rust Notes for Java/C Engineers
     ///
-    /// The fast path borrows a DashMap entry while awaiting the separate Tokio
-    /// read lock. That await performs no filesystem or network work, but the map
-    /// guard remains live for its lexical scope. Rust makes both guard lifetimes
-    /// explicit; Java/C code relies more heavily on manual lock-scope review.
-    ///
-    /// TODO(doc): Verify whether callers serialize concurrent rotations for the
-    /// same scope. Updating `scoped_pins` and the separate pin set is not one
-    /// atomic critical section, so racing rotations may not preserve a strict
-    /// one-pin-per-scope state at every instant.
+    /// The scoped-state mutex stays held while the derived pin set is updated,
+    /// giving concurrent rotations one lock order: scoped ownership, then the
+    /// disk pin set. Rust makes that guard lifetime explicit; Java/C code relies
+    /// more heavily on manual lock-scope review.
     pub async fn pin_scoped(&self, scope: &str, key: &str) {
-        // The common active-segment case avoids allocation and the exclusive
-        // pin lock; the map guard remains live only across the shared lock wait.
-        if let Some(current) = self.scoped_pins.get(scope) {
-            if current.value() == key && self.pinned.read().await.contains(key) {
-                if let Some(ref mem) = self.memory {
-                    mem.pin(key);
-                }
-                return;
+        let mut scoped = self.scoped_pins.lock().await;
+
+        if scoped
+            .scope_keys
+            .get(scope)
+            .is_some_and(|current| current == key)
+        {
+            let mut pinned = self.pinned.write().await;
+            pinned.insert(key.to_string());
+            if let Some(ref mem) = self.memory {
+                mem.pin(key);
             }
+            return;
         }
 
-        let old = self.scoped_pins.insert(scope.to_string(), key.to_string());
+        let old_key = scoped.scope_keys.insert(scope.to_string(), key.to_string());
+        let release_old = old_key
+            .as_deref()
+            .is_some_and(|old_key| scoped.remove_key_owner(old_key));
+        scoped.add_key_owner(key);
+
         let mut pinned = self.pinned.write().await;
-        if let Some(old_key) = old {
-            if old_key != key {
-                pinned.remove(&old_key);
-                self.decoded.remove(&old_key);
-                if let Some(ref mem) = self.memory {
-                    mem.unpin(&old_key);
-                }
-                debug!(scope = scope, key = %old_key, "unpinned rotated cache key");
+        if let Some(old_key) = old_key.as_deref().filter(|_| release_old) {
+            pinned.remove(old_key);
+            self.decoded.remove(old_key);
+            if let Some(ref mem) = self.memory {
+                mem.unpin(old_key);
             }
+            debug!(scope = scope, key = old_key, "unpinned rotated cache key");
         }
         pinned.insert(key.to_string());
         if let Some(ref mem) = self.memory {
@@ -1279,18 +1321,27 @@ impl DiskCache {
     ///
     /// # Side Effects
     ///
-    /// If the scope exists, removes its mapping, disk and memory pin markers,
-    /// and decoded entry. Raw bytes remain eligible for ordinary eviction. An
-    /// unknown scope is a no-op.
+    /// If the scope exists, removes its ownership. Disk and memory pin markers
+    /// and the decoded entry are released only when this was the physical key's
+    /// last logical owner. Raw bytes then become eligible for ordinary eviction.
+    /// An unknown scope is a no-op.
     ///
     /// # Examples
     ///
     /// Removing `photos:bootstrap` after active metadata is restored from normal
     /// centroids releases the bootstrap decode and makes its bytes evictable.
     pub async fn unpin_scoped(&self, scope: &str) {
-        let Some((_, old_key)) = self.scoped_pins.remove(scope) else {
+        let mut scoped = self.scoped_pins.lock().await;
+        let Some(old_key) = scoped.scope_keys.remove(scope) else {
             return;
         };
+
+        let release_key = scoped.remove_key_owner(&old_key);
+        if !release_key {
+            debug!(scope = scope, key = %old_key, "released shared scoped cache pin owner");
+            return;
+        }
+
         let mut pinned = self.pinned.write().await;
         pinned.remove(&old_key);
         self.decoded.remove(&old_key);

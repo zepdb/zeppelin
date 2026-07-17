@@ -88,6 +88,7 @@ use crate::storage::{ObjectUserMetadata, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::{DistanceMetric, IndexType};
 
+use super::branching::ArtifactOrigin;
 pub use super::types::{is_valid_namespace_name, NamespaceIncarnationId};
 use super::NamespaceId;
 
@@ -408,6 +409,33 @@ impl NamespaceDestructionRecord {
 }
 
 impl NamespaceMetadata {
+    /// Return the authoritative namespace lifetime carried by object metadata.
+    ///
+    /// Legacy metadata can legitimately omit the incarnation. Callers may then
+    /// use a matching bound manifest, but must fail loud if both authorities are
+    /// unbound rather than inventing an identity.
+    pub fn artifact_origin(&self) -> Result<Option<ArtifactOrigin>> {
+        let Some(incarnation) = self.incarnation_id.clone() else {
+            return Ok(None);
+        };
+        if incarnation.is_nil() {
+            return Err(ZeppelinError::Serialization(format!(
+                "namespace {} has a nil incarnation identity",
+                self.name
+            )));
+        }
+        let namespace = NamespaceId::parse(self.name.clone()).map_err(|_| {
+            ZeppelinError::Validation(format!(
+                "namespace metadata name violates namespace grammar: {}",
+                self.name
+            ))
+        })?;
+        Ok(Some(ArtifactOrigin {
+            namespace,
+            incarnation,
+        }))
+    }
+
     /// Builds the object-store key for a namespace metadata record.
     ///
     /// # Parameters

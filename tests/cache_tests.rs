@@ -218,6 +218,57 @@ async fn test_cache_pin_scoped_rotates_on_new_key() {
 }
 
 #[tokio::test]
+async fn test_cache_pin_scoped_shares_physical_key_until_last_scope_releases() {
+    let dir = TempDir::new().unwrap();
+    let cache = test_cache(dir.path(), 100);
+    let shared_key = "source@inc/segments/seg1/centroids.bin";
+    let target_a_scope = "target-a@inc-a:centroids";
+    let target_b_scope = "target-b@inc-b:centroids";
+
+    cache.pin_scoped(target_a_scope, shared_key).await;
+    cache.pin_scoped(target_b_scope, shared_key).await;
+
+    cache.unpin_scoped(target_a_scope).await;
+    assert!(
+        cache.is_pinned(shared_key).await,
+        "one target releasing a shared physical key must not release another target's pin"
+    );
+
+    cache.unpin_scoped(target_b_scope).await;
+    assert!(
+        !cache.is_pinned(shared_key).await,
+        "the shared physical key must be released after its last logical scope"
+    );
+}
+
+#[tokio::test]
+async fn test_cache_pin_scoped_rotation_preserves_other_physical_owner() {
+    let dir = TempDir::new().unwrap();
+    let cache = test_cache(dir.path(), 100);
+    let shared_key = "source@inc/segments/seg1/centroids.bin";
+    let replacement_key = "target-a@inc-a/segments/seg2/centroids.bin";
+    let target_a_scope = "target-a@inc-a:centroids";
+    let target_b_scope = "target-b@inc-b:centroids";
+
+    cache.pin_scoped(target_a_scope, shared_key).await;
+    cache.pin_scoped(target_b_scope, shared_key).await;
+
+    cache.pin_scoped(target_a_scope, replacement_key).await;
+    assert!(
+        cache.is_pinned(shared_key).await,
+        "rotating one target must preserve the shared source key for the other target"
+    );
+    assert!(cache.is_pinned(replacement_key).await);
+
+    cache.unpin_scoped(target_b_scope).await;
+    assert!(!cache.is_pinned(shared_key).await);
+    assert!(cache.is_pinned(replacement_key).await);
+
+    cache.unpin_scoped(target_a_scope).await;
+    assert!(!cache.is_pinned(replacement_key).await);
+}
+
+#[tokio::test]
 async fn test_cache_invalidate() {
     let dir = TempDir::new().unwrap();
     let cache = test_cache(dir.path(), 1024 * 1024);

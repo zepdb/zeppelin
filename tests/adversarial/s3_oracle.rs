@@ -209,22 +209,34 @@ impl S3Tracker {
         };
         let reachable = match reachable_keys_for_s3_oracle(store, namespace, &manifest).await {
             Ok(reachable) => reachable,
-            Err(error) if fault_window_active => {
-                eprintln!(
-                    "tolerated retained-history reachability read failure in active \
-                     fault window for {namespace}: {error}"
-                );
-                reachable_keys(namespace, &manifest)
-            }
             Err(error) => {
-                violations.push(violation(
-                    ViolationId::I14S3Reachability,
-                    op_index,
-                    namespace,
-                    "retained-history reachability read-failed",
-                    json!({ "error": error }),
-                ));
-                reachable_keys(namespace, &manifest)
+                if fault_window_active {
+                    eprintln!(
+                        "tolerated retained-history reachability read failure in active \
+                         fault window for {namespace}: {error}"
+                    );
+                } else {
+                    violations.push(violation(
+                        ViolationId::I14S3Reachability,
+                        op_index,
+                        namespace,
+                        "retained-history reachability read-failed",
+                        json!({ "error": error }),
+                    ));
+                }
+                match reachable_keys(namespace, &manifest) {
+                    Ok(reachable) => reachable,
+                    Err(error) => {
+                        violations.push(violation(
+                            ViolationId::I14S3Reachability,
+                            op_index,
+                            namespace,
+                            "live-manifest artifact origins failed reachability validation",
+                            json!({ "error": error }),
+                        ));
+                        return violations;
+                    }
+                }
             }
         };
         let mut missing = reachable
@@ -448,7 +460,20 @@ pub async fn check_clone_manifest(
     }
 
     let target_prefix = format!("{target}/");
-    let escaped = reachable_keys(target, &manifest)
+    let reachable = match reachable_keys(target, &manifest) {
+        Ok(reachable) => reachable,
+        Err(error) => {
+            violations.push(violation(
+                ViolationId::I9Clone,
+                op_index,
+                target,
+                "clone target artifact origins failed reachability validation",
+                json!({ "error": error }),
+            ));
+            return violations;
+        }
+    };
+    let escaped = reachable
         .into_iter()
         .filter(|key| !key.starts_with(&target_prefix))
         .collect::<Vec<_>>();

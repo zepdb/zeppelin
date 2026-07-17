@@ -134,6 +134,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use axum::extract::{Extension, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -142,12 +143,14 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{info, instrument};
 
+use crate::cache::DiskCache;
 use crate::error::ZeppelinError;
 use crate::index::filter::{combine_filters, evaluate_filter};
 use crate::index::ivf_flat::build::{
     attrs_key, cluster_key, deserialize_attrs, deserialize_cluster_from_object,
 };
 use crate::index::ivf_flat::membership::deserialize_membership;
+use crate::namespace::branching::ArtifactOrigin;
 use crate::namespace::manager::NamespaceMetadata;
 use crate::query;
 use crate::security::{
@@ -155,9 +158,10 @@ use crate::security::{
     AuditParams, FieldMask, NamespaceId, SecurityError,
 };
 use crate::server::{AppState, AuditRequest};
+use crate::storage::ZeppelinStore;
 use crate::types::{AttributeValue, ConsistencyLevel, Filter, VectorEntry, VectorId};
-use crate::wal::manifest::SegmentRef;
-use crate::wal::{FragmentCachePolicy, Manifest, ManifestAppendGuard};
+use crate::wal::manifest::{LocatedFragmentRef, LocatedSegmentRef};
+use crate::wal::{FragmentCachePolicy, Manifest, ManifestAppendGuard, WalFragmentCache, WalReader};
 
 use super::ApiError;
 
@@ -390,6 +394,33 @@ struct FetchProjection<'a> {
     include_attributes: bool,
     /// Optional borrowed metadata allow-list; `None` includes every field.
     attribute_fields: Option<&'a [String]>,
+}
+
+/// Minimal read dependencies for supplied-manifest point lookup.
+#[derive(Clone, Copy)]
+struct FetchReadContext<'a> {
+    store: &'a ZeppelinStore,
+    wal_reader: &'a WalReader,
+    cache: Option<&'a Arc<DiskCache>>,
+    fragment_cache: Option<&'a Arc<WalFragmentCache>>,
+}
+
+impl<'a> From<&'a AppState> for FetchReadContext<'a> {
+    fn from(state: &'a AppState) -> Self {
+        Self {
+            store: &state.store,
+            wal_reader: &state.wal_reader,
+            cache: Some(&state.cache),
+            fragment_cache: Some(&state.fragment_cache),
+        }
+    }
+}
+
+impl<'a> FetchReadContext<'a> {
+    fn fragment_cache_policy(self) -> FragmentCachePolicy<'a> {
+        self.cache
+            .map_or(FragmentCachePolicy::Bypass, FragmentCachePolicy::ReadWrite)
+    }
 }
 
 /// Supplies the wire default for omitted lookup projection flags.
@@ -696,6 +727,7 @@ async fn apply_upsert_security_constraints(
                 attribute_fields: None,
             },
             manifest,
+            meta.artifact_origin()?,
         )
         .await?;
         let rows = response
@@ -1267,6 +1299,7 @@ pub async fn delete_vectors(
     }
     .map_err(ApiError::from)?;
 
+    let authoritative_origin = meta.artifact_origin().map_err(ApiError::from)?;
     let (delete_ids, guard) = match selection {
         DeleteSelection::Ids(ids) if decision.mandatory_filter.is_none() => (ids, None),
         DeleteSelection::Ids(ids) => {
@@ -1286,9 +1319,16 @@ pub async fn delete_vectors(
                     "constrained ID delete lost its mandatory filter".into(),
                 ))
             })?;
-            let ids = select_requested_ids_matching_filter(&state, &ns, &ids, filter, manifest)
-                .await
-                .map_err(ApiError::from)?;
+            let ids = select_requested_ids_matching_filter(
+                &state,
+                &ns,
+                &ids,
+                filter,
+                manifest,
+                authoritative_origin.clone(),
+            )
+            .await
+            .map_err(ApiError::from)?;
             (ids, Some(guard))
         }
         DeleteSelection::Filter(caller_filter) => {
@@ -1310,9 +1350,15 @@ pub async fn delete_vectors(
                             "filter delete did not produce an effective filter".into(),
                         ))
                     })?;
-            let ids = select_all_ids_matching_filter(&state, &ns, &effective_filter, manifest)
-                .await
-                .map_err(ApiError::from)?;
+            let ids = select_all_ids_matching_filter(
+                &state,
+                &ns,
+                &effective_filter,
+                manifest,
+                authoritative_origin,
+            )
+            .await
+            .map_err(ApiError::from)?;
             (ids, Some(guard))
         }
     };
@@ -1380,6 +1426,7 @@ async fn select_requested_ids_matching_filter(
     requested_ids: &[VectorId],
     filter: &Filter,
     manifest: Manifest,
+    authoritative_origin: Option<ArtifactOrigin>,
 ) -> Result<Vec<VectorId>, ZeppelinError> {
     let unique_ids = requested_ids
         .iter()
@@ -1398,6 +1445,7 @@ async fn select_requested_ids_matching_filter(
             attribute_fields: None,
         },
         manifest,
+        authoritative_origin,
     )
     .await?;
     let matching = response
@@ -1423,20 +1471,23 @@ async fn select_all_ids_matching_filter(
     ns: &str,
     filter: &Filter,
     manifest: Manifest,
+    authoritative_origin: Option<ArtifactOrigin>,
 ) -> Result<Vec<VectorId>, ZeppelinError> {
+    let local_origin = resolve_authoritative_artifact_origin(ns, &manifest, authoritative_origin)?;
+    let resolver = manifest.artifact_origin_resolver(&local_origin)?;
     let mut ids = BTreeSet::new();
-    if let Some(segment) = active_segment(&manifest)? {
-        let membership_ref = segment.membership.as_ref().ok_or_else(|| {
+    if let Some(located) = resolver.active_located_segment()? {
+        let membership_ref = located.segment.membership.as_ref().ok_or_else(|| {
             ZeppelinError::Membership("filter delete requires segment membership artifact".into())
         })?;
         let membership = deserialize_membership(&state.store.get(&membership_ref.key).await?)?;
         ids.extend(membership.entries.into_iter().map(|(id, _)| id));
     }
+    let located_fragments = resolver.uncompacted_located_fragments()?;
     let fragments = state
         .wal_reader
-        .read_fragments_from_refs_unchecked(
-            ns,
-            manifest.uncompacted_fragments(),
+        .read_located_fragments_unchecked(
+            &located_fragments,
             FragmentCachePolicy::ReadWrite(&state.cache),
         )
         .await?;
@@ -1457,6 +1508,7 @@ async fn select_all_ids_matching_filter(
             attribute_fields: None,
         },
         manifest,
+        Some(local_origin),
     )
     .await?;
     Ok(response
@@ -1560,11 +1612,12 @@ pub async fn get_vectors(
     validate_get_vectors_request(&req, state.config.server.max_vector_id_length)
         .map_err(ApiError::from)?;
 
-    state
+    let meta = state
         .namespace_manager
         .get(&ns)
         .await
         .map_err(ApiError::from)?;
+    let authoritative_origin = meta.artifact_origin().map_err(ApiError::from)?;
 
     let manifest = query::read_manifest_for_query(
         &state.store,
@@ -1596,6 +1649,7 @@ pub async fn get_vectors(
         req.consistency,
         storage_projection,
         manifest,
+        authoritative_origin,
     )
     .await
     .map_err(ApiError::from)?;
@@ -1852,12 +1906,18 @@ pub(crate) async fn fetch_vector_values_by_id(
     id: &str,
     consistency: ConsistencyLevel,
     manifest: Manifest,
+    authoritative_origin: Option<ArtifactOrigin>,
 ) -> Result<Option<Vec<f32>>, ZeppelinError> {
-    Ok(
-        fetch_vector_values_by_id_with_trace(state, ns, id, consistency, manifest)
-            .await?
-            .0,
+    Ok(fetch_vector_values_by_id_with_trace(
+        state,
+        ns,
+        id,
+        consistency,
+        manifest,
+        authoritative_origin,
     )
+    .await?
+    .0)
 }
 
 /// Resolves one vector while retaining the exact segment artifacts consumed.
@@ -1867,10 +1927,17 @@ pub(crate) async fn fetch_vector_values_by_id_with_trace(
     id: &str,
     consistency: ConsistencyLevel,
     manifest: Manifest,
+    authoritative_origin: Option<ArtifactOrigin>,
 ) -> Result<(Option<Vec<f32>>, BTreeSet<String>), ZeppelinError> {
-    let (values, touched) =
-        fetch_vector_values_by_ids_with_trace(state, ns, &[id.to_string()], consistency, manifest)
-            .await?;
+    let (values, touched) = fetch_vector_values_by_ids_with_trace(
+        state,
+        ns,
+        &[id.to_string()],
+        consistency,
+        manifest,
+        authoritative_origin,
+    )
+    .await?;
     Ok((values.into_iter().next().map(|(_, values)| values), touched))
 }
 
@@ -1883,6 +1950,7 @@ pub(crate) async fn fetch_vector_values_by_id_scoped(
     consistency: ConsistencyLevel,
     manifest: Manifest,
     mandatory_filter: Option<&crate::types::Filter>,
+    authoritative_origin: Option<ArtifactOrigin>,
 ) -> Result<Option<Vec<f32>>, ZeppelinError> {
     Ok(fetch_vector_values_by_id_scoped_with_trace(
         state,
@@ -1891,6 +1959,7 @@ pub(crate) async fn fetch_vector_values_by_id_scoped(
         consistency,
         manifest,
         mandatory_filter,
+        authoritative_origin,
     )
     .await?
     .0)
@@ -1904,9 +1973,18 @@ pub(crate) async fn fetch_vector_values_by_id_scoped_with_trace(
     consistency: ConsistencyLevel,
     manifest: Manifest,
     mandatory_filter: Option<&crate::types::Filter>,
+    authoritative_origin: Option<ArtifactOrigin>,
 ) -> Result<(Option<Vec<f32>>, BTreeSet<String>), ZeppelinError> {
     if mandatory_filter.is_none() {
-        return fetch_vector_values_by_id_with_trace(state, ns, id, consistency, manifest).await;
+        return fetch_vector_values_by_id_with_trace(
+            state,
+            ns,
+            id,
+            consistency,
+            manifest,
+            authoritative_origin,
+        )
+        .await;
     }
     let projection = FetchProjection {
         include_vector: true,
@@ -1920,6 +1998,7 @@ pub(crate) async fn fetch_vector_values_by_id_scoped_with_trace(
         consistency,
         projection,
         manifest,
+        authoritative_origin,
     )
     .await?;
     let Some(record) = response.results.into_iter().next() else {
@@ -1994,12 +2073,18 @@ pub(crate) async fn fetch_vector_values_by_ids(
     ids: &[VectorId],
     consistency: ConsistencyLevel,
     manifest: Manifest,
+    authoritative_origin: Option<ArtifactOrigin>,
 ) -> Result<HashMap<VectorId, Vec<f32>>, ZeppelinError> {
-    Ok(
-        fetch_vector_values_by_ids_with_trace(state, ns, ids, consistency, manifest)
-            .await?
-            .0,
+    Ok(fetch_vector_values_by_ids_with_trace(
+        state,
+        ns,
+        ids,
+        consistency,
+        manifest,
+        authoritative_origin,
     )
+    .await?
+    .0)
 }
 
 /// Resolves vectors while retaining the exact immutable segment reads.
@@ -2009,14 +2094,23 @@ pub(crate) async fn fetch_vector_values_by_ids_with_trace(
     ids: &[VectorId],
     consistency: ConsistencyLevel,
     manifest: Manifest,
+    authoritative_origin: Option<ArtifactOrigin>,
 ) -> Result<(HashMap<VectorId, Vec<f32>>, BTreeSet<String>), ZeppelinError> {
     let projection = FetchProjection {
         include_vector: true,
         include_attributes: false,
         attribute_fields: None,
     };
-    let (response, touched) =
-        fetch_vectors_by_id_with_trace(state, ns, ids, consistency, projection, manifest).await?;
+    let (response, touched) = fetch_vectors_by_id_with_trace(
+        state,
+        ns,
+        ids,
+        consistency,
+        projection,
+        manifest,
+        authoritative_origin,
+    )
+    .await?;
     let values = response
         .results
         .into_iter()
@@ -2107,12 +2201,19 @@ async fn fetch_vectors_by_id(
     consistency: ConsistencyLevel,
     projection: FetchProjection<'_>,
     manifest: Manifest,
+    authoritative_origin: Option<ArtifactOrigin>,
 ) -> Result<GetVectorsResponse, ZeppelinError> {
-    Ok(
-        fetch_vectors_by_id_with_trace(state, ns, ids, consistency, projection, manifest)
-            .await?
-            .0,
+    Ok(fetch_vectors_by_id_with_trace(
+        state,
+        ns,
+        ids,
+        consistency,
+        projection,
+        manifest,
+        authoritative_origin,
     )
+    .await?
+    .0)
 }
 
 /// Point lookup plus the exact manifest-owned segment artifacts it consumed.
@@ -2123,13 +2224,81 @@ async fn fetch_vectors_by_id_with_trace(
     consistency: ConsistencyLevel,
     projection: FetchProjection<'_>,
     manifest: Manifest,
+    authoritative_origin: Option<ArtifactOrigin>,
 ) -> Result<(GetVectorsResponse, BTreeSet<String>), ZeppelinError> {
-    let active_ids: Vec<ulid::Ulid> = manifest
-        .uncompacted_fragments()
+    fetch_vectors_by_id_with_trace_from_reads(
+        FetchReadContext::from(state),
+        ns,
+        ids,
+        consistency,
+        projection,
+        manifest,
+        authoritative_origin,
+    )
+    .await
+}
+
+/// Feature-only adapter for external physical-origin integration fixtures.
+///
+/// This enters the same supplied-manifest lookup core as production handlers,
+/// but deliberately omits disposable caches so tests observe exact object-store
+/// routing without constructing the unrelated `AppState` services.
+#[cfg(feature = "branching-test-support")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fetch_vectors_by_id_for_test_support(
+    store: &ZeppelinStore,
+    namespace: &str,
+    ids: &[VectorId],
+    consistency: ConsistencyLevel,
+    include_vector: bool,
+    include_attributes: bool,
+    attribute_fields: Option<&[String]>,
+    manifest: Manifest,
+    authoritative_origin: ArtifactOrigin,
+) -> Result<(GetVectorsResponse, BTreeSet<String>), ZeppelinError> {
+    let wal_reader = WalReader::new(store.clone());
+    fetch_vectors_by_id_with_trace_from_reads(
+        FetchReadContext {
+            store,
+            wal_reader: &wal_reader,
+            cache: None,
+            fragment_cache: None,
+        },
+        namespace,
+        ids,
+        consistency,
+        FetchProjection {
+            include_vector,
+            include_attributes,
+            attribute_fields,
+        },
+        manifest,
+        Some(authoritative_origin),
+    )
+    .await
+}
+
+/// Supplied-manifest point lookup over the minimal immutable-read dependencies.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_vectors_by_id_with_trace_from_reads(
+    reads: FetchReadContext<'_>,
+    ns: &str,
+    ids: &[VectorId],
+    consistency: ConsistencyLevel,
+    projection: FetchProjection<'_>,
+    manifest: Manifest,
+    authoritative_origin: Option<ArtifactOrigin>,
+) -> Result<(GetVectorsResponse, BTreeSet<String>), ZeppelinError> {
+    let local_origin = resolve_authoritative_artifact_origin(ns, &manifest, authoritative_origin)?;
+    let resolver = manifest.artifact_origin_resolver(&local_origin)?;
+    let located_fragments = resolver.uncompacted_located_fragments()?;
+    let active_identities = located_fragments
         .iter()
-        .map(|fragment| fragment.id)
-        .collect();
-    state.fragment_cache.evict_compacted(ns, &active_ids);
+        .map(|located| located.identity())
+        .collect::<Vec<_>>();
+    if let Some(fragment_cache) = reads.fragment_cache {
+        fragment_cache.evict_compacted_located(&local_origin, &active_identities);
+    }
     let requested: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let mut found = HashMap::new();
     let mut deleted = HashSet::new();
@@ -2137,9 +2306,8 @@ async fn fetch_vectors_by_id_with_trace(
     match consistency {
         ConsistencyLevel::Strong => {
             fetch_strong_wal_records(
-                state,
-                ns,
-                &manifest,
+                reads,
+                &located_fragments,
                 &requested,
                 projection,
                 &mut found,
@@ -2148,13 +2316,12 @@ async fn fetch_vectors_by_id_with_trace(
             .await?;
         }
         ConsistencyLevel::Eventual => {
-            deleted = state
+            deleted = reads
                 .wal_reader
-                .read_delete_ids_from_refs_unchecked(
-                    ns,
-                    manifest.uncompacted_fragments(),
-                    FragmentCachePolicy::ReadWrite(&state.cache),
-                    Some(&state.fragment_cache),
+                .read_located_delete_ids_unchecked(
+                    &located_fragments,
+                    reads.fragment_cache_policy(),
+                    reads.fragment_cache,
                 )
                 .await?;
         }
@@ -2165,8 +2332,9 @@ async fn fetch_vectors_by_id_with_trace(
         .filter(|id| !found.contains_key(id.as_str()) && !deleted.contains(id.as_str()))
         .cloned()
         .collect();
+    let active_segment = resolver.active_located_segment()?;
     let (segment_records, touched) =
-        fetch_segment_records(state, ns, &manifest, &segment_ids, projection).await?;
+        fetch_segment_records(reads, active_segment, &segment_ids, projection).await?;
     found.extend(segment_records);
 
     let mut results = Vec::new();
@@ -2179,6 +2347,25 @@ async fn fetch_vectors_by_id_with_trace(
     }
 
     Ok((GetVectorsResponse { results, missing }, touched))
+}
+
+/// Select the target namespace lifetime that authorizes one manifest read.
+fn resolve_authoritative_artifact_origin(
+    namespace: &str,
+    manifest: &Manifest,
+    authoritative_origin: Option<ArtifactOrigin>,
+) -> Result<ArtifactOrigin, ZeppelinError> {
+    let origin = match authoritative_origin {
+        Some(origin) => origin,
+        None => manifest.local_origin()?,
+    };
+    if origin.namespace.as_str() != namespace {
+        return Err(ZeppelinError::Index(format!(
+            "artifact origin context names namespace {}, expected {namespace}",
+            origin.namespace.as_str()
+        )));
+    }
+    Ok(origin)
 }
 
 /// Replays all visible uncompacted WAL operations into lookup overlay state.
@@ -2245,25 +2432,23 @@ async fn fetch_vectors_by_id_with_trace(
 /// references or C pointers. Fragment entries are then moved out of each owned
 /// fragment, avoiding deep clones.
 async fn fetch_strong_wal_records(
-    state: &AppState,
-    ns: &str,
-    manifest: &Manifest,
+    reads: FetchReadContext<'_>,
+    refs: &[LocatedFragmentRef<'_>],
     requested: &HashSet<&str>,
     projection: FetchProjection<'_>,
     found: &mut HashMap<VectorId, GetVectorRecord>,
     deleted: &mut HashSet<VectorId>,
 ) -> Result<(), ZeppelinError> {
-    if manifest.uncompacted_fragments().is_empty() {
+    if refs.is_empty() {
         return Ok(());
     }
 
-    let fragments = state
+    let fragments = reads
         .wal_reader
-        .read_query_fragments_from_refs_unchecked(
-            ns,
-            manifest.uncompacted_fragments(),
-            FragmentCachePolicy::ReadWrite(&state.cache),
-            Some(&state.fragment_cache),
+        .read_located_query_fragments_unchecked(
+            refs,
+            reads.fragment_cache_policy(),
+            reads.fragment_cache,
         )
         .await?;
     for fragment in &fragments {
@@ -2360,23 +2545,23 @@ async fn fetch_strong_wal_records(
 /// non-null for the remainder, unlike a nullable Java/C pointer checked by
 /// convention.
 async fn fetch_segment_records(
-    state: &AppState,
-    ns: &str,
-    manifest: &Manifest,
+    reads: FetchReadContext<'_>,
+    located: Option<LocatedSegmentRef<'_>>,
     ids: &[VectorId],
     projection: FetchProjection<'_>,
 ) -> Result<(HashMap<VectorId, GetVectorRecord>, BTreeSet<String>), ZeppelinError> {
     if ids.is_empty() {
         return Ok((HashMap::new(), BTreeSet::new()));
     }
-    let Some(segment) = active_segment(manifest)? else {
+    let Some(located) = located else {
         return Ok((HashMap::new(), BTreeSet::new()));
     };
+    let segment = located.segment;
     let membership_ref = segment.membership.as_ref().ok_or_else(|| {
         ZeppelinError::Membership("fetch by id requires segment membership artifact".into())
     })?;
     let mut touched = BTreeSet::from([membership_ref.key.clone()]);
-    let membership_bytes = state.store.get(&membership_ref.key).await?;
+    let membership_bytes = reads.store.get(&membership_ref.key).await?;
     let membership = deserialize_membership(&membership_bytes)?;
     if membership.cluster_count as usize != segment.cluster_count {
         return Err(ZeppelinError::Membership(format!(
@@ -2419,15 +2604,11 @@ async fn fetch_segment_records(
 
     let mut records = HashMap::new();
     for (cluster_idx, cluster_ids) in ids_by_cluster {
-        touched.insert(segment_cluster_artifact_key(ns, segment, cluster_idx));
-        let cluster = fetch_segment_cluster(state, ns, segment, cluster_idx).await?;
+        touched.insert(segment_cluster_artifact_key(located, cluster_idx));
+        let cluster = fetch_segment_cluster(reads, located, cluster_idx).await?;
         let attrs = if projection.include_attributes {
-            touched.insert(attrs_key(
-                ns,
-                segment.cluster_owner(cluster_idx),
-                cluster_idx,
-            ));
-            Some(fetch_segment_attrs(state, ns, segment, cluster_idx, cluster.ids.len()).await?)
+            touched.insert(segment_attrs_artifact_key(located, cluster_idx));
+            Some(fetch_segment_attrs(reads, located, cluster_idx, cluster.ids.len()).await?)
         } else {
             None
         };
@@ -2459,54 +2640,6 @@ async fn fetch_segment_records(
     }
 
     Ok((records, touched))
-}
-
-/// Resolves the manifest's active segment ID to its retained descriptor.
-///
-/// # Parameters
-///
-/// - `manifest`: Borrowed visibility snapshot to inspect.
-///
-/// # Returns
-///
-/// `Ok(None)` when the manifest has no active compacted view, or `Ok(Some)` with
-/// a descriptor borrowed from `manifest.segments` when the ID is present.
-///
-/// # Errors
-///
-/// Returns [`ZeppelinError::Index`] when `active_segment` names an ID absent
-/// from the segment descriptors. That contradiction is not treated as an empty
-/// namespace.
-///
-/// # Performance
-///
-/// Linearly scans retained descriptors and performs no allocation or I/O.
-///
-/// # Examples
-///
-/// A new manifest with no active ID returns `None`. An active ID `seg-9` returns
-/// a borrow of the matching descriptor; naming `seg-9` with no descriptor fails.
-///
-/// # Rust Notes for Java/C Engineers
-///
-/// The returned `&SegmentRef` borrows storage inside `manifest`: it cannot be
-/// null in the `Some` branch and cannot outlive the manifest. This resembles a
-/// Java object reference or C `const SegmentRef *`, but Rust checks both
-/// non-null state and lifetime at compile time.
-fn active_segment(manifest: &Manifest) -> Result<Option<&SegmentRef>, ZeppelinError> {
-    let Some(segment_id) = manifest.active_segment.as_ref() else {
-        return Ok(None);
-    };
-    manifest
-        .segments
-        .iter()
-        .find(|segment| segment.id == *segment_id)
-        .map(Some)
-        .ok_or_else(|| {
-            ZeppelinError::Index(format!(
-                "active segment {segment_id} is missing from manifest segments"
-            ))
-        })
 }
 
 /// Loads and decodes one logical cluster from its manifest-selected object.
@@ -2560,24 +2693,39 @@ fn active_segment(manifest: &Manifest) -> Result<Option<&SegmentRef>, ZeppelinEr
 /// retaining a pointer into a descriptor while asynchronous work continues
 /// would require manual lifetime discipline; Rust enforces it.
 async fn fetch_segment_cluster(
-    state: &AppState,
-    ns: &str,
-    segment: &SegmentRef,
+    reads: FetchReadContext<'_>,
+    located: LocatedSegmentRef<'_>,
     cluster_idx: usize,
 ) -> Result<crate::index::ivf_flat::build::ClusterData, ZeppelinError> {
-    let key = segment_cluster_artifact_key(ns, segment, cluster_idx);
-    let data = state.store.get(&key).await?;
+    let key = segment_cluster_artifact_key(located, cluster_idx);
+    let data = reads.store.get(&key).await?;
     deserialize_cluster_from_object(&data, cluster_idx)
 }
 
 /// Resolves the sole manifest-selected object key containing one cluster.
-fn segment_cluster_artifact_key(ns: &str, segment: &SegmentRef, cluster_idx: usize) -> String {
-    segment
+fn segment_cluster_artifact_key(located: LocatedSegmentRef<'_>, cluster_idx: usize) -> String {
+    located
+        .segment
         .cluster_objects
         .iter()
         .find(|object| object.clusters.contains(&cluster_idx))
         .map(|object| object.key.clone())
-        .unwrap_or_else(|| cluster_key(ns, segment.cluster_owner(cluster_idx), cluster_idx))
+        .unwrap_or_else(|| {
+            cluster_key(
+                located.physical_namespace(),
+                located.segment.cluster_owner(cluster_idx),
+                cluster_idx,
+            )
+        })
+}
+
+/// Resolves one row-aligned attribute sidecar through the segment's owner.
+fn segment_attrs_artifact_key(located: LocatedSegmentRef<'_>, cluster_idx: usize) -> String {
+    attrs_key(
+        located.physical_namespace(),
+        located.segment.cluster_owner(cluster_idx),
+        cluster_idx,
+    )
 }
 
 /// Loads and validates the row-aligned attribute sidecar for one cluster.
@@ -2624,14 +2772,13 @@ fn segment_cluster_artifact_key(ns: &str, segment: &SegmentRef, cluster_idx: usi
 /// explicit `None` rows. Two entries fail loudly because row-to-vector metadata
 /// association would be ambiguous.
 async fn fetch_segment_attrs(
-    state: &AppState,
-    ns: &str,
-    segment: &SegmentRef,
+    reads: FetchReadContext<'_>,
+    located: LocatedSegmentRef<'_>,
     cluster_idx: usize,
     cluster_len: usize,
 ) -> Result<Vec<Option<HashMap<String, AttributeValue>>>, ZeppelinError> {
-    let key = attrs_key(ns, segment.cluster_owner(cluster_idx), cluster_idx);
-    let data = state.store.get(&key).await?;
+    let key = segment_attrs_artifact_key(located, cluster_idx);
+    let data = reads.store.get(&key).await?;
     let attrs = deserialize_attrs(&data)?;
     if attrs.len() < cluster_len {
         return Err(ZeppelinError::Index(format!(
@@ -2764,4 +2911,66 @@ fn project_attributes(
 fn is_valid_vector_id(id: &str) -> bool {
     id.bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
+    use crate::namespace::{NamespaceId, NamespaceIncarnationId};
+    use crate::wal::manifest::SegmentRef;
+
+    fn origin(namespace: &str, incarnation: u128) -> ArtifactOrigin {
+        ArtifactOrigin {
+            namespace: NamespaceId::parse(namespace.to_string()).unwrap(),
+            incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(incarnation)),
+        }
+    }
+
+    fn segment(id: &str, artifact_origin: Option<ArtifactOriginIndex>) -> SegmentRef {
+        SegmentRef {
+            id: id.to_string(),
+            vector_count: 1,
+            cluster_count: 1,
+            quantization: crate::index::quantization::QuantizationType::None,
+            hierarchical: false,
+            bitmap_fields: Vec::new(),
+            fts_fields: Vec::new(),
+            has_global_fts: false,
+            cluster_owners: Vec::new(),
+            sketch: None,
+            cluster_objects: Vec::new(),
+            bootstrap: None,
+            membership: None,
+            artifact_origin,
+        }
+    }
+
+    #[test]
+    fn foreign_segment_computed_exact_fetch_keys_use_physical_origin() {
+        let target = origin("target-fetch", 1);
+        let source = origin("source-fetch", 2);
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(target.incarnation.as_uuid())
+            .unwrap();
+        manifest.artifact_origins = vec![source];
+        manifest.add_segment(segment(
+            "segment-foreign",
+            Some(ArtifactOriginIndex::new(0)),
+        ));
+
+        let resolver = manifest.artifact_origin_resolver(&target).unwrap();
+        let located = resolver.active_located_segment().unwrap().unwrap();
+
+        assert_eq!(
+            segment_cluster_artifact_key(located, 0),
+            "source-fetch/segments/segment-foreign/cluster_0.bin"
+        );
+        assert_eq!(
+            segment_attrs_artifact_key(located, 0),
+            "source-fetch/segments/segment-foreign/attrs_0.bin"
+        );
+    }
 }

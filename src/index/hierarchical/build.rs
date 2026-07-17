@@ -352,6 +352,8 @@ pub async fn build_hierarchical(
     Ok(HierarchicalIndex {
         meta,
         namespace: namespace.to_string(),
+        physical_namespace: namespace.to_string(),
+        physical_origin: None,
         segment_id: segment_id.to_string(),
         bitmap_fields,
         routing_node_ids,
@@ -891,11 +893,55 @@ pub async fn load_hierarchical(
     segment_id: &str,
     cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
 ) -> Result<HierarchicalIndex> {
-    let key = tree_meta_key(namespace, segment_id);
+    load_hierarchical_routed(store, namespace, namespace, None, None, segment_id, cache).await
+}
+
+/// Loads one manifest-selected hierarchical descriptor through its resolved
+/// physical owner while retaining the logical namespace for pin scope.
+pub(crate) async fn load_hierarchical_from_located_manifest(
+    store: &ZeppelinStore,
+    located: crate::wal::manifest::LocatedSegmentRef<'_>,
+    cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
+) -> Result<HierarchicalIndex> {
+    load_hierarchical_routed(
+        store,
+        located.logical_namespace,
+        located.physical_namespace(),
+        Some(located.logical_origin.as_origin()),
+        Some(located.physical_origin.as_origin()),
+        &located.segment.id,
+        cache,
+    )
+    .await
+}
+
+async fn load_hierarchical_routed(
+    store: &ZeppelinStore,
+    logical_namespace: &str,
+    physical_namespace: &str,
+    logical_origin: Option<&crate::namespace::branching::ArtifactOrigin>,
+    physical_origin: Option<&crate::namespace::branching::ArtifactOrigin>,
+    segment_id: &str,
+    cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
+) -> Result<HierarchicalIndex> {
+    let key = tree_meta_key(physical_namespace, segment_id);
+    let cache_key = physical_origin.map_or_else(
+        || key.clone(),
+        |origin| crate::wal::manifest::immutable_artifact_cache_key(origin, &key),
+    );
     let data = match cache {
         Some(c) => {
-            let data = c.get_or_fetch(&key, || store.get(&key)).await?;
-            c.pin_scoped(namespace, &key).await;
+            let data = c.get_or_fetch(&cache_key, || store.get(&key)).await?;
+            let pin_scope = logical_origin.map_or_else(
+                || logical_namespace.to_string(),
+                |origin| {
+                    format!(
+                        "artifact-origin/{}/pin/hierarchical",
+                        origin.incarnation.as_uuid().simple()
+                    )
+                },
+            );
+            c.pin_scoped(&pin_scope, &cache_key).await;
             data
         }
         None => store.get(&key).await?,
@@ -903,7 +949,8 @@ pub async fn load_hierarchical(
     let meta: TreeMeta = serde_json::from_slice(&data)?;
 
     info!(
-        namespace,
+        namespace = logical_namespace,
+        physical_namespace,
         segment_id,
         num_levels = meta.num_levels,
         num_leaf_clusters = meta.num_leaf_clusters,
@@ -913,7 +960,9 @@ pub async fn load_hierarchical(
 
     Ok(HierarchicalIndex {
         meta,
-        namespace: namespace.to_string(),
+        namespace: logical_namespace.to_string(),
+        physical_namespace: physical_namespace.to_string(),
+        physical_origin: physical_origin.cloned(),
         segment_id: segment_id.to_string(),
         bitmap_fields: Vec::new(), // Populated from SegmentRef at search time
         routing_node_ids: Vec::new(),

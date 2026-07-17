@@ -199,6 +199,42 @@ impl TestHarness {
         format!("{}/{}", self.prefix, suffix)
     }
 
+    /// Build a URL-safe namespace owned by this fixture's random identity.
+    #[cfg(feature = "branching-test-support")]
+    pub fn artifact_origin_namespace(&self, suffix: &str) -> String {
+        format!("{}-{suffix}", self.prefix)
+    }
+
+    /// Construct an in-memory foreign-origin view through the feature adapter.
+    #[cfg(feature = "branching-test-support")]
+    pub async fn synthetic_foreign_origin_view(
+        &self,
+        source_namespace: &str,
+        target_namespace: &str,
+    ) -> zeppelin::error::Result<
+        zeppelin::namespace::branching::test_support::SyntheticForeignOriginView,
+    > {
+        zeppelin::namespace::branching::test_support::SyntheticForeignOriginView::from_source(
+            self.store.clone(),
+            source_namespace,
+            target_namespace,
+        )
+        .await
+    }
+
+    /// Remove one URL-safe namespace created by an artifact-origin fixture.
+    #[cfg(feature = "branching-test-support")]
+    pub async fn cleanup_artifact_origin_namespace(&self, namespace: &str) {
+        let deleted = self
+            .store
+            .delete_prefix(&format!("{namespace}/"))
+            .await
+            .unwrap_or_else(|error| panic!("artifact-origin cleanup failed: {error}"));
+        if deleted > 0 {
+            eprintln!("[test harness] cleaned up {deleted} objects under {namespace}/");
+        }
+    }
+
     /// Clean up all objects under this test's prefix.
     pub async fn cleanup(&self) {
         let runtimes = {

@@ -13,10 +13,4 @@ pub use types::{ArtifactOrigin, ArtifactOriginIndex};
 
 #[cfg(feature = "branching-test-support")]
 #[doc(hidden)]
-pub mod test_support {
-    //! Narrow compile-time marker for later external branching fixtures.
-    //!
-    //! Phase 03 adds storage-backed fixture adapters here. Keeping the module
-    //! feature-gated now proves default and server builds cannot select the
-    //! temporary test-support surface at runtime.
-}
+pub mod test_support;

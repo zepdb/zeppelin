@@ -144,6 +144,7 @@ use zeppelin::index::quantization::sq::{
     deserialize_sq_cluster, sq_calibration_key, sq_cluster_key, SqCalibration,
 };
 use zeppelin::index::quantization::QuantizationType;
+use zeppelin::namespace::branching::ArtifactOrigin;
 use zeppelin::namespace::manager::NamespaceManager;
 use zeppelin::query::{execute_query, QueryParams};
 use zeppelin::storage::ZeppelinStore;
@@ -2164,7 +2165,7 @@ async fn prepare_namespace(
 ) -> Result<PreparedNamespace> {
     let namespace = format!("recall-eval-{}", Uuid::new_v4());
     let manager = NamespaceManager::new(store.clone());
-    manager
+    let metadata = manager
         .create(
             &namespace,
             dataset
@@ -2175,6 +2176,11 @@ async fn prepare_namespace(
             dataset.distance_metric,
         )
         .await?;
+    let authoritative_origin = metadata.artifact_origin()?.ok_or_else(|| {
+        RecallEvalError::Integrity(
+            "newly created recall namespace has no incarnation identity".into(),
+        )
+    })?;
 
     let writer = WalWriter::new(store.clone());
     for chunk in dataset.entries.chunks(INGEST_BATCH_SIZE) {
@@ -2197,7 +2203,13 @@ async fn prepare_namespace(
         ));
     }
 
-    let segment = verify_compacted_sq8_segment(store, &namespace, dataset.entries.len()).await?;
+    let segment = verify_compacted_sq8_segment(
+        store,
+        &namespace,
+        &authoritative_origin,
+        dataset.entries.len(),
+    )
+    .await?;
     Ok(PreparedNamespace {
         namespace,
         wal_reader: WalReader::new(store.clone()),
@@ -2216,6 +2228,7 @@ async fn prepare_namespace(
 ///
 /// - `store`: MinIO-backed gateway used for direct authoritative reads.
 /// - `namespace`: Prepared namespace prefix.
+/// - `authoritative_origin`: Metadata-bound identity of the logical namespace.
 /// - `expected_vectors`: Generated corpus size that the active descriptor must
 ///   report exactly.
 ///
@@ -2273,6 +2286,7 @@ async fn prepare_namespace(
 async fn verify_compacted_sq8_segment(
     store: &ZeppelinStore,
     namespace: &str,
+    authoritative_origin: &ArtifactOrigin,
     expected_vectors: usize,
 ) -> Result<SegmentSummary> {
     let manifest = Manifest::read(store, namespace)
@@ -2291,6 +2305,10 @@ async fn verify_compacted_sq8_segment(
                 "active segment {active_segment_id} missing from manifest segments"
             ))
         })?;
+    let physical_origin = manifest
+        .active_segment_artifact_origin(authoritative_origin)?
+        .ok_or_else(|| RecallEvalError::Integrity("no active segment origin".into()))?;
+    let physical_namespace = physical_origin.namespace.as_str();
 
     if !manifest.uncompacted_fragments().is_empty() {
         return Err(RecallEvalError::Integrity(format!(
@@ -2322,7 +2340,7 @@ async fn verify_compacted_sq8_segment(
     }
 
     let centroids = store
-        .get(&centroids_key(namespace, active_segment_id))
+        .get(&centroids_key(physical_namespace, active_segment_id))
         .await?;
     let parsed =
         if centroids.starts_with(b"ZCT2") {
@@ -2378,7 +2396,7 @@ async fn verify_compacted_sq8_segment(
             }
             SqCalibration::from_bytes(&centroids[cal_start..cal_end])?
         } else {
-            let calibration_key = sq_calibration_key(namespace, active_segment_id);
+            let calibration_key = sq_calibration_key(physical_namespace, active_segment_id);
             let calibration = store.get(&calibration_key).await?;
             SqCalibration::from_bytes(&calibration)?
         };
@@ -2389,9 +2407,9 @@ async fn verify_compacted_sq8_segment(
     }
     let manifest_cluster_zero_present =
         manifest_sq_cluster_artifact_present(store, segment, 0).await?;
-    let cluster_zero_key = sq_cluster_key(namespace, segment.cluster_owner(0), 0);
+    let cluster_zero_key = sq_cluster_key(physical_namespace, segment.cluster_owner(0), 0);
     let colocated_cluster_zero_key = format!(
-        "{namespace}/segments/{}/cluster_0.bin",
+        "{physical_namespace}/segments/{}/cluster_0.bin",
         segment.cluster_owner(0)
     );
     let colocated_cluster_zero_present = match store.get(&colocated_cluster_zero_key).await {
@@ -3261,7 +3279,13 @@ mod tests {
         let segment_id = "seg_grouped";
         let group_key = format!("{namespace}/segments/{segment_id}/cluster_group_0.bin");
 
-        let mut manifest = Manifest::new();
+        let manager = NamespaceManager::new(store.clone());
+        let metadata = manager
+            .create(namespace, 2, DistanceMetric::Euclidean)
+            .await
+            .unwrap();
+        let authoritative_origin = metadata.artifact_origin().unwrap().unwrap();
+        let mut manifest = Manifest::read(&store, namespace).await.unwrap().unwrap();
         manifest.add_segment(SegmentRef {
             id: segment_id.to_string(),
             vector_count: 1,
@@ -3308,7 +3332,7 @@ mod tests {
             .await
             .unwrap();
 
-        let summary = verify_compacted_sq8_segment(&store, namespace, 1)
+        let summary = verify_compacted_sq8_segment(&store, namespace, &authoritative_origin, 1)
             .await
             .expect("grouped SQ8 cluster object should satisfy recall verifier");
         assert!(summary.sq_cluster_zero_present);

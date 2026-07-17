@@ -68,10 +68,10 @@
 //!   recomputed from full-precision vectors.
 //! - Filters are applied before quantized truncation and again to selected
 //!   candidates, preventing selective predicates from being silently discarded.
-//! - Bitmap evaluation is an optional prefilter. Unsupported, missing, or corrupt
-//!   bitmap data falls back to exact attributes rather than excluding rows.
-//! - Required tree, vector, quantization, or attribute artifacts fail the query
-//!   loudly when they cannot be loaded or decoded.
+//! - Bitmap evaluation is an optional prefilter. Unsupported predicates use
+//!   exact attributes; missing or corrupt advertised bitmap data fails loudly.
+//! - Required tree, vector, quantization, attribute, or advertised bitmap
+//!   artifacts fail the query loudly when they cannot be loaded or decoded.
 //!
 //! ## Rust concepts used here
 //!
@@ -195,53 +195,53 @@ fn coarse_candidate_cmp(a: &(String, f32, usize), b: &(String, f32, usize)) -> O
     a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
 }
 
-/// Fetches immutable artifact bytes through the cache when one is available.
+/// Immutable read context for one manifest-selected hierarchical segment.
 ///
-/// # Parameters
-///
-/// - `cache`: Optional shared memory/disk cache.
-/// - `store`: Authoritative object-store abstraction used on a cache miss.
-/// - `key`: Complete immutable segment-artifact key.
-///
-/// # Returns
-///
-/// Shared immutable bytes from memory, disk, or object storage.
-///
-/// # Errors
-///
-/// Propagates cache read/write or object-store failures. Required artifacts do
-/// not silently become empty bytes.
-///
-/// # Side Effects
-///
-/// A cold cached lookup may perform one GET and populate disk and memory tiers.
-///
-/// # Consistency
-///
-/// Cache entries are copies of immutable segment objects. The manifest-selected
-/// key, not cache contents, determines which segment is queried.
-///
-/// # Performance
-///
-/// Warm memory is cheapest, followed by local disk; a cold miss incurs an
-/// object-store GET and cache population.
-///
-/// # Examples
-///
-/// The first query may fetch `node_root.bin` from S3; a later query for the same
-/// immutable segment can receive the same bytes from memory or disk.
-async fn fetch_with_cache(
-    cache: Option<&Arc<DiskCache>>,
-    store: &ZeppelinStore,
-    key: &str,
-) -> Result<bytes::Bytes> {
-    let bytes = if let Some(c) = cache {
-        c.get_or_fetch(key, || store.get(key)).await
-    } else {
-        store.get(key).await
-    }?;
-    record_artifact_read(key);
-    Ok(bytes)
+/// Store keys are derived from the physical namespace while cache keys also
+/// include the physical incarnation. Keeping both identities together prevents
+/// callers from accidentally using a logical namespace for I/O or a bare S3
+/// key for disposable cache state.
+#[derive(Clone, Copy)]
+struct ArtifactReadContext<'a> {
+    index: &'a HierarchicalIndex,
+    store: &'a ZeppelinStore,
+    cache: Option<&'a Arc<DiskCache>>,
+}
+
+impl<'a> ArtifactReadContext<'a> {
+    fn new(
+        index: &'a HierarchicalIndex,
+        store: &'a ZeppelinStore,
+        cache: Option<&'a Arc<DiskCache>>,
+    ) -> Self {
+        Self {
+            index,
+            store,
+            cache,
+        }
+    }
+
+    fn physical_namespace(self) -> &'a str {
+        &self.index.physical_namespace
+    }
+
+    fn segment_id(self) -> &'a str {
+        &self.index.segment_id
+    }
+
+    /// Fetch immutable bytes without conflating S3 addressing and cache identity.
+    async fn fetch(self, store_key: &str) -> Result<bytes::Bytes> {
+        let bytes = if let Some(cache) = self.cache {
+            let cache_key = self.index.artifact_cache_key(store_key);
+            cache
+                .get_or_fetch(&cache_key, || self.store.get(store_key))
+                .await
+        } else {
+            self.store.get(store_key).await
+        }?;
+        record_artifact_read(store_key);
+        Ok(bytes)
+    }
 }
 
 /// Searches one hierarchical segment with mixed-depth beam traversal.
@@ -432,8 +432,9 @@ async fn search_hierarchical_with_trace_inner(
         });
     }
 
-    let ns = &index.namespace;
-    let seg = &index.segment_id;
+    let artifacts = ArtifactReadContext::new(index, store, cache);
+    let ns = artifacts.physical_namespace();
+    let seg = artifacts.segment_id();
     let effective_beam = beam_width.max(1);
     let routing_inventory = (!index.routing_node_ids.is_empty()).then(|| {
         index
@@ -447,7 +448,7 @@ async fn search_hierarchical_with_trace_inner(
     // Start at root.
     require_inventoried_routing_node(routing_inventory.as_ref(), &index.meta.root_node_id)?;
     let root_key = tree_node_key(ns, seg, &index.meta.root_node_id);
-    let root_data = fetch_with_cache(cache, store, &root_key).await?;
+    let root_data = artifacts.fetch(&root_key).await?;
     let root_node = deserialize_tree_node(&root_data)?;
 
     // Rank root centroids.
@@ -478,28 +479,17 @@ async fn search_hierarchical_with_trace_inner(
             .filter_map(|(id, _)| id.parse::<usize>().ok())
             .collect();
         let candidates = scan_leaf_clusters(
-            index,
+            artifacts,
             &cluster_indices,
             query,
             top_k,
             filter,
             distance_metric,
-            store,
             oversample_factor,
-            cache,
         )
         .await?;
-        let results = finalize_candidates(
-            ns,
-            seg,
-            candidates,
-            top_k,
-            filter,
-            store,
-            cache,
-            include_attributes,
-        )
-        .await?;
+        let results =
+            finalize_candidates(artifacts, candidates, top_k, filter, include_attributes).await?;
         return Ok(HierarchicalSearchOutput {
             results,
             probed_centroids: cluster_indices,
@@ -536,15 +526,13 @@ async fn search_hierarchical_with_trace_inner(
             "root beam: partitioned into leaf clusters and internal nodes"
         );
         let leaf_candidates = scan_leaf_clusters(
-            index,
+            artifacts,
             &root_leaf_clusters,
             query,
             top_k,
             filter,
             distance_metric,
-            store,
             oversample_factor,
-            cache,
         )
         .await?;
         accumulated.extend(leaf_candidates);
@@ -552,17 +540,8 @@ async fn search_hierarchical_with_trace_inner(
 
     if current_ids.is_empty() {
         // All root beam entries were leaf clusters — return results.
-        let results = finalize_candidates(
-            ns,
-            seg,
-            accumulated,
-            top_k,
-            filter,
-            store,
-            cache,
-            include_attributes,
-        )
-        .await?;
+        let results =
+            finalize_candidates(artifacts, accumulated, top_k, filter, include_attributes).await?;
         return Ok(HierarchicalSearchOutput {
             results,
             probed_centroids,
@@ -581,7 +560,7 @@ async fn search_hierarchical_with_trace_inner(
         probed_routing_nodes.extend(current_ids.iter().cloned());
         let node_results = futures::future::join_all(current_ids.iter().map(|node_id| {
             let nkey = tree_node_key(ns, seg, node_id);
-            async move { (node_id.clone(), fetch_with_cache(cache, store, &nkey).await) }
+            async move { (node_id.clone(), artifacts.fetch(&nkey).await) }
         }))
         .await;
 
@@ -627,15 +606,13 @@ async fn search_hierarchical_with_trace_inner(
         if !leaf_clusters.is_empty() {
             probed_centroids.extend(leaf_clusters.iter().copied());
             let leaf_candidates = scan_leaf_clusters(
-                index,
+                artifacts,
                 &leaf_clusters,
                 query,
                 top_k,
                 filter,
                 distance_metric,
-                store,
                 oversample_factor,
-                cache,
             )
             .await?;
             accumulated.extend(leaf_candidates);
@@ -643,17 +620,9 @@ async fn search_hierarchical_with_trace_inner(
 
         if internal_ids.is_empty() {
             // No more internal nodes to descend — return merged results.
-            let results = finalize_candidates(
-                ns,
-                seg,
-                accumulated,
-                top_k,
-                filter,
-                store,
-                cache,
-                include_attributes,
-            )
-            .await?;
+            let results =
+                finalize_candidates(artifacts, accumulated, top_k, filter, include_attributes)
+                    .await?;
             let mut seen = HashSet::new();
             probed_centroids.retain(|cluster| seen.insert(*cluster));
             let mut seen_nodes = HashSet::new();
@@ -680,15 +649,14 @@ async fn search_hierarchical_with_trace_inner(
 ///
 /// # Parameters
 ///
-/// - `index`: Segment metadata and manifest-provided bitmap field declaration.
+/// - `artifacts`: Typed physical-read context including segment metadata and
+///   manifest-provided bitmap field declarations.
 /// - `cluster_indices`: Borrowed leaf IDs selected by beam traversal.
 /// - `query`: Dimension-validated query vector.
 /// - `top_k`: Maximum candidates this leaf batch should return.
 /// - `filter`: Optional exact attribute predicate.
 /// - `distance_metric`: Metric used for coarse and exact distances as applicable.
-/// - `store`: Object store for leaf artifacts.
 /// - `oversample_factor`: Filtered-query candidate multiplier.
-/// - `cache`: Optional shared immutable-artifact cache.
 ///
 /// # Returns
 ///
@@ -714,15 +682,13 @@ async fn search_hierarchical_with_trace_inner(
 /// be truncated by approximate distance.
 #[allow(clippy::too_many_arguments)]
 async fn scan_leaf_clusters(
-    index: &HierarchicalIndex,
+    artifacts: ArtifactReadContext<'_>,
     cluster_indices: &[usize],
     query: &[f32],
     top_k: usize,
     filter: Option<&Filter>,
     distance_metric: DistanceMetric,
-    store: &ZeppelinStore,
     oversample_factor: usize,
-    cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
     let fetch_k = if filter.is_some() {
         oversampled_k(top_k, oversample_factor)
@@ -732,53 +698,42 @@ async fn scan_leaf_clusters(
 
     debug!(nprobe = cluster_indices.len(), clusters = ?cluster_indices, "probing leaf clusters");
 
-    let ns = &index.namespace;
-    let seg = &index.segment_id;
-    let has_bitmaps = !index.bitmap_fields.is_empty();
+    let has_bitmaps = !artifacts.index.bitmap_fields.is_empty();
 
-    let candidates = match index.meta.quantization {
+    let candidates = match artifacts.index.meta.quantization {
         QuantizationType::Scalar => {
             scan_clusters_sq(
-                ns,
-                seg,
+                artifacts,
                 cluster_indices,
                 query,
                 distance_metric,
                 filter,
                 fetch_k,
-                index.meta.sq_calibration.as_deref(),
+                artifacts.index.meta.sq_calibration.as_deref(),
                 has_bitmaps,
-                store,
-                cache,
             )
             .await?
         }
         QuantizationType::Product => {
             scan_clusters_pq(
-                ns,
-                seg,
+                artifacts,
                 cluster_indices,
                 query,
                 distance_metric,
                 filter,
                 fetch_k,
                 has_bitmaps,
-                store,
-                cache,
             )
             .await?
         }
         QuantizationType::None => {
             scan_clusters_flat(
-                ns,
-                seg,
+                artifacts,
                 cluster_indices,
                 query,
                 distance_metric,
                 filter,
                 has_bitmaps,
-                store,
-                cache,
             )
             .await?
         }
@@ -826,15 +781,12 @@ async fn scan_leaf_clusters(
 ///
 /// # Parameters
 ///
-/// - `namespace`: Namespace component of leaf keys.
-/// - `segment_id`: Immutable segment component of leaf keys.
+/// - `artifacts`: Typed physical-read context for the selected segment.
 /// - `cluster_indices`: Selected numbered leaves.
 /// - `query`: Validated query vector.
 /// - `distance_metric`: Exact metric for result scores.
 /// - `filter`: Optional predicate requiring attribute rows.
 /// - `has_bitmaps`: Whether manifest metadata says bitmap sidecars may exist.
-/// - `store`: Object store for vectors, attrs, and bitmap bytes.
-/// - `cache`: Optional tiered cache.
 ///
 /// # Returns
 ///
@@ -844,8 +796,8 @@ async fn scan_leaf_clusters(
 ///
 /// # Errors
 ///
-/// Propagates vector or required attribute fetch/decoding failures. Bitmap
-/// failures yield no prefilter and therefore do not cause false negatives.
+/// Propagates vector, required attribute, and advertised bitmap fetch/decoding
+/// failures. Unsupported bitmap predicates still use exact attributes.
 ///
 /// # Performance
 ///
@@ -866,35 +818,28 @@ async fn scan_leaf_clusters(
 /// synchronization.
 #[allow(clippy::too_many_arguments)]
 async fn scan_clusters_flat(
-    namespace: &str,
-    segment_id: &str,
+    artifacts: ArtifactReadContext<'_>,
     cluster_indices: &[usize],
     query: &[f32],
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
     has_bitmaps: bool,
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
     // Phase 1: Parallel prefetch — all S3 I/O fires concurrently.
     let want_attrs = filter.is_some();
     let prefetched = futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| {
-        let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
+        let cvec_key = cluster_key(
+            artifacts.physical_namespace(),
+            artifacts.segment_id(),
+            cluster_idx,
+        );
         async move {
             let (cluster_res, prefilter, attrs) = tokio::join!(
-                fetch_with_cache(cache, store, &cvec_key),
-                try_bitmap_prefilter(
-                    namespace,
-                    segment_id,
-                    cluster_idx,
-                    filter,
-                    has_bitmaps,
-                    store,
-                    cache,
-                ),
+                artifacts.fetch(&cvec_key),
+                try_bitmap_prefilter(artifacts, cluster_idx, filter, has_bitmaps),
                 async {
                     if want_attrs {
-                        load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
+                        load_attrs(artifacts, cluster_idx, filter).await
                     } else {
                         Ok(None)
                     }
@@ -909,6 +854,7 @@ async fn scan_clusters_flat(
     let mut candidates = Vec::new();
     for (cluster_idx, cluster_res, prefilter, attrs) in prefetched {
         let cluster_data = cluster_res?;
+        let prefilter = prefilter?;
         let attrs = attrs?;
         let cluster = deserialize_cluster(&cluster_data)?;
 
@@ -943,8 +889,7 @@ async fn scan_clusters_flat(
 ///
 /// # Parameters
 ///
-/// - `namespace`: Namespace component of artifact keys.
-/// - `segment_id`: Immutable segment identifier.
+/// - `artifacts`: Typed physical-read context for the selected segment.
 /// - `cluster_indices`: Selected leaf indexes.
 /// - `query`: Validated full-precision query.
 /// - `distance_metric`: Metric used by SQ8 asymmetric distance and exact rerank.
@@ -953,8 +898,6 @@ async fn scan_clusters_flat(
 /// - `sq_calibration`: Embedded calibration bytes for new segments, or `None`
 ///   for the legacy sidecar format.
 /// - `has_bitmaps`: Whether bitmap prefilter objects may be available.
-/// - `store`: Object store for calibration, codes, full vectors, and attrs.
-/// - `cache`: Optional tiered cache.
 ///
 /// # Returns
 ///
@@ -963,8 +906,8 @@ async fn scan_clusters_flat(
 ///
 /// # Errors
 ///
-/// Propagates invalid calibration or SQ8 data, required object/attribute reads,
-/// cluster decoding, and cache failures. A missing bitmap alone uses attrs.
+/// Propagates invalid calibration or SQ8 data, required object/attribute/bitmap
+/// reads, cluster decoding, and cache failures.
 ///
 /// # Performance
 ///
@@ -988,8 +931,7 @@ async fn scan_clusters_flat(
 /// deep-copying its contents.
 #[allow(clippy::too_many_arguments)]
 async fn scan_clusters_sq(
-    namespace: &str,
-    segment_id: &str,
+    artifacts: ArtifactReadContext<'_>,
     cluster_indices: &[usize],
     query: &[f32],
     distance_metric: DistanceMetric,
@@ -997,16 +939,14 @@ async fn scan_clusters_sq(
     fetch_k: usize,
     sq_calibration: Option<&[u8]>,
     has_bitmaps: bool,
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
     use crate::index::quantization::sq::{sq_calibration_key, SqCalibration};
 
     let calibration = if let Some(calibration) = sq_calibration {
         SqCalibration::from_bytes(calibration)?
     } else {
-        let cal_key = sq_calibration_key(namespace, segment_id);
-        let cal_data = fetch_with_cache(cache, store, &cal_key).await?;
+        let cal_key = sq_calibration_key(artifacts.physical_namespace(), artifacts.segment_id());
+        let cal_data = artifacts.fetch(&cal_key).await?;
         SqCalibration::from_bytes(&cal_data)?
     };
     let prefer_colocated_clusters = sq_calibration.is_some();
@@ -1022,26 +962,11 @@ async fn scan_clusters_sq(
     let coarse_prefetched =
         futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| async move {
             let (prefilter, sq_res, attrs) = tokio::join!(
-                try_bitmap_prefilter(
-                    namespace,
-                    segment_id,
-                    cluster_idx,
-                    filter,
-                    has_bitmaps,
-                    store,
-                    cache,
-                ),
-                load_sq_cluster_for_coarse(
-                    namespace,
-                    segment_id,
-                    cluster_idx,
-                    prefer_colocated_clusters,
-                    store,
-                    cache,
-                ),
+                try_bitmap_prefilter(artifacts, cluster_idx, filter, has_bitmaps),
+                load_sq_cluster_for_coarse(artifacts, cluster_idx, prefer_colocated_clusters,),
                 async {
                     if want_attr_filter {
-                        load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
+                        load_attrs(artifacts, cluster_idx, filter).await
                     } else {
                         Ok(None)
                     }
@@ -1054,6 +979,7 @@ async fn scan_clusters_sq(
     let mut coarse: Vec<(String, f32, usize)> = Vec::new();
     let mut prefetched_clusters: HashMap<usize, bytes::Bytes> = HashMap::new();
     for (cluster_idx, prefilter, sq_res, attrs) in coarse_prefetched {
+        let prefilter = prefilter?;
         let (sq_cluster, cluster_data) = sq_res?;
         if let Some(cluster_data) = cluster_data {
             prefetched_clusters.insert(cluster_idx, cluster_data);
@@ -1086,19 +1012,23 @@ async fn scan_clusters_sq(
     let rerank_prefetched =
         futures::future::join_all(by_cluster.iter().map(|(&cluster_idx, needed_ids)| {
             let prefetched_cluster = prefetched_clusters.get(&cluster_idx).cloned();
-            let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
+            let cvec_key = cluster_key(
+                artifacts.physical_namespace(),
+                artifacts.segment_id(),
+                cluster_idx,
+            );
             let needed_ids = needed_ids.clone();
             async move {
                 let cluster_fetch = async {
                     if let Some(cluster_data) = prefetched_cluster {
                         Ok(cluster_data)
                     } else {
-                        fetch_with_cache(cache, store, &cvec_key).await
+                        artifacts.fetch(&cvec_key).await
                     }
                 };
                 let (cluster_res, attrs) = tokio::join!(cluster_fetch, async {
                     if want_rerank_attrs {
-                        load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
+                        load_attrs(artifacts, cluster_idx, filter).await
                     } else {
                         Ok(None)
                     }
@@ -1142,12 +1072,9 @@ async fn scan_clusters_sq(
 ///
 /// # Parameters
 ///
-/// - `namespace`: Namespace component of artifact keys.
-/// - `segment_id`: Immutable segment identifier.
+/// - `artifacts`: Typed physical-read context for the selected segment.
 /// - `cluster_idx`: Numbered leaf to load.
 /// - `prefer_colocated`: Whether metadata indicates the new embedded layout.
-/// - `store`: Object store for required bytes.
-/// - `cache`: Optional tiered cache.
 ///
 /// # Returns
 ///
@@ -1169,12 +1096,9 @@ async fn scan_clusters_sq(
 /// A new leaf with embedded codes returns both decoded codes and the shared
 /// cluster bytes, allowing exact rerank without another vector GET.
 async fn load_sq_cluster_for_coarse(
-    namespace: &str,
-    segment_id: &str,
+    artifacts: ArtifactReadContext<'_>,
     cluster_idx: usize,
     prefer_colocated: bool,
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
 ) -> Result<(
     crate::index::quantization::sq::SqClusterData,
     Option<bytes::Bytes>,
@@ -1182,20 +1106,32 @@ async fn load_sq_cluster_for_coarse(
     use crate::index::quantization::sq::{deserialize_sq_cluster, sq_cluster_key};
 
     if prefer_colocated {
-        let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
-        let cluster_data = fetch_with_cache(cache, store, &cvec_key).await?;
+        let cvec_key = cluster_key(
+            artifacts.physical_namespace(),
+            artifacts.segment_id(),
+            cluster_idx,
+        );
+        let cluster_data = artifacts.fetch(&cvec_key).await?;
         if let Some(sq_cluster) = deserialize_colocated_sq_cluster(&cluster_data)? {
             return Ok((sq_cluster, Some(cluster_data)));
         }
 
-        let sq_key = sq_cluster_key(namespace, segment_id, cluster_idx);
-        let sq_data = fetch_with_cache(cache, store, &sq_key).await?;
+        let sq_key = sq_cluster_key(
+            artifacts.physical_namespace(),
+            artifacts.segment_id(),
+            cluster_idx,
+        );
+        let sq_data = artifacts.fetch(&sq_key).await?;
         let sq_cluster = deserialize_sq_cluster(&sq_data)?;
         return Ok((sq_cluster, Some(cluster_data)));
     }
 
-    let sq_key = sq_cluster_key(namespace, segment_id, cluster_idx);
-    let sq_data = fetch_with_cache(cache, store, &sq_key).await?;
+    let sq_key = sq_cluster_key(
+        artifacts.physical_namespace(),
+        artifacts.segment_id(),
+        cluster_idx,
+    );
+    let sq_data = artifacts.fetch(&sq_key).await?;
     let sq_cluster = deserialize_sq_cluster(&sq_data)?;
     Ok((sq_cluster, None))
 }
@@ -1209,16 +1145,13 @@ async fn load_sq_cluster_for_coarse(
 ///
 /// # Parameters
 ///
-/// - `namespace`: Namespace component of artifact keys.
-/// - `segment_id`: Immutable segment identifier.
+/// - `artifacts`: Typed physical-read context for the selected segment.
 /// - `cluster_indices`: Selected numbered leaves.
 /// - `query`: Validated full-precision query vector.
 /// - `distance_metric`: Metric used to construct the ADC table and exact scores.
 /// - `filter`: Optional predicate applied before coarse truncation.
 /// - `fetch_k`: Expanded result target; four times this many coarse rows rerank.
 /// - `has_bitmaps`: Whether bitmap prefilter sidecars may be present.
-/// - `store`: Object store for codebook, PQ codes, vectors, and attrs.
-/// - `cache`: Optional shared tiered cache.
 ///
 /// # Returns
 ///
@@ -1251,23 +1184,20 @@ async fn load_sq_cluster_for_coarse(
 /// its source collection changes.
 #[allow(clippy::too_many_arguments)]
 async fn scan_clusters_pq(
-    namespace: &str,
-    segment_id: &str,
+    artifacts: ArtifactReadContext<'_>,
     cluster_indices: &[usize],
     query: &[f32],
     distance_metric: DistanceMetric,
     filter: Option<&Filter>,
     fetch_k: usize,
     has_bitmaps: bool,
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<Candidate>> {
     use crate::index::quantization::pq::{
         deserialize_pq_cluster, pq_cluster_key, pq_codebook_key, PqCodebook,
     };
 
-    let cb_key = pq_codebook_key(namespace, segment_id);
-    let cb_data = fetch_with_cache(cache, store, &cb_key).await?;
+    let cb_key = pq_codebook_key(artifacts.physical_namespace(), artifacts.segment_id());
+    let cb_data = artifacts.fetch(&cb_key).await?;
     let codebook = PqCodebook::from_bytes(&cb_data)?;
     let adc_table = codebook.build_adc_table(query, distance_metric);
 
@@ -1278,22 +1208,18 @@ async fn scan_clusters_pq(
     let want_attr_filter = filter.is_some();
 
     let coarse_prefetched = futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| {
-        let pq_key = pq_cluster_key(namespace, segment_id, cluster_idx);
+        let pq_key = pq_cluster_key(
+            artifacts.physical_namespace(),
+            artifacts.segment_id(),
+            cluster_idx,
+        );
         async move {
             let (prefilter, pq_res, attrs) = tokio::join!(
-                try_bitmap_prefilter(
-                    namespace,
-                    segment_id,
-                    cluster_idx,
-                    filter,
-                    has_bitmaps,
-                    store,
-                    cache,
-                ),
-                fetch_with_cache(cache, store, &pq_key),
+                try_bitmap_prefilter(artifacts, cluster_idx, filter, has_bitmaps),
+                artifacts.fetch(&pq_key),
                 async {
                     if want_attr_filter {
-                        load_attrs(namespace, segment_id, cluster_idx, filter, store, cache).await
+                        load_attrs(artifacts, cluster_idx, filter).await
                     } else {
                         Ok(None)
                     }
@@ -1306,6 +1232,7 @@ async fn scan_clusters_pq(
 
     let mut coarse: Vec<(String, f32, usize)> = Vec::new();
     for (cluster_idx, prefilter, pq_res, attrs) in coarse_prefetched {
+        let prefilter = prefilter?;
         let pq_data = pq_res?;
         let attrs = attrs?;
         let pq_cluster = deserialize_pq_cluster(&pq_data)?;
@@ -1335,18 +1262,20 @@ async fn scan_clusters_pq(
     let want_rerank_attrs = filter.is_some();
     let rerank_prefetched =
         futures::future::join_all(by_cluster.iter().map(|(&cluster_idx, needed_ids)| {
-            let cvec_key = cluster_key(namespace, segment_id, cluster_idx);
+            let cvec_key = cluster_key(
+                artifacts.physical_namespace(),
+                artifacts.segment_id(),
+                cluster_idx,
+            );
             let needed_ids = needed_ids.clone();
             async move {
-                let (cluster_res, attrs) =
-                    tokio::join!(fetch_with_cache(cache, store, &cvec_key), async {
-                        if want_rerank_attrs {
-                            load_attrs(namespace, segment_id, cluster_idx, filter, store, cache)
-                                .await
-                        } else {
-                            Ok(None)
-                        }
-                    },);
+                let (cluster_res, attrs) = tokio::join!(artifacts.fetch(&cvec_key), async {
+                    if want_rerank_attrs {
+                        load_attrs(artifacts, cluster_idx, filter).await
+                    } else {
+                        Ok(None)
+                    }
+                },);
                 (cluster_idx, needed_ids, cluster_res, attrs)
             }
         }))
@@ -1385,13 +1314,10 @@ async fn scan_clusters_pq(
 ///
 /// # Parameters
 ///
-/// - `namespace`: Namespace component of attribute keys.
-/// - `segment_id`: Immutable segment identifier.
+/// - `artifacts`: Typed physical-read context for the selected segment.
 /// - `candidates`: Owned exact candidates accumulated across tree depths.
 /// - `top_k`: Maximum results to retain.
 /// - `filter`: Presence indicates attrs were loaded during scanning.
-/// - `store`: Object store for deferred attribute reads.
-/// - `cache`: Optional tiered cache.
 /// - `include_attributes`: Whether response results should carry attrs.
 ///
 /// # Returns
@@ -1418,13 +1344,10 @@ async fn scan_clusters_pq(
 /// objects after top-k rather than all six during scanning.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_candidates(
-    namespace: &str,
-    segment_id: &str,
+    artifacts: ArtifactReadContext<'_>,
     mut candidates: Vec<Candidate>,
     top_k: usize,
     filter: Option<&Filter>,
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
     include_attributes: bool,
 ) -> Result<Vec<SearchResult>> {
     partial_topk_by(&mut candidates, top_k, candidate_distance_cmp);
@@ -1445,7 +1368,7 @@ async fn finalize_candidates(
     }
 
     if include_attributes {
-        enrich_unfiltered_results(namespace, segment_id, candidates, store, cache).await
+        enrich_unfiltered_results(artifacts, candidates).await
     } else {
         Ok(candidates
             .into_iter()
@@ -1462,11 +1385,8 @@ async fn finalize_candidates(
 ///
 /// # Parameters
 ///
-/// - `namespace`: Namespace component of attrs keys.
-/// - `segment_id`: Immutable segment identifier.
+/// - `artifacts`: Typed physical-read context for the selected segment.
 /// - `candidates`: Already-ranked owned candidates with cluster and row locations.
-/// - `store`: Object store for attrs objects.
-/// - `cache`: Optional tiered cache.
 ///
 /// # Returns
 ///
@@ -1497,11 +1417,8 @@ async fn finalize_candidates(
 /// `for candidate in &candidates` borrow is active and automatically drops the
 /// location-only candidates after their fields move into results.
 async fn enrich_unfiltered_results(
-    namespace: &str,
-    segment_id: &str,
+    artifacts: ArtifactReadContext<'_>,
     candidates: Vec<Candidate>,
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
 ) -> Result<Vec<SearchResult>> {
     if candidates.is_empty() {
         return Ok(Vec::new());
@@ -1517,10 +1434,7 @@ async fn enrich_unfiltered_results(
 
     let attrs_fetches =
         futures::future::join_all(cluster_indices.iter().map(|&cluster_idx| async move {
-            (
-                cluster_idx,
-                load_attrs(namespace, segment_id, cluster_idx, None, store, cache).await,
-            )
+            (cluster_idx, load_attrs(artifacts, cluster_idx, None).await)
         }))
         .await;
 
@@ -1567,37 +1481,35 @@ async fn enrich_unfiltered_results(
 
 /// Attempts to produce an exact bitmap row set for one cluster and filter.
 ///
-/// Bitmap data is a performance sidecar, not authoritative query state. This
-/// helper returns `None` for no filter, no manifest-declared bitmap fields, a
-/// missing/corrupt sidecar, or a predicate the bitmap representation cannot
-/// answer. Callers then evaluate original attributes. `Some(empty)` is distinct:
-/// it proves that the indexed predicate matches no rows in this cluster.
+/// Bitmap data is selected by manifest capability. This helper returns `None`
+/// for no filter, no manifest-declared bitmap fields, or a predicate the bitmap
+/// representation cannot answer. Missing, unreadable, or corrupt advertised
+/// sidecars fail the scan. `Some(empty)` proves that the indexed predicate
+/// matches no rows in this cluster.
 ///
 /// # Parameters
 ///
-/// - `namespace`: Namespace component of the bitmap key.
-/// - `segment_id`: Immutable segment identifier.
+/// - `artifacts`: Typed physical-read context for the selected segment.
 /// - `cluster_idx`: Leaf whose row bitmap should be evaluated.
 /// - `filter`: Optional predicate to pre-evaluate.
 /// - `has_bitmaps`: Whether manifest metadata declares any bitmap fields.
-/// - `store`: Object store for a cold sidecar read.
-/// - `cache`: Optional tiered cache.
 ///
 /// # Returns
 ///
 /// `Some(rows)` only when the bitmap index can answer the complete predicate;
-/// otherwise `None`, directing the caller to exact attrs.
+/// otherwise `None` directs the caller to exact attrs. Artifact failures return
+/// an error instead of changing execution strategies.
 ///
 /// # Side Effects
 ///
-/// May fetch and cache one bitmap object. Decode failures emit a debug event;
-/// fetch failures are treated as optimization misses.
+/// May fetch and cache one bitmap object. Cache, object-store, and decode
+/// failures propagate to the complete query.
 ///
 /// # Consistency
 ///
 /// The manifest supplies `has_bitmaps`, and immutable row positions must align
-/// with vector and attribute artifacts. An unavailable sidecar never excludes a
-/// row, so it cannot silently change exact filter meaning.
+/// with vector and attribute artifacts. Advertised artifacts are mandatory;
+/// exact-attribute evaluation remains only for unsupported predicates.
 ///
 /// # Performance
 ///
@@ -1613,38 +1525,32 @@ async fn enrich_unfiltered_results(
 ///
 /// # Rust Notes for Java/C Engineers
 ///
-/// The `?` operator is used on `Option` to return early when no filter exists.
-/// Unlike a Java null or C null pointer, `Option<RoaringBitmap>` is a tagged type
-/// that requires callers to distinguish unavailable evaluation from an owned,
-/// valid empty set.
+/// Pattern matching returns a successful `None` when no filter exists. The
+/// outer `Result` distinguishes an artifact failure from that intentional
+/// absence; the inner `Option` distinguishes unsupported evaluation from an
+/// owned, valid bitmap.
 async fn try_bitmap_prefilter(
-    namespace: &str,
-    segment_id: &str,
+    artifacts: ArtifactReadContext<'_>,
     cluster_idx: usize,
     filter: Option<&Filter>,
     has_bitmaps: bool,
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
-) -> Option<roaring::RoaringBitmap> {
-    let filter = filter?;
+) -> Result<Option<roaring::RoaringBitmap>> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
     if !has_bitmaps {
-        return None;
+        return Ok(None);
     }
 
-    let bkey = bitmap_key(namespace, segment_id, cluster_idx);
-    let data = match fetch_with_cache(cache, store, &bkey).await {
-        Ok(d) => d,
-        Err(_) => return None,
-    };
-    let bitmap_index = match ClusterBitmapIndex::from_bytes(&data) {
-        Ok(idx) => idx,
-        Err(e) => {
-            tracing::debug!(cluster = cluster_idx, error = %e, "failed to load bitmap index");
-            return None;
-        }
-    };
+    let bkey = bitmap_key(
+        artifacts.physical_namespace(),
+        artifacts.segment_id(),
+        cluster_idx,
+    );
+    let data = artifacts.fetch(&bkey).await?;
+    let bitmap_index = ClusterBitmapIndex::from_bytes(&data)?;
 
-    evaluate_filter_bitmap(filter, &bitmap_index)
+    Ok(evaluate_filter_bitmap(filter, &bitmap_index))
 }
 
 /// Loads and decodes the row-aligned attribute object for one leaf.
@@ -1655,12 +1561,9 @@ async fn try_bitmap_prefilter(
 ///
 /// # Parameters
 ///
-/// - `namespace`: Namespace component of the attrs key.
-/// - `segment_id`: Immutable segment identifier.
+/// - `artifacts`: Typed physical-read context for the selected segment.
 /// - `cluster_idx`: Numbered leaf whose attrs are required.
 /// - `_filter`: Optional caller predicate, currently not inspected.
-/// - `store`: Object store used on a cache miss.
-/// - `cache`: Optional tiered cache.
 ///
 /// # Returns
 ///
@@ -1682,14 +1585,202 @@ async fn try_bitmap_prefilter(
 /// Loading leaf 3 returns a vector whose row 7 corresponds to vector row 7 in
 /// `cluster_3.bin`; a truncated attrs object fails the query.
 async fn load_attrs(
-    namespace: &str,
-    segment_id: &str,
+    artifacts: ArtifactReadContext<'_>,
     cluster_idx: usize,
     _filter: Option<&Filter>,
-    store: &ZeppelinStore,
-    cache: Option<&Arc<DiskCache>>,
 ) -> Result<Option<ClusterAttrs>> {
-    let akey = attrs_key(namespace, segment_id, cluster_idx);
-    let data = fetch_with_cache(cache, store, &akey).await?;
+    let akey = attrs_key(
+        artifacts.physical_namespace(),
+        artifacts.segment_id(),
+        cluster_idx,
+    );
+    let data = artifacts.fetch(&akey).await?;
     Ok(Some(deserialize_attrs(&data)?))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::index::hierarchical::{serialize_tree_node, TreeMeta, TreeNode};
+    use crate::index::ivf_flat::build::{serialize_attrs, serialize_cluster};
+    use crate::namespace::branching::ArtifactOrigin;
+    use crate::namespace::{NamespaceId, NamespaceIncarnationId};
+
+    fn origin(incarnation: u128) -> ArtifactOrigin {
+        ArtifactOrigin {
+            namespace: NamespaceId::parse("physical-owner").expect("valid namespace"),
+            incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(incarnation)),
+        }
+    }
+
+    fn one_leaf_index(physical_origin: ArtifactOrigin) -> HierarchicalIndex {
+        HierarchicalIndex {
+            meta: TreeMeta {
+                num_levels: 1,
+                branching_factor: 1,
+                total_vectors: 1,
+                dim: 1,
+                root_node_id: "root".to_string(),
+                num_leaf_clusters: 1,
+                quantization: QuantizationType::None,
+                sq_calibration: None,
+            },
+            namespace: "logical-reader".to_string(),
+            physical_namespace: "physical-owner".to_string(),
+            physical_origin: Some(physical_origin),
+            segment_id: "shared-segment".to_string(),
+            bitmap_fields: Vec::new(),
+            routing_node_ids: vec!["root".to_string()],
+        }
+    }
+
+    async fn write_one_leaf_artifacts(store: &ZeppelinStore, vector_id: &str) {
+        let root = TreeNode {
+            centroids: vec![vec![0.0]],
+            children: vec!["0".to_string()],
+            is_leaf: true,
+        };
+        store
+            .put(
+                &tree_node_key("physical-owner", "shared-segment", "root"),
+                serialize_tree_node(&root, 1),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &cluster_key("physical-owner", "shared-segment", 0),
+                serialize_cluster(&[vector_id.to_string()], &[vec![0.0]], 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &attrs_key("physical-owner", "shared-segment", 0),
+                serialize_attrs(&[None::<HashMap<String, AttributeValue>>]).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn advertised_missing_bitmap_fails_hierarchical_scan() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        write_one_leaf_artifacts(&store, "row-0").await;
+        let mut index = one_leaf_index(origin(1));
+        index.bitmap_fields = vec!["color".to_string()];
+        let filter = Filter::Eq {
+            field: "color".to_string(),
+            value: AttributeValue::String("blue".to_string()),
+        };
+
+        let result = search_hierarchical(
+            &index,
+            &[0.0],
+            1,
+            1,
+            Some(&filter),
+            DistanceMetric::Euclidean,
+            &store,
+            1,
+            None,
+            true,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("an advertised missing bitmap must fail the hierarchical scan"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("bitmap_0.bin"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn advertised_corrupt_bitmap_fails_hierarchical_scan() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        write_one_leaf_artifacts(&store, "row-0").await;
+        store
+            .put(
+                &bitmap_key("physical-owner", "shared-segment", 0),
+                bytes::Bytes::from_static(b"not-a-bitmap-index"),
+            )
+            .await
+            .unwrap();
+        let mut index = one_leaf_index(origin(1));
+        index.bitmap_fields = vec!["color".to_string()];
+        let filter = Filter::Eq {
+            field: "color".to_string(),
+            value: AttributeValue::String("blue".to_string()),
+        };
+
+        let result = search_hierarchical(
+            &index,
+            &[0.0],
+            1,
+            1,
+            Some(&filter),
+            DistanceMetric::Euclidean,
+            &store,
+            1,
+            None,
+            true,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("an advertised corrupt bitmap must fail the hierarchical scan"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("bitmap"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn same_store_key_different_incarnations_do_not_alias_hierarchical_cache() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let cache = Arc::new(
+            DiskCache::new_with_max_bytes(cache_dir.path().to_path_buf(), 1024 * 1024).unwrap(),
+        );
+
+        write_one_leaf_artifacts(&store, "first-incarnation").await;
+        let first = search_hierarchical(
+            &one_leaf_index(origin(1)),
+            &[0.0],
+            1,
+            1,
+            None,
+            DistanceMetric::Euclidean,
+            &store,
+            1,
+            Some(&cache),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first[0].id, "first-incarnation");
+
+        write_one_leaf_artifacts(&store, "second-incarnation").await;
+        let second = search_hierarchical(
+            &one_leaf_index(origin(2)),
+            &[0.0],
+            1,
+            1,
+            None,
+            DistanceMetric::Euclidean,
+            &store,
+            1,
+            Some(&cache),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second[0].id, "second-incarnation");
+    }
 }

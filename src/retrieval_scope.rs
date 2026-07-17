@@ -32,11 +32,12 @@ use crate::index::ivf_flat::build::build_ivf_flat;
 use crate::index::ivf_flat::search::search_ivf_flat_with_trace;
 use crate::index::topk::partial_topk_by;
 use crate::index::{HierarchicalIndex, IvfFlatIndex};
+use crate::namespace::branching::ArtifactOrigin;
 use crate::storage::{CreateOnlyOutcome, ZeppelinStore};
 use crate::types::{
     AttributeValue, ConsistencyLevel, DistanceMetric, Filter, SearchResult, VectorEntry,
 };
-use crate::wal::manifest::SegmentRef;
+use crate::wal::manifest::LocatedSegmentRef;
 use crate::wal::Manifest;
 
 const CACHE_KEY_VERSION: &str = "v2";
@@ -179,7 +180,7 @@ enum ScopedAnnArtifact {
 /// Immutable inputs that identify and configure one policy-owned ANN artifact.
 pub(crate) struct ScopedAnnBuildRequest<'a> {
     pub(crate) store: &'a ZeppelinStore,
-    pub(crate) namespace: &'a str,
+    pub(crate) logical_origin: &'a ArtifactOrigin,
     pub(crate) source_segment_id: &'a str,
     pub(crate) scope_cache_key: &'a str,
     pub(crate) mandatory_filter: &'a Filter,
@@ -209,13 +210,14 @@ impl ScopedAnnIndex {
     {
         let ScopedAnnBuildRequest {
             store,
-            namespace,
+            logical_origin,
             source_segment_id,
             scope_cache_key,
             mandatory_filter,
             config,
             cache,
         } = request;
+        let namespace = logical_origin.namespace.as_str();
         let location = ScopedArtifactLocation::new(namespace, source_segment_id);
         let artifact_namespace = location.artifact_namespace();
         let descriptor_key = location.ann_descriptor_key(scope_cache_key)?;
@@ -1238,29 +1240,31 @@ async fn decode_scoped_fts(
 }
 
 /// Cache identity for one fully decoded immutable segment corpus.
-pub(crate) fn segment_corpus_cache_key(
-    namespace: &str,
-    segment_ref: &SegmentRef,
-) -> Result<String> {
+pub(crate) fn segment_corpus_cache_key(located: LocatedSegmentRef<'_>) -> Result<String> {
     cache_key(
         "segment-corpus",
-        namespace,
-        &[serde_json::to_vec(segment_ref)?],
+        located.logical_namespace,
+        &[
+            serde_json::to_vec(located.logical_origin.as_origin())?,
+            serde_json::to_vec(located.physical_origin.as_origin())?,
+            serde_json::to_vec(located.segment)?,
+        ],
     )
 }
 
 /// Cache identity for one policy-slice IVF artifact.
 pub(crate) fn scoped_ann_cache_key(
-    namespace: &str,
-    segment_ref: &SegmentRef,
+    located: LocatedSegmentRef<'_>,
     mandatory_filter: &Filter,
     config: &IndexingConfig,
 ) -> Result<String> {
     cache_key(
         "scoped-ann",
-        namespace,
+        located.logical_namespace,
         &[
-            serde_json::to_vec(segment_ref)?,
+            serde_json::to_vec(located.logical_origin.as_origin())?,
+            serde_json::to_vec(located.physical_origin.as_origin())?,
+            serde_json::to_vec(located.segment)?,
             serde_json::to_vec(mandatory_filter)?,
             serde_json::to_vec(config)?,
         ],
@@ -1269,7 +1273,7 @@ pub(crate) fn scoped_ann_cache_key(
 
 /// Cache identity for one policy-corpus BM25 artifact at a fixed snapshot.
 pub(crate) fn scoped_fts_cache_key(
-    namespace: &str,
+    logical_origin: &ArtifactOrigin,
     manifest: &Manifest,
     consistency: ConsistencyLevel,
     mandatory_filter: &Filter,
@@ -1278,8 +1282,9 @@ pub(crate) fn scoped_fts_cache_key(
     let canonical_configs: BTreeMap<&String, &FtsFieldConfig> = fts_configs.iter().collect();
     cache_key(
         "scoped-fts",
-        namespace,
+        logical_origin.namespace.as_str(),
         &[
+            serde_json::to_vec(logical_origin)?,
             serde_json::to_vec(manifest)?,
             serde_json::to_vec(&consistency)?,
             serde_json::to_vec(mandatory_filter)?,
@@ -1585,6 +1590,8 @@ mod tests {
                     sq_calibration: None,
                 },
                 namespace: String::new(),
+                physical_namespace: String::new(),
+                physical_origin: None,
                 segment_id: String::new(),
                 bitmap_fields: Vec::new(),
                 routing_node_ids: Vec::new(),

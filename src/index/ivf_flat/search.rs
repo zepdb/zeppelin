@@ -40,12 +40,13 @@
 //! exact filter/order, optional attribute enrichment, top-k
 //! ```
 //!
-//! Bitmap filtering is an optimization, not a separate source of truth. If a
-//! bitmap object is absent, unreadable, or cannot express a filter, quantized
-//! scans fetch row attributes and evaluate the same filter exactly before
-//! approximate truncation. Immutable object keys make cached bytes reusable;
-//! object storage remains the source of truth, and malformed cached full objects
-//! are evicted rather than accepted.
+//! Bitmap filtering is an optimization, not a separate source of truth. A filter
+//! that the bitmap representation cannot express uses row attributes for exact
+//! evaluation before approximate truncation. Once the manifest advertises
+//! bitmap artifacts, absent, unreadable, or malformed bytes fail the query.
+//! Immutable object keys make cached bytes reusable; object storage remains the
+//! source of truth, and malformed cached full objects are evicted rather than
+//! accepted.
 //!
 //! ## Reading map
 //!
@@ -273,6 +274,8 @@ fn coarse_pq_candidate_cmp(a: &(String, f32, usize), b: &(String, f32, usize)) -
 struct ClusterFetchObject {
     /// Immutable object-store key.
     key: String,
+    /// Incarnation-qualified cache identity for `key`.
+    cache_key: String,
     /// Logical cluster indexes whose full sections live in the object.
     clusters: Vec<usize>,
     /// Optional self-contained prefix containing live full-vector data.
@@ -624,9 +627,10 @@ async fn fetch_with_cache(
     cache: Option<&Arc<DiskCache>>,
     store: &ZeppelinStore,
     key: &str,
+    cache_key: &str,
 ) -> Result<bytes::Bytes> {
     let bytes = if let Some(c) = cache {
-        c.get_or_fetch(key, || store.get(key)).await
+        c.get_or_fetch(cache_key, || store.get(key)).await
     } else {
         store.get(key).await
     }?;
@@ -671,11 +675,12 @@ async fn fetch_with_cache_counted(
     cache: Option<&Arc<DiskCache>>,
     store: &ZeppelinStore,
     key: &str,
+    cache_key: &str,
     stats: Option<&SqSearchByteStats>,
     phase: SqBytePhase,
 ) -> Result<bytes::Bytes> {
     if let Some(c) = cache {
-        if let Some(data) = c.get(key).await {
+        if let Some(data) = c.get(cache_key).await {
             if let Some(stats) = stats {
                 stats.record_local_bytes(data.len());
             }
@@ -683,7 +688,7 @@ async fn fetch_with_cache_counted(
             return Ok(data);
         }
         let data = c
-            .get_or_fetch(key, || async {
+            .get_or_fetch(cache_key, || async {
                 let data = store.get(key).await?;
                 if let Some(stats) = stats {
                     stats.record_get(phase, data.len());
@@ -743,7 +748,8 @@ async fn fetch_with_cache_counted(
 /// helper evicts it and returns `CorruptEvicted`; the caller then reads S3.
 async fn cached_full_object_for_range(
     cache: Option<&Arc<DiskCache>>,
-    key: &str,
+    cache_key: &str,
+    store_key: &str,
     size_bytes: u64,
     needed_end: usize,
     phase: &'static str,
@@ -752,7 +758,7 @@ async fn cached_full_object_for_range(
     let Some(c) = cache else {
         return Ok(RangeCacheLookup::Miss);
     };
-    let Some(data) = c.get(key).await else {
+    let Some(data) = c.get(cache_key).await else {
         return Ok(RangeCacheLookup::Miss);
     };
 
@@ -761,7 +767,7 @@ async fn cached_full_object_for_range(
             crate::metrics::RANGE_SOURCE_TOTAL
                 .with_label_values(&[phase, "local"])
                 .inc_by(range_count);
-            record_artifact_read(key);
+            record_artifact_read(store_key);
             return Ok(RangeCacheLookup::Local(data));
         }
         return Ok(RangeCacheLookup::Miss);
@@ -769,9 +775,9 @@ async fn cached_full_object_for_range(
 
     let actual = data.len() as u64;
     if actual != size_bytes {
-        c.invalidate(key).await?;
+        c.invalidate(cache_key).await?;
         error!(
-            key,
+            key = store_key,
             expected = size_bytes,
             actual,
             "cached object length mismatch; evicting"
@@ -786,7 +792,7 @@ async fn cached_full_object_for_range(
         crate::metrics::RANGE_SOURCE_TOTAL
             .with_label_values(&[phase, "local"])
             .inc_by(range_count);
-        record_artifact_read(key);
+        record_artifact_read(store_key);
         return Ok(RangeCacheLookup::Local(data));
     }
 
@@ -833,6 +839,7 @@ fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<Clus
         }
         return Ok(ClusterFetchObject {
             key: object_ref.key.clone(),
+            cache_key: index.artifact_cache_key(&object_ref.key),
             clusters: object_ref.clusters.clone(),
             live_range,
             size_bytes: object_ref.size_bytes,
@@ -841,10 +848,15 @@ fn cluster_fetch_object(index: &IvfFlatIndex, cluster_idx: usize) -> Result<Clus
 
     Ok(ClusterFetchObject {
         key: cluster_key(
-            &index.namespace,
+            &index.physical_namespace,
             index.cluster_owner(cluster_idx),
             cluster_idx,
         ),
+        cache_key: index.artifact_cache_key(&cluster_key(
+            &index.physical_namespace,
+            index.cluster_owner(cluster_idx),
+            cluster_idx,
+        )),
         clusters: vec![cluster_idx],
         live_range: None,
         size_bytes: 0,
@@ -898,6 +910,7 @@ async fn fetch_cluster_object_for_flat_scan(
             // live span is a prefix, so slicing preserves parse semantics.
             match cached_full_object_for_range(
                 cache,
+                &object.cache_key,
                 &object.key,
                 object.size_bytes,
                 range.end,
@@ -917,7 +930,7 @@ async fn fetch_cluster_object_for_flat_scan(
             return fetch_range_traced(store, &object.key, range).await;
         }
     }
-    fetch_with_cache(cache, store, &object.key).await
+    fetch_with_cache(cache, store, &object.key, &object.cache_key).await
 }
 
 /// Deduplicates physical objects for a list of logical clusters.
@@ -2061,7 +2074,7 @@ async fn scan_clusters_flat(
                     let owner = index.cluster_owner(cluster_idx);
                     let (prefilter, attrs) = tokio::join!(
                         try_bitmap_prefilter(
-                            &index.namespace,
+                            index,
                             owner,
                             cluster_idx,
                             filter,
@@ -2102,6 +2115,7 @@ async fn scan_clusters_flat(
                     "cluster metadata mismatch for object {object_key}: cluster {cluster_idx}"
                 )));
             }
+            let prefilter = prefilter?;
             let attrs = attrs?;
             let cluster = deserialize_cluster_from_object(&object_data, cluster_idx)?;
 
@@ -2240,11 +2254,12 @@ async fn scan_clusters_sq(
     let calibration = if let Some(calibration) = &index.sq_calibration {
         calibration.clone()
     } else {
-        let cal_key = sq_calibration_key(&index.namespace, &index.segment_id);
+        let cal_key = sq_calibration_key(&index.physical_namespace, &index.segment_id);
         let cal_data = fetch_with_cache_counted(
             cache,
             store,
             &cal_key,
+            &index.artifact_cache_key(&cal_key),
             byte_stats.as_deref(),
             SqBytePhase::Other,
         )
@@ -2291,15 +2306,7 @@ async fn scan_clusters_sq(
         let stats = byte_stats.clone();
         async move {
             let (prefilter, attrs) = tokio::join!(
-                try_bitmap_prefilter(
-                    &index.namespace,
-                    owner,
-                    cluster_idx,
-                    filter,
-                    has_bitmaps,
-                    store,
-                    cache,
-                ),
+                try_bitmap_prefilter(index, owner, cluster_idx, filter, has_bitmaps, store, cache,),
                 async {
                     if want_attr_filter {
                         load_attrs(index, cluster_idx, filter, store, cache, stats.as_deref()).await
@@ -2342,6 +2349,7 @@ async fn scan_clusters_sq(
 
     let mut meta_by_cluster = HashMap::new();
     for (cluster_idx, prefilter, attrs) in meta_prefetched {
+        let prefilter = prefilter?;
         let attrs = attrs?;
         if meta_by_cluster
             .insert(cluster_idx, (prefilter, attrs))
@@ -2606,12 +2614,19 @@ async fn load_sq_object_for_coarse(
         let mut sq_clusters = Vec::with_capacity(object.clusters.len());
         for &cluster_idx in &object.clusters {
             let sq_key = sq_cluster_key(
-                &index.namespace,
+                &index.physical_namespace,
                 index.cluster_owner(cluster_idx),
                 cluster_idx,
             );
-            let sq_data =
-                fetch_with_cache_counted(cache, store, &sq_key, stats, SqBytePhase::Sq).await?;
+            let sq_data = fetch_with_cache_counted(
+                cache,
+                store,
+                &sq_key,
+                &index.artifact_cache_key(&sq_key),
+                stats,
+                SqBytePhase::Sq,
+            )
+            .await?;
             if let Some(stats) = stats {
                 stats.record_logical_sq_bytes(sq_data.len());
             }
@@ -2629,6 +2644,7 @@ async fn load_sq_object_for_coarse(
         if layout.sections.iter().all(|section| section.sq.is_some()) {
             let sq_bytes = fetch_object_sq_range(
                 &object.key,
+                &object.cache_key,
                 object.size_bytes,
                 &layout,
                 &object.clusters,
@@ -2673,8 +2689,15 @@ async fn load_sq_object_for_coarse(
         }
     }
 
-    let object_data =
-        fetch_with_cache_counted(cache, store, &object.key, stats, SqBytePhase::Sq).await?;
+    let object_data = fetch_with_cache_counted(
+        cache,
+        store,
+        &object.key,
+        &object.cache_key,
+        stats,
+        SqBytePhase::Sq,
+    )
+    .await?;
     let mut sq_clusters = Vec::with_capacity(object.clusters.len());
     for &cluster_idx in &object.clusters {
         if let Some(sq_cluster) =
@@ -2691,12 +2714,19 @@ async fn load_sq_object_for_coarse(
         }
 
         let sq_key = sq_cluster_key(
-            &index.namespace,
+            &index.physical_namespace,
             index.cluster_owner(cluster_idx),
             cluster_idx,
         );
-        let sq_data =
-            fetch_with_cache_counted(cache, store, &sq_key, stats, SqBytePhase::Sq).await?;
+        let sq_data = fetch_with_cache_counted(
+            cache,
+            store,
+            &sq_key,
+            &index.artifact_cache_key(&sq_key),
+            stats,
+            SqBytePhase::Sq,
+        )
+        .await?;
         if let Some(stats) = stats {
             stats.record_logical_sq_bytes(sq_data.len());
         }
@@ -2757,8 +2787,10 @@ struct RangeBytes {
 ///
 /// SQ sections `100..180` and `200..260` produce one physical `100..260` read,
 /// 140 logical bytes, and 20 slack bytes.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_object_sq_range(
     object_key: &str,
+    cache_key: &str,
     object_size_bytes: u64,
     layout: &ClusterObjectLayout,
     clusters: &[usize],
@@ -2791,7 +2823,17 @@ async fn fetch_object_sq_range(
             "empty SQ range for object {object_key}"
         )));
     }
-    match cached_full_object_for_range(cache, object_key, object_size_bytes, end, "sq", 1).await? {
+    match cached_full_object_for_range(
+        cache,
+        cache_key,
+        object_key,
+        object_size_bytes,
+        end,
+        "sq",
+        1,
+    )
+    .await?
+    {
         RangeCacheLookup::Local(data) => {
             if let Some(stats) = stats {
                 stats.record_local_bytes(data.len());
@@ -2959,6 +3001,7 @@ async fn load_full_clusters_for_rerank(
     {
         return fetch_rerank_vectors_by_range(
             &object.key,
+            &object.cache_key,
             object.size_bytes,
             &needed_clusters,
             cluster_candidates,
@@ -2971,8 +3014,15 @@ async fn load_full_clusters_for_rerank(
         .await;
     }
 
-    let object_data =
-        fetch_with_cache_counted(cache, store, &object.key, stats, SqBytePhase::Rerank).await?;
+    let object_data = fetch_with_cache_counted(
+        cache,
+        store,
+        &object.key,
+        &object.cache_key,
+        stats,
+        SqBytePhase::Rerank,
+    )
+    .await?;
     rerank_vectors_from_object(
         &object.key,
         &object_data,
@@ -3068,6 +3118,7 @@ fn all_needed_vectors_have_ranges(
 /// escaping, while ownership moves each completed vector out exactly once.
 async fn fetch_rerank_vectors_by_range(
     object_key: &str,
+    cache_key: &str,
     object_size_bytes: u64,
     clusters: &[usize],
     cluster_candidates: &HashMap<usize, Vec<RerankNeed>>,
@@ -3119,6 +3170,7 @@ async fn fetch_rerank_vectors_by_range(
     let vector_bytes =
         match cached_full_object_for_range(
             cache,
+            cache_key,
             object_key,
             object_size_bytes,
             needed_end,
@@ -3500,18 +3552,18 @@ async fn load_cluster_object_layout(
     }
 
     if let Some(c) = cache {
-        if let Some(layout) = c.get_decoded::<ClusterObjectLayout>(&object.key)? {
+        if let Some(layout) = c.get_decoded::<ClusterObjectLayout>(&object.cache_key)? {
             record_artifact_read(&object.key);
             return Ok(Some(layout));
         }
     }
     if let Some(layout) = cluster_object_layout_cache()
-        .get(&object.key)
+        .get(&object.cache_key)
         .map(|entry| Arc::clone(entry.value()))
     {
         record_artifact_read(&object.key);
         if let Some(c) = cache {
-            c.insert_decoded(&object.key, Arc::clone(&layout));
+            c.insert_decoded(&object.cache_key, Arc::clone(&layout));
         }
         return Ok(Some(layout));
     }
@@ -3519,6 +3571,7 @@ async fn load_cluster_object_layout(
     let header_len = cluster_object_header_range_len(object.clusters.len())?;
     let header = match cached_full_object_for_range(
         cache,
+        &object.cache_key,
         &object.key,
         object.size_bytes,
         header_len,
@@ -3552,9 +3605,9 @@ async fn load_cluster_object_layout(
     validate_layout_matches_manifest(&object.key, &layout, &object.clusters)?;
 
     let layout = Arc::new(layout);
-    cluster_object_layout_cache().insert(object.key.clone(), Arc::clone(&layout));
+    cluster_object_layout_cache().insert(object.cache_key.clone(), Arc::clone(&layout));
     if let Some(c) = cache {
-        c.insert_decoded(&object.key, Arc::clone(&layout));
+        c.insert_decoded(&object.cache_key, Arc::clone(&layout));
     }
     Ok(Some(layout))
 }
@@ -3757,8 +3810,9 @@ async fn scan_clusters_pq(
     };
 
     // Load PQ codebook.
-    let cb_key = pq_codebook_key(&index.namespace, &index.segment_id);
-    let cb_data = fetch_with_cache(cache, store, &cb_key).await?;
+    let cb_key = pq_codebook_key(&index.physical_namespace, &index.segment_id);
+    let cb_data =
+        fetch_with_cache(cache, store, &cb_key, &index.artifact_cache_key(&cb_key)).await?;
     let codebook = PqCodebook::from_bytes(&cb_data)?;
 
     // Precompute ADC lookup table.
@@ -3774,19 +3828,12 @@ async fn scan_clusters_pq(
 
     let coarse_prefetched = futures::future::join_all(probe_clusters.iter().map(|&cluster_idx| {
         let owner = index.cluster_owner(cluster_idx);
-        let pq_key = pq_cluster_key(&index.namespace, owner, cluster_idx);
+        let pq_key = pq_cluster_key(&index.physical_namespace, owner, cluster_idx);
+        let pq_cache_key = index.artifact_cache_key(&pq_key);
         async move {
             let (prefilter, pq_res, attrs) = tokio::join!(
-                try_bitmap_prefilter(
-                    &index.namespace,
-                    owner,
-                    cluster_idx,
-                    filter,
-                    has_bitmaps,
-                    store,
-                    cache,
-                ),
-                fetch_with_cache(cache, store, &pq_key),
+                try_bitmap_prefilter(index, owner, cluster_idx, filter, has_bitmaps, store, cache,),
+                fetch_with_cache(cache, store, &pq_key, &pq_cache_key),
                 async {
                     if want_attr_filter {
                         load_attrs(index, cluster_idx, filter, store, cache, None).await
@@ -3802,6 +3849,7 @@ async fn scan_clusters_pq(
 
     let mut coarse_candidates: Vec<(String, f32, usize)> = Vec::new();
     for (cluster_idx, prefilter, pq_res, attrs) in coarse_prefetched {
+        let prefilter = prefilter?;
         let pq_data = pq_res?;
         let attrs = attrs?;
         let pq_cluster = deserialize_pq_cluster(&pq_data)?;
@@ -3844,7 +3892,7 @@ async fn scan_clusters_pq(
             async move {
                 let cluster_fetch = async {
                     let object = cluster_object?;
-                    fetch_with_cache(cache, store, &object.key).await
+                    fetch_with_cache(cache, store, &object.key, &object.cache_key).await
                 };
                 let (cluster_res, attrs) = tokio::join!(cluster_fetch, async {
                     if want_rerank_attrs {
@@ -3886,10 +3934,10 @@ async fn scan_clusters_pq(
 
 /// Tries to resolve a metadata filter into allowed row positions for one cluster.
 ///
-/// Bitmap indexes accelerate supported predicates but are optional. Any absent,
-/// unreadable, undecodable, or inexpressible bitmap path returns `None`, causing
-/// the caller to load attributes and use exact filter evaluation. That fallback
-/// preserves semantics rather than silently accepting or rejecting rows.
+/// Bitmap indexes accelerate supported predicates but are optional. A filter
+/// that the bitmap representation cannot express returns `None`, causing the
+/// caller to use exact attributes. Once the manifest advertises bitmaps, a
+/// missing, unreadable, or undecodable bitmap fails the scan.
 ///
 /// # Parameters
 ///
@@ -3908,8 +3956,8 @@ async fn scan_clusters_pq(
 ///
 /// # Side Effects
 ///
-/// May perform and cache one bitmap-object GET. Decode failures emit a debug
-/// event; storage/cache failures are intentionally converted to `None`.
+/// May perform and cache one bitmap-object GET. Storage, cache, and decode
+/// failures propagate to the complete query.
 ///
 /// # Performance
 ///
@@ -3923,33 +3971,26 @@ async fn scan_clusters_pq(
 /// `{2, 9, 11}`. A token predicate absent from the bitmap index returns `None`,
 /// so exact row attributes decide matches.
 async fn try_bitmap_prefilter(
-    namespace: &str,
+    index: &IvfFlatIndex,
     segment_id: &str,
     cluster_idx: usize,
     filter: Option<&Filter>,
     has_bitmaps: bool,
     store: &ZeppelinStore,
     cache: Option<&Arc<DiskCache>>,
-) -> Option<roaring::RoaringBitmap> {
-    let filter = filter?;
+) -> Result<Option<roaring::RoaringBitmap>> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
     if !has_bitmaps {
-        return None;
+        return Ok(None);
     }
 
-    let bkey = bitmap_key(namespace, segment_id, cluster_idx);
-    let data = match fetch_with_cache(cache, store, &bkey).await {
-        Ok(d) => d,
-        Err(_) => return None,
-    };
-    let bitmap_index = match ClusterBitmapIndex::from_bytes(&data) {
-        Ok(idx) => idx,
-        Err(e) => {
-            tracing::debug!(cluster = cluster_idx, error = %e, "failed to load bitmap index");
-            return None;
-        }
-    };
+    let bkey = bitmap_key(&index.physical_namespace, segment_id, cluster_idx);
+    let data = fetch_with_cache(cache, store, &bkey, &index.artifact_cache_key(&bkey)).await?;
+    let bitmap_index = ClusterBitmapIndex::from_bytes(&data)?;
 
-    evaluate_filter_bitmap(filter, &bitmap_index)
+    Ok(evaluate_filter_bitmap(filter, &bitmap_index))
 }
 
 /// Decides whether one row may enter a quantized coarse-ranking frontier.
@@ -4165,11 +4206,19 @@ async fn load_attrs(
         return Ok(None);
     }
     let akey = attrs_key(
-        &index.namespace,
+        &index.physical_namespace,
         index.cluster_owner(cluster_idx),
         cluster_idx,
     );
-    let data = fetch_with_cache_counted(cache, store, &akey, stats, SqBytePhase::Other).await?;
+    let data = fetch_with_cache_counted(
+        cache,
+        store,
+        &akey,
+        &index.artifact_cache_key(&akey),
+        stats,
+        SqBytePhase::Other,
+    )
+    .await?;
     Ok(Some(deserialize_attrs(&data)?))
 }
 
@@ -4185,6 +4234,7 @@ mod tests {
     //! integration coverage exercises real cache/object-store interaction.
 
     use super::*;
+    use crate::index::ivf_flat::build::{serialize_attrs, serialize_cluster};
 
     /// Builds a minimal two-centroid handle for validation-only search tests.
     ///
@@ -4204,6 +4254,8 @@ mod tests {
             num_vectors: 4,
             dim: 2,
             namespace: "test_ns".to_string(),
+            physical_namespace: "test_ns".to_string(),
+            physical_origin: None,
             segment_id: "seg_001".to_string(),
             quantization: QuantizationType::None,
             sq_calibration: None,
@@ -4216,6 +4268,112 @@ mod tests {
             bootstrap_ref: None,
             membership_ref: None,
         }
+    }
+
+    async fn write_one_filtered_cluster(store: &ZeppelinStore) {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "color".to_string(),
+            AttributeValue::String("blue".to_string()),
+        );
+        store
+            .put(
+                &cluster_key("test_ns", "seg_001", 0),
+                serialize_cluster(&["row-0".to_string()], &[vec![0.0, 0.0]], 2).unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &attrs_key("test_ns", "seg_001", 0),
+                serialize_attrs(&[Some(attrs)]).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn advertised_missing_bitmap_fails_flat_scan() {
+        let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        write_one_filtered_cluster(&store).await;
+        let mut index = make_index();
+        index.bitmap_fields = vec!["color".to_string()];
+        let filter = Filter::Eq {
+            field: "color".to_string(),
+            value: AttributeValue::String("blue".to_string()),
+        };
+
+        let result = scan_clusters_flat(
+            &index,
+            &[0],
+            &[0.0, 0.0],
+            DistanceMetric::Euclidean,
+            Some(&filter),
+            &store,
+            None,
+            false,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("an advertised missing bitmap must fail the flat scan"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("bitmap_0.bin"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn advertised_corrupt_bitmap_fails_flat_scan() {
+        let store = ZeppelinStore::new(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        write_one_filtered_cluster(&store).await;
+        store
+            .put(
+                &bitmap_key("test_ns", "seg_001", 0),
+                bytes::Bytes::from_static(b"not-a-bitmap-index"),
+            )
+            .await
+            .unwrap();
+        let mut index = make_index();
+        index.bitmap_fields = vec!["color".to_string()];
+        let filter = Filter::Eq {
+            field: "color".to_string(),
+            value: AttributeValue::String("blue".to_string()),
+        };
+
+        let result = scan_clusters_flat(
+            &index,
+            &[0],
+            &[0.0, 0.0],
+            DistanceMetric::Euclidean,
+            Some(&filter),
+            &store,
+            None,
+            false,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("an advertised corrupt bitmap must fail the flat scan"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("bitmap"), "{error}");
+    }
+
+    #[test]
+    fn legacy_cluster_reads_use_physical_namespace_not_logical_namespace() {
+        let mut index = make_index();
+        index.namespace = "branch-target".to_string();
+        index.physical_namespace = "branch-source".to_string();
+        index.physical_origin = Some(crate::namespace::branching::ArtifactOrigin {
+            namespace: crate::namespace::NamespaceId::parse("branch-source".to_string())
+                .expect("test namespace is valid"),
+            incarnation: crate::namespace::NamespaceIncarnationId::new(),
+        });
+
+        let object = cluster_fetch_object(&index, 1).expect("legacy cluster key resolves");
+
+        assert_eq!(object.key, "branch-source/segments/seg_001/cluster_1.bin");
+        assert_ne!(object.cache_key, object.key);
     }
 
     /// Builds a production-v4 sketch over one deterministic row per cluster.

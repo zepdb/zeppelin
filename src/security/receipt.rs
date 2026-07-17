@@ -11,7 +11,6 @@ use crate::error::{Result as ZeppelinResult, ZeppelinError};
 use crate::storage::ZeppelinStore;
 use crate::types::SearchResult;
 use crate::wal::manifest::{manifest_root_signing_bytes, Manifest, ReceiptBindingVersion};
-use crate::wal::WalFragment;
 
 use super::{
     DecisionId, MerklePath, MerkleTree, PolicyVersion, Principal, PrincipalId, SecurityError,
@@ -316,8 +315,7 @@ pub(crate) fn issue_receipt(issue: ReceiptIssue<'_>) -> ZeppelinResult<Retrieval
         .root_signer_node()
         .ok_or(SecurityError::ReceiptsUnavailableUnhashed)?
         .to_string();
-    let touched_keys = logical_touched_artifact_keys(namespace, manifest, touched_artifacts);
-    let touched = touched_keys
+    let touched = touched_artifacts
         .iter()
         .map(|key| {
             let content_hash = artifacts.get(key).ok_or_else(|| {
@@ -406,27 +404,6 @@ pub(crate) fn issue_receipt(issue: ReceiptIssue<'_>) -> ZeppelinResult<Retrieval
     }
     receipt.signature = signature;
     Ok(receipt)
-}
-
-/// Resolve the exact immutable artifact set consumed by one query.
-///
-/// The manifest root still commits to the complete reachable inventory. The
-/// execution layer records successful cache/object reads at their physical
-/// seams. Receipt issuance adds the WAL fragments consumed by the selected
-/// consistency path and then requires every key to exist in the signed manifest
-/// inventory; no compatibility-name filter may silently discard a traced read.
-fn logical_touched_artifact_keys(
-    namespace: &str,
-    manifest: &Manifest,
-    execution_artifacts: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let mut touched = manifest
-        .fragments
-        .iter()
-        .map(|fragment| WalFragment::s3_key(namespace, &fragment.id))
-        .collect::<BTreeSet<_>>();
-    touched.extend(execution_artifacts.iter().cloned());
-    touched
 }
 
 impl RetrievalReceipt {

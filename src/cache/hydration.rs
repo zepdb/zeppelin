@@ -112,8 +112,10 @@ use crate::error::{Result, ZeppelinError};
 use crate::fts::global_index::global_fts_key;
 use crate::index::bitmap::bitmap_key;
 use crate::index::ivf_flat::build::attrs_key;
+use crate::namespace::branching::ArtifactOrigin;
 use crate::storage::ZeppelinStore;
-use crate::wal::manifest::SegmentRef;
+use crate::wal::manifest::{immutable_artifact_cache_key, LocatedSegmentRef, SegmentRef};
+use crate::wal::Manifest;
 
 use super::DiskCache;
 
@@ -314,13 +316,83 @@ impl HydrationTrigger {
     }
 }
 
+/// Owned, origin-validated active segment selected for cache hydration.
+///
+/// The logical origin controls policy, metrics, and logs. The physical origin
+/// controls every immutable object-store key and disposable cache identity.
+/// Keeping both identities beside the cloned descriptor prevents the
+/// background worker from reconstructing storage location from a target
+/// namespace after the authoritative manifest borrow has ended.
+#[derive(Debug, Clone)]
+pub struct HydrationTarget {
+    logical_origin: ArtifactOrigin,
+    physical_origin: ArtifactOrigin,
+    segment: SegmentRef,
+}
+
+impl HydrationTarget {
+    /// Resolve and clone the active segment from a namespace-bound manifest.
+    ///
+    /// This convenience is appropriate when the manifest itself carries the
+    /// authoritative target incarnation. Legacy unbound manifests fail loudly;
+    /// callers with namespace metadata authority must use
+    /// [`Self::from_active_manifest_with_origin`].
+    pub fn from_active_manifest(manifest: &Manifest) -> Result<Option<Self>> {
+        let logical_origin = manifest.local_origin()?;
+        Self::from_active_manifest_with_origin(manifest, &logical_origin)
+    }
+
+    /// Resolve and clone the active segment using authoritative target metadata.
+    ///
+    /// The manifest resolver validates the target binding, origin table,
+    /// explicit artifact keys, duplicate global identities, and unique active
+    /// descriptor before this method returns an owned target.
+    pub fn from_active_manifest_with_origin(
+        manifest: &Manifest,
+        authoritative_local: &ArtifactOrigin,
+    ) -> Result<Option<Self>> {
+        let resolver = manifest.artifact_origin_resolver(authoritative_local)?;
+        Ok(resolver.active_located_segment()?.map(Self::from_located))
+    }
+
+    fn from_located(located: LocatedSegmentRef<'_>) -> Self {
+        Self {
+            logical_origin: located.logical_origin.as_origin().clone(),
+            physical_origin: located.physical_origin.as_origin().clone(),
+            segment: located.segment.clone(),
+        }
+    }
+
+    /// Return the logical namespace used for policy, metrics, and logs.
+    #[must_use]
+    pub fn logical_namespace(&self) -> &str {
+        self.logical_origin.namespace.as_str()
+    }
+
+    /// Return the physical namespace prefix used to build computed store keys.
+    #[must_use]
+    pub fn physical_namespace(&self) -> &str {
+        self.physical_origin.namespace.as_str()
+    }
+
+    /// Return the manifest-selected immutable segment descriptor.
+    #[must_use]
+    pub fn segment(&self) -> &SegmentRef {
+        &self.segment
+    }
+
+    /// Build an incarnation-qualified cache identity for one physical object.
+    #[must_use]
+    pub fn cache_key(&self, store_key: &str) -> String {
+        immutable_artifact_cache_key(&self.physical_origin, store_key)
+    }
+}
+
 /// Owned message moved from a query/admin caller into the worker channel.
 #[derive(Debug)]
 struct HydrationJob {
-    /// Namespace used for sidecar keys, logs, and metrics.
-    namespace: String,
-    /// Cloned manifest segment snapshot used to plan immutable objects.
-    segment: SegmentRef,
+    /// Validated logical/physical identity plus cloned manifest descriptor.
+    target: HydrationTarget,
     /// Source label retained across retries.
     trigger: HydrationTrigger,
 }
@@ -361,8 +433,10 @@ impl HydrationObjectKind {
 /// One object key and size evidence in a hydration plan.
 #[derive(Debug, Clone)]
 struct HydrationItem {
-    /// Full object-store/cache key.
-    key: String,
+    /// Full immutable object-store key under the physical namespace.
+    store_key: String,
+    /// Incarnation-qualified disposable-cache identity for `store_key`.
+    cache_key: String,
     /// Category used for success metrics.
     kind: HydrationObjectKind,
     /// Bytes charged to the pre-download capacity budget.
@@ -437,9 +511,8 @@ impl SegmentHydrator {
     ///
     /// # Parameters
     ///
-    /// - `namespace`: Namespace whose heat metric/policy state should advance.
-    /// - `segment`: Current manifest-visible segment to clone into a triggered
-    ///   job.
+    /// - `target`: Origin-validated active segment whose logical namespace
+    ///   advances policy state and whose physical origin supplies artifacts.
     ///
     /// # Returns
     ///
@@ -465,7 +538,9 @@ impl SegmentHydrator {
     ///
     /// The third query in a hot window may enqueue the active `seg-42`. If the
     /// queue is full, that query still executes normally on the cold path.
-    pub fn observe_query(&self, namespace: &str, segment: &SegmentRef) {
+    pub fn observe_query(&self, target: &HydrationTarget) {
+        let namespace = target.logical_namespace();
+        let segment = target.segment();
         crate::metrics::NAMESPACE_HEAT
             .with_label_values(&[namespace])
             .inc();
@@ -474,7 +549,7 @@ impl SegmentHydrator {
             .observe_query(namespace, &segment.id, Instant::now())
             == HeatDecision::Hydrate
         {
-            self.enqueue(namespace, segment, HydrationTrigger::Heat);
+            self.enqueue(target, HydrationTrigger::Heat);
         }
     }
 
@@ -482,8 +557,7 @@ impl SegmentHydrator {
     ///
     /// # Parameters
     ///
-    /// - `namespace`: Namespace named by the administrative request.
-    /// - `segment`: Current manifest-visible segment to hydrate.
+    /// - `target`: Origin-validated active segment named by the request.
     ///
     /// # Returns
     ///
@@ -498,9 +572,9 @@ impl SegmentHydrator {
     ///
     /// An operator can request `catalog` immediately after startup; the session
     /// policy returns `Hydrate` without waiting for its query threshold.
-    pub fn request_hydration(&self, namespace: &str, segment: &SegmentRef) {
-        if self.policy.request_hydration(namespace) == HeatDecision::Hydrate {
-            self.enqueue(namespace, segment, HydrationTrigger::Admin);
+    pub fn request_hydration(&self, target: &HydrationTarget) {
+        if self.policy.request_hydration(target.logical_namespace()) == HeatDecision::Hydrate {
+            self.enqueue(target, HydrationTrigger::Admin);
         }
     }
 
@@ -508,8 +582,8 @@ impl SegmentHydrator {
     ///
     /// # Parameters
     ///
-    /// - `namespace`: Namespace copied into the owned channel message.
-    /// - `segment`: Manifest segment cloned for planning after the caller returns.
+    /// - `target`: Validated identities and manifest segment cloned for work
+    ///   after the caller returns.
     /// - `trigger`: Heat/admin source used by metrics and structured logs.
     ///
     /// # Returns
@@ -525,10 +599,9 @@ impl SegmentHydrator {
     ///
     /// A heat-triggered `seg-42` job enters the queue with label `heat`. If all
     /// 1,024 slots are occupied, it is dropped and recorded rather than awaited.
-    fn enqueue(&self, namespace: &str, segment: &SegmentRef, trigger: HydrationTrigger) {
+    fn enqueue(&self, target: &HydrationTarget, trigger: HydrationTrigger) {
         let job = HydrationJob {
-            namespace: namespace.to_string(),
-            segment: segment.clone(),
+            target: target.clone(),
             trigger,
         };
         match self.jobs.try_send(job) {
@@ -540,8 +613,8 @@ impl SegmentHydrator {
             Err(error) => {
                 crate::metrics::HYDRATION_FAILURES_TOTAL.inc();
                 error!(
-                    namespace,
-                    segment_id = %segment.id,
+                    namespace = target.logical_namespace(),
+                    segment_id = %target.segment.id,
                     trigger = trigger.as_str(),
                     error = %error,
                     "failed to enqueue hydration job"
@@ -634,8 +707,8 @@ async fn run_job_with_retries(
             Err(error) => {
                 crate::metrics::HYDRATION_FAILURES_TOTAL.inc();
                 error!(
-                    namespace = %job.namespace,
-                    segment_id = %job.segment.id,
+                    namespace = job.target.logical_namespace(),
+                    segment_id = %job.target.segment.id,
                     trigger = job.trigger.as_str(),
                     attempt,
                     error = %error,
@@ -680,7 +753,7 @@ async fn run_job_with_retries(
 ///
 /// # Consistency
 ///
-/// Hydration uses exactly the immutable references in `job.segment`; it does
+/// Hydration uses exactly the immutable references in `job.target`; it does
 /// not re-read or publish a manifest. Cache population cannot make the segment
 /// visible independently of that manifest.
 ///
@@ -702,13 +775,13 @@ async fn hydrate_segment_once(
     job: &HydrationJob,
     capacity_refusals_logged: &mut HashMap<String, String>,
 ) -> Result<()> {
-    if is_incremental_segment(&job.segment) {
+    if is_incremental_segment(job.target.segment()) {
         crate::metrics::HYDRATION_SKIPPED_TOTAL
             .with_label_values(&["incremental_segment"])
             .inc();
         warn!(
-            namespace = %job.namespace,
-            segment_id = %job.segment.id,
+            namespace = job.target.logical_namespace(),
+            segment_id = %job.target.segment.id,
             reason = "incremental_segment",
             tracked_bug = INCREMENTAL_GATE_MESSAGE,
             "warm-set hydration refused for incremental segment"
@@ -717,9 +790,9 @@ async fn hydrate_segment_once(
     }
 
     let items = plan_hydration_items(store, job).await?;
-    let required_bytes = hydration_items_bytes(&items, &job.segment)?;
+    let required_bytes = hydration_items_bytes(&items, job.target.segment())?;
     crate::metrics::HYDRATION_REQUIRED_BYTES
-        .with_label_values(&[&job.namespace])
+        .with_label_values(&[job.target.logical_namespace()])
         .set(required_bytes as f64);
     let capacity_limit = hydration_capacity_limit(cache.max_size_bytes(), config)?;
     if required_bytes > capacity_limit {
@@ -743,9 +816,9 @@ async fn hydrate_segment_once(
         result?;
     }
     crate::metrics::HYDRATION_REFUSED
-        .with_label_values(&[job.namespace.as_str(), "capacity"])
+        .with_label_values(&[job.target.logical_namespace(), "capacity"])
         .set(0);
-    capacity_refusals_logged.remove(&job.namespace);
+    capacity_refusals_logged.remove(job.target.logical_namespace());
     Ok(())
 }
 
@@ -782,24 +855,27 @@ fn record_capacity_refusal(
     capacity_refusals_logged: &mut HashMap<String, String>,
 ) {
     crate::metrics::HYDRATION_REFUSED
-        .with_label_values(&[job.namespace.as_str(), "capacity"])
+        .with_label_values(&[job.target.logical_namespace(), "capacity"])
         .set(1);
 
     let should_log = capacity_refusals_logged
-        .get(&job.namespace)
-        .map(|segment_id| segment_id != &job.segment.id)
+        .get(job.target.logical_namespace())
+        .map(|segment_id| segment_id != &job.target.segment.id)
         .unwrap_or(true);
     if !should_log {
         return;
     }
 
-    capacity_refusals_logged.insert(job.namespace.clone(), job.segment.id.clone());
+    capacity_refusals_logged.insert(
+        job.target.logical_namespace().to_string(),
+        job.target.segment.id.clone(),
+    );
     crate::metrics::HYDRATION_REFUSAL_LOGS_TOTAL
-        .with_label_values(&[job.namespace.as_str(), "capacity"])
+        .with_label_values(&[job.target.logical_namespace(), "capacity"])
         .inc();
     warn!(
-        namespace = %job.namespace,
-        segment_id = %job.segment.id,
+        namespace = job.target.logical_namespace(),
+        segment_id = %job.target.segment.id,
         segment_bytes = required_bytes,
         cache_max_bytes = cache_max_size_bytes,
         max_fraction = config.max_segment_fraction,
@@ -871,21 +947,24 @@ async fn plan_hydration_items(
     job: &HydrationJob,
 ) -> Result<Vec<HydrationItem>> {
     let mut items: Vec<HydrationItem> = job
+        .target
         .segment
         .cluster_objects
         .iter()
         .map(|object| HydrationItem {
-            key: object.key.clone(),
+            store_key: object.key.clone(),
+            cache_key: job.target.cache_key(&object.key),
             kind: HydrationObjectKind::Cluster,
             size_bytes: object.size_bytes,
             expected_size: (object.size_bytes != 0).then_some(object.size_bytes),
         })
         .collect();
 
-    for (key, kind) in sidecar_keys(&job.namespace, &job.segment) {
-        let meta = store.head(&key).await?;
+    for (store_key, kind) in sidecar_keys(job.target.physical_namespace(), job.target.segment()) {
+        let meta = store.head(&store_key).await?;
         items.push(HydrationItem {
-            key,
+            cache_key: job.target.cache_key(&store_key),
+            store_key,
             kind,
             size_bytes: meta.size as u64,
             expected_size: None,
@@ -1049,10 +1128,10 @@ async fn hydrate_item(
     cache: Arc<DiskCache>,
     item: HydrationItem,
 ) -> Result<()> {
-    let key = item.key.clone();
-    let fetch_key = key.clone();
+    let cache_key = item.cache_key.clone();
+    let fetch_key = item.store_key.clone();
     let bytes = cache
-        .get_or_fetch(&key, move || {
+        .get_or_fetch(&cache_key, move || {
             let store = store.clone();
             async move { store.get(&fetch_key).await }
         })
@@ -1060,9 +1139,10 @@ async fn hydrate_item(
     let actual = bytes.len() as u64;
     if let Some(expected) = item.expected_size {
         if actual != expected {
-            cache.invalidate(&key).await?;
+            cache.invalidate(&cache_key).await?;
             return Err(ZeppelinError::Cache(format!(
-                "hydrated object length mismatch for {key}: expected={expected}, actual={actual}",
+                "hydrated object length mismatch for {}: expected={expected}, actual={actual}",
+                item.store_key,
             )));
         }
     }
@@ -1279,12 +1359,82 @@ impl HeatPolicy for SessionWindowPolicy {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     //! Unit tests for deterministic session-window transitions and trait use.
 
     use std::time::{Duration, Instant};
 
-    use super::{HeatDecision, HeatPolicy, SessionWindowPolicy};
+    use super::{
+        sidecar_keys, HeatDecision, HeatPolicy, HydrationObjectKind, HydrationTarget,
+        SessionWindowPolicy,
+    };
+    use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
+    use crate::namespace::{NamespaceId, NamespaceIncarnationId};
+    use crate::wal::manifest::SegmentRef;
+    use crate::wal::Manifest;
+
+    fn origin(namespace: &str, incarnation: u128) -> ArtifactOrigin {
+        ArtifactOrigin {
+            namespace: NamespaceId::parse(namespace)
+                .expect("hydration origin fixture namespace must be valid"),
+            incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(incarnation)),
+        }
+    }
+
+    fn segment(id: &str, artifact_origin: Option<ArtifactOriginIndex>) -> SegmentRef {
+        SegmentRef {
+            id: id.to_string(),
+            vector_count: 1,
+            cluster_count: 1,
+            quantization: crate::index::quantization::QuantizationType::None,
+            hierarchical: false,
+            bitmap_fields: Vec::new(),
+            fts_fields: Vec::new(),
+            has_global_fts: false,
+            cluster_owners: Vec::new(),
+            sketch: None,
+            cluster_objects: Vec::new(),
+            bootstrap: None,
+            membership: None,
+            artifact_origin,
+        }
+    }
+
+    #[test]
+    fn foreign_active_segment_hydration_uses_physical_origin_and_cache_incarnation() {
+        let logical_origin = origin("target", 1);
+        let physical_origin = origin("source", 2);
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(logical_origin.incarnation.as_uuid())
+            .expect("target manifest must accept its incarnation");
+        manifest.artifact_origins.push(physical_origin.clone());
+        manifest
+            .segments
+            .push(segment("seg-foreign", Some(ArtifactOriginIndex::new(0))));
+        manifest.active_segment = Some("seg-foreign".to_string());
+
+        let target = HydrationTarget::from_active_manifest_with_origin(&manifest, &logical_origin)
+            .expect("foreign descriptor must resolve")
+            .expect("fixture must have an active segment");
+        let sidecars = sidecar_keys(target.physical_namespace(), target.segment());
+        let store_key = "source/segments/seg-foreign/attrs_0.bin";
+
+        assert_eq!(target.logical_namespace(), "target");
+        assert_eq!(target.physical_namespace(), "source");
+        assert_eq!(
+            sidecars,
+            vec![(store_key.to_string(), HydrationObjectKind::Attrs)]
+        );
+        assert_eq!(
+            target.cache_key(store_key),
+            format!(
+                "artifact-origin/{}/{store_key}",
+                physical_origin.incarnation.as_uuid().simple()
+            )
+        );
+    }
 
     /// Constructs a policy or fails the test with the configuration error.
     ///

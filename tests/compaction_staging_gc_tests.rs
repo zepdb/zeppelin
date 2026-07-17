@@ -96,7 +96,8 @@ async fn gc_sweep_age_floor(
         .unwrap()
         .expect("manifest must exist");
     let staged = active_staged_keys(store, namespace).await.unwrap();
-    let reachable = reachable_keys_with_staging(namespace, &manifest, &staged);
+    let reachable = reachable_keys_with_staging(namespace, &manifest, &staged)
+        .expect("manifest reachability must resolve");
     let mut deleted = Vec::new();
     for key in store
         .list_prefix(&format!("{namespace}/segments/"))

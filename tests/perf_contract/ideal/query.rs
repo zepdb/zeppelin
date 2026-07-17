@@ -910,7 +910,7 @@ async fn verify_clone_target(
     assert_eq!(manifest.segment_vector_count(), 8);
     assert!(manifest.pending_deletes.is_empty());
     assert_eq!(manifest.fencing_token, 0);
-    for key in reachable_keys(target, &manifest) {
+    for key in reachable_keys(target, &manifest).expect("clone reachability must resolve") {
         assert!(
             key.starts_with(&format!("{target}/")),
             "clone target retained a source key: {key}"

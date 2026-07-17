@@ -143,6 +143,7 @@ use std::collections::BTreeMap;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
+use crate::cache::hydration::HydrationTarget;
 use crate::compaction::background::run_compaction_with_reserved_lease;
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
@@ -1768,8 +1769,10 @@ async fn materialize_clone_manifest(
 ///
 /// # Errors
 ///
-/// Returns an index error if any generated or stored reachable key lies outside
-/// the source namespace prefix. No copies occur in this helper.
+/// Returns a typed branching-not-ready error when the complete reachable
+/// inventory contains an artifact owned by another namespace lifetime. Phase
+/// 06 owns collision-safe materialization of that multi-origin logical view.
+/// No copies occur in this helper.
 ///
 /// # Examples
 ///
@@ -1781,7 +1784,29 @@ fn clone_copy_map(
     target: &str,
     manifest: &Manifest,
 ) -> Result<BTreeMap<String, String>, ZeppelinError> {
-    let source_keys = manifest.receipt_artifacts(source)?.keys().cloned();
+    // Materialize the complete physical inventory before classifying it. A
+    // foreign-backed manifest is a valid read view, but raw prefix substitution
+    // cannot safely make it an independently owned clone: equal segment IDs or
+    // WAL ULIDs from different origins can collide at the destination. Fail
+    // before scheduling any copy; Phase 06 rebuilds such views through the
+    // production owned-view materialization seam.
+    let source_keys = manifest
+        .receipt_artifacts(source)?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let source_prefix = format!("{source}/");
+    if source_keys
+        .iter()
+        .any(|source_key| !source_key.starts_with(&source_prefix))
+    {
+        return Err(
+            crate::namespace::branching::BranchError::BranchingNotReady {
+                feature: "copy clone of a foreign-backed manifest",
+            }
+            .into(),
+        );
+    }
     source_keys
         .into_iter()
         .map(|source_key| {
@@ -2697,7 +2722,7 @@ pub async fn trigger_hydration(
         .as_ref()
         .ok_or(ApiError(ZeppelinError::HydrationDisabled))?;
 
-    state
+    let metadata = state
         .namespace_manager
         .get(&ns)
         .await
@@ -2707,14 +2732,20 @@ pub async fn trigger_hydration(
         .get_strong_required(&state.store, &ns)
         .await
         .map_err(ApiError::from)?;
-    let segment = active_segment_snapshot(&manifest).ok_or_else(|| {
+    let authoritative_origin = metadata.artifact_origin().map_err(ApiError::from)?;
+    let target = match authoritative_origin.as_ref() {
+        Some(origin) => HydrationTarget::from_active_manifest_with_origin(&manifest, origin),
+        None => HydrationTarget::from_active_manifest(&manifest),
+    }
+    .map_err(ApiError::from)?
+    .ok_or_else(|| {
         ApiError(ZeppelinError::Validation(format!(
             "namespace {ns} has no active segment to hydrate"
         )))
     })?;
-    let segment_id = segment.id.clone();
+    let segment_id = target.segment().id.clone();
 
-    hydrator.request_hydration(&ns, &segment);
+    hydrator.request_hydration(&target);
     info!(
         namespace = %ns,
         segment_id = %segment_id,
@@ -2727,41 +2758,6 @@ pub async fn trigger_hydration(
             segment_id,
         }),
     ))
-}
-
-/// Clones the manifest's active segment descriptor for work beyond the borrow.
-///
-/// # Parameters
-///
-/// - `manifest`: Borrowed visibility snapshot whose active pointer should be
-///   resolved.
-///
-/// # Returns
-///
-/// An owned [`SegmentRef`] when `active_segment` matches an entry in
-/// `manifest.segments`, or `None` when the pointer is absent or unresolved.
-///
-/// # Performance
-///
-/// Scans segment references linearly, then clones the selected descriptor and
-/// its owned keys/vectors. It performs no storage I/O.
-///
-/// # Examples
-///
-/// A manifest pointing to `s42` returns an owned `s42` descriptor that a
-/// hydration job can retain after the manifest borrow ends.
-///
-/// # Rust Notes for Java/C Engineers
-///
-/// The inner lookup returns `&SegmentRef`, a temporary shared borrow. `.cloned()`
-/// creates an owned descriptor because the async hydrator may outlive the
-/// borrowed manifest. Java object references would remain heap-managed; C would
-/// require a deep-copy/lifetime convention. Rust prevents enqueuing a dangling
-/// reference.
-fn active_segment_snapshot(
-    manifest: &crate::wal::Manifest,
-) -> Option<crate::wal::manifest::SegmentRef> {
-    active_segment_ref(manifest).cloned()
 }
 
 /// Derives the compact polling view from one borrowed manifest snapshot.

@@ -88,9 +88,13 @@ use std::sync::Arc;
 use crate::config::IndexingConfig;
 use crate::error::Result;
 use crate::index::VectorIndex;
+use crate::namespace::branching::ArtifactOrigin;
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, Filter, SearchResult, VectorEntry};
-use crate::wal::manifest::{BootstrapRef, ClusterDataObjectRef, MembershipRef};
+use crate::wal::manifest::{
+    immutable_artifact_cache_key, BootstrapRef, ClusterDataObjectRef, LocatedSegmentRef,
+    MembershipRef,
+};
 
 /// Resident routing metadata for one immutable IVF-Flat segment.
 ///
@@ -131,6 +135,14 @@ pub struct IvfFlatIndex {
     pub(crate) dim: usize,
     /// Namespace prefix used to construct legacy and sidecar object keys.
     pub(crate) namespace: String,
+    /// Physical namespace prefix that owns every immutable artifact selected
+    /// through this handle.  This differs from `namespace` when a branch reads
+    /// a source segment without copying it.
+    pub(crate) physical_namespace: String,
+    /// Incarnation-qualified physical owner used for disposable cache keys.
+    /// Keeping this alongside the physical prefix prevents a recreated
+    /// namespace from reusing stale immutable bytes with the same S3 key.
+    pub(crate) physical_origin: Option<ArtifactOrigin>,
     /// Identity of the segment that owns segment-global artifacts.
     ///
     /// Centroids, calibration, codebooks, sketches, and bootstrap metadata live
@@ -183,6 +195,12 @@ pub struct IvfFlatIndex {
 }
 
 impl IvfFlatIndex {
+    /// Return an incarnation-qualified cache identity while retaining the exact
+    /// manifest-selected S3 key for the actual object-store GET.
+    #[must_use]
+    pub(crate) fn artifact_cache_key(&self, store_key: &str) -> String {
+        artifact_cache_key(self.physical_origin.as_ref(), store_key)
+    }
     /// Reports the number of logical centroid clusters in this segment.
     ///
     /// # Returns
@@ -519,6 +537,51 @@ impl IvfFlatIndex {
         )
         .await
     }
+
+    /// Loads a manifest-selected segment through its resolved physical owner.
+    ///
+    /// The logical namespace remains attached to the returned handle for
+    /// accounting and cache-pin scope; every immutable object GET derives from
+    /// `located.physical_namespace()` instead.
+    pub(crate) async fn load_from_located_manifest(
+        store: &ZeppelinStore,
+        located: LocatedSegmentRef<'_>,
+        cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
+    ) -> Result<Self> {
+        let segment = located.segment;
+        build::load_ivf_flat_from_located_manifest(store, located, cache)
+            .await
+            .map(|mut index| {
+                // Preserve the manifest's logical target for caller-visible
+                // accounting while build routing has already used the source.
+                index.namespace = located.logical_namespace.to_string();
+                index.segment_id = segment.id.clone();
+                index
+            })
+    }
+}
+
+pub(crate) fn artifact_cache_key(origin: Option<&ArtifactOrigin>, store_key: &str) -> String {
+    origin.map_or_else(
+        || store_key.to_string(),
+        |origin| immutable_artifact_cache_key(origin, store_key),
+    )
+}
+
+pub(crate) fn cache_pin_scope(
+    logical_origin: Option<&ArtifactOrigin>,
+    logical_namespace: &str,
+    role: &str,
+) -> String {
+    logical_origin.map_or_else(
+        || format!("{logical_namespace}:{role}"),
+        |origin| {
+            format!(
+                "artifact-origin/{}/pin/{role}",
+                origin.incarnation.as_uuid().simple()
+            )
+        },
+    )
 }
 
 #[async_trait]

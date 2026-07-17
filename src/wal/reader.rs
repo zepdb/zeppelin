@@ -68,7 +68,9 @@
 //! compaction read-only behavior distinct states. Each cached variant borrows an
 //! `Arc`, so the reader performs no reference-count clone per fragment.
 
-use std::collections::HashSet;
+use std::borrow::Borrow;
+use std::collections::{BTreeSet, HashSet};
+use std::ops::Deref;
 use std::sync::Arc;
 
 use tracing::{debug, instrument, warn};
@@ -80,7 +82,46 @@ use crate::storage::ZeppelinStore;
 
 use super::fragment::WalFragment;
 use super::fragment_cache::WalFragmentCache;
-use super::manifest::{FragmentRef, Manifest};
+use super::manifest::{FragmentRef, LocatedFragmentIdentity, LocatedFragmentRef, Manifest};
+
+/// Decoded immutable WAL body retaining its exact physical identity.
+#[derive(Debug, Clone)]
+pub(crate) struct LocatedWalFragment {
+    /// Origin-qualified identity used by decoded and derived caches.
+    pub(crate) identity: LocatedFragmentIdentity,
+    /// Shared checksum-validated body.
+    pub(crate) fragment: Arc<WalFragment>,
+}
+
+/// Successful origin-resolved WAL reads plus their exact physical keys.
+pub(crate) struct LocatedWalRead {
+    /// Checksum-validated bodies in manifest replay order.
+    pub(crate) fragments: Vec<LocatedWalFragment>,
+    /// Physical immutable keys whose contents were returned to the caller.
+    pub(crate) touched_artifacts: BTreeSet<String>,
+}
+
+/// Effective tombstones plus the exact WAL objects consumed to derive them.
+pub(crate) struct LocatedWalDeleteRead {
+    /// IDs whose last operation among the selected delete-bearing refs is delete.
+    pub(crate) deleted_ids: HashSet<String>,
+    /// Physical immutable keys whose contents were returned to the caller.
+    pub(crate) touched_artifacts: BTreeSet<String>,
+}
+
+impl Borrow<WalFragment> for LocatedWalFragment {
+    fn borrow(&self) -> &WalFragment {
+        &self.fragment
+    }
+}
+
+impl Deref for LocatedWalFragment {
+    type Target = WalFragment;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fragment
+    }
+}
 
 /// Cache behavior for a batch of immutable WAL fragment reads.
 ///
@@ -420,6 +461,135 @@ impl WalReader {
         Ok(fragments)
     }
 
+    /// Read origin-resolved fragment refs in manifest order.
+    ///
+    /// Each immutable GET and byte-cache lookup is keyed by the descriptor's
+    /// physical namespace lifetime. The logical target is retained only for
+    /// missing-ref revalidation and metrics.
+    pub(crate) async fn read_located_fragments_unchecked(
+        &self,
+        refs: &[LocatedFragmentRef<'_>],
+        cache_policy: FragmentCachePolicy<'_>,
+    ) -> Result<Vec<WalFragment>> {
+        Self::validate_located_batch(refs)?;
+        let results = futures::future::join_all(
+            refs.iter()
+                .map(|located| self.read_located_fragment_with_cache(*located, cache_policy)),
+        )
+        .await;
+        self.finish_located_fragment_results(refs, results).await
+    }
+
+    /// Read origin-resolved refs while retaining identities for derived caches.
+    pub(crate) async fn read_located_query_fragments_unchecked(
+        &self,
+        refs: &[LocatedFragmentRef<'_>],
+        cache_policy: FragmentCachePolicy<'_>,
+        fragment_cache: Option<&Arc<WalFragmentCache>>,
+    ) -> Result<Vec<LocatedWalFragment>> {
+        Self::validate_located_batch(refs)?;
+        let results = futures::future::join_all(refs.iter().map(|located| async move {
+            let identity = located.identity();
+            if let Some(cache) = fragment_cache {
+                if let Some(fragment) = cache.get(&identity) {
+                    return Ok(LocatedWalFragment { identity, fragment });
+                }
+            }
+
+            let fragment = Arc::new(
+                self.read_located_fragment_with_cache(*located, cache_policy)
+                    .await?,
+            );
+            if let Some(cache) = fragment_cache {
+                cache.insert_decoded(
+                    located.logical_origin.as_origin(),
+                    identity.clone(),
+                    Arc::clone(&fragment),
+                );
+            }
+            Ok(LocatedWalFragment { identity, fragment })
+        }))
+        .await;
+        self.finish_located_fragment_results(refs, results).await
+    }
+
+    /// Read origin-resolved query fragments and retain exact successful keys.
+    pub(crate) async fn read_located_query_fragments_with_trace_unchecked(
+        &self,
+        refs: &[LocatedFragmentRef<'_>],
+        cache_policy: FragmentCachePolicy<'_>,
+        fragment_cache: Option<&Arc<WalFragmentCache>>,
+    ) -> Result<LocatedWalRead> {
+        let fragments = self
+            .read_located_query_fragments_unchecked(refs, cache_policy, fragment_cache)
+            .await?;
+        let touched_artifacts = fragments
+            .iter()
+            .map(|fragment| {
+                WalFragment::s3_key(
+                    fragment.identity.physical_origin.namespace.as_str(),
+                    &fragment.identity.id,
+                )
+            })
+            .collect();
+        Ok(LocatedWalRead {
+            fragments,
+            touched_artifacts,
+        })
+    }
+
+    /// Compute effective tombstones from origin-resolved delete-bearing refs.
+    pub(crate) async fn read_located_delete_ids_unchecked(
+        &self,
+        refs: &[LocatedFragmentRef<'_>],
+        cache_policy: FragmentCachePolicy<'_>,
+        fragment_cache: Option<&Arc<WalFragmentCache>>,
+    ) -> Result<HashSet<String>> {
+        self.read_located_delete_ids_with_trace_unchecked(refs, cache_policy, fragment_cache)
+            .await
+            .map(|read| read.deleted_ids)
+    }
+
+    /// Compute effective tombstones and retain exact successful physical keys.
+    pub(crate) async fn read_located_delete_ids_with_trace_unchecked(
+        &self,
+        refs: &[LocatedFragmentRef<'_>],
+        cache_policy: FragmentCachePolicy<'_>,
+        fragment_cache: Option<&Arc<WalFragmentCache>>,
+    ) -> Result<LocatedWalDeleteRead> {
+        let delete_refs: Vec<LocatedFragmentRef<'_>> = refs
+            .iter()
+            .copied()
+            .filter(|located| located.fragment.delete_count > 0)
+            .collect();
+        if delete_refs.is_empty() {
+            return Ok(LocatedWalDeleteRead {
+                deleted_ids: HashSet::new(),
+                touched_artifacts: BTreeSet::new(),
+            });
+        }
+        let read = self
+            .read_located_query_fragments_with_trace_unchecked(
+                &delete_refs,
+                cache_policy,
+                fragment_cache,
+            )
+            .await?;
+        let mut deleted_ids = HashSet::new();
+        for fragment in &read.fragments {
+            for deleted in &fragment.deletes {
+                deleted_ids.insert(deleted.clone());
+            }
+            for vector in &fragment.vectors {
+                deleted_ids.remove(&vector.id);
+            }
+        }
+        Ok(LocatedWalDeleteRead {
+            deleted_ids,
+            touched_artifacts: read.touched_artifacts,
+        })
+    }
+
     /// Reads query-visible refs while memoizing successful decoded fragments.
     ///
     /// Manifest selection remains the caller's responsibility. A decoded-cache
@@ -434,21 +604,15 @@ impl WalReader {
         cache_policy: FragmentCachePolicy<'_>,
         fragment_cache: Option<&Arc<WalFragmentCache>>,
     ) -> Result<Vec<Arc<WalFragment>>> {
+        // Compatibility path for namespace-local callers that have not supplied
+        // an incarnation-qualified located identity. Production query and
+        // compaction paths use `read_located_query_fragments_unchecked`.
+        let _ = fragment_cache;
         let results = futures::future::join_all(refs.iter().map(|fref| async move {
-            if let Some(cache) = fragment_cache {
-                if let Some(fragment) = cache.get(&fref.id) {
-                    return Ok(fragment);
-                }
-            }
-
-            let fragment = Arc::new(
+            Ok(Arc::new(
                 self.read_fragment_unchecked_with_cache(namespace, &fref.id, cache_policy)
                     .await?,
-            );
-            if let Some(cache) = fragment_cache {
-                cache.insert_decoded(namespace, Arc::clone(&fragment));
-            }
-            Ok(fragment)
+            ))
         }))
         .await;
 
@@ -559,6 +723,63 @@ impl WalReader {
         );
 
         Ok(deleted_ids)
+    }
+
+    fn validate_located_batch(refs: &[LocatedFragmentRef<'_>]) -> Result<()> {
+        let Some(first) = refs.first() else {
+            return Ok(());
+        };
+        let logical_origin = first.logical_origin.as_origin();
+        let mut identities = HashSet::with_capacity(refs.len());
+        for located in refs {
+            if located.logical_origin.as_origin() != logical_origin {
+                return Err(ZeppelinError::Serialization(
+                    "one WAL read batch cannot mix logical namespace lifetimes".to_string(),
+                ));
+            }
+            if !identities.insert(located.identity()) {
+                return Err(ZeppelinError::Serialization(format!(
+                    "duplicate located WAL fragment identity in read batch: {}/{}",
+                    located.physical_origin.namespace(),
+                    located.fragment.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn read_located_fragment_with_cache(
+        &self,
+        located: LocatedFragmentRef<'_>,
+        cache_policy: FragmentCachePolicy<'_>,
+    ) -> Result<WalFragment> {
+        let s3_key = WalFragment::s3_key(located.physical_origin.namespace(), &located.fragment.id);
+        let cache_key = located.cache_key(&s3_key);
+        let data = self
+            .read_fragment_bytes_at(
+                &s3_key,
+                &cache_key,
+                located.logical_namespace,
+                &located.fragment.id,
+                cache_policy,
+            )
+            .await?;
+        let result = WalFragment::from_bytes(&data)
+            .and_then(|fragment| Self::validate_fragment_identity(fragment, &located.fragment.id));
+        if result.is_err() {
+            if let Some(cache) = cache_policy.cache() {
+                if let Err(error) = cache.invalidate(&cache_key).await {
+                    warn!(
+                        logical_namespace = located.logical_namespace,
+                        physical_namespace = located.physical_origin.namespace(),
+                        fragment_id = %located.fragment.id,
+                        error = %error,
+                        "failed to evict corrupt located WAL fragment cache entry"
+                    );
+                }
+            }
+        }
+        result
     }
 
     /// Reads cached-or-authoritative bytes and decodes them with checksum validation.
@@ -710,8 +931,21 @@ impl WalReader {
         cache_policy: FragmentCachePolicy<'_>,
     ) -> Result<bytes::Bytes> {
         let s3_key = WalFragment::s3_key(namespace, fragment_id);
+        let cache_key = Self::fragment_cache_key(fragment_id);
+        self.read_fragment_bytes_at(&s3_key, &cache_key, namespace, fragment_id, cache_policy)
+            .await
+    }
+
+    async fn read_fragment_bytes_at(
+        &self,
+        s3_key: &str,
+        cache_key: &str,
+        logical_namespace: &str,
+        fragment_id: &Ulid,
+        cache_policy: FragmentCachePolicy<'_>,
+    ) -> Result<bytes::Bytes> {
         let (cache, populate_on_miss) = match cache_policy {
-            FragmentCachePolicy::Bypass => return self.store.get(&s3_key).await,
+            FragmentCachePolicy::Bypass => return self.store.get(s3_key).await,
             FragmentCachePolicy::ReadWrite(cache) => (cache, true),
             FragmentCachePolicy::ReadOnly(cache) => (cache, false),
         };
@@ -722,15 +956,14 @@ impl WalReader {
         // cache-write failure (e.g. disk full, or a torn-down cache dir) must
         // never fail a query that already has the bytes. Degrade to
         // served-from-S3-uncached, log, and move on.
-        let cache_key = Self::fragment_cache_key(fragment_id);
-        if let Some(data) = cache.get(&cache_key).await {
+        if let Some(data) = cache.get(cache_key).await {
             return Ok(data);
         }
-        let data = self.store.get(&s3_key).await?;
+        let data = self.store.get(s3_key).await?;
         if populate_on_miss {
-            if let Err(e) = cache.put(&cache_key, &data).await {
+            if let Err(e) = cache.put(cache_key, &data).await {
                 warn!(
-                    namespace = namespace,
+                    namespace = logical_namespace,
                     fragment_id = %fragment_id,
                     error = %e,
                     "WAL fragment cache write failed; serving from S3 uncached"
@@ -858,6 +1091,68 @@ impl WalReader {
                 .inc();
         }
 
+        Ok(fragments)
+    }
+
+    async fn finish_located_fragment_results<T>(
+        &self,
+        refs: &[LocatedFragmentRef<'_>],
+        results: Vec<Result<T>>,
+    ) -> Result<Vec<T>> {
+        if refs.len() != results.len() {
+            return Err(ZeppelinError::Serialization(
+                "located WAL result count does not match requested ref count".to_string(),
+            ));
+        }
+        let mut fragments = Vec::with_capacity(results.len());
+        let mut missing = Vec::new();
+        for (located, result) in refs.iter().zip(results) {
+            match result {
+                Ok(fragment) => fragments.push(fragment),
+                Err(ZeppelinError::NotFound { key }) => {
+                    missing.push((located.identity(), key));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(fragments);
+        }
+
+        let Some(first) = refs.first() else {
+            return Err(ZeppelinError::Serialization(
+                "missing located WAL result without a requested ref".to_string(),
+            ));
+        };
+        let logical_origin = first.logical_origin.as_origin().clone();
+        let logical_namespace = first.logical_namespace;
+        let Some(fresh_manifest) = Manifest::read(&self.store, logical_namespace).await? else {
+            let (_, key) = missing.remove(0);
+            return Err(ZeppelinError::NotFound { key });
+        };
+        let resolver = fresh_manifest.artifact_origin_resolver(&logical_origin)?;
+        let live_identities: HashSet<LocatedFragmentIdentity> = resolver
+            .uncompacted_located_fragments()?
+            .into_iter()
+            .map(LocatedFragmentRef::identity)
+            .collect();
+        for (identity, key) in &missing {
+            if live_identities.contains(identity) {
+                return Err(ZeppelinError::NotFound { key: key.clone() });
+            }
+        }
+        for (identity, key) in missing {
+            warn!(
+                namespace = logical_namespace,
+                physical_namespace = identity.physical_origin.namespace.as_str(),
+                fragment_id = %identity.id,
+                key,
+                "located WAL fragment disappeared after authoritative compaction"
+            );
+            crate::metrics::WAL_FRAGMENT_GC_RACE_SKIPPED_TOTAL
+                .with_label_values(&[logical_namespace])
+                .inc();
+        }
         Ok(fragments)
     }
 }

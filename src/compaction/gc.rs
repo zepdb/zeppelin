@@ -122,6 +122,7 @@ use crate::index::ivf_flat::build::{attrs_key, centroids_key, cluster_key};
 use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
 use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
 use crate::index::quantization::QuantizationType;
+use crate::namespace::branching::ArtifactOrigin;
 use crate::namespace::manager::{NamespaceIncarnationId, NamespaceMetadata};
 use crate::security::{NamespaceId, PreservationService};
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
@@ -141,6 +142,57 @@ const GC_MANIFEST_CAS_RETRIES: usize = 10;
 
 /// Maximum number of reads polled concurrently within one variable-size GC batch.
 const GC_READ_BATCH_CONCURRENCY: usize = 32;
+
+/// Object-store key proven to belong to the namespace whose GC cycle may delete it.
+///
+/// Reachability may legitimately contain foreign physical keys. Destructive GC
+/// paths must cross this classifier before calling `delete_many`, so a borrowed
+/// source artifact can never become a target-owned deletion candidate by
+/// accident.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TargetOwnedDeletionKey {
+    target: NamespaceId,
+    key: String,
+}
+
+impl TargetOwnedDeletionKey {
+    fn classify(namespace: &str, key: String) -> Result<Self> {
+        let target = NamespaceId::new(namespace.to_string())?;
+        let target_prefix = format!("{}/", target.as_str());
+        if !key.starts_with(&target_prefix) {
+            return Err(ZeppelinError::Serialization(format!(
+                "GC target {} cannot delete foreign key {key}",
+                target.as_str()
+            )));
+        }
+        Ok(Self { target, key })
+    }
+
+    fn as_str(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Exercise the same ownership classifier used by every destructive GC path.
+#[cfg(feature = "branching-test-support")]
+pub(crate) fn classify_target_owned_deletion_key_for_test_support(
+    namespace: &str,
+    key: String,
+) -> Result<String> {
+    TargetOwnedDeletionKey::classify(namespace, key).map(|owned| owned.key)
+}
+
+async fn delete_target_owned_many(
+    store: &ZeppelinStore,
+    keys: &[TargetOwnedDeletionKey],
+) -> Result<usize> {
+    debug_assert!(keys
+        .first()
+        .is_none_or(|first| keys.iter().all(|key| key.target == first.target)));
+    store
+        .delete_many(keys.iter().map(|key| key.key.clone()).collect())
+        .await
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GcReadMode {
@@ -632,6 +684,33 @@ pub fn staging_key(namespace: &str, fencing_token: u64) -> String {
     format!("{namespace}/_staging/{fencing_token}.json")
 }
 
+fn local_artifact_origin_for_gc(
+    namespace: &str,
+    manifest: &Manifest,
+) -> Result<Option<ArtifactOrigin>> {
+    let has_explicit_origins = !manifest.artifact_origins.is_empty()
+        || manifest
+            .fragments
+            .iter()
+            .any(|fragment| fragment.artifact_origin.is_some())
+        || manifest
+            .segments
+            .iter()
+            .any(|segment| segment.artifact_origin.is_some());
+    let Some(incarnation) = manifest.namespace_incarnation() else {
+        if has_explicit_origins {
+            return Err(ZeppelinError::Serialization(format!(
+                "manifest for namespace {namespace} has artifact origins but no local incarnation"
+            )));
+        }
+        return Ok(None);
+    };
+    Ok(Some(ArtifactOrigin {
+        namespace: NamespaceId::new(namespace.to_string())?,
+        incarnation: NamespaceIncarnationId::from_uuid(incarnation),
+    }))
+}
+
 /// Derives every immutable artifact key referenced by one manifest.
 ///
 /// This pure function expands WAL fragments, segment metadata, cluster data,
@@ -651,6 +730,12 @@ pub fn staging_key(namespace: &str, fencing_token: u64) -> String {
 ///
 /// A lexicographically ordered, duplicate-free owned set of exact object keys.
 /// Shared carried-cluster objects appear once.
+///
+/// # Errors
+///
+/// Returns an artifact-origin integrity error when an indexed reference cannot
+/// be resolved or an explicit stored key falls outside its declared physical
+/// origin. Legacy local-only manifests remain namespace-routed.
 ///
 /// # Consistency
 ///
@@ -677,8 +762,7 @@ pub fn staging_key(namespace: &str, fencing_token: u64) -> String {
 /// reference or `const Manifest *` in C, but Rust also guarantees it is non-null
 /// and valid for the call. The returned [`BTreeSet`] owns cloned key strings and
 /// therefore remains valid after the manifest borrow ends.
-#[must_use]
-pub fn reachable_keys(namespace: &str, manifest: &Manifest) -> BTreeSet<String> {
+pub fn reachable_keys(namespace: &str, manifest: &Manifest) -> Result<BTreeSet<String>> {
     reachable_keys_with_staging(namespace, manifest, &BTreeSet::new())
 }
 
@@ -689,13 +773,15 @@ pub fn reachable_keys(namespace: &str, manifest: &Manifest) -> BTreeSet<String> 
 /// checks do not re-list and re-download the same history bodies. A caller must
 /// still take a fresh history observation before any physical deletion whose
 /// safety depends on retained history.
-#[must_use]
-fn reachable_keys_from_manifests(namespace: &str, manifests: &[Manifest]) -> BTreeSet<String> {
+fn reachable_keys_from_manifests(
+    namespace: &str,
+    manifests: &[Manifest],
+) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     for manifest in manifests {
-        keys.extend(reachable_keys(namespace, manifest));
+        keys.extend(reachable_keys(namespace, manifest)?);
     }
-    keys
+    Ok(keys)
 }
 
 /// Unions one manifest's references with caller-validated staged uploads.
@@ -715,6 +801,11 @@ fn reachable_keys_from_manifests(namespace: &str, manifests: &[Manifest]) -> BTr
 ///
 /// An owned, ordered union containing manifest and staged keys exactly once.
 ///
+/// # Errors
+///
+/// Returns an artifact-origin integrity error rather than deriving any
+/// unresolved immutable key from the logical namespace.
+///
 /// # Consistency
 ///
 /// This is a snapshot calculation. Sweep code re-reads both authoritative
@@ -725,30 +816,45 @@ fn reachable_keys_from_manifests(namespace: &str, manifests: &[Manifest]) -> BTr
 /// If the manifest references segment A while the active compactor has
 /// uploaded two objects for segment B, the result protects A and both B objects;
 /// only A is query-visible.
-#[must_use]
 pub fn reachable_keys_with_staging(
     namespace: &str,
     manifest: &Manifest,
     staging: &BTreeSet<String>,
-) -> BTreeSet<String> {
+) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
+    let local_origin = local_artifact_origin_for_gc(namespace, manifest)?;
+    let origins = local_origin
+        .as_ref()
+        .map(|local_origin| manifest.artifact_origin_resolver(local_origin))
+        .transpose()?;
 
     for fragment in &manifest.fragments {
-        keys.insert(WalFragment::s3_key(namespace, &fragment.id));
+        let physical_namespace = match origins {
+            Some(origins) => origins
+                .locate_fragment(fragment)?
+                .physical_origin
+                .namespace(),
+            None => namespace,
+        };
+        keys.insert(WalFragment::s3_key(physical_namespace, &fragment.id));
     }
 
     for segment in &manifest.segments {
+        let physical_namespace = match origins {
+            Some(origins) => origins.locate_segment(segment)?.physical_namespace(),
+            None => namespace,
+        };
         if segment.hierarchical {
-            keys.insert(tree_meta_key(namespace, &segment.id));
+            keys.insert(tree_meta_key(physical_namespace, &segment.id));
             for node_id in manifest.hierarchical_routing_nodes(&segment.id) {
                 keys.insert(crate::index::hierarchical::tree_node_key(
-                    namespace,
+                    physical_namespace,
                     &segment.id,
                     node_id,
                 ));
             }
         } else {
-            keys.insert(centroids_key(namespace, &segment.id));
+            keys.insert(centroids_key(physical_namespace, &segment.id));
         }
 
         if let Some(sketch) = &segment.sketch {
@@ -764,7 +870,7 @@ pub fn reachable_keys_with_staging(
         if segment.cluster_objects.is_empty() {
             for cluster_idx in 0..segment.cluster_count {
                 keys.insert(cluster_key(
-                    namespace,
+                    physical_namespace,
                     segment.cluster_owner(cluster_idx),
                     cluster_idx,
                 ));
@@ -777,22 +883,22 @@ pub fn reachable_keys_with_staging(
 
         for cluster_idx in 0..segment.cluster_count {
             let owner = segment.cluster_owner(cluster_idx);
-            keys.insert(attrs_key(namespace, owner, cluster_idx));
+            keys.insert(attrs_key(physical_namespace, owner, cluster_idx));
 
             if !segment.bitmap_fields.is_empty() {
-                keys.insert(bitmap_key(namespace, owner, cluster_idx));
+                keys.insert(bitmap_key(physical_namespace, owner, cluster_idx));
             }
 
             if !segment.fts_fields.is_empty() {
-                keys.insert(fts_index_key(namespace, owner, cluster_idx));
+                keys.insert(fts_index_key(physical_namespace, owner, cluster_idx));
             }
 
             match segment.quantization {
                 QuantizationType::Scalar => {
-                    keys.insert(sq_cluster_key(namespace, owner, cluster_idx));
+                    keys.insert(sq_cluster_key(physical_namespace, owner, cluster_idx));
                 }
                 QuantizationType::Product => {
-                    keys.insert(pq_cluster_key(namespace, owner, cluster_idx));
+                    keys.insert(pq_cluster_key(physical_namespace, owner, cluster_idx));
                 }
                 QuantizationType::None => {}
             }
@@ -800,22 +906,22 @@ pub fn reachable_keys_with_staging(
 
         match segment.quantization {
             QuantizationType::Scalar => {
-                keys.insert(sq_calibration_key(namespace, &segment.id));
+                keys.insert(sq_calibration_key(physical_namespace, &segment.id));
             }
             QuantizationType::Product => {
-                keys.insert(pq_codebook_key(namespace, &segment.id));
+                keys.insert(pq_codebook_key(physical_namespace, &segment.id));
             }
             QuantizationType::None => {}
         }
 
         if segment.has_global_fts {
-            keys.insert(global_fts_key(namespace, &segment.id));
+            keys.insert(global_fts_key(physical_namespace, &segment.id));
         }
     }
 
     keys.extend(manifest.pending_deletes.iter().cloned());
     keys.extend(staging.iter().cloned());
-    keys
+    Ok(keys)
 }
 
 /// Loads retained manifest history and unions every referenced artifact key.
@@ -864,7 +970,7 @@ pub async fn retained_manifest_history_reachable_keys(
         let manifest = Manifest::read_history(store, namespace, entry.version)
             .await?
             .ok_or_else(|| crate::error::ZeppelinError::NotFound { key: entry.key })?;
-        keys.extend(reachable_keys(namespace, &manifest));
+        keys.extend(reachable_keys(namespace, &manifest)?);
     }
     Ok(keys)
 }
@@ -903,12 +1009,12 @@ pub async fn reachable_keys_with_retained_history_and_staging(
     staging: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>> {
     let retained_history = retained_manifest_history_reachable_keys(store, namespace).await?;
-    Ok(reachable_keys_with_retained_history_and_staging_keys(
+    reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         manifest,
         staging,
         &retained_history,
-    ))
+    )
 }
 
 /// Unions already-loaded retained-history keys with live and staged roots.
@@ -933,10 +1039,10 @@ fn reachable_keys_with_retained_history_and_staging_keys(
     manifest: &Manifest,
     staging: &BTreeSet<String>,
     retained_history: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let mut keys = reachable_keys_with_staging(namespace, manifest, staging);
+) -> Result<BTreeSet<String>> {
+    let mut keys = reachable_keys_with_staging(namespace, manifest, staging)?;
     keys.extend(retained_history.iter().cloned());
-    keys
+    Ok(keys)
 }
 
 /// A known-shape artifact observed outside the authoritative reachable union.
@@ -1542,7 +1648,7 @@ async fn drain_pending_deletes_with_retained_history_from(
             });
         let retry_roots = if retry_may_delete {
             let snapshot = load_history_snapshot(store, namespace, retry_history).await?;
-            let roots = history_snapshot_reachable_keys(namespace, &snapshot);
+            let roots = history_snapshot_reachable_keys(namespace, &snapshot)?;
             refreshed_history.push(snapshot);
             Some(roots)
         } else {
@@ -1556,9 +1662,10 @@ async fn drain_pending_deletes_with_retained_history_from(
         let mut eligible = BTreeSet::new();
         let mut live = manifest.clone();
         live.pending_deletes.clear();
-        let live_reachable = reachable_keys(namespace, &live);
+        let live_reachable = reachable_keys(namespace, &live)?;
 
         for key in &pending {
+            let deletion_key = TargetOwnedDeletionKey::classify(namespace, key.clone())?;
             if retained_history.contains(key) {
                 retained.insert(key.clone());
                 continue;
@@ -1573,16 +1680,16 @@ async fn drain_pending_deletes_with_retained_history_from(
                     "pending-delete key {key} is also reachable from the live manifest"
                 )));
             }
-            eligible.insert(key.clone());
+            eligible.insert(deletion_key);
         }
 
         let eligible = eligible.into_iter().collect::<Vec<_>>();
         for batch in eligible.chunks(DELETE_MANY_MAX_KEYS) {
-            let batch = batch.to_vec();
-            match store.delete_many(batch.clone()).await {
+            match delete_target_owned_many(store, batch).await {
                 Ok(deleted) => {
                     debug_assert_eq!(deleted, batch.len());
                     for key in batch {
+                        let key = key.as_str().to_string();
                         confirmed_absent.insert(key.clone());
                         if deleted_keys.insert(key.clone()) {
                             crate::metrics::GC_OBJECTS_DELETED_TOTAL
@@ -1594,7 +1701,7 @@ async fn drain_pending_deletes_with_retained_history_from(
                 }
                 Err(error) => {
                     complete = false;
-                    retained.extend(batch.iter().cloned());
+                    retained.extend(batch.iter().map(|key| key.as_str().to_string()));
                     warn!(
                         namespace,
                         batch_size = batch.len(),
@@ -1698,9 +1805,10 @@ async fn drain_pending_deletes_with_inventory_authority_from(
         if attempt == 0 {
             let mut live = manifest.clone();
             live.pending_deletes.clear();
-            let live_reachable = reachable_keys(namespace, &live);
+            let live_reachable = reachable_keys(namespace, &live)?;
             let mut eligible = BTreeSet::new();
             for key in &manifest.pending_deletes {
+                let deletion_key = TargetOwnedDeletionKey::classify(namespace, key.clone())?;
                 if retained_history.contains(key)
                     || !pending_delete_horizon_satisfied(namespace, key, now, gc.horizon_secs)
                 {
@@ -1711,15 +1819,15 @@ async fn drain_pending_deletes_with_inventory_authority_from(
                         "pending-delete key {key} is also reachable from the live manifest"
                     )));
                 }
-                eligible.insert(key.clone());
+                eligible.insert(deletion_key);
             }
             let eligible = eligible.into_iter().collect::<Vec<_>>();
             for batch in eligible.chunks(DELETE_MANY_MAX_KEYS) {
-                let batch = batch.to_vec();
-                match store.delete_many(batch.clone()).await {
+                match delete_target_owned_many(store, batch).await {
                     Ok(deleted) => {
                         debug_assert_eq!(deleted, batch.len());
                         for key in batch {
+                            let key = key.as_str().to_string();
                             confirmed_absent.insert(key.clone());
                             if deleted_keys.insert(key.clone()) {
                                 crate::metrics::GC_OBJECTS_DELETED_TOTAL
@@ -1767,7 +1875,7 @@ async fn drain_pending_deletes_with_inventory_authority_from(
 
         let mut live = manifest.clone();
         live.pending_deletes.clear();
-        let live_reachable = reachable_keys(namespace, &live);
+        let live_reachable = reachable_keys(namespace, &live)?;
         if let Some(key) = removable.iter().find(|key| live_reachable.contains(*key)) {
             return Err(ZeppelinError::Serialization(format!(
                 "pending-delete key {key} became live after it was confirmed absent"
@@ -1884,7 +1992,7 @@ async fn prepare_warm_pending_delete_drain(
         Some(prior_history),
     )
     .await?;
-    let retained_history = history_snapshot_reachable_keys(namespace, &history);
+    let retained_history = history_snapshot_reachable_keys(namespace, &history)?;
     let observed = read_versioned_manifest_from_inventory(store, namespace, &predelete_inventory)
         .await?
         .ok_or_else(|| ZeppelinError::NotFound {
@@ -2422,7 +2530,7 @@ async fn load_history_observation_owned(
             Some(CachedHistory {
                 storage_version: StorageVersion::Etag(list_etag.clone()),
                 manifest: manifest.clone(),
-                reachable_keys: reachable_keys(namespace, &manifest),
+                reachable_keys: reachable_keys(namespace, &manifest)?,
             })
         }
         Some(StorageVersion::BackendVersion(_)) | None => None,
@@ -2562,8 +2670,13 @@ async fn prune_history_with_memo_at(
         }
     }
 
-    for batch in prunable.chunks(DELETE_MANY_MAX_KEYS) {
-        store.delete_many(batch.to_vec()).await?;
+    let deletion_keys = prunable
+        .iter()
+        .cloned()
+        .map(|key| TargetOwnedDeletionKey::classify(namespace, key))
+        .collect::<Result<Vec<_>>>()?;
+    for batch in deletion_keys.chunks(DELETE_MANY_MAX_KEYS) {
+        delete_target_owned_many(store, batch).await?;
     }
 
     Ok(MemoizedHistoryPruneResult {
@@ -2678,11 +2791,16 @@ async fn prune_history_with_memo_parallel_from_observations(
         }
     }
 
-    for batch in prunable.chunks(DELETE_MANY_MAX_KEYS) {
-        store.delete_many(batch.to_vec()).await?;
+    let deletion_keys = prunable
+        .iter()
+        .cloned()
+        .map(|key| TargetOwnedDeletionKey::classify(namespace, key))
+        .collect::<Result<Vec<_>>>()?;
+    for batch in deletion_keys.chunks(DELETE_MANY_MAX_KEYS) {
+        delete_target_owned_many(store, batch).await?;
         if let Some(inventory) = inventory.as_deref_mut() {
             for key in batch {
-                inventory.remove(key);
+                inventory.remove(key.as_str());
             }
         }
     }
@@ -2700,16 +2818,16 @@ async fn prune_history_with_memo_parallel_from_observations(
 fn history_snapshot_reachable_keys(
     namespace: &str,
     snapshot: &HistorySnapshot,
-) -> BTreeSet<String> {
+) -> Result<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
     for (observation, manifest) in &snapshot.entries {
         if let Some(cached) = snapshot.cacheable.get(&observation.history.key) {
             keys.extend(cached.reachable_keys.iter().cloned());
         } else {
-            keys.extend(reachable_keys(namespace, manifest));
+            keys.extend(reachable_keys(namespace, manifest)?);
         }
     }
-    keys
+    Ok(keys)
 }
 
 fn history_observations_match_snapshot(
@@ -2721,6 +2839,17 @@ fn history_observations_match_snapshot(
         .eq(actual.entries.iter().map(|(observation, _)| observation))
 }
 
+enum NextGcDeadlineError {
+    Reachability(ZeppelinError),
+    InvalidSchedule,
+}
+
+impl From<ZeppelinError> for NextGcDeadlineError {
+    fn from(error: ZeppelinError) -> Self {
+        Self::Reachability(error)
+    }
+}
+
 fn next_gc_deadline(
     namespace: &str,
     gc: &GcConfig,
@@ -2729,7 +2858,7 @@ fn next_gc_deadline(
     manifest: &Manifest,
     history: &HistorySnapshot,
     staging: &ActiveStagingObservation,
-) -> std::result::Result<Option<DateTime<Utc>>, ()> {
+) -> std::result::Result<Option<DateTime<Utc>>, NextGcDeadlineError> {
     let mut next = None;
     let mut consider_deadline = |deadline: DateTime<Utc>, include_overdue: bool| {
         let deadline = if include_overdue && deadline <= now {
@@ -2742,13 +2871,13 @@ fn next_gc_deadline(
         }
     };
 
-    let retained_history = history_snapshot_reachable_keys(namespace, history);
+    let retained_history = history_snapshot_reachable_keys(namespace, history)?;
     let candidate_reachable = reachable_keys_with_retained_history_and_staging_keys(
         namespace,
         manifest,
         &staging.keys,
         &retained_history,
-    );
+    )?;
     let mut live_without_pending = manifest.clone();
     live_without_pending.pending_deletes.clear();
     let pending_reachable = reachable_keys_with_retained_history_and_staging_keys(
@@ -2756,19 +2885,23 @@ fn next_gc_deadline(
         &live_without_pending,
         &staging.keys,
         &retained_history,
-    );
+    )?;
 
     for candidate in candidates {
         if candidate_reachable.contains(&candidate.key) {
             continue;
         }
-        let first_seen = deadline_after_secs(candidate.first_seen_unreachable_at, gc.horizon_secs)?;
-        let artifact = parse_gc_artifact_key(namespace, &candidate.key).ok_or(())?;
+        let first_seen = deadline_after_secs(candidate.first_seen_unreachable_at, gc.horizon_secs)
+            .map_err(|()| NextGcDeadlineError::InvalidSchedule)?;
+        let artifact = parse_gc_artifact_key(namespace, &candidate.key)
+            .ok_or(NextGcDeadlineError::InvalidSchedule)?;
         let artifact_created = DateTime::<Utc>::from_timestamp_millis(
-            i64::try_from(artifact.ulid().timestamp_ms()).map_err(|_| ())?,
+            i64::try_from(artifact.ulid().timestamp_ms())
+                .map_err(|_| NextGcDeadlineError::InvalidSchedule)?,
         )
-        .ok_or(())?;
-        let artifact_due = deadline_after_secs(artifact_created, gc.horizon_secs)?;
+        .ok_or(NextGcDeadlineError::InvalidSchedule)?;
+        let artifact_due = deadline_after_secs(artifact_created, gc.horizon_secs)
+            .map_err(|()| NextGcDeadlineError::InvalidSchedule)?;
         let deadline = first_seen.max(artifact_due);
         consider_deadline(deadline, true);
     }
@@ -2781,10 +2914,12 @@ fn next_gc_deadline(
             continue;
         };
         let artifact_created = DateTime::<Utc>::from_timestamp_millis(
-            i64::try_from(artifact.ulid().timestamp_ms()).map_err(|_| ())?,
+            i64::try_from(artifact.ulid().timestamp_ms())
+                .map_err(|_| NextGcDeadlineError::InvalidSchedule)?,
         )
-        .ok_or(())?;
-        let deadline = deadline_after_secs(artifact_created, gc.horizon_secs)?;
+        .ok_or(NextGcDeadlineError::InvalidSchedule)?;
+        let deadline = deadline_after_secs(artifact_created, gc.horizon_secs)
+            .map_err(|()| NextGcDeadlineError::InvalidSchedule)?;
         consider_deadline(deadline, true);
     }
 
@@ -2793,9 +2928,13 @@ fn next_gc_deadline(
             .pitr_retention_secs
             .checked_add(gc.skew_slop_secs)
             .and_then(|seconds| seconds.checked_add(1))
-            .ok_or(())?;
+            .ok_or(NextGcDeadlineError::InvalidSchedule)?;
         for (_, manifest) in &history.entries {
-            consider_deadline(deadline_after_secs(manifest.updated_at, retention)?, false);
+            consider_deadline(
+                deadline_after_secs(manifest.updated_at, retention)
+                    .map_err(|()| NextGcDeadlineError::InvalidSchedule)?,
+                false,
+            );
         }
     }
 
@@ -3247,7 +3386,7 @@ async fn run_gc_cycle_at_inner(
     } = history_prune;
     let manifest_history_pruned = history_prune.pruned;
     let prune_reachable =
-        reachable_keys_from_manifests(namespace, &history_prune.retained_manifests);
+        reachable_keys_from_manifests(namespace, &history_prune.retained_manifests)?;
     if prior_entries.is_none() && initial_inventory.is_none() {
         let prefix = format!("{namespace}/");
         let listed = match store.list_prefix_meta(&prefix).await {
@@ -3320,7 +3459,7 @@ async fn run_gc_cycle_at_inner(
                 }
             };
             let retained_history =
-                history_snapshot_reachable_keys(namespace, &retained_history_snapshot);
+                history_snapshot_reachable_keys(namespace, &retained_history_snapshot)?;
             let (pending_outcome, mut retry_history_snapshots) =
                 match drain_pending_deletes_with_retained_history_from(
                     store,
@@ -3459,7 +3598,7 @@ async fn run_gc_cycle_at_inner(
         &mark_manifest,
         &mark_staging.keys,
         &retained_history,
-    );
+    )?;
     extend_scoped_artifact_roots(
         namespace,
         &mark_manifest,
@@ -3691,7 +3830,7 @@ async fn run_gc_cycle_at_inner(
         }
     };
     let sweep_retained_history =
-        history_snapshot_reachable_keys(namespace, &sweep_history_snapshot);
+        history_snapshot_reachable_keys(namespace, &sweep_history_snapshot)?;
     let sweep_listed_keys = completed_inventory
         .as_ref()
         .map_or_else(|| listed_keys.clone(), NamespaceInventory::all_keys);
@@ -3700,7 +3839,7 @@ async fn run_gc_cycle_at_inner(
         &sweep_manifest,
         &sweep_staging.keys,
         &sweep_retained_history,
-    );
+    )?;
     extend_scoped_artifact_roots(
         namespace,
         &sweep_manifest,
@@ -3709,7 +3848,7 @@ async fn run_gc_cycle_at_inner(
         &mut sweep_reachable,
     );
     let oldest_inflight_ms = oldest_inflight_ulid_ms(namespace, &sweep_staging.keys);
-    let known_sizes = known_reclaimable_sizes(namespace, &sweep_manifest);
+    let known_sizes = known_reclaimable_sizes(namespace, &sweep_manifest)?;
 
     let mut retained_with_order = Vec::new();
     let mut deletable = Vec::new();
@@ -3790,15 +3929,22 @@ async fn run_gc_cycle_at_inner(
         }
     }
 
+    let deletable = deletable
+        .into_iter()
+        .map(|(order, candidate)| {
+            let key = TargetOwnedDeletionKey::classify(namespace, candidate.key.clone())?;
+            Ok((order, candidate, key))
+        })
+        .collect::<Result<Vec<_>>>()?;
     for batch in deletable.chunks(DELETE_MANY_MAX_KEYS) {
         let keys = batch
             .iter()
-            .map(|(_, candidate)| candidate.key.clone())
+            .map(|(_, _, key)| key.clone())
             .collect::<Vec<_>>();
-        match store.delete_many(keys).await {
+        match delete_target_owned_many(store, &keys).await {
             Ok(deleted) => {
                 debug_assert_eq!(deleted, batch.len());
-                for (_, candidate) in batch {
+                for (_, candidate, _) in batch {
                     if let Some(inventory) = completed_inventory.as_mut() {
                         inventory.remove(&candidate.key);
                     }
@@ -3827,7 +3973,7 @@ async fn run_gc_cycle_at_inner(
                     error = %error,
                     "gc sweep batch uncertain; retaining every candidate"
                 );
-                for (order, candidate) in batch {
+                for (order, candidate, _) in batch {
                     log_gc_skip(namespace, &candidate.key, SkipReason::DeleteFailed);
                     candidates_skipped += 1;
                     retained_with_order.push((*order, candidate.clone()));
@@ -3938,7 +4084,8 @@ async fn run_gc_cycle_at_inner(
             &sweep_staging,
         ) {
             Ok(deadline) => deadline,
-            Err(()) => {
+            Err(NextGcDeadlineError::Reachability(error)) => return Err(error),
+            Err(NextGcDeadlineError::InvalidSchedule) => {
                 completed_inventory = None;
                 None
             }
@@ -4140,11 +4287,23 @@ fn oldest_inflight_ulid_ms(namespace: &str, staged: &BTreeSet<String>) -> Option
 ///
 /// A 100-byte fragment and 512-byte sketch produce two entries; an attribute
 /// sidecar has no entry and contributes zero to the cycle's lower-bound report.
-fn known_reclaimable_sizes(namespace: &str, manifest: &Manifest) -> BTreeMap<String, u64> {
+fn known_reclaimable_sizes(namespace: &str, manifest: &Manifest) -> Result<BTreeMap<String, u64>> {
     let mut sizes = BTreeMap::new();
+    let local_origin = local_artifact_origin_for_gc(namespace, manifest)?;
+    let origins = local_origin
+        .as_ref()
+        .map(|local_origin| manifest.artifact_origin_resolver(local_origin))
+        .transpose()?;
     for fragment in &manifest.fragments {
+        let physical_namespace = match origins {
+            Some(origins) => origins
+                .locate_fragment(fragment)?
+                .physical_origin
+                .namespace(),
+            None => namespace,
+        };
         sizes.insert(
-            WalFragment::s3_key(namespace, &fragment.id),
+            WalFragment::s3_key(physical_namespace, &fragment.id),
             fragment.size_bytes,
         );
     }
@@ -4153,7 +4312,7 @@ fn known_reclaimable_sizes(namespace: &str, manifest: &Manifest) -> BTreeMap<Str
             sizes.insert(sketch.key.clone(), sketch.size_bytes);
         }
     }
-    sizes
+    Ok(sizes)
 }
 
 /// Extends exact manifest reachability with policy artifacts owned by a live segment.
@@ -4400,6 +4559,11 @@ fn numbered_bin(file_name: &str, prefix: &str) -> bool {
 /// the new manifest's generation. An empty vector means no exact reference was
 /// released.
 ///
+/// # Errors
+///
+/// Returns an artifact-origin integrity error from either manifest instead of
+/// computing a partial reachability delta.
+///
 /// # Consistency
 ///
 /// Call this only for the old/new pair around a successful manifest CAS. The
@@ -4417,24 +4581,23 @@ fn numbered_bin(file_name: &str, prefix: &str) -> bool {
 /// 1, only the old centroid, cluster-1, and cluster-1 sidecar keys enter the
 /// delta. A never-published upload appears in neither manifest and is found only
 /// by periodic LIST-based marking.
-#[must_use]
 pub fn gc_candidates_from_manifest_delta(
     namespace: &str,
     old_manifest: &Manifest,
     new_manifest: &Manifest,
     commit_time: DateTime<Utc>,
-) -> Vec<GcCandidate> {
-    let old_reachable = reachable_keys(namespace, old_manifest);
-    let new_reachable = reachable_keys(namespace, new_manifest);
+) -> Result<Vec<GcCandidate>> {
+    let old_reachable = reachable_keys(namespace, old_manifest)?;
+    let new_reachable = reachable_keys(namespace, new_manifest)?;
 
-    old_reachable
+    Ok(old_reachable
         .difference(&new_reachable)
         .map(|key| GcCandidate {
             key: key.clone(),
             first_seen_unreachable_at: commit_time,
             unreachable_since_manifest_version: new_manifest.version(),
         })
-        .collect()
+        .collect())
 }
 
 /// Keeps only candidates still unreachable in a supplied manifest snapshot.
@@ -4455,6 +4618,11 @@ pub fn gc_candidates_from_manifest_delta(
 /// input order. It does not apply history, staging, age, LIST, or key-shape
 /// guards and therefore is not a complete delete predicate.
 ///
+/// # Errors
+///
+/// Returns an artifact-origin integrity error instead of treating a corrupt
+/// manifest as proof that a candidate is unreachable.
+///
 /// # Examples
 ///
 /// If candidates A and B are supplied and a fresh manifest references A again,
@@ -4466,18 +4634,17 @@ pub fn gc_candidates_from_manifest_delta(
 /// Filtering borrows each entry and `.cloned()` creates owned output records.
 /// The caller keeps its original slice; Rust prevents the returned vector from
 /// containing dangling pointers into it.
-#[must_use]
 pub fn revalidate_unreachable_candidates(
     namespace: &str,
     manifest: &Manifest,
     candidates: &[GcCandidate],
-) -> Vec<GcCandidate> {
-    let reachable = reachable_keys(namespace, manifest);
-    candidates
+) -> Result<Vec<GcCandidate>> {
+    let reachable = reachable_keys(namespace, manifest)?;
+    Ok(candidates
         .iter()
         .filter(|candidate| !reachable.contains(&candidate.key))
         .cloned()
-        .collect()
+        .collect())
 }
 
 /// Writes the exact staged-key set for one compaction lease token.
@@ -4750,6 +4917,7 @@ mod tests {
     use crate::index::quantization::pq::{pq_cluster_key, pq_codebook_key};
     use crate::index::quantization::sq::{sq_calibration_key, sq_cluster_key};
     use crate::index::quantization::QuantizationType;
+    use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
     use crate::wal::fragment::WalFragment;
     use crate::wal::manifest::{
         BootstrapRef, ClusterDataObjectRef, FragmentRef, Manifest, MembershipRef, SegmentRef,
@@ -5184,7 +5352,7 @@ mod tests {
         ];
 
         for case in cases {
-            let reachable = reachable_keys(NS, &case.manifest);
+            let reachable = reachable_keys(NS, &case.manifest).unwrap();
             for key in case.present {
                 assert!(
                     reachable.contains(&key),
@@ -5202,6 +5370,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reachability_routes_immutable_refs_through_their_physical_origin() {
+        const SOURCE: &str = "gc_source";
+        let source_origin = ArtifactOrigin {
+            namespace: NamespaceId::new(SOURCE).unwrap(),
+            incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(2)),
+        };
+        let fragment_id = Ulid::from_parts(1, 44);
+        let mut fragment = fragment_ref(fragment_id);
+        fragment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        let mut segment = segment_ref("seg_foreign", 1);
+        segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        segment.bitmap_fields = vec!["color".to_string()];
+        segment.fts_fields = vec!["body".to_string()];
+        segment.has_global_fts = true;
+        segment.quantization = QuantizationType::Product;
+        segment.sketch = Some(SketchRef {
+            key: sketch_key(SOURCE, "seg_foreign"),
+            version: 3,
+            code_dims: 8,
+            bytes_per_vector: 8,
+            size_bytes: 512,
+            rotation_seed: None,
+        });
+        segment.bootstrap = Some(BootstrapRef {
+            key: bootstrap_key(SOURCE, "seg_foreign"),
+            size_bytes: 1024,
+        });
+        segment.membership = Some(MembershipRef {
+            key: membership_key(SOURCE, "seg_foreign"),
+            size_bytes: 256,
+            entry_count: 10,
+        });
+        let mut hierarchical = segment_ref("seg_foreign_tree", 1);
+        hierarchical.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        hierarchical.hierarchical = true;
+        hierarchical.quantization = QuantizationType::Scalar;
+        let tree_node = format!("root_{}", Ulid::from_parts(2, 46));
+
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
+        manifest.artifact_origins = vec![source_origin];
+        manifest.fragments = vec![fragment];
+        manifest.segments = vec![segment, hierarchical];
+        manifest.set_hierarchical_routing_nodes("seg_foreign_tree", vec![tree_node.clone()]);
+
+        let reachable = reachable_keys(NS, &manifest).unwrap();
+
+        assert!(reachable.contains(&WalFragment::s3_key(SOURCE, &fragment_id)));
+        assert!(reachable.contains(&centroids_key(SOURCE, "seg_foreign")));
+        assert!(reachable.contains(&cluster_key(SOURCE, "seg_foreign", 0)));
+        assert!(reachable.contains(&attrs_key(SOURCE, "seg_foreign", 0)));
+        assert!(reachable.contains(&bitmap_key(SOURCE, "seg_foreign", 0)));
+        assert!(reachable.contains(&fts_index_key(SOURCE, "seg_foreign", 0)));
+        assert!(reachable.contains(&pq_cluster_key(SOURCE, "seg_foreign", 0)));
+        assert!(reachable.contains(&pq_codebook_key(SOURCE, "seg_foreign")));
+        assert!(reachable.contains(&global_fts_key(SOURCE, "seg_foreign")));
+        assert!(reachable.contains(&sketch_key(SOURCE, "seg_foreign")));
+        assert!(reachable.contains(&bootstrap_key(SOURCE, "seg_foreign")));
+        assert!(reachable.contains(&membership_key(SOURCE, "seg_foreign")));
+        assert!(reachable.contains(&tree_meta_key(SOURCE, "seg_foreign_tree")));
+        assert!(reachable.contains(&tree_node_key(SOURCE, "seg_foreign_tree", &tree_node,)));
+        assert!(reachable.contains(&sq_cluster_key(SOURCE, "seg_foreign_tree", 0)));
+        assert!(reachable.contains(&sq_calibration_key(SOURCE, "seg_foreign_tree")));
+        assert!(!reachable.contains(&WalFragment::s3_key(NS, &fragment_id)));
+        assert!(!reachable.contains(&centroids_key(NS, "seg_foreign")));
+    }
+
+    #[test]
+    fn deletion_keys_must_be_owned_by_the_gc_target() {
+        let local =
+            TargetOwnedDeletionKey::classify(NS, format!("{NS}/segments/seg_local/cluster_0.bin"))
+                .unwrap();
+        assert_eq!(
+            local.as_str(),
+            format!("{NS}/segments/seg_local/cluster_0.bin")
+        );
+
+        let error = TargetOwnedDeletionKey::classify(
+            NS,
+            "gc_source/segments/seg_foreign/cluster_0.bin".to_string(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot delete foreign key"));
+    }
+
+    #[test]
+    fn reachability_rejects_an_unresolvable_artifact_origin() {
+        let mut fragment = fragment_ref(Ulid::from_parts(1, 45));
+        fragment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
+        manifest.fragments = vec![fragment];
+
+        let error = reachable_keys(NS, &manifest).unwrap_err();
+
+        assert!(error.to_string().contains("artifact origin index"));
+    }
+
     /// Verifies that two live references to one carried object produce one root key.
     ///
     /// This protects the set semantics used by manifest deltas: shared object
@@ -5215,7 +5486,7 @@ mod tests {
         second.cluster_owners = vec!["seg_shared".to_string()];
         manifest.segments = vec![first, second];
 
-        let reachable = reachable_keys(NS, &manifest);
+        let reachable = reachable_keys(NS, &manifest).unwrap();
         let shared_key = cluster_key(NS, "seg_shared", 0);
         assert_eq!(
             reachable.iter().filter(|key| *key == &shared_key).count(),
@@ -5245,7 +5516,8 @@ mod tests {
         new_manifest.segments = vec![new_segment];
 
         let candidates =
-            gc_candidates_from_manifest_delta(NS, &old_manifest, &new_manifest, commit_time);
+            gc_candidates_from_manifest_delta(NS, &old_manifest, &new_manifest, commit_time)
+                .unwrap();
 
         assert_eq!(
             candidate_keys(&candidates),
@@ -5302,7 +5574,8 @@ mod tests {
             &old_manifest,
             &one_reference_released,
             commit_time,
-        );
+        )
+        .unwrap();
         let first_release_keys = candidate_keys(&first_release);
         assert!(
             !first_release_keys.contains(&shared_cluster_key),
@@ -5319,7 +5592,8 @@ mod tests {
             &one_reference_released,
             &no_references,
             commit_time,
-        );
+        )
+        .unwrap();
         assert!(
             candidate_keys(&second_release)
                 .is_superset(&BTreeSet::from([shared_cluster_key, shared_attrs_key,])),
@@ -5342,7 +5616,8 @@ mod tests {
         new_manifest.segments = vec![segment_ref("seg_live", 1)];
 
         let candidates =
-            gc_candidates_from_manifest_delta(NS, &old_manifest, &new_manifest, commit_time);
+            gc_candidates_from_manifest_delta(NS, &old_manifest, &new_manifest, commit_time)
+                .unwrap();
 
         assert!(
             !candidate_keys(&candidates).contains(&crash_orphan),
@@ -5376,7 +5651,8 @@ mod tests {
             },
         ];
 
-        let still_unreachable = revalidate_unreachable_candidates(NS, &manifest, &candidates);
+        let still_unreachable =
+            revalidate_unreachable_candidates(NS, &manifest, &candidates).unwrap();
 
         assert_eq!(
             candidate_keys(&still_unreachable),
@@ -5400,7 +5676,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let reachable = reachable_keys_with_staging(NS, &manifest, &staged);
+        let reachable = reachable_keys_with_staging(NS, &manifest, &staged).unwrap();
 
         assert!(reachable.contains(&centroids_key(NS, "seg_live")));
         for key in staged {
@@ -5444,12 +5720,12 @@ mod tests {
         let mut live = Manifest::new();
         live.segments.push(segment_ref(&source_id, 1));
         let retained_history = BTreeSet::new();
-        let mut reachable = reachable_keys(NS, &live);
+        let mut reachable = reachable_keys(NS, &live).unwrap();
         extend_scoped_artifact_roots(NS, &live, &retained_history, &listed, &mut reachable);
         assert!(listed.is_subset(&reachable));
 
         let removed = Manifest::new();
-        let mut unreachable = reachable_keys(NS, &removed);
+        let mut unreachable = reachable_keys(NS, &removed).unwrap();
         extend_scoped_artifact_roots(NS, &removed, &retained_history, &listed, &mut unreachable);
         assert!(listed.is_disjoint(&unreachable));
         let candidates = mark_gc_candidates(
@@ -5908,6 +6184,9 @@ mod tests {
         let store = ZeppelinStore::new(Arc::new(InMemory::new()));
         let now = Utc::now();
         let mut manifest = Manifest::new_at(now);
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
         manifest.write(&store, NS).await.unwrap();
         let old_ms =
             u64::try_from((now - chrono::Duration::seconds(60)).timestamp_millis()).unwrap();

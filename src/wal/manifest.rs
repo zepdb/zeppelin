@@ -508,6 +508,232 @@ impl SegmentRef {
     }
 }
 
+/// Borrowed, validated physical owner for one immutable artifact read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedArtifactOrigin<'a> {
+    origin: &'a ArtifactOrigin,
+}
+
+impl<'a> ResolvedArtifactOrigin<'a> {
+    /// Return the strong namespace-lifetime identity selected by the manifest.
+    #[must_use]
+    pub(crate) const fn as_origin(self) -> &'a ArtifactOrigin {
+        self.origin
+    }
+
+    /// Return the physical namespace prefix used by immutable key builders.
+    #[must_use]
+    pub(crate) fn namespace(self) -> &'a str {
+        self.origin.namespace.as_str()
+    }
+}
+
+/// Globally unique identity of one immutable WAL fragment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LocatedFragmentIdentity {
+    /// Namespace lifetime that owns the physical object.
+    pub(crate) physical_origin: ArtifactOrigin,
+    /// ULID embedded in the immutable fragment key and body.
+    pub(crate) id: Ulid,
+}
+
+/// Manifest fragment descriptor paired with its logical and physical identities.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocatedFragmentRef<'a> {
+    /// Namespace whose manifest authorizes visibility and query accounting.
+    pub(crate) logical_namespace: &'a str,
+    /// Exact target lifetime whose manifest authorizes this read.
+    pub(crate) logical_origin: ResolvedArtifactOrigin<'a>,
+    /// Namespace lifetime whose prefix contains the immutable object.
+    pub(crate) physical_origin: ResolvedArtifactOrigin<'a>,
+    /// Exact descriptor selected from the authoritative manifest.
+    pub(crate) fragment: &'a FragmentRef,
+}
+
+impl LocatedFragmentRef<'_> {
+    /// Build the global cache/dedup identity for this descriptor.
+    #[must_use]
+    pub(crate) fn identity(self) -> LocatedFragmentIdentity {
+        LocatedFragmentIdentity {
+            physical_origin: self.physical_origin.as_origin().clone(),
+            id: self.fragment.id,
+        }
+    }
+
+    /// Build the incarnation-qualified disposable-cache key for this object.
+    #[must_use]
+    pub(crate) fn cache_key(self, store_key: &str) -> String {
+        immutable_artifact_cache_key(self.physical_origin.as_origin(), store_key)
+    }
+}
+
+/// Globally unique identity of one immutable segment descriptor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LocatedSegmentIdentity {
+    /// Namespace lifetime that owns the physical segment objects.
+    pub(crate) physical_origin: ArtifactOrigin,
+    /// Segment identifier used beneath that physical namespace.
+    pub(crate) id: String,
+}
+
+/// Manifest segment descriptor paired with its logical and physical identities.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocatedSegmentRef<'a> {
+    /// Namespace whose manifest authorizes visibility and query accounting.
+    pub(crate) logical_namespace: &'a str,
+    /// Exact target lifetime whose manifest authorizes this read.
+    pub(crate) logical_origin: ResolvedArtifactOrigin<'a>,
+    /// Namespace lifetime whose prefix contains the immutable objects.
+    pub(crate) physical_origin: ResolvedArtifactOrigin<'a>,
+    /// Exact descriptor selected from the authoritative manifest.
+    pub(crate) segment: &'a SegmentRef,
+}
+
+impl<'a> LocatedSegmentRef<'a> {
+    /// Build the global cache/dedup identity for this descriptor.
+    #[must_use]
+    pub(crate) fn identity(self) -> LocatedSegmentIdentity {
+        LocatedSegmentIdentity {
+            physical_origin: self.physical_origin.as_origin().clone(),
+            id: self.segment.id.clone(),
+        }
+    }
+
+    /// Return the namespace prefix used by every computed segment key.
+    #[must_use]
+    pub(crate) fn physical_namespace(self) -> &'a str {
+        self.physical_origin.namespace()
+    }
+
+    /// Build the incarnation-qualified disposable-cache key for an artifact.
+    #[must_use]
+    pub(crate) fn cache_key(self, store_key: &str) -> String {
+        immutable_artifact_cache_key(self.physical_origin.as_origin(), store_key)
+    }
+}
+
+/// Build a cache-only identity that cannot alias across namespace recreation.
+#[must_use]
+pub(crate) fn immutable_artifact_cache_key(origin: &ArtifactOrigin, store_key: &str) -> String {
+    format!(
+        "artifact-origin/{}/{store_key}",
+        origin.incarnation.as_uuid().simple()
+    )
+}
+
+/// Resolves every descriptor in one manifest against one authoritative target lifetime.
+///
+/// The resolver is a read-only context. It never fills legacy manifest fields in
+/// memory, which preserves the signed bytes and receipt projection of retained
+/// pre-incarnation history.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArtifactOriginResolver<'a> {
+    manifest: &'a Manifest,
+    authoritative_local: &'a ArtifactOrigin,
+}
+
+impl<'a> ArtifactOriginResolver<'a> {
+    /// Resolve one fragment descriptor without exposing its persisted table index.
+    pub(crate) fn locate_fragment(
+        &self,
+        fragment: &'a FragmentRef,
+    ) -> Result<LocatedFragmentRef<'a>> {
+        let physical_origin = match fragment.artifact_origin {
+            Some(index) => ResolvedArtifactOrigin {
+                origin: self.manifest.indexed_artifact_origin_ref(
+                    "fragment",
+                    &fragment.id.to_string(),
+                    index,
+                )?,
+            },
+            None => ResolvedArtifactOrigin {
+                origin: self.authoritative_local,
+            },
+        };
+        Ok(LocatedFragmentRef {
+            logical_namespace: self.authoritative_local.namespace.as_str(),
+            logical_origin: ResolvedArtifactOrigin {
+                origin: self.authoritative_local,
+            },
+            physical_origin,
+            fragment,
+        })
+    }
+
+    /// Resolve all visible fragment descriptors in manifest replay order.
+    #[allow(dead_code)] // Full-inventory consumers arrive with branch normalization in phase 05.
+    pub(crate) fn located_fragments(&self) -> Result<Vec<LocatedFragmentRef<'a>>> {
+        self.manifest
+            .fragments
+            .iter()
+            .map(|fragment| self.locate_fragment(fragment))
+            .collect()
+    }
+
+    /// Resolve only the currently uncompacted refs in replay order.
+    pub(crate) fn uncompacted_located_fragments(&self) -> Result<Vec<LocatedFragmentRef<'a>>> {
+        self.manifest
+            .uncompacted_fragments()
+            .iter()
+            .map(|fragment| self.locate_fragment(fragment))
+            .collect()
+    }
+
+    /// Resolve one segment descriptor without exposing its persisted table index.
+    pub(crate) fn locate_segment(&self, segment: &'a SegmentRef) -> Result<LocatedSegmentRef<'a>> {
+        let physical_origin = match segment.artifact_origin {
+            Some(index) => ResolvedArtifactOrigin {
+                origin: self
+                    .manifest
+                    .indexed_artifact_origin_ref("segment", &segment.id, index)?,
+            },
+            None => ResolvedArtifactOrigin {
+                origin: self.authoritative_local,
+            },
+        };
+        Ok(LocatedSegmentRef {
+            logical_namespace: self.authoritative_local.namespace.as_str(),
+            logical_origin: ResolvedArtifactOrigin {
+                origin: self.authoritative_local,
+            },
+            physical_origin,
+            segment,
+        })
+    }
+
+    /// Resolve all retained segment descriptors in manifest order.
+    pub(crate) fn located_segments(&self) -> Result<Vec<LocatedSegmentRef<'a>>> {
+        self.manifest
+            .segments
+            .iter()
+            .map(|segment| self.locate_segment(segment))
+            .collect()
+    }
+
+    /// Resolve the unique descriptor named by the manifest's active pointer.
+    pub(crate) fn active_located_segment(&self) -> Result<Option<LocatedSegmentRef<'a>>> {
+        let Some(active_id) = self.manifest.active_segment.as_deref() else {
+            return Ok(None);
+        };
+        let mut matches = self
+            .manifest
+            .segments
+            .iter()
+            .filter(|segment| segment.id == active_id);
+        let Some(segment) = matches.next() else {
+            return Err(ZeppelinError::Index(format!(
+                "active segment {active_id} is missing from manifest segments"
+            )));
+        };
+        if matches.next().is_some() {
+            return Err(ZeppelinError::Index(format!(
+                "active segment {active_id} is ambiguous across artifact origins"
+            )));
+        }
+        self.locate_segment(segment).map(Some)
+    }
+}
+
 /// Persisted strong type for one namespace lifetime identity.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
@@ -1108,12 +1334,141 @@ impl Manifest {
         })
     }
 
-    fn indexed_artifact_origin(
+    /// Resolve the physical owner of this manifest's active immutable segment.
+    ///
+    /// This is the narrow public seam used by offline production evaluators
+    /// that validate exact segment objects without constructing the internal
+    /// query index. Resolution still runs through the same manifest validator
+    /// as server reads, including namespace-incarnation binding, origin-table
+    /// bounds, duplicate identities, and active-segment ambiguity checks.
+    ///
+    /// # Parameters
+    ///
+    /// - `authoritative_local`: Namespace metadata identity for the logical
+    ///   manifest owner. It supplies read-time identity for legacy unbound
+    ///   manifests and must match bindings carried by current manifests.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(None)` when the manifest has no active segment, otherwise the exact
+    /// namespace lifetime that owns the active segment's immutable objects.
+    ///
+    /// # Errors
+    ///
+    /// Returns the normal typed manifest/origin error when the supplied owner
+    /// conflicts with a binding, an origin is corrupt, or the active descriptor
+    /// cannot be resolved uniquely.
+    pub fn active_segment_artifact_origin(
+        &self,
+        authoritative_local: &ArtifactOrigin,
+    ) -> Result<Option<ArtifactOrigin>> {
+        self.artifact_origin_resolver(authoritative_local)?
+            .active_located_segment()
+            .map(|located| located.map(|located| located.physical_origin.as_origin().clone()))
+    }
+
+    /// Bind read routing to the authoritative local namespace lifetime.
+    ///
+    /// Persisted bindings, when present, must match the supplied context. When
+    /// legacy fields are absent the context supplies only read-time location;
+    /// the manifest remains byte-for-byte unchanged.
+    pub(crate) fn artifact_origin_resolver<'a>(
+        &'a self,
+        authoritative_local: &'a ArtifactOrigin,
+    ) -> Result<ArtifactOriginResolver<'a>> {
+        if authoritative_local.incarnation.is_nil() {
+            return Err(self.artifact_origin_error(
+                "manifest",
+                "authoritative_local_origin",
+                None,
+                None,
+                Some(authoritative_local.clone()),
+                "authoritative namespace incarnation is nil",
+            ));
+        }
+        if let Some(namespace) = self.namespace.as_deref() {
+            if namespace != authoritative_local.namespace.as_str() {
+                return Err(self.artifact_origin_error(
+                    "manifest",
+                    "namespace",
+                    None,
+                    None,
+                    Some(authoritative_local.clone()),
+                    "persisted namespace does not match authoritative local origin",
+                ));
+            }
+        }
+        if let Some(incarnation) = self.namespace_incarnation() {
+            if incarnation != authoritative_local.incarnation.as_uuid() {
+                return Err(self.artifact_origin_error(
+                    "manifest",
+                    "namespace_incarnation",
+                    None,
+                    None,
+                    Some(authoritative_local.clone()),
+                    "persisted incarnation does not match authoritative local origin",
+                ));
+            }
+        }
+
+        self.validate_artifact_origins_structural(true)?;
+        let resolver = ArtifactOriginResolver {
+            manifest: self,
+            authoritative_local,
+        };
+
+        let mut fragment_identities = HashSet::with_capacity(self.fragments.len());
+        for fragment in &self.fragments {
+            let located = resolver.locate_fragment(fragment)?;
+            if !fragment_identities.insert(located.identity()) {
+                return Err(self.artifact_origin_error(
+                    "fragment",
+                    fragment.id.to_string(),
+                    fragment.artifact_origin,
+                    None,
+                    Some(located.physical_origin.as_origin().clone()),
+                    "duplicate full located fragment identity",
+                ));
+            }
+        }
+
+        let mut segment_identities = HashSet::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            let located = resolver.locate_segment(segment)?;
+            let origin = located.physical_origin.as_origin();
+            if let Some(sketch) = &segment.sketch {
+                self.validate_explicit_origin_key(segment, origin, &sketch.key)?;
+            }
+            if let Some(bootstrap) = &segment.bootstrap {
+                self.validate_explicit_origin_key(segment, origin, &bootstrap.key)?;
+            }
+            if let Some(membership) = &segment.membership {
+                self.validate_explicit_origin_key(segment, origin, &membership.key)?;
+            }
+            for object in &segment.cluster_objects {
+                self.validate_explicit_origin_key(segment, origin, &object.key)?;
+            }
+            if !segment_identities.insert(located.identity()) {
+                return Err(self.artifact_origin_error(
+                    "segment",
+                    &segment.id,
+                    segment.artifact_origin,
+                    None,
+                    Some(origin.clone()),
+                    "duplicate full located segment identity",
+                ));
+            }
+        }
+
+        Ok(resolver)
+    }
+
+    fn indexed_artifact_origin_ref(
         &self,
         descriptor_kind: &'static str,
         descriptor_id: &str,
         index: ArtifactOriginIndex,
-    ) -> Result<ArtifactOrigin> {
+    ) -> Result<&ArtifactOrigin> {
         let index_usize = usize::try_from(index.get()).map_err(|_| {
             self.artifact_origin_error(
                 descriptor_kind,
@@ -1124,22 +1479,29 @@ impl Manifest {
                 "artifact origin index does not fit this platform",
             )
         })?;
-        self.artifact_origins
-            .get(index_usize)
+        self.artifact_origins.get(index_usize).ok_or_else(|| {
+            self.artifact_origin_error(
+                descriptor_kind,
+                descriptor_id,
+                Some(index),
+                None,
+                None,
+                format!(
+                    "artifact origin index is out of bounds for table length {}",
+                    self.artifact_origins.len()
+                ),
+            )
+        })
+    }
+
+    fn indexed_artifact_origin(
+        &self,
+        descriptor_kind: &'static str,
+        descriptor_id: &str,
+        index: ArtifactOriginIndex,
+    ) -> Result<ArtifactOrigin> {
+        self.indexed_artifact_origin_ref(descriptor_kind, descriptor_id, index)
             .cloned()
-            .ok_or_else(|| {
-                self.artifact_origin_error(
-                    descriptor_kind,
-                    descriptor_id,
-                    Some(index),
-                    None,
-                    None,
-                    format!(
-                        "artifact origin index is out of bounds for table length {}",
-                        self.artifact_origins.len()
-                    ),
-                )
-            })
     }
 
     /// Resolve one WAL fragment's exact physical namespace lifetime.
@@ -1549,7 +1911,9 @@ impl Manifest {
         }) {
             return Err(crate::security::SecurityError::ReceiptsUnavailableUnhashed);
         }
-        let reachable = self.receipt_reachable_keys(namespace);
+        let reachable = self
+            .receipt_reachable_keys(namespace)
+            .map_err(|error| crate::security::SecurityError::InvalidReceipt(error.to_string()))?;
         if reachable.len() != self.artifact_hashes.len()
             || reachable
                 .iter()
@@ -1582,25 +1946,52 @@ impl Manifest {
         store: &ZeppelinStore,
         namespace: &str,
     ) -> Result<()> {
-        for segment in self.segments.clone() {
-            if segment.hierarchical && self.hierarchical_routing_nodes(&segment.id).is_empty() {
-                let node_ids =
-                    crate::index::hierarchical::build::discover_hierarchical_routing_nodes(
-                        store,
-                        namespace,
-                        &segment.id,
-                    )
-                    .await?;
-                if node_ids.is_empty() {
-                    return Err(ZeppelinError::Index(format!(
-                        "hierarchical segment {} has no routing-node inventory",
-                        segment.id
-                    )));
-                }
-                self.set_hierarchical_routing_nodes(&segment.id, node_ids);
+        let incarnation = self.namespace_incarnation().ok_or_else(|| {
+            ZeppelinError::Serialization(format!(
+                "manifest for namespace {namespace} has no incarnation for receipt hydration"
+            ))
+        })?;
+        let local_origin = ArtifactOrigin {
+            namespace: NamespaceId::parse(namespace.to_string()).map_err(|_| {
+                ZeppelinError::Validation(format!(
+                    "namespace violates artifact-origin grammar: {namespace}"
+                ))
+            })?,
+            incarnation: NamespaceIncarnationId::from_uuid(incarnation),
+        };
+        let hierarchical_segments = self
+            .artifact_origin_resolver(&local_origin)?
+            .located_segments()?
+            .into_iter()
+            .filter(|located| {
+                located.segment.hierarchical
+                    && self
+                        .hierarchical_routing_nodes(&located.segment.id)
+                        .is_empty()
+            })
+            .map(|located| {
+                (
+                    located.segment.id.clone(),
+                    located.physical_namespace().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (segment_id, physical_namespace) in hierarchical_segments {
+            let node_ids = crate::index::hierarchical::build::discover_hierarchical_routing_nodes(
+                store,
+                &physical_namespace,
+                &segment_id,
+            )
+            .await?;
+            if node_ids.is_empty() {
+                return Err(ZeppelinError::Index(format!(
+                    "hierarchical segment {} has no routing-node inventory",
+                    segment_id
+                )));
             }
+            self.set_hierarchical_routing_nodes(&segment_id, node_ids);
         }
-        let reachable = self.receipt_reachable_keys(namespace);
+        let reachable = self.receipt_reachable_keys(namespace)?;
         self.artifact_hashes
             .retain(|key, _| reachable.contains(key));
         for key in reachable {
@@ -1683,6 +2074,22 @@ impl Manifest {
             )
         })?;
         self.compute_receipt_state_digest(namespace, binding_version)
+    }
+
+    /// Seal a feature-only synthetic foreign view with a valid v2 projection.
+    ///
+    /// This only makes integration-fixture bytes structurally well-formed so
+    /// normal persisted decoding reaches the independent foreign-origin
+    /// admission gate. It does not publish or authorize the manifest.
+    #[cfg(feature = "branching-test-support")]
+    pub(crate) fn bind_synthetic_origin_receipt_for_test_support(
+        &mut self,
+        namespace: &str,
+    ) -> Result<()> {
+        self.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
+        self.receipt_state_digest =
+            Some(self.compute_receipt_state_digest(namespace, ReceiptBindingVersion::V2Origins)?);
+        Ok(())
     }
 
     fn compute_receipt_state_digest(
@@ -1919,13 +2326,55 @@ impl Manifest {
             .map_or(&[], Vec::as_slice)
     }
 
-    fn receipt_reachable_keys(&self, namespace: &str) -> std::collections::BTreeSet<String> {
-        let mut reachable = crate::compaction::gc::reachable_keys(namespace, self);
-        for segment in &self.segments {
+    fn receipt_reachable_keys(&self, namespace: &str) -> Result<BTreeSet<String>> {
+        let mut reachable = crate::compaction::gc::reachable_keys(namespace, self)?;
+        let located_segments = match self.namespace_incarnation() {
+            Some(incarnation) => {
+                let local_origin = ArtifactOrigin {
+                    namespace: NamespaceId::parse(namespace.to_string()).map_err(|_| {
+                        ZeppelinError::Validation(format!(
+                            "namespace violates artifact-origin grammar: {namespace}"
+                        ))
+                    })?,
+                    incarnation: NamespaceIncarnationId::from_uuid(incarnation),
+                };
+                self.artifact_origin_resolver(&local_origin)?
+                    .located_segments()?
+                    .into_iter()
+                    .map(|located| {
+                        (
+                            located.segment.clone(),
+                            located.physical_namespace().to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }
+            None if self.has_explicit_artifact_origins() => {
+                return Err(self.artifact_origin_error(
+                    "manifest",
+                    "namespace_incarnation",
+                    None,
+                    None,
+                    None,
+                    "explicit artifact origins require a local namespace incarnation",
+                ));
+            }
+            // Pre-incarnation manifests cannot contain an origin table or
+            // descriptor indices. Their immutable layout is therefore
+            // unambiguously namespace-local. Preserve that wire-compatible
+            // receipt inventory without fabricating a namespace-lifetime ID.
+            None => self
+                .segments
+                .iter()
+                .map(|segment| (segment.clone(), namespace.to_string()))
+                .collect::<Vec<_>>(),
+        };
+        for (segment, physical_namespace) in located_segments {
+            let physical_namespace = physical_namespace.as_str();
             if segment.hierarchical {
                 for node_id in self.hierarchical_routing_nodes(&segment.id) {
                     reachable.insert(crate::index::hierarchical::tree_node_key(
-                        namespace,
+                        physical_namespace,
                         &segment.id,
                         node_id,
                     ));
@@ -1934,7 +2383,7 @@ impl Manifest {
             if segment.has_global_fts {
                 for cluster_idx in 0..segment.cluster_count {
                     reachable.remove(&crate::fts::inverted_index::fts_index_key(
-                        namespace,
+                        physical_namespace,
                         segment.cluster_owner(cluster_idx),
                         cluster_idx,
                     ));
@@ -1950,12 +2399,12 @@ impl Manifest {
             // published objects.
             if segment.hierarchical {
                 reachable.remove(&crate::index::quantization::sq::sq_calibration_key(
-                    namespace,
+                    physical_namespace,
                     &segment.id,
                 ));
                 for cluster_idx in 0..segment.cluster_count {
                     reachable.remove(&crate::index::quantization::sq::sq_cluster_key(
-                        namespace,
+                        physical_namespace,
                         segment.cluster_owner(cluster_idx),
                         cluster_idx,
                     ));
@@ -1973,7 +2422,7 @@ impl Manifest {
             // clusters bind only the object that actually contains the codes.
             if segment.bootstrap.is_some() {
                 reachable.remove(&crate::index::quantization::sq::sq_calibration_key(
-                    namespace,
+                    physical_namespace,
                     &segment.id,
                 ));
             }
@@ -1983,7 +2432,7 @@ impl Manifest {
                     || (segment.bootstrap.is_some() && owner == segment.id);
                 if codes_are_colocated {
                     reachable.remove(&crate::index::quantization::sq::sq_cluster_key(
-                        namespace,
+                        physical_namespace,
                         owner,
                         cluster_idx,
                     ));
@@ -1993,14 +2442,14 @@ impl Manifest {
         for pending in &self.pending_deletes {
             reachable.remove(pending);
         }
-        reachable
+        Ok(reachable)
     }
 
     fn finalize_receipt_root(&mut self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
         self.canonicalize_explicit_artifact_origins()?;
         self.validate_artifact_origins()?;
         self.validate_foreign_origin_admission()?;
-        let reachable = self.receipt_reachable_keys(namespace);
+        let reachable = self.receipt_reachable_keys(namespace)?;
         self.artifact_hashes
             .retain(|key, _| reachable.contains(key));
         for key in &reachable {
@@ -2259,6 +2708,43 @@ impl Manifest {
             self.compaction_watermark = Some(watermark);
         }
         self.updated_at = now;
+    }
+
+    /// Removes an exact compaction snapshot using origin-qualified identities.
+    ///
+    /// Unlike the legacy ULID-only helper, this keeps a same-ULID fragment from
+    /// another physical namespace lifetime visible. The authoritative logical
+    /// origin is revalidated against this fresh CAS candidate before mutation.
+    pub(crate) fn remove_compacted_located_fragments_at(
+        &mut self,
+        authoritative_local: &ArtifactOrigin,
+        compacted: &HashSet<LocatedFragmentIdentity>,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let remove = {
+            let resolver = self.artifact_origin_resolver(authoritative_local)?;
+            self.fragments
+                .iter()
+                .map(|fragment| {
+                    resolver
+                        .locate_fragment(fragment)
+                        .map(|located| compacted.contains(&located.identity()))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        self.fragments = std::mem::take(&mut self.fragments)
+            .into_iter()
+            .zip(remove)
+            .filter_map(|(fragment, remove)| (!remove).then_some(fragment))
+            .collect();
+        if let Some(max_id) = compacted.iter().map(|identity| identity.id).max() {
+            self.compaction_watermark = Some(
+                self.compaction_watermark
+                    .map_or(max_id, |previous| previous.max(max_id)),
+            );
+        }
+        self.updated_at = now;
+        Ok(())
     }
 
     /// Add a segment reference and prune old segments using the provided limit.
@@ -4445,6 +4931,78 @@ mod tests {
         assert_eq!(manifest.local_origin().unwrap(), local);
         assert_eq!(manifest.fragment_origin(&local_fragment).unwrap(), local);
         assert_eq!(manifest.fragment_origin(&foreign_fragment).unwrap(), source);
+    }
+
+    #[test]
+    fn pre_incarnation_manifest_uses_authoritative_local_origin_without_mutation() {
+        let mut manifest = Manifest::new();
+        manifest.fragments.push(FragmentRef {
+            id: Ulid::from(21_u128),
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 1,
+            artifact_origin: None,
+        });
+        let original = manifest.to_bytes().unwrap();
+        let authoritative = origin("legacy-target", 9);
+
+        let origins = manifest
+            .artifact_origin_resolver(&authoritative)
+            .expect("authoritative metadata must resolve an unbound legacy manifest");
+        let located = origins
+            .locate_fragment(&manifest.fragments[0])
+            .expect("implicit legacy fragment must resolve through the context");
+
+        assert_eq!(located.logical_namespace, "legacy-target");
+        assert_eq!(located.physical_origin.as_origin(), &authoritative);
+        assert_eq!(
+            manifest.to_bytes().unwrap(),
+            original,
+            "read routing must not rewrite history"
+        );
+    }
+
+    #[test]
+    fn located_identity_rejects_exact_duplicates_but_keeps_cross_origin_ulids() {
+        let repeated_id = Ulid::from(22_u128);
+        let local = FragmentRef {
+            id: repeated_id,
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 1,
+            artifact_origin: None,
+        };
+        let foreign = FragmentRef {
+            sequence_number: 1,
+            artifact_origin: Some(ArtifactOriginIndex::new(0)),
+            ..local.clone()
+        };
+        let authoritative = origin("identity-target", 10);
+        let source = origin("identity-source", 11);
+
+        let mut distinct = Manifest::new();
+        distinct.namespace = Some("identity-target".to_string());
+        distinct
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(10))
+            .unwrap();
+        distinct.artifact_origins = vec![source];
+        distinct.fragments = vec![local.clone(), foreign];
+        let origins = distinct.artifact_origin_resolver(&authoritative).unwrap();
+        assert_eq!(origins.located_fragments().unwrap().len(), 2);
+
+        let mut duplicate = distinct;
+        duplicate.fragments = vec![local.clone(), local];
+        let error = duplicate
+            .artifact_origin_resolver(&authoritative)
+            .and_then(|origins| origins.located_fragments().map(|_| ()))
+            .expect_err("one full located fragment identity cannot occur twice");
+        assert!(matches!(
+            error,
+            ZeppelinError::Branch(error)
+                if matches!(error.as_ref(), BranchError::ArtifactOriginInvalid { .. })
+        ));
     }
 
     #[test]

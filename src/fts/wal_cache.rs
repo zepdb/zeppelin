@@ -16,8 +16,8 @@
 //! ```text
 //! authoritative manifest snapshot
 //!            |
-//!            | visible uncompacted fragment IDs
-//!            +---------------------------> evict_compacted
+//!            | visible origin-qualified fragment identities
+//!            +--------------------> evict_compacted_located
 //!            |                                  |
 //!            v                                  v
 //! decoded immutable WalFragment          retain matching cache entries
@@ -25,7 +25,7 @@
 //!            v
 //!       get_or_tokenize
 //!        /           \
-//!   ID hit           ID miss
+//! identity hit      identity miss
 //!      |                 |
 //! deep-clone       tokenize requested fields
 //! cached maps             |
@@ -39,25 +39,20 @@
 //! 2. Read [`CachedFragmentFts`] for the fragment-level key space.
 //! 3. Read [`WalFtsCache::get_or_tokenize`] for hit, miss, and concurrency
 //!    behavior.
-//! 4. Finish with [`WalFtsCache::evict_compacted`] for manifest-driven
+//! 4. Finish with [`WalFtsCache::evict_compacted_located`] for manifest-driven
 //!    lifecycle cleanup.
 //!
-//! ## Invariants and current cache-key boundary
+//! ## Invariants and cache-key boundary
 //!
-//! - Fragment ULIDs identify immutable payloads. Reusing a ULID for different
-//!   bytes would make every cached answer unsafe.
+//! - A physical namespace lifetime plus fragment ULID identifies one immutable
+//!   payload. Equal ULIDs from different origins are distinct cache entries.
+//! - A canonical sorted field/config discriminator identifies the derived token
+//!   view. Logical namespaces with equal analysis contexts share work; contexts
+//!   with different fields or configuration never alias.
 //! - Cached data is derived state. S3/MinIO and its manifest remain
 //!   authoritative, and clearing the whole cache must preserve query results.
 //! - Document text is tokenized with `prefix_mode = false`; query-side prefix
 //!   behavior expands against these normal document tokens.
-//! - The current key contains only the fragment ULID, not namespace, requested
-//!   fields, or [`FtsFieldConfig`]. The first miss fixes the fields and
-//!   configuration represented by that entry; later hits do not extend or
-//!   re-tokenize it.
-//!
-//! TODO(doc): Verify whether the intended production key should include the
-//! namespace, field set, and tokenization configuration, or whether callers
-//! will guarantee one stable, complete tokenization context per fragment.
 //!
 //! ## Rust concepts used here
 //!
@@ -70,16 +65,17 @@
 //! Cloning [`CachedFragmentFts`] is not an `Arc`-style pointer copy: it deeply
 //! clones the owned strings and hash maps.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use ulid::Ulid;
 
 use crate::fts::tokenizer::tokenize_text;
-use crate::fts::FtsFieldConfig;
+use crate::fts::{FtsFieldConfig, FtsLanguage};
+use crate::namespace::branching::ArtifactOrigin;
 use crate::types::AttributeValue;
 use crate::wal::fragment::WalFragment;
+use crate::wal::manifest::LocatedFragmentIdentity;
 
 /// BM25 input derived from one document's value for one configured text field.
 ///
@@ -130,16 +126,83 @@ pub struct CachedFragmentFts {
 /// Process-local cache of pre-tokenized WAL fragment data.
 ///
 /// The cache is safe for concurrent access but is neither persistent nor
-/// authoritative. Its key is a fragment ULID, and its value is a complete
-/// owned snapshot from the first tokenization miss for that ULID. See the
-/// module-level cache-key caveat before changing call sites or FTS settings.
+/// authoritative. Its key combines the fragment's physical namespace lifetime
+/// and ULID with a canonical requested-field/full-config discriminator. Equal
+/// physical data can therefore be reused only when its derived token view is
+/// also equal.
 pub struct WalFtsCache {
     /// Sharded concurrent map shared through reference-counted ownership.
     ///
     /// A [`DashMap`] entry guard is held only long enough to clone a hit. The
     /// cache performs tokenization outside the map, so a slow miss does not hold
     /// a shard lock across the CPU-heavy work.
-    cache: Arc<DashMap<Ulid, CachedFragmentFts>>,
+    cache: Arc<DashMap<WalFtsCacheKey, CacheEntry>>,
+}
+
+/// Complete identity of one cached tokenization result.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct WalFtsCacheKey {
+    identity: LocatedFragmentIdentity,
+    discriminator: FtsCacheDiscriminator,
+}
+
+/// Canonical requested-field and configuration projection.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FtsCacheDiscriminator {
+    fields: Vec<FtsFieldCacheDiscriminator>,
+}
+
+/// Stable cache identity for one configured requested field.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FtsFieldCacheDiscriminator {
+    field: String,
+    language: FtsLanguageCacheDiscriminator,
+    stemming: bool,
+    remove_stopwords: bool,
+    case_sensitive: bool,
+    k1_bits: u32,
+    b_bits: u32,
+    max_token_length: usize,
+}
+
+/// Hashable exhaustive projection of the persisted analyzer language.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FtsLanguageCacheDiscriminator {
+    English,
+}
+
+impl FtsCacheDiscriminator {
+    /// Build an order- and duplicate-insensitive context key.
+    fn new(fts_configs: &HashMap<String, FtsFieldConfig>, fields_needed: &[&str]) -> Self {
+        let mut fields = fields_needed
+            .iter()
+            .filter_map(|field| {
+                let config = fts_configs.get(*field)?;
+                let language = match config.language {
+                    FtsLanguage::English => FtsLanguageCacheDiscriminator::English,
+                };
+                Some(FtsFieldCacheDiscriminator {
+                    field: (*field).to_string(),
+                    language,
+                    stemming: config.stemming,
+                    remove_stopwords: config.remove_stopwords,
+                    case_sensitive: config.case_sensitive,
+                    k1_bits: config.k1.to_bits(),
+                    b_bits: config.b.to_bits(),
+                    max_token_length: config.max_token_length,
+                })
+            })
+            .collect::<Vec<_>>();
+        fields.sort_unstable_by(|left, right| left.field.cmp(&right.field));
+        fields.dedup_by(|left, right| left.field == right.field);
+        Self { fields }
+    }
+}
+
+/// One physical token snapshot and the logical namespace lifetimes using it.
+struct CacheEntry {
+    logical_origins: HashSet<ArtifactOrigin>,
+    token_data: CachedFragmentFts,
 }
 
 impl WalFtsCache {
@@ -168,14 +231,19 @@ impl WalFtsCache {
 
     /// Returns cached token statistics for a fragment or computes them once on a miss.
     ///
-    /// A hit is based only on `fragment.id`; the supplied configuration and
-    /// field slice are ignored after a matching entry exists. On a miss, the
-    /// method visits vector upserts, skips deletes, and tokenizes only requested
-    /// fields that both have a configuration and contain a string attribute.
-    /// Empty token streams are not stored.
+    /// A hit is based on the fragment's origin-qualified identity plus a
+    /// canonical projection of configured requested fields. Both hits and
+    /// misses register the logical namespace lifetime that is currently using
+    /// that exact derived view. On a miss, the method visits vector upserts,
+    /// skips deletes, and tokenizes only requested fields that both have a
+    /// configuration and contain a string attribute. Empty token streams are
+    /// not stored.
     ///
     /// # Parameters
     ///
+    /// - `logical_origin`: Exact target namespace lifetime whose manifest made
+    ///   this physical fragment visible.
+    /// - `identity`: Exact physical namespace lifetime and ULID of `fragment`.
     /// - `fragment`: Borrowed immutable fragment whose vector attributes provide
     ///   document text. Its checksum and manifest sequence are not inspected.
     /// - `fts_configs`: Borrowed field-to-tokenizer settings. A requested field
@@ -197,12 +265,13 @@ impl WalFtsCache {
     ///
     /// # Consistency
     ///
-    /// The fragment must obey Zeppelin's immutable-ULID invariant. The cache is
-    /// disposable derived data and cannot make an unreferenced fragment visible.
-    /// Because lookup and insertion are separate, concurrent misses may both
-    /// tokenize and the later insertion replaces the earlier value. This is
-    /// result-equivalent only when both calls use the same field/configuration
-    /// context.
+    /// The fragment must obey Zeppelin's immutable origin-plus-ULID invariant,
+    /// and `identity.id` must equal `fragment.id` or the method fails loudly.
+    /// The cache is disposable derived data and cannot make an unreferenced
+    /// fragment visible. Concurrent misses may both tokenize, but entry
+    /// insertion keeps the first equal-context snapshot and only adds the later
+    /// caller's logical owner. Different field/configuration contexts use
+    /// different entries even when the immutable fragment identity is shared.
     ///
     /// # Performance
     ///
@@ -221,8 +290,7 @@ impl WalFtsCache {
     /// ```
     ///
     /// If the first call requests only `content`, a later call for `title`
-    /// currently hits the same ULID entry and receives no newly computed title
-    /// data. Callers must account for the module-level cache-key boundary.
+    /// computes and retains a separate derived view of the same fragment.
     ///
     /// # Rust Notes for Java/C Engineers
     ///
@@ -231,16 +299,27 @@ impl WalFtsCache {
     /// for the call by construction. `match` handles every `Option` case, so
     /// missing attributes cannot become a null dereference. The returned maps
     /// are owned allocations, not views into the borrowed fragment.
-    pub fn get_or_tokenize(
+    pub(crate) fn get_or_tokenize(
         &self,
+        logical_origin: &ArtifactOrigin,
+        identity: &LocatedFragmentIdentity,
         fragment: &WalFragment,
         fts_configs: &HashMap<String, FtsFieldConfig>,
         fields_needed: &[&str],
     ) -> CachedFragmentFts {
+        assert_eq!(
+            identity.id, fragment.id,
+            "WAL FTS cache identity does not match decoded fragment"
+        );
+        let cache_key = WalFtsCacheKey {
+            identity: identity.clone(),
+            discriminator: FtsCacheDiscriminator::new(fts_configs, fields_needed),
+        };
         // Clone while the DashMap guard is alive, then release the shard before
         // returning owned data to query scoring.
-        if let Some(cached) = self.cache.get(&fragment.id) {
-            return cached.clone();
+        if let Some(mut cached) = self.cache.get_mut(&cache_key) {
+            cached.logical_origins.insert(logical_origin.clone());
+            return cached.token_data.clone();
         }
 
         // Tokenization intentionally happens without a map guard so unrelated
@@ -286,28 +365,44 @@ impl WalFtsCache {
             }
         }
 
-        let cached = CachedFragmentFts { doc_field_data };
-        self.cache.insert(fragment.id, cached.clone());
-        cached
+        let token_data = CachedFragmentFts { doc_field_data };
+        match self.cache.entry(cache_key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                occupied
+                    .get_mut()
+                    .logical_origins
+                    .insert(logical_origin.clone());
+                occupied.get().token_data.clone()
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(CacheEntry {
+                    logical_origins: HashSet::from([logical_origin.clone()]),
+                    token_data: token_data.clone(),
+                });
+                token_data
+            }
+        }
     }
 
-    /// Retains only entries whose fragment IDs occur in the supplied active set.
+    /// Retires one logical owner's references absent from its active set.
     ///
-    /// The BM25 query coordinator derives `active_fragment_ids` from the
+    /// The BM25 query coordinator derives `active_fragment_identities` from the
     /// authoritative manifest snapshot before scanning. This bounds memory once
     /// compaction publishes a segment and removes incorporated WAL references.
     /// Eviction does not delete WAL objects or change manifest visibility.
     ///
     /// # Parameters
     ///
-    /// - `active_fragment_ids`: Borrowed IDs that should remain cached. An empty
-    ///   slice clears the map.
+    /// - `logical_origin`: Exact logical namespace lifetime being reconciled.
+    /// - `active_fragment_identities`: Origin-qualified physical identities that
+    ///   remain visible to this logical owner. An empty slice retires all of the
+    ///   owner's observations without disturbing other owners.
     ///
     /// # Side Effects
     ///
-    /// Removes every shared-map entry whose ULID is absent from the slice.
-    /// Already returned [`CachedFragmentFts`] values remain valid because they
-    /// own their data.
+    /// Removes `logical_origin` from entries absent from its active set, then
+    /// removes only entries with no remaining logical owners. Already returned
+    /// [`CachedFragmentFts`] values remain valid because they own their data.
     ///
     /// # Consistency
     ///
@@ -315,30 +410,34 @@ impl WalFtsCache {
     /// still scans the fragments selected by its manifest even if their cache
     /// entries disappear concurrently.
     ///
-    /// The server owns one cache across namespaces, while this method receives
-    /// one namespace's active IDs and the key contains no namespace. Therefore
-    /// a call currently evicts entries belonging to other namespaces as well;
-    /// this reduces hit rate but does not change results because misses rebuild.
-    ///
-    /// TODO(doc): Verify whether cross-namespace eviction is intentional or the
-    /// cache lifecycle should retain entries per namespace.
-    ///
     /// # Performance
     ///
-    /// Builds an `O(a)` borrowed-ID set for `a` active IDs, then scans all `c`
-    /// cache entries in `O(a + c)` expected time. It clones no ULIDs.
+    /// Builds an `O(a)` owned-identity set for `a` active refs, then scans all
+    /// `c` cache entries in `O(a + c)` expected time.
     ///
     /// # Examples
     ///
     /// If the cache holds fragments `[10, 11, 12]` and a newly published
     /// manifest retains only `[12]`, this call removes token data for `10` and
     /// `11`. A still-running query that already cloned those values is unaffected.
-    pub fn evict_compacted(&self, active_fragment_ids: &[Ulid]) {
-        let active_set: std::collections::HashSet<&Ulid> = active_fragment_ids.iter().collect();
-        self.cache.retain(|id, _| active_set.contains(id));
+    pub(crate) fn evict_compacted_located(
+        &self,
+        logical_origin: &ArtifactOrigin,
+        active_fragment_identities: &[LocatedFragmentIdentity],
+    ) {
+        let active = active_fragment_identities
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        self.cache.retain(|key, entry| {
+            if entry.logical_origins.contains(logical_origin) && !active.contains(&key.identity) {
+                entry.logical_origins.remove(logical_origin);
+            }
+            !entry.logical_origins.is_empty()
+        });
     }
 
-    /// Reports the number of fragment entries currently retained.
+    /// Reports the number of fragment-and-analysis-context entries retained.
     ///
     /// # Returns
     ///
@@ -348,8 +447,8 @@ impl WalFtsCache {
     ///
     /// # Examples
     ///
-    /// A new cache reports zero; after tokenizing one previously unseen
-    /// fragment it normally reports one.
+    /// A new cache reports zero; one fragment tokenized under two distinct
+    /// field/configuration contexts reports two.
     pub fn len(&self) -> usize {
         self.cache.len()
     }
@@ -391,7 +490,24 @@ mod tests {
     //! integrity verification, object-store access, or manifest publication.
 
     use super::*;
+    use crate::namespace::branching::ArtifactOrigin;
+    use crate::namespace::{NamespaceId, NamespaceIncarnationId};
     use crate::types::VectorEntry;
+    use ulid::Ulid;
+
+    fn origin(namespace: &str, incarnation: u128) -> ArtifactOrigin {
+        ArtifactOrigin {
+            namespace: NamespaceId::parse(namespace).unwrap(),
+            incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(incarnation)),
+        }
+    }
+
+    fn identity(origin: &ArtifactOrigin, id: Ulid) -> LocatedFragmentIdentity {
+        LocatedFragmentIdentity {
+            physical_origin: origin.clone(),
+            id,
+        }
+    }
 
     /// Wraps owned vector fixtures in a fresh, delete-free fragment.
     ///
@@ -460,15 +576,17 @@ mod tests {
     fn test_cache_hit() {
         let cache = WalFtsCache::new();
         let fragment = make_fragment(vec![make_vec_entry("v1", "hello world")]);
+        let owner = origin("owner", 1);
+        let identity = identity(&owner, fragment.id);
         let configs = make_configs();
         let fields = vec!["content"];
 
         // The miss establishes the one cache entry.
-        let result1 = cache.get_or_tokenize(&fragment, &configs, &fields);
+        let result1 = cache.get_or_tokenize(&owner, &identity, &fragment, &configs, &fields);
         assert_eq!(cache.len(), 1);
 
         // An identical request must reuse rather than append another entry.
-        let result2 = cache.get_or_tokenize(&fragment, &configs, &fields);
+        let result2 = cache.get_or_tokenize(&owner, &identity, &fragment, &configs, &fields);
         assert_eq!(cache.len(), 1);
 
         // Equal shapes demonstrate that the owned hit clone retained all data.
@@ -486,10 +604,17 @@ mod tests {
             make_vec_entry("v1", "cat dog cat"),
             make_vec_entry("v2", "bird"),
         ]);
+        let owner = origin("owner", 1);
         let configs = make_configs();
         let fields = vec!["content"];
 
-        let result = cache.get_or_tokenize(&fragment, &configs, &fields);
+        let result = cache.get_or_tokenize(
+            &owner,
+            &identity(&owner, fragment.id),
+            &fragment,
+            &configs,
+            &fields,
+        );
 
         let v1_data = result
             .doc_field_data
@@ -514,15 +639,153 @@ mod tests {
         let cache = WalFtsCache::new();
         let f1 = make_fragment(vec![make_vec_entry("v1", "hello")]);
         let f2 = make_fragment(vec![make_vec_entry("v2", "world")]);
+        let owner = origin("owner", 1);
+        let f1_identity = identity(&owner, f1.id);
+        let f2_identity = identity(&owner, f2.id);
         let configs = make_configs();
         let fields = vec!["content"];
 
-        cache.get_or_tokenize(&f1, &configs, &fields);
-        cache.get_or_tokenize(&f2, &configs, &fields);
+        cache.get_or_tokenize(&owner, &f1_identity, &f1, &configs, &fields);
+        cache.get_or_tokenize(&owner, &f2_identity, &f2, &configs, &fields);
         assert_eq!(cache.len(), 2);
 
         // Model a manifest snapshot where compaction removed `f1` but retained `f2`.
-        cache.evict_compacted(&[f2.id]);
+        cache.evict_compacted_located(&owner, &[f2_identity]);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn equal_ulids_from_different_physical_origins_do_not_alias() {
+        let cache = WalFtsCache::new();
+        let shared_id = Ulid::new();
+        let source = origin("source", 1);
+        let target = origin("target", 2);
+        let logical = origin("logical", 3);
+        let source_fragment = WalFragment {
+            id: shared_id,
+            vectors: vec![make_vec_entry("source-doc", "source term")],
+            deletes: Vec::new(),
+            checksum: 0,
+        };
+        let target_fragment = WalFragment {
+            id: shared_id,
+            vectors: vec![make_vec_entry("target-doc", "target term")],
+            deletes: Vec::new(),
+            checksum: 0,
+        };
+        let configs = make_configs();
+        let fields = ["content"];
+
+        let source_tokens = cache.get_or_tokenize(
+            &logical,
+            &identity(&source, shared_id),
+            &source_fragment,
+            &configs,
+            &fields,
+        );
+        let target_tokens = cache.get_or_tokenize(
+            &logical,
+            &identity(&target, shared_id),
+            &target_fragment,
+            &configs,
+            &fields,
+        );
+
+        assert!(source_tokens
+            .doc_field_data
+            .contains_key(&("source-doc".to_string(), "content".to_string())));
+        assert!(target_tokens
+            .doc_field_data
+            .contains_key(&("target-doc".to_string(), "content".to_string())));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn shared_physical_entry_survives_one_logical_scope_eviction() {
+        let cache = WalFtsCache::new();
+        let source = origin("source", 1);
+        let target = origin("target", 2);
+        let fragment = make_fragment(vec![make_vec_entry("shared-doc", "shared term")]);
+        let identity = identity(&source, fragment.id);
+        let configs = make_configs();
+        let fields = ["content"];
+
+        cache.get_or_tokenize(&source, &identity, &fragment, &configs, &fields);
+        cache.get_or_tokenize(&target, &identity, &fragment, &configs, &fields);
+
+        cache.evict_compacted_located(&target, &[]);
+        assert_eq!(cache.len(), 1);
+
+        cache.evict_compacted_located(&source, &[]);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn cache_discriminator_separates_logical_field_sets_for_one_physical_fragment() {
+        let cache = WalFtsCache::new();
+        let source = origin("source", 1);
+        let branch = origin("branch", 2);
+        let mut vector = make_vec_entry("shared-doc", "source content");
+        vector.attributes.as_mut().unwrap().insert(
+            "title".to_string(),
+            AttributeValue::String("branch title".to_string()),
+        );
+        let fragment = make_fragment(vec![vector]);
+        let identity = identity(&source, fragment.id);
+        let mut configs = make_configs();
+        configs.insert(
+            "title".to_string(),
+            FtsFieldConfig {
+                stemming: false,
+                remove_stopwords: false,
+                ..Default::default()
+            },
+        );
+
+        let source_tokens =
+            cache.get_or_tokenize(&source, &identity, &fragment, &configs, &["content"]);
+        let branch_tokens =
+            cache.get_or_tokenize(&branch, &identity, &fragment, &configs, &["title"]);
+
+        assert!(source_tokens
+            .doc_field_data
+            .contains_key(&("shared-doc".to_string(), "content".to_string())));
+        assert!(branch_tokens
+            .doc_field_data
+            .contains_key(&("shared-doc".to_string(), "title".to_string())));
+        assert!(!branch_tokens
+            .doc_field_data
+            .contains_key(&("shared-doc".to_string(), "content".to_string())));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn cache_discriminator_separates_logical_analyzers_for_one_physical_fragment() {
+        let cache = WalFtsCache::new();
+        let source = origin("source", 1);
+        let branch = origin("branch", 2);
+        let fragment = make_fragment(vec![make_vec_entry("shared-doc", "MiXeD")]);
+        let identity = identity(&source, fragment.id);
+        let source_configs = make_configs();
+        let mut branch_configs = make_configs();
+        branch_configs.get_mut("content").unwrap().case_sensitive = true;
+
+        let source_tokens =
+            cache.get_or_tokenize(&source, &identity, &fragment, &source_configs, &["content"]);
+        let branch_tokens =
+            cache.get_or_tokenize(&branch, &identity, &fragment, &branch_configs, &["content"]);
+
+        let source_data = source_tokens
+            .doc_field_data
+            .get(&("shared-doc".to_string(), "content".to_string()))
+            .unwrap();
+        let branch_data = branch_tokens
+            .doc_field_data
+            .get(&("shared-doc".to_string(), "content".to_string()))
+            .unwrap();
+        assert!(source_data.term_freqs.contains_key("mixed"));
+        assert!(branch_data.term_freqs.contains_key("MiXeD"));
+        assert!(!branch_data.term_freqs.contains_key("mixed"));
+        assert_eq!(cache.len(), 2);
     }
 }

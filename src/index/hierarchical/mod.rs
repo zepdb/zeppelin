@@ -83,8 +83,10 @@ use crate::config::IndexingConfig;
 use crate::error::Result;
 use crate::index::quantization::QuantizationType;
 use crate::index::VectorIndex;
+use crate::namespace::branching::ArtifactOrigin;
 use crate::storage::ZeppelinStore;
 use crate::types::{DistanceMetric, Filter, SearchResult, VectorEntry};
+use crate::wal::manifest::immutable_artifact_cache_key;
 
 /// Persisted description needed to open a hierarchical segment.
 ///
@@ -157,6 +159,10 @@ pub struct HierarchicalIndex {
     pub(crate) meta: TreeMeta,
     /// Namespace prefix used only to derive immutable object-store keys.
     pub(crate) namespace: String,
+    /// Physical namespace owning the immutable tree and leaf artifacts.
+    pub(crate) physical_namespace: String,
+    /// Incarnation-qualified owner used to prevent disposable-cache aliasing.
+    pub(crate) physical_origin: Option<ArtifactOrigin>,
     /// Manifest segment identifier used only to derive object-store keys.
     pub(crate) segment_id: String,
     /// Manifest-declared fields whose leaf clusters may have bitmap sidecars.
@@ -409,6 +415,13 @@ pub fn deserialize_tree_node(data: &[u8]) -> Result<TreeNode> {
 }
 
 impl HierarchicalIndex {
+    #[must_use]
+    pub(crate) fn artifact_cache_key(&self, store_key: &str) -> String {
+        self.physical_origin.as_ref().map_or_else(
+            || store_key.to_string(),
+            |origin| immutable_artifact_cache_key(origin, store_key),
+        )
+    }
     /// Returns the number of globally numbered leaf clusters.
     ///
     /// # Returns
@@ -493,6 +506,15 @@ impl HierarchicalIndex {
         cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
     ) -> Result<Self> {
         build::load_hierarchical(store, namespace, segment_id, cache).await
+    }
+
+    /// Loads a manifest-selected hierarchical segment from its physical owner.
+    pub(crate) async fn load_from_located_manifest(
+        store: &ZeppelinStore,
+        located: crate::wal::manifest::LocatedSegmentRef<'_>,
+        cache: Option<&std::sync::Arc<crate::cache::DiskCache>>,
+    ) -> Result<Self> {
+        build::load_hierarchical_from_located_manifest(store, located, cache).await
     }
 }
 

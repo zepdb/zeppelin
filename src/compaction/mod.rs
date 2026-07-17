@@ -215,7 +215,8 @@ use crate::config::{CompactionConfig, IndexingConfig};
 use crate::error::{Result, ZeppelinError};
 use crate::fts::inverted_index::{fts_index_key, InvertedIndex};
 use crate::fts::FtsFieldConfig;
-use crate::index::hierarchical::build::{build_hierarchical, load_hierarchical};
+use crate::index::hierarchical::build::build_hierarchical;
+use crate::index::hierarchical::HierarchicalIndex;
 use crate::index::ivf_flat::build::{
     attrs_key, build_ivf_flat, cluster_group_key, cluster_key, cluster_object_sections,
     deserialize_attrs, deserialize_cluster,
@@ -230,7 +231,8 @@ use crate::time::Clock;
 use crate::types::VectorEntry;
 use crate::wal::fragment::WalFragment;
 use crate::wal::manifest::{
-    BootstrapRef, ClusterDataObjectRef, Manifest, MembershipRef, SegmentRef,
+    BootstrapRef, ClusterDataObjectRef, LocatedFragmentIdentity, LocatedFragmentRef,
+    LocatedSegmentRef, Manifest, MembershipRef, SegmentRef,
 };
 use crate::wal::{FragmentCachePolicy, WalReader};
 
@@ -328,6 +330,30 @@ fn active_segment_ref(manifest: &Manifest) -> Option<&SegmentRef> {
         .segments
         .iter()
         .find(|segment| segment.id == *active_segment)
+}
+
+/// Returns the only prefix this logical target is allowed to sweep for an old segment.
+///
+/// A branch may compact a segment physically owned by another namespace lifetime.
+/// Such an object remains reachable to the logical target but is never a target-owned
+/// deletion candidate. Comparing the complete origins, rather than namespace text,
+/// also protects objects from an earlier incarnation of a recreated namespace.
+#[must_use]
+fn target_owned_old_segment_prefix(located: LocatedSegmentRef<'_>) -> Option<String> {
+    (located.physical_origin.as_origin() == located.logical_origin.as_origin()).then(|| {
+        format!(
+            "{}/segments/{}/",
+            located.physical_namespace(),
+            located.segment.id
+        )
+    })
+}
+
+/// Classifies one retired WAL fragment as a target-owned deletion candidate.
+#[must_use]
+fn target_owned_fragment_deletion_key(located: LocatedFragmentRef<'_>) -> Option<String> {
+    (located.physical_origin.as_origin() == located.logical_origin.as_origin())
+        .then(|| WalFragment::s3_key(located.physical_origin.namespace(), &located.fragment.id))
 }
 
 /// Reports whether the active segment's physical layout differs from config.
@@ -1173,6 +1199,7 @@ impl Compactor {
                 })?;
         let indexing_config = self.effective_indexing_config(namespace).await?;
         let rewrite_for_index_config = manifest_needs_index_rewrite(&manifest, &indexing_config);
+        let authoritative_origin = manifest.local_origin()?;
 
         // 2. If no uncompacted fragments → no-op
         if manifest.uncompacted_fragments().is_empty() && !rewrite_for_index_config {
@@ -1221,14 +1248,20 @@ impl Compactor {
             });
         }
 
-        let fragment_refs = manifest.uncompacted_fragments().to_vec();
-        let fragments_removed = fragment_refs.len();
+        let artifact_origins = manifest.artifact_origin_resolver(&authoritative_origin)?;
+        let located_fragment_refs = artifact_origins.uncompacted_located_fragments()?;
+        let old_segment = artifact_origins.active_located_segment()?;
+        let fragments_removed = located_fragment_refs.len();
         // Exact set of fragment IDs in this compaction's snapshot. Manifest
         // removal must use this set, not a max-ULID watermark: a fragment
         // appended concurrently can sort <= the snapshot max (same-ms ULIDs
         // or clock skew) and a watermark comparison would silently drop it.
-        let compacted_ids: HashSet<Ulid> = fragment_refs.iter().map(|f| f.id).collect();
-        if compacted_ids.is_empty() && !rewrite_for_index_config {
+        let compacted_fragments: HashSet<LocatedFragmentIdentity> = located_fragment_refs
+            .iter()
+            .copied()
+            .map(|located| located.identity())
+            .collect();
+        if compacted_fragments.is_empty() && !rewrite_for_index_config {
             return Err(ZeppelinError::Index("no fragments to compact".into()));
         }
 
@@ -1241,7 +1274,7 @@ impl Compactor {
         // Uses unchecked read — fragments were validated on write.
         let fragments = self
             .wal_reader
-            .read_fragments_from_refs_unchecked(namespace, &fragment_refs, fragment_cache)
+            .read_located_fragments_unchecked(&located_fragment_refs, fragment_cache)
             .await?;
 
         // 4. Merge vectors: process in manifest order (sequence number), latest wins.
@@ -1271,15 +1304,12 @@ impl Compactor {
         // 5. Snapshot the old active segment, if any. S3 manifest state is the
         // source of truth for retrain decisions; do not load old vectors just to
         // count them.
-        let old_segment_id = manifest.active_segment.clone();
+        let old_segment_id = old_segment.map(|located| located.segment.id.clone());
         // Snapshot of the old active segment's full SegmentRef — needed both
         // to resolve its per-cluster owners (carried-over clusters live under
         // an even-older segment's keys) and to enumerate the exact S3 objects
         // it referenced when computing what is safe to delete.
-        let old_segment_ref: Option<SegmentRef> = old_segment_id
-            .as_ref()
-            .and_then(|seg_id| manifest.segments.iter().find(|s| s.id == *seg_id))
-            .cloned();
+        let old_segment_ref = old_segment.map(|located| located.segment);
         let old_cluster_owners: Vec<String> = old_segment_ref
             .as_ref()
             .map(|s| s.cluster_owners.clone())
@@ -1299,9 +1329,16 @@ impl Compactor {
         } else {
             new_from_wal as f64 / existing_count as f64
         };
+        let old_segment_is_target_owned = old_segment
+            .is_none_or(|located| located.physical_origin.as_origin() == &authoritative_origin);
         let should_retrain = rewrite_for_index_config
             || existing_count == 0
-            || retrain_ratio > self.config.retrain_imbalance_threshold;
+            || retrain_ratio > self.config.retrain_imbalance_threshold
+            // A target-local candidate cannot encode a foreign namespace in
+            // legacy `cluster_owners`. Fully materialize the foreign view under
+            // the target instead of silently turning source owner IDs into
+            // target keys during incremental carry-over.
+            || !old_segment_is_target_owned;
         if should_retrain {
             crate::metrics::COMPACTION_FULL_RETRAIN_TOTAL
                 .with_label_values(&[namespace])
@@ -1310,6 +1347,7 @@ impl Compactor {
                 new_from_wal,
                 existing_count,
                 retrain_ratio,
+                old_segment_is_target_owned,
                 retrain_imbalance_threshold = self.config.retrain_imbalance_threshold,
                 "compaction full retrain selected"
             );
@@ -1367,23 +1405,9 @@ impl Compactor {
             // untouched clusters are no longer scanned; any pre-Task-10 poison
             // in an untouched carried cluster remains exactly as it was served
             // before until that cluster is rewritten or a retrain fires.
-            if let Some(ref seg_id) = old_segment_id {
-                let is_hierarchical = old_segment_ref
-                    .as_ref()
-                    .map(|s| s.hierarchical)
-                    .unwrap_or(false);
-                let (existing_vecs, id_to_cluster) = load_segment_vectors(
-                    &self.store,
-                    namespace,
-                    seg_id,
-                    is_hierarchical,
-                    &old_cluster_owners,
-                    old_segment_ref
-                        .as_ref()
-                        .map(|s| s.cluster_objects.as_slice())
-                        .unwrap_or(&[]),
-                )
-                .await?;
+            if let Some(located) = old_segment {
+                let (existing_vecs, id_to_cluster) =
+                    load_segment_vectors(&self.store, located).await?;
                 old_id_to_cluster = id_to_cluster;
                 for vec in existing_vecs {
                     // WAL overrides: only insert if not already in latest_vectors and not deleted
@@ -1408,15 +1432,16 @@ impl Compactor {
         // segment) from deletion, whereas the all-deleted and full-rebuild
         // branches delete every old object.
         let mut deferred_deletes: Vec<String> = Vec::new();
-        for fref in &fragment_refs {
-            deferred_deletes.push(WalFragment::s3_key(namespace, &fref.id));
+        for located in &located_fragment_refs {
+            if let Some(key) = target_owned_fragment_deletion_key(*located) {
+                deferred_deletes.push(key);
+            }
         }
 
         if vectors_compacted == 0 {
             // No new segment is produced, so nothing is carried over — every
             // old-segment object is safe to delete.
-            if let Some(ref seg_id) = old_segment_id {
-                let prefix = format!("{namespace}/segments/{seg_id}/");
+            if let Some(prefix) = old_segment.and_then(target_owned_old_segment_prefix) {
                 deferred_deletes.extend(self.store.list_prefix(&prefix).await?);
             }
             // Edge case: all vectors were deleted
@@ -1455,7 +1480,11 @@ impl Compactor {
                 if let Some(seg_id) = old_segment_id.as_deref() {
                     fresh_manifest.remove_segment_at(seg_id, manifest_stamp);
                 }
-                fresh_manifest.remove_compacted_fragments_at(&compacted_ids, manifest_stamp);
+                fresh_manifest.remove_compacted_located_fragments_at(
+                    &authoritative_origin,
+                    &compacted_fragments,
+                    manifest_stamp,
+                )?;
                 merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
                 // Layer 2: CAS.
@@ -1524,7 +1553,7 @@ impl Compactor {
             match self
                 .incremental_build_bounded(
                     namespace,
-                    old_segment_id.as_deref().ok_or_else(|| {
+                    old_segment.ok_or_else(|| {
                         ZeppelinError::Index("no old segment for bounded incremental build".into())
                     })?,
                     &indexing_config,
@@ -1591,9 +1620,7 @@ impl Compactor {
                     let full_vectors = load_full_surviving_vectors_for_fallback(
                         &self.store,
                         namespace,
-                        old_segment_id.as_deref(),
-                        old_segment_ref.as_ref(),
-                        &old_cluster_owners,
+                        old_segment,
                         latest_vectors.clone(),
                         &deleted_ids,
                     )
@@ -1626,7 +1653,7 @@ impl Compactor {
             match self
                 .incremental_build(
                     namespace,
-                    old_segment_id.as_deref().ok_or_else(|| {
+                    old_segment.ok_or_else(|| {
                         ZeppelinError::Index("no old segment for incremental build".into())
                     })?,
                     &indexing_config,
@@ -1789,29 +1816,35 @@ impl Compactor {
         // older segment are not under `{old_seg}/` at all, so the listing never
         // surfaces them. Under-deletion leaks objects (Task 19 GC), which is the
         // safe failure mode.
-        if let Some(ref seg_id) = old_segment_id {
+        if let Some((located, prefix)) = old_segment.and_then(|located| {
+            target_owned_old_segment_prefix(located).map(|prefix| (located, prefix))
+        }) {
             use crate::index::quantization::pq::pq_cluster_key;
             use crate::index::quantization::sq::sq_cluster_key;
 
+            let seg_id = &located.segment.id;
+            let physical_namespace = located.physical_namespace();
             let mut referenced: HashSet<String> = HashSet::new();
             for (i, owner) in cluster_owners.iter().enumerate() {
                 if owner == seg_id {
-                    referenced.insert(cluster_key(namespace, seg_id, i));
-                    referenced.insert(attrs_key(namespace, seg_id, i));
-                    referenced.insert(sq_cluster_key(namespace, seg_id, i));
-                    referenced.insert(pq_cluster_key(namespace, seg_id, i));
-                    referenced.insert(crate::index::bitmap::bitmap_key(namespace, seg_id, i));
-                    referenced.insert(fts_index_key(namespace, seg_id, i));
+                    referenced.insert(cluster_key(physical_namespace, seg_id, i));
+                    referenced.insert(attrs_key(physical_namespace, seg_id, i));
+                    referenced.insert(sq_cluster_key(physical_namespace, seg_id, i));
+                    referenced.insert(pq_cluster_key(physical_namespace, seg_id, i));
+                    referenced.insert(crate::index::bitmap::bitmap_key(
+                        physical_namespace,
+                        seg_id,
+                        i,
+                    ));
+                    referenced.insert(fts_index_key(physical_namespace, seg_id, i));
                 }
             }
-            let old_prefix = format!("{namespace}/segments/{seg_id}/");
             for object_ref in &cluster_objects {
-                if object_ref.key.starts_with(&old_prefix) {
+                if object_ref.key.starts_with(&prefix) {
                     referenced.insert(object_ref.key.clone());
                 }
             }
 
-            let prefix = format!("{namespace}/segments/{seg_id}/");
             let old_keys = self.store.list_prefix(&prefix).await?;
             let carried = old_keys.iter().filter(|k| referenced.contains(*k)).count();
             deferred_deletes.extend(old_keys.into_iter().filter(|k| !referenced.contains(k)));
@@ -2028,7 +2061,11 @@ impl Compactor {
                 fresh_manifest
                     .set_hierarchical_routing_nodes(&segment_id, routing_node_ids.clone());
             }
-            fresh_manifest.remove_compacted_fragments_at(&compacted_ids, manifest_stamp);
+            fresh_manifest.remove_compacted_located_fragments_at(
+                &authoritative_origin,
+                &compacted_fragments,
+                manifest_stamp,
+            )?;
             merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
 
             // A legacy generation may retain old immutable segments alongside
@@ -2151,9 +2188,9 @@ impl Compactor {
     ///
     /// # Parameters
     ///
-    /// - `namespace`: Namespace used to derive object keys and metric labels.
-    /// - `old_segment_id`: Previously active segment whose centroids and global
-    ///   quantization artifacts are reused.
+    /// - `namespace`: Logical target used to derive new keys and metric labels.
+    /// - `old_segment`: Manifest-resolved active segment whose physical
+    ///   centroids and global quantization artifacts are reused.
     /// - `indexing_config`: Effective layout and quantization configuration.
     /// - `new_segment_id`: Unique owner for newly written artifacts.
     /// - `vectors`: Complete sorted survivor set, including old and WAL rows.
@@ -2212,7 +2249,7 @@ impl Compactor {
     async fn incremental_build(
         &self,
         namespace: &str,
-        old_segment_id: &str,
+        old_segment: LocatedSegmentRef<'_>,
         indexing_config: &IndexingConfig,
         new_segment_id: &str,
         vectors: &[VectorEntry],
@@ -2234,7 +2271,7 @@ impl Compactor {
     )> {
         use crate::index::distance::euclidean_distance;
         let centroid_state = self
-            .load_incremental_centroid_state(namespace, old_segment_id, indexing_config)
+            .load_incremental_centroid_state(namespace, old_segment, indexing_config)
             .await?;
         let IncrementalCentroidState {
             centroids,
@@ -2306,7 +2343,7 @@ impl Compactor {
         };
         self.write_incremental_segment(
             namespace,
-            old_segment_id,
+            old_segment,
             new_segment_id,
             centroid_state,
             cluster_state,
@@ -2325,9 +2362,9 @@ impl Compactor {
     ///
     /// # Parameters
     ///
-    /// - `namespace`: Namespace containing the old immutable artifacts.
-    /// - `old_segment_id`: Segment whose centroid coordinate system must remain
-    ///   stable for carried clusters.
+    /// - `namespace`: Logical target used for metrics.
+    /// - `old_segment`: Located segment whose physical centroid coordinate
+    ///   system must remain stable for carried clusters.
     /// - `indexing_config`: Effective quantization choice for the new segment.
     ///
     /// # Returns
@@ -2366,12 +2403,14 @@ impl Compactor {
     async fn load_incremental_centroid_state(
         &self,
         namespace: &str,
-        old_segment_id: &str,
+        old_segment: LocatedSegmentRef<'_>,
         indexing_config: &IndexingConfig,
     ) -> Result<IncrementalCentroidState> {
         use crate::index::ivf_flat::build::{centroids_key, deserialize_centroids_data};
 
-        let ckey = centroids_key(namespace, old_segment_id);
+        let physical_namespace = old_segment.physical_namespace();
+        let old_segment_id = &old_segment.segment.id;
+        let ckey = centroids_key(physical_namespace, old_segment_id);
         let centroids_data = get_compaction_read(
             &self.store,
             namespace,
@@ -2393,7 +2432,7 @@ impl Compactor {
                 get_compaction_read(
                     &self.store,
                     namespace,
-                    &sq_calibration_key(namespace, old_segment_id),
+                    &sq_calibration_key(physical_namespace, old_segment_id),
                     COMPACTION_READ_CLASS_SQ,
                 )
                 .await?,
@@ -2439,8 +2478,8 @@ impl Compactor {
     ///
     /// # Parameters
     ///
-    /// - `namespace`: Namespace used for keys, storage reads, and metrics.
-    /// - `old_segment_id`: Previously active physical segment root.
+    /// - `namespace`: Logical target used for new keys and metrics.
+    /// - `old_segment`: Manifest-resolved previously active physical segment.
     /// - `indexing_config`: Effective flat-IVF and quantization configuration.
     /// - `new_segment_id`: Unique ID for newly written artifacts.
     /// - `latest_vectors`: Last WAL upsert per ID after snapshot-order merge.
@@ -2490,7 +2529,7 @@ impl Compactor {
     async fn incremental_build_bounded(
         &self,
         namespace: &str,
-        old_segment_id: &str,
+        old_segment: LocatedSegmentRef<'_>,
         indexing_config: &IndexingConfig,
         new_segment_id: &str,
         latest_vectors: &HashMap<String, VectorEntry>,
@@ -2513,7 +2552,7 @@ impl Compactor {
         use crate::index::ivf_flat::sketch::decode_resident_sketch;
 
         let centroid_state = self
-            .load_incremental_centroid_state(namespace, old_segment_id, indexing_config)
+            .load_incremental_centroid_state(namespace, old_segment, indexing_config)
             .await?;
         let num_clusters = centroid_state.centroids.len();
         if old_membership.cluster_count as usize != num_clusters {
@@ -2604,8 +2643,7 @@ impl Compactor {
 
         let loaded_touched = load_touched_segment_vectors(
             &self.store,
-            namespace,
-            old_segment_id,
+            old_segment,
             old_cluster_owners,
             old_cluster_objects,
             &touched,
@@ -2672,7 +2710,7 @@ impl Compactor {
 
         self.write_incremental_segment(
             namespace,
-            old_segment_id,
+            old_segment,
             new_segment_id,
             centroid_state,
             cluster_state,
@@ -2717,8 +2755,8 @@ impl Compactor {
     ///
     /// # Parameters
     ///
-    /// - `namespace`: Namespace used to construct every object key.
-    /// - `old_segment_id`: Prior logical segment used as default carried owner.
+    /// - `namespace`: Logical target used to construct every new object key.
+    /// - `old_segment`: Located prior segment used as the default carried owner.
     /// - `new_segment_id`: Candidate segment ID owning all new objects.
     /// - `centroid_state`: Reused segment-global coordinate and SQ state.
     /// - `cluster_state`: IDs, rewritten values/attributes, and touched flags.
@@ -2782,7 +2820,7 @@ impl Compactor {
     async fn write_incremental_segment(
         &self,
         namespace: &str,
-        old_segment_id: &str,
+        old_segment: LocatedSegmentRef<'_>,
         new_segment_id: &str,
         centroid_state: IncrementalCentroidState,
         cluster_state: IncrementalClusterState,
@@ -2811,6 +2849,9 @@ impl Compactor {
             build_resident_sketch, stitch_resident_sketch, ResidentSketchStitch,
         };
         use bytes::Bytes;
+
+        let old_segment_id = old_segment.segment.id.as_str();
+        let old_physical_namespace = old_segment.physical_namespace();
 
         let IncrementalCentroidState {
             centroids,
@@ -3067,7 +3108,7 @@ impl Compactor {
                 let cb_data = get_compaction_read(
                     &self.store,
                     namespace,
-                    &pq_codebook_key(namespace, old_segment_id),
+                    &pq_codebook_key(old_physical_namespace, old_segment_id),
                     COMPACTION_READ_CLASS_SQ,
                 )
                 .await?;
@@ -3327,10 +3368,8 @@ fn nearest_cluster(centroids: &[Vec<f32>], values: &[f32]) -> Result<usize> {
 /// # Parameters
 ///
 /// - `store`: Object-store boundary used to load the prior segment.
-/// - `namespace`: Namespace containing the artifacts.
-/// - `old_segment_id`: Previous active ID, or `None` for a first segment.
-/// - `old_segment_ref`: Descriptor carrying hierarchy and object layout.
-/// - `old_cluster_owners`: Physical owner override for each logical cluster.
+/// - `namespace`: Logical target used for filtering metrics.
+/// - `old_segment`: Manifest-resolved previous active descriptor, if present.
 /// - `latest_vectors`: Owned latest WAL upserts; the helper extends this map.
 /// - `deleted_ids`: IDs that must not be restored from the old segment.
 ///
@@ -3362,27 +3401,12 @@ fn nearest_cluster(centroids: &[Vec<f32>], values: &[f32]) -> Result<usize> {
 async fn load_full_surviving_vectors_for_fallback(
     store: &ZeppelinStore,
     namespace: &str,
-    old_segment_id: Option<&str>,
-    old_segment_ref: Option<&SegmentRef>,
-    old_cluster_owners: &[String],
+    old_segment: Option<LocatedSegmentRef<'_>>,
     mut latest_vectors: HashMap<String, VectorEntry>,
     deleted_ids: &HashSet<String>,
 ) -> Result<Vec<VectorEntry>> {
-    if let Some(seg_id) = old_segment_id {
-        let is_hierarchical = old_segment_ref
-            .map(|segment| segment.hierarchical)
-            .unwrap_or(false);
-        let (existing_vecs, _id_to_cluster) = load_segment_vectors(
-            store,
-            namespace,
-            seg_id,
-            is_hierarchical,
-            old_cluster_owners,
-            old_segment_ref
-                .map(|segment| segment.cluster_objects.as_slice())
-                .unwrap_or(&[]),
-        )
-        .await?;
+    if let Some(located) = old_segment {
+        let (existing_vecs, _id_to_cluster) = load_segment_vectors(store, located).await?;
         for vector in existing_vecs {
             if !latest_vectors.contains_key(&vector.id) && !deleted_ids.contains(&vector.id) {
                 latest_vectors.insert(vector.id.clone(), vector);
@@ -3416,8 +3440,8 @@ async fn load_full_surviving_vectors_for_fallback(
 /// # Parameters
 ///
 /// - `store`: Object-store boundary for immutable GETs.
-/// - `namespace`: Namespace containing the old segment.
-/// - `segment_id`: Prior logical segment, used when no owner override exists.
+/// - `old_segment`: Located prior segment supplying the logical metric scope and
+///   physical namespace for computed keys.
 /// - `cluster_owners`: Resolved per-cluster physical segment owners.
 /// - `cluster_objects`: Explicit grouped-object layout, or empty for legacy
 ///   one-object-per-cluster data.
@@ -3458,12 +3482,14 @@ async fn load_full_surviving_vectors_for_fallback(
 /// followed by their two attribute GETs.
 async fn load_touched_segment_vectors(
     store: &ZeppelinStore,
-    namespace: &str,
-    segment_id: &str,
+    old_segment: LocatedSegmentRef<'_>,
     cluster_owners: &[String],
     cluster_objects: &[ClusterDataObjectRef],
     touched: &[bool],
 ) -> Result<Vec<Vec<VectorEntry>>> {
+    let namespace = old_segment.logical_namespace;
+    let physical_namespace = old_segment.physical_namespace();
+    let segment_id = old_segment.segment.id.as_str();
     let owner = |i: usize| -> &str {
         cluster_owners
             .get(i)
@@ -3476,8 +3502,8 @@ async fn load_touched_segment_vectors(
     if cluster_objects.is_empty() {
         cluster_results =
             futures::future::join_all((0..num_clusters).filter(|&i| touched[i]).map(|i| {
-                let cvec_key = cluster_key(namespace, owner(i), i);
-                let cattr_key = attrs_key(namespace, owner(i), i);
+                let cvec_key = cluster_key(physical_namespace, owner(i), i);
+                let cattr_key = attrs_key(physical_namespace, owner(i), i);
                 async move {
                     let (cluster_res, attrs_res) = tokio::join!(
                         get_compaction_read(
@@ -3547,7 +3573,7 @@ async fn load_touched_segment_vectors(
                             object_ref.key
                         ))
                     })?;
-                let cattr_key = attrs_key(namespace, owner(cluster_idx), cluster_idx);
+                let cattr_key = attrs_key(physical_namespace, owner(cluster_idx), cluster_idx);
                 let attrs_res =
                     get_compaction_read(store, namespace, &cattr_key, COMPACTION_READ_CLASS_ATTRS)
                         .await;
@@ -3991,12 +4017,8 @@ fn check_upload_window(
 /// # Parameters
 ///
 /// - `store`: Object-store abstraction for all immutable artifact reads.
-/// - `namespace`: Namespace containing the segment.
-/// - `segment_id`: Logical segment whose global metadata is loaded.
-/// - `is_hierarchical`: Selects tree metadata versus flat centroid metadata for
-///   determining cluster count.
-/// - `cluster_owners`: Per-cluster physical owner overrides from the manifest.
-/// - `cluster_objects`: Explicit grouped data layout, or empty for legacy keys.
+/// - `located`: Manifest-resolved descriptor supplying the logical metric scope,
+///   physical namespace, layout, owner overrides, and exact grouped refs.
 ///
 /// # Returns
 ///
@@ -4050,12 +4072,13 @@ fn check_upload_window(
 /// clusters.
 async fn load_segment_vectors(
     store: &ZeppelinStore,
-    namespace: &str,
-    segment_id: &str,
-    is_hierarchical: bool,
-    cluster_owners: &[String],
-    cluster_objects: &[ClusterDataObjectRef],
+    located: LocatedSegmentRef<'_>,
 ) -> Result<(Vec<VectorEntry>, HashMap<String, usize>)> {
+    let namespace = located.logical_namespace;
+    let physical_namespace = located.physical_namespace();
+    let segment_id = located.segment.id.as_str();
+    let cluster_owners = located.segment.cluster_owners.as_slice();
+    let cluster_objects = located.segment.cluster_objects.as_slice();
     // Resolve cluster `i`'s owning segment ID (carried-over clusters live
     // under an older segment's keys; empty map ⇒ this segment owns all).
     let owner = |i: usize| -> &str {
@@ -4072,16 +4095,16 @@ async fn load_segment_vectors(
     // `segment_id` to sum vector counts, which would 404 on a segment whose
     // clusters were carried over to other keys. Centroids are segment-global
     // and always live under `segment_id`.
-    let num_clusters = if is_hierarchical {
+    let num_clusters = if located.segment.hierarchical {
         // Compaction reads the segment once; no query cache involved here.
-        let h_index = load_hierarchical(store, namespace, segment_id, None).await?;
+        let h_index = HierarchicalIndex::load_from_located_manifest(store, located, None).await?;
         h_index.num_leaf_clusters()
     } else {
         use crate::index::ivf_flat::build::{centroids_key, deserialize_centroids};
         let centroids_data = get_compaction_read(
             store,
             namespace,
-            &centroids_key(namespace, segment_id),
+            &centroids_key(physical_namespace, segment_id),
             COMPACTION_READ_CLASS_CENTROIDS,
         )
         .await?;
@@ -4094,8 +4117,8 @@ async fn load_segment_vectors(
         // Parallel fetch: 2 GETs per cluster via tokio::join!
         cluster_results =
             futures::future::join_all((0..num_clusters).map(|i| {
-                let cvec_key = cluster_key(namespace, owner(i), i);
-                let cattr_key = attrs_key(namespace, owner(i), i);
+                let cvec_key = cluster_key(physical_namespace, owner(i), i);
+                let cattr_key = attrs_key(physical_namespace, owner(i), i);
                 async move {
                     let (cluster_res, attrs_res) = tokio::join!(
                         get_compaction_read(
@@ -4147,7 +4170,7 @@ async fn load_segment_vectors(
                             object_ref.key
                         ))
                     })?;
-                let cattr_key = attrs_key(namespace, owner(cluster_idx), cluster_idx);
+                let cattr_key = attrs_key(physical_namespace, owner(cluster_idx), cluster_idx);
                 let attrs_res =
                     get_compaction_read(store, namespace, &cattr_key, COMPACTION_READ_CLASS_ATTRS)
                         .await;
@@ -4219,7 +4242,9 @@ mod tests {
 
     use super::*;
     use crate::config::{Config, GcConfig, SecurityMode};
+    use crate::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
     use crate::namespace::manager::{CompactionHealth, NamespaceIndexConfig};
+    use crate::namespace::{NamespaceId, NamespaceIncarnationId};
     use crate::time::TimeSource;
     use crate::types::{DistanceMetric, IndexType};
     use crate::wal::manifest::FragmentRef;
@@ -4452,6 +4477,97 @@ mod tests {
             membership: None,
             artifact_origin: None,
         }
+    }
+
+    fn artifact_origin(namespace: &str, incarnation: u128) -> ArtifactOrigin {
+        ArtifactOrigin {
+            namespace: NamespaceId::parse(namespace).expect("test namespace must be valid"),
+            incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(incarnation)),
+        }
+    }
+
+    fn manifest_with_foreign_active_segment() -> (Manifest, ArtifactOrigin) {
+        let target_origin = artifact_origin("branch-target", 1);
+        let source_origin = artifact_origin("branch-source", 2);
+        let mut manifest = Manifest::new();
+        manifest
+            .bind_namespace_incarnation(target_origin.incarnation.as_uuid())
+            .expect("target fixture must bind its incarnation");
+        manifest.artifact_origins = vec![source_origin];
+        let mut segment = segment_for_config("seg_foreign", 1, &IndexingConfig::default());
+        segment.cluster_count = 1;
+        segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        manifest.add_segment(segment);
+        (manifest, target_origin)
+    }
+
+    #[tokio::test]
+    async fn foreign_old_segment_reads_source_physical_keys() {
+        use crate::index::ivf_flat::build::{
+            attrs_key, centroids_key, cluster_key, serialize_attrs, serialize_centroids,
+            serialize_cluster,
+        };
+
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let store = ZeppelinStore::new(mem);
+        let source_namespace = "branch-source";
+        let segment_id = "seg_foreign";
+        store
+            .put(
+                &centroids_key(source_namespace, segment_id),
+                serialize_centroids(&[vec![0.0, 0.0]], 2).unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &cluster_key(source_namespace, segment_id, 0),
+                serialize_cluster(&["source-row".to_string()], &[vec![1.0, 2.0]], 2).unwrap(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &attrs_key(source_namespace, segment_id, 0),
+                serialize_attrs(&[None]).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (manifest, target_origin) = manifest_with_foreign_active_segment();
+        let located = manifest
+            .artifact_origin_resolver(&target_origin)
+            .unwrap()
+            .active_located_segment()
+            .unwrap()
+            .expect("fixture has one active segment");
+
+        let (vectors, membership) = load_segment_vectors(&store, located).await.unwrap();
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].id, "source-row");
+        assert_eq!(membership.get("source-row"), Some(&0));
+    }
+
+    #[test]
+    fn foreign_old_artifacts_never_become_deferred_deletion_candidates() {
+        let (mut manifest, target_origin) = manifest_with_foreign_active_segment();
+        manifest.add_fragment(FragmentRef {
+            id: Ulid::from_parts(1, 1),
+            vector_count: 0,
+            delete_count: 1,
+            sequence_number: 0,
+            size_bytes: 1,
+            artifact_origin: Some(ArtifactOriginIndex::new(0)),
+        });
+        let resolver = manifest.artifact_origin_resolver(&target_origin).unwrap();
+        let located = resolver
+            .active_located_segment()
+            .unwrap()
+            .expect("fixture has one active segment");
+        let located_fragment = resolver.locate_fragment(&manifest.fragments[0]).unwrap();
+
+        assert_eq!(target_owned_old_segment_prefix(located), None);
+        assert_eq!(target_owned_fragment_deletion_key(located_fragment), None);
     }
 
     /// Trigger evaluation consumes caller-supplied snapshots and therefore

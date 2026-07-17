@@ -154,6 +154,7 @@ use subtle::ConstantTimeEq;
 use tracing::{error, info, instrument};
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::cache::hydration::HydrationTarget;
 use crate::config::IndexingConfig;
 use crate::error::ZeppelinError;
 use crate::fts::bm25::{self, Bm25Params};
@@ -963,6 +964,7 @@ pub async fn query_namespace(
                     manifest: as_of_manifest.clone(),
                     notify_hydration,
                 },
+                meta.artifact_origin().map_err(ApiError::from)?,
             )
             .await
             .map_err(ApiError::from)?,
@@ -1245,7 +1247,8 @@ pub async fn batch_query_namespace(
         false => None,
     };
     if let Some(manifest) = manifest.as_ref() {
-        notify_hydrator(&state, &ns, manifest);
+        let authoritative_origin = meta.artifact_origin().map_err(ApiError::from)?;
+        notify_hydrator(&state, manifest, authoritative_origin.as_ref()).map_err(ApiError::from)?;
     }
 
     let mut results = Vec::with_capacity(req.queries.len());
@@ -1876,7 +1879,9 @@ async fn execute_validated_query(
         options,
     } = execution;
 
-    let manifest = read_manifest_for_execution(state, ns, req.consistency, options).await?;
+    let manifest =
+        read_manifest_for_execution(state, ns, req.consistency, options, meta.artifact_origin()?)
+            .await?;
     let source_ref = resolve_query_source_ref(
         state,
         ns,
@@ -1884,6 +1889,7 @@ async fn execute_validated_query(
         validated.source,
         manifest.clone(),
         security.mandatory_filter.as_ref(),
+        meta.artifact_origin()?,
     )
     .await?;
     validate_query_source_metadata(ns, meta, &source_ref)?;
@@ -2018,7 +2024,9 @@ async fn execute_hybrid_query(
         ));
     }
 
-    let manifest = read_manifest_for_execution(state, ns, req.consistency, options).await?;
+    let manifest =
+        read_manifest_for_execution(state, ns, req.consistency, options, meta.artifact_origin()?)
+            .await?;
     let mut source_responses = Vec::with_capacity(source_count);
     let emit_debug = req.debug.unwrap_or(false);
     let first_stage_top_k = first_stage_top_k(req, validated);
@@ -2040,6 +2048,7 @@ async fn execute_hybrid_query(
             index,
             manifest.clone(),
             security.mandatory_filter.as_ref(),
+            meta.artifact_origin()?,
         )
         .await?;
         validate_query_source_metadata(ns, meta, &source_ref)?;
@@ -3298,6 +3307,7 @@ async fn apply_vector_rerank(
         &ids,
         ctx.req.consistency,
         ctx.manifest.clone(),
+        ctx.meta.artifact_origin()?,
     )
     .await?;
     response.receipt_touched_artifacts.extend(touched_artifacts);
@@ -4326,6 +4336,7 @@ async fn read_manifest_for_execution(
     ns: &str,
     consistency: ConsistencyLevel,
     options: QueryExecutionOptions,
+    authoritative_origin: Option<crate::namespace::branching::ArtifactOrigin>,
 ) -> Result<Manifest, ZeppelinError> {
     let manifest = match options.manifest {
         Some(manifest) => manifest,
@@ -4340,7 +4351,7 @@ async fn read_manifest_for_execution(
         }
     };
     if options.notify_hydration {
-        notify_hydrator(state, ns, &manifest);
+        notify_hydrator(state, &manifest, authoritative_origin.as_ref())?;
     }
     Ok(manifest)
 }
@@ -4415,6 +4426,7 @@ async fn execute_query_source_with_manifest(
     emit_debug: bool,
     source_index: usize,
 ) -> Result<SourceQueryResponse, ZeppelinError> {
+    let authoritative_origin = meta.artifact_origin()?;
     match source_ref {
         QuerySourceRef::Bm25 {
             rank_by,
@@ -4453,6 +4465,7 @@ async fn execute_query_source_with_manifest(
                     knobs.bm25_max_full_scan_vectors,
                     include_attributes,
                     manifest,
+                    authoritative_origin.clone(),
                 )
                 .await
             } else {
@@ -4475,6 +4488,7 @@ async fn execute_query_source_with_manifest(
                     knobs.bm25_max_full_scan_vectors,
                     include_attributes,
                     manifest,
+                    authoritative_origin.clone(),
                 )
                 .await
             };
@@ -4549,6 +4563,7 @@ async fn execute_query_source_with_manifest(
                     manifest,
                     Some(&state.fragment_cache),
                     scoped_ann,
+                    authoritative_origin,
                 )
                 .await
             } else {
@@ -4557,6 +4572,7 @@ async fn execute_query_source_with_manifest(
                     manifest,
                     Some(&state.fragment_cache),
                     scoped_ann,
+                    authoritative_origin,
                 )
                 .await
             };
@@ -4709,6 +4725,63 @@ fn fuse_source_responses(
         receipt_touched_artifacts,
         receipt_derived_artifacts_complete,
     })
+}
+
+/// Fuse one ANN and one BM25 response through the production hybrid reducer.
+///
+/// This feature-only seam accepts responses that were already executed against
+/// the same supplied manifest. It exists so external artifact-origin tests can
+/// exercise the real score-direction, receipt-artifact, scan-counter, and debug
+/// aggregation without opening foreign-origin HTTP admission.
+#[cfg(feature = "branching-test-support")]
+pub(crate) fn fuse_ann_bm25_for_test_support(
+    ann: QueryResponse,
+    bm25: QueryResponse,
+    top_k: usize,
+    nprobe: usize,
+    distance_metric: crate::types::DistanceMetric,
+    consistency: ConsistencyLevel,
+    attributes_loaded: bool,
+    emit_debug: bool,
+) -> Result<QueryResponse, ZeppelinError> {
+    let ann_traversal = TraversalSourceParams {
+        source_index: 0,
+        kind: TraversalSourceKind::Ann,
+        nprobe: Some(nprobe),
+        metric: distance_metric.into(),
+        probed_centroids: ann.probed_centroids.clone(),
+        scanned_clusters: ann.scanned_clusters.clone(),
+        probed_routing_nodes: ann.probed_routing_nodes.clone(),
+        attributes_loaded,
+    };
+    let bm25_traversal = TraversalSourceParams {
+        source_index: 1,
+        kind: TraversalSourceKind::Bm25,
+        nprobe: None,
+        metric: TraversalMetric::Bm25,
+        probed_centroids: bm25.probed_centroids.clone(),
+        scanned_clusters: bm25.scanned_clusters.clone(),
+        probed_routing_nodes: Vec::new(),
+        attributes_loaded,
+    };
+    fuse_source_responses(
+        None,
+        vec![
+            SourceQueryResponse {
+                kind: QuerySourceKind::Ann,
+                response: ann,
+                traversal: ann_traversal,
+            },
+            SourceQueryResponse {
+                kind: QuerySourceKind::Bm25,
+                response: bm25,
+                traversal: bm25_traversal,
+            },
+        ],
+        top_k,
+        consistency,
+        emit_debug,
+    )
 }
 
 /// Sums per-source diagnostics into one hybrid query diagnostics block.
@@ -4991,6 +5064,7 @@ async fn resolve_query_source_ref<'a>(
     source: ValidatedSource,
     manifest: Manifest,
     mandatory_filter: Option<&Filter>,
+    authoritative_origin: Option<crate::namespace::branching::ArtifactOrigin>,
 ) -> Result<QuerySourceRef<'a>, ZeppelinError> {
     match source {
         ValidatedSource::LegacyVector => req
@@ -5011,7 +5085,16 @@ async fn resolve_query_source_ref<'a>(
             })
             .ok_or_else(|| ZeppelinError::Validation("rank_by must be provided".into())),
         ValidatedSource::AlgebraAnn { index } | ValidatedSource::AlgebraBm25 { index } => {
-            resolve_algebra_source_ref(state, ns, req, index, manifest, mandatory_filter).await
+            resolve_algebra_source_ref(
+                state,
+                ns,
+                req,
+                index,
+                manifest,
+                mandatory_filter,
+                authoritative_origin,
+            )
+            .await
         }
         ValidatedSource::AlgebraHybrid { .. } => Err(ZeppelinError::Validation(
             "hybrid query must execute through all algebra sources".into(),
@@ -5058,6 +5141,7 @@ async fn resolve_algebra_source_ref<'a>(
     index: usize,
     manifest: Manifest,
     mandatory_filter: Option<&Filter>,
+    authoritative_origin: Option<crate::namespace::branching::ArtifactOrigin>,
 ) -> Result<QuerySourceRef<'a>, ZeppelinError> {
     let sources = req
         .sources
@@ -5079,6 +5163,7 @@ async fn resolve_algebra_source_ref<'a>(
                         req.consistency,
                         manifest,
                         mandatory_filter,
+                        authoritative_origin,
                     )
                     .await?;
                 let vector = vector.ok_or_else(|| ZeppelinError::VectorNotFound {
@@ -5212,14 +5297,23 @@ fn resolve_ann_nprobe(
 ///
 /// Repeated live queries can enqueue active `seg-42`. Historical queries disable
 /// this notification so old snapshots do not heat the current-segment policy.
-fn notify_hydrator(state: &AppState, namespace: &str, manifest: &Manifest) {
+fn notify_hydrator(
+    state: &AppState,
+    manifest: &Manifest,
+    authoritative_origin: Option<&crate::namespace::branching::ArtifactOrigin>,
+) -> Result<(), ZeppelinError> {
     let Some(hydrator) = state.hydrator.as_ref() else {
-        return;
+        return Ok(());
     };
-    let Some(segment) = active_segment_snapshot(manifest) else {
-        return;
+    let target = match authoritative_origin {
+        Some(origin) => HydrationTarget::from_active_manifest_with_origin(manifest, origin)?,
+        None => HydrationTarget::from_active_manifest(manifest)?,
     };
-    hydrator.observe_query(namespace, &segment);
+    let Some(target) = target else {
+        return Ok(());
+    };
+    hydrator.observe_query(&target);
+    Ok(())
 }
 
 /// Finds and clones the descriptor named by a manifest's active-segment ID.
