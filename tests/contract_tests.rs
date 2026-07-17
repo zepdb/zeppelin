@@ -183,6 +183,16 @@ fn openapi_documents_exact_routed_surface() {
 }
 
 #[test]
+fn branching_release_contract_is_gated_and_has_no_merge_surface() {
+    let api = include_str!("../api/zeppelin-api.yaml");
+    assert!(api.contains("/v1/namespaces/{ns}/branches:"));
+    assert!(!api.contains("/merge"));
+    assert!(!api.contains("/rebase"));
+    assert!(!api.contains("/diff"));
+    assert!(!zeppelin::config::BranchingConfig::default().enabled);
+}
+
+#[test]
 fn openapi_documents_bearer_security_for_every_protected_operation() {
     let api = include_str!("../api/zeppelin-api.yaml");
     assert!(
