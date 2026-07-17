@@ -2751,6 +2751,13 @@ mod tests {
                 last_seen: now - Duration::from_secs(60),
             },
         );
+
+        if state.config.branching.enabled {
+            other_routes = other_routes.route(
+                "/v1/namespaces/:ns/branches",
+                secure_route(post(namespace::create_branch), &state),
+            );
+        }
         buckets.insert(
             fresh_key.clone(),
             RateLimitBucket {

@@ -148,6 +148,8 @@ use crate::compaction::background::run_compaction_with_reserved_lease;
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
+use crate::namespace::branching::{BranchError, PrepareForkOutcome, PrepareForkRequest};
+use crate::namespace::graph::NamespaceGraph;
 use crate::namespace::manager::{
     CreateNamespaceOutcome, NamespaceDestructionRecord, NamespaceIndexConfig, NamespaceMetadata,
     NamespaceState, COMPACTION_DEGRADED_FAILURE_THRESHOLD,
@@ -176,6 +178,74 @@ const CLONE_COPY_CONCURRENCY: usize = 16;
 /// requests. The pin is an internal implementation detail and is released on
 /// both the success and handled-failure paths.
 const CLONE_INTERNAL_SNAPSHOT_PREFIX: &str = "__clone_";
+
+/// Strict live-head fork request.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkRequest {
+    /// Target namespace name.
+    pub target: String,
+}
+
+/// Minimal public fork response; internal manifest details are intentionally omitted.
+#[derive(Debug, Serialize)]
+pub struct ForkResponse {
+    /// Stable branch edge identifier.
+    pub branch_id: String,
+    /// Whether this request created the target.
+    pub created: bool,
+    /// Target namespace name.
+    pub target: String,
+}
+
+/// Create a live-head copy-on-write fork when branching is enabled.
+#[instrument(skip(state), fields(source = %source))]
+pub async fn create_branch(
+    State(state): State<AppState>,
+    Path(source): Path<String>,
+    Json(request): Json<ForkRequest>,
+) -> Result<(StatusCode, Json<ForkResponse>), ApiError> {
+    if !state.config.branching.enabled {
+        return Err(ApiError(ZeppelinError::Branch(Box::new(
+            BranchError::BranchingNotReady {
+                feature: "namespace branching",
+            },
+        ))));
+    }
+    let graph = NamespaceGraph::new(
+        state.store.clone(),
+        state.namespace_manager.clone(),
+        state.lease_manager.clone(),
+        state.clock,
+        state.manifest_cache.clone(),
+        state.config.branching.clone(),
+        state.config.indexing.clone(),
+    );
+    let outcome = graph
+        .prepare_fork(PrepareForkRequest {
+            source: NamespaceId::new(source).map_err(|e| ApiError(e.into()))?,
+            target: NamespaceId::new(request.target).map_err(|e| ApiError(e.into()))?,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    let (branch, created) = match outcome {
+        PrepareForkOutcome::Prepared(branch) => (branch, true),
+        PrepareForkOutcome::ExistingPrepared(branch) => (branch, false),
+    };
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(ForkResponse {
+            branch_id: branch.identity.branch_id.to_string(),
+            created,
+            target: branch.identity.target_namespace.to_string(),
+        }),
+    ))
+}
 
 /// JSON body that selects a namespace's immutable shape and index defaults.
 ///
