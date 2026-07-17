@@ -17,7 +17,8 @@ use crate::cache::manifest_cache::ManifestCache;
 use crate::config::{BranchingConfig, IndexingConfig};
 use crate::error::{Result, ZeppelinError};
 use crate::namespace::branch_root::{
-    insert_branch_root_with_lease, source_data_plane_config_digest, InsertBranchRootRequest,
+    insert_branch_root_with_lease, remove_branch_root, source_data_plane_config_digest,
+    InsertBranchRootRequest, RemoveBranchRootRequest,
 };
 use crate::namespace::branching::{
     ArtifactOrigin, BranchDescriptor, BranchError, BranchListRequest, BranchMaintenanceReport,
@@ -116,6 +117,29 @@ impl NamespaceGraph {
         let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
         let (manifest, _) = Manifest::read_versioned_required(&self.store, name).await?;
         if !manifest.branch_roots().is_empty() {
+            if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
+                if metadata.branch_identity.is_some() && !manifest.branch_roots().is_empty() {
+                    // Child roots are checked against the target manifest below;
+                    // the source root itself is not a child of the target.
+                    let target_manifest = Manifest::read_versioned_required_for_incarnation(
+                        &self.store,
+                        name,
+                        reservation.target_incarnation.as_uuid(),
+                    )
+                    .await
+                    .ok()
+                    .map(|(value, _)| value);
+                    if target_manifest
+                        .as_ref()
+                        .is_some_and(|value| !value.branch_roots().is_empty())
+                    {
+                        return Err(BranchError::BranchHasLiveChildren {
+                            branch_id: reservation.branch_id,
+                        }
+                        .into());
+                    }
+                }
+            }
             return Err(BranchError::NamespaceHasLiveBranches {
                 namespace: request.namespace.to_string(),
             }
@@ -124,7 +148,35 @@ impl NamespaceGraph {
         if matches!(metadata.state, NamespaceState::Deleting) {
             return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
         }
-        self.namespace_manager.delete(name).await?;
+        if let NamespaceCreationKind::Fork(reservation) = &metadata.creation_kind {
+            let source_manifest = Manifest::read_versioned_required_for_incarnation(
+                &self.store,
+                reservation.source_namespace.as_str(),
+                reservation.source_incarnation.as_uuid(),
+            )
+            .await?
+            .0;
+            let root = source_manifest
+                .branch_roots()
+                .get(&reservation.branch_id)
+                .cloned()
+                .ok_or(BranchError::BranchRootMissing {
+                    branch_id: reservation.branch_id,
+                })?;
+            self.namespace_manager.delete(name).await?;
+            remove_branch_root(
+                &self.store,
+                &self.namespace_manager,
+                &self.lease_manager,
+                RemoveBranchRootRequest {
+                    source_namespace: reservation.source_namespace.clone(),
+                    expected_root: root,
+                },
+            )
+            .await?;
+        } else {
+            self.namespace_manager.delete(name).await?;
+        }
         Ok(NamespaceDeleteOutcome::Deleted)
     }
 

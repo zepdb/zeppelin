@@ -138,6 +138,13 @@ pub enum BranchError {
         namespace: String,
     },
 
+    /// A branch cannot be deleted while it has direct child roots.
+    #[error("branch {branch_id} has live child branches")]
+    BranchHasLiveChildren {
+        /// Branch edge whose direct children block deletion.
+        branch_id: BranchId,
+    },
+
     /// Retained bytes do not match the exact digest named by a current root.
     #[error("manifest history generation {generation:?} does not match its branch root")]
     ManifestDigestMismatch {
