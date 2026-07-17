@@ -842,6 +842,10 @@ impl Compactor {
         // Idle namespace: nothing to compact, never trigger (no busy work,
         // no S3 churn on quiet namespaces).
         if fragments.is_empty() {
+            if manifest.has_foreign_visible_artifacts()? {
+                info!("compaction triggered by foreign branch materialization");
+                return Ok(true);
+            }
             let indexing_config =
                 resolve_indexing_config(namespace, metadata, &self.indexing_config)?;
             if manifest_needs_index_rewrite(manifest, &indexing_config) {
@@ -1199,10 +1203,14 @@ impl Compactor {
                 })?;
         let indexing_config = self.effective_indexing_config(namespace).await?;
         let rewrite_for_index_config = manifest_needs_index_rewrite(&manifest, &indexing_config);
+        let materialize_foreign = manifest.has_foreign_visible_artifacts()?;
         let authoritative_origin = manifest.local_origin()?;
 
         // 2. If no uncompacted fragments → no-op
-        if manifest.uncompacted_fragments().is_empty() && !rewrite_for_index_config {
+        if manifest.uncompacted_fragments().is_empty()
+            && !rewrite_for_index_config
+            && !materialize_foreign
+        {
             if self.store.object_signer_node()?.is_some()
                 && manifest.receipt_upgrade_needed(namespace)
             {
@@ -1261,7 +1269,7 @@ impl Compactor {
             .copied()
             .map(|located| located.identity())
             .collect();
-        if compacted_fragments.is_empty() && !rewrite_for_index_config {
+        if compacted_fragments.is_empty() && !rewrite_for_index_config && !materialize_foreign {
             return Err(ZeppelinError::Index("no fragments to compact".into()));
         }
 
@@ -1485,6 +1493,7 @@ impl Compactor {
                     &compacted_fragments,
                     manifest_stamp,
                 )?;
+                fresh_manifest.canonicalize_artifact_origins()?;
                 fresh_manifest.validate_pending_deletes_are_local(namespace)?;
                 validate_deferred_deletes_are_local(namespace, &deferred_deletes)?;
                 merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);
@@ -2068,6 +2077,7 @@ impl Compactor {
                 &compacted_fragments,
                 manifest_stamp,
             )?;
+            fresh_manifest.canonicalize_artifact_origins()?;
             fresh_manifest.validate_pending_deletes_are_local(namespace)?;
             validate_deferred_deletes_are_local(namespace, &deferred_deletes)?;
             merge_pending_deletes(&mut fresh_manifest, &deferred_deletes, &processed_deletes);

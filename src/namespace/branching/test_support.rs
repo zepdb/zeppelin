@@ -170,6 +170,29 @@ pub async fn prepare_fork_for_test(
         .await
 }
 
+/// Prepare and activate a branch for compaction/query integration tests.
+/// Production callers must supply the security and approval proof separately.
+pub async fn activate_fork_for_test(
+    store: ZeppelinStore,
+    source: NamespaceId,
+    target: NamespaceId,
+    indexing: IndexingConfig,
+    branching: BranchingConfig,
+) -> Result<PrepareForkOutcome> {
+    let outcome =
+        prepare_fork_for_test(store.clone(), source, target.clone(), indexing, branching).await?;
+    let manager = NamespaceManager::new(store);
+    let identity = match &outcome {
+        PrepareForkOutcome::Prepared(branch) | PrepareForkOutcome::ExistingPrepared(branch) => {
+            branch.identity.clone()
+        }
+    };
+    manager
+        .activate_reserved_namespace(target.as_str(), Some(&identity))
+        .await?;
+    Ok(outcome)
+}
+
 /// Stop deterministically after the exact source root CAS.
 pub async fn prepare_fork_until_root_for_test(
     store: ZeppelinStore,

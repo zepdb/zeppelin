@@ -3715,18 +3715,16 @@ impl Manifest {
     /// Returns whether any currently visible segment or WAL fragment is
     /// owned by another namespace incarnation.
     pub fn has_foreign_visible_artifacts(&self) -> Result<bool> {
-        self.validate_artifact_origins()?;
-        let foreign_segment = self.active_segment.as_deref().is_some_and(|active| {
-            self.segments
-                .iter()
-                .find(|segment| segment.id == active)
-                .is_some_and(|segment| segment.artifact_origin.is_some())
-        });
-        Ok(foreign_segment
-            || self
-                .fragments
-                .iter()
-                .any(|fragment| fragment.artifact_origin.is_some()))
+        let local = self.local_origin()?;
+        let resolver = self.artifact_origin_resolver(&local)?;
+        let foreign_segment = resolver
+            .active_located_segment()?
+            .is_some_and(|segment| segment.physical_origin.as_origin() != &local);
+        let foreign_fragment = resolver
+            .uncompacted_located_fragments()?
+            .iter()
+            .any(|fragment| fragment.physical_origin.as_origin() != &local);
+        Ok(foreign_segment || foreign_fragment)
     }
 
     /// Returns true when every visible artifact is target-local.

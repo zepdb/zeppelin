@@ -13,9 +13,9 @@ use zeppelin::error::ZeppelinError;
 use zeppelin::fts::FtsFieldConfig;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::branching::test_support::{
-    branch_control_snapshot, branch_metadata_snapshot, maintain_branches_for_test,
-    prepare_fork_for_test, prepare_fork_until_reserved_for_test, prepare_fork_until_root_for_test,
-    prepared_manifest_snapshot, publish_deletion_fence,
+    activate_fork_for_test, branch_control_snapshot, branch_metadata_snapshot,
+    maintain_branches_for_test, prepare_fork_for_test, prepare_fork_until_reserved_for_test,
+    prepare_fork_until_root_for_test, prepared_manifest_snapshot, publish_deletion_fence,
 };
 use zeppelin::namespace::branching::{BranchError, BranchPrepareStage, PrepareForkOutcome};
 use zeppelin::namespace::manager::{
@@ -53,6 +53,48 @@ fn test_compactor(store: &zeppelin::storage::ZeppelinStore) -> Compactor {
         fork_indexing(),
         common::default_gc_upload_window(),
     )
+}
+
+#[tokio::test]
+async fn activated_foreign_branch_compaction_materializes_target_owned_segment() {
+    let harness = TestHarness::new().await;
+    let source = harness.artifact_origin_namespace("materialize-source");
+    let target = harness.artifact_origin_namespace("materialize-target");
+    let (_vectors, _) = compact_source(&harness, &source).await;
+    activate_fork_for_test(
+        harness.store.clone(),
+        NamespaceId::new(source.clone()).unwrap(),
+        NamespaceId::new(target.clone()).unwrap(),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .unwrap();
+
+    test_compactor(&harness.store)
+        .compact(&target)
+        .await
+        .unwrap();
+    let manifest = Manifest::read(&harness.store, &target)
+        .await
+        .unwrap()
+        .unwrap();
+    let active = manifest.active_segment.as_ref().unwrap();
+    let segment = manifest
+        .segments
+        .iter()
+        .find(|item| &item.id == active)
+        .unwrap();
+    assert!(segment.artifact_origin.is_some());
+    assert!(manifest.visible_refs_are_local().unwrap());
+    assert!(Manifest::read(&harness.store, &source)
+        .await
+        .unwrap()
+        .is_some());
+
+    harness.cleanup_artifact_origin_namespace(&source).await;
+    harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
 }
 
 async fn compact_source(
