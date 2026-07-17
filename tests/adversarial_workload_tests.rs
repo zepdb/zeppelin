@@ -1,6 +1,11 @@
 mod adversarial;
 mod common;
 
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
 const REQUIRED_OP_KINDS: &[&str] = &[
     "create_namespace",
     "get_namespace",
@@ -293,12 +298,12 @@ async fn crash_matrix() {
 }
 
 #[tokio::test]
-async fn restartable_server_exposes_hard_abort() {
+async fn restartable_server_composes_replacement_after_crash_retirement() {
     let harness = common::harness::TestHarness::new().await;
     let prefix = harness.prefix.clone();
     let namespace = format!("{prefix}-restart");
     let config = zeppelin::config::Config::default();
-    let mut server = common::server::start_test_server_full(
+    let server = common::server::start_test_server_full(
         harness.store.clone(),
         Some(prefix.clone()),
         config.clone(),
@@ -340,9 +345,14 @@ async fn restartable_server_exposes_hard_abort() {
         .unwrap();
     assert!(upsert.status().is_success());
 
-    server.abort();
-    drop(server);
-    let mut replacement =
+    // A replacement may only compose after the old node has joined every
+    // child that can retain authority or renew a lease. `abort()` is a raw
+    // listener escape hatch; this fixture exercises the retired crash boundary.
+    server
+        .abort_and_drop()
+        .await
+        .expect("restart fixture must join the old HTTP task");
+    let replacement =
         common::server::start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
             harness.store.clone(),
             Some(prefix),
@@ -370,7 +380,7 @@ async fn restartable_server_exposes_hard_abort() {
     let body = fetched.json::<serde_json::Value>().await.unwrap();
     assert_eq!(body["results"][0]["id"], "survivor");
 
-    replacement.abort();
+    replacement.shutdown().await;
     common::server::cleanup_ns(&harness.store, &namespace).await;
     harness.cleanup().await;
 }
@@ -420,7 +430,7 @@ async fn full_server_shutdown_stops_policy_refresh_before_harness_cleanup() {
 /// An aborted server must release its policy-refresh cache even while crash
 /// recovery retains its application-store clone for the replacement server.
 #[tokio::test]
-async fn full_server_abort_stops_policy_refresh_with_retained_application_store() {
+async fn full_server_crash_retirement_stops_policy_refresh_with_retained_application_store() {
     use std::time::Duration;
 
     let harness = common::harness::TestHarness::new().await;
@@ -428,14 +438,15 @@ async fn full_server_abort_stops_policy_refresh_with_retained_application_store(
     let (store, counter) = common::counting::counting_store(&harness.store);
     let mut config = zeppelin::config::Config::default();
     config.security.policy_refresh_secs = 1;
-    let mut server =
+    let server =
         common::server::start_test_server_full(store, Some(prefix.clone()), config, false, None)
             .await;
     let retained_application_store = server.store.clone();
 
-    server.abort();
-    drop(server);
-    tokio::task::yield_now().await;
+    server
+        .abort_and_drop()
+        .await
+        .expect("policy-refresh crash retirement must join its HTTP task");
     harness.cleanup().await;
     counter.reset();
 
@@ -456,6 +467,219 @@ async fn full_server_abort_stops_policy_refresh_with_retained_application_store(
     );
 
     drop(retained_application_store);
+}
+
+/// Open a completed HTTP/1.1 keep-alive health exchange and retain its socket.
+///
+/// The returned socket keeps the server's accepted connection task alive until
+/// crash retirement closes that connection. This makes the test exercise the
+/// state that a listener-only abort used to leak.
+async fn open_keep_alive_health_connection(base_url: &str) -> TcpStream {
+    let address = base_url
+        .strip_prefix("http://")
+        .unwrap_or_else(|| panic!("test server URL is not HTTP: {base_url}"));
+    let mut connection = TcpStream::connect(address)
+        .await
+        .unwrap_or_else(|error| panic!("keep-alive connection failed: {error}"));
+    let request =
+        format!("GET /healthz HTTP/1.1\r\nHost: {address}\r\nConnection: keep-alive\r\n\r\n");
+    connection
+        .write_all(request.as_bytes())
+        .await
+        .unwrap_or_else(|error| panic!("keep-alive health request write failed: {error}"));
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let header_end = loop {
+        let read = tokio::time::timeout(Duration::from_secs(2), connection.read(&mut buffer))
+            .await
+            .expect("keep-alive health response timed out")
+            .unwrap_or_else(|error| panic!("keep-alive health response read failed: {error}"));
+        assert!(
+            read > 0,
+            "server closed keep-alive health request before a response"
+        );
+        response.extend_from_slice(&buffer[..read]);
+        assert!(
+            response.len() <= 16 * 1024,
+            "keep-alive health response headers exceeded 16 KiB"
+        );
+        if let Some(position) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let headers = std::str::from_utf8(&response[..header_end])
+        .expect("keep-alive health response headers must be UTF-8");
+    assert!(
+        headers.starts_with("HTTP/1.1 200 "),
+        "keep-alive health request failed: {headers:?}"
+    );
+    assert!(
+        !headers.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("connection")
+                    && value.trim().eq_ignore_ascii_case("close")
+            })
+        }),
+        "server declined the requested keep-alive connection: {headers:?}"
+    );
+    let content_length = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| {
+            value
+                .trim()
+                .parse::<usize>()
+                .expect("keep-alive health content length must be a usize")
+        })
+        .expect("keep-alive health response must have Content-Length");
+    while response.len() < header_end + content_length {
+        let read = tokio::time::timeout(Duration::from_secs(2), connection.read(&mut buffer))
+            .await
+            .expect("keep-alive health body timed out")
+            .unwrap_or_else(|error| panic!("keep-alive health body read failed: {error}"));
+        assert!(
+            read > 0,
+            "server closed keep-alive health response before its body"
+        );
+        response.extend_from_slice(&buffer[..read]);
+    }
+
+    connection
+}
+
+async fn peer_closed_keep_alive_connection(connection: &mut TcpStream) -> bool {
+    let mut byte = [0_u8; 1];
+    matches!(
+        tokio::time::timeout(Duration::from_secs(1), connection.read(&mut byte)).await,
+        Ok(Ok(0))
+    )
+}
+
+/// A simulated crash must retire all old connection-owned preservation state
+/// before recovery composes a replacement over the retained application store.
+#[tokio::test]
+async fn full_server_abort_drops_preservation_refresh_before_replacement_composition() {
+    const OLD_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+    const OBSERVATION_WINDOW: Duration = Duration::from_millis(2_300);
+    const HOLD_EVENT_ID: &str = "crash-retirement-held-manifest-read";
+
+    let harness = common::harness::TestHarness::new().await;
+    let prefix = harness.prefix.clone();
+    let (store, counter) = common::counting::counting_store(&harness.store);
+    let scheduler =
+        adversarial::faults::FaultScheduler::from_schedule(adversarial::faults::FaultSchedule {
+            profile: adversarial::faults::FaultProfile::Sched,
+            events: vec![adversarial::faults::FaultEvent {
+                id: HOLD_EVENT_ID.to_string(),
+                start_op: 1,
+                end_op: None,
+                boundary: adversarial::faults::Boundary::ObjectStore,
+                target: adversarial::faults::TargetSelector {
+                    store_op: Some(adversarial::chaos::StoreOp::Get),
+                    key_substring: Some("manifest.json".to_string()),
+                    path_substring: None,
+                    methods: None,
+                },
+                kind: adversarial::faults::FaultKind::HoldCall { for_ops: 1_000 },
+            }],
+        });
+    let mut old_config = zeppelin::config::Config::default();
+    old_config.security.policy_refresh_secs = 1;
+    let server = common::server::start_test_server_full(
+        adversarial::faults::store_proxy::store_fault_proxy(&store, scheduler.clone()),
+        Some(prefix.clone()),
+        old_config,
+        false,
+        None,
+    )
+    .await;
+
+    // This clone matches the crash/restart runner: storage survives the old
+    // node, but the old node's authority and refresh work must not.
+    let retained_application_store = server.store.clone();
+    let mut old_connection = open_keep_alive_health_connection(&server.base_url).await;
+    let old_client = common::server::client_with_bearer(&server.admin_bearer);
+    let namespace = common::server::create_ns_api(&old_client, &server.base_url, 2).await;
+    let _ = scheduler.advance_to(1);
+    let held_url = format!("{}/v1/namespaces/{namespace}", server.base_url);
+    let held_scheduler = scheduler.clone();
+    let held_request = tokio::spawn(async move {
+        held_scheduler
+            .with_armed_hold(HOLD_EVENT_ID.to_string(), async move {
+                old_client.get(held_url).send().await
+            })
+            .await
+    });
+    scheduler
+        .wait_for_hold_window_active(HOLD_EVENT_ID, 1)
+        .await;
+
+    let mut retirement = tokio::spawn(async move {
+        server
+            .abort_and_drop()
+            .await
+            .expect("held-request crash retirement must join its HTTP task");
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut retirement)
+            .await
+            .is_err(),
+        "crash retirement must remain pending while an accepted old request owns AppState"
+    );
+    assert!(
+        !retirement.is_finished(),
+        "crash retirement must not finish before its accepted request is released"
+    );
+
+    let mut replacement_config = zeppelin::config::Config::default();
+    replacement_config.security.policy_refresh_secs = 60;
+    scheduler.release_held_calls();
+    let _ = tokio::time::timeout(Duration::from_secs(2), held_request)
+        .await
+        .expect("held request did not finish after release")
+        .expect("held request task panicked");
+    tokio::time::timeout(Duration::from_secs(2), retirement)
+        .await
+        .expect("crash retirement did not join accepted HTTP connections")
+        .expect("crash retirement task must not panic");
+    let replacement = common::server::start_test_server_full(
+        retained_application_store,
+        Some(prefix.clone()),
+        replacement_config,
+        false,
+        None,
+    )
+    .await;
+    counter.reset();
+    tokio::time::sleep(OBSERVATION_WINDOW).await;
+
+    let replacement_health = reqwest::Client::new()
+        .get(format!("{}/healthz", replacement.base_url))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("replacement health request failed: {error}"));
+    assert!(replacement_health.status().is_success());
+
+    let preservation_head = format!("{prefix}/_security/preservation/heads/locks.json");
+    let stale_refreshes = counter.gets_matching(&preservation_head);
+    let old_connection_closed = peer_closed_keep_alive_connection(&mut old_connection).await;
+    drop(old_connection);
+    replacement.shutdown().await;
+    harness.cleanup().await;
+
+    assert!(
+        old_connection_closed,
+        "crash retirement returned with the old keep-alive connection open; \
+         observed {stale_refreshes} preservation refresh GET(s) over at least two \
+         {OLD_REFRESH_INTERVAL:?} intervals"
+    );
+    assert_eq!(
+        stale_refreshes, 0,
+        "old preservation refresh survived while replacement was live for at least two \
+         {OLD_REFRESH_INTERVAL:?} intervals"
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant};
@@ -440,6 +441,60 @@ impl HttpFaultContext {
         let mut context = self.clone();
         context.direct_base_url = server.base_url.clone();
         context
+    }
+}
+
+/// Owns the primary test server across simulated crashes.
+///
+/// Keeping the server in an explicit slot makes the lifecycle boundary visible:
+/// crash recovery must consume and drop the old node before installing a
+/// replacement, rather than evaluating a replacement while the old security
+/// refresh tasks are still alive.
+struct RestartableFullTestServer {
+    server: Option<FullTestServer>,
+}
+
+impl RestartableFullTestServer {
+    fn new(server: FullTestServer) -> Self {
+        Self {
+            server: Some(server),
+        }
+    }
+
+    fn take(&mut self) -> FullTestServer {
+        self.server
+            .take()
+            .expect("primary test server must be present before lifecycle transition")
+    }
+
+    fn install(&mut self, replacement: FullTestServer) {
+        assert!(
+            self.server.is_none(),
+            "replacement may only be installed after the old primary test server is dropped"
+        );
+        self.server = Some(replacement);
+    }
+
+    fn into_inner(mut self) -> FullTestServer {
+        self.take()
+    }
+}
+
+impl Deref for RestartableFullTestServer {
+    type Target = FullTestServer;
+
+    fn deref(&self) -> &Self::Target {
+        self.server
+            .as_ref()
+            .expect("primary test server must be present while it is in use")
+    }
+}
+
+impl DerefMut for RestartableFullTestServer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.server
+            .as_mut()
+            .expect("primary test server must be present while it is in use")
     }
 }
 
@@ -1557,15 +1612,17 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
         security_program.as_ref(),
     );
     let disk_cache_max_bytes = disk_cache_max_bytes_for_schedule(scheduler.as_ref());
-    let mut server = start_test_server_full_with_disk_cache_max_bytes(
-        primary_store,
-        Some(prefix.clone()),
-        config.clone(),
-        mode == RunMode::Chaos,
-        injected_clock(test_clock.as_ref()),
-        disk_cache_max_bytes,
-    )
-    .await;
+    let mut server = RestartableFullTestServer::new(
+        start_test_server_full_with_disk_cache_max_bytes(
+            primary_store,
+            Some(prefix.clone()),
+            config.clone(),
+            mode == RunMode::Chaos,
+            injected_clock(test_clock.as_ref()),
+            disk_cache_max_bytes,
+        )
+        .await,
+    );
     clear_receipt_evidence_for_server(&server.base_url);
     let bootstrapped_policy_version = if let Some(program) = &security_program {
         Some(bootstrap_security_program(&server, program).await)
@@ -2093,7 +2150,7 @@ async fn run_replay(env: &RunnerEnv, replay: &Path) -> SeedOutcome {
     let audit_day = server.clock.now().date_naive();
     let audit_node_id = server.audit_node_id.clone();
     drop(client);
-    server.shutdown().await;
+    server.into_inner().shutdown().await;
     if security_program.is_some() {
         let verification =
             zeppelin::security::verify_audit_day(&audit_store, audit_day, &audit_node_id)
@@ -2783,7 +2840,7 @@ async fn shutdown_http_fault_injector(injector: &mut Option<Arc<HttpFaultInjecto
 
 #[allow(clippy::too_many_arguments)]
 async fn restart_after_crash(
-    server: &mut FullTestServer,
+    server: &mut RestartableFullTestServer,
     controller: &ProcessController,
     scheduler: &FaultScheduler,
     injector: &mut Option<Arc<HttpFaultInjector>>,
@@ -2802,11 +2859,15 @@ async fn restart_after_crash(
     let clock = server.clock.clone();
     let admin_bearer = server.admin_bearer.clone();
     let workload_credentials = server.workload_credentials.clone();
-    server.abort();
+    let old_server = server.take();
     controller.park_token.cancel();
+    old_server
+        .abort_and_drop()
+        .await
+        .unwrap_or_else(|error| panic!("crashed primary HTTP retirement failed: {error}"));
     shutdown_http_fault_injector(injector).await;
 
-    *server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
+    let mut replacement = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
         server_store.clone(),
         Some(prefix.to_string()),
         config.clone(),
@@ -2816,7 +2877,8 @@ async fn restart_after_crash(
         &admin_bearer,
     )
     .await;
-    server.workload_credentials = workload_credentials;
+    replacement.workload_credentials = workload_credentials;
+    server.install(replacement);
     wait_for_health(client, &server.base_url).await;
     scheduler.record(TimelineEvent {
         event_id: crash.event_id,
@@ -2844,7 +2906,7 @@ async fn restart_after_crash(
     });
     *injector = Some(new_injector);
 
-    crash_recovery_probe(client, server, model, op_index).await
+    crash_recovery_probe(client, &*server, model, op_index).await
 }
 
 async fn wait_for_health(client: &Client, base_url: &str) {
@@ -3609,15 +3671,17 @@ async fn run_seed(
         security_program.as_ref(),
     );
     let disk_cache_max_bytes = disk_cache_max_bytes_for_schedule(scheduler.as_ref());
-    let mut server = start_test_server_full_with_disk_cache_max_bytes(
-        primary_store,
-        Some(prefix.clone()),
-        config.clone(),
-        mode == RunMode::Chaos,
-        injected_clock(test_clock.as_ref()),
-        disk_cache_max_bytes,
-    )
-    .await;
+    let mut server = RestartableFullTestServer::new(
+        start_test_server_full_with_disk_cache_max_bytes(
+            primary_store,
+            Some(prefix.clone()),
+            config.clone(),
+            mode == RunMode::Chaos,
+            injected_clock(test_clock.as_ref()),
+            disk_cache_max_bytes,
+        )
+        .await,
+    );
     clear_receipt_evidence_for_server(&server.base_url);
     let bootstrapped_policy_version = if let Some(program) = &security_program {
         Some(bootstrap_security_program(&server, program).await)
@@ -4241,7 +4305,7 @@ async fn run_seed(
     let audit_day = server.clock.now().date_naive();
     let audit_node_id = server.audit_node_id.clone();
     drop(client);
-    server.shutdown().await;
+    server.into_inner().shutdown().await;
     if security_program_enabled {
         let verification =
             zeppelin::security::verify_audit_day(&audit_store, audit_day, &audit_node_id)
@@ -8195,7 +8259,7 @@ async fn inject_dual_writer_fencing_mutation(
 
 struct QuietPeriod<'a> {
     client: &'a Client,
-    server: &'a mut FullTestServer,
+    server: &'a mut RestartableFullTestServer,
     scheduler: Option<&'a FaultScheduler>,
     test_clock: Option<&'a Arc<TestClock>>,
     injector: &'a mut Option<Arc<HttpFaultInjector>>,
@@ -8483,19 +8547,27 @@ impl QuietPeriod<'_> {
             let admin_bearer = self.server.admin_bearer.clone();
             let workload_credentials = self.server.workload_credentials.clone();
             let spawn_compaction_loop = self.server.shutdown_compaction.is_some();
-            self.server.abort();
-            *self.server = start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
-                store,
-                Some(self.prefix.to_string()),
-                self.config.clone(),
-                spawn_compaction_loop,
-                Some(clock),
-                self.disk_cache_max_bytes,
-                &admin_bearer,
-            )
-            .await;
+            let old_server = self.server.take();
+            if let Err(error) = old_server.abort_and_drop().await {
+                tracing::warn!(
+                    error = %error,
+                    "retired primary whose HTTP task had already failed"
+                );
+            }
+            let mut replacement =
+                start_test_server_full_with_disk_cache_max_bytes_and_admin_bearer(
+                    store,
+                    Some(self.prefix.to_string()),
+                    self.config.clone(),
+                    spawn_compaction_loop,
+                    Some(clock),
+                    self.disk_cache_max_bytes,
+                    &admin_bearer,
+                )
+                .await;
+            replacement.workload_credentials = workload_credentials;
+            self.server.install(replacement);
             clear_receipt_evidence_for_server(&self.server.base_url);
-            self.server.workload_credentials = workload_credentials;
             true
         } else {
             false
@@ -8909,6 +8981,108 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+#[derive(Default)]
+struct DurableAuditEvidence {
+    request_ids: BTreeSet<String>,
+    records: BTreeMap<String, AuditRecord>,
+    verified_terminal_streams: BTreeSet<(String, String)>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalAuditSeal {
+    format: String,
+    day: String,
+    node_id: String,
+    last_hash: Option<String>,
+    record_count: u64,
+}
+
+/// Collect durable records for this test run while validating every sealed
+/// historical stream that crash retirement left behind.
+async fn collect_durable_audit_evidence(
+    store: &ZeppelinStore,
+    prefix: &str,
+) -> DurableAuditEvidence {
+    const TERMINAL_SEAL_FORMAT: &str = "zeppelin_audit_terminal_seal_v1";
+
+    let node_marker = format!("/test-node-{prefix}-");
+    let mut evidence = DurableAuditEvidence::default();
+    for key in store
+        .list_prefix("_audit/")
+        .await
+        .unwrap_or_else(|error| panic!("quiet audit LIST failed: {error}"))
+    {
+        if !key.contains(&node_marker) || !key.ends_with(".jsonl") {
+            continue;
+        }
+        let bytes = store
+            .get(&key)
+            .await
+            .unwrap_or_else(|error| panic!("quiet audit GET failed for {key}: {error}"));
+        let seal = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|value| value.get("format").is_some().then_some(value))
+            .map(|value| {
+                serde_json::from_value::<TerminalAuditSeal>(value)
+                    .unwrap_or_else(|error| panic!("invalid terminal audit seal in {key}: {error}"))
+            });
+        if let Some(seal) = seal {
+            assert_eq!(
+                seal.format, TERMINAL_SEAL_FORMAT,
+                "unexpected terminal audit seal format in {key}"
+            );
+            let day =
+                chrono::NaiveDate::parse_from_str(&seal.day, "%Y-%m-%d").unwrap_or_else(|error| {
+                    panic!("invalid terminal audit seal day in {key}: {error}")
+                });
+            assert_eq!(
+                seal.day,
+                day.format("%Y-%m-%d").to_string(),
+                "terminal audit seal day was not canonical in {key}"
+            );
+            assert_eq!(
+                seal.record_count == 0,
+                seal.last_hash.is_none(),
+                "terminal audit seal hash presence disagreed with record count in {key}"
+            );
+            let stream_prefix = format!("_audit/{}/{}/", seal.day, seal.node_id);
+            assert!(
+                key.starts_with(&stream_prefix),
+                "terminal audit seal identity did not match its object key {key}"
+            );
+            assert!(
+                evidence
+                    .verified_terminal_streams
+                    .insert((seal.day.clone(), seal.node_id.clone())),
+                "duplicate terminal audit seal for {}/{}",
+                seal.day,
+                seal.node_id
+            );
+            let verification = verify_audit_day(store, day, &seal.node_id)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("terminal audit seal verification failed for {key}: {error}")
+                });
+            assert!(
+                verification.valid,
+                "terminal audit seal verification failed for {key}: {verification:?}"
+            );
+            continue;
+        }
+
+        let body = String::from_utf8(bytes.to_vec())
+            .unwrap_or_else(|error| panic!("quiet audit object {key} was not UTF-8: {error}"));
+        for line in body.lines().filter(|line| !line.is_empty()) {
+            let record: AuditRecord = serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("quiet audit record in {key} was invalid: {error}"));
+            evidence.request_ids.insert(record.request_id.clone());
+            evidence.records.insert(record.request_id.clone(), record);
+        }
+    }
+    evidence
+}
+
 async fn run_security_refresh_checks(
     server: &FullTestServer,
     model: &mut Model,
@@ -8925,31 +9099,9 @@ async fn run_security_refresh_checks(
     let mut findings = Vec::new();
     server.flush_audit().await;
     let audit_prefix = "_audit/";
-    let mut durable_request_ids = BTreeSet::new();
-    let mut durable_audit_records = BTreeMap::new();
-    for key in server
-        .store
-        .list_prefix(audit_prefix)
-        .await
-        .unwrap_or_else(|error| panic!("quiet audit LIST failed: {error}"))
-    {
-        if !key.contains(&format!("/test-node-{prefix}-")) {
-            continue;
-        }
-        let bytes = server
-            .store
-            .get(&key)
-            .await
-            .unwrap_or_else(|error| panic!("quiet audit GET failed for {key}: {error}"));
-        let body = String::from_utf8(bytes.to_vec())
-            .unwrap_or_else(|error| panic!("quiet audit object {key} was not UTF-8: {error}"));
-        for line in body.lines().filter(|line| !line.is_empty()) {
-            let record: AuditRecord = serde_json::from_str(line)
-                .unwrap_or_else(|error| panic!("quiet audit record in {key} was invalid: {error}"));
-            durable_request_ids.insert(record.request_id.clone());
-            durable_audit_records.insert(record.request_id.clone(), record);
-        }
-    }
+    let durable_evidence = collect_durable_audit_evidence(&server.store, prefix).await;
+    let mut durable_request_ids = durable_evidence.request_ids;
+    let durable_audit_records = durable_evidence.records;
     if mutation == Some(OracleMutation::AuditRecordDeletion) {
         if let Some(request_id) = model.security.successful_audit_requests.iter().next() {
             durable_request_ids.remove(request_id);
@@ -13748,7 +13900,7 @@ mod outcome_tests {
     }
 
     #[tokio::test]
-    async fn quiet_period_releases_terminal_hold_and_drains_reserved_ops() {
+    async fn quiet_period_restarts_finished_primary_after_terminal_hold_and_drains_reserved_ops() {
         let harness = TestHarness::new().await;
         let prefix = harness.prefix.clone();
         let held_ns = format!("{prefix}-held");
@@ -13777,14 +13929,16 @@ mod outcome_tests {
             }],
         });
         let config = deterministic_config();
-        let mut server = start_test_server_full(
-            store_fault_proxy(&harness.store, scheduler.clone()),
-            Some(prefix.clone()),
-            config.clone(),
-            false,
-            None,
-        )
-        .await;
+        let mut server = RestartableFullTestServer::new(
+            start_test_server_full(
+                store_fault_proxy(&harness.store, scheduler.clone()),
+                Some(prefix.clone()),
+                config.clone(),
+                false,
+                None,
+            )
+            .await,
+        );
         let artifacts_dir = tempfile::TempDir::new().unwrap();
         let env = RunnerEnv {
             seconds: 1,
@@ -13866,7 +14020,7 @@ mod outcome_tests {
             &scheduler,
             hold,
             client.clone(),
-            OpExecutionTarget::from(&server),
+            OpExecutionTarget::from(&*server),
             held_op,
             2,
             started,
@@ -14056,8 +14210,265 @@ mod outcome_tests {
         assert!(environment_restored < held_release, "{timeline:#?}");
         assert!(held_release < release_complete, "{timeline:#?}");
 
+        // A graceful primary exit before a second quiet period must take the
+        // runner's primary-finished branch, not leave its old runtime behind.
+        let _ = server.shutdown_http.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !server.server_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("primary server did not finish before quiet-period recovery");
+
+        let mut empty_pending: Option<PendingHeldOp> = None;
+        let mut empty_drain_ops = VecDeque::new();
+        let recovered_quiet = QuietPeriod {
+            client: &client,
+            server: &mut server,
+            scheduler: None,
+            test_clock: None,
+            injector: &mut injector,
+            http_fault_context: &mut http_fault_context,
+            chaos: None,
+            operational_state: &mut operational_state,
+            operational_observer: None,
+            pending_held_op: &mut empty_pending,
+            dual_writer_lease_hold: &mut dual_writer_lease_hold,
+            initial_dual_writer_stale_fencing_token: None,
+            artifacts: &mut artifacts,
+            model: &mut model,
+            coverage: &mut coverage,
+            s3_tracker: &mut s3_tracker,
+            corruption_tracker: &mut corruption_tracker,
+            created_namespaces: &mut created_namespaces,
+            background_compaction_starts: &mut background_compaction_starts,
+            op_index: &mut op_index,
+            compactions: &mut compactions,
+            started,
+            mutation: None,
+            mode: RunMode::Chaos,
+            exact_vector_count: false,
+            verify: false,
+            preserve_recorded_holds: false,
+            prefix: &prefix,
+            config: &config,
+            disk_cache_max_bytes: 100 * 1024 * 1024,
+            drain_ops: &mut empty_drain_ops,
+        }
+        .run()
+        .await;
+        assert!(
+            recovered_quiet.violations.is_empty(),
+            "{:?}",
+            recovered_quiet.violations
+        );
+        assert!(recovered_quiet.timeline.iter().any(|event| {
+            event.event_id == "quiet-05"
+                && event.recovery.as_deref() == Some("primary restarted and healthy")
+        }));
+
         cleanup_ns(&harness.store, &held_ns).await;
         cleanup_ns(&harness.store, &other_ns).await;
+        server.into_inner().shutdown().await;
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn restart_after_crash_retires_then_replaces_primary() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let scheduler = FaultScheduler::from_schedule(FaultSchedule {
+            profile: FaultProfile::Crash,
+            events: vec![FaultEvent {
+                id: "runner-direct-crash-recovery".to_string(),
+                start_op: u64::MAX,
+                end_op: None,
+                boundary: Boundary::Process,
+                target: TargetSelector {
+                    store_op: Some(StoreOp::Put),
+                    key_substring: Some("never-trigger-direct-recovery".to_string()),
+                    ..TargetSelector::default()
+                },
+                kind: FaultKind::CrashAt {
+                    point: crate::adversarial::faults::process::CrashPoint::ManifestCas,
+                    position: TriggerPosition::Pre,
+                },
+            }],
+        });
+        let config = deterministic_config();
+        let mut server = RestartableFullTestServer::new(
+            start_test_server_full(
+                store_fault_proxy(&harness.store, scheduler.clone()),
+                Some(prefix.clone()),
+                config.clone(),
+                false,
+                None,
+            )
+            .await,
+        );
+        let old_base_url = server.base_url.clone();
+        let server_store = server.store.clone();
+        let client = adversarial_client(&server);
+        let controller = scheduler
+            .process_controller()
+            .expect("crash schedule must own a process controller");
+        let mut injector = None;
+        let mut http_fault_context = None;
+        let model = Model::default();
+
+        scheduler.advance_to(7);
+        let recovery = restart_after_crash(
+            &mut server,
+            &controller,
+            &scheduler,
+            &mut injector,
+            &mut http_fault_context,
+            &server_store,
+            &harness.store,
+            &prefix,
+            &config,
+            false,
+            &client,
+            &model,
+            7,
+            CrashRequest {
+                event_id: "runner-direct-crash-recovery".to_string(),
+                op_index: 7,
+                point: crate::adversarial::faults::process::CrashPoint::ManifestCas,
+                position: TriggerPosition::Pre,
+                key: format!("{prefix}/namespace/manifest.json"),
+            },
+        )
+        .await;
+
+        assert!(recovery.is_empty(), "{recovery:?}");
+        assert_ne!(server.base_url, old_base_url);
+        let crash_events = scheduler
+            .timeline()
+            .into_iter()
+            .filter(|event| event.event_id == "runner-direct-crash-recovery")
+            .collect::<Vec<_>>();
+        assert_eq!(crash_events.len(), 1, "{crash_events:#?}");
+        assert_eq!(
+            crash_events[0].recovery.as_deref(),
+            Some("restart+health-wait")
+        );
+
+        drop(http_fault_context.take());
+        shutdown_http_fault_injector(&mut injector).await;
+        drop(client);
+        server.into_inner().shutdown().await;
+        harness.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn durable_audit_evidence_accepts_verified_terminal_seal() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let server = start_test_server_full(
+            harness.store.clone(),
+            Some(prefix.clone()),
+            deterministic_config(),
+            false,
+            None,
+        )
+        .await;
+        let client = client_with_bearer(&server.admin_bearer);
+        let _ = crate::common::server::create_ns_api(&client, &server.base_url, 2).await;
+        let audit_store = server.store.clone();
+        drop(client);
+        server.shutdown().await;
+
+        let evidence = collect_durable_audit_evidence(&audit_store, &prefix).await;
+
+        assert!(
+            !evidence.verified_terminal_streams.is_empty(),
+            "graceful audit shutdown must produce one verified terminal stream"
+        );
+        assert!(
+            !evidence.records.is_empty(),
+            "durable audit evidence must retain the namespace request"
+        );
+        harness.cleanup().await;
+    }
+
+    async fn durable_audit_evidence_panic_message(store: ZeppelinStore, prefix: String) -> String {
+        let error = tokio::spawn(async move {
+            let _ = collect_durable_audit_evidence(&store, &prefix).await;
+        })
+        .await
+        .expect_err("malformed audit evidence must panic loudly");
+        let payload = error.into_panic();
+        if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else {
+            "non-string panic payload".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_audit_evidence_rejects_malformed_and_unknown_terminal_seals() {
+        let harness = TestHarness::new().await;
+        let prefix = harness.prefix.clone();
+        let node_id = format!("test-node-{prefix}-malformed");
+        let malformed_key = format!("_audit/2026-07-16/{node_id}/00000000000000000000000000.jsonl");
+        let malformed = serde_json::to_vec(&json!({
+            "format": "zeppelin_audit_terminal_seal_v1",
+            "day": "2026-07-16",
+            "node_id": node_id.clone(),
+            "last_hash": null,
+            "record_count": 0,
+            "unexpected": true,
+        }))
+        .expect("malformed terminal seal fixture must encode");
+        harness
+            .store
+            .put(&malformed_key, Bytes::from(malformed))
+            .await
+            .expect("malformed terminal seal fixture write must succeed");
+
+        let malformed_message =
+            durable_audit_evidence_panic_message(harness.store.clone(), prefix.clone()).await;
+        assert!(
+            malformed_message.contains("invalid terminal audit seal in"),
+            "{malformed_message}"
+        );
+        harness
+            .store
+            .delete(&malformed_key)
+            .await
+            .expect("malformed terminal seal fixture cleanup must succeed");
+
+        let unknown_format_key =
+            format!("_audit/2026-07-16/{node_id}/00000000000000000000000001.jsonl");
+        let unknown_format = serde_json::to_vec(&json!({
+            "format": "unexpected_terminal_seal_format",
+            "day": "2026-07-16",
+            "node_id": node_id.clone(),
+            "last_hash": null,
+            "record_count": 0,
+        }))
+        .expect("unknown-format terminal seal fixture must encode");
+        harness
+            .store
+            .put(&unknown_format_key, Bytes::from(unknown_format))
+            .await
+            .expect("unknown-format terminal seal fixture write must succeed");
+
+        let unknown_format_message =
+            durable_audit_evidence_panic_message(harness.store.clone(), prefix).await;
+        assert!(
+            unknown_format_message.contains("unexpected terminal audit seal format"),
+            "{unknown_format_message}"
+        );
+        harness
+            .store
+            .delete(&unknown_format_key)
+            .await
+            .expect("unknown-format terminal seal fixture cleanup must succeed");
         harness.cleanup().await;
     }
 
