@@ -3282,6 +3282,7 @@ mod tests {
             }],
             bootstrap: None,
             membership: None,
+            artifact_origin: None,
         });
         manifest.write(&store, namespace).await.unwrap();
 

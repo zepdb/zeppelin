@@ -1084,6 +1084,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 0,
             size_bytes: 1,
+            artifact_origin: None,
         });
         manifest.write(&store, "ns").await.unwrap();
 
@@ -1523,6 +1524,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 0,
             size_bytes: 3,
+            artifact_origin: None,
         });
         manifest.write(&store, "ns").await.unwrap();
 
@@ -1558,6 +1560,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 0,
             size_bytes: 3,
+            artifact_origin: None,
         });
         manifest.write(&store, "ns").await.unwrap();
 

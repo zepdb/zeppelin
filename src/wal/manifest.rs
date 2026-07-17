@@ -128,17 +128,20 @@
 //! can be moved into storage calls without retaining pointers into a temporary
 //! buffer.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::ops::Range;
 use ulid::Ulid;
 
 use crate::error::{Result, ZeppelinError};
+use crate::namespace::branching::{
+    ArtifactOrigin, ArtifactOriginIndex, ArtifactOriginSetBuilder, BranchError,
+};
+use crate::namespace::{NamespaceId, NamespaceIncarnationId};
 use crate::storage::store::DELETE_MANY_MAX_KEYS;
 use crate::storage::{CreateOnlyOutcome, ListedObject, StorageVersion, ZeppelinStore};
 
@@ -179,6 +182,11 @@ pub struct FragmentRef {
     /// new fields are trailing and `#[serde(default)]`.
     #[serde(default)]
     pub size_bytes: u64,
+    /// Physical owner of this fragment, or local ownership when absent.
+    ///
+    /// NOTE: this field must remain last for positional MessagePack decoding.
+    #[serde(default)]
+    pub artifact_origin: Option<ArtifactOriginIndex>,
 }
 
 /// Location and shape of a segment's immutable coarse-search sketch.
@@ -411,11 +419,16 @@ pub struct SegmentRef {
     /// 2C.1 writes it for new IVF-Flat segments only; current readers do not
     /// consult it yet.
     ///
-    /// NOTE: this field must stay LAST in the struct. MessagePack encodes
+    /// NOTE: newer persisted fields must remain trailing. MessagePack encodes
     /// structs as arrays, so old manifests decode only if new fields are
     /// trailing and `#[serde(default)]`.
     #[serde(default)]
     pub membership: Option<MembershipRef>,
+    /// Physical owner of this segment, or local ownership when absent.
+    ///
+    /// NOTE: this field must remain last for positional MessagePack decoding.
+    #[serde(default)]
+    pub artifact_origin: Option<ArtifactOriginIndex>,
 }
 
 impl SegmentRef {
@@ -622,19 +635,35 @@ pub struct Manifest {
     receipt_state_digest: Option<[u8; 32]>,
     /// Version of the stable projection encoded by `receipt_state_digest`.
     ///
-    /// This field remains last because MessagePack encodes structs as
-    /// positional arrays. A new query-relevant manifest field requires a new
-    /// binding version rather than changing the v1 projection in place.
+    /// A new query-relevant manifest field requires a new binding version
+    /// rather than changing the v1 projection in place.
     #[serde(default)]
     receipt_binding_version: Option<ReceiptBindingVersion>,
+    /// Canonical physical owners referenced by fragment and segment descriptors.
+    #[serde(default)]
+    pub artifact_origins: Vec<ArtifactOrigin>,
+    /// Versioned digest of retention and lineage control state.
+    ///
+    /// Phase 02 reserves this trailing seam. V1 and V2 require it to be absent.
+    #[serde(default)]
+    control_state_digest: Option<[u8; 32]>,
 }
 
 /// Stable manifest execution projection version used by signed receipts.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum ReceiptBindingVersion {
     /// Original field-by-field query-routing projection.
+    #[serde(rename = "v1")]
     V1,
+    /// Origin-aware execution projection and v2 root envelope.
+    #[serde(rename = "v2_origins")]
+    V2Origins,
+    /// Reserved root-control projection owned by phase 04.
+    #[serde(rename = "v3_roots")]
+    V3Roots,
+    /// Reserved branch-lineage projection owned by phase 05.
+    #[serde(rename = "v4_lineage")]
+    V4Lineage,
 }
 
 #[derive(Serialize)]
@@ -702,6 +731,51 @@ struct ManifestExecutionBindingV1<'a> {
     segments: Vec<SegmentExecutionBindingV1<'a>>,
     active_segment: Option<&'a str>,
     hierarchical_routing_nodes: Vec<HierarchicalRoutingExecutionBindingV1<'a>>,
+}
+
+#[derive(Serialize)]
+struct FragmentExecutionBindingV2 {
+    id: String,
+    vector_count: usize,
+    delete_count: usize,
+    sequence_number: u64,
+    size_bytes: u64,
+    artifact_origin: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct SegmentExecutionBindingV2<'a> {
+    id: &'a str,
+    vector_count: usize,
+    cluster_count: usize,
+    quantization: &'static str,
+    hierarchical: bool,
+    bitmap_fields: &'a [String],
+    fts_fields: &'a [String],
+    has_global_fts: bool,
+    cluster_owners: &'a [String],
+    sketch: Option<SketchExecutionBindingV1<'a>>,
+    cluster_objects: Vec<ClusterObjectExecutionBindingV1<'a>>,
+    bootstrap: Option<BootstrapExecutionBindingV1<'a>>,
+    artifact_origin: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct ArtifactOriginExecutionBindingV2<'a> {
+    namespace: &'a str,
+    incarnation: [u8; 16],
+}
+
+#[derive(Serialize)]
+struct ManifestExecutionBindingV2<'a> {
+    format: &'static str,
+    namespace: &'a str,
+    namespace_incarnation: Option<[u8; 16]>,
+    fragments: Vec<FragmentExecutionBindingV2>,
+    segments: Vec<SegmentExecutionBindingV2<'a>>,
+    active_segment: Option<&'a str>,
+    hierarchical_routing_nodes: Vec<HierarchicalRoutingExecutionBindingV1<'a>>,
+    artifact_origins: Vec<ArtifactOriginExecutionBindingV2<'a>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -813,24 +887,76 @@ pub(crate) fn manifest_root_signing_bytes(
     fencing_token: u64,
     binding_version: ReceiptBindingVersion,
     state_digest: [u8; 32],
+    control_state_digest: Option<[u8; 32]>,
 ) -> Result<Vec<u8>> {
-    #[derive(Serialize)]
-    struct RootBinding {
-        merkle_root: [u8; 32],
-        manifest_version: u64,
-        fencing_token: u64,
-        binding_version: ReceiptBindingVersion,
-        state_digest: [u8; 32],
-    }
+    match binding_version {
+        ReceiptBindingVersion::V1 => {
+            if control_state_digest.is_some() {
+                return Err(ZeppelinError::Serialization(
+                    "receipt binding v1 forbids a control digest".to_string(),
+                ));
+            }
 
-    serde_json::to_vec(&RootBinding {
-        merkle_root,
-        manifest_version,
-        fencing_token,
-        binding_version,
-        state_digest,
-    })
-    .map_err(|error| ZeppelinError::Serialization(format!("manifest root signing failed: {error}")))
+            #[derive(Serialize)]
+            struct RootBinding {
+                merkle_root: [u8; 32],
+                manifest_version: u64,
+                fencing_token: u64,
+                binding_version: ReceiptBindingVersion,
+                state_digest: [u8; 32],
+            }
+
+            serde_json::to_vec(&RootBinding {
+                merkle_root,
+                manifest_version,
+                fencing_token,
+                binding_version,
+                state_digest,
+            })
+            .map_err(|error| {
+                ZeppelinError::Serialization(format!("manifest root signing failed: {error}"))
+            })
+        }
+        ReceiptBindingVersion::V2Origins => {
+            if control_state_digest.is_some() {
+                return Err(ZeppelinError::Serialization(
+                    "receipt binding v2_origins forbids a control digest".to_string(),
+                ));
+            }
+
+            #[derive(Serialize)]
+            struct ManifestRootEnvelopeV2 {
+                domain: &'static str,
+                merkle_root: [u8; 32],
+                manifest_generation: u64,
+                fencing_token: u64,
+                binding_version: ReceiptBindingVersion,
+                execution_digest: [u8; 32],
+                control_digest: Option<[u8; 32]>,
+            }
+
+            serde_json::to_vec(&ManifestRootEnvelopeV2 {
+                domain: "zeppelin-manifest-root-envelope-v2",
+                merkle_root,
+                manifest_generation: manifest_version,
+                fencing_token,
+                binding_version,
+                execution_digest: state_digest,
+                control_digest: control_state_digest,
+            })
+            .map_err(|error| {
+                ZeppelinError::Serialization(format!("manifest root signing failed: {error}"))
+            })
+        }
+        ReceiptBindingVersion::V3Roots => Err(BranchError::BranchingNotReady {
+            feature: "receipt binding v3_roots signing",
+        }
+        .into()),
+        ReceiptBindingVersion::V4Lineage => Err(BranchError::BranchingNotReady {
+            feature: "receipt binding v4_lineage signing",
+        }
+        .into()),
+    }
 }
 
 impl Manifest {
@@ -873,6 +999,8 @@ impl Manifest {
             hierarchical_routing_nodes: BTreeMap::new(),
             receipt_state_digest: None,
             receipt_binding_version: None,
+            artifact_origins: Vec::new(),
+            control_state_digest: None,
         }
     }
 
@@ -900,6 +1028,456 @@ impl Manifest {
     pub(crate) fn namespace_incarnation(&self) -> Option<uuid::Uuid> {
         self.namespace_incarnation
             .map(ManifestNamespaceIncarnation::as_uuid)
+    }
+
+    fn artifact_origin_error(
+        &self,
+        descriptor_kind: &'static str,
+        descriptor_id: impl Into<String>,
+        offending_index: Option<ArtifactOriginIndex>,
+        offending_key: Option<String>,
+        expected_origin: Option<ArtifactOrigin>,
+        reason: impl Into<String>,
+    ) -> ZeppelinError {
+        BranchError::ArtifactOriginInvalid {
+            manifest_namespace: self
+                .namespace
+                .clone()
+                .unwrap_or_else(|| "<unbound>".to_string()),
+            manifest_incarnation: self
+                .namespace_incarnation()
+                .map(NamespaceIncarnationId::from_uuid),
+            descriptor_kind,
+            descriptor_id: descriptor_id.into(),
+            offending_index,
+            offending_key,
+            expected_origin,
+            reason: reason.into(),
+        }
+        .into()
+    }
+
+    /// Resolve the physical owner encoded by an absent origin index.
+    pub(crate) fn local_origin(&self) -> Result<ArtifactOrigin> {
+        let namespace = self.namespace.as_ref().ok_or_else(|| {
+            self.artifact_origin_error(
+                "manifest",
+                "namespace",
+                None,
+                None,
+                None,
+                "local artifact origin requires a namespace binding",
+            )
+        })?;
+        let namespace = NamespaceId::parse(namespace.clone()).map_err(|_| {
+            self.artifact_origin_error(
+                "manifest",
+                "namespace",
+                None,
+                None,
+                None,
+                "manifest namespace violates the namespace grammar",
+            )
+        })?;
+        let incarnation = self
+            .namespace_incarnation()
+            .map(NamespaceIncarnationId::from_uuid)
+            .ok_or_else(|| {
+                self.artifact_origin_error(
+                    "manifest",
+                    "namespace_incarnation",
+                    None,
+                    None,
+                    None,
+                    "local artifact origin requires an incarnation binding",
+                )
+            })?;
+        if incarnation.is_nil() {
+            return Err(self.artifact_origin_error(
+                "manifest",
+                "namespace_incarnation",
+                None,
+                None,
+                None,
+                "manifest namespace incarnation is nil",
+            ));
+        }
+        Ok(ArtifactOrigin {
+            namespace,
+            incarnation,
+        })
+    }
+
+    fn indexed_artifact_origin(
+        &self,
+        descriptor_kind: &'static str,
+        descriptor_id: &str,
+        index: ArtifactOriginIndex,
+    ) -> Result<ArtifactOrigin> {
+        let index_usize = usize::try_from(index.get()).map_err(|_| {
+            self.artifact_origin_error(
+                descriptor_kind,
+                descriptor_id,
+                Some(index),
+                None,
+                None,
+                "artifact origin index does not fit this platform",
+            )
+        })?;
+        self.artifact_origins
+            .get(index_usize)
+            .cloned()
+            .ok_or_else(|| {
+                self.artifact_origin_error(
+                    descriptor_kind,
+                    descriptor_id,
+                    Some(index),
+                    None,
+                    None,
+                    format!(
+                        "artifact origin index is out of bounds for table length {}",
+                        self.artifact_origins.len()
+                    ),
+                )
+            })
+    }
+
+    /// Resolve one WAL fragment's exact physical namespace lifetime.
+    pub(crate) fn fragment_origin(&self, fragment: &FragmentRef) -> Result<ArtifactOrigin> {
+        match fragment.artifact_origin {
+            Some(index) => {
+                self.indexed_artifact_origin("fragment", &fragment.id.to_string(), index)
+            }
+            None => self.local_origin(),
+        }
+    }
+
+    /// Resolve one immutable segment's exact physical namespace lifetime.
+    pub(crate) fn segment_origin(&self, segment: &SegmentRef) -> Result<ArtifactOrigin> {
+        match segment.artifact_origin {
+            Some(index) => self.indexed_artifact_origin("segment", &segment.id, index),
+            None => self.local_origin(),
+        }
+    }
+
+    fn validate_origin_entry(&self, origin: &ArtifactOrigin, index: usize) -> Result<()> {
+        NamespaceId::parse(origin.namespace.as_str().to_string()).map_err(|_| {
+            self.artifact_origin_error(
+                "manifest",
+                "artifact_origins",
+                u32::try_from(index).ok().map(ArtifactOriginIndex::new),
+                None,
+                Some(origin.clone()),
+                "origin namespace violates the namespace grammar",
+            )
+        })?;
+        if origin.incarnation.is_nil() {
+            return Err(self.artifact_origin_error(
+                "manifest",
+                "artifact_origins",
+                u32::try_from(index).ok().map(ArtifactOriginIndex::new),
+                None,
+                Some(origin.clone()),
+                "origin namespace incarnation is nil",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_artifact_origin_table_len(&self, count: u64) -> Result<()> {
+        if count <= u64::from(u32::MAX) {
+            return Ok(());
+        }
+        Err(self.artifact_origin_error(
+            "manifest",
+            "artifact_origins",
+            None,
+            None,
+            None,
+            "origin table exceeds u32 address space",
+        ))
+    }
+
+    fn validate_explicit_origin_key(
+        &self,
+        segment: &SegmentRef,
+        origin: &ArtifactOrigin,
+        key: &str,
+    ) -> Result<()> {
+        let prefix = format!("{}/", origin.namespace.as_str());
+        if key.starts_with(&prefix) {
+            return Ok(());
+        }
+        Err(self.artifact_origin_error(
+            "segment",
+            &segment.id,
+            segment.artifact_origin,
+            Some(key.to_string()),
+            Some(origin.clone()),
+            format!("explicit artifact key is outside expected prefix {prefix:?}"),
+        ))
+    }
+
+    fn validate_artifact_origins_structural(&self, require_canonical_order: bool) -> Result<()> {
+        let origin_count = u64::try_from(self.artifact_origins.len()).map_err(|_| {
+            self.artifact_origin_error(
+                "manifest",
+                "artifact_origins",
+                None,
+                None,
+                None,
+                "origin table exceeds u32 address space",
+            )
+        })?;
+        self.validate_artifact_origin_table_len(origin_count)?;
+
+        let mut unique = BTreeSet::new();
+        let mut previous = None;
+        for (index, origin) in self.artifact_origins.iter().enumerate() {
+            self.validate_origin_entry(origin, index)?;
+            if require_canonical_order && !unique.insert(origin) {
+                return Err(self.artifact_origin_error(
+                    "manifest",
+                    "artifact_origins",
+                    u32::try_from(index).ok().map(ArtifactOriginIndex::new),
+                    None,
+                    Some(origin.clone()),
+                    "duplicate artifact origin makes persisted indices ambiguous",
+                ));
+            }
+            if require_canonical_order && previous.is_some_and(|previous| previous > origin) {
+                return Err(self.artifact_origin_error(
+                    "manifest",
+                    "artifact_origins",
+                    u32::try_from(index).ok().map(ArtifactOriginIndex::new),
+                    None,
+                    Some(origin.clone()),
+                    "artifact origin table is not in canonical sorted order",
+                ));
+            }
+            previous = Some(origin);
+        }
+
+        for fragment in &self.fragments {
+            if fragment.artifact_origin.is_some() {
+                self.fragment_origin(fragment)?;
+            }
+        }
+        for segment in &self.segments {
+            let origin = match segment.artifact_origin {
+                Some(_) => self.segment_origin(segment)?,
+                None if self.namespace.is_some() && self.namespace_incarnation.is_some() => {
+                    self.local_origin()?
+                }
+                None => continue,
+            };
+            if let Some(sketch) = &segment.sketch {
+                self.validate_explicit_origin_key(segment, &origin, &sketch.key)?;
+            }
+            if let Some(bootstrap) = &segment.bootstrap {
+                self.validate_explicit_origin_key(segment, &origin, &bootstrap.key)?;
+            }
+            if let Some(membership) = &segment.membership {
+                self.validate_explicit_origin_key(segment, &origin, &membership.key)?;
+            }
+            for object in &segment.cluster_objects {
+                self.validate_explicit_origin_key(segment, &origin, &object.key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the complete persisted origin table and every descriptor index.
+    pub(crate) fn validate_artifact_origins(&self) -> Result<()> {
+        self.validate_artifact_origins_structural(true)
+    }
+
+    fn validate_foreign_origin_admission(&self) -> Result<()> {
+        if !self
+            .fragments
+            .iter()
+            .any(|fragment| fragment.artifact_origin.is_some())
+            && !self
+                .segments
+                .iter()
+                .any(|segment| segment.artifact_origin.is_some())
+        {
+            return Ok(());
+        }
+        let local = self.local_origin()?;
+        let foreign_fragment = self.fragments.iter().find_map(|fragment| {
+            fragment
+                .artifact_origin
+                .map(|_| fragment)
+                .filter(|fragment| {
+                    self.fragment_origin(fragment)
+                        .is_ok_and(|origin| origin != local)
+                })
+        });
+        let foreign_segment = self.segments.iter().find_map(|segment| {
+            segment.artifact_origin.map(|_| segment).filter(|segment| {
+                self.segment_origin(segment)
+                    .is_ok_and(|origin| origin != local)
+            })
+        });
+        if foreign_fragment.is_some() || foreign_segment.is_some() {
+            return Err(BranchError::BranchingNotReady {
+                feature: "foreign artifact origin admission",
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Canonicalize all resolved owners and remap descriptors in a second pass.
+    #[allow(dead_code)] // Phase 05 calls this after collecting a fork's ultimate owners.
+    pub(crate) fn canonicalize_artifact_origins(&mut self) -> Result<()> {
+        self.validate_artifact_origins_structural(false)?;
+        let fragment_origins = self
+            .fragments
+            .iter()
+            .map(|fragment| self.fragment_origin(fragment))
+            .collect::<Result<Vec<_>>>()?;
+        let segment_origins = self
+            .segments
+            .iter()
+            .map(|segment| self.segment_origin(segment))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut builder = ArtifactOriginSetBuilder::default();
+        for origin in fragment_origins.iter().chain(&segment_origins) {
+            builder.collect(origin.clone())?;
+        }
+        let canonical = builder.finish()?;
+
+        let fragment_indices = self
+            .fragments
+            .iter()
+            .zip(&fragment_origins)
+            .map(|(fragment, origin)| {
+                self.canonical_origin_index(
+                    &canonical.indices,
+                    "fragment",
+                    fragment.id.to_string(),
+                    origin,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let segment_indices = self
+            .segments
+            .iter()
+            .zip(&segment_origins)
+            .map(|(segment, origin)| {
+                self.canonical_origin_index(
+                    &canonical.indices,
+                    "segment",
+                    segment.id.clone(),
+                    origin,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (fragment, index) in self.fragments.iter_mut().zip(fragment_indices) {
+            fragment.artifact_origin = Some(index);
+        }
+        for (segment, index) in self.segments.iter_mut().zip(segment_indices) {
+            segment.artifact_origin = Some(index);
+        }
+        self.artifact_origins = canonical.table;
+        Ok(())
+    }
+
+    fn canonical_origin_index(
+        &self,
+        indices: &BTreeMap<ArtifactOrigin, ArtifactOriginIndex>,
+        descriptor_kind: &'static str,
+        descriptor_id: String,
+        origin: &ArtifactOrigin,
+    ) -> Result<ArtifactOriginIndex> {
+        indices.get(origin).copied().ok_or_else(|| {
+            self.artifact_origin_error(
+                descriptor_kind,
+                descriptor_id,
+                None,
+                None,
+                Some(origin.clone()),
+                "canonical origin table omitted a referenced owner",
+            )
+        })
+    }
+
+    /// Canonicalize only persisted explicit origins while preserving legacy
+    /// local ownership as `None`.
+    fn canonicalize_explicit_artifact_origins(&mut self) -> Result<()> {
+        self.validate_artifact_origins_structural(false)?;
+        let fragment_origins = self
+            .fragments
+            .iter()
+            .map(|fragment| match fragment.artifact_origin {
+                Some(_) => self.fragment_origin(fragment).map(Some),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let segment_origins = self
+            .segments
+            .iter()
+            .map(|segment| match segment.artifact_origin {
+                Some(_) => self.segment_origin(segment).map(Some),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut builder = ArtifactOriginSetBuilder::default();
+        for origin in fragment_origins.iter().chain(&segment_origins).flatten() {
+            builder.collect(origin.clone())?;
+        }
+        let canonical = builder.finish()?;
+
+        let fragment_indices = self
+            .fragments
+            .iter()
+            .zip(&fragment_origins)
+            .map(|(fragment, origin)| {
+                origin
+                    .as_ref()
+                    .map(|origin| {
+                        self.canonical_origin_index(
+                            &canonical.indices,
+                            "fragment",
+                            fragment.id.to_string(),
+                            origin,
+                        )
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let segment_indices = self
+            .segments
+            .iter()
+            .zip(&segment_origins)
+            .map(|(segment, origin)| {
+                origin
+                    .as_ref()
+                    .map(|origin| {
+                        self.canonical_origin_index(
+                            &canonical.indices,
+                            "segment",
+                            segment.id.clone(),
+                            origin,
+                        )
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (fragment, index) in self.fragments.iter_mut().zip(fragment_indices) {
+            fragment.artifact_origin = index;
+        }
+        for (segment, index) in self.segments.iter_mut().zip(segment_indices) {
+            segment.artifact_origin = index;
+        }
+        self.artifact_origins = canonical.table;
+        Ok(())
     }
 
     /// Builds the live manifest key for a namespace.
@@ -1045,7 +1623,6 @@ impl Manifest {
         self.root_signature = None;
         self.root_signer_node = None;
         self.receipt_state_digest = None;
-        self.receipt_binding_version = None;
         Ok(())
     }
 
@@ -1092,6 +1669,12 @@ impl Manifest {
         self.receipt_binding_version
     }
 
+    /// Return the versioned retention/lineage control digest, when published.
+    #[must_use]
+    pub const fn control_state_digest(&self) -> Option<[u8; 32]> {
+        self.control_state_digest
+    }
+
     /// Recompute the domain-separated query-routing projection digest.
     pub(crate) fn recompute_receipt_state_digest(&self, namespace: &str) -> Result<[u8; 32]> {
         let binding_version = self.receipt_binding_version.ok_or_else(|| {
@@ -1110,6 +1693,18 @@ impl Manifest {
         self.validate_namespace_binding(namespace)?;
         let bytes = match binding_version {
             ReceiptBindingVersion::V1 => serde_json::to_vec(&self.execution_binding_v1(namespace)),
+            ReceiptBindingVersion::V2Origins => {
+                self.validate_artifact_origins()?;
+                serde_json::to_vec(&self.execution_binding_v2(namespace))
+            }
+            ReceiptBindingVersion::V3Roots | ReceiptBindingVersion::V4Lineage => {
+                return Err(
+                    crate::namespace::branching::BranchError::BranchingNotReady {
+                        feature: "reserved receipt binding projection",
+                    }
+                    .into(),
+                );
+            }
         };
         let bytes = bytes.map_err(|error| {
             ZeppelinError::Serialization(format!(
@@ -1117,6 +1712,98 @@ impl Manifest {
             ))
         })?;
         Ok(Sha256::digest(bytes).into())
+    }
+
+    fn execution_binding_v2<'a>(&'a self, namespace: &'a str) -> ManifestExecutionBindingV2<'a> {
+        let fragments = self
+            .fragments
+            .iter()
+            .map(|fragment| FragmentExecutionBindingV2 {
+                id: fragment.id.to_string(),
+                vector_count: fragment.vector_count,
+                delete_count: fragment.delete_count,
+                sequence_number: fragment.sequence_number,
+                size_bytes: fragment.size_bytes,
+                artifact_origin: fragment.artifact_origin.map(ArtifactOriginIndex::get),
+            })
+            .collect();
+        let segments = self
+            .segments
+            .iter()
+            .map(|segment| SegmentExecutionBindingV2 {
+                id: &segment.id,
+                vector_count: segment.vector_count,
+                cluster_count: segment.cluster_count,
+                quantization: match segment.quantization {
+                    crate::index::quantization::QuantizationType::None => "none",
+                    crate::index::quantization::QuantizationType::Scalar => "scalar",
+                    crate::index::quantization::QuantizationType::Product => "product",
+                },
+                hierarchical: segment.hierarchical,
+                bitmap_fields: &segment.bitmap_fields,
+                fts_fields: &segment.fts_fields,
+                has_global_fts: segment.has_global_fts,
+                cluster_owners: &segment.cluster_owners,
+                sketch: segment
+                    .sketch
+                    .as_ref()
+                    .map(|sketch| SketchExecutionBindingV1 {
+                        key: &sketch.key,
+                        version: sketch.version,
+                        code_dims: sketch.code_dims,
+                        bytes_per_vector: sketch.bytes_per_vector,
+                        size_bytes: sketch.size_bytes,
+                        rotation_seed: sketch.rotation_seed,
+                    }),
+                cluster_objects: segment
+                    .cluster_objects
+                    .iter()
+                    .map(|object| ClusterObjectExecutionBindingV1 {
+                        key: &object.key,
+                        clusters: &object.clusters,
+                        live_offset: object.live_offset,
+                        live_len: object.live_len,
+                        size_bytes: object.size_bytes,
+                    })
+                    .collect(),
+                bootstrap: segment.bootstrap.as_ref().map(|bootstrap| {
+                    BootstrapExecutionBindingV1 {
+                        key: &bootstrap.key,
+                        size_bytes: bootstrap.size_bytes,
+                    }
+                }),
+                artifact_origin: segment.artifact_origin.map(ArtifactOriginIndex::get),
+            })
+            .collect();
+        let hierarchical_routing_nodes = self
+            .hierarchical_routing_nodes
+            .iter()
+            .map(
+                |(segment_id, node_ids)| HierarchicalRoutingExecutionBindingV1 {
+                    segment_id,
+                    node_ids,
+                },
+            )
+            .collect();
+        let artifact_origins = self
+            .artifact_origins
+            .iter()
+            .map(|origin| ArtifactOriginExecutionBindingV2 {
+                namespace: origin.namespace.as_str(),
+                incarnation: *origin.incarnation.as_uuid().as_bytes(),
+            })
+            .collect();
+
+        ManifestExecutionBindingV2 {
+            format: "zeppelin-manifest-execution-v2-origins",
+            namespace,
+            namespace_incarnation: self.namespace_incarnation.map(|incarnation| incarnation.0),
+            fragments,
+            segments,
+            active_segment: self.active_segment.as_deref(),
+            hierarchical_routing_nodes,
+            artifact_origins,
+        }
     }
 
     fn execution_binding_v1<'a>(&'a self, namespace: &'a str) -> ManifestExecutionBindingV1<'a> {
@@ -1310,6 +1997,9 @@ impl Manifest {
     }
 
     fn finalize_receipt_root(&mut self, store: &ZeppelinStore, namespace: &str) -> Result<()> {
+        self.canonicalize_explicit_artifact_origins()?;
+        self.validate_artifact_origins()?;
+        self.validate_foreign_origin_admission()?;
         let reachable = self.receipt_reachable_keys(namespace);
         self.artifact_hashes
             .retain(|key, _| reachable.contains(key));
@@ -1321,6 +2011,29 @@ impl Manifest {
             }
         }
 
+        let binding_version = match self.receipt_binding_version {
+            Some(ReceiptBindingVersion::V2Origins) => ReceiptBindingVersion::V2Origins,
+            Some(ReceiptBindingVersion::V3Roots) => {
+                return Err(BranchError::BranchingNotReady {
+                    feature: "receipt binding v3_roots publication",
+                }
+                .into());
+            }
+            Some(ReceiptBindingVersion::V4Lineage) => {
+                return Err(BranchError::BranchingNotReady {
+                    feature: "receipt binding v4_lineage publication",
+                }
+                .into());
+            }
+            Some(ReceiptBindingVersion::V1) | None if self.has_explicit_artifact_origins() => {
+                ReceiptBindingVersion::V2Origins
+            }
+            Some(ReceiptBindingVersion::V1) | None => ReceiptBindingVersion::V1,
+        };
+        let state_digest = self.compute_receipt_state_digest(namespace, binding_version)?;
+        self.receipt_state_digest = Some(state_digest);
+        self.receipt_binding_version = Some(binding_version);
+
         if reachable
             .iter()
             .any(|key| !self.artifact_hashes.contains_key(key))
@@ -1328,23 +2041,18 @@ impl Manifest {
             self.merkle_root = None;
             self.root_signature = None;
             self.root_signer_node = None;
-            self.receipt_state_digest = None;
-            self.receipt_binding_version = None;
             return Ok(());
         }
 
         let root = crate::security::MerkleTree::build(&self.artifact_hashes)?.root();
-        let binding_version = ReceiptBindingVersion::V1;
-        let state_digest = self.compute_receipt_state_digest(namespace, binding_version)?;
         self.merkle_root = Some(root);
-        self.receipt_state_digest = Some(state_digest);
-        self.receipt_binding_version = Some(binding_version);
         let payload = manifest_root_signing_bytes(
             root,
             self.version,
             self.fencing_token,
             binding_version,
             state_digest,
+            self.control_state_digest,
         )?;
         if let Some((signer_node, signature)) = store.sign_object(&payload)? {
             self.root_signer_node = Some(signer_node);
@@ -1907,7 +2615,81 @@ impl Manifest {
     pub(crate) fn from_bytes_for_namespace(data: &[u8], namespace: &str) -> Result<Self> {
         let manifest = Self::from_bytes(data)?;
         manifest.validate_namespace_binding(namespace)?;
+        manifest.validate_artifact_origins()?;
+        manifest.validate_receipt_binding_state()?;
+        manifest.validate_foreign_origin_admission()?;
         Ok(manifest)
+    }
+
+    fn has_explicit_artifact_origins(&self) -> bool {
+        !self.artifact_origins.is_empty()
+            || self
+                .fragments
+                .iter()
+                .any(|fragment| fragment.artifact_origin.is_some())
+            || self
+                .segments
+                .iter()
+                .any(|segment| segment.artifact_origin.is_some())
+    }
+
+    fn validate_receipt_binding_state(&self) -> Result<()> {
+        match self.receipt_binding_version {
+            None => {
+                if self.receipt_state_digest.is_some() || self.control_state_digest.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "manifest digest fields require a receipt binding version".to_string(),
+                    ));
+                }
+                if self.has_explicit_artifact_origins() {
+                    return Err(ZeppelinError::Serialization(
+                        "explicit artifact origins require receipt binding v2_origins".to_string(),
+                    ));
+                }
+            }
+            Some(ReceiptBindingVersion::V1) => {
+                if self.receipt_state_digest.is_none() {
+                    return Err(ZeppelinError::Serialization(
+                        "receipt binding v1 requires an execution digest".to_string(),
+                    ));
+                }
+                if self.control_state_digest.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "receipt binding v1 forbids a control digest".to_string(),
+                    ));
+                }
+                if self.has_explicit_artifact_origins() {
+                    return Err(ZeppelinError::Serialization(
+                        "explicit artifact origins require receipt binding v2_origins".to_string(),
+                    ));
+                }
+            }
+            Some(ReceiptBindingVersion::V2Origins) => {
+                if self.receipt_state_digest.is_none() {
+                    return Err(ZeppelinError::Serialization(
+                        "receipt binding v2_origins requires an execution digest".to_string(),
+                    ));
+                }
+                if self.control_state_digest.is_some() {
+                    return Err(ZeppelinError::Serialization(
+                        "receipt binding v2_origins forbids a control digest".to_string(),
+                    ));
+                }
+            }
+            Some(ReceiptBindingVersion::V3Roots) => {
+                return Err(BranchError::BranchingNotReady {
+                    feature: "receipt binding v3_roots",
+                }
+                .into());
+            }
+            Some(ReceiptBindingVersion::V4Lineage) => {
+                return Err(BranchError::BranchingNotReady {
+                    feature: "receipt binding v4_lineage",
+                }
+                .into());
+            }
+        }
+        Ok(())
     }
 
     fn validate_namespace_binding(&self, namespace: &str) -> Result<()> {
@@ -3487,6 +4269,7 @@ mod tests {
     //! breaks a focused compatibility test.
 
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn conditional_manifest_versions_reject_missing_or_empty_etags() {
@@ -3538,7 +4321,435 @@ mod tests {
             cluster_objects: Vec::new(),
             bootstrap: None,
             membership: None,
+            artifact_origin: None,
         }
+    }
+
+    fn origin(namespace: &str, incarnation: u128) -> ArtifactOrigin {
+        ArtifactOrigin {
+            namespace: crate::namespace::NamespaceId::parse(namespace)
+                .expect("origin fixture namespace must be valid"),
+            incarnation: crate::namespace::NamespaceIncarnationId::from_uuid(
+                uuid::Uuid::from_u128(incarnation),
+            ),
+        }
+    }
+
+    #[test]
+    fn receipt_v2_digest_binds_segment_origin_index() {
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("target".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .expect("target manifest must bind one incarnation");
+        manifest.artifact_origins = vec![origin("source-a", 2), origin("source-b", 3)];
+        let mut segment = make_segment("segment-origin");
+        segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        manifest.segments.push(segment);
+        manifest.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
+
+        let baseline = manifest
+            .recompute_receipt_state_digest("target")
+            .expect("origin-aware receipt projection must encode");
+        manifest.segments[0].artifact_origin = Some(ArtifactOriginIndex::new(1));
+
+        assert_ne!(
+            baseline,
+            manifest
+                .recompute_receipt_state_digest("target")
+                .expect("mutated origin-aware receipt projection must encode"),
+            "changing only an origin index must change the receipt digest"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_out_of_bounds_artifact_origin_index() {
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("target".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .expect("target manifest must bind one incarnation");
+        manifest.artifact_origins = vec![origin("source", 2)];
+        let mut segment = make_segment("segment-oob");
+        segment.artifact_origin = Some(ArtifactOriginIndex::new(1));
+        manifest.segments.push(segment);
+
+        let error = Manifest::from_bytes_for_namespace(
+            &manifest.to_bytes().expect("fixture must encode"),
+            "target",
+        )
+        .expect_err("out-of-bounds origin index must fail decode");
+        assert!(matches!(
+            error,
+            ZeppelinError::Branch(error)
+                if matches!(error.as_ref(), BranchError::ArtifactOriginInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_explicit_key_outside_artifact_origin_prefix() {
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("target".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .expect("target manifest must bind one incarnation");
+        manifest.artifact_origins = vec![origin("source", 2)];
+        let mut segment = make_segment("segment-prefix");
+        segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        segment.sketch = Some(SketchRef {
+            key: "wrong/segments/segment-prefix/coarse_sketch.bin".to_string(),
+            version: 4,
+            code_dims: 1,
+            bytes_per_vector: 1,
+            size_bytes: 1,
+            rotation_seed: None,
+        });
+        manifest.segments.push(segment);
+
+        let error = Manifest::from_bytes_for_namespace(
+            &manifest.to_bytes().expect("fixture must encode"),
+            "target",
+        )
+        .expect_err("origin/key prefix mismatch must fail decode");
+        assert!(matches!(
+            error,
+            ZeppelinError::Branch(error)
+                if matches!(error.as_ref(), BranchError::ArtifactOriginInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn absent_and_indexed_origins_resolve_exact_namespace_lifetimes() {
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("target".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .expect("target manifest must bind one incarnation");
+        let local = origin("target", 1);
+        let source = origin("source", 2);
+        manifest.artifact_origins.push(source.clone());
+
+        let local_fragment = FragmentRef {
+            id: Ulid::from(20_u128),
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 1,
+            artifact_origin: None,
+        };
+        let foreign_fragment = FragmentRef {
+            artifact_origin: Some(ArtifactOriginIndex::new(0)),
+            ..local_fragment.clone()
+        };
+
+        assert_eq!(manifest.local_origin().unwrap(), local);
+        assert_eq!(manifest.fragment_origin(&local_fragment).unwrap(), local);
+        assert_eq!(manifest.fragment_origin(&foreign_fragment).unwrap(), source);
+    }
+
+    #[test]
+    fn decode_rejects_duplicate_nil_and_invalid_origin_entries() {
+        let mut duplicate = Manifest::new();
+        duplicate.namespace = Some("target".to_string());
+        duplicate
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
+        duplicate.artifact_origins = vec![origin("source", 2), origin("source", 2)];
+
+        let mut nil = duplicate.clone();
+        nil.artifact_origins = vec![origin("source", 0)];
+
+        let mut invalid = duplicate.clone();
+        invalid.artifact_origins = vec![serde_json::from_value(serde_json::json!({
+            "namespace": "../source",
+            "incarnation": "00000000-0000-0000-0000-000000000002"
+        }))
+        .expect("wire fixture intentionally bypasses the NamespaceId constructor")];
+
+        for (fixture, expected_reason) in [
+            (duplicate, "duplicate artifact origin"),
+            (nil, "incarnation is nil"),
+            (invalid, "namespace violates"),
+        ] {
+            let error = Manifest::from_bytes_for_namespace(
+                &fixture.to_bytes().expect("fixture must encode"),
+                "target",
+            )
+            .expect_err("invalid origin table must fail decode");
+            assert!(
+                matches!(&error, ZeppelinError::Branch(branch_error)
+                    if matches!(branch_error.as_ref(), BranchError::ArtifactOriginInvalid { reason, .. }
+                        if reason.contains(expected_reason))),
+                "expected {expected_reason:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_origin_table_rejects_count_beyond_u32_address_space() {
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("origin-capacity".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
+
+        manifest
+            .validate_artifact_origin_table_len(u64::from(u32::MAX))
+            .expect("the largest addressable table must remain valid");
+        let error = manifest
+            .validate_artifact_origin_table_len(u64::from(u32::MAX) + 1)
+            .expect_err("persisted origin tables must not exceed u32 indices");
+        assert!(
+            matches!(&error, ZeppelinError::Branch(branch_error)
+                if matches!(branch_error.as_ref(), BranchError::ArtifactOriginInvalid { reason, .. }
+                    if reason.contains("exceeds u32 address space"))),
+            "unexpected capacity error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn origin_canonicalization_is_deterministic_and_remaps_all_refs() {
+        let source_a = origin("source-a", 10);
+        let source_b = origin("source-b", 11);
+        let mut first = Manifest::new();
+        first.namespace = Some("target".to_string());
+        first
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
+        first.artifact_origins = vec![source_b.clone(), source_a.clone()];
+        first.fragments = vec![
+            FragmentRef {
+                id: Ulid::from(30_u128),
+                vector_count: 1,
+                delete_count: 0,
+                sequence_number: 0,
+                size_bytes: 1,
+                artifact_origin: Some(ArtifactOriginIndex::new(0)),
+            },
+            FragmentRef {
+                id: Ulid::from(31_u128),
+                vector_count: 1,
+                delete_count: 0,
+                sequence_number: 1,
+                size_bytes: 1,
+                artifact_origin: Some(ArtifactOriginIndex::new(1)),
+            },
+        ];
+
+        let mut second = first.clone();
+        second.artifact_origins = vec![source_a.clone(), source_b.clone()];
+        second.fragments[0].artifact_origin = Some(ArtifactOriginIndex::new(1));
+        second.fragments[1].artifact_origin = Some(ArtifactOriginIndex::new(0));
+
+        first.canonicalize_artifact_origins().unwrap();
+        second.canonicalize_artifact_origins().unwrap();
+
+        assert_eq!(first.artifact_origins, vec![source_a, source_b]);
+        assert_eq!(first.artifact_origins, second.artifact_origins);
+        assert_eq!(first.fragments, second.fragments);
+        assert_eq!(
+            first
+                .fragments
+                .iter()
+                .map(|fragment| fragment.artifact_origin.unwrap().get())
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_valid_origin_tables_resolve_and_canonicalize_deterministically(
+            raw_origins in proptest::collection::vec(
+                ("[a-z][a-z0-9-]{0,12}", 1_u128..=u128::MAX),
+                1..9,
+            ),
+            ref_choices in proptest::collection::vec(any::<usize>(), 1..24),
+            order_keys in proptest::collection::vec(any::<u64>(), 1..9),
+        ) {
+            let canonical = raw_origins
+                .into_iter()
+                .map(|(namespace, incarnation)| ArtifactOrigin {
+                    namespace: NamespaceId::parse(namespace).unwrap(),
+                    incarnation: NamespaceIncarnationId::from_uuid(uuid::Uuid::from_u128(
+                        incarnation,
+                    )),
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+
+            let mut permuted = canonical
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, origin)| (order_keys[index % order_keys.len()], index, origin))
+                .collect::<Vec<_>>();
+            permuted.sort_by_key(|(order, index, _)| (*order, *index));
+            let permuted = permuted
+                .into_iter()
+                .map(|(_, _, origin)| origin)
+                .collect::<Vec<_>>();
+
+            let expected = permuted
+                .iter()
+                .cloned()
+                .chain(
+                    ref_choices
+                        .iter()
+                        .map(|choice| permuted[*choice % permuted.len()].clone()),
+                )
+                .collect::<Vec<_>>();
+            let mut first = Manifest::new();
+            first.namespace = Some("property-target".to_string());
+            first
+                .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+                .unwrap();
+            first.artifact_origins = permuted.clone();
+            first.fragments = expected
+                .iter()
+                .enumerate()
+                .map(|(position, expected_origin)| FragmentRef {
+                    id: Ulid::from((position + 1) as u128),
+                    vector_count: 1,
+                    delete_count: 0,
+                    sequence_number: position as u64,
+                    size_bytes: 1,
+                    artifact_origin: Some(ArtifactOriginIndex::new(
+                        u32::try_from(
+                            permuted
+                                .iter()
+                                .position(|origin| origin == expected_origin)
+                                .unwrap(),
+                        )
+                        .unwrap(),
+                    )),
+                })
+                .collect();
+
+            for (fragment, expected_origin) in first.fragments.iter().zip(&expected) {
+                prop_assert_eq!(first.fragment_origin(fragment).unwrap(), expected_origin.clone());
+            }
+
+            let mut second = first.clone();
+            second.artifact_origins = canonical.clone();
+            for (fragment, expected_origin) in second.fragments.iter_mut().zip(&expected) {
+                fragment.artifact_origin = Some(ArtifactOriginIndex::new(
+                    u32::try_from(
+                        canonical
+                            .iter()
+                            .position(|origin| origin == expected_origin)
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                ));
+            }
+
+            first.canonicalize_artifact_origins().unwrap();
+            second.canonicalize_artifact_origins().unwrap();
+
+            prop_assert_eq!(&first.artifact_origins, &canonical);
+            prop_assert_eq!(&second.artifact_origins, &canonical);
+            prop_assert_eq!(first.fragments, second.fragments);
+        }
+    }
+
+    #[test]
+    fn receipt_publication_canonicalizes_only_explicit_origin_metadata() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let local = origin("canonical-publication", 1);
+        let unused = origin("unused-origin", 2);
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("canonical-publication".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
+        manifest.artifact_origins = vec![unused, local.clone(), local.clone()];
+        manifest.fragments = vec![
+            FragmentRef {
+                id: Ulid::from(40_u128),
+                vector_count: 1,
+                delete_count: 0,
+                sequence_number: 0,
+                size_bytes: 1,
+                artifact_origin: None,
+            },
+            FragmentRef {
+                id: Ulid::from(41_u128),
+                vector_count: 1,
+                delete_count: 0,
+                sequence_number: 1,
+                size_bytes: 1,
+                artifact_origin: Some(ArtifactOriginIndex::new(2)),
+            },
+        ];
+        let mut explicit_segment = make_segment("segment-explicit-local");
+        explicit_segment.artifact_origin = Some(ArtifactOriginIndex::new(1));
+        manifest.segments = vec![explicit_segment, make_segment("segment-implicit-local")];
+
+        manifest
+            .finalize_receipt_root(&store, "canonical-publication")
+            .expect("publication must canonicalize valid explicit origins");
+
+        assert_eq!(manifest.artifact_origins, vec![local]);
+        assert_eq!(manifest.fragments[0].artifact_origin, None);
+        assert_eq!(
+            manifest.fragments[1].artifact_origin,
+            Some(ArtifactOriginIndex::new(0))
+        );
+        assert_eq!(
+            manifest.segments[0].artifact_origin,
+            Some(ArtifactOriginIndex::new(0))
+        );
+        assert_eq!(manifest.segments[1].artifact_origin, None);
+        assert_eq!(
+            manifest.receipt_binding_version(),
+            Some(ReceiptBindingVersion::V2Origins)
+        );
+    }
+
+    #[test]
+    fn receipt_v2_digest_binds_origin_table_namespace_and_incarnation() {
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("target".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
+        manifest.artifact_origins = vec![origin("source", 2)];
+        let mut segment = make_segment("segment-origin-table");
+        segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        manifest.segments.push(segment);
+        manifest.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
+        let baseline = manifest.recompute_receipt_state_digest("target").unwrap();
+
+        let mut namespace_tamper = manifest.clone();
+        namespace_tamper.artifact_origins[0] = origin("another-source", 2);
+        assert_ne!(
+            namespace_tamper
+                .recompute_receipt_state_digest("target")
+                .unwrap(),
+            baseline
+        );
+
+        let mut incarnation_tamper = manifest.clone();
+        incarnation_tamper.artifact_origins[0] = origin("source", 3);
+        assert_ne!(
+            incarnation_tamper
+                .recompute_receipt_state_digest("target")
+                .unwrap(),
+            baseline
+        );
+
+        let mut table_tamper = manifest;
+        table_tamper
+            .artifact_origins
+            .push(origin("unused-source", 4));
+        assert_ne!(
+            table_tamper
+                .recompute_receipt_state_digest("target")
+                .unwrap(),
+            baseline
+        );
     }
 
     #[test]
@@ -3554,6 +4765,7 @@ mod tests {
                 delete_count: 0,
                 sequence_number: 0,
                 size_bytes: 10,
+                artifact_origin: None,
             },
             FragmentRef {
                 id: Ulid::from(2_u128),
@@ -3561,6 +4773,7 @@ mod tests {
                 delete_count: 0,
                 sequence_number: 1,
                 size_bytes: 11,
+                artifact_origin: None,
             },
         ];
         manifest.segments = vec![make_segment("segment-a"), make_segment("segment-b")];
@@ -3641,6 +4854,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 4,
             size_bytes: 5,
+            artifact_origin: None,
         }];
         manifest.segments = vec![make_segment("segment-stable")];
         let binding = serde_json::to_value(manifest.execution_binding_v1("stable"))
@@ -3685,6 +4899,254 @@ mod tests {
             !segment.contains_key("membership"),
             "write-path-only membership is deliberately outside query execution v1"
         );
+    }
+
+    #[test]
+    fn receipt_v1_root_signing_bytes_and_signature_are_frozen() {
+        use ed25519_dalek::Signer as _;
+
+        let bytes =
+            manifest_root_signing_bytes([1; 32], 7, 9, ReceiptBindingVersion::V1, [2; 32], None)
+                .expect("legacy V1 root binding must encode");
+        let expected = concat!(
+            r#"{"merkle_root":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,"#,
+            r#"1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"#,
+            r#""manifest_version":7,"fencing_token":9,"binding_version":"v1","#,
+            r#""state_digest":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,"#,
+            r#"2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]}"#,
+        );
+        assert_eq!(bytes, expected.as_bytes());
+
+        let signature = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+            .sign(&bytes)
+            .to_bytes();
+        assert_eq!(
+            signature,
+            [
+                137, 0, 201, 209, 102, 145, 229, 89, 174, 203, 186, 189, 183, 75, 39, 193, 8, 129,
+                188, 226, 42, 176, 145, 80, 157, 45, 133, 85, 227, 81, 96, 14, 98, 177, 118, 112,
+                155, 84, 173, 5, 19, 177, 14, 126, 67, 126, 97, 92, 119, 124, 126, 74, 44, 23, 98,
+                137, 95, 72, 200, 54, 57, 72, 187, 8,
+            ]
+        );
+    }
+
+    #[test]
+    fn receipt_v2_uses_fixed_envelope_and_rejects_control_digest() {
+        let bytes = manifest_root_signing_bytes(
+            [1; 32],
+            7,
+            9,
+            ReceiptBindingVersion::V2Origins,
+            [2; 32],
+            None,
+        )
+        .expect("V2 origin-aware root envelope must encode");
+        let expected = concat!(
+            r#"{"domain":"zeppelin-manifest-root-envelope-v2","#,
+            r#""merkle_root":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,"#,
+            r#"1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"#,
+            r#""manifest_generation":7,"fencing_token":9,"#,
+            r#""binding_version":"v2_origins","#,
+            r#""execution_digest":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,"#,
+            r#"2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2],"control_digest":null}"#,
+        );
+        assert_eq!(bytes, expected.as_bytes());
+
+        let error = manifest_root_signing_bytes(
+            [1; 32],
+            7,
+            9,
+            ReceiptBindingVersion::V2Origins,
+            [2; 32],
+            Some([3; 32]),
+        )
+        .expect_err("V2 origins must not reinterpret a future control digest");
+        assert!(matches!(error, ZeppelinError::Serialization(_)));
+    }
+
+    #[test]
+    fn receipt_binding_version_never_downgrades_within_one_namespace_lifetime() {
+        let store = ZeppelinStore::new(Arc::new(InMemory::new()));
+        let mut manifest = Manifest::new();
+        manifest.namespace = Some("binding-monotonic".to_string());
+        manifest
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
+        manifest.artifact_origins = vec![origin("binding-monotonic", 1)];
+        let mut segment = make_segment("segment-binding-monotonic");
+        segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        manifest.segments.push(segment);
+
+        manifest
+            .finalize_receipt_root(&store, "binding-monotonic")
+            .unwrap();
+        assert_eq!(
+            manifest.receipt_binding_version(),
+            Some(ReceiptBindingVersion::V2Origins)
+        );
+
+        manifest.segments.clear();
+        manifest.artifact_origins.clear();
+        manifest
+            .finalize_receipt_root(&store, "binding-monotonic")
+            .unwrap();
+        assert_eq!(
+            manifest.receipt_binding_version(),
+            Some(ReceiptBindingVersion::V2Origins),
+            "removing the last explicit origin must not downgrade this namespace lifetime"
+        );
+    }
+
+    #[test]
+    fn receipt_binding_combinations_fail_closed() {
+        fn decode_error(mut manifest: Manifest) -> ZeppelinError {
+            manifest.namespace = Some("binding-combinations".to_string());
+            manifest
+                .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+                .unwrap();
+            Manifest::from_bytes_for_namespace(
+                &manifest.to_bytes().expect("fixture must encode"),
+                "binding-combinations",
+            )
+            .expect_err("invalid receipt binding combination must fail")
+        }
+
+        let mut digest_without_version = Manifest::new();
+        digest_without_version.receipt_state_digest = Some([1; 32]);
+        assert!(matches!(
+            decode_error(digest_without_version),
+            ZeppelinError::Serialization(_)
+        ));
+
+        let mut v1_without_digest = Manifest::new();
+        v1_without_digest.receipt_binding_version = Some(ReceiptBindingVersion::V1);
+        assert!(matches!(
+            decode_error(v1_without_digest),
+            ZeppelinError::Serialization(_)
+        ));
+
+        let mut v1_with_control = Manifest::new();
+        v1_with_control.receipt_binding_version = Some(ReceiptBindingVersion::V1);
+        v1_with_control.receipt_state_digest = Some([1; 32]);
+        v1_with_control.control_state_digest = Some([2; 32]);
+        assert!(matches!(
+            decode_error(v1_with_control),
+            ZeppelinError::Serialization(_)
+        ));
+
+        let mut v2_without_digest = Manifest::new();
+        v2_without_digest.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
+        assert!(matches!(
+            decode_error(v2_without_digest),
+            ZeppelinError::Serialization(_)
+        ));
+
+        let mut v2_with_control = Manifest::new();
+        v2_with_control.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
+        v2_with_control.receipt_state_digest = Some([1; 32]);
+        v2_with_control.control_state_digest = Some([2; 32]);
+        assert!(matches!(
+            decode_error(v2_with_control),
+            ZeppelinError::Serialization(_)
+        ));
+
+        let mut v1_with_origin = Manifest::new();
+        v1_with_origin.receipt_binding_version = Some(ReceiptBindingVersion::V1);
+        v1_with_origin.receipt_state_digest = Some([1; 32]);
+        v1_with_origin.artifact_origins = vec![origin("binding-combinations", 1)];
+        let mut segment = make_segment("segment-v1-origin");
+        segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        v1_with_origin.segments.push(segment);
+        assert!(matches!(
+            decode_error(v1_with_origin),
+            ZeppelinError::Serialization(_)
+        ));
+    }
+
+    #[test]
+    fn legacy_receipt_bindings_reject_all_origin_metadata() {
+        fn decode_error(mut manifest: Manifest) -> ZeppelinError {
+            manifest.namespace = Some("legacy-origin-binding".to_string());
+            manifest
+                .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+                .unwrap();
+            Manifest::from_bytes_for_namespace(
+                &manifest.to_bytes().expect("fixture must encode"),
+                "legacy-origin-binding",
+            )
+            .expect_err("legacy binding must reject origin metadata")
+        }
+
+        let local_origin = origin("legacy-origin-binding", 1);
+
+        let mut unbound_table_only = Manifest::new();
+        unbound_table_only.artifact_origins = vec![local_origin.clone()];
+        assert!(matches!(
+            decode_error(unbound_table_only),
+            ZeppelinError::Serialization(_)
+        ));
+
+        let mut unbound_indexed = Manifest::new();
+        unbound_indexed.artifact_origins = vec![local_origin.clone()];
+        unbound_indexed.fragments.push(FragmentRef {
+            id: Ulid::from(77_u128),
+            vector_count: 1,
+            delete_count: 0,
+            sequence_number: 0,
+            size_bytes: 1,
+            artifact_origin: Some(ArtifactOriginIndex::new(0)),
+        });
+        assert!(matches!(
+            decode_error(unbound_indexed),
+            ZeppelinError::Serialization(_)
+        ));
+
+        let mut v1_table_only = Manifest::new();
+        v1_table_only.receipt_binding_version = Some(ReceiptBindingVersion::V1);
+        v1_table_only.receipt_state_digest = Some([1; 32]);
+        v1_table_only.artifact_origins = vec![local_origin];
+        assert!(matches!(
+            decode_error(v1_table_only),
+            ZeppelinError::Serialization(_)
+        ));
+    }
+
+    #[test]
+    fn reserved_v3_v4_bindings_deserialize_but_fail_closed() {
+        for version in [
+            ReceiptBindingVersion::V3Roots,
+            ReceiptBindingVersion::V4Lineage,
+        ] {
+            let mut manifest = Manifest::new();
+            manifest.namespace = Some("reserved-binding".to_string());
+            manifest
+                .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+                .unwrap();
+            manifest.receipt_binding_version = Some(version);
+            manifest.receipt_state_digest = Some([1; 32]);
+
+            let error = Manifest::from_bytes_for_namespace(
+                &manifest
+                    .to_bytes()
+                    .expect("reserved version must serialize"),
+                "reserved-binding",
+            )
+            .expect_err("reserved version must not become authority");
+            assert!(matches!(
+                error,
+                ZeppelinError::Branch(error)
+                    if matches!(error.as_ref(), BranchError::BranchingNotReady { .. })
+            ));
+
+            let error = manifest_root_signing_bytes([1; 32], 1, 1, version, [2; 32], None)
+                .expect_err("reserved root projection must not sign");
+            assert!(matches!(
+                error,
+                ZeppelinError::Branch(error)
+                    if matches!(error.as_ref(), BranchError::BranchingNotReady { .. })
+            ));
+        }
     }
 
     /// Sketch refs written before v4 decode with no invented rotation seed.
@@ -3747,6 +5209,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 0,
             size_bytes: 8,
+            artifact_origin: None,
         });
         first
             .write_conditional(&store, ns, &first_etag)
@@ -3764,6 +5227,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 0,
             size_bytes: 8,
+            artifact_origin: None,
         });
         second
             .write_conditional(&store, ns, &second_etag)
@@ -3789,6 +5253,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 0,
             size_bytes: 32,
+            artifact_origin: None,
         });
         first
             .write_conditional(&store, ns, &first_etag)
@@ -3957,6 +5422,7 @@ mod tests {
                 delete_count: 0,
                 sequence_number: 0,
                 size_bytes: 16,
+                artifact_origin: None,
             });
             manifest.write_conditional(&store, ns, &etag).await.unwrap();
         }
@@ -3999,6 +5465,7 @@ mod tests {
                 delete_count: 0,
                 sequence_number: 0,
                 size_bytes: 16,
+                artifact_origin: None,
             });
             manifest.updated_at = match version {
                 2 => Utc::now() - chrono::Duration::seconds(60),
@@ -4258,6 +5725,7 @@ mod tests {
                 delete_count: 0,
                 sequence_number: 0,
                 size_bytes: 0,
+                artifact_origin: None,
             });
         }
 
@@ -4286,6 +5754,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 0,
             size_bytes: 0,
+            artifact_origin: None,
         });
         manifest.remove_compacted_fragments(&[newer].into_iter().collect());
         assert_eq!(manifest.compaction_watermark, Some(newer));
@@ -4296,6 +5765,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 0,
             size_bytes: 0,
+            artifact_origin: None,
         });
         manifest.remove_compacted_fragments(&[older].into_iter().collect());
         assert_eq!(
@@ -4324,6 +5794,7 @@ mod tests {
             delete_count: 3,
             sequence_number: 0,
             size_bytes: 111,
+            artifact_origin: None,
         });
         manifest.add_fragment(FragmentRef {
             id: Ulid::from_parts(3000, 2),
@@ -4331,6 +5802,7 @@ mod tests {
             delete_count: 1,
             sequence_number: 0,
             size_bytes: 222,
+            artifact_origin: None,
         });
 
         assert_eq!(
@@ -4351,6 +5823,7 @@ mod tests {
             delete_count: 3,
             sequence_number: 0,
             size_bytes: 10,
+            artifact_origin: None,
         });
 
         assert_eq!(
@@ -4392,6 +5865,193 @@ mod tests {
             .bind_namespace_incarnation(target_incarnation)
             .expect("clone target must bind a fresh namespace lifetime");
         assert_eq!(clone.namespace_incarnation(), Some(target_incarnation));
+    }
+
+    #[test]
+    fn local_and_foreign_origin_manifests_round_trip_with_fail_closed_admission() {
+        let mut local = Manifest::new();
+        local.namespace = Some("origin-roundtrip".to_string());
+        local
+            .bind_namespace_incarnation(uuid::Uuid::from_u128(1))
+            .unwrap();
+        let local_bytes = local.to_bytes().unwrap();
+        let decoded_local =
+            Manifest::from_bytes_for_namespace(&local_bytes, "origin-roundtrip").unwrap();
+        assert!(decoded_local.artifact_origins.is_empty());
+        assert_eq!(
+            decoded_local.local_origin().unwrap(),
+            origin("origin-roundtrip", 1)
+        );
+
+        let mut explicit_local = local.clone();
+        explicit_local.artifact_origins = vec![origin("origin-roundtrip", 1)];
+        let mut local_segment = make_segment("segment-local-origin");
+        local_segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        explicit_local.segments.push(local_segment);
+        explicit_local.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
+        explicit_local.receipt_state_digest = Some(
+            explicit_local
+                .compute_receipt_state_digest("origin-roundtrip", ReceiptBindingVersion::V2Origins)
+                .unwrap(),
+        );
+        let decoded_explicit = Manifest::from_bytes_for_namespace(
+            &explicit_local.to_bytes().unwrap(),
+            "origin-roundtrip",
+        )
+        .unwrap();
+        assert_eq!(
+            decoded_explicit
+                .segment_origin(&decoded_explicit.segments[0])
+                .unwrap(),
+            origin("origin-roundtrip", 1)
+        );
+
+        let mut foreign = local;
+        foreign.artifact_origins = vec![origin("source", 2)];
+        let mut foreign_segment = make_segment("segment-foreign-origin");
+        foreign_segment.artifact_origin = Some(ArtifactOriginIndex::new(0));
+        foreign.segments.push(foreign_segment);
+        foreign.receipt_binding_version = Some(ReceiptBindingVersion::V2Origins);
+        foreign.receipt_state_digest = Some(
+            foreign
+                .compute_receipt_state_digest("origin-roundtrip", ReceiptBindingVersion::V2Origins)
+                .unwrap(),
+        );
+        let foreign_bytes = foreign.to_bytes().unwrap();
+        let decoded_foreign = Manifest::from_bytes(&foreign_bytes).unwrap();
+        decoded_foreign.validate_artifact_origins().unwrap();
+        assert_eq!(
+            decoded_foreign
+                .segment_origin(&decoded_foreign.segments[0])
+                .unwrap(),
+            origin("source", 2)
+        );
+        assert!(matches!(
+            Manifest::from_bytes_for_namespace(&foreign_bytes, "origin-roundtrip")
+                .expect_err("foreign origin admission must stay closed until lineage lands"),
+            ZeppelinError::Branch(error)
+                if matches!(error.as_ref(), BranchError::BranchingNotReady { .. })
+        ));
+    }
+
+    #[test]
+    fn immediately_pre_origin_manifest_resolves_implicit_refs_locally() {
+        #[derive(Serialize)]
+        struct OldFragmentBeforeOrigins {
+            id: Ulid,
+            vector_count: usize,
+            delete_count: usize,
+            sequence_number: u64,
+            size_bytes: u64,
+        }
+
+        #[derive(Serialize)]
+        struct OldSegmentBeforeOrigins {
+            id: String,
+            vector_count: usize,
+            cluster_count: usize,
+            quantization: crate::index::quantization::QuantizationType,
+            hierarchical: bool,
+            bitmap_fields: Vec<String>,
+            fts_fields: Vec<String>,
+            has_global_fts: bool,
+            cluster_owners: Vec<String>,
+            sketch: Option<SketchRef>,
+            cluster_objects: Vec<ClusterDataObjectRef>,
+            bootstrap: Option<BootstrapRef>,
+            membership: Option<MembershipRef>,
+        }
+
+        #[derive(Serialize)]
+        struct OldManifestBeforeOrigins {
+            fragments: Vec<OldFragmentBeforeOrigins>,
+            segments: Vec<OldSegmentBeforeOrigins>,
+            compaction_watermark: Option<Ulid>,
+            active_segment: Option<String>,
+            next_sequence: u64,
+            pending_deletes: Vec<String>,
+            fencing_token: u64,
+            updated_at: DateTime<Utc>,
+            version: u64,
+            namespace: Option<String>,
+            namespace_incarnation: Option<ManifestNamespaceIncarnation>,
+            deletion_fence: Option<ManifestDeletionFence>,
+            artifact_hashes: BTreeMap<String, [u8; 32]>,
+            merkle_root: Option<[u8; 32]>,
+            root_signature: Option<Vec<u8>>,
+            root_signer_node: Option<String>,
+            hierarchical_routing_nodes: BTreeMap<String, Vec<String>>,
+            receipt_state_digest: Option<[u8; 32]>,
+            receipt_binding_version: Option<ReceiptBindingVersion>,
+        }
+
+        let fragment_id = Ulid::from(0x123_u128);
+        let namespace_incarnation = uuid::Uuid::from_u128(0x456);
+        let old = OldManifestBeforeOrigins {
+            fragments: vec![OldFragmentBeforeOrigins {
+                id: fragment_id,
+                vector_count: 1,
+                delete_count: 0,
+                sequence_number: 0,
+                size_bytes: 7,
+            }],
+            segments: vec![OldSegmentBeforeOrigins {
+                id: "legacy-segment".to_string(),
+                vector_count: 1,
+                cluster_count: 1,
+                quantization: crate::index::quantization::QuantizationType::None,
+                hierarchical: false,
+                bitmap_fields: Vec::new(),
+                fts_fields: Vec::new(),
+                has_global_fts: false,
+                cluster_owners: Vec::new(),
+                sketch: None,
+                cluster_objects: Vec::new(),
+                bootstrap: None,
+                membership: None,
+            }],
+            compaction_watermark: None,
+            active_segment: Some("legacy-segment".to_string()),
+            next_sequence: 1,
+            pending_deletes: Vec::new(),
+            fencing_token: 2,
+            updated_at: Utc::now(),
+            version: 3,
+            namespace: Some("legacy-bound".to_string()),
+            namespace_incarnation: Some(ManifestNamespaceIncarnation::from_uuid(
+                namespace_incarnation,
+            )),
+            deletion_fence: None,
+            artifact_hashes: BTreeMap::new(),
+            merkle_root: None,
+            root_signature: None,
+            root_signer_node: None,
+            hierarchical_routing_nodes: BTreeMap::new(),
+            receipt_state_digest: None,
+            receipt_binding_version: None,
+        };
+
+        let mut data = vec![MANIFEST_FORMAT_MSGPACK];
+        data.extend_from_slice(&rmp_serde::to_vec(&old).unwrap());
+        let decoded = Manifest::from_bytes_for_namespace(&data, "legacy-bound")
+            .expect("the immediately pre-origin positional shape must decode locally");
+
+        assert!(decoded.artifact_origins.is_empty());
+        assert_eq!(decoded.fragments[0].artifact_origin, None);
+        assert_eq!(decoded.segments[0].artifact_origin, None);
+        let expected = ArtifactOrigin {
+            namespace: NamespaceId::parse("legacy-bound").unwrap(),
+            incarnation: NamespaceIncarnationId::from_uuid(namespace_incarnation),
+        };
+        assert_eq!(decoded.local_origin().unwrap(), expected);
+        assert_eq!(
+            decoded.fragment_origin(&decoded.fragments[0]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            decoded.segment_origin(&decoded.segments[0]).unwrap(),
+            expected
+        );
     }
 
     /// Backward compat: manifests serialized BEFORE `FragmentRef.size_bytes`
@@ -4461,6 +6121,8 @@ mod tests {
         assert_eq!(decoded.fragments[0].id, frag_id);
         assert_eq!(decoded.fragments[0].vector_count, 42);
         assert_eq!(decoded.fragments[0].sequence_number, 7);
+        assert_eq!(decoded.fragments[0].artifact_origin, None);
+        assert!(decoded.artifact_origins.is_empty());
         assert_eq!(
             decoded.fragments[0].size_bytes, 0,
             "missing size_bytes decodes to the serde default (0)"
@@ -4926,6 +6588,8 @@ mod tests {
         let decoded_json = Manifest::from_bytes(&json)
             .expect("legacy JSON segment refs without membership must decode");
         assert!(decoded_json.segments[0].membership.is_none());
+        assert!(decoded_json.segments[0].artifact_origin.is_none());
+        assert!(decoded_json.artifact_origins.is_empty());
     }
 
     /// Verifies that a current fragment's stored byte size survives a manifest
@@ -4939,6 +6603,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 0,
             size_bytes: 12_345,
+            artifact_origin: None,
         });
         let bytes = manifest.to_bytes().unwrap();
         let decoded = Manifest::from_bytes(&bytes).unwrap();

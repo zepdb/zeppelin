@@ -262,6 +262,7 @@ async fn old_fragment_that_just_left_manifest_is_not_collected_before_horizon() 
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 28,
+        artifact_origin: None,
     });
     manifest.write(&store, &ns).await.unwrap();
 

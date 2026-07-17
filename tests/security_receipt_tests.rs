@@ -19,9 +19,11 @@ use zeppelin::fts::global_index::global_fts_key;
 use zeppelin::index::ivf_flat::build::attrs_key;
 use zeppelin::index::quantization::sq::{serialize_sq_cluster, SqCalibration};
 use zeppelin::index::quantization::QuantizationType;
+use zeppelin::namespace::branching::{ArtifactOrigin, ArtifactOriginIndex};
+use zeppelin::namespace::{NamespaceId, NamespaceIncarnationId, NamespaceManager};
 use zeppelin::security::Feature;
 use zeppelin::security::{MerkleTree, VerificationMode};
-use zeppelin::wal::manifest::SegmentRef;
+use zeppelin::wal::manifest::{ReceiptBindingVersion, SegmentRef};
 use zeppelin::wal::{Manifest, WalFragment};
 
 fn hash(byte: u8) -> [u8; 32] {
@@ -152,6 +154,130 @@ async fn verify_query_receipt(
         .expect("receipt verification must return JSON");
     assert_eq!(status, StatusCode::OK, "{body}");
     body
+}
+
+#[tokio::test]
+async fn v2_origin_receipt_verifies_and_rejects_origin_table_tamper() {
+    let harness = TestHarness::new().await;
+    let config = Config::default();
+    let server = start_test_server_full(
+        harness.store.clone(),
+        Some(harness.prefix.clone()),
+        config.clone(),
+        false,
+        None,
+    )
+    .await;
+    let bearer = server.admin_bearer.clone();
+    let client = client_with_bearer(&bearer);
+    let namespace = create_ns_api_with(
+        &client,
+        &server.base_url,
+        json!({"dimensions": 2, "distance_metric": "euclidean"}),
+    )
+    .await;
+    let upsert = client
+        .post(format!(
+            "{}/v1/namespaces/{namespace}/vectors",
+            server.base_url
+        ))
+        .json(&json!({
+            "vectors": [{"id": "v2-origin-receipt", "values": [0.0, 0.0]}]
+        }))
+        .send()
+        .await
+        .expect("V2 origin receipt fixture upsert must complete");
+    assert_eq!(upsert.status(), StatusCode::OK);
+
+    let metadata = NamespaceManager::new(harness.store.clone())
+        .get(&namespace)
+        .await
+        .expect("V2 origin receipt metadata must read");
+    let incarnation = metadata
+        .incarnation_id
+        .expect("new namespace metadata must carry an incarnation");
+    let (mut manifest, version) = Manifest::read_versioned(&harness.store, &namespace)
+        .await
+        .expect("V2 origin receipt manifest must read")
+        .expect("V2 origin receipt manifest must exist");
+    assert_eq!(manifest.fragments.len(), 1);
+    manifest.artifact_origins = vec![ArtifactOrigin {
+        namespace: NamespaceId::new(namespace.clone()).expect("fixture namespace must be valid"),
+        incarnation,
+    }];
+    manifest.fragments[0].artifact_origin = Some(ArtifactOriginIndex::new(0));
+    manifest
+        .write_conditional(&harness.store, &namespace, &version)
+        .await
+        .expect("explicit local origin must publish");
+    assert_eq!(
+        manifest.receipt_binding_version(),
+        Some(ReceiptBindingVersion::V2Origins)
+    );
+    assert!(manifest.root_signature().is_some());
+    server.shutdown().await;
+
+    let restarted_store = zeppelin::storage::ZeppelinStore::new(harness.store.inner());
+    let restarted = start_test_server_full_without_rate_limit_override_and_admin_bearer(
+        restarted_store,
+        Some(harness.prefix.clone()),
+        config,
+        &bearer,
+    )
+    .await;
+    let client = client_with_bearer(&bearer);
+    let query = query_with_receipt(&client, &restarted.base_url, &namespace, 1).await;
+    assert_eq!(query["receipt"]["manifest_binding_version"], "v2_origins");
+    let verified = verify_query_receipt(&client, &restarted.base_url, &query, 1).await;
+    assert_eq!(verified["valid"], true, "{verified}");
+    assert_eq!(verified["manifest_history_checked"], true, "{verified}");
+
+    let receipt_version = query["receipt"]["manifest_version"]
+        .as_u64()
+        .expect("receipt generation must be numeric");
+    let history_key = Manifest::history_key(&namespace, receipt_version);
+    let mut history = Manifest::read_history(&harness.store, &namespace, receipt_version)
+        .await
+        .expect("V2 origin receipt history must read")
+        .expect("V2 origin receipt history must exist");
+    let original_history = history
+        .to_bytes()
+        .expect("V2 origin receipt history must encode");
+    assert_eq!(history.artifact_origins.len(), 1);
+    let tamper_incarnation: NamespaceIncarnationId =
+        serde_json::from_value(json!("00000000-0000-0000-0000-000000000002"))
+            .expect("non-nil tamper incarnation must decode");
+    history.artifact_origins.push(ArtifactOrigin {
+        namespace: NamespaceId::new(format!("{namespace}-zz-tamper"))
+            .expect("tamper namespace must be valid"),
+        incarnation: tamper_incarnation,
+    });
+    harness
+        .store
+        .put(
+            &history_key,
+            history
+                .to_bytes()
+                .expect("tampered V2 origin receipt history must encode"),
+        )
+        .await
+        .expect("harness must simulate V2 origin-table history tamper");
+
+    let tampered = verify_query_receipt(&client, &restarted.base_url, &query, 1).await;
+    assert_eq!(tampered["valid"], false, "{tampered}");
+    assert_eq!(
+        tampered["first_divergence"], "manifest_history",
+        "{tampered}"
+    );
+    assert_eq!(tampered["manifest_history_checked"], true, "{tampered}");
+
+    harness
+        .store
+        .put(&history_key, original_history)
+        .await
+        .expect("V2 origin receipt history must restore before teardown");
+    restarted.shutdown().await;
+    cleanup_ns(&harness.store, &namespace).await;
 }
 
 #[tokio::test]
@@ -1719,6 +1845,7 @@ async fn legacy_scalar_receipt_proves_the_standalone_calibration_read() {
         sketch: None,
         bootstrap: None,
         membership: None,
+        artifact_origin: None,
     });
     manifest
         .write(&server.store, &namespace)

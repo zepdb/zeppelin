@@ -852,6 +852,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 0,
+        artifact_origin: None,
     });
     manifest.add_fragment(FragmentRef {
         id: frag2.id,
@@ -859,6 +860,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 0,
+        artifact_origin: None,
     });
     manifest.write(store, &ns).await.unwrap();
 
@@ -928,6 +930,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 0,
+        artifact_origin: None,
     });
     w2_snap.fencing_token = w2_token;
     w2_snap
@@ -944,6 +947,7 @@ async fn test_tla_toctou_fencing_gap_cas_catches_zombie() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 0,
+        artifact_origin: None,
     });
     w1_modified.fencing_token = w1_token;
     let w1_cas_result = w1_modified.write_conditional(store, &ns, &w1_version).await;

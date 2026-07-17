@@ -635,6 +635,7 @@ impl WalWriter {
                     delete_count: fragment.deletes.len(),
                     sequence_number: 0, // assigned by add_fragment at commit
                     size_bytes,
+                    artifact_origin: None,
                 },
                 fencing_token,
                 expected_manifest,

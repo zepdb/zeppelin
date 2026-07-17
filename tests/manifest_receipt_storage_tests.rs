@@ -30,6 +30,7 @@ async fn receipt_publication_reuses_successful_put_hash_without_readback() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 24,
+        artifact_origin: None,
     });
     manifest.write(&harness.store, &namespace).await.unwrap();
 
@@ -73,6 +74,7 @@ async fn put_hash_survives_manifest_conflict_and_is_consumed_after_retry_commit(
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 30,
+        artifact_origin: None,
     });
     assert!(matches!(
         stale
@@ -95,6 +97,7 @@ async fn put_hash_survives_manifest_conflict_and_is_consumed_after_retry_commit(
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 30,
+        artifact_origin: None,
     });
     retry
         .write_conditional(&harness.store, &namespace, &retry_version)

@@ -320,6 +320,10 @@ pub enum ZeppelinError {
     #[error("security error: {0}")]
     Security(#[from] crate::security::SecurityError),
 
+    /// Namespace-branching integrity or lifecycle validation failed.
+    #[error("branch error: {0}")]
+    Branch(Box<crate::namespace::branching::BranchError>),
+
     /// Durable security-audit delivery or lifecycle management failed.
     #[error("audit sink error: {0}")]
     AuditSink(#[from] crate::security::AuditSinkError),
@@ -378,6 +382,12 @@ pub enum ZeppelinError {
         /// Seconds until the next token becomes available.
         retry_after_secs: u64,
     },
+}
+
+impl From<crate::namespace::branching::BranchError> for ZeppelinError {
+    fn from(error: crate::namespace::branching::BranchError) -> Self {
+        Self::Branch(Box::new(error))
+    }
 }
 
 impl From<Box<bincode::ErrorKind>> for ZeppelinError {
@@ -573,6 +583,7 @@ impl ZeppelinError {
             ZeppelinError::NotImplemented { .. } => "NOT_IMPLEMENTED",
             ZeppelinError::Config(_) => "INTERNAL_ERROR",
             ZeppelinError::Security(error) => error.code(),
+            ZeppelinError::Branch(_) => "INTERNAL_ERROR",
             ZeppelinError::AuditSink(_) => "INTERNAL_ERROR",
             ZeppelinError::ServerTaskSupervisor(_) => "INTERNAL_ERROR",
             ZeppelinError::CompactionLifecycle(_) => "INTERNAL_ERROR",
@@ -704,6 +715,7 @@ impl ZeppelinError {
             | ZeppelinError::Membership(_)
             | ZeppelinError::KMeansConvergence { .. }
             | ZeppelinError::Config(_)
+            | ZeppelinError::Branch(_)
             | ZeppelinError::AuditSink(_)
             | ZeppelinError::ServerTaskSupervisor(_)
             | ZeppelinError::CompactionLifecycle(_)

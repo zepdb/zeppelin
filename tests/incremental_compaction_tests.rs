@@ -585,6 +585,7 @@ async fn seed_segment(store: &ZeppelinStore, ns: &str) -> (String, Vec<VectorEnt
         cluster_objects: index.cluster_objects().to_vec(),
         bootstrap: None,
         membership: None,
+        artifact_origin: None,
     });
     manifest.write(store, ns).await.unwrap();
     common::write_active_namespace_metadata(store, ns, DIM, DistanceMetric::Euclidean).await;
@@ -800,6 +801,7 @@ async fn seed_legacy_flat_segment(
         cluster_objects: Vec::new(),
         bootstrap: None,
         membership: None,
+        artifact_origin: None,
     });
     manifest.write(store, ns).await.unwrap();
     common::write_active_namespace_metadata(store, ns, DIM, DistanceMetric::Euclidean).await;
@@ -920,6 +922,7 @@ async fn seed_legacy_sq8_segment(store: &ZeppelinStore, ns: &str) -> (String, Ve
         cluster_objects: Vec::new(),
         bootstrap: None,
         membership: None,
+        artifact_origin: None,
     });
     manifest.write(store, ns).await.unwrap();
     common::write_active_namespace_metadata(store, ns, DIM, DistanceMetric::Euclidean).await;

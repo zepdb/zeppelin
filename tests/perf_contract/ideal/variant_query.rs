@@ -509,6 +509,7 @@ async fn install_deterministic_legacy_sq_fixture(
         cluster_objects: Vec::new(),
         bootstrap: None,
         membership: None,
+        artifact_origin: None,
     });
     manifest
         .write(&server.store, namespace)

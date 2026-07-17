@@ -26,6 +26,7 @@ mod receipt;
 mod resource;
 mod route_map;
 
+pub use crate::namespace::NamespaceId;
 pub use action::Action;
 pub use audit::{
     AuditChainPosition, AuditOutcome, AuditParams, AuditRecord, AuditedVectorIds,
@@ -72,7 +73,7 @@ pub use receipt::{
     TraversalParams, TraversalSourceKind, TraversalSourceParams, VerificationMode,
     VerifyReceiptRequest, VerifyReceiptResponse,
 };
-pub use resource::{NamespaceId, Resource, SnapshotName};
+pub use resource::{Resource, SnapshotName};
 pub use route_map::{classify_route, RouteAction, RouteClass, ROUTE_ACTIONS};
 
 use thiserror::Error;

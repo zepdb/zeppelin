@@ -83,10 +83,13 @@ use crate::config::IndexingConfig;
 use crate::error::{Result, ZeppelinError};
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
-use crate::security::{DecisionId, NamespaceId, PreservationService, PrincipalId, SecurityError};
+use crate::security::{DecisionId, PreservationService, PrincipalId, SecurityError};
 use crate::storage::{ObjectUserMetadata, ZeppelinStore};
 use crate::time::Clock;
 use crate::types::{DistanceMetric, IndexType};
+
+pub use super::types::{is_valid_namespace_name, NamespaceIncarnationId};
+use super::NamespaceId;
 
 /// Default lifetime of a process-local namespace registry entry.
 const DEFAULT_NAMESPACE_REGISTRY_TTL: Duration = Duration::from_secs(5);
@@ -95,37 +98,6 @@ const MAX_NAMESPACE_INCARNATION_MIGRATION_ATTEMPTS: usize = 8;
 pub(crate) const NAMESPACE_INCARNATION_METADATA_KEY: &str = "zeppelin-namespace-incarnation";
 /// Consecutive compaction failures before a namespace is reported degraded.
 pub const COMPACTION_DEGRADED_FAILURE_THRESHOLD: u32 = 5;
-
-/// Collision-resistant identity for one lifetime of a namespace name.
-///
-/// The value is stored as S3 user metadata on `meta.json`, outside its JSON
-/// body. This lets cache and GC memos distinguish delete/recreate even when a
-/// frozen or regressed wall clock repeats the exact creation timestamp.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct NamespaceIncarnationId(uuid::Uuid);
-
-impl NamespaceIncarnationId {
-    #[must_use]
-    pub(crate) fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        uuid::Uuid::parse_str(value).map(Self).map_err(|error| {
-            ZeppelinError::Serialization(format!(
-                "invalid namespace incarnation metadata {value:?}: {error}"
-            ))
-        })
-    }
-
-    fn as_string(&self) -> String {
-        self.0.to_string()
-    }
-
-    pub(crate) const fn as_uuid(&self) -> uuid::Uuid {
-        self.0
-    }
-}
 
 /// Lifecycle state stored in `meta.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1290,7 +1262,7 @@ impl NamespaceManager {
             let incarnation_id = match crate::wal::Manifest::read(&self.store, name).await? {
                 Some(manifest) => manifest
                     .namespace_incarnation()
-                    .map(NamespaceIncarnationId)
+                    .map(NamespaceIncarnationId::from_uuid)
                     .unwrap_or_else(NamespaceIncarnationId::new),
                 None if meta.state == NamespaceState::Creating => NamespaceIncarnationId::new(),
                 None => {
@@ -2350,46 +2322,6 @@ impl NamespaceManager {
             })
             .collect()
     }
-}
-
-/// Validates a namespace name as both an S3 top-level key prefix and one URL
-/// path segment. This deliberately matches the safe names produced by the
-/// test helpers: `TestHarness::key()` may contain `/` for raw S3 keys, while
-/// `api_ns()` produces slash-free namespace names suitable for HTTP paths.
-///
-/// # Parameters
-///
-/// - `name`: Candidate UTF-8 name. Only ASCII alphanumeric characters, dash,
-///   underscore, and dot are accepted; the first byte must be alphanumeric.
-///
-/// # Returns
-///
-/// Returns `true` for a name between 1 and 255 bytes that satisfies the storage
-/// and routing grammar, otherwise `false`.
-///
-/// # Examples
-///
-/// `tenant-a`, `tenant_a`, and `tenant.a` are valid. `tenant/a`, `../tenant`,
-/// and `-tenant` are rejected before they can become ambiguous keys or paths.
-///
-/// # Rust Notes for Java/C Engineers
-///
-/// Indexing `bytes[0]` is safe here because the empty case returns first. Rust
-/// string bytes expose the exact ASCII grammar without permitting mutation;
-/// non-ASCII UTF-8 bytes fail the ASCII checks rather than being split as
-/// characters accidentally.
-#[must_use]
-pub fn is_valid_namespace_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 255 {
-        return false;
-    }
-    let bytes = name.as_bytes();
-    if !bytes[0].is_ascii_alphanumeric() {
-        return false;
-    }
-    bytes
-        .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
 /// Compares an idempotent create request with persisted immutable settings.

@@ -89,6 +89,7 @@ fn fragment(id: u128) -> FragmentRef {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 16,
+        artifact_origin: None,
     }
 }
 

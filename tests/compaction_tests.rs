@@ -645,6 +645,7 @@ async fn test_compact_with_existing_segment() {
         cluster_objects: old_index.cluster_objects().to_vec(),
         bootstrap: None,
         membership: None,
+        artifact_origin: None,
     });
     manifest.write(store, &ns).await.unwrap();
     common::write_active_namespace_metadata(store, &ns, 16, DistanceMetric::Euclidean).await;

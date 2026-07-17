@@ -3,27 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 use super::SecurityError;
-
-/// Validated namespace identifier used by security policy.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct NamespaceId(String);
+use crate::namespace::NamespaceId;
 
 impl NamespaceId {
     /// Validate a namespace using the same grammar as namespace creation.
     pub fn new(value: impl Into<String>) -> Result<Self, SecurityError> {
-        let value = value.into();
-        if crate::namespace::manager::is_valid_namespace_name(&value) {
-            Ok(Self(value))
-        } else {
-            Err(SecurityError::InvalidNamespaceId)
-        }
-    }
-
-    /// Borrow the namespace text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+        Self::parse(value).map_err(|_| SecurityError::InvalidNamespaceId)
     }
 }
 

@@ -4925,6 +4925,7 @@ mod tests {
             delete_count: 0,
             sequence_number: 0,
             size_bytes: 100,
+            artifact_origin: None,
         }
     }
 
@@ -4959,6 +4960,7 @@ mod tests {
             cluster_objects: Vec::new(),
             bootstrap: None,
             membership: None,
+            artifact_origin: None,
         }
     }
 

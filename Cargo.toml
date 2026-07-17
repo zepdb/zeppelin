@@ -10,6 +10,7 @@ rust-version = "1.85"
 default = []
 profiling = ["dep:pprof"]
 managed = []
+branching-test-support = []
 
 [[bin]]
 name = "zeppelin"

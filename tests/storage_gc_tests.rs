@@ -1624,6 +1624,7 @@ async fn standalone_pending_delete_validates_every_live_overlap_before_batching(
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 28,
+        artifact_origin: None,
     });
     manifest.pending_deletes = vec![safe_key.clone(), live_key.clone()];
     manifest.updated_at = now;
@@ -1693,6 +1694,7 @@ async fn warm_pending_delete_validates_every_live_overlap_before_batching() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 22,
+        artifact_origin: None,
     });
     manifest.pending_deletes = vec![safe_key.clone(), live_key.clone()];
     manifest.updated_at = now + chrono::Duration::seconds(1);
@@ -1739,6 +1741,7 @@ async fn gc_cycle_retains_objects_referenced_only_by_manifest_history() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 26,
+        artifact_origin: None,
     });
     manifest.write(&store, &ns).await.unwrap();
 
@@ -1790,6 +1793,7 @@ async fn gc_sweep_rereads_retained_history_before_deleting_candidate() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 26,
+        artifact_origin: None,
     });
     history_manifest.write(&store, &ns).await.unwrap();
 
@@ -1947,6 +1951,7 @@ async fn gc_pitr_time_retention_keeps_old_generation_and_artifacts() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 18,
+        artifact_origin: None,
     });
     manifest.write(&store, &ns).await.unwrap();
 
@@ -2015,6 +2020,7 @@ async fn gc_prunes_expired_history_and_collects_artifacts_after_horizon() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 20,
+        artifact_origin: None,
     });
     manifest.updated_at = Utc::now() - chrono::Duration::seconds(60);
     manifest.write(&store, &ns).await.unwrap();
@@ -2069,6 +2075,7 @@ async fn gc_named_snapshot_pin_keeps_generation_until_released() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 20,
+        artifact_origin: None,
     });
     manifest.updated_at = Utc::now() - chrono::Duration::seconds(60);
     manifest.write(&store, &ns).await.unwrap();
@@ -2183,6 +2190,7 @@ async fn gc_cycle_retains_pending_deletes_referenced_by_manifest_history() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 27,
+        artifact_origin: None,
     });
     manifest.write(&store, &ns).await.unwrap();
 
@@ -2237,6 +2245,7 @@ async fn gc_cycle_rereads_retained_manifest_history_before_sweep() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 22,
+        artifact_origin: None,
     });
     manifest.write(&store, &ns).await.unwrap();
 
@@ -2556,6 +2565,7 @@ async fn gc_runner_warm_prune_roots_protect_every_pending_delete_without_refresh
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 32,
+        artifact_origin: None,
     });
     retained.write(&store, &namespace).await.unwrap();
     let (mut current, etag) = Manifest::read_versioned(&store, &namespace)
@@ -2623,6 +2633,7 @@ async fn gc_runner_warm_eligible_pending_refresh_sees_new_history_root_before_de
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 29,
+        artifact_origin: None,
     });
     let (injecting_store, injection) = PutOnNthDeleteStore::wrap(
         store.inner(),
@@ -2727,6 +2738,7 @@ async fn gc_runner_warm_prune_root_reuse_keeps_final_sweep_history_fresh() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 26,
+        artifact_origin: None,
     });
     let (controlled_store, control) =
         HistoryMetadataControlStore::wrap(&store, history_prefix.clone());
@@ -2798,6 +2810,7 @@ async fn gc_runner_failed_eligible_pending_history_refresh_cannot_authorize_idle
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 30,
+        artifact_origin: None,
     });
     let injected_history_key = Manifest::history_key(&namespace, 4);
     let (injecting_store, injection) = PutOnNthDeleteStore::wrap(
@@ -3635,6 +3648,7 @@ async fn gc_runner_warm_due_non_delete_uses_one_full_namespace_inventory() {
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 26,
+        artifact_origin: None,
     });
     live.updated_at = now + chrono::Duration::seconds(1);
     live.write_conditional(&store, &namespace, &version)
@@ -4262,6 +4276,7 @@ async fn gc_runner_pending_predelete_inventory_cannot_hide_candidate_replacement
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 43,
+        artifact_origin: None,
     });
     let late_history_key = Manifest::history_key(&namespace, late_history_generation);
     let replacement_body = Bytes::from_static(b"replacement candidate body with new identity");
@@ -4808,6 +4823,7 @@ async fn gc_runner_second_namespace_inventory_sees_new_history_root_before_delet
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 40,
+        artifact_origin: None,
     });
     let late_history_key = Manifest::history_key(&namespace, 2);
     control.put_on_nth_list(

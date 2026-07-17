@@ -235,6 +235,7 @@ async fn manual_sq_fixture(label: &str, layout: SqFixtureLayout) -> BenchFixture
         cluster_objects: Vec::new(),
         bootstrap: None,
         membership: None,
+        artifact_origin: None,
     });
     manifest.write(&store, &namespace).await.unwrap();
 

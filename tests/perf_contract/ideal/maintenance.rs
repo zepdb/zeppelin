@@ -2017,6 +2017,7 @@ async fn execute_history_memo_unpublished_orphan_overwrite(case: &IdealCase) -> 
         delete_count: 0,
         sequence_number: 0,
         size_bytes: 19,
+        artifact_origin: None,
     });
     world
         .store

@@ -4962,6 +4962,7 @@ mod tests {
             cluster_objects: Vec::new(),
             bootstrap: None,
             membership: None,
+            artifact_origin: None,
         }
     }
 

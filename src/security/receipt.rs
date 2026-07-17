@@ -159,6 +159,12 @@ pub struct RetrievalReceipt {
     pub manifest_signer_node: String,
     /// Fencing generation bound by the manifest-root signature.
     pub manifest_fencing_token: u64,
+    /// Optional versioned retention/lineage digest bound by the root envelope.
+    ///
+    /// The absent field is skipped so reserializing a legacy V1 receipt keeps
+    /// its exact already-signed bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_control_state_digest: Option<[u8; 32]>,
 }
 
 /// Stable first-divergence fields returned by structural verification.
@@ -384,6 +390,7 @@ pub(crate) fn issue_receipt(issue: ReceiptIssue<'_>) -> ZeppelinResult<Retrieval
         manifest_root_signature,
         manifest_signer_node,
         manifest_fencing_token: manifest.fencing_token(),
+        manifest_control_state_digest: manifest.control_state_digest(),
     };
     receipt.signer_node = store
         .object_signer_node()?
@@ -439,6 +446,7 @@ fn retained_manifest_matches_receipt(
         || manifest.merkle_root() != Some(receipt.manifest_root)
         || manifest.receipt_state_digest() != Some(receipt.manifest_state_digest)
         || manifest.receipt_binding_version() != Some(receipt.manifest_binding_version)
+        || manifest.control_state_digest() != receipt.manifest_control_state_digest
         || manifest.root_signature() != Some(receipt.manifest_root_signature.as_slice())
         || manifest.root_signer_node() != Some(receipt.manifest_signer_node.as_str())
     {
@@ -545,6 +553,7 @@ pub(crate) async fn verify_receipt(
         receipt.manifest_fencing_token,
         receipt.manifest_binding_version,
         receipt.manifest_state_digest,
+        receipt.manifest_control_state_digest,
     )?;
     if !super::delegation::verify_published_signature(
         store,
