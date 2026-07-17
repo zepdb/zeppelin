@@ -20,8 +20,9 @@ use crate::namespace::branch_root::{
     insert_branch_root_with_lease, source_data_plane_config_digest, InsertBranchRootRequest,
 };
 use crate::namespace::branching::{
-    ArtifactOrigin, BranchError, BranchMaintenanceReport, BranchPrepareStage, ForkDataPlaneConfig,
-    ForkIdentity, ForkPrepareIntent, ForkReservationIdentity, NamespaceCreationKind,
+    ArtifactOrigin, BranchDescriptor, BranchError, BranchListRequest, BranchMaintenanceReport,
+    BranchPrepareStage, ForkDataPlaneConfig, ForkIdentity, ForkPrepareIntent,
+    ForkReservationIdentity, NamespaceCreationKind, NamespaceDeleteOutcome, NamespaceDeleteRequest,
     PrepareForkOutcome, PrepareForkRequest, PreparedBranch,
 };
 use crate::namespace::manager::{
@@ -104,6 +105,54 @@ impl NamespaceGraph {
                     "complete fork preparation stopped before returning an outcome".to_string(),
                 )
             })
+    }
+
+    /// Delete through the graph guard, refusing to bypass live child roots.
+    pub(crate) async fn delete(
+        &self,
+        request: NamespaceDeleteRequest,
+    ) -> Result<NamespaceDeleteOutcome> {
+        let name = request.namespace.as_str();
+        let (metadata, _) = self.namespace_manager.read_metadata_versioned(name).await?;
+        let (manifest, _) = Manifest::read_versioned_required(&self.store, name).await?;
+        if !manifest.branch_roots().is_empty() {
+            return Err(BranchError::NamespaceHasLiveBranches {
+                namespace: request.namespace.to_string(),
+            }
+            .into());
+        }
+        if matches!(metadata.state, NamespaceState::Deleting) {
+            return Ok(NamespaceDeleteOutcome::AlreadyDeleting);
+        }
+        self.namespace_manager.delete(name).await?;
+        Ok(NamespaceDeleteOutcome::Deleted)
+    }
+
+    /// List only the direct children represented by the authoritative root map.
+    pub(crate) async fn list_children(
+        &self,
+        request: BranchListRequest,
+    ) -> Result<Vec<BranchDescriptor>> {
+        let (manifest, _) =
+            Manifest::read_versioned_required(&self.store, request.source.as_str()).await?;
+        let mut children = Vec::with_capacity(manifest.branch_roots().len());
+        for root in manifest.branch_roots().values() {
+            let state = self
+                .namespace_manager
+                .read_metadata_versioned(root.target_namespace.as_str())
+                .await
+                .map(|(metadata, _)| match metadata.state {
+                    NamespaceState::Creating => "creating",
+                    NamespaceState::Active => "active",
+                    NamespaceState::Deleting => "deleting",
+                })?;
+            children.push(BranchDescriptor {
+                target: root.target_namespace.clone(),
+                branch_id: root.branch_id,
+                state,
+            });
+        }
+        Ok(children)
     }
 
     /// Feature-only deterministic crash point immediately after the root CAS.

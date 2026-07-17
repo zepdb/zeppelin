@@ -165,6 +165,41 @@ pub struct PrepareForkRequest {
     pub target: NamespaceId,
 }
 
+/// Graph-owned deletion request. Authorization proof plumbing is added by the
+/// HTTP security phase; the graph remains the only lifecycle entry point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceDeleteRequest {
+    /// Namespace selected for graph-owned deletion.
+    pub namespace: NamespaceId,
+}
+
+/// Result of graph-owned deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceDeleteOutcome {
+    /// Cleanup completed through the namespace manager.
+    Deleted,
+    /// The namespace was already in the deleting lifecycle state.
+    AlreadyDeleting,
+}
+
+/// Direct-child listing request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchListRequest {
+    /// Source namespace whose direct root map is listed.
+    pub source: NamespaceId,
+}
+
+/// Redacted direct-child descriptor returned by the graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchDescriptor {
+    /// Direct child target namespace.
+    pub target: NamespaceId,
+    /// Stable branch edge identity.
+    pub branch_id: BranchId,
+    /// Redacted lifecycle state.
+    pub state: &'static str,
+}
+
 /// Complete proof returned after prepare reaches `manifest_published`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedBranch {
