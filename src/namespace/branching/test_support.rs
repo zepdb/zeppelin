@@ -35,7 +35,8 @@ use chrono::{DateTime, Utc};
 use super::{
     ArtifactOrigin, ArtifactOriginIndex, BranchId, BranchLineage, BranchMaintenanceReport,
     BranchPrepareStage, BranchRoot, ForkIdentity, ForkReservationIdentity, ForkViewDigest,
-    ManifestGeneration, NamespaceCreationKind, PrepareForkOutcome, PrepareForkRequest,
+    ManifestGeneration, NamespaceCreationKind, NamespaceDeleteOutcome, NamespaceDeleteRequest,
+    PrepareForkOutcome, PrepareForkRequest,
 };
 use crate::namespace::branch_root::{
     insert_branch_root, remove_branch_root, source_data_plane_config_digest,
@@ -228,6 +229,18 @@ pub async fn maintain_branches_for_test(
 ) -> Result<BranchMaintenanceReport> {
     graph_for_test(store, indexing, branching)
         .maintain(budget)
+        .await
+}
+
+/// Exercise graph-owned deletion through the feature-only test seam.
+pub async fn delete_namespace_for_test(
+    store: ZeppelinStore,
+    namespace: NamespaceId,
+    indexing: IndexingConfig,
+    branching: BranchingConfig,
+) -> Result<NamespaceDeleteOutcome> {
+    graph_for_test(store, indexing, branching)
+        .delete(NamespaceDeleteRequest { namespace })
         .await
 }
 

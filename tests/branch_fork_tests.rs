@@ -14,8 +14,9 @@ use zeppelin::fts::FtsFieldConfig;
 use zeppelin::index::quantization::QuantizationType;
 use zeppelin::namespace::branching::test_support::{
     activate_fork_for_test, branch_control_snapshot, branch_metadata_snapshot,
-    maintain_branches_for_test, prepare_fork_for_test, prepare_fork_until_reserved_for_test,
-    prepare_fork_until_root_for_test, prepared_manifest_snapshot, publish_deletion_fence,
+    delete_namespace_for_test, maintain_branches_for_test, prepare_fork_for_test,
+    prepare_fork_until_reserved_for_test, prepare_fork_until_root_for_test,
+    prepared_manifest_snapshot, publish_deletion_fence,
 };
 use zeppelin::namespace::branching::{BranchError, BranchPrepareStage, PrepareForkOutcome};
 use zeppelin::namespace::manager::{
@@ -91,6 +92,52 @@ async fn activated_foreign_branch_compaction_materializes_target_owned_segment()
         .await
         .unwrap()
         .is_some());
+
+    harness.cleanup_artifact_origin_namespace(&source).await;
+    harness.cleanup_artifact_origin_namespace(&target).await;
+    harness.cleanup().await;
+}
+
+#[tokio::test]
+async fn graph_delete_rejects_a_source_with_a_live_child_root() {
+    let harness = TestHarness::new().await;
+    let source = harness.artifact_origin_namespace("delete-source");
+    let target = harness.artifact_origin_namespace("delete-target");
+    NamespaceManager::new(harness.store.clone())
+        .create(&source, 4, DistanceMetric::Cosine)
+        .await
+        .unwrap();
+    prepare_fork_for_test(
+        harness.store.clone(),
+        NamespaceId::new(source.clone()).unwrap(),
+        NamespaceId::new(target.clone()).unwrap(),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .unwrap();
+
+    let error = delete_namespace_for_test(
+        harness.store.clone(),
+        NamespaceId::new(source.clone()).unwrap(),
+        fork_indexing(),
+        fork_limits(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ZeppelinError::Branch(inner)
+            if matches!(*inner, BranchError::NamespaceHasLiveBranches { .. })
+    ));
+    assert_eq!(
+        NamespaceManager::new(harness.store.clone())
+            .get(&source)
+            .await
+            .unwrap()
+            .name,
+        source
+    );
 
     harness.cleanup_artifact_origin_namespace(&source).await;
     harness.cleanup_artifact_origin_namespace(&target).await;
