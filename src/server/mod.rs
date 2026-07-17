@@ -2755,7 +2755,10 @@ mod tests {
         if state.config.branching.enabled {
             other_routes = other_routes.route(
                 "/v1/namespaces/:ns/branches",
-                secure_route(post(namespace::create_branch), &state),
+                secure_route(
+                    get(namespace::list_branches).post(namespace::create_branch),
+                    &state,
+                ),
             );
         }
         buckets.insert(

@@ -148,6 +148,10 @@ use crate::compaction::background::run_compaction_with_reserved_lease;
 use crate::error::ZeppelinError;
 use crate::fts::FtsFieldConfig;
 use crate::index::quantization::QuantizationType;
+use crate::namespace::branching::http::{
+    BranchDescriptorResponse, BranchHealth, BranchLifecycle, BranchListResponse, BranchMode,
+    BranchTargetIdentity,
+};
 use crate::namespace::branching::{BranchError, PrepareForkOutcome, PrepareForkRequest};
 use crate::namespace::graph::NamespaceGraph;
 use crate::namespace::manager::{
@@ -245,6 +249,63 @@ pub async fn create_branch(
             target: branch.identity.target_namespace.to_string(),
         }),
     ))
+}
+
+/// List direct branch roots for an enabled source namespace.
+#[instrument(skip(state), fields(source = %source))]
+pub async fn list_branches(
+    State(state): State<AppState>,
+    Path(source): Path<String>,
+) -> Result<Json<BranchListResponse>, ApiError> {
+    if !state.config.branching.enabled {
+        return Err(ApiError(ZeppelinError::Branch(Box::new(
+            BranchError::BranchingNotReady {
+                feature: "namespace branching",
+            },
+        ))));
+    }
+    let (manifest, _) = Manifest::read_versioned_required(&state.store, &source).await?;
+    let mut branches = Vec::with_capacity(manifest.branch_roots().len());
+    for root in manifest.branch_roots().values() {
+        let (metadata, _) = state
+            .namespace_manager
+            .read_metadata_versioned(root.target_namespace.as_str())
+            .await?;
+        let identity = root;
+        let depth = metadata
+            .branch_identity
+            .as_ref()
+            .map(|value| value.depth)
+            .unwrap_or(0);
+        branches.push(BranchDescriptorResponse {
+            branch_id: identity.branch_id.to_string(),
+            target: BranchTargetIdentity {
+                namespace: identity.target_namespace.to_string(),
+                incarnation: identity.target_incarnation.to_string(),
+            },
+            mode: BranchMode::CopyOnWrite,
+            depth,
+            lifecycle: match metadata.state {
+                NamespaceState::Creating => BranchLifecycle::Preparing,
+                NamespaceState::Active => BranchLifecycle::Active,
+                NamespaceState::Deleting => BranchLifecycle::Deleting,
+            },
+            health: if matches!(metadata.state, NamespaceState::Deleting) {
+                BranchHealth::DeletionInProgress
+            } else {
+                BranchHealth::Ready
+            },
+            materialized: false,
+            created_at: identity.created_at,
+        });
+    }
+    branches.sort_by(|a, b| {
+        a.target
+            .namespace
+            .cmp(&b.target.namespace)
+            .then(a.branch_id.cmp(&b.branch_id))
+    });
+    Ok(Json(BranchListResponse { branches }))
 }
 
 /// JSON body that selects a namespace's immutable shape and index defaults.
